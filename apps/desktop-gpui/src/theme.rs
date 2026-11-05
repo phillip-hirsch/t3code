@@ -365,7 +365,7 @@ impl Tokens {
     pub fn for_choice(choice: &ThemeChoice, system_dark: bool) -> Self {
         let (dark, colors) = choice.resolve(system_dark);
         let base = if dark { Self::dark() } else { Self::light() };
-        colors.map_or(base, |colors| base.themed(colors))
+        colors.map_or(base, |colors| base.themed(&colors))
     }
 
     /// The `--contrast-*` tokens (`index.css`): below 100% text fades toward its surface and
@@ -477,6 +477,22 @@ pub fn set_preference(choice: ThemeChoice, window: &mut Window, cx: &mut App) {
     window.refresh();
 }
 
+/// The theme editor's draft (`applyThemeColorPreview`): its colors and appearance paint the
+/// app until it is cleared, over the stored pick.
+#[derive(Clone, Copy, Default)]
+struct EditorPreview(Option<(bool, ThemeColors)>);
+
+impl Global for EditorPreview {}
+
+pub fn set_editor_preview(preview: Option<(bool, ThemeColors)>, window: &mut Window, cx: &mut App) {
+    if cx.try_global::<EditorPreview>().and_then(|p| p.0) == preview {
+        return;
+    }
+    cx.set_global(EditorPreview(preview));
+    sync(window, cx);
+    window.refresh();
+}
+
 pub fn system_dark(window: &Window) -> bool {
     matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
 }
@@ -487,7 +503,11 @@ pub fn sync(window: &mut Window, cx: &mut App) {
     let choice = cx.try_global::<Preference>().map(|preference| preference.0.clone()).unwrap_or_default();
     let mut appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
     appearance.fonts = appearance.fonts.installed_or_default(cx);
-    let tokens = Tokens::for_choice(&choice, system_dark(window)).with_appearance(appearance);
+    let base = match cx.try_global::<EditorPreview>().and_then(|preview| preview.0) {
+        Some((dark, colors)) => if dark { Tokens::dark() } else { Tokens::light() }.themed(&colors),
+        None => Tokens::for_choice(&choice, system_dark(window)),
+    };
+    let tokens = base.with_appearance(appearance);
     let (dark, fonts) = (tokens.dark, tokens.fonts);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |theme| {
@@ -607,7 +627,7 @@ mod tests {
     #[test]
     fn a_theme_repaints_the_tokens_it_maps() {
         let grove = crate::themes::ThemeChoice { base: Some("grove".into()), ..Default::default() };
-        let colors = crate::themes::find("grove").unwrap().colors_for(true).unwrap();
+        let colors = crate::themes::built_in()[1].colors_for(true).unwrap();
         let tokens = Tokens::for_choice(&grove, true);
         assert!(tokens.dark);
         assert_eq!(hex_of(tokens.background), hex_of(colors.canvas));

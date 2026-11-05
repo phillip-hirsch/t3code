@@ -16,6 +16,8 @@ async-channel = "2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 env_logger = "0.11"
+# Inflates Open VSX theme packages; GPUI already builds this crate.
+flate2 = "1"
 futures = "0.3"
 getrandom = "0.3"
 # The preview browser: a native WebView2 / WKWebView child of the GPUI window.

@@ -1,14 +1,17 @@
 //! The theme library: the built-in palettes (`BUILT_IN_THEMES` in
-//! `packages/shared/src/themePalettes.ts`, generated into `themes.json` by `tools/theme_data.mjs`)
-//! and the light/dark pick rules of `useTheme.ts` and `themePalette.ts`.
+//! `packages/shared/src/themePalettes.ts`, generated into `themes.json` by `tools/theme_data.mjs`),
+//! the saved themes (`t3code:themes:v1`) and the light/dark pick rules of `useTheme.ts` and
+//! `themePalette.ts`.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use gpui_kit::{Hsla, rgb};
+use gpui_kit::{Hsla, Rgba, rgb};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::settings::ThemePreference;
+use crate::theme_color;
 
 macro_rules! theme_colors {
     ($($field:ident = $role:literal),* $(,)?) => {
@@ -17,8 +20,9 @@ macro_rules! theme_colors {
         pub struct ThemeColors { $(pub $field: Hsla,)* }
 
         impl ThemeColors {
-            fn from_roles(roles: &HashMap<String, String>) -> Option<Self> {
-                Some(Self { $($field: parse_color(roles.get($role)?)?,)* })
+            /// Paints `roles`; a role that is not a color takes `fallback`'s.
+            pub fn from_roles(roles: &Roles, fallback: Option<&ThemeColors>) -> Option<Self> {
+                Some(Self { $($field: parse_color(roles.get($role)).or(fallback.map(|f| f.$field))?,)* })
             }
         }
     };
@@ -55,17 +59,104 @@ theme_colors! {
     sidebar_border = "sidebarBorder",
 }
 
-/// `#rrggbb` or `oklch(L C H)`, the two forms the built-in palettes use.
 fn parse_color(value: &str) -> Option<Hsla> {
-    if let Some(hex) = value.strip_prefix('#') {
-        return (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(|v| rgb(v).into());
+    let [r, g, b, a] = theme_color::to_srgba(value)?;
+    Some(Rgba { r, g, b, a }.into())
+}
+
+#[derive(Deserialize)]
+struct Standard {
+    roles: Vec<String>,
+    reserved: Vec<String>,
+    light: HashMap<String, String>,
+    dark: HashMap<String, String>,
+}
+
+fn standard_data() -> &'static Standard {
+    static DATA: OnceLock<Standard> = OnceLock::new();
+    DATA.get_or_init(|| serde_json::from_str(include_str!("theme_standard.json")).expect("theme_standard.json"))
+}
+
+/// `THEME_COLOR_ROLES`, in file order.
+pub fn role_names() -> &'static [String] {
+    &standard_data().roles
+}
+
+/// `RESERVED_THEME_IDS`: appearance keywords, built-ins and legacy aliases.
+pub fn is_reserved(id: &str) -> bool {
+    standard_data().reserved.iter().any(|reserved| reserved == id)
+}
+
+/// A value for every `THEME_COLOR_ROLES` role, in role order. Values may be mid-edit text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Roles(Vec<String>);
+
+impl Roles {
+    fn from_map(map: &HashMap<String, String>) -> Option<Self> {
+        role_names().iter().map(|role| map.get(role).cloned()).collect::<Option<_>>().map(Self)
     }
-    let inner = value.strip_prefix("oklch(")?.strip_suffix(')')?;
-    let [l, c, h] = inner.split_whitespace().map(str::parse::<f32>).collect::<Result<Vec<_>, _>>().ok()?[..] else {
-        return None;
-    };
-    let (sin, cos) = h.to_radians().sin_cos();
-    Some(crate::theme::srgb_from_oklab([l, c * cos, c * sin]).into())
+
+    /// `fallback` with every role of `overrides` that holds a color, canonicalized
+    /// (`lenientThemeColorOverrides`).
+    pub fn layered(fallback: &Roles, overrides: &Map<String, Value>) -> Self {
+        let mut roles = fallback.clone();
+        for (role, value) in overrides {
+            if let Some(color) = value.as_str().and_then(theme_color::canonical) {
+                roles.set(role, color);
+            }
+        }
+        roles
+    }
+
+    pub fn get(&self, role: &str) -> &str {
+        role_names().iter().position(|name| name == role).map_or("", |index| &self.0[index])
+    }
+
+    pub fn set(&mut self, role: &str, value: String) {
+        if let Some(index) = role_names().iter().position(|name| name == role) {
+            self.0[index] = value;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        role_names().iter().map(String::as_str).zip(self.0.iter().map(String::as_str))
+    }
+
+    /// Every role as a canonical color, or why one is not (`decodeThemeColors`).
+    pub fn canonical(&self) -> Result<Self, String> {
+        self.iter()
+            .map(|(role, value)| {
+                theme_color::canonical(value).ok_or_else(|| {
+                    format!("The color for \"{role}\" must be a literal CSS color such as oklch(0.62 0.2 280).")
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    pub fn to_json(&self) -> Value {
+        Value::Object(self.iter().map(|(role, value)| (role.to_owned(), Value::from(value))).collect())
+    }
+}
+
+/// `getDefaultThemeColors`: T3 Chat's palette, which theme files layer over, canonical.
+pub fn default_roles(dark: bool) -> &'static Roles {
+    static ROLES: OnceLock<[Roles; 2]> = OnceLock::new();
+    &ROLES.get_or_init(|| {
+        let theme = find_built_in("t3-chat").expect("t3-chat");
+        [&theme.roles, theme.variant_roles.as_ref().expect("t3-chat dark")].map(|r| r.canonical().expect("t3-chat"))
+    })[dark as usize]
+}
+
+/// `getStandardThemeColors`: the stock T3 Code palette (its dark canvas is black), canonical.
+pub fn standard_roles(dark: bool) -> &'static Roles {
+    static ROLES: OnceLock<[Roles; 2]> = OnceLock::new();
+    &ROLES.get_or_init(|| {
+        let data = standard_data();
+        let mut dark = data.dark.clone();
+        dark.insert("canvas".into(), "#000000".into());
+        [&data.light, &dark].map(|map| Roles::from_map(map).and_then(|r| r.canonical().ok()).expect("standard"))
+    })[dark as usize]
 }
 
 #[derive(Deserialize)]
@@ -78,24 +169,63 @@ struct ThemeFile {
     variants: HashMap<String, HashMap<String, String>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Collection {
+    pub id: String,
+    pub label: String,
+}
+
 /// One palette (`ThemeDefinition`): its own appearance plus, optionally, the other one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ThemeDefinition {
     pub id: String,
     pub label: String,
     pub dark: bool,
+    pub roles: Roles,
+    pub variant_roles: Option<Roles>,
     pub colors: ThemeColors,
     pub variant: Option<ThemeColors>,
+    pub collection: Option<Collection>,
+    /// Guided-editor output: Duplicate and Edit open in the guided editor.
+    pub managed: bool,
 }
 
 impl ThemeDefinition {
+    /// None when a role is not a color.
+    pub fn new(id: String, label: String, dark: bool, roles: Roles, variant_roles: Option<Roles>) -> Option<Self> {
+        Some(Self {
+            colors: ThemeColors::from_roles(&roles, None)?,
+            variant: match &variant_roles {
+                Some(roles) => Some(ThemeColors::from_roles(roles, None)?),
+                None => None,
+            },
+            id,
+            label,
+            dark,
+            roles,
+            variant_roles,
+            collection: None,
+            managed: false,
+        })
+    }
+
     /// `getThemeColorsForMode`.
     pub fn colors_for(&self, dark: bool) -> Option<&ThemeColors> {
         if dark == self.dark { Some(&self.colors) } else { self.variant.as_ref() }
     }
 
+    pub fn roles_for(&self, dark: bool) -> Option<&Roles> {
+        if dark == self.dark { Some(&self.roles) } else { self.variant_roles.as_ref() }
+    }
+
     /// `singleAppearanceOf`: the one appearance a palette has, if it lacks the other.
     pub fn single_appearance(&self) -> Option<bool> {
         self.variant.is_none().then_some(self.dark)
+    }
+
+    /// `getThemeModes`: light first.
+    pub fn modes(&self) -> Vec<bool> {
+        [false, true].into_iter().filter(|dark| self.colors_for(*dark).is_some()).collect()
     }
 }
 
@@ -108,21 +238,98 @@ pub fn built_in() -> &'static [ThemeDefinition] {
             .map(|file| {
                 let dark = file.appearance == "dark";
                 let other = if dark { "light" } else { "dark" };
-                ThemeDefinition {
-                    colors: ThemeColors::from_roles(&file.colors).expect("built-in theme colors"),
-                    variant: file.variants.get(other).map(|roles| ThemeColors::from_roles(roles).expect("variant")),
-                    id: file.id,
-                    label: file.label,
-                    dark,
-                }
+                let roles = Roles::from_map(&file.colors).expect("built-in theme roles");
+                let variant = file.variants.get(other).map(|map| Roles::from_map(map).expect("variant roles"));
+                ThemeDefinition::new(file.id, file.label, dark, roles, variant).expect("built-in theme colors")
             })
             .collect()
     })
 }
 
-/// `getThemeDefinition`; `system`, `light` and `dark` name the standard palette, not a theme.
-pub fn find(id: &str) -> Option<&'static ThemeDefinition> {
+fn find_built_in(id: &str) -> Option<&'static ThemeDefinition> {
     built_in().iter().find(|theme| theme.id == id)
+}
+
+/// The saved themes (`t3code:themes:v1`). Clones share the list; edits return a new library.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Library(Arc<Vec<ThemeDefinition>>);
+
+impl Library {
+    pub fn new(themes: Vec<ThemeDefinition>) -> Self {
+        Self(Arc::new(themes))
+    }
+
+    pub fn custom(&self) -> &[ThemeDefinition] {
+        &self.0
+    }
+
+    /// `getThemeDefinition`: built-ins win, then saved themes. `system`, `light` and `dark`
+    /// name the standard palette, not a theme.
+    pub fn find(&self, id: &str) -> Option<&ThemeDefinition> {
+        find_built_in(id).or_else(|| self.custom_theme(id))
+    }
+
+    pub fn custom_theme(&self, id: &str) -> Option<&ThemeDefinition> {
+        self.0.iter().find(|theme| theme.id == id)
+    }
+
+    /// `installCustomTheme`.
+    pub fn install(&self, theme: ThemeDefinition) -> Result<Self, String> {
+        if is_reserved(&theme.id) {
+            return Err(format!("The theme id \"{}\" is reserved.", theme.id));
+        }
+        if self.find(&theme.id).is_some() {
+            return Err(format!("A theme named \"{}\" is already installed.", theme.label));
+        }
+        let mut themes = (*self.0).clone();
+        themes.push(theme);
+        Ok(Self::new(themes))
+    }
+
+    /// `updateCustomTheme`.
+    pub fn update(&self, theme: ThemeDefinition) -> Result<Self, String> {
+        if is_reserved(&theme.id) {
+            return Err(format!("The theme id \"{}\" is reserved.", theme.id));
+        }
+        let Some(index) = self.0.iter().position(|existing| existing.id == theme.id) else {
+            return Err(format!("The theme \"{}\" is not installed.", theme.label));
+        };
+        let mut themes = (*self.0).clone();
+        themes[index] = theme;
+        Ok(Self::new(themes))
+    }
+
+    /// `removeCustomThemes`.
+    pub fn remove(&self, ids: &[String]) -> Self {
+        Self::new(self.0.iter().filter(|theme| !ids.contains(&theme.id)).cloned().collect())
+    }
+
+    /// `replaceCustomThemeCollection`: the collection's themes in place of its old ones.
+    pub fn replace_collection(&self, collection_id: &str, themes: Vec<ThemeDefinition>) -> Result<Self, String> {
+        let in_collection = |theme: &ThemeDefinition| theme.collection.as_ref().is_some_and(|c| c.id == collection_id);
+        let ids: std::collections::HashSet<_> = themes.iter().map(|theme| &theme.id).collect();
+        if themes.is_empty() || ids.len() != themes.len() || !themes.iter().all(in_collection) {
+            return Err("That theme collection is invalid.".into());
+        }
+        if let Some(conflict) = themes.iter().find(|theme| {
+            is_reserved(&theme.id)
+                || find_built_in(&theme.id).is_some()
+                || self.0.iter().any(|existing| !in_collection(existing) && existing.id == theme.id)
+        }) {
+            return Err(format!("A theme named \"{}\" is already installed.", conflict.label));
+        }
+        let mut next = Vec::with_capacity(self.0.len() + themes.len());
+        let mut replacement = Some(themes);
+        for theme in self.0.iter() {
+            if !in_collection(theme) {
+                next.push(theme.clone());
+            } else if let Some(themes) = replacement.take() {
+                next.extend(themes);
+            }
+        }
+        next.extend(replacement.into_iter().flatten());
+        Ok(Self::new(next))
+    }
 }
 
 /// The theme a card stands for: `None` is the standard "T3 Code" card.
@@ -140,44 +347,45 @@ impl ThemeHalves {
         if dark { self.dark.as_deref() } else { self.light.as_deref() }
     }
 
-    fn set(&mut self, dark: bool, id: Option<String>) {
+    pub fn set(&mut self, dark: bool, id: Option<String>) {
         *(if dark { &mut self.dark } else { &mut self.light }) = id;
     }
 }
 
-/// Everything the theme library stores: the appearance mode, the whole theme in use, and
-/// the theme each appearance uses instead of it.
+/// Everything the theme library stores: the appearance mode, the whole theme in use, the
+/// theme each appearance uses instead of it, and the saved themes they may name.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThemeChoice {
     pub mode: ThemePreference,
     pub base: CardId,
     pub halves: ThemeHalves,
+    pub library: Library,
 }
 
 impl ThemeChoice {
     /// A half that names a theme with colors for its appearance (`parseThemeHalves`).
-    fn half(&self, dark: bool) -> Option<&'static ThemeDefinition> {
-        self.halves.get(dark).and_then(find).filter(|theme| theme.colors_for(dark).is_some())
+    fn half(&self, dark: bool) -> Option<&ThemeDefinition> {
+        self.halves.get(dark).and_then(|id| self.library.find(id)).filter(|theme| theme.colors_for(dark).is_some())
     }
 
-    fn base_theme(&self) -> Option<&'static ThemeDefinition> {
-        self.base.as_deref().and_then(find)
+    fn base_theme(&self) -> Option<&ThemeDefinition> {
+        self.base.as_deref().and_then(|id| self.library.find(id))
     }
 
     /// `resolveThemeAppearance` then `resolveThemeHalf`: whether the app is dark, and the
     /// palette it paints with (`None` for the standard one).
-    pub fn resolve(&self, system_dark: bool) -> (bool, Option<&'static ThemeColors>) {
+    pub fn resolve(&self, system_dark: bool) -> (bool, Option<ThemeColors>) {
         let dark = match self.mode {
             ThemePreference::System => system_dark,
             ThemePreference::Light => false,
             ThemePreference::Dark => true,
         };
         if let Some(theme) = self.half(dark) {
-            return (dark, theme.colors_for(dark));
+            return (dark, theme.colors_for(dark).copied());
         }
         match self.base_theme() {
-            Some(theme) if theme.colors_for(dark).is_none() => (theme.dark, Some(&theme.colors)),
-            Some(theme) => (dark, theme.colors_for(dark)),
+            Some(theme) if theme.colors_for(dark).is_none() => (theme.dark, Some(theme.colors)),
+            Some(theme) => (dark, theme.colors_for(dark).copied()),
             None => (dark, None),
         }
     }
@@ -189,7 +397,7 @@ impl ThemeChoice {
 
     /// `setTheme`: a whole theme replaces the mix.
     pub fn use_theme(&mut self, base: CardId) {
-        self.base = base.filter(|id| find(id).is_some());
+        self.base = base.filter(|id| self.library.find(id).is_some());
         self.halves = ThemeHalves::default();
     }
 
@@ -208,10 +416,26 @@ impl ThemeChoice {
     /// `onUse` on a card: a two-appearance theme becomes the whole theme; a one-appearance
     /// theme takes its own half.
     pub fn use_card(&mut self, card: CardId) {
-        match card.as_deref().and_then(find).and_then(ThemeDefinition::single_appearance) {
+        match card.as_deref().and_then(|id| self.library.find(id)).and_then(ThemeDefinition::single_appearance) {
             Some(dark) => self.assign_half(dark, card),
             None => self.use_theme(card),
         }
+    }
+
+    /// `handleConfirmRemoveTheme`: the pick once `removed` themes are gone. A removed base
+    /// falls back to the standard palette; a removed half is cleared.
+    pub fn without(&self, removed: &[String]) -> Self {
+        let mut next = self.clone();
+        let gone = |id: Option<&str>| id.is_some_and(|id| removed.iter().any(|r| r == id));
+        if gone(self.base.as_deref()) {
+            next.base = None;
+        }
+        for dark in [false, true] {
+            if gone(self.halves.get(dark)) {
+                next.halves.set(dark, None);
+            }
+        }
+        next
     }
 }
 
@@ -254,7 +478,7 @@ impl Preview {
         }
     }
 
-    fn of(colors: &ThemeColors) -> Self {
+    pub fn of(colors: &ThemeColors) -> Self {
         Self {
             sidebar: colors.sidebar,
             canvas: colors.canvas,
@@ -267,8 +491,8 @@ impl Preview {
     }
 
     /// `pickColors`: the card's colors for `dark`, else its only appearance's.
-    pub fn of_card(card: Option<&str>, dark: bool) -> Self {
-        match card.and_then(find) {
+    pub fn of_card(card: Option<&str>, dark: bool, library: &Library) -> Self {
+        match card.and_then(|id| library.find(id)) {
             Some(theme) => Self::of(theme.colors_for(dark).unwrap_or(&theme.colors)),
             None => Self::standard(dark),
         }
@@ -280,7 +504,11 @@ mod tests {
     use super::*;
 
     fn choice(mode: ThemePreference, base: Option<&str>) -> ThemeChoice {
-        ThemeChoice { mode, base: base.map(str::to_owned), halves: ThemeHalves::default() }
+        ThemeChoice { mode, base: base.map(str::to_owned), ..Default::default() }
+    }
+
+    fn colors(id: &str, dark: bool) -> Option<ThemeColors> {
+        find_built_in(id).unwrap().colors_for(dark).copied()
     }
 
     #[test]
@@ -289,19 +517,22 @@ mod tests {
         assert_eq!(ids, ["t3-chat", "grove", "ocean", "ember", "iris"]);
         assert!(built_in().iter().all(|theme| theme.single_appearance().is_none()));
         // oklch(1 0 0) is white; T3 Chat's light overlay surface.
-        let white = find("t3-chat").unwrap().colors.surface_overlay.to_rgb();
+        let white = find_built_in("t3-chat").unwrap().colors.surface_overlay.to_rgb();
         assert!((white.r - 1.).abs() < 1e-3 && (white.g - 1.).abs() < 1e-3 && (white.b - 1.).abs() < 1e-3);
         assert_eq!(parse_color("#ff0000").map(|c| c.to_rgb().r), Some(1.));
-        assert_eq!(parse_color("rgb(1 2 3)"), None);
+        assert_eq!(parse_color("var(--x)"), None);
+        assert_eq!(role_names().len(), 61);
+        assert!(is_reserved("dark") && is_reserved("t3-grove") && !is_reserved("aurora"));
+        assert_eq!(standard_roles(true).get("canvas"), "oklch(0 0 0)");
     }
 
     #[test]
     fn halves_win_over_the_base_for_their_appearance() {
         let mut picked = choice(ThemePreference::System, Some("grove"));
-        assert_eq!(picked.resolve(true), (true, find("grove").unwrap().colors_for(true)));
+        assert_eq!(picked.resolve(true), (true, colors("grove", true)));
         picked.assign_half(true, Some("ocean".into()));
-        assert_eq!(picked.resolve(true).1, find("ocean").unwrap().colors_for(true));
-        assert_eq!(picked.resolve(false).1, find("grove").unwrap().colors_for(false));
+        assert_eq!(picked.resolve(true).1, colors("ocean", true));
+        assert_eq!(picked.resolve(false).1, colors("grove", false));
         assert_eq!((picked.owner(false), picked.owner(true)), (Some("grove".into()), Some("ocean".into())));
         // An unknown half is ignored, as `parseThemeHalves` drops it.
         picked.halves.dark = Some("gone".into());
@@ -315,12 +546,46 @@ mod tests {
         assert_eq!(picked.base, None);
         assert_eq!(picked.halves, ThemeHalves { light: Some("ember".into()), dark: None });
         let light = ThemeChoice { mode: ThemePreference::Light, ..picked.clone() };
-        assert_eq!(light.resolve(false).1, find("ember").unwrap().colors_for(false));
+        assert_eq!(light.resolve(false).1, colors("ember", false));
         assert_eq!(picked.resolve(true), (true, None));
         // A whole theme clears the mix; the standard card clears everything.
         picked.use_card(Some("iris".into()));
         assert_eq!((picked.base.as_deref(), &picked.halves), (Some("iris"), &ThemeHalves::default()));
         picked.use_card(None);
         assert_eq!(picked, choice(ThemePreference::Dark, None));
+    }
+
+    fn saved(id: &str, dark: bool) -> ThemeDefinition {
+        ThemeDefinition::new(id.into(), id.into(), dark, default_roles(dark).clone(), None).unwrap()
+    }
+
+    #[test]
+    fn saved_themes_resolve_and_one_appearance_themes_take_their_half() {
+        let library = Library::default().install(saved("aurora", true)).unwrap();
+        assert_eq!(
+            library.install(saved("aurora", true)).unwrap_err(),
+            "A theme named \"aurora\" is already installed."
+        );
+        assert!(library.install(saved("grove", true)).is_err(), "built-in ids are taken");
+        assert!(library.install(saved("system", true)).unwrap_err().contains("reserved"));
+        let mut picked = ThemeChoice { library: library.clone(), ..Default::default() };
+        picked.use_card(Some("aurora".into()));
+        assert_eq!((picked.base.as_deref(), picked.halves.get(true)), (None, Some("aurora")));
+        assert_eq!(picked.resolve(true).1, Some(library.custom()[0].colors));
+        // Removing it clears the half it held.
+        assert_eq!(picked.without(&["aurora".into()]).halves, ThemeHalves::default());
+        assert!(library.remove(&["aurora".into()]).custom().is_empty());
+    }
+
+    #[test]
+    fn a_collection_replaces_its_themes_in_place() {
+        let collection = Collection { id: "open-vsx:a.b".into(), label: "A".into() };
+        let member = |id: &str| ThemeDefinition { collection: Some(collection.clone()), ..saved(id, false) };
+        let library = Library::new(vec![saved("first", false), member("old"), saved("last", false)]);
+        let next = library.replace_collection(&collection.id, vec![member("new-1"), member("new-2")]).unwrap();
+        let ids: Vec<_> = next.custom().iter().map(|theme| theme.id.as_str()).collect();
+        assert_eq!(ids, ["first", "new-1", "new-2", "last"]);
+        assert!(library.replace_collection(&collection.id, vec![member("first")]).is_err(), "id taken outside");
+        assert!(library.replace_collection(&collection.id, vec![saved("loose", false)]).is_err());
     }
 }

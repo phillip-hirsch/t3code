@@ -43,8 +43,8 @@ impl Workspace {
     /// System, Light and Dark tiles, each a wireframe in the theme that owns its appearance.
     fn render_mode_tiles(&self, owners: &[CardId; 2], t: &Tokens, cx: &mut Context<Self>) -> Div {
         let current = self.client_settings.theme;
-        let [light, dark] =
-            [Preview::of_card(owners[0].as_deref(), false), Preview::of_card(owners[1].as_deref(), true)];
+        let [light, dark] = [false, true]
+            .map(|dark| Preview::of_card(owners[dark as usize].as_deref(), dark, &self.client_settings.themes));
         let tile = |mode: ThemePreference, label: &'static str| {
             let active = current == mode;
             let wireframe = match mode {
@@ -102,7 +102,7 @@ impl Workspace {
         let key = card.clone().unwrap_or_else(|| "default".into());
         let circles = [false, true].map(|dark| {
             let picked = owners[dark as usize] == card;
-            let colors = Preview::of_card(card.as_deref(), dark);
+            let colors = Preview::of_card(card.as_deref(), dark, &self.client_settings.themes);
             let card = card.clone();
             div()
                 .id(SharedString::from(format!("theme-{key}-{}", if dark { "dark" } else { "light" })))
