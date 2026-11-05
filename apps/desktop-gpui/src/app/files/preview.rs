@@ -74,6 +74,8 @@ pub(super) struct PreviewState {
     markdown: Option<Entity<TextViewState>>,
     /// The table of a CSV or TSV file's contents, parsed when first shown.
     table: Option<std::rc::Rc<super::table::Table>>,
+    /// Bumped whenever `saved` changes, so rendered views rebuild without comparing text.
+    revision: u64,
     full: Option<FullFile>,
     /// The word wrap toggle; unset, it follows `wordWrap`.
     wrap: Option<bool>,
@@ -97,6 +99,7 @@ impl PreviewState {
             saving: false,
             markdown: None,
             table: None,
+            revision: 0,
             full: None,
             wrap: None,
             applied_wrap: None,
@@ -303,6 +306,7 @@ impl Workspace {
                     }
                 }
                 state.table = None;
+                state.revision += 1;
                 state.saved = contents;
             }
             Err(RpcError::Failure(error)) => {
@@ -414,6 +418,8 @@ impl Workspace {
                 match result {
                     Ok(_) => {
                         state.dirty = state.editor.as_ref().is_some_and(|e| *e.read(cx).value() != *contents);
+                        state.table = None;
+                        state.revision += 1;
                         state.saved = contents;
                     }
                     Err(error) => {
@@ -751,8 +757,9 @@ impl Workspace {
                     return self.render_full_file(key, full, tokens, cx);
                 }
                 if logic::is_mermaid(&key.1) && render_mermaid {
-                    let saved = state.saved.clone();
-                    return self.render_mermaid(key, &saved, window, cx);
+                    let revision = state.revision;
+                    let source = self.files.documents.stale(key, revision).then(|| state.saved.clone());
+                    return self.render_mermaid(key, revision, source, window, cx);
                 }
                 if let Some(delimiter) = delimiter {
                     let saved = &state.saved;

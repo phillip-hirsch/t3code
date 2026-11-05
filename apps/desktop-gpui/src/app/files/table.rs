@@ -1,13 +1,14 @@
 //! CSV and TSV tables (`DelimitedTablePreview`, `LargeTextViewer`, `VirtualTablePreview.tsx`):
 //! the first row heads the columns, rows are numbered, and only the visible rows render.
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, px, uniform_list,
+    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, div, px, uniform_list,
 };
 
 use crate::app::Workspace;
@@ -24,6 +25,16 @@ pub(super) struct Table {
     header: Vec<SharedString>,
     rows: Vec<Vec<SharedString>>,
     columns: usize,
+    /// The horizontal scroll, which picks the columns that render (the web's column window).
+    scroll: ScrollHandle,
+}
+
+/// The columns in view at horizontal `offset` (zero or negative), with one spare each side.
+pub(super) fn visible_columns(offset: f32, viewport: f32, column_width: f32, columns: usize) -> Range<usize> {
+    let count = (viewport / column_width).ceil() as usize + 3;
+    let first = ((-offset - ROW_HEADER).max(0.) / column_width) as usize;
+    let first = first.saturating_sub(1).min(columns.saturating_sub(count));
+    first..(first + count).min(columns)
 }
 
 /// `parseDelimitedPreview`: quoted cells, `""` escapes, CRLF, a leading BOM, and bounds on rows,
@@ -120,7 +131,7 @@ impl Table {
     pub(super) fn grid(rows: &[Vec<String>]) -> Self {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         let rows = rows.iter().map(|row| row.iter().map(|c| SharedString::from(c.clone())).collect()).collect();
-        Self { header: Vec::new(), rows, columns }
+        Self { header: Vec::new(), rows, columns, scroll: ScrollHandle::new() }
     }
 
     pub(super) fn parse(text: &str, delimiter: char) -> Self {
@@ -128,7 +139,12 @@ impl Table {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         let header = if rows.is_empty() { Vec::new() } else { rows.remove(0) };
         let shared = |row: Vec<String>| row.into_iter().map(SharedString::from).collect::<Vec<_>>();
-        Self { header: shared(header), rows: rows.into_iter().map(shared).collect(), columns }
+        Self {
+            header: shared(header),
+            rows: rows.into_iter().map(shared).collect(),
+            columns,
+            scroll: ScrollHandle::new(),
+        }
     }
 }
 
@@ -152,6 +168,8 @@ impl Workspace {
         let column_width = ((width - ROW_HEADER) / table.columns.min(6) as f32).clamp(128., 320.);
         let table_width = (ROW_HEADER + column_width * table.columns as f32).max(width);
         let border = tokens.border;
+        let visible = visible_columns(f32::from(table.scroll.offset().x), width, column_width, table.columns);
+        let spacer = |columns: usize| div().flex_none().w(px(column_width * columns as f32));
         let header = h_flex()
             .flex_none()
             .h(px(ROW_HEIGHT))
@@ -160,7 +178,8 @@ impl Workspace {
             .bg(tokens.muted.opacity(0.6))
             .font_weight(FontWeight::MEDIUM)
             .child(div().w(px(ROW_HEADER)).h_full().flex_none().border_r_1().border_color(border).bg(tokens.background))
-            .children((0..table.columns).map(|column| {
+            .child(spacer(visible.start))
+            .children(visible.clone().map(|column| {
                 let label = table.header.get(column).cloned().unwrap_or_else(|| column_label(column).into());
                 div()
                     .w(px(column_width))
@@ -173,11 +192,13 @@ impl Workspace {
                     .child(label)
             }));
         let rows = table.clone();
+        let scroll = table.scroll.clone();
         let list = uniform_list(
             ElementId::Name(format!("table:{id}").into()),
             table.rows.len(),
             cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                 let tokens = *crate::theme::tokens(cx);
+                let visible = visible_columns(f32::from(scroll.offset().x), width, column_width, rows.columns);
                 range
                     .map(|index| {
                         let row = &rows.rows[index];
@@ -200,7 +221,8 @@ impl Workspace {
                                     .text_color(tokens.muted_foreground)
                                     .child(SharedString::from((index + 1).to_string())),
                             )
-                            .children((0..rows.columns).map(|column| {
+                            .child(div().flex_none().w(px(column_width * visible.start as f32)))
+                            .children(visible.clone().map(|column| {
                                 div()
                                     .w(px(column_width))
                                     .flex_none()
@@ -220,6 +242,7 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .overflow_x_scroll()
+            .track_scroll(&table.scroll)
             .text_xs()
             .child(v_flex().w(px(table_width)).h_full().child(header).child(list))
             .into_any_element()
@@ -243,6 +266,14 @@ mod tests {
         assert!(truncated);
         assert!(parse_delimited("\"open", ',', 10, 10, 10).1, "an unclosed quote is truncation");
         assert_eq!(parse_delimited("abcdef", ',', 10, 10, 3).0, [vec!["abc".to_owned()]]);
+    }
+
+    #[test]
+    fn only_the_columns_in_view_render() {
+        assert_eq!(visible_columns(0., 600., 128., 1024), 0..8);
+        assert_eq!(visible_columns(-(56. + 128. * 10.), 600., 128., 1024), 9..17);
+        assert_eq!(visible_columns(-5000., 600., 128., 20), 12..20, "the last columns stay in range");
+        assert_eq!(visible_columns(0., 600., 128., 3), 0..3);
     }
 
     #[test]

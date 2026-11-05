@@ -30,10 +30,19 @@ struct DocView {
     /// The workspace mutation and `fileRevision` the page loaded.
     mutation: (Option<String>, Option<String>),
     revision: Option<String>,
+    /// A rendered diagram's source revision.
+    content: u64,
     shown: bool,
     used: u64,
     _task: Option<Task<()>>,
     _links: Option<Task<()>>,
+}
+
+impl Documents {
+    /// Whether `key`'s diagram must be built for source `revision`.
+    pub(super) fn stale(&self, key: &Key, revision: u64) -> bool {
+        self.views.get(key).is_none_or(|doc| doc.content != revision)
+    }
 }
 
 #[derive(Default)]
@@ -249,6 +258,7 @@ impl Workspace {
             failed: None,
             mutation: mutation.clone(),
             revision: None,
+            content: 0,
             shown: false,
             used: 0,
             _task: None,
@@ -404,20 +414,18 @@ impl Workspace {
     pub(super) fn render_mermaid(
         &mut self,
         key: &Key,
-        source: &str,
+        revision: u64,
+        source: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let revision = Some(format!("{:x}", source_digest(source)));
         let dark = self.dark_theme(cx);
         let mutation = self.files.mutation.clone();
         let documents = &mut self.files.documents;
         documents.drawn = Some(key.clone());
-        if documents.views.get(key).is_some_and(|doc| doc.revision != revision) {
+        if let Some(source) = source {
             documents.views.remove(key);
-        }
-        if !documents.views.contains_key(key) {
             let colors = DiagramColors {
                 background: css_hex(tokens.background),
                 foreground: css_hex(tokens.foreground),
@@ -428,7 +436,7 @@ impl Workspace {
                 critical: css_hex(tokens.error),
                 dark,
             };
-            let page = mermaid_page(source, &colors);
+            let page = mermaid_page(&source, &colors);
             let Ok(handle) = window.window_handle() else { return div().into_any_element() };
             let parent = ParentWindow(handle.as_raw());
             let request_key = key.clone();
@@ -469,7 +477,8 @@ impl Workspace {
                     view: None,
                     failed: None,
                     mutation,
-                    revision,
+                    revision: None,
+                    content: revision,
                     shown: false,
                     used: 0,
                     _task: Some(task),
@@ -573,13 +582,6 @@ impl Workspace {
         })
         .detach();
     }
-}
-
-/// A digest of a diagram's source, so an edit rebuilds its page.
-fn source_digest(source: &str) -> u64 {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(source.as_bytes());
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
 }
 
 #[cfg(test)]
