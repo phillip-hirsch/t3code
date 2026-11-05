@@ -124,10 +124,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        if view.scope.kind != ScopeKind::Environment || self.settings_client().is_none() {
+        let Some(client) = self.settings_client().filter(|_| view.scope.kind == ScopeKind::Environment) else {
             return self.export_scope_notice(view, &t, cx);
-        }
-        let client = self.settings_client().expect("checked above");
+        };
         let saved_values = self.settings_info().settings.get("observability");
         let saved: [String; 3] =
             SIGNALS.map(|(key, ..)| saved_values[key].as_str().unwrap_or_default().trim().to_owned());
