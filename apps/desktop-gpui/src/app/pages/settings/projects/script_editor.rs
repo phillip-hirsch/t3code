@@ -58,7 +58,7 @@ impl Workspace {
             None => ScriptInput::default(),
             Some(id) => {
                 match resolve_project_scripts(&self.server_info.settings, project).iter().find(|s| s.id == id) {
-                    Some(script) => ScriptInput::from_script(script, &self.server_info.keybindings_json),
+                    Some(script) => ScriptInput::from_script(script, self.server_info.keybindings_json()),
                     None => return,
                 }
             }

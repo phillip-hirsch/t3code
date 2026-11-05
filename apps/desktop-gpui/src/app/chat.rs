@@ -663,7 +663,7 @@ fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tok
 impl Workspace {
     /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
     fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base.clone()) else { return };
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
         let mut resource = serde_json::json!({
             "_tag": "attachment",
             "attachmentId": embed.attachment_id,

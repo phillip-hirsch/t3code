@@ -1,6 +1,7 @@
-//! Thread actions the sidebar rows offer: settle, snooze, pin, rename, archive,
-//! delete, mark unread, and their undo (`apps/web/src/hooks/useThreadActions.ts`,
-//! `components/threadActionMenu.logic.ts`, `SidebarThreadUndoNotice.tsx`).
+//! Thread actions and their menu, shared by sidebar rows and the chat title: settle, snooze,
+//! pin, rename, archive, delete, mark unread, and their undo (`hooks/useThreadActions.ts`,
+//! `hooks/useThreadActionMenu.ts`, `components/threadActionMenu.logic.ts`,
+//! `SidebarThreadUndoNotice.tsx`).
 
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::{Shelf, now_ms};
+use crate::app::thread_menu::hosted_thread_link;
 use crate::app::{Target, Workspace, new_id, project_name};
 use crate::inbox::{self, Facts};
 
@@ -60,12 +62,29 @@ impl UndoNotice {
     }
 }
 
-/// The title editor of the row being renamed.
-pub(super) struct Renaming {
-    pub(super) thread_id: String,
-    pub(super) input: Entity<InputState>,
+/// Where a thread menu opened. The sidebar renames in the row, moves on from the open thread
+/// after parking it, and offers the project filter; the chat title does none of these.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum MenuOrigin {
+    Sidebar,
+    Title,
+}
+
+/// The title editor of the thread being renamed, in its row or in the chat title.
+pub(in crate::app) struct Renaming {
+    pub(in crate::app) thread_id: String,
+    pub(in crate::app) input: Entity<InputState>,
     original: String,
     _subscription: Subscription,
+}
+
+/// A confirmation a client setting turns on (`api.dialogs.confirm`).
+struct Confirm {
+    setting: &'static str,
+    message: String,
+    detail: Option<&'static str>,
+    ok: &'static str,
+    level: PromptLevel,
 }
 
 const UNDO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -208,11 +227,20 @@ impl Workspace {
         }
     }
 
-    pub(in crate::app) fn settle_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// `advance` moves on from the open thread, as the sidebar's settle does.
+    pub(in crate::app) fn settle_thread(
+        &mut self,
+        thread_id: &str,
+        advance: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entry = self.undo_entry(thread_id);
         self.thread_command("thread.settle", thread_id, json!({}), cx);
         self.push_undo(UndoAction::Settled, entry, cx);
-        self.leave_thread(thread_id, window, cx);
+        if advance {
+            self.leave_thread(thread_id, window, cx);
+        }
     }
 
     pub(super) fn unsettle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -220,7 +248,14 @@ impl Workspace {
         self.thread_command("thread.unsettle", thread_id, json!({"reason": "user"}), cx);
     }
 
-    pub(super) fn snooze_thread(&mut self, thread_id: &str, wake_ms: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn snooze_thread(
+        &mut self,
+        thread_id: &str,
+        wake_ms: i64,
+        advance: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if wake_ms <= now_ms() {
             self.error = Some("That snooze time has passed. Choose another time.".into());
             cx.notify();
@@ -229,7 +264,9 @@ impl Workspace {
         let entry = self.undo_entry(thread_id);
         self.thread_command("thread.snooze", thread_id, json!({"snoozedUntil": inbox::iso(wake_ms)}), cx);
         self.push_undo(UndoAction::Snoozed, entry, cx);
-        self.leave_thread(thread_id, window, cx);
+        if advance {
+            self.leave_thread(thread_id, window, cx);
+        }
     }
 
     pub(super) fn wake_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -243,84 +280,136 @@ impl Workspace {
         self.thread_command("thread.pin", thread_id, fields, cx);
     }
 
-    pub(in crate::app) fn unpin_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.unpin", thread_id, json!({}), cx);
-        self.push_undo(UndoAction::Unpinned, entry, cx);
-    }
-
-    fn archive_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let entry = self.undo_entry(thread_id);
-        let project_id = self.thread(thread_id).map(|t| t.project_id.clone());
-        self.thread_command("thread.archive", thread_id, json!({}), cx);
-        self.push_undo(UndoAction::Archived, entry, cx);
-        if self.target.as_ref() == Some(&Target::Thread(thread_id.to_owned())) {
-            if let Some(project_id) = project_id {
-                self.start_draft(project_id, window, cx);
-            }
-        }
-    }
-
-    /// `confirm('Delete thread "…"?')`, then `thread.delete`; there is no undo.
-    fn delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// `confirmAndUnpinThread`: asked first when `confirmThreadUnpin` is on.
+    pub(in crate::app) fn unpin_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let title = self.thread(thread_id).map(|t| t.title.clone()).unwrap_or_default();
-        let answer = window.prompt(
-            PromptLevel::Critical,
-            &format!("Delete thread \"{title}\"?"),
-            Some("This permanently clears conversation history for this thread."),
-            &["Delete", "Cancel"],
-            cx,
-        );
         let thread_id = thread_id.to_owned();
-        cx.spawn(async move |this, cx| {
+        let question = Confirm {
+            setting: "confirmThreadUnpin",
+            message: format!("Unpin thread \"{title}\"?"),
+            detail: Some("This will move the thread out of your pinned section."),
+            ok: "Unpin",
+            level: PromptLevel::Info,
+        };
+        self.confirm_then(question, window, cx, move |this, _, cx| {
+            let entry = this.undo_entry(&thread_id);
+            this.thread_command("thread.unpin", &thread_id, json!({}), cx);
+            this.push_undo(UndoAction::Unpinned, entry, cx);
+        });
+    }
+
+    /// `thread.archive`, asked first when `confirmThreadArchive` is on; the open thread
+    /// gives way to a new draft in its project.
+    pub(in crate::app) fn archive_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(thread_id) else { return };
+        let (project_id, title) = (thread.project_id.clone(), thread.title.clone());
+        let thread_id = thread_id.to_owned();
+        let question = Confirm {
+            setting: "confirmThreadArchive",
+            message: format!("Archive thread \"{title}\"?"),
+            detail: None,
+            ok: "Archive",
+            level: PromptLevel::Info,
+        };
+        self.confirm_then(question, window, cx, move |this, window, cx| {
+            let entry = this.undo_entry(&thread_id);
+            this.thread_command("thread.archive", &thread_id, json!({}), cx);
+            this.push_undo(UndoAction::Archived, entry, cx);
+            if this.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
+                this.start_draft(project_id, window, cx);
+            }
+        });
+    }
+
+    /// `thread.delete`, asked first unless `confirmThreadDelete` is off; there is no undo.
+    pub(in crate::app) fn delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.thread(thread_id).map(|t| t.title.clone()).unwrap_or_default();
+        let thread_id = thread_id.to_owned();
+        let question = Confirm {
+            setting: "confirmThreadDelete",
+            message: format!("Delete thread \"{title}\"?"),
+            detail: Some("This permanently clears conversation history for this thread."),
+            ok: "Delete",
+            level: PromptLevel::Critical,
+        };
+        self.confirm_then(question, window, cx, move |this, _, cx| {
+            this.expire_undo(&thread_id);
+            this.thread_command("thread.delete", &thread_id, json!({}), cx);
+        });
+    }
+
+    /// Runs `then` at once when the question's setting is off, else once the user agrees.
+    fn confirm_then(
+        &mut self,
+        question: Confirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if self.client_settings.values.get(question.setting).as_bool() != Some(true) {
+            then(self, window, cx);
+            return;
+        }
+        let answer = window.prompt(question.level, &question.message, question.detail, &[question.ok, "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(0) {
-                let _ = this.update(cx, |this, cx| {
-                    this.expire_undo(&thread_id);
-                    this.thread_command("thread.delete", &thread_id, json!({}), cx);
-                });
+                let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
             }
         })
         .detach();
     }
 
-    /// Starts editing a row's title in place (double-click, F2, or the menu).
-    pub(super) fn start_rename(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Starts editing a thread's title in its row (double-click, F2, the row menu) or in the
+    /// chat title (double-click, the title menu).
+    pub(in crate::app) fn start_rename(
+        &mut self,
+        thread_id: &str,
+        origin: MenuOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(title) = self.thread(thread_id).map(|t| t.title.clone()) else { return };
-        let input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx);
-            state.set_value(title.clone(), window, cx);
-            state
-        });
-        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(window, cx),
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title.clone()));
+        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(origin, cx),
             _ => {}
         });
         input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.sidebar.renaming =
-            Some(Renaming { thread_id: thread_id.to_owned(), input, original: title, _subscription: subscription });
+        let renaming =
+            Renaming { thread_id: thread_id.to_owned(), input, original: title, _subscription: subscription };
+        *self.renaming_slot(origin) = Some(renaming);
         self.notify_sidebar(cx);
+        cx.notify();
     }
 
-    pub(super) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar.renaming.take().is_some() {
+    pub(in crate::app) fn cancel_rename(&mut self, origin: MenuOrigin, cx: &mut Context<Self>) {
+        if self.renaming_slot(origin).take().is_some() {
             self.notify_sidebar(cx);
+            cx.notify();
         }
     }
 
-    /// `commitThreadRename`: an empty title is refused, an unchanged one is a no-op.
-    fn commit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(renaming) = self.sidebar.renaming.take() else { return };
+    fn renaming_slot(&mut self, origin: MenuOrigin) -> &mut Option<Renaming> {
+        match origin {
+            MenuOrigin::Sidebar => &mut self.sidebar.renaming,
+            MenuOrigin::Title => &mut self.title.rename,
+        }
+    }
+
+    /// `resolveRenameCommit`: an empty title is refused, an unchanged one is a no-op.
+    fn commit_rename(&mut self, origin: MenuOrigin, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming_slot(origin).take() else { return };
         let title = renaming.input.read(cx).value().trim().to_owned();
         if title.is_empty() {
             self.error = Some("Thread title cannot be empty".into());
-            cx.notify();
         } else if title != renaming.original {
             self.thread_command("thread.metadata.update", &renaming.thread_id, json!({"title": title}), cx);
         }
         self.notify_sidebar(cx);
+        cx.notify();
     }
 
     /// Opens the snooze menu for a card's clock button at `position`.
@@ -332,7 +421,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let view = cx.weak_entity();
-        let snooze = SnoozeItems::new(self, thread_id, false, cx);
+        let snooze = SnoozeItems::new(self, thread_id, MenuOrigin::Sidebar, false, cx);
         // Below the clock, right-aligned (`side="bottom" align="end"`).
         let position = gpui_kit::point(position.x + px(10.), position.y + px(14.));
         self.open_menu(position, gpui_kit::Anchor::TopRight, window, cx, move |menu, _, _| {
@@ -340,28 +429,40 @@ impl Workspace {
         });
     }
 
-    /// What the row's right-click menu shows, read before the menu is built.
-    pub(super) fn thread_menu(&self, thread_id: &str, cx: &gpui_kit::App) -> Option<ThreadMenu> {
+    /// What a thread's menu shows, read before the menu is built.
+    pub(in crate::app) fn thread_menu(
+        &self,
+        thread_id: &str,
+        origin: MenuOrigin,
+        cx: &gpui_kit::App,
+    ) -> Option<ThreadMenu> {
         let thread = self.thread(thread_id)?;
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let facts = Facts::new(thread, &requests);
+        let info = &self.server_info;
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-        let filter = project.filter(|p| p.archived_at.is_none()).map(|p| {
+        let sidebar = origin == MenuOrigin::Sidebar;
+        let filter = project.filter(|p| sidebar && p.archived_at.is_none()).map(|p| {
             let scoped = self.sidebar.scope == [p.id.clone()];
             let label = if scoped { "Show all projects".to_owned() } else { format!("Filter by {}", project_name(p)) };
             (label, if scoped { Vec::new() } else { vec![p.id.clone()] })
         });
         Some(ThreadMenu {
             thread_id: thread.id.clone(),
+            origin,
+            // The web offers these once the environment's config has loaded.
+            loaded: info.environment_id.is_some(),
             pinned: thread.pinned_at.is_some(),
             settled: thread.settled_override.as_deref() == Some("settled"),
             snoozed: facts.is_snoozed(now),
-            snooze: facts.can_snooze(now).then(|| SnoozeItems::new(self, thread_id, true, cx)),
+            snooze: facts.can_snooze(now).then(|| SnoozeItems::new(self, thread_id, origin, true, cx)),
             regenerating: thread.title_regeneration.is_some(),
+            auto_settle: info.capability("threadAutoSettleOptOut").then_some(thread.auto_settle_disabled_at.is_none()),
             filter,
             path: thread.worktree_path.clone().or_else(|| project.map(|p| p.workspace_root.clone())),
             branch: thread.branch.clone(),
+            link: info.environment_id.as_deref().map(|env| hosted_thread_link(env, &thread.id)),
             running: matches!(facts.status(), inbox::Status::Working | inbox::Status::Preparing),
         })
     }
@@ -426,17 +527,19 @@ pub(super) struct SnoozeItems {
     thread_id: String,
     settings: Vec<inbox::SnoozeSetting>,
     presets: Vec<inbox::SnoozePreset>,
-    /// The context submenu shows "Label (time)"; the card menu right-aligns the time.
+    /// A thread menu's submenu shows "Label (time)"; the card menu right-aligns the time.
     inline_when: bool,
+    advance: bool,
     muted: gpui_kit::Hsla,
 }
 
 impl SnoozeItems {
-    fn new(workspace: &Workspace, thread_id: &str, inline_when: bool, cx: &gpui_kit::App) -> Self {
-        let settings = inbox::snooze_settings(&workspace.server_info.snooze_presets);
+    fn new(workspace: &Workspace, thread_id: &str, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
+        let settings = inbox::snooze_settings(workspace.server_info.settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
-        Self { thread_id: thread_id.to_owned(), settings, presets, inline_when, muted }
+        let advance = origin == MenuOrigin::Sidebar;
+        Self { thread_id: thread_id.to_owned(), settings, presets, inline_when, advance, muted }
     }
 
     /// Adds the preset rows, a separator, and "Custom…" (`SnoozeMenuButton`).
@@ -461,37 +564,45 @@ impl SnoozeItems {
             menu = menu.item(item.on_click(move |_, window, cx| {
                 let now = chrono::Local::now();
                 let Some(wake) = inbox::pick_snooze(&this.presets, &id, &this.settings, &now) else { return };
-                let _ = view.update(cx, |workspace, cx| workspace.snooze_thread(&this.thread_id, wake, window, cx));
+                let _ = view.update(cx, |workspace, cx| {
+                    workspace.snooze_thread(&this.thread_id, wake, this.advance, window, cx)
+                });
             }));
         }
         if !self.presets.is_empty() {
             menu = menu.separator();
         }
-        let (view, thread_id) = (view.clone(), self.thread_id.clone());
+        let (view, thread_id, advance) = (view.clone(), self.thread_id.clone(), self.advance);
         menu.item(PopupMenuItem::new("Custom…").on_click(move |_, window, cx| {
-            let _ = view.update(cx, |workspace, cx| workspace.open_custom_snooze(&thread_id, window, cx));
+            let _ = view.update(cx, |workspace, cx| workspace.open_custom_snooze(&thread_id, advance, window, cx));
         }))
     }
 }
 
-/// The right-click menu of one row (`buildThreadActionMenuItems`).
-pub(super) struct ThreadMenu {
+/// A thread's menu (`buildThreadActionMenuItems`), from a sidebar row or the chat title.
+pub(in crate::app) struct ThreadMenu {
     thread_id: String,
+    origin: MenuOrigin,
+    /// The environment's config has loaded, so pin, settle, snooze and regenerate apply.
+    loaded: bool,
     pinned: bool,
     settled: bool,
     snoozed: bool,
     /// `None` when the thread can't be snoozed now.
     snooze: Option<SnoozeItems>,
     regenerating: bool,
+    /// Whether auto-settle is on, when the server lets a thread opt out.
+    auto_settle: Option<bool>,
     /// The "Filter by …" label and the scope it sets.
     filter: Option<(String, Vec<String>)>,
     path: Option<String>,
     branch: Option<String>,
+    link: Option<String>,
     running: bool,
 }
 
 impl ThreadMenu {
-    pub(super) fn build(
+    pub(in crate::app) fn build(
         self,
         view: &WeakEntity<Workspace>,
         mut menu: PopupMenu,
@@ -499,6 +610,8 @@ impl ThreadMenu {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let item = |label: &str, icon: Lucide| PopupMenuItem::new(label.to_owned()).icon(Icon::new(icon));
+        let origin = self.origin;
+        let advance = origin == MenuOrigin::Sidebar;
         // Each item acts on this menu's thread through the workspace.
         macro_rules! act {
             ($item:expr, |$this:ident, $window:ident, $cx:ident, $id:ident| $body:expr) => {{
@@ -509,56 +622,79 @@ impl ThreadMenu {
                 })
             }};
         }
-        menu = menu.item(if self.pinned {
-            act!(item("Unpin thread", Lucide::PinOff), |this, _w, cx, id| this.unpin_thread(&id, cx))
-        } else {
-            act!(item("Pin thread", Lucide::Pin), |this, _w, cx, id| this.pin_thread(&id, cx))
-        });
-        menu = menu.item(if self.settled {
-            act!(item("Un-settle thread", Lucide::CircleCheck), |this, _w, cx, id| this.unsettle_thread(&id, cx))
-        } else {
-            act!(item("Settle thread", Lucide::CircleCheck), |this, window, cx, id| this.settle_thread(&id, window, cx))
-        });
-        menu = match (&self.snooze, self.snoozed) {
-            (_, true) => {
-                menu.item(act!(item("Wake thread", Lucide::Clock), |this, _w, cx, id| this.wake_thread(&id, cx)))
-            }
-            (Some(snooze), false) => {
-                let (snooze, view) = (snooze.clone(), view.clone());
-                menu.submenu_with_icon(Some(Icon::new(Lucide::Clock)), "Snooze", window, cx, move |menu, _, _| {
-                    snooze.add_to(&view, menu.min_w(px(160.)))
-                })
-            }
-            (None, false) => menu.item(item("Snooze", Lucide::Clock).disabled(true)),
+        let command = |label: &str, icon: Lucide, kind: &'static str, fields: Value| {
+            act!(item(label, icon), |this, _w, cx, id| this.thread_command(kind, &id, fields.clone(), cx))
         };
+        if self.loaded {
+            menu = menu.item(if self.pinned {
+                act!(item("Unpin thread", Lucide::PinOff), |this, window, cx, id| this.unpin_thread(&id, window, cx))
+            } else {
+                act!(item("Pin thread", Lucide::Pin), |this, _w, cx, id| this.pin_thread(&id, cx))
+            });
+            menu = menu.item(if self.settled {
+                act!(item("Un-settle thread", Lucide::CircleCheck), |this, _w, cx, id| this.unsettle_thread(&id, cx))
+            } else {
+                act!(item("Settle thread", Lucide::CircleCheck), |this, window, cx, id| this
+                    .settle_thread(&id, advance, window, cx))
+            });
+            menu = match (&self.snooze, self.snoozed) {
+                (_, true) => {
+                    menu.item(act!(item("Wake thread", Lucide::Clock), |this, _w, cx, id| this.wake_thread(&id, cx)))
+                }
+                (Some(snooze), false) => {
+                    let (snooze, view) = (snooze.clone(), view.clone());
+                    menu.submenu_with_icon(Some(Icon::new(Lucide::Clock)), "Snooze", window, cx, move |menu, _, _| {
+                        snooze.add_to(&view, menu.min_w(px(160.)))
+                    })
+                }
+                (None, false) => menu.item(item("Snooze", Lucide::Clock).disabled(true)),
+            };
+        }
         menu = menu.separator();
-        menu = menu.item(
-            act!(item("Rename thread", Lucide::Pencil), |this, window, cx, id| this.start_rename(&id, window, cx))
-        );
-        menu = menu.item(if self.regenerating {
-            item("Regenerating…", Lucide::RefreshCw).disabled(true)
-        } else {
-            act!(item("Regenerate title", Lucide::RefreshCw), |this, _w, cx, id| this.thread_command(
-                "thread.metadata.update",
-                &id,
-                json!({"regenerateTitle": true}),
-                cx
-            ))
-        });
-        menu = menu.item(act!(item("Mark unread", Lucide::MailOpen), |this, _w, cx, id| this.thread_command(
-            "thread.mark-unread",
-            &id,
-            json!({}),
-            cx
-        )));
+        menu = menu.item(act!(item("Rename thread", Lucide::Pencil), |this, window, cx, id| this
+            .start_rename(&id, origin, window, cx)));
+        if self.loaded {
+            menu = menu.item(if self.regenerating {
+                item("Regenerating…", Lucide::RefreshCw).disabled(true)
+            } else {
+                command(
+                    "Regenerate title",
+                    Lucide::RefreshCw,
+                    "thread.metadata.update",
+                    json!({"regenerateTitle": true}),
+                )
+            });
+        }
+        menu = menu.item(command("Mark unread", Lucide::MailOpen, "thread.mark-unread", json!({})));
         if let Some((label, scope)) = self.filter {
             let view = view.clone();
             menu = menu.item(item(&label, Lucide::FolderTree).on_click(move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| this.set_scope(scope.clone(), cx));
             }));
         }
+        if let Some(enabled) = self.auto_settle {
+            let (view, id) = (view.clone(), self.thread_id.clone());
+            menu = menu.submenu_with_icon(
+                Some(Icon::new(Lucide::Timer)),
+                "Auto-settle behavior",
+                window,
+                cx,
+                move |mut menu, _, _| {
+                    for (label, on) in [("Enabled", true), ("Disabled", false)] {
+                        let (view, id) = (view.clone(), id.clone());
+                        menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.thread_command("thread.auto-settle.set", &id, json!({"enabled": on}), cx)
+                            });
+                        }));
+                    }
+                    menu
+                },
+            );
+        }
         menu = menu.separator();
-        let (path, branch, id) = (self.path.clone(), self.branch.clone(), self.thread_id.clone());
+        let (path, branch, link, id) =
+            (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread_id.clone());
         menu = menu.submenu_with_icon(Some(Icon::new(Lucide::Copy)), "Copy", window, cx, move |mut menu, _, _| {
             let copy = |text: String| {
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
@@ -572,6 +708,11 @@ impl ThreadMenu {
             if let Some(branch) = &branch {
                 menu = menu.item(
                     PopupMenuItem::new("Branch").icon(Icon::new(Lucide::GitBranch)).on_click(copy(branch.clone())),
+                );
+            }
+            if let Some(link) = &link {
+                menu = menu.item(
+                    PopupMenuItem::new("Thread").icon(Icon::new(Lucide::MessageSquare)).on_click(copy(link.clone())),
                 );
             }
             menu.item(PopupMenuItem::new("Thread ID").icon(Icon::new(Lucide::Hash)).on_click(copy(id.clone())))

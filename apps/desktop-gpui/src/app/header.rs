@@ -112,7 +112,7 @@ impl Workspace {
                 .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
-                        this.cancel_title_rename(cx);
+                        this.cancel_rename(super::sidebar::MenuOrigin::Title, cx);
                     }
                 }))
                 .child(Input::new(&rename.input).small().text_color(tokens.foreground))

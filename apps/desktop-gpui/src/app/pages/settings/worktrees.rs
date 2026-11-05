@@ -155,7 +155,9 @@ impl Workspace {
             .reset(stored.is_some().then(|| {
                 reset_button(
                     "worktree-submodules",
-                    cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "worktreeSubmodules": null }), cx)),
+                    cx.listener(|this, _, _, cx| {
+                        this.pending_update_settings(json!({ "worktreeSubmodules": null }), cx)
+                    }),
                 )
             }))
             .control(select(

@@ -47,21 +47,21 @@ struct Configured {
 
 impl DraftWorkspace {
     pub fn new(info: &ServerInfo, project: &ProjectShell, project_has_threads: bool) -> Self {
-        let overrides = &info.project_settings_overrides[project.id.as_str()];
+        let overrides = &info.settings.get("projectSettingsOverrides")[project.id.as_str()];
         // `resolveProjectOverrides`: stored overrides win over the legacy project field until folded.
         let project_mode = EnvMode::parse(overrides.get("defaultThreadEnvMode")).or_else(|| {
             let legacy = project.default_thread_env_mode.as_deref().map(Value::from);
-            if info.project_settings_folded { None } else { EnvMode::parse(legacy.as_ref()) }
+            if info.settings.bool("projectSettingsFolded") { None } else { EnvMode::parse(legacy.as_ref()) }
         });
         let configured = match project_mode {
             Some(mode) => Some(Configured { mode, from_environment: false }),
-            None => EnvMode::parse(info.default_thread_env_mode.as_deref().map(Value::from).as_ref())
+            None => EnvMode::parse(Some(info.settings.get("defaultThreadEnvMode")))
                 .map(|mode| Configured { mode, from_environment: true }),
         };
         let start_from_origin = overrides
             .get("newWorktreesStartFromOrigin")
             .and_then(Value::as_bool)
-            .or(info.new_worktrees_start_from_origin)
+            .or(info.settings.get("newWorktreesStartFromOrigin").as_bool())
             .unwrap_or(true);
         Self {
             configured,

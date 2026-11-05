@@ -207,11 +207,11 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let state = window
             .use_keyed_state("settings-storage", cx, |window, cx| StorageState::new(client, workspace, window, cx));
-        let capabilities = &self.server_info.config["environment"]["capabilities"];
+        let info = &self.server_info;
         let (cleanup, cleanup_run, database) = (
-            capabilities["storageCleanup"] == true,
-            capabilities["storageCleanupRun"] == true,
-            capabilities["databaseStorage"] == true,
+            info.capability("storageCleanup"),
+            info.capability("storageCleanupRun"),
+            info.capability("databaseStorage"),
         );
         let mut sections = Vec::new();
         if database {

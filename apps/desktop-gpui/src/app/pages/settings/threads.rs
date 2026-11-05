@@ -185,7 +185,9 @@ impl Workspace {
         let reset = (!saved.is_empty()).then(|| {
             reset_button(
                 "add-project-starts-in",
-                cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "addProjectBaseDirectory": "" }), cx)),
+                cx.listener(|this, _, _, cx| {
+                    this.pending_update_settings(json!({ "addProjectBaseDirectory": "" }), cx)
+                }),
             )
         });
         Row::new("add-project-starts-in", "Add project starts in")
@@ -271,7 +273,9 @@ impl Workspace {
             .reset(workspace_mode.is_some().then(|| {
                 reset_button(
                     "default-workspace",
-                    cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "defaultThreadEnvMode": null }), cx)),
+                    cx.listener(|this, _, _, cx| {
+                        this.pending_update_settings(json!({ "defaultThreadEnvMode": null }), cx)
+                    }),
                 )
             }))
             .control(select(
@@ -352,7 +356,10 @@ impl Workspace {
                     reset_button(
                         "auto-settle",
                         cx.listener(|this, _, _, cx| {
-                            this.pending_update_settings(json!({ "sidebarAutoSettleAfterDays": AUTO_SETTLE_DEFAULT_DAYS }), cx)
+                            this.pending_update_settings(
+                                json!({ "sidebarAutoSettleAfterDays": AUTO_SETTLE_DEFAULT_DAYS }),
+                                cx,
+                            )
                         }),
                     )
                 }))

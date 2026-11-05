@@ -225,7 +225,7 @@ impl Workspace {
 
     pub(super) fn render_settings_about(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let policy = &self.server_info.config["managedPolicy"];
+        let policy = &self.server_info.managed_policy;
         let organization = policy["organization"].as_str().map(str::to_owned);
         let mut app = Vec::new();
         if let Some(organization) = &organization {
@@ -281,7 +281,7 @@ impl Workspace {
     }
 
     fn settings_json(&self) -> &Value {
-        &self.server_info.config["settings"]
+        &self.server_info.settings
     }
 
     /// `server.updateSettings` with a global patch; the reply is the whole new settings.
@@ -292,7 +292,7 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(settings) => {
-                        if let Err(error) = this.server_info.set_settings(&settings) {
+                        if let Err(error) = this.server_info.apply_settings(&settings) {
                             log::warn!("bad settings reply: {error}");
                         }
                     }

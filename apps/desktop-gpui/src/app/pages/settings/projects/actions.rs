@@ -161,7 +161,7 @@ impl Workspace {
             .children(script.preview_url.is_some().then(|| badge("preview · desktop only")));
         let command = div().max_w_full().truncate().font_family(FONT_MONO).child(script.command.clone());
         let shortcut = shortcut_label_for_command(
-            &self.server_info.keybindings_json,
+            self.server_info.keybindings_json(),
             command_for_project_script(&script.id).as_deref(),
         );
         let (pid, sid) = (project_id.to_owned(), script.id.clone());

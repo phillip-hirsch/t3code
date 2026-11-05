@@ -71,9 +71,8 @@ impl Workspace {
         }
         let t = *theme::tokens(cx);
         let mut sections = vec![saved_environments(&t)];
-        let config = &self.server_info.config;
-        let offers_links = config.pointer("/environment/capabilities/peerLinks") == Some(&Value::Bool(true))
-            && config.pointer("/settings/linkedEnvironmentsEnabled") == Some(&Value::Bool(true));
+        let info = &self.server_info;
+        let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
         let readable = state.read(cx).session.as_ref().is_some_and(|s| s.grants(ACCESS_READ));
         if offers_links && readable && self.client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));

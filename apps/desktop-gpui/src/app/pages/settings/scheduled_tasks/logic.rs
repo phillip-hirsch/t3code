@@ -372,10 +372,10 @@ pub(super) fn default_model(info: &ServerInfo, project: Option<&ProjectShell>) -
         .collect();
     // `resolveProjectSettings`: the stored override wins over the legacy project field until folded.
     let configured = project.and_then(|project| {
-        let stored = info.project_settings_overrides[project.id.as_str()].get("defaultModelSelection");
+        let stored = info.settings.get("projectSettingsOverrides")[project.id.as_str()].get("defaultModelSelection");
         match stored {
             Some(value) => ModelSelection::deserialize(value).ok(),
-            None if info.project_settings_folded => None,
+            None if info.settings.bool("projectSettingsFolded") => None,
             None => project.default_model_selection.clone(),
         }
     });

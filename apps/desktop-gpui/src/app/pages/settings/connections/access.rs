@@ -270,7 +270,7 @@ impl Workspace {
         }
         if s.grants(ENVIRONMENT_MAINTAIN) {
             let version = config.pointer("/environment/serverVersion").and_then(Value::as_str);
-            let url = self.endpoint.as_ref().map(|e| e.http_base.as_str());
+            let url = self.http_base();
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
             let description = if version.is_none() { "Loading\u{2026}".to_owned() } else { parts.join(" · ") };
             let status = has_config
@@ -465,7 +465,7 @@ impl Workspace {
             let (state, endpoint) = (state.clone(), endpoint.clone());
             move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
         });
-        let denial = logic::remote_clients_denial(&self.server_info.config["managedPolicy"]);
+        let denial = logic::remote_clients_denial(&self.server_info.managed_policy);
         let delegatable: Vec<String> = match &s.session {
             SessionLoad::Ready(session) => session.delegatable().to_vec(),
             _ => Vec::new(),

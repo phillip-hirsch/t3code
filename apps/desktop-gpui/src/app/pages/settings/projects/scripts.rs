@@ -350,7 +350,7 @@ pub(super) fn plan_scripts_write(
     let defaults = scripts_at(settings.get("defaultProjectScripts")).unwrap_or_default();
     let current = resolve_project_scripts(settings, project);
     let effective = next.clone().unwrap_or_else(|| defaults.clone());
-    let patch = if info.project_settings_overrides_capability {
+    let patch = if info.capability("projectSettingsOverrides") {
         let mut entry = override_entry(settings, &project.id).cloned().unwrap_or_default();
         match &next {
             Some(scripts) => {
@@ -377,7 +377,7 @@ pub(super) fn plan_scripts_write(
             continue;
         }
         let command = command_for_project_script(&id);
-        let previous = keybinding_value_for_command(&info.keybindings_json, command.as_deref())
+        let previous = keybinding_value_for_command(info.keybindings_json(), command.as_deref())
             .map(|value| decode_keybinding(Some(&value), command.as_deref()))
             .transpose()?
             .flatten();
@@ -631,7 +631,8 @@ mod tests {
     fn info(settings: Value, keybindings: Value) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.settings = crate::settings::Settings::layered(&Default::default(), &settings);
-        (info.keybindings_json, info.project_settings_overrides_capability) = (keybindings, true);
+        info.config = serde_json::json!({"keybindings": keybindings});
+        info.capabilities = serde_json::json!({"projectSettingsOverrides": true});
         info
     }
 

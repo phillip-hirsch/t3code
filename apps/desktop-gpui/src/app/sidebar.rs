@@ -2,6 +2,7 @@
 //! `components/sidebar/*`): chrome row, search, the inbox list, and the footer.
 
 mod actions;
+pub(super) use actions::{MenuOrigin, Renaming};
 mod custom_snooze;
 mod filter;
 mod search_results;
@@ -423,7 +424,7 @@ impl Workspace {
             // Opening a thread can move the rows, so the second click may land on another one.
             let same_row = self.sidebar.clicked.as_deref() == Some(thread_id);
             if same_row && !event.modifiers().modified() && self.sidebar.renaming.is_none() {
-                self.start_rename(thread_id, window, cx);
+                self.start_rename(thread_id, MenuOrigin::Sidebar, window, cx);
             }
             return;
         }
@@ -440,7 +441,9 @@ impl Workspace {
         let view = cx.weak_entity();
         let thread_id = thread_id.to_owned();
         move |menu, window, cx| {
-            let model = view.upgrade().and_then(|workspace| workspace.read(cx).thread_menu(&thread_id, cx));
+            let model = view
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).thread_menu(&thread_id, MenuOrigin::Sidebar, cx));
             match model {
                 Some(model) => model.build(&view, menu.min_w(px(200.)), window, cx),
                 None => menu,
@@ -462,9 +465,9 @@ impl Workspace {
             .rounded(px(4.))
             .cursor_pointer()
             .tooltip(tooltip("Unpin thread"))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.unpin_thread(&id, cx);
+                this.unpin_thread(&id, window, cx);
             }))
             .child(div().absolute().group_hover(group.clone(), |s| s.invisible()).child(icon(
                 IconName::Pin,
@@ -505,7 +508,7 @@ impl Workspace {
                 .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                     cx.stop_propagation();
                     if event.keystroke.key == "escape" {
-                        this.cancel_rename(cx);
+                        this.cancel_rename(MenuOrigin::Sidebar, cx);
                     }
                 }))
                 .child(
@@ -732,7 +735,7 @@ impl Workspace {
                 }
                 ("f2", None) => {
                     if let Some(id) = key.strip_prefix("thread:") {
-                        self.start_rename(id, window, cx);
+                        self.start_rename(id, MenuOrigin::Sidebar, window, cx);
                     }
                 }
                 _ => return,
@@ -1367,7 +1370,7 @@ impl Workspace {
             .tooltip(tooltip("Settle thread"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.settle_thread(&thread_id, window, cx);
+                this.settle_thread(&thread_id, true, window, cx);
             }))
             .child(Icon::new(IconName::Check).size(px(14.)))
             .child("Settle");
@@ -1667,7 +1670,7 @@ impl Workspace {
     /// `project-favicon` resource signs a URL, then the image is read over HTTP
     /// (`createProjectFaviconUrlAtomFamily` in `client-runtime/src/state/assets.ts`).
     fn load_favicons(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base.clone()) else { return };
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
         for project in &self.shell.projects {
             let key = favicon_key(project);
             if self.sidebar.favicons.contains_key(&key) {

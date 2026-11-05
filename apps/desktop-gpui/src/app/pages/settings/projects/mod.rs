@@ -9,13 +9,13 @@
 
 mod actions;
 mod defaults;
-mod rows;
-mod script_editor;
-pub(in crate::app) mod scripts;
 mod favicon_picker;
 mod groups;
 mod icon;
 mod icon_picker;
+mod rows;
+mod script_editor;
+pub(in crate::app) mod scripts;
 
 use std::rc::Rc;
 
@@ -651,7 +651,7 @@ impl Workspace {
                 &tokens,
             ),
         ];
-        if self.server_info.project_organization {
+        if self.server_info.capability("projectOrganization") {
             let pin = {
                 let (panel, all_ids) = (panel.clone(), all_ids.clone());
                 Switch::new("pin-project").checked(group.pinned).disabled(organizing).on_click(cx.listener(

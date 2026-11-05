@@ -41,11 +41,11 @@ impl Workspace {
 
     /// The environment's name, as the web's `EnvironmentPresentation.label`.
     fn environment_label(&self) -> Option<&str> {
-        self.server_info.config.pointer("/environment/label").and_then(Value::as_str)
+        self.server_info.environment_label.as_deref()
     }
 
     fn server_settings(&self) -> &Value {
-        &self.server_info.config["settings"]
+        &self.server_info.settings
     }
 }
 
