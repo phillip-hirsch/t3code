@@ -744,7 +744,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(thread_id) else { return };
         let reset_passed =
             update["resetAt"].as_str().and_then(parse_ms).is_none_or(|reset| reset <= crate::timestamp::now_ms());
         if snooze && update["snooze"] == true && reset_passed {

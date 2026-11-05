@@ -145,6 +145,11 @@ impl Workspace {
         Some(&mut self.session_mut(environment_id)?.server_info)
     }
 
+    /// One environment's config, for a listed item that lives there.
+    pub(super) fn env_info(&self, environment_id: &str) -> Option<&ServerInfo> {
+        Some(&self.session(environment_id)?.server_info)
+    }
+
     /// The device state of the environment Settings reads.
     pub(super) fn settings_device_state(&self) -> Option<&DeviceState> {
         self.sessions[self.settings_index()].device_state.as_ref()

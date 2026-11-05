@@ -102,7 +102,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(environment) = self.active_environment().cloned() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         let title = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).map(|p| p.thread.title.clone());
         let target = new_id();
         let command = json!({
@@ -118,7 +119,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(_) => this.select_thread(target, window, cx),
+                // The shell may not list the fork yet; it lives beside its source.
+                Ok(_) => this.select_thread_in(environment, target, window, cx),
                 Err(error) => {
                     this.error = Some(format!("Failed to fork this response: {error}").into());
                     cx.notify();

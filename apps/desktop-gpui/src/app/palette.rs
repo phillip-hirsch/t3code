@@ -1068,14 +1068,11 @@ impl Workspace {
     /// `handleAddProjectForEnvironment`: reuse a project already at `path`
     /// (unarchiving it), else `projects.mutate` a new one; then open it.
     pub(super) fn add_project(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(environment) = self.active_environment().cloned() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         self.close_palette(window, cx);
-        let environment = self.active_environment().cloned();
-        let existing = self
-            .shell
-            .projects
-            .iter()
-            .find(|p| Some(&p.environment_id) == environment.as_ref() && same_path(&p.workspace_root, &path));
+        let existing =
+            self.shell.projects.iter().find(|p| p.environment_id == environment && same_path(&p.workspace_root, &path));
         if let Some(existing) = existing {
             let project_id = existing.id.clone();
             if existing.archived_at.is_some() {
@@ -1098,7 +1095,8 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.mutate", mutation).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(_) => this.start_draft(project_id, window, cx),
+                // The shell may not list the new project yet.
+                Ok(_) => this.start_draft_in(environment, project_id, window, cx),
                 Err(error) => {
                     this.error = Some(format!("Failed to add project: {error}").into());
                     cx.notify();

@@ -87,8 +87,8 @@ pub(super) struct DraftWorkspaceState {
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
-    /// `vcs.listRefs` for an open thread's checkout, by cwd (`persistComposerContextStrip`).
-    thread_refs: Option<(String, Value)>,
+    /// `vcs.listRefs` for an open thread's checkout, by environment and cwd (`persistComposerContextStrip`).
+    thread_refs: Option<(Option<SharedString>, String, Value)>,
 }
 
 impl Workspace {
@@ -151,6 +151,7 @@ impl Workspace {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let thread = matches!(self.target, Some(Target::Thread { .. }));
         let project_id = self.draft_workspace.project_id.clone();
+        let environment = self.active_environment().cloned();
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
@@ -162,7 +163,7 @@ impl Workspace {
                     }
                 };
                 if thread {
-                    this.draft_workspace.thread_refs = Some((cwd, refs));
+                    this.draft_workspace.thread_refs = Some((environment, cwd, refs));
                 } else if this.draft_workspace.project_id == project_id {
                     this.draft_workspace.refs = Some(refs);
                 } else {
@@ -178,8 +179,9 @@ impl Workspace {
     fn refs(&self) -> Option<&Value> {
         match &self.target {
             Some(Target::Thread { .. }) => {
-                let (cwd, refs) = self.draft_workspace.thread_refs.as_ref()?;
-                (Some(cwd) == self.composer_cwd().as_ref()).then_some(refs)
+                let (environment, cwd, refs) = self.draft_workspace.thread_refs.as_ref()?;
+                let here = environment.as_ref() == self.active_environment();
+                (here && Some(cwd) == self.composer_cwd().as_ref()).then_some(refs)
             }
             _ => self.draft_workspace.refs.as_ref(),
         }
@@ -307,10 +309,15 @@ impl Workspace {
     ) {
         let Some(client) = self.client() else { return };
         self.draft_workspace.choice.branch = Some(name.clone());
+        let project_id = self.draft_workspace.project_id.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
+                // The draft moved on while the ref switched.
+                if this.draft_workspace.project_id != project_id {
+                    return;
+                }
                 match result {
                     Ok(value) => {
                         let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
@@ -383,7 +390,7 @@ impl Workspace {
         worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(&thread_id) else { return };
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {

@@ -57,7 +57,8 @@ fn toast_error(title: &str, message: impl Into<gpui_kit::SharedString>, window: 
 impl Workspace {
     /// `startScratchThread`: `projects.ensureScratch`, then a draft there, holding `prompt` if given.
     pub(super) fn start_scratch_thread(&mut self, prompt: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(environment) = self.active_environment().cloned() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.ensureScratch", json!({})).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -69,7 +70,8 @@ impl Workspace {
                     }
                 };
                 let Some(project_id) = project_id else { return };
-                this.start_draft(project_id, window, cx);
+                // A scratch project made just now may not be listed yet.
+                this.start_draft_in(environment, project_id, window, cx);
                 if let Some(prompt) = &prompt {
                     this.set_composer_text(prompt.clone(), window, cx);
                 }

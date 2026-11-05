@@ -806,6 +806,11 @@ impl Workspace {
 
     fn start_draft(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(env) = self.project_environment(&project_id) else { return };
+        self.start_draft_in(env, project_id, window, cx);
+    }
+
+    /// A project's draft on `env`, for a project the shell may not list yet.
+    fn start_draft_in(&mut self, env: SharedString, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
         self.stash_composer(cx);
         let leaving = self.target.replace(Target::Draft { env, project_id });
