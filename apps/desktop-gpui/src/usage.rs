@@ -871,10 +871,13 @@ pub struct Account {
     pub environments: Vec<(String, String)>,
     /// The usage-limit source that reports it, when no provider here is signed in to it.
     pub source_label: Option<String>,
-    /// The environment to send `provider.consumeResetCredit` to, and the input that spends
-    /// its next reset credit.
-    pub redeem: Option<(String, Value)>,
+    /// How to spend its next reset credit.
+    pub redeem: Option<Redemption>,
 }
+
+/// The environment to send `provider.consumeResetCredit` to, and the input that spends an
+/// account's next reset credit.
+pub type Redemption = (String, Value);
 
 /// One selected environment as the Limits view reads it (`LimitPresentations`' entry).
 pub struct LimitEnvironment<'a> {
@@ -965,8 +968,8 @@ struct Merging {
     account: Account,
     /// Some provider here is signed in to it, so it names no source.
     signed_in: bool,
-    credits: Option<(i64, Option<crate::model::ResetCredits>, Option<(String, Value)>)>,
-    hub_redeem: Option<(i64, (String, Value))>,
+    credits: Option<(i64, Option<crate::model::ResetCredits>, Option<Redemption>)>,
+    hub_redeem: Option<(i64, Redemption)>,
     plan: Option<(i64, String)>,
 }
 
