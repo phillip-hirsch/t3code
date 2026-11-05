@@ -18,7 +18,6 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div, point, px,
 };
 use gpui_webview::WebView;
-use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use serde_json::{Value, json};
 
 use super::right_panel::Surface;
@@ -28,8 +27,6 @@ use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPrevie
 use crate::theme::{self, Tokens};
 
 mod empty;
-#[cfg(windows)]
-mod native;
 mod profiles;
 mod server;
 
@@ -47,8 +44,8 @@ pub(super) enum PageEvent {
     Started(String),
     Finished(String),
     Title(String),
-    /// Back/forward availability may have changed without a load.
-    History,
+    /// The page's history moved, possibly without a load.
+    History(preview::PageHistory),
     Failed {
         url: String,
         code: i64,
@@ -73,6 +70,8 @@ struct HostedTab {
     /// apply until the tab is adjusted (`browserDefaultTabState`).
     defaults: (f64, Appearance),
     shown: bool,
+    /// The tab's own page events, which a load's failure probe reports on.
+    page_events: async_channel::Sender<PageEvent>,
     _events: Task<()>,
 }
 
@@ -117,16 +116,6 @@ impl PreviewState {
     pub(super) fn disconnect(&mut self) {
         self._events = None;
         self.reported_profiles = None;
-    }
-}
-
-/// The GPUI window's native handle, owned so a view can be built after the borrow ends.
-struct ParentWindow(RawWindowHandle);
-
-impl HasWindowHandle for ParentWindow {
-    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        // SAFETY: the handle is the live GPUI window that owns this workspace.
-        Ok(unsafe { WindowHandle::borrow_raw(self.0) })
     }
 }
 
@@ -585,78 +574,33 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Creates the native view for a tab and starts `url` in it. The view is built
-    /// asynchronously: WebView2's blocking constructor pumps the window's messages, which
-    /// would run GPUI tasks while the app is borrowed.
+    /// Creates the native view for a tab and starts `url` in it, from a task: see [`build_view`].
     fn host_tab(&mut self, thread_id: &str, tab_id: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pending) = self.preview.starting.get_mut(tab_id) {
             *pending = url.to_owned();
             return;
         }
-        let parent = match window.window_handle() {
-            Ok(handle) => ParentWindow(handle.as_raw()),
-            Err(error) => {
-                self.error = Some(format!("Unable to start the browser: {error}").into());
-                return;
-            }
-        };
-        let (sender, events) = async_channel::unbounded();
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id));
         let partition = profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref()));
         self.preview.starting.insert(tab_id.to_owned(), url.to_owned());
-        let (thread_id, tab_id, url) = (thread_id.to_owned(), tab_id.to_owned(), url.to_owned());
+        let (thread_id, tab_id) = (thread_id.to_owned(), tab_id.to_owned());
         cx.spawn_in(window, async move |this, cx| {
-            let mut context = partition.context();
-            let built = partition
-                .builder(context.as_mut())
-                .with_url(&url)
-                .with_devtools(true)
-                .with_on_page_load_handler({
-                    let sender = sender.clone();
-                    move |event, url| {
-                        let _ = sender.try_send(match event {
-                            wry::PageLoadEvent::Started => PageEvent::Started(url),
-                            wry::PageLoadEvent::Finished => PageEvent::Finished(url),
-                        });
-                    }
-                })
-                .with_document_title_changed_handler({
-                    let sender = sender.clone();
-                    move |title| {
-                        let _ = sender.try_send(PageEvent::Title(title));
-                    }
-                })
-                .with_new_window_req_handler({
-                    let sender = sender.clone();
-                    move |url, _| {
-                        let _ = sender.try_send(PageEvent::OpenLink(url));
-                        wry::NewWindowResponse::Deny
-                    }
-                })
-                .build_as_child_async(&parent)
-                .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let latest = this.preview.starting.remove(&tab_id).unwrap_or_default();
-                let webview = match built {
-                    Ok(webview) => webview,
-                    Err(error) => {
-                        this.error = Some(format!("Unable to start the browser: {error}").into());
-                        cx.notify();
-                        return;
-                    }
-                };
-                // The tab closed while its view was starting.
+                let url = this.preview.starting.remove(&tab_id).unwrap_or_default();
+                // The tab closed while its view was waiting to start.
                 if this.preview.threads.get(&thread_id).and_then(|p| p.get(&tab_id)).is_none() {
                     return;
                 }
-                if latest != url {
-                    let _ = webview.load_url(&latest);
+                let (sender, events) = async_channel::unbounded();
+                let mut context = partition.context();
+                let builder = page_builder(partition.builder(context.as_mut()), &url, sender.clone());
+                match build_view(builder, window, cx) {
+                    Ok(webview) => this.adopt_view(thread_id, tab_id, url, webview, (sender, events), window, cx),
+                    Err(error) => {
+                        this.error = Some(format!("Unable to start the browser: {error}").into());
+                        cx.notify();
+                    }
                 }
-                #[cfg(windows)]
-                native::watch(&webview, sender);
-                #[cfg(not(windows))]
-                drop(sender);
-                this.adopt_view(thread_id, tab_id, latest, webview, events, window, cx);
             });
         })
         .detach();
@@ -668,12 +612,11 @@ impl Workspace {
         thread_id: String,
         tab_id: String,
         url: String,
-        webview: wry::WebView,
-        events: async_channel::Receiver<PageEvent>,
+        webview: WebView,
+        (page_events, events): (async_channel::Sender<PageEvent>, async_channel::Receiver<PageEvent>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let webview = WebView::new(webview, window, cx);
         // Hidden until a frame lays it out, so it never flashes at the window's origin.
         let _ = webview.set_visible(false);
         let view = cx.new(|_| webview);
@@ -691,13 +634,15 @@ impl Workspace {
                 thread_id,
                 view,
                 status: NavStatus::Loading { url, title: String::new() },
-                can_go_back: false,
-                can_go_forward: false,
+                // Until the page reports its history; WebKit without the Navigation API never does.
+                can_go_back: !cfg!(windows),
+                can_go_forward: !cfg!(windows),
                 reported: None,
                 zoom: 1.,
                 appearance: None,
                 defaults: self.browser_defaults(),
                 shown: false,
+                page_events,
                 _events: pump,
             },
         );
@@ -712,6 +657,7 @@ impl Workspace {
             // A failure reported for this load stays; the error page's load is not a success.
             PageEvent::Finished(url) => {
                 if !matches!(&tab.status, NavStatus::LoadFailed { url: failed, .. } if *failed == url) {
+                    probe_failure(tab.view.read(cx).raw(), &url, &tab.page_events);
                     tab.status = NavStatus::Success { url, title };
                 }
             }
@@ -721,12 +667,16 @@ impl Workspace {
                 | NavStatus::LoadFailed { title, .. } => *title = new_title,
                 NavStatus::Idle => {}
             },
-            // Same-document navigation (pushState, fragments) has no load events: read the URL.
-            PageEvent::History => {
-                if let Ok(current) = tab.view.read(cx).raw().url()
+            // Same-document navigation (pushState, fragments) has no load events: take the page's
+            // URL, which can't leave the origin the view is on.
+            PageEvent::History(history) => {
+                (tab.can_go_back, tab.can_go_forward) = (history.back, history.forward);
+                let origin = |url: &str| url::Url::parse(url).ok().map(|url| url.origin());
+                let current = tab.view.read(cx).raw().url().ok();
+                if current.is_some_and(|current| origin(&current) == origin(&history.url))
                     && let NavStatus::Loading { url, .. } | NavStatus::Success { url, .. } = &mut tab.status
                 {
-                    *url = current;
+                    *url = history.url;
                 }
             }
             PageEvent::Failed { url, code, description } => {
@@ -737,15 +687,6 @@ impl Workspace {
                 self.open_preview_tab(thread_id, Some(url), window, cx);
                 return;
             }
-        }
-        #[cfg(windows)]
-        {
-            (tab.can_go_back, tab.can_go_forward) = native::history(tab.view.read(cx).raw());
-        }
-        #[cfg(not(windows))]
-        {
-            // WKWebView and WebKitGTK history isn't reachable through wry; keep both usable.
-            (tab.can_go_back, tab.can_go_forward) = (true, true);
         }
         let (thread_id, status) = (tab.thread_id.clone(), tab.status.clone());
         self.record_title(&thread_id, &status);
@@ -1220,27 +1161,14 @@ impl Workspace {
         }
         #[cfg(windows)]
         {
-            menu = menu
-                .child(separator())
-                .child(item("menu-clear-cookies".into(), "Clear cookies".into(), false, has_page).when(
-                    has_page,
-                    |el| {
-                        el.on_click(cx.listener(move |this, _, _, cx| {
-                            this.with_active_view(cx, |view| {
-                                native::devtools_command(view, "Network.clearBrowserCookies", "{}")
-                            });
-                            close(this, cx);
-                        }))
-                    },
-                ))
-                .child(item("menu-clear-cache".into(), "Clear cache".into(), false, has_page).when(has_page, |el| {
+            menu = menu.child(separator()).child(
+                item("menu-clear-cookies".into(), "Clear cookies".into(), false, has_page).when(has_page, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.with_active_view(cx, |view| {
-                            native::devtools_command(view, "Network.clearBrowserCache", "{}")
-                        });
+                        this.with_active_view(cx, clear_cookies);
                         close(this, cx);
                     }))
-                }));
+                }),
+            );
         }
         div()
             .child(trigger)
@@ -1336,10 +1264,79 @@ fn host_of(url: &str) -> String {
     url::Url::parse(url).ok().and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_else(|| url.to_owned())
 }
 
-/// Electron's `reloadIgnoringCache`.
+/// Electron's `reloadIgnoringCache`, as close as wry gets: a plain reload, which revalidates the page.
 fn hard_reload(view: &wry::WebView) {
-    #[cfg(windows)]
-    native::devtools_command(view, "Page.reload", r#"{"ignoreCache":true}"#);
-    #[cfg(not(windows))]
-    let _ = view.reload();
+    if let Err(error) = view.reload() {
+        log::warn!("could not reload the page: {error}");
+    }
+}
+
+/// `Network.clearBrowserCookies`: every cookie in the tab's profile.
+#[cfg(windows)]
+fn clear_cookies(view: &wry::WebView) {
+    let cleared = view.cookies().and_then(|cookies| cookies.iter().try_for_each(|cookie| view.delete_cookie(cookie)));
+    if let Err(error) = cleared {
+        log::warn!("could not clear the cookies: {error}");
+    }
+}
+
+/// wry reports a failed navigation as a finished one: asks the page whether it is WebView2's
+/// error page, and if so reports the load as failed with the error it names.
+fn probe_failure(view: &wry::WebView, url: &str, events: &async_channel::Sender<PageEvent>) {
+    let (url, events) = (url.to_owned(), events.clone());
+    let probed = view.evaluate_script_with_callback(preview::FAILURE_PROBE, move |result| {
+        if let Some((code, description)) = preview::failed_load(&result) {
+            let _ = events.try_send(PageEvent::Failed { url: url.clone(), code, description: description.into() });
+        }
+    });
+    if let Err(error) = probed {
+        log::warn!("could not check the page for a failed load: {error}");
+    }
+}
+
+/// Builds a native view in `window` (gpui-webview's safe constructor). Call it from inside a task's
+/// update, never from an event handler or `defer`: WebView2's constructor runs the window's message
+/// loop, and only while a task runs does GPUI post no other task to that loop, so no task re-enters
+/// the borrowed app. The UI still pauses for the build, and window events in that time are dropped.
+pub(super) fn build_view(builder: wry::WebViewBuilder, window: &mut Window, cx: &mut App) -> wry::Result<WebView> {
+    WebView::build(builder, window, cx)
+}
+
+/// A tab's view: its page events, and the script that reports its history.
+fn page_builder<'a>(
+    builder: wry::WebViewBuilder<'a>,
+    url: &str,
+    sender: async_channel::Sender<PageEvent>,
+) -> wry::WebViewBuilder<'a> {
+    builder
+        .with_url(url)
+        .with_devtools(true)
+        .with_initialization_script(preview::HISTORY_SCRIPT)
+        .with_ipc_handler({
+            let sender = sender.clone();
+            move |request| {
+                if let Some(history) = preview::history_message(request.body()) {
+                    let _ = sender.try_send(PageEvent::History(history));
+                }
+            }
+        })
+        .with_on_page_load_handler({
+            let sender = sender.clone();
+            move |event, url| {
+                let _ = sender.try_send(match event {
+                    wry::PageLoadEvent::Started => PageEvent::Started(url),
+                    wry::PageLoadEvent::Finished => PageEvent::Finished(url),
+                });
+            }
+        })
+        .with_document_title_changed_handler({
+            let sender = sender.clone();
+            move |title| {
+                let _ = sender.try_send(PageEvent::Title(title));
+            }
+        })
+        .with_new_window_req_handler(move |url, _| {
+            let _ = sender.try_send(PageEvent::OpenLink(url));
+            wry::NewWindowResponse::Deny
+        })
 }

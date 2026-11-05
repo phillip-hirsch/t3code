@@ -521,59 +521,17 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
 }
 
+/// The bearer tokens, DPAPI-encrypted for the current Windows user.
 #[cfg(windows)]
 mod secure {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
-    };
+    use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 
     pub fn protect(data: &[u8]) -> Result<Vec<u8>, String> {
-        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() };
-        let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-        // SAFETY: `input` points at `data`, which outlives the call; DPAPI only reads it and
-        // allocates `output`, which `take` frees.
-        let ok = unsafe {
-            CryptProtectData(
-                &input,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-        };
-        take(ok, output)
+        encrypt_data(data, Scope::User, None).map_err(|error| format!("{error:#}"))
     }
 
     pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
-        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() };
-        let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-        // SAFETY: as in `protect`.
-        let ok = unsafe {
-            CryptUnprotectData(
-                &input,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                CRYPTPROTECT_UI_FORBIDDEN,
-                &mut output,
-            )
-        };
-        take(ok, output)
-    }
-
-    fn take(ok: i32, output: CRYPT_INTEGER_BLOB) -> Result<Vec<u8>, String> {
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        // SAFETY: on success DPAPI filled `output` with `cbData` bytes it allocated with LocalAlloc.
-        let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
-        // SAFETY: freed once, with the allocator DPAPI documents.
-        unsafe { LocalFree(output.pbData.cast()) };
-        Ok(bytes)
+        decrypt_data(data, Scope::User, None).map_err(|error| format!("{error:#}"))
     }
 }
 

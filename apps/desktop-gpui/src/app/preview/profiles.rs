@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 
+use std::time::Duration;
+
 use gpui_kit::{Context, Task, Window};
-use raw_window_handle::HasWindowHandle as _;
 use serde_json::json;
 
-use super::ParentWindow;
 use crate::app::Workspace;
 use crate::preview::{self, Partition};
 
@@ -55,16 +55,33 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let server = self.client().filter(|_| self.server_info().capability("serverBrowser"));
-        let parent = window.window_handle().map(|handle| ParentWindow(handle.as_raw()));
         let storage = Storage::of(Some(&profile_id));
-        cx.spawn_in(window, async move |_, _| {
-            let parent = parent.map_err(|error| error.to_string())?;
+        cx.spawn_in(window, async move |_, cx| {
+            // Clears through a hidden view in the profile's storage, which works whether or not a tab of it is open.
+            let view = cx.update(|window, cx| {
+                let mut context = storage.context();
+                let builder = storage
+                    .builder(context.as_mut())
+                    .with_visible(false)
+                    // A focused view would take the keyboard focus with it when it is dropped.
+                    .with_focused(false)
+                    .with_url("about:blank");
+                super::build_view(builder, window, cx)
+            });
+            let view = view.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            let desktop = async {
+                view.raw().clear_all_browsing_data().map_err(|error| error.to_string())?;
+                // WebView2 clears in the background and reports nothing back; dropping the view
+                // early could cut that short.
+                cx.background_executor().timer(CLEAR_GRACE).await;
+                Ok::<(), String>(())
+            };
             let server = async {
                 let Some(client) = server else { return Ok(()) };
                 let input = json!({"profileId": profile_id});
                 client.request("preview.clearProfile", input).await.map(drop).map_err(|error| error.to_string())
             };
-            let (desktop, server) = futures::join!(clear_desktop(storage, &parent), server);
+            let (desktop, server) = futures::join!(desktop, server);
             desktop.and(server)
         })
     }
@@ -88,20 +105,5 @@ impl Workspace {
     }
 }
 
-/// Clears through a hidden view in the profile's storage, which works whether or not a tab of it is open.
-async fn clear_desktop(storage: Storage, parent: &ParentWindow) -> Result<(), String> {
-    let mut context = storage.context();
-    let view = storage
-        .builder(context.as_mut())
-        .with_visible(false)
-        // A focused view would take the keyboard focus with it when it is dropped.
-        .with_focused(false)
-        .with_url("about:blank")
-        .build_as_child_async(parent)
-        .await
-        .map_err(|error| error.to_string())?;
-    #[cfg(windows)]
-    return super::native::clear_cookies_and_cache(&view).await;
-    #[cfg(not(windows))]
-    return view.clear_all_browsing_data().map_err(|error| error.to_string());
-}
+/// How long a hidden view stays alive after it asked WebView2 to clear its profile.
+const CLEAR_GRACE: Duration = Duration::from_secs(2);

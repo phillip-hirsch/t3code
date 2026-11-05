@@ -63,15 +63,8 @@ pub fn decode(line: &[u8]) -> Option<Vec<String>> {
 fn forward(address: &str, args: &[String]) -> std::io::Result<()> {
     let mut pipe = std::fs::OpenOptions::new().write(true).open(address)?;
     // The launch the user just made may hand the foreground to the running app.
-    // SAFETY: plain Win32 call with a constant argument.
-    unsafe { AllowSetForegroundWindow(u32::MAX) };
+    let _ = winsafe::AllowSetForegroundWindow(None);
     pipe.write_all(&message(args))
-}
-
-#[cfg(windows)]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn AllowSetForegroundWindow(process_id: u32) -> i32;
 }
 
 #[cfg(windows)]

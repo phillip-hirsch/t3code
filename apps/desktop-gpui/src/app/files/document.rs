@@ -389,9 +389,7 @@ impl Workspace {
         }
     }
 
-    /// Builds `key`'s native view with gpui-webview's safe constructor. It runs after the
-    /// current update, outside every entity, because WebView2's constructor pumps the
-    /// window's messages.
+    /// Builds `key`'s native view from a task: see [`build_view`](crate::app::preview::build_view).
     fn build_view(
         &mut self,
         key: Key,
@@ -400,10 +398,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let this = cx.weak_entity();
-        window.defer(cx, move |window, cx| {
-            let built = WebView::build(builder, window, cx);
-            let _ = this.update(cx, |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                // The document closed while its view waited to start.
+                if !this.files.documents.views.contains_key(&key) {
+                    return;
+                }
+                let built = crate::app::preview::build_view(builder, window, cx);
                 let Some(state) = this.files.documents.views.get_mut(&key) else { return };
                 state._task = None;
                 match built {
@@ -421,7 +422,8 @@ impl Workspace {
                 }
                 cx.notify();
             });
-        });
+        })
+        .detach();
     }
 
     fn fail_view(&mut self, key: &Key, error: String, cx: &mut Context<Self>) {

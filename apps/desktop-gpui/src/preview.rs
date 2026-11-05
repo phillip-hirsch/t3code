@@ -186,27 +186,73 @@ pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32)) -> ((f32, f32),
     ((width * scale, height * scale), scale)
 }
 
-/// A WebView2 `COREWEBVIEW2_WEB_ERROR_STATUS` as the Chromium net error Electron reports
-/// (`did-fail-load`), so `LoadFailed` reads the same to agents and other clients. `None`
-/// when the navigation did not fail: a cancel, or an HTTP error page that still loaded.
-pub fn web_error(status: i32) -> Option<(i64, &'static str)> {
-    Some(match status {
-        1 => (-200, "ERR_CERT_COMMON_NAME_INVALID"),
-        2 => (-201, "ERR_CERT_DATE_INVALID"),
-        3 => (-117, "ERR_BAD_SSL_CLIENT_AUTH_CERT"),
-        4 => (-206, "ERR_CERT_REVOKED"),
-        5 => (-202, "ERR_CERT_AUTHORITY_INVALID"),
-        6 => (-109, "ERR_ADDRESS_UNREACHABLE"),
-        7 => (-118, "ERR_CONNECTION_TIMED_OUT"),
-        8 => (-320, "ERR_INVALID_RESPONSE"),
-        9 => (-103, "ERR_CONNECTION_ABORTED"),
-        10 => (-101, "ERR_CONNECTION_RESET"),
-        11 => (-106, "ERR_INTERNET_DISCONNECTED"),
-        12 => (-102, "ERR_CONNECTION_REFUSED"),
-        13 => (-105, "ERR_NAME_NOT_RESOLVED"),
-        15 => (-310, "ERR_TOO_MANY_REDIRECTS"),
-        16 => (-2, "ERR_FAILED"),
-        _ => return None,
+/// The Chromium net errors a failed load reports as Electron's `did-fail-load` does, so
+/// `LoadFailed` reads the same to agents and other clients.
+const NET_ERRORS: [(i64, &str); 19] = [
+    (-200, "ERR_CERT_COMMON_NAME_INVALID"),
+    (-201, "ERR_CERT_DATE_INVALID"),
+    (-117, "ERR_BAD_SSL_CLIENT_AUTH_CERT"),
+    (-206, "ERR_CERT_REVOKED"),
+    (-202, "ERR_CERT_AUTHORITY_INVALID"),
+    (-109, "ERR_ADDRESS_UNREACHABLE"),
+    (-118, "ERR_CONNECTION_TIMED_OUT"),
+    (-320, "ERR_INVALID_RESPONSE"),
+    (-103, "ERR_CONNECTION_ABORTED"),
+    (-101, "ERR_CONNECTION_RESET"),
+    (-106, "ERR_INTERNET_DISCONNECTED"),
+    (-102, "ERR_CONNECTION_REFUSED"),
+    (-105, "ERR_NAME_NOT_RESOLVED"),
+    (-310, "ERR_TOO_MANY_REDIRECTS"),
+    (-312, "ERR_UNSAFE_PORT"),
+    (-100, "ERR_CONNECTION_CLOSED"),
+    (-324, "ERR_EMPTY_RESPONSE"),
+    (-107, "ERR_SSL_PROTOCOL_ERROR"),
+    (-2, "ERR_FAILED"),
+];
+
+/// Run in a page after its load: on WebView2's error page, the net error it names (in Chromium's
+/// `loadTimeData` or the page text), else `null`.
+pub const FAILURE_PROBE: &str = r#"(() => {
+  if (location.protocol !== "chrome-error:") return null;
+  const data = window.loadTimeData && window.loadTimeData.data_;
+  const text = (data ? JSON.stringify(data) : "") + " " + (document.body ? document.body.innerText : "");
+  const code = /\bERR_[A-Z_]+\b/.exec(text);
+  return code ? code[0] : "";
+})()"#;
+
+/// [`FAILURE_PROBE`]'s JSON result as the failed load's net error, or `None` for a page that loaded.
+/// An error page whose error isn't listed reads as `ERR_FAILED`.
+pub fn failed_load(result: &str) -> Option<(i64, &'static str)> {
+    let name = serde_json::from_str::<Option<String>>(result).ok()??;
+    Some(NET_ERRORS.into_iter().find(|(_, known)| *known == name).unwrap_or((-2, "ERR_FAILED")))
+}
+
+/// Reports the top page's URL and back/forward state over wry's IPC on load and on each history
+/// change, through Chromium's Navigation API (WebView2; WebKit lacks it and reports nothing).
+pub const HISTORY_SCRIPT: &str = r#"(() => {
+  if (window !== window.top || !window.navigation || !window.ipc) return;
+  const post = () => window.ipc.postMessage(JSON.stringify({ t3History: { url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward } }));
+  post();
+  navigation.addEventListener("currententrychange", post);
+  addEventListener("pageshow", post);
+})();"#;
+
+/// [`HISTORY_SCRIPT`]'s message. The page can post one too, so its URL is only trusted within the
+/// page's own origin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageHistory {
+    pub url: String,
+    pub back: bool,
+    pub forward: bool,
+}
+
+pub fn history_message(body: &str) -> Option<PageHistory> {
+    let message: serde_json::Value = serde_json::from_str(body).ok()?;
+    let history = message.get("t3History")?;
+    Some(PageHistory {
+        url: history.get("url")?.as_str()?.to_owned(),
+        back: history.get("back")?.as_bool()?,
+        forward: history.get("forward")?.as_bool()?,
     })
 }
 
@@ -922,11 +968,24 @@ mod tests {
     }
 
     #[test]
-    fn maps_webview2_errors_to_chromium_net_errors() {
-        assert_eq!(web_error(13), Some((-105, "ERR_NAME_NOT_RESOLVED")));
-        assert_eq!(web_error(12), Some((-102, "ERR_CONNECTION_REFUSED")));
-        assert_eq!(web_error(14), None, "a canceled navigation is not a failure");
-        assert_eq!(web_error(0), None, "an HTTP error page still loaded");
+    fn reads_failed_loads_from_the_error_page_probe() {
+        assert_eq!(failed_load(r#""ERR_NAME_NOT_RESOLVED""#), Some((-105, "ERR_NAME_NOT_RESOLVED")));
+        assert_eq!(failed_load(r#""ERR_CONNECTION_REFUSED""#), Some((-102, "ERR_CONNECTION_REFUSED")));
+        assert_eq!(failed_load(r#""ERR_SOMETHING_NEW""#), Some((-2, "ERR_FAILED")));
+        assert_eq!(failed_load(r#""""#), Some((-2, "ERR_FAILED")), "an error page without its code still failed");
+        assert_eq!(failed_load("null"), None, "a page that loaded");
+        assert_eq!(failed_load(""), None, "a page that couldn't run the probe");
+    }
+
+    #[test]
+    fn reads_the_history_scripts_message() {
+        assert_eq!(
+            history_message(r#"{"t3History":{"url":"https://a.test/#b","back":true,"forward":false}}"#),
+            Some(PageHistory { url: "https://a.test/#b".into(), back: true, forward: false })
+        );
+        assert_eq!(history_message(r#"{"t3History":{"url":"https://a.test/","back":true}}"#), None);
+        assert_eq!(history_message("not json"), None);
+        assert_eq!(history_message(r#"{"other":1}"#), None);
     }
 
     #[test]
