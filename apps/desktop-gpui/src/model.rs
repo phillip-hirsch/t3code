@@ -112,6 +112,8 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub supports_text_generation: Option<bool>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -140,12 +142,12 @@ impl UsageWindow {
 }
 
 impl Provider {
-    fn is_selectable(&self) -> bool {
+    pub fn is_selectable(&self) -> bool {
         self.enabled && self.availability.as_deref() != Some("unavailable")
     }
 
     /// `getDefaultProviderInstanceModel` in `apps/web/src/providerInstances.ts`.
-    fn default_model(&self) -> Option<&str> {
+    pub fn default_model(&self) -> Option<&str> {
         self.models
             .iter()
             .find(|m| m.is_default == Some(true) && !m.is_custom)
@@ -173,6 +175,10 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The whole `ServerSettings` as last sent, for Settings to read by path.
+    pub settings: Value,
+    /// `environment.capabilities` from the config snapshot.
+    pub capabilities: Value,
 }
 
 impl ServerInfo {
@@ -188,6 +194,7 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -197,6 +204,7 @@ impl ServerInfo {
     }
 
     fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.settings = settings.clone();
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
         self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
