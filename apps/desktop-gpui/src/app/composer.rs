@@ -216,6 +216,7 @@ impl Workspace {
             return self.picker_key(keystroke, window, cx);
         }
         if self.stash_menu_key(keystroke, window, cx)
+            || self.stash_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || self.composer_shortcut(keystroke, window, cx)
             || self.redirect_to_composer(keystroke, window, cx)
@@ -228,6 +229,16 @@ impl Workspace {
                 || self.menu_key(keystroke, window, cx)
                 || self.history_key(keystroke, window, cx)
                 || self.send_key(keystroke, window, cx))
+    }
+
+    /// Mod+S, `composer.stash`'s default; the keymap's `composer.stash` command replaces this.
+    fn stash_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if keystroke.key != "s" || !(m.control || m.platform) || m.shift || m.alt {
+            return false;
+        }
+        self.stash_shortcut(window, cx);
+        true
     }
 
     /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a

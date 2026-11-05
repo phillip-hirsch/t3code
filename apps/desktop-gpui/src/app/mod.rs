@@ -180,6 +180,8 @@ pub struct Workspace {
     vcs: git::VcsWatch,
     /// Local servers, while the details card's Servers section can show.
     servers: details::servers::ServersWatch,
+    /// Scheduled tasks, while the details card's Automations section can show.
+    automations: details::automations::AutomationsWatch,
     /// The editor "Open in" launches, once picked.
     preferred_editor: Option<String>,
     right_panel: right_panel::RightPanel,
@@ -314,6 +316,7 @@ impl Workspace {
             lineage_expanded: None,
             vcs: git::VcsWatch::default(),
             servers: Default::default(),
+            automations: Default::default(),
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
@@ -872,6 +875,7 @@ impl Render for Workspace {
         }
         self.sync_vcs(window, cx);
         self.sync_servers(window, cx);
+        self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);
         self.sync_preview_views(window, cx);
@@ -901,7 +905,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .map(|el| self.on_terminal_actions(el, cx))
-            .map(|el| self.on_stash_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();

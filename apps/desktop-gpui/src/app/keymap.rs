@@ -22,7 +22,6 @@ const COMMANDS: &[(&str, fn() -> Box<dyn Action>)] = &[
     ("chat.newLocal", || Box::new(super::NewThreadInProject)),
     ("preview.toggle", || Box::new(super::TogglePreview)),
     ("rightPanel.toggle", || Box::new(super::ToggleRightPanel)),
-    ("composer.stash", || Box::new(super::prompt_stash::StashPrompt)),
 ];
 
 /// The when-clause context (`ShortcutMatchContext` in `apps/web/src/keybindings.ts`).

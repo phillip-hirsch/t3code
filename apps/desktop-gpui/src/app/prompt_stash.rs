@@ -26,8 +26,6 @@ use super::{Workspace, new_id};
 use crate::keybindings::{self, Shortcut};
 use crate::theme::Tokens;
 
-gpui_kit::actions!(workspace, [StashPrompt]);
-
 pub(super) const MAX_STASH_ENTRIES: usize = 20;
 const SNIPPET_MAX_CHARS: usize = 90;
 const STORE_VERSION: u64 = 1;
@@ -295,12 +293,9 @@ fn toast(window: &mut Window, cx: &mut Context<Workspace>, notification: Notific
 }
 
 impl Workspace {
-    pub(super) fn on_stash_actions<E: gpui_kit::InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
-        el.on_action(cx.listener(|this, _: &StashPrompt, window, cx| this.stash_shortcut(window, cx)))
-    }
-
     /// `handleStashShortcut`.
-    fn stash_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The `composer.stash` command (Mod+S).
+    pub(super) fn stash_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() || self.page.is_some() || self.settings.is_some() {
             return;
         }

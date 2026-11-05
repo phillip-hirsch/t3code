@@ -22,6 +22,7 @@ use crate::model::{ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
+pub(super) mod automations;
 pub(super) mod servers;
 
 const CARD_WIDTH: f32 = 280.;
@@ -194,6 +195,7 @@ impl Workspace {
             self.workspace_section(&tokens, &colors, cx),
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
+            self.automations_section(&tokens, &colors, cx),
             self.lineage_section(&tokens, &colors, cx).filter(|_| self.lineage_shown()),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
@@ -211,6 +213,7 @@ impl Workspace {
             self.workspace_section_at(density, &tokens, &colors, cx),
             self.version_control_section_at(density, &tokens, &colors, cx),
             (density == Density::Full).then(|| self.servers_section(&tokens, &colors, cx)).flatten(),
+            (density == Density::Full).then(|| self.automations_section(&tokens, &colors, cx)).flatten(),
             (density == Density::Full && self.lineage_shown())
                 .then(|| self.lineage_section(&tokens, &colors, cx))
                 .flatten(),

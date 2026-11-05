@@ -7,7 +7,7 @@
 //! `section`, `group` and `row` below are placeholders for the foundation's settings widgets.
 
 mod editor;
-mod logic;
+pub(in crate::app) mod logic;
 mod webhook_logic;
 mod webhooks;
 mod worktree_mode;
