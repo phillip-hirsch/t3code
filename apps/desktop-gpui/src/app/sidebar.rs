@@ -11,7 +11,7 @@ use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, DragMoveEvent, EmptyView, Entity, Focusable as _,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowControlArea, deferred, div,
     prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::json;
@@ -374,13 +374,17 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .opacity(0.64)
+                // Inside the drag region a button must occlude, or Windows takes the press as a drag.
+                .occlude()
                 .tooltip(tooltip(label))
                 .child(icon(name, 14., sb.muted_foreground))
         };
         h_flex()
+            .id("sidebar-chrome")
             .h(px(40.))
             .flex_none()
             .pr(px(12.))
+            .window_control_area(WindowControlArea::Drag)
             .child(
                 h_flex()
                     .ml(px(52.))

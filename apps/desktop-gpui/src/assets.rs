@@ -15,37 +15,55 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
 ];
 
-/// Lucide icons outside gpui-kit's default bundle (or redrawn at the web's 1.75
-/// stroke), served at their catalog paths so `gpui_kit::assets::IconName` resolves them.
-const LUCIDE_ICONS: &[(&str, &[u8])] = &[
-    ("icons/paperclip.svg", include_bytes!("../assets/icons/lucide/paperclip.svg")),
-    ("icons/corner-up-right.svg", include_bytes!("../assets/icons/lucide/corner-up-right.svg")),
-    ("icons/shield.svg", include_bytes!("../assets/icons/lucide/shield.svg")),
-    ("icons/shield-off.svg", include_bytes!("../assets/icons/lucide/shield-off.svg")),
-    ("icons/lock.svg", include_bytes!("../assets/icons/lucide/lock.svg")),
-    ("icons/pen-line.svg", include_bytes!("../assets/icons/lucide/pen-line.svg")),
-    ("icons/sparkles.svg", include_bytes!("../assets/icons/lucide/sparkles.svg")),
-    ("icons/square-pen.svg", include_bytes!("../assets/icons/lucide/square-pen.svg")),
-    ("icons/terminal.svg", include_bytes!("../assets/icons/lucide/terminal.svg")),
-    ("icons/wrench.svg", include_bytes!("../assets/icons/lucide/wrench.svg")),
-    ("icons/hammer.svg", include_bytes!("../assets/icons/lucide/hammer.svg")),
-    ("icons/x.svg", include_bytes!("../assets/icons/lucide/x.svg")),
-    ("icons/list-filter.svg", include_bytes!("../assets/icons/lucide/list-filter.svg")),
-    ("icons/folder-plus.svg", include_bytes!("../assets/icons/lucide/folder-plus.svg")),
-    ("icons/chart-no-axes-column.svg", include_bytes!("../assets/icons/lucide/chart-no-axes-column.svg")),
-    ("icons/git-pull-request-arrow.svg", include_bytes!("../assets/icons/lucide/git-pull-request-arrow.svg")),
-    ("icons/folder-git-2.svg", include_bytes!("../assets/icons/lucide/folder-git-2.svg")),
-    ("icons/circle-dashed.svg", include_bytes!("../assets/icons/lucide/circle-dashed.svg")),
-    ("icons/circle-dot-dashed.svg", include_bytes!("../assets/icons/lucide/circle-dot-dashed.svg")),
-    ("icons/shield-question-mark.svg", include_bytes!("../assets/icons/lucide/shield-question-mark.svg")),
-    (
-        "icons/message-circle-question-mark.svg",
-        include_bytes!("../assets/icons/lucide/message-circle-question-mark.svg"),
-    ),
-    ("icons/alarm-clock.svg", include_bytes!("../assets/icons/lucide/alarm-clock.svg")),
-    ("icons/alarm-clock-off.svg", include_bytes!("../assets/icons/lucide/alarm-clock-off.svg")),
-    ("icons/user-round.svg", include_bytes!("../assets/icons/lucide/user-round.svg")),
-    ("icons/pin.svg", include_bytes!("../assets/icons/lucide/pin.svg")),
+/// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
+/// stroke, served at their catalog paths so `gpui_kit::assets::IconName` resolves them.
+macro_rules! lucide {
+    ($($name:literal),* $(,)?) => {
+        &[$((concat!("icons/", $name, ".svg"), include_bytes!(concat!("../assets/icons/lucide/", $name, ".svg")))),*]
+    };
+}
+
+const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
+    "alarm-clock",
+    "alarm-clock-off",
+    "bot",
+    "chart-no-axes-column",
+    "chevron-down",
+    "circle-dashed",
+    "circle-dot-dashed",
+    "cloud",
+    "corner-left-up",
+    "corner-up-right",
+    "folder",
+    "folder-git",
+    "folder-git-2",
+    "folder-plus",
+    "git-branch",
+    "git-pull-request-arrow",
+    "hammer",
+    "laptop",
+    "list-filter",
+    "lock",
+    "message-circle-question-mark",
+    "monitor",
+    "panel-bottom",
+    "panel-left",
+    "panel-left-close",
+    "panel-right",
+    "paperclip",
+    "pen-line",
+    "pin",
+    "server",
+    "shield",
+    "shield-off",
+    "shield-question-mark",
+    "sparkles",
+    "square-menu",
+    "square-pen",
+    "terminal",
+    "user-round",
+    "wrench",
+    "x",
 ];
 
 pub struct Assets;
