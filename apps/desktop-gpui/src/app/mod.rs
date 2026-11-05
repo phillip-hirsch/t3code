@@ -803,9 +803,12 @@ impl Render for Workspace {
                         .child(self.render_header(cx))
                         .children(self.render_error(cx))
                         .child(div().relative().flex_1().min_h_0().map(|el| {
-                            match self.page {
-                                Some(page) => el.child(self.render_page(page, window, cx)),
-                                None => el
+                            match (self.page, self.target.clone()) {
+                                (Some(page), _) => el.child(self.render_page(page, window, cx)),
+                                (None, Some(Target::Draft { project_id })) => el
+                                    .child(self.render_draft_stage(&project_id, window, cx))
+                                    .children(self.render_details_card(window, cx)),
+                                (None, _) => el
                                     .child(
                                         v_flex()
                                             .size_full()

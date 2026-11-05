@@ -19,7 +19,6 @@ use gpui_kit::{
 
 use gpui_kit::assets::IconName;
 
-use super::layout::Lane;
 use super::{Target, Workspace, project_name};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timeline::{self, Row, Steer, WorkRow, WorkRowKind};
@@ -38,10 +37,8 @@ impl Workspace {
         let (lane, _) = self.chat_layout(window);
         match (&self.target, &self.thread) {
             (None, _) => no_thread(&t),
-            (Some(Target::Draft { project_id }), _) => {
-                let project = self.shell.projects.iter().find(|p| &p.id == project_id).map(project_name);
-                draft_hero(project, lane, &t)
-            }
+            // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
+            (Some(Target::Draft { .. }), _) => div().into_any_element(),
             (Some(Target::Thread(_)), Some(thread)) if thread.state.projection.is_none() => {
                 centered_note("Loading thread…", &t)
             }
@@ -156,8 +153,8 @@ fn no_thread(t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-/// "What should we build in **project**?" above the composer.
-fn draft_hero(project: Option<SharedString>, lane: Lane, t: &Tokens) -> AnyElement {
+/// "What should we build in **project**?" (`DraftHeroHeadline`).
+fn draft_headline(project: Option<SharedString>, t: &Tokens) -> gpui_kit::Div {
     let headline = match project {
         Some(project) => h_flex()
             .justify_center()
@@ -167,16 +164,45 @@ fn draft_hero(project: Option<SharedString>, lane: Lane, t: &Tokens) -> AnyEleme
             .child("?"),
         None => h_flex().justify_center().child("What should we work on?"),
     };
-    div()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .justify_end()
-        .pl(px(lane.left))
-        .pr(px(lane.right))
-        .pb(px(16.))
-        .child(div().w_full().text_size(px(30.)).line_height(px(36.)).text_color(t.foreground).child(headline))
-        .into_any_element()
+    div().w_full().text_size(px(30.)).line_height(px(36.)).text_color(t.foreground).child(headline)
+}
+
+impl Workspace {
+    /// A draft centers its composer in the chat area and hangs the headline
+    /// above it, out of flow like `ChatView`'s draft hero, so the composer sits
+    /// in the middle however tall the headline wraps.
+    pub(super) fn render_draft_stage(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let (lane, _) = self.chat_layout(window);
+        let project = self.shell.projects.iter().find(|p| p.id == project_id).map(project_name);
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_full()
+                            .pl(px(lane.left))
+                            .pr(px(lane.right))
+                            .pb(px(16.))
+                            .child(draft_headline(project, &t)),
+                    )
+                    .child(self.render_composer(window, cx)),
+            )
+            .into_any_element()
+    }
 }
 
 fn centered_note(text: &'static str, t: &Tokens) -> AnyElement {
