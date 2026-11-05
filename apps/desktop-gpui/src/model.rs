@@ -124,6 +124,8 @@ pub struct Provider {
     #[serde(default)]
     pub installed: bool,
     #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
     pub runtime_paths: Option<RuntimePaths>,
     #[serde(default)]
     pub supports_text_generation: Option<bool>,
@@ -690,6 +692,13 @@ pub struct ThreadShell {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_class: Option<String>,
+    #[serde(default)]
+    pub last_error_code: Option<String>,
+    #[serde(default)]
+    pub usage_limit_reset_at: Option<String>,
+    /// `OrchestrationV2LimitRecovery`: auto-resume or snooze set for a usage-limited run.
+    #[serde(default)]
+    pub limit_recovery: Option<Value>,
     #[serde(default)]
     pub has_actionable_proposed_plan: bool,
     #[serde(default)]

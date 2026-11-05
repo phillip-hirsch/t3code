@@ -13,6 +13,7 @@ mod keybindings;
 mod model_select;
 
 mod providers;
+pub(in crate::app) use providers::chatgpt_usage_button;
 mod search;
 mod snap_shot;
 mod system;

@@ -569,7 +569,9 @@ impl Workspace {
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
+                .children(self.render_environment_banner(&t, cx))
                 .children(self.render_fallback_banner(&t, cx))
+                .children(self.render_recovery_banner(&t, cx))
                 .children(self.render_question(&t, cx))
                 .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
                 .children(self.render_context_strip(&t, cx)),

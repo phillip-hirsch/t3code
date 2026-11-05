@@ -7,6 +7,7 @@
 
 mod accent;
 mod accounts;
+pub(in crate::app) use accounts::chatgpt_usage_button;
 mod acp;
 mod add;
 mod codex_callback;

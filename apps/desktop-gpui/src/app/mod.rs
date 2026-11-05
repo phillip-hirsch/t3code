@@ -24,6 +24,7 @@ use crate::timeline::{self, Row};
 
 mod alerts;
 mod attachments;
+mod banners;
 mod chat;
 mod composer;
 mod composer_menu;
@@ -216,6 +217,7 @@ pub struct Workspace {
     alerts: alerts::AlertState,
     quit: quit::QuitState,
     queue: queue::QueueUi,
+    banners: banners::BannerUi,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -335,6 +337,7 @@ impl Workspace {
             alerts: Default::default(),
             quit: Default::default(),
             queue: Default::default(),
+            banners: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -465,6 +468,7 @@ impl Workspace {
             }
         }
         self.connection = connection;
+        self.sync_connection_banner(cx);
         self.notify_sidebar(cx);
         cx.notify();
     }
@@ -932,7 +936,6 @@ impl Render for Workspace {
                             .min_w_0()
                             .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             .child(self.render_header(cx))
-                            .children(self.render_error(cx))
                             .child(
                                 div()
                                     .id("chat-canvas")
@@ -970,6 +973,7 @@ impl Render for Workspace {
                                         }
                                     })
                                     .children(mini_player)
+                                    .children(self.render_banner_lane(cx))
                                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
                                         this.drop_paths(paths, window, cx)
                                     }))

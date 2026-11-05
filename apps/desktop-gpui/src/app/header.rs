@@ -1,10 +1,9 @@
 //! The main column's 40px header: the "project / thread" breadcrumb, which
 //! doubles as the window's drag region (`ChatView.tsx` header + `ChatHeader.tsx`).
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, StyledExt as _, h_flex};
+use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, WindowControlArea, canvas, div, px, rgb,
@@ -163,29 +162,6 @@ impl Workspace {
                 }),
             )
             .into_any_element()
-    }
-
-    pub(super) fn render_error(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let error = self.error.clone()?;
-        let theme = cx.theme();
-        Some(
-            h_flex()
-                .mx_4()
-                .mt_2()
-                .px_3()
-                .py_2()
-                .gap_2()
-                .rounded_md()
-                .bg(theme.danger.opacity(0.12))
-                .text_color(theme.danger)
-                .child(div().flex_1().min_w_0().child(error))
-                .child(Button::new("dismiss-error").ghost().xsmall().icon(IconName::Close).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.error = None;
-                        cx.notify();
-                    },
-                ))),
-        )
     }
 }
 
