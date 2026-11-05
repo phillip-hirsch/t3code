@@ -55,8 +55,23 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
     })
 }
 
+/// What a target keeps of the composer while another one is on screen, like
+/// the web's `composerDraftStore` (in memory only).
+pub(super) enum ComposerDraft {
+    Prompt(String),
+    /// An open question card; its prompt is the one it set aside.
+    Question(QuestionDraft),
+}
+
 impl Workspace {
+    /// A user edit. While a question is open the editor holds its custom answer;
+    /// programmatic changes (`set_composer_text`) never reach the draft.
     pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+        self.save_custom_answer(cx);
+        self.sync_composer_empty(cx);
+    }
+
+    fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
         if empty != self.composer_empty {
             self.composer_empty = empty;
@@ -73,25 +88,66 @@ impl Workspace {
     ) {
         let text = text.into();
         self.composer.update(cx, |composer, cx| composer.set_value(text, window, cx));
-        self.on_composer_change(cx);
+        self.sync_composer_empty(cx);
     }
 
-    /// Opens a fresh draft when the first pending question changes. Returns
-    /// true when the new active question carries a seeded answer, which the
-    /// caller loads into the editor (the editor is the custom answer's source).
-    pub(super) fn sync_question(&mut self) -> bool {
-        let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
-        let first = projection.and_then(|p| p.pending_user_inputs().into_iter().next());
-        let Some((request, item)) = first else {
-            self.question = None;
-            return false;
+    /// Keeps the leaving target's composer; call before the target changes.
+    pub(super) fn stash_composer(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let draft = match self.question.take() {
+            Some(question) => ComposerDraft::Question(question),
+            None => ComposerDraft::Prompt(self.composer.read(cx).value().to_string()),
         };
-        if self.question.as_ref().is_some_and(|q| q.request_id == request.id) {
-            return false;
+        if matches!(&draft, ComposerDraft::Prompt(prompt) if prompt.is_empty()) {
+            self.composer_drafts.remove(&target);
+        } else {
+            self.composer_drafts.insert(target, draft);
         }
-        let questions = requests::questions(item);
-        self.question = (!questions.is_empty()).then(|| QuestionDraft::new(request.id.clone(), questions));
-        self.question.as_ref().is_some_and(|draft| draft.drafts.contains_key(&draft.questions[0].id))
+    }
+
+    /// Brings back the new target's composer; call after the target changes.
+    /// `sync_question` drops a restored question once the thread shows it resolved.
+    pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
+            Some(ComposerDraft::Question(question)) => {
+                self.question = Some(question);
+                self.load_custom_answer(window, cx);
+            }
+            Some(ComposerDraft::Prompt(prompt)) => {
+                self.question = None;
+                self.set_composer_text(prompt, window, cx);
+            }
+            None => {
+                self.question = None;
+                self.set_composer_text("", window, cx);
+            }
+        }
+    }
+
+    /// Opens a fresh draft when the first pending question changes. The editor
+    /// then holds the question's answer, and the prompt waits in the draft
+    /// until the last question closes.
+    pub(super) fn sync_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
+        let first = projection.pending_user_inputs().into_iter().next();
+        if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
+            return;
+        }
+        let next = first
+            .map(|(request, item)| (request.id.clone(), requests::questions(item)))
+            .filter(|(_, questions)| !questions.is_empty());
+        match (self.question.take(), next) {
+            (None, None) => {}
+            (Some(previous), None) => self.set_composer_text(previous.prompt, window, cx),
+            (previous, Some((request_id, questions))) => {
+                let prompt = match previous {
+                    Some(previous) => previous.prompt,
+                    None => self.composer.read(cx).value().to_string(),
+                };
+                self.question = Some(QuestionDraft { prompt, ..QuestionDraft::new(request_id, questions) });
+                self.load_custom_answer(window, cx);
+            }
+        }
     }
 
     fn pending_question_request(&self) -> Option<(&RuntimeRequest, &TurnItem)> {
@@ -100,7 +156,6 @@ impl Workspace {
         projection.pending_user_inputs().into_iter().find(|(request, _)| &request.id == id)
     }
 
-    /// The composer text is the active question's custom answer.
     fn save_custom_answer(&mut self, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().to_string();
         let Some(draft) = &mut self.question else { return };
@@ -112,7 +167,7 @@ impl Workspace {
         draft.drafts.insert(question.id.clone(), next);
     }
 
-    pub(super) fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = &self.question else { return };
         let question = &draft.questions[draft.index];
         let text = draft.drafts.get(&question.id).and_then(|d| d.custom.clone()).unwrap_or_default();
@@ -121,7 +176,6 @@ impl Workspace {
 
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
     pub(super) fn advance_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_custom_answer(cx);
         let Some(draft) = &mut self.question else { return };
         let question = &draft.questions[draft.index];
         if requests::answer(question, draft.drafts.get(&question.id)).is_none() {
@@ -138,12 +192,10 @@ impl Workspace {
         if self.responding.is_some() {
             return;
         }
-        self.set_composer_text("", window, cx);
         self.respond(request_id, json!({"answers": answers}), cx);
     }
 
     fn previous_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_custom_answer(cx);
         let Some(draft) = &mut self.question else { return };
         draft.index = draft.index.saturating_sub(1);
         self.load_custom_answer(window, cx);
@@ -467,8 +519,7 @@ impl Workspace {
                 self.pending_question_request().is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
             let last = draft.index + 1 == draft.questions.len();
             let question = &draft.questions[draft.index];
-            let answered = !self.composer_empty && question.allows_custom()
-                || requests::answer(question, draft.drafts.get(&question.id)).is_some();
+            let answered = requests::answer(question, draft.drafts.get(&question.id)).is_some();
             let ready = if last {
                 draft.questions.iter().enumerate().all(|(i, q)| {
                     (i == draft.index && answered) || requests::answer(q, draft.drafts.get(&q.id)).is_some()
@@ -804,7 +855,7 @@ impl Workspace {
                 .child(v_flex().ml(px(-6.)).mt(px(6.)).children(question.options.iter().enumerate().map(
                     |(index, option)| {
                         let value = option.value().to_owned();
-                        let selected = self.composer_empty && requests::is_selected(question, draft_answer, &value);
+                        let selected = requests::is_selected(question, draft_answer, &value);
                         render_option(question, option, index, selected, disabled, t).when(!disabled, |el| {
                             el.on_click(
                                 cx.listener(move |this, _, window, cx| this.pick_option(value.clone(), window, cx)),

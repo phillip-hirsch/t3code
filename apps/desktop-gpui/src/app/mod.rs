@@ -1,7 +1,7 @@
 //! The main window: sidebar of projects and threads, the open thread's
 //! timeline, pending approvals, and the composer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ enum Connection {
 }
 
 /// Where the composer sends.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Target {
     Thread(String),
     /// A new thread in this project, created by the first message.
@@ -83,6 +83,8 @@ pub struct Workspace {
     composer_empty: bool,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
+    /// Composer text and question drafts of the targets not on screen.
+    composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The request whose response is in flight.
     responding: Option<String>,
     error: Option<SharedString>,
@@ -92,6 +94,8 @@ pub struct Workspace {
     /// Collapsed, the sidebar column is not rendered at all.
     sidebar_open: bool,
     details_open: bool,
+    /// The details card as a popover, while the canvas is too narrow for it inline.
+    details_popover: bool,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
     _connection_task: Task<()>,
@@ -136,6 +140,7 @@ impl Workspace {
             runtime_mode_override: None,
             composer_empty: true,
             question: None,
+            composer_drafts: HashMap::new(),
             responding: None,
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
@@ -146,6 +151,7 @@ impl Workspace {
             },
             sidebar_open: true,
             details_open: true,
+            details_popover: false,
             lineage_expanded: None,
             _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
@@ -330,9 +336,7 @@ impl Workspace {
                 log::warn!("bad thread event: {error}");
             }
             this.refresh_rows(cx);
-            if this.sync_question() {
-                this.load_custom_answer(window, cx);
-            }
+            this.sync_question(window, cx);
         }));
     }
 
@@ -360,10 +364,11 @@ impl Workspace {
         if self.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
             return;
         }
+        self.stash_composer(cx);
         self.target = Some(Target::Thread(thread_id.clone()));
         self.thread = Some(OpenThread { id: thread_id.clone(), state: ThreadState::default(), _subscription: None });
         self.model_override = None;
-        self.question = None;
+        self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
         self.open_visit(&thread_id, cx);
@@ -373,11 +378,12 @@ impl Workspace {
     }
 
     fn start_draft(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.stash_composer(cx);
         self.target = Some(Target::Draft { project_id });
         self.thread = None;
         self.model_override = None;
         self.runtime_mode_override = None;
-        self.question = None;
+        self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
@@ -587,7 +593,10 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let details_inline = self.chat_layout(window).1.is_some();
+        // Widening to the inline layout closes the popover, as the web does.
+        if self.details_inline(window) {
+            self.details_popover = false;
+        }
         let theme = cx.theme();
         div()
             .size_full()
@@ -599,10 +608,8 @@ impl Render for Workspace {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleThreadDetails, _, cx| {
-                this.details_open = !this.details_open;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .capture_key_down(cx.listener(Self::escape_details_popover))
             .child(
                 h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_cached_sidebar())).child(
                     v_flex()
@@ -623,7 +630,7 @@ impl Render for Workspace {
                                         .child(self.render_body(window, cx))
                                         .child(self.render_composer(window, cx)),
                                 )
-                                .when(details_inline, |el| el.children(self.render_details_card(cx))),
+                                .children(self.render_details_card(window, cx)),
                         ),
                 ),
             )
