@@ -383,7 +383,7 @@ impl Workspace {
             Some(terminal_id) => {
                 drawer.set_active(&terminal_id);
                 self.terminals.focus_pending = Some(terminal_id.clone());
-                if let Some(client) = self.client() {
+                if let Some(client) = self.thread_client(&thread_id) {
                     let payload = json!({"threadId": thread_id, "terminalId": terminal_id, "data": input});
                     cx.spawn(async move |this, cx| {
                         if let Err(error) = client.request("terminal.write", payload).await {
@@ -412,7 +412,7 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.client().is_none() {
+        if self.thread_client(&thread_id).is_none() {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
@@ -441,7 +441,8 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        // A terminal runs on its thread's environment (a draft's is the open one).
+        let Some(client) = self.thread_client(&thread_id) else { return };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
@@ -505,7 +506,7 @@ impl Workspace {
                 self.terminals.focus_pending = Some(drawer.active_id.clone());
             }
         }
-        if let Some(client) = self.client() {
+        if let Some(client) = self.thread_client(thread_id) {
             let (thread_id, terminal_id) = (thread_id.to_owned(), terminal_id.to_owned());
             cx.background_spawn(async move {
                 let close = json!({"threadId": thread_id, "terminalId": terminal_id, "deleteHistory": true});
@@ -551,7 +552,7 @@ impl Workspace {
                     launch.worktree_path = summary.worktree_path.clone();
                 }
             }
-            let client = self.client();
+            let client = self.thread_client(&thread_id);
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
             let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, window, cx));
             let _events = cx.subscribe_in(&session, window, |this, session, event: &SessionEvent, window, cx| {
