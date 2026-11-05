@@ -124,6 +124,13 @@ pub struct Provider {
     pub supports_text_generation: Option<bool>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    /// `versionAdvisory`, `compatibilityAdvisory` and `updateState` (`packages/contracts/src/server.ts`).
+    #[serde(default)]
+    pub version_advisory: Option<Value>,
+    #[serde(default)]
+    pub compatibility_advisory: Option<Value>,
+    #[serde(default)]
+    pub update_state: Option<Value>,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
@@ -260,6 +267,10 @@ pub struct ServerInfo {
     pub keybindings_config_path: Option<String>,
     /// `config.availableEditors`, editor ids that can open a path on the server's host.
     pub available_editors: Vec<String>,
+    /// `snoozePresets`; null means the defaults (`crate::inbox::snooze_presets`).
+    pub snooze_presets: Value,
+    /// Where "Add project" starts browsing; empty means `~/`.
+    pub add_project_base_directory: String,
 }
 
 impl ServerInfo {
@@ -319,6 +330,9 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.snooze_presets = settings.get("snoozePresets").cloned().unwrap_or_default();
+        self.add_project_base_directory =
+            settings.get("addProjectBaseDirectory").and_then(Value::as_str).unwrap_or_default().to_owned();
         Ok(())
     }
 
@@ -408,6 +422,11 @@ pub struct ProjectShell {
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,
+    /// The repo favicon the server found, relative to the workspace root.
+    #[serde(default)]
+    pub favicon_path: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

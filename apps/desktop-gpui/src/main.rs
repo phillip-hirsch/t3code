@@ -11,6 +11,7 @@ mod pull_requests;
 mod requests;
 mod rpc;
 mod settings;
+mod search;
 mod theme;
 mod timeline;
 mod usage;
@@ -42,6 +43,7 @@ fn main() {
             .expect("bundled fonts");
         // The defaults until the server's keybindings arrive.
         app::keymap::install(&[], cx);
+        cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-z", app::UndoThreadAction, None)]);
         // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {

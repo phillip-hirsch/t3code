@@ -17,6 +17,9 @@ const COMMANDS: &[(&str, fn() -> Box<dyn Action>)] = &[
     ("navigation.back", || Box::new(GoBack)),
     ("navigation.forward", || Box::new(GoForward)),
     ("usage.open", || Box::new(OpenUsage)),
+    ("commandPalette.toggle", || Box::new(super::TogglePalette)),
+    ("chat.new", || Box::new(super::NewThread)),
+    ("chat.newLocal", || Box::new(super::NewThreadInProject)),
 ];
 
 /// The when-clause context (`ShortcutMatchContext` in `apps/web/src/keybindings.ts`).
@@ -120,7 +123,7 @@ mod tests {
         assert!(bound.contains(&("ctrl-b".into(), "sidebar.toggle")));
         assert!(bound.contains(&("ctrl-shift-b".into(), "threadPanel.toggle")), "!terminalFocus holds");
         assert!(bound.contains(&("ctrl-[".into(), "navigation.back")));
-        assert!(!bound.iter().any(|(_, command)| *command == "chat.new"), "no handler yet");
+        assert!(bound.contains(&("ctrl-k".into(), "commandPalette.toggle")));
         let gated = [compile("mod+y", "sidebar.toggle", Some("terminalFocus")).unwrap()];
         assert!(bindable(&gated, false).is_empty(), "terminalFocus never holds here");
         let custom = keybindings::merge_with_defaults(&[compile("mod+alt+y", "sidebar.toggle", None).unwrap()]);

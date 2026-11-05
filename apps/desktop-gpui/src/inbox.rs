@@ -74,25 +74,38 @@ pub fn format_relative(elapsed_ms: i64) -> String {
 /// thread's latest user message (else updated, else created), or its own
 /// updated/created time without threads; ties go by title, then id.
 pub fn most_recent_project<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Option<&'a ProjectShell> {
+    projects_by_recency(projects, threads).into_iter().next()
+}
+
+/// Unarchived projects, newest first (`sortScopedProjectsForSidebar(.., "updated_at")`).
+pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Vec<&'a ProjectShell> {
     let thread_time = |t: &ThreadShell| {
         ms(t.latest_user_message_at.as_deref()).or_else(|| parse_ms(&t.updated_at)).or_else(|| parse_ms(&t.created_at))
     };
+    let mut latest: HashMap<&str, i64> = HashMap::new();
+    for thread in threads.iter().filter(|t| t.archived_at.is_none()) {
+        let time = thread_time(thread).unwrap_or(i64::MIN);
+        latest.entry(thread.project_id.as_str()).and_modify(|l| *l = (*l).max(time)).or_insert(time);
+    }
     let project_time = |p: &ProjectShell| {
-        let mut latest: Option<i64> = None;
-        for thread in threads.iter().filter(|t| t.project_id == p.id && t.archived_at.is_none()) {
-            let time = thread_time(thread).unwrap_or(i64::MIN);
-            latest = Some(latest.map_or(time, |l| l.max(time)));
-        }
-        latest.or_else(|| ms(p.updated_at.as_deref().or(p.created_at.as_deref()))).unwrap_or(i64::MIN)
+        latest
+            .get(p.id.as_str())
+            .copied()
+            .or_else(|| ms(p.updated_at.as_deref().or(p.created_at.as_deref())))
+            .unwrap_or(i64::MIN)
     };
-    projects
-        .iter()
-        .filter(|p| p.archived_at.is_none())
-        .map(|p| (project_time(p), p))
-        .max_by(|(a_time, a), (b_time, b)| {
-            a_time.cmp(b_time).then_with(|| b.title.cmp(&a.title)).then_with(|| b.id.cmp(&a.id))
-        })
-        .map(|(_, p)| p)
+    let mut sorted: Vec<&ProjectShell> = projects.iter().filter(|p| p.archived_at.is_none()).collect();
+    sorted.sort_by(|a, b| {
+        project_time(b).cmp(&project_time(a)).then_with(|| a.title.cmp(&b.title)).then_with(|| a.id.cmp(&b.id))
+    });
+    sorted
+}
+
+/// `pickableProjectGroups`: pinned projects first, each part newest first.
+pub fn pickable_projects<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Vec<&'a ProjectShell> {
+    let mut sorted = projects_by_recency(projects, threads);
+    sorted.sort_by_key(|p| p.pinned_at.is_none());
+    sorted
 }
 
 /// Milliseconds until [`format_relative`] shows a different label.
@@ -449,6 +462,32 @@ impl<'a> Facts<'a> {
         .fold(0, i64::max)
     }
 
+    /// `canSnooze` in `threadSettled.ts`: nothing waits on the user and no turn is queued.
+    pub fn can_snooze(&self, now: i64) -> bool {
+        let t = self.thread;
+        if t.pending_runtime_request.is_some() || self.child_request.is_some() || t.pending_guest_message_count > 0 {
+            return false;
+        }
+        !self.has_queued_turn_start(now)
+    }
+
+    /// `hasQueuedTurnStart`, bounded by the 2-minute grace on both sides.
+    fn has_queued_turn_start(&self, now: i64) -> bool {
+        if matches!(self.runtime_status(), Some("preparing" | "queued" | "starting")) {
+            return true;
+        }
+        let Some(message_at) = ms(self.thread.latest_user_message_at.as_deref()) else { return false };
+        if self.runtime_status() == Some("error") || (now - message_at).abs() > 2 * 60_000 {
+            return false;
+        }
+        if self.thread.latest_run_id.is_none() {
+            return true;
+        }
+        [self.latest_run_requested_at(), self.latest_run_started_at(), self.latest_run_completed_at()]
+            .into_iter()
+            .all(|at| ms(at).is_none_or(|at| at < message_at))
+    }
+
     fn send_timestamp(&self) -> i64 {
         let sent = match &self.thread.latest_user_authored_message_at {
             Some(authored) => authored.as_deref(),
@@ -688,6 +727,285 @@ pub const PROJECT_COLORS: [(&str, u32, u32); 18] = [
     ("pink", 0xe60076, 0xfb64b6),
     ("rose", 0xec003f, 0xff637e),
 ];
+
+/// `isProviderUpdateCandidate` + `canOneClickUpdateProviderCandidate`: enabled,
+/// behind its latest version, not known broken, one-click updatable, not updating.
+pub fn is_provider_update_candidate(provider: &crate::model::Provider) -> bool {
+    let advisory = provider.version_advisory.as_ref();
+    let field = |key: &str| advisory.map(|a| &a[key]);
+    let latest_status = provider.compatibility_advisory.as_ref().and_then(|c| c["latestVersionStatus"].as_str());
+    let updating = provider.update_state.as_ref().and_then(|u| u["status"].as_str());
+    provider.enabled
+        && !matches!(latest_status, Some("broken" | "unsupported"))
+        && field("status").and_then(|s| s.as_str()) == Some("behind_latest")
+        && field("latestVersion").is_some_and(|v| v.is_string())
+        && field("canUpdate").and_then(|v| v.as_bool()) == Some(true)
+        && !matches!(updating, Some("queued" | "running"))
+}
+
+/// One `snoozePresets` entry (`packages/contracts/src/settings.ts`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SnoozeSetting {
+    After {
+        minutes: i64,
+    },
+    /// `day` is `today`, `tomorrow`, or a lowercase weekday name.
+    At {
+        day: String,
+        hour: u32,
+        minute: u32,
+    },
+}
+
+impl SnoozeSetting {
+    fn id(&self) -> String {
+        match self {
+            SnoozeSetting::After { minutes } => format!("after:{minutes}"),
+            SnoozeSetting::At { day, hour, minute } => format!("at:{day}:{hour:02}:{minute:02}"),
+        }
+    }
+}
+
+/// The server's `snoozePresets`, else `DEFAULT_SNOOZE_PRESETS`.
+pub fn snooze_settings(value: &serde_json::Value) -> Vec<SnoozeSetting> {
+    let Some(entries) = value.as_array() else {
+        let at = |day: &str, hour| SnoozeSetting::At { day: day.into(), hour, minute: 0 };
+        return vec![
+            SnoozeSetting::After { minutes: 60 },
+            SnoozeSetting::After { minutes: 180 },
+            at("today", 18),
+            at("tomorrow", 9),
+            at("monday", 9),
+        ];
+    };
+    entries
+        .iter()
+        .filter_map(|entry| match entry["kind"].as_str()? {
+            "after" => Some(SnoozeSetting::After { minutes: entry["minutes"].as_i64()? }),
+            "at" => {
+                let (hour, minute) = entry["time"].as_str()?.split_once(':')?;
+                let day = entry["day"].as_str()?.to_owned();
+                Some(SnoozeSetting::At { day, hour: hour.parse().ok()?, minute: minute.parse().ok()? })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A snooze menu row (`SnoozePreset`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnoozePreset {
+    pub id: String,
+    pub label: String,
+    pub when_label: String,
+    pub wake_ms: i64,
+}
+
+const WEEKDAYS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+fn plural(count: i64, unit: &str) -> String {
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// "3:05 PM", the en-US `formatShortTimestamp`.
+pub fn clock_label<Tz: chrono::TimeZone>(at: &chrono::DateTime<Tz>) -> String {
+    use chrono::Timelike as _;
+    let suffix = if at.hour() < 12 { "AM" } else { "PM" };
+    format!("{}:{:02} {suffix}", (at.hour() + 11) % 12 + 1, at.minute())
+}
+
+/// `resolveSnoozePreset` in the zone of `now`; `None` once a set time has passed.
+pub fn resolve_snooze<Tz: chrono::TimeZone>(
+    setting: &SnoozeSetting,
+    now: &chrono::DateTime<Tz>,
+) -> Option<SnoozePreset> {
+    use chrono::Datelike as _;
+    let now_ms = now.timestamp_millis();
+    let (wake, label, names_day) = match setting {
+        SnoozeSetting::After { minutes } => {
+            let duration = if minutes % 1440 == 0 {
+                plural(minutes / 1440, "day")
+            } else if minutes % 60 == 0 {
+                plural(minutes / 60, "hour")
+            } else {
+                plural(*minutes, "minute")
+            };
+            (now.clone() + chrono::Duration::minutes(*minutes), format!("In {duration}"), false)
+        }
+        SnoozeSetting::At { day, hour, minute } => {
+            let today = now.weekday().num_days_from_sunday() as i64;
+            let days_ahead = match day.as_str() {
+                "today" => 0,
+                "tomorrow" => 1,
+                weekday => match (WEEKDAYS.iter().position(|d| *d == weekday)? as i64 - today + 7) % 7 {
+                    0 => 7,
+                    n => n,
+                },
+            };
+            // A calendar-day advance, so DST days keep their local time.
+            let date = now.date_naive().checked_add_days(chrono::Days::new(days_ahead as u64))?;
+            let local = date.and_hms_opt(*hour, *minute, 0)?;
+            let zone = now.timezone();
+            let wake = zone
+                .from_local_datetime(&local)
+                .earliest()
+                .or_else(|| zone.from_local_datetime(&(local + chrono::Duration::hours(1))).earliest())?;
+            if wake.timestamp_millis() <= now_ms {
+                return None;
+            }
+            let label = match days_ahead {
+                0 if *hour < 12 => "This morning".to_owned(),
+                0 if *hour < 17 => "This afternoon".to_owned(),
+                0 => "This evening".to_owned(),
+                1 => "Tomorrow".to_owned(),
+                _ if day == "monday" => "Next week".to_owned(),
+                7 => format!("Next {}", capitalize(day)),
+                _ => capitalize(day),
+            };
+            let names_day = label != "Next week";
+            (wake, label, names_day)
+        }
+    };
+    let time = clock_label(&wake);
+    let when_label = if names_day || wake.date_naive() == now.date_naive() {
+        time
+    } else {
+        format!("{} {time}", capitalize(&WEEKDAYS[wake.weekday().num_days_from_sunday() as usize][..3]))
+    };
+    Some(SnoozePreset { id: setting.id(), label, when_label, wake_ms: wake.timestamp_millis() })
+}
+
+/// `resolveSnoozePresets`: soonest first, one row per wake minute.
+pub fn snooze_presets<Tz: chrono::TimeZone>(
+    settings: &[SnoozeSetting],
+    now: &chrono::DateTime<Tz>,
+) -> Vec<SnoozePreset> {
+    let mut presets: Vec<SnoozePreset> = settings.iter().filter_map(|s| resolve_snooze(s, now)).collect();
+    presets.sort_by_key(|p| p.wake_ms.div_euclid(60_000));
+    presets.dedup_by_key(|p| p.wake_ms.div_euclid(60_000));
+    presets
+}
+
+/// `pickSnoozePreset`: a duration counts from the pick; a set time keeps the
+/// shown wake while it is still ahead.
+pub fn pick_snooze<Tz: chrono::TimeZone>(
+    shown: &[SnoozePreset],
+    id: &str,
+    settings: &[SnoozeSetting],
+    now: &chrono::DateTime<Tz>,
+) -> Option<i64> {
+    let after = settings.iter().find(|s| matches!(s, SnoozeSetting::After { .. }) && s.id() == id);
+    if let Some(preset) = after.and_then(|s| resolve_snooze(s, now)) {
+        return Some(preset.wake_ms);
+    }
+    shown.iter().find(|p| p.id == id).map(|p| p.wake_ms).filter(|wake| *wake > now.timestamp_millis())
+}
+
+/// An ISO-8601 UTC timestamp, as `Date#toISOString`.
+pub fn iso(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+const PIN_DIGITS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+fn pin_midpoint(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if !b.is_empty() {
+        let n = (0..b.len()).take_while(|&n| a.get(n).copied().unwrap_or(b'a') == b[n]).count();
+        if n > 0 {
+            let mut key = b[..n].to_vec();
+            key.extend(pin_midpoint(a.get(n..).unwrap_or_default(), &b[n..]));
+            return key;
+        }
+    }
+    let digit_a = a.first().map_or(0, |c| (c - b'a') as usize);
+    let digit_b = b.first().map_or(PIN_DIGITS.len(), |c| (c - b'a') as usize);
+    if digit_b - digit_a > 1 {
+        return vec![PIN_DIGITS[((digit_a + digit_b) as f32 / 2.).round() as usize]];
+    }
+    if b.len() > 1 {
+        return vec![b[0]];
+    }
+    let mut key = vec![PIN_DIGITS[digit_a]];
+    key.extend(pin_midpoint(a.get(1..).unwrap_or_default(), b""));
+    key
+}
+
+/// `pinOrderKeyBetween`: a key sorting strictly between two neighbors, `None`
+/// for corrupt or out-of-order keys (the server then picks one).
+pub fn pin_key_between(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    let valid = |key: &str| key.bytes().all(|c| c.is_ascii_lowercase()) && !key.is_empty() && !key.ends_with('a');
+    let (a, b) = (before.unwrap_or_default(), after.unwrap_or_default());
+    if (!a.is_empty() && !valid(a)) || (!b.is_empty() && !valid(b)) || (!b.is_empty() && a >= b) {
+        return None;
+    }
+    String::from_utf8(pin_midpoint(a.as_bytes(), b.as_bytes())).ok()
+}
+
+/// The key that pins a thread above every other pin (`pinThread`).
+pub fn top_pin_key(threads: &[ThreadShell]) -> Option<String> {
+    let lowest = threads.iter().filter(|t| t.pinned_at.is_some()).filter_map(|t| t.pin_order_key.as_deref()).min();
+    pin_key_between(None, lowest)
+}
+
+/// The custom snooze dialog's unit (`CustomSnoozeDialog.tsx`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnoozeUnit {
+    Minutes,
+    Hours,
+    Days,
+}
+
+impl SnoozeUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            SnoozeUnit::Minutes => "Minutes",
+            SnoozeUnit::Hours => "Hours",
+            SnoozeUnit::Days => "Days",
+        }
+    }
+}
+
+pub enum CustomSnooze {
+    Date { date: String, time: String },
+    Duration { amount: String, unit: SnoozeUnit },
+}
+
+/// `resolveCustomSnooze`: the wake time in ms, or the dialog's error text.
+pub fn resolve_custom_snooze<Tz: chrono::TimeZone>(
+    input: &CustomSnooze,
+    now: &chrono::DateTime<Tz>,
+) -> Result<i64, &'static str> {
+    let now_ms = now.timestamp_millis();
+    match input {
+        CustomSnooze::Duration { amount, unit } => {
+            const ERROR: &str = "Enter a positive duration.";
+            let amount: f64 = amount.trim().parse().map_err(|_| ERROR)?;
+            let unit_ms = match unit {
+                SnoozeUnit::Minutes => 60_000.,
+                SnoozeUnit::Hours => 3_600_000.,
+                SnoozeUnit::Days => 86_400_000.,
+            };
+            if !amount.is_finite() || amount <= 0. {
+                return Err(ERROR);
+            }
+            Ok(now_ms + (amount * unit_ms).round() as i64)
+        }
+        CustomSnooze::Date { date, time } => {
+            const ERROR: &str = "Choose a valid date and time in the future.";
+            let date = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").map_err(|_| ERROR)?;
+            let time = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M").map_err(|_| ERROR)?;
+            // A nonexistent local time (a DST gap) has no single reading: refuse it.
+            let wake = now.timezone().from_local_datetime(&date.and_time(time)).single().ok_or(ERROR)?;
+            let wake = wake.timestamp_millis();
+            if wake <= now_ms { Err(ERROR) } else { Ok(wake) }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1062,5 +1380,83 @@ mod tests {
         );
         assert_eq!(Facts::new(&activity, &requests).working_started_at(), parse_ms("2026-11-04T11:25:00.000Z"));
         assert_eq!(Facts::new(&run, &requests).working_started_at(), parse_ms("2026-11-04T11:00:00.000Z"));
+    }
+
+    #[test]
+    fn snooze_presets_follow_the_web_labels_and_order() {
+        use chrono::TimeZone as _;
+        // Tuesday 2026-11-03 14:05 local.
+        let zone = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        let now = zone.with_ymd_and_hms(2026, 11, 3, 14, 5, 0).unwrap();
+        let settings = snooze_settings(&serde_json::Value::Null);
+        let presets = snooze_presets(&settings, &now);
+        let rows: Vec<(&str, &str)> = presets.iter().map(|p| (p.label.as_str(), p.when_label.as_str())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("In 1 hour", "3:05 PM"),
+                ("In 3 hours", "5:05 PM"),
+                ("This evening", "6:00 PM"),
+                ("Tomorrow", "9:00 AM"),
+                ("Next week", "Mon 9:00 AM"),
+            ]
+        );
+        // After 6 PM "This evening" is gone; on a Sunday Monday 9:00 folds into Tomorrow.
+        let sunday = zone.with_ymd_and_hms(2026, 11, 8, 19, 0, 0).unwrap();
+        let labels: Vec<String> = snooze_presets(&settings, &sunday).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, ["In 1 hour", "In 3 hours", "Tomorrow"]);
+        let late = zone.with_ymd_and_hms(2026, 11, 3, 23, 30, 0).unwrap();
+        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 90 }, &late).unwrap().when_label, "Wed 1:00 AM");
+        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 2880 }, &late).unwrap().label, "In 2 days");
+        let later = now + chrono::Duration::minutes(10);
+        assert_eq!(pick_snooze(&presets, "after:60", &settings, &later), Some(later.timestamp_millis() + 3_600_000));
+        assert_eq!(pick_snooze(&presets, "at:tomorrow:09:00", &settings, &later), Some(presets[3].wake_ms));
+        assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pin_keys_sort_between_their_neighbors() {
+        assert_eq!(pin_key_between(None, None).as_deref(), Some("n"));
+        assert_eq!(pin_key_between(None, Some("n")).as_deref(), Some("h"));
+        assert_eq!(pin_key_between(Some("n"), None).as_deref(), Some("u"));
+        assert_eq!(pin_key_between(Some("n"), Some("na")), None, "a trailing `a` is corrupt");
+        assert_eq!(pin_key_between(Some("u"), Some("n")), None);
+        for after in ["b", "ab", "aab"] {
+            let key = pin_key_between(None, Some(after)).unwrap();
+            assert!(key.as_str() < after && !key.ends_with('a'), "{key} < {after}");
+        }
+    }
+
+    #[test]
+    fn custom_snooze_needs_a_future_time_or_positive_duration() {
+        use chrono::TimeZone as _;
+        let zone = chrono::FixedOffset::east_opt(0).unwrap();
+        let now = zone.with_ymd_and_hms(2026, 11, 3, 14, 5, 0).unwrap();
+        let at = |date: &str, time: &str| CustomSnooze::Date { date: date.into(), time: time.into() };
+        let after = |amount: &str| CustomSnooze::Duration { amount: amount.into(), unit: SnoozeUnit::Hours };
+        assert_eq!(resolve_custom_snooze(&at("2026-11-03", "15:00"), &now), Ok(now.timestamp_millis() + 55 * 60_000));
+        assert!(resolve_custom_snooze(&at("2026-11-03", "14:00"), &now).is_err(), "in the past");
+        assert!(resolve_custom_snooze(&at("2026-02-30", "09:00"), &now).is_err(), "no such day");
+        assert_eq!(resolve_custom_snooze(&after("1.5"), &now), Ok(now.timestamp_millis() + 5_400_000));
+        assert_eq!(resolve_custom_snooze(&after("0"), &now), Err("Enter a positive duration."));
+    }
+
+    #[test]
+    fn provider_updates_need_a_one_click_update_to_a_newer_version() {
+        let provider = |advisory: serde_json::Value, extra: serde_json::Value| {
+            let mut value = serde_json::json!({"instanceId": "codex", "driver": "codex", "enabled": true, "versionAdvisory": advisory});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<crate::model::Provider>(value).unwrap()
+        };
+        let behind = serde_json::json!({"status": "behind_latest", "latestVersion": "1.2.0", "canUpdate": true});
+        assert!(is_provider_update_candidate(&provider(behind.clone(), serde_json::json!({}))));
+        let current = serde_json::json!({"status": "current", "latestVersion": "1.2.0", "canUpdate": true});
+        assert!(!is_provider_update_candidate(&provider(current, serde_json::json!({}))));
+        let manual = serde_json::json!({"status": "behind_latest", "latestVersion": "1.2.0", "canUpdate": false});
+        assert!(!is_provider_update_candidate(&provider(manual, serde_json::json!({}))));
+        let broken = serde_json::json!({"compatibilityAdvisory": {"latestVersionStatus": "broken"}});
+        assert!(!is_provider_update_candidate(&provider(behind.clone(), broken)));
+        let running = serde_json::json!({"updateState": {"status": "running"}});
+        assert!(!is_provider_update_candidate(&provider(behind, running)));
     }
 }

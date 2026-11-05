@@ -158,7 +158,7 @@ impl Workspace {
             .map(|id| self.render_spec(spec(id), window, cx).render(&t));
         let mut sections = vec![
             section("New projects", None, new_projects, &t),
-            section("New threads", None, self.new_thread_rows(cx), &t),
+            section("New threads", None, self.settings_new_thread_rows(cx), &t),
             section("Snooze", None, [self.snooze_row(window, cx)], &t),
             section("Usage limits", None, usage, &t),
         ];
@@ -196,7 +196,7 @@ impl Workspace {
     }
 
     /// `ProjectDefaultsSettings category="general"`: Model, Fallback model, Permissions, Workspace.
-    fn new_thread_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn settings_new_thread_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let stored = self.setting("defaultModelSelection").clone();
         let automatic = stored.is_null();

@@ -30,11 +30,15 @@ mod header;
 pub(crate) mod keymap;
 mod layout;
 mod pages;
+mod palette;
 mod sidebar;
 mod titlebar;
 mod visits;
 
-gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
+gpui_kit::actions!(
+    workspace,
+    [ToggleSidebar, ToggleThreadDetails, TogglePalette, NewThread, NewThreadInProject, UndoThreadAction]
+);
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -70,6 +74,8 @@ pub struct Workspace {
     connection: Connection,
     /// The server the socket talks to, for its HTTP routes (`/api/auth/*`).
     endpoint: Option<backend::Endpoint>,
+    /// The connected server's HTTP origin, for signed asset URLs.
+    http_base: Option<String>,
     server: Option<ServerHandle>,
     server_info: ServerInfo,
     shell: ShellState,
@@ -132,6 +138,10 @@ pub struct Workspace {
     keybindings_panel: Option<gpui_kit::AnyView>,
     /// Open "Advanced" folds in Settings sections, by section id.
     settings_folds: HashSet<&'static str>,
+    /// The command palette, while open.
+    palette: Option<palette::Palette>,
+    /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
+    focus: gpui_kit::FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -159,6 +169,7 @@ impl Workspace {
         Self {
             connection: Connection::Starting,
             endpoint: None,
+            http_base: None,
             server: None,
             server_info: ServerInfo::default(),
             shell: ShellState::default(),
@@ -205,6 +216,8 @@ impl Workspace {
             installed_keybindings: Rc::default(),
             keybindings_panel: None,
             settings_folds: HashSet::new(),
+            palette: None,
+            focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -276,6 +289,7 @@ impl Workspace {
                         let current = endpoint.clone();
                         if this
                             .update_in(cx, |this, window, cx| {
+                                this.http_base = Some(current.http_base.clone());
                                 this.endpoint = Some(current);
                                 this.on_connected(client.clone(), window, cx)
                             })
@@ -812,10 +826,14 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
+        if window.focused(cx).is_none() {
+            self.focus.focus(window, cx);
+        }
         let theme = cx.theme();
         div()
             .size_full()
             .relative()
+            .track_focus(&self.focus)
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
@@ -827,6 +845,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &keymap::GoBack, window, cx| this.go_back(window, cx)))
             .on_action(cx.listener(|this, _: &keymap::GoForward, window, cx| this.go_forward(window, cx)))
             .on_action(cx.listener(|this, _: &keymap::OpenUsage, _, cx| this.open_page(pages::Page::Usage, cx)))
+            .on_action(
+                cx.listener(|this, _: &TogglePalette, window, cx| this.open_palette(palette::View::Root, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(false, window, cx)))
+            .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
+            .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -874,5 +898,6 @@ impl Render for Workspace {
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
+            .children(self.render_palette(window, cx))
     }
 }

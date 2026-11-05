@@ -149,7 +149,7 @@ impl SettingsUi {
             }
             InputEvent::PressEnter { .. } => {
                 if let Some(item) = this.settings_results(cx).get(this.settings_ui.active_result).cloned() {
-                    this.open_search_result(&item, window, cx);
+                    this.open_settings_search_result(&item, window, cx);
                 }
             }
             _ => {}
@@ -384,7 +384,7 @@ impl Workspace {
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).
-    fn open_search_result(&mut self, item: &SearchItem, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings_search_result(&mut self, item: &SearchItem, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
         let target = item.target_id.clone().unwrap_or_else(|| item.id.clone());
         // A row inside a fold opens it first.
@@ -484,7 +484,7 @@ impl Workspace {
                                 }
                             }))
                             .on_click(
-                                cx.listener(move |this, _, window, cx| this.open_search_result(&open, window, cx)),
+                                cx.listener(move |this, _, window, cx| this.open_settings_search_result(&open, window, cx)),
                             )
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(

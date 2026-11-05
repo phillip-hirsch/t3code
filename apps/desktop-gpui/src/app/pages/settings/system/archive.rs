@@ -115,7 +115,7 @@ impl Workspace {
         let now = now_ms();
         let sections = groups.into_iter().map(|(project, threads)| {
             let rows = threads.iter().map(|thread| self.archived_row(thread, &state, now, &t, cx)).collect();
-            section(project.title.clone(), Some(sidebar::project_icon(&project, &t, false)), rows, true, &t)
+            section(project.title.clone(), Some(sidebar::project_icon(&project, &t, false, 16., self.favicon(&project))), rows, true, &t)
         });
         gpui_kit::component::v_flex().gap_8().children(sections).into_any_element()
     }
