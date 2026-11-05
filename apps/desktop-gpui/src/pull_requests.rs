@@ -10,8 +10,8 @@ use std::rc::Rc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::inbox::parse_ms;
 use crate::rpc::RpcError;
+use crate::timestamp::parse_ms;
 
 /// One page from the host and no more: providers ask for one row beyond the page as their
 /// "is there more" probe, and GitHub serves a hundred per request.

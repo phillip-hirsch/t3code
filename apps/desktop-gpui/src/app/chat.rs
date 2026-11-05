@@ -484,7 +484,7 @@ pub(super) fn render_row(
         Row::Plan { id, plan } => plan_card(id, plan, this, lane_width, cx, &t),
         Row::Work(work) => work_row(work, this, &t, cx),
         Row::Working { started_at } => {
-            let label = match started_at.as_deref().and_then(work_log::parse_iso_ms) {
+            let label = match started_at.as_deref().and_then(crate::timestamp::parse_ms) {
                 Some(start) => format!("Working for {}", working_duration(now_ms() - start)),
                 None => "Working...".into(),
             };
@@ -705,8 +705,8 @@ pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Wor
                 .border_color(t.background)
                 .bg(dot),
         );
-    let elapsed = card.started_at.as_deref().and_then(work_log::parse_iso_ms).and_then(|start| {
-        let end = match card.completed_at.as_deref().and_then(work_log::parse_iso_ms) {
+    let elapsed = card.started_at.as_deref().and_then(crate::timestamp::parse_ms).and_then(|start| {
+        let end = match card.completed_at.as_deref().and_then(crate::timestamp::parse_ms) {
             Some(end) => end,
             None if card.live => now_ms(),
             None => return None,

@@ -415,11 +415,11 @@ pub(super) fn timestamp(
 ) -> Option<impl IntoElement> {
     let format = this.upgrade().and_then(|w| w.read(cx).client_settings.values.get("timestampFormat").as_str());
     let hour12 = crate::timestamp::hour12(format.unwrap_or_default());
-    let text = crate::timestamp::day_aware(iso, &jiff::Zoned::now(), hour12)?;
+    let text = crate::timestamp::day_aware(iso, &chrono::Local::now(), hour12)?;
     let iso = iso.clone();
     Some(div().id(ElementId::Name(id)).text_xs().text_color(t.muted_foreground).child(text).tooltip(
         move |window, cx| {
-            let tooltip = crate::timestamp::tooltip(&iso, &jiff::tz::TimeZone::system(), hour12).unwrap_or_default();
+            let tooltip = crate::timestamp::tooltip(&iso, &chrono::Local, hour12).unwrap_or_default();
             Tooltip::new(tooltip).build(window, cx)
         },
     ))

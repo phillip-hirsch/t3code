@@ -515,7 +515,7 @@ mod tests {
         let report = json!({"finishedAt": "2026-11-05T11:00:00Z", "bytesFreed": 2048,
             "counts": {"removed": 3, "kept": 1, "failed": 1}});
         assert_eq!(counts_label(&report), "3 removed, 1 kept, 1 failed");
-        let now = crate::inbox::parse_ms("2026-11-05T12:00:00Z").unwrap();
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
         assert_eq!(
             last_run_description(&report, now),
             "Last run 1h ago. 2.00 KB recovered. 1 item couldn't be removed."

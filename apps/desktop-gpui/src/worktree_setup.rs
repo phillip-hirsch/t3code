@@ -108,7 +108,7 @@ pub fn stage_trailing(stage: &Stage) -> Option<String> {
 
 /// `resolveVisibleWorktreeSetup` without a recorded snapshot: a finished setup gives way to the
 /// turn it started unless a stage failed.
-pub fn visible(snapshot: Option<&Snapshot>, turn_started: bool) -> Option<&Snapshot> {
+pub fn visible(snapshot: Option<&Rc<Snapshot>>, turn_started: bool) -> Option<&Rc<Snapshot>> {
     let snapshot = snapshot?;
     match snapshot.phase.as_str() {
         "running" => Some(snapshot),
@@ -120,13 +120,13 @@ pub fn visible(snapshot: Option<&Snapshot>, turn_started: bool) -> Option<&Snaps
 /// Puts the card in the timeline: after the working row when setup owns it, else after the
 /// first user message. Once the agent took over and its run started, the card folds to a
 /// summary row (`embedded`), and a running one hides.
-pub fn insert_row(rows: &mut Vec<Row>, snapshot: &Snapshot, run_started: bool) {
+pub fn insert_row(rows: &mut Vec<Row>, snapshot: &Rc<Snapshot>, run_started: bool) {
     let handed_off = snapshot.agent_started() && run_started;
     if handed_off && snapshot.phase == "running" {
         return;
     }
     let owns_working = !handed_off && matches!(snapshot.phase.as_str(), "running" | "done");
-    let row = Row::WorktreeSetup { snapshot: Rc::new(snapshot.clone()), embedded: handed_off };
+    let row = Row::WorktreeSetup { snapshot: Rc::clone(snapshot), embedded: handed_off };
     let working = owns_working.then(|| rows.iter().position(|r| matches!(r, Row::Working { .. }))).flatten();
     match working {
         Some(index) => rows.insert(index + 1, row),
@@ -148,7 +148,7 @@ mod tests {
 
     use super::*;
 
-    fn snapshot(phase: &str, stages: serde_json::Value) -> Snapshot {
+    fn snapshot(phase: &str, stages: serde_json::Value) -> Rc<Snapshot> {
         serde_json::from_value(json!({"threadId": "t", "phase": phase, "startedAt": "2026-01-01T00:00:00Z",
             "stages": stages, "sequence": 1}))
         .unwrap()

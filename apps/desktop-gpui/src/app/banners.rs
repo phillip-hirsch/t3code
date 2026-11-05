@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use super::{Connection, Target, Workspace, new_id};
 use crate::model::{Provider, ThreadShell};
 use crate::theme::Tokens;
+use crate::timestamp::parse_ms;
 
 /// `CHATGPT_USAGE_LIMIT_CODE` and friends (`packages/shared/src/usageLimits.ts`).
 const CHATGPT_USAGE_LIMIT_CODE: &str = "subscription_sharing_usage_limit_exceeded";
@@ -205,10 +206,6 @@ pub(crate) struct Recovery {
     pub scheduled: bool,
     pub snoozed: bool,
     pub reset_passed: bool,
-}
-
-fn parse_ms(iso: &str) -> Option<i64> {
-    iso.parse::<jiff::Timestamp>().ok().map(|t| t.as_millisecond())
 }
 
 /// `usageLimitRecoveryBannerItem` + `RecoveryActions`, for a thread whose latest run hit a limit.
@@ -649,14 +646,14 @@ impl Workspace {
 
     pub(super) fn render_recovery_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.open_shell_thread()?;
-        let state = recovery(thread, jiff::Timestamp::now().as_millisecond())?;
+        let state = recovery(thread, crate::timestamp::now_ms())?;
         let code = thread.last_error_code.as_deref();
         let workspace_limit = code == Some(CHATGPT_WORKSPACE_USAGE_LIMIT_CODE);
         let chatgpt_limit = workspace_limit || code == Some(CHATGPT_USAGE_LIMIT_CODE);
         let hour12 =
             crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));
         let reset = match state.reset_at.as_deref() {
-            Some(at) => crate::timestamp::upcoming(at, &jiff::Zoned::now(), hour12)
+            Some(at) => crate::timestamp::upcoming_local(at, hour12)
                 .map(|at| format!("Resets {at}"))
                 .unwrap_or_else(|| "Reset time unavailable; retry manually".into()),
             None => "Reset time unavailable; retry manually".into(),
@@ -742,10 +739,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client() else { return };
-        let reset_passed = update["resetAt"]
-            .as_str()
-            .and_then(parse_ms)
-            .is_none_or(|reset| reset <= jiff::Timestamp::now().as_millisecond());
+        let reset_passed =
+            update["resetAt"].as_str().and_then(parse_ms).is_none_or(|reset| reset <= crate::timestamp::now_ms());
         if snooze && update["snooze"] == true && reset_passed {
             let note = Notification::error("The reset time has passed. Retry the thread manually.")
                 .title("Could not snooze thread");

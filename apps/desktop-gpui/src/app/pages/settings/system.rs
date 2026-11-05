@@ -528,7 +528,7 @@ fn now_ms() -> i64 {
 
 /// `formatRelativeTimeLabel` (`apps/web/src/timestampFormat.ts`).
 fn relative_label(iso: &str, now_ms: i64) -> String {
-    let Some(at) = crate::inbox::parse_ms(iso) else { return String::new() };
+    let Some(at) = crate::timestamp::parse_ms(iso) else { return String::new() };
     let minutes = (now_ms - at).max(0) / 60_000;
     match minutes {
         0 => "just now".into(),
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(format_bytes(1536.), "1.50 KB");
         assert_eq!(format_bytes(1024. * 1023.6), "1.00 MB", "the unit is picked after rounding");
         assert_eq!(format_bytes(150. * 1024. * 1024.), "150 MB");
-        let now = crate::inbox::parse_ms("2026-11-05T12:00:00Z").unwrap();
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
         assert_eq!(relative_label("2026-11-05T11:59:30Z", now), "just now");
         assert_eq!(relative_label("2026-11-05T11:15:00Z", now), "45m ago");
         assert_eq!(relative_label("2026-11-03T12:00:00Z", now), "2d ago");

@@ -29,7 +29,7 @@ pub(super) struct WorkflowUi {
 }
 
 fn iso(ms: Option<i64>) -> Option<SharedString> {
-    jiff::Timestamp::from_millisecond(ms?).ok().map(|at| at.to_string().into())
+    crate::timestamp::iso(ms?).map(Into::into)
 }
 
 fn card(member: &Member, driver: &str) -> Rc<SubagentCard> {

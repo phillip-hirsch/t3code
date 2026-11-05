@@ -39,9 +39,10 @@ gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-yaml",
 ] }
 hmac = "0.12"
+# The system zone's IANA name, which usage reads send so the server buckets days locally.
+iana-time-zone = "0.1"
 # Agent browser tabs stream JPEG frames and SnapShots encode PNG; GPUI already builds both codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-jiff = "0.2"
 log = "0.4"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }

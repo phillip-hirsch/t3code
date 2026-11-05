@@ -6,6 +6,7 @@ mod prices;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -17,8 +18,6 @@ use gpui_kit::{
     MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
 };
-use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use super::super::Workspace;
@@ -36,7 +35,6 @@ pub(in crate::app) struct UsageState {
     hidden: Vec<String>,
     /// The environment filter: this window reads one environment, so it is on or off.
     environment_selected: bool,
-    tz: TimeZone,
     window: UsageWindow,
     /// The answer on screen and the window it answers; a new window keeps it until it lands.
     summary: Option<(Rc<Summary>, UsageWindow)>,
@@ -55,16 +53,20 @@ pub(in crate::app) struct UsageState {
     redeemed: Vec<(String, String, Option<String>)>,
 }
 
+/// A usage window ending now, in the system time zone.
+fn local_window(days: u32) -> UsageWindow {
+    let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
+    UsageWindow::new(days, crate::timestamp::now_ms(), &Local, zone)
+}
+
 impl Default for UsageState {
     fn default() -> Self {
-        let tz = TimeZone::system();
         Self {
             metric: "limits",
             days: 30,
             hidden: Vec::new(),
             environment_selected: true,
-            window: UsageWindow::new(30, Timestamp::now(), &tz),
-            tz,
+            window: local_window(30),
             summary: None,
             merged: Rc::default(),
             error: None,
@@ -147,7 +149,7 @@ impl Workspace {
 
     fn select_usage_window(&mut self, days: u32, cx: &mut Context<Self>) {
         self.usage.days = days;
-        self.usage.window = UsageWindow::new(days, Timestamp::now(), &self.usage.tz);
+        self.usage.window = local_window(days);
         self.usage.hover = None;
         self.read_usage(false, cx);
     }
@@ -254,7 +256,7 @@ impl Workspace {
             self.refresh_limits(false, cx);
             return;
         }
-        self.usage.window = UsageWindow::new(self.usage.days, Timestamp::now(), &self.usage.tz);
+        self.usage.window = local_window(self.usage.days);
         self.usage.refreshing = true;
         self.read_usage(true, cx);
     }
@@ -845,7 +847,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tokens = self.usage.tokens();
-        let tz = self.usage.tz.clone();
+        let tz = Local;
         let periods = window.periods();
         let columns: Vec<Vec<f64>> = periods
             .iter()
@@ -1191,7 +1193,7 @@ impl Workspace {
             }
             for period in periods {
                 let label = match period.hour_ms {
-                    Some(ms) => logic::format_hour_short(ms, &usage.tz),
+                    Some(ms) => logic::format_hour_short(ms, &Local),
                     None => logic::format_day_short(&period.day),
                 };
                 table =

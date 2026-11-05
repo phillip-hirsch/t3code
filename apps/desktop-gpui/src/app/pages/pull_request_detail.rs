@@ -26,7 +26,6 @@ use serde_json::{Value, json};
 use super::super::Workspace;
 use super::super::sidebar::now_ms;
 use super::pull_requests::{label_chip, outline_button, relative_time, tone};
-use crate::inbox::parse_ms;
 use crate::pull_request_detail::{
     self as logic, Activity, Actor, Check, Comment, Conversation, Detail, Event, EventKind, Primary, Reference,
     ReviewOutcome, TimelineRow,
@@ -34,6 +33,7 @@ use crate::pull_request_detail::{
 use crate::pull_requests::{self as list_logic, Entry};
 use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
+use crate::timestamp::parse_ms;
 
 mod avatars;
 mod code;

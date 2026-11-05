@@ -431,7 +431,7 @@ pub(super) fn delivery_tone(outcome: &str, pending_window: bool) -> Tone {
 
 /// `relativeLabel` in `ScheduledTasksSettings.tsx`: past times like `formatRelativeTime`, future ones as "in 5m".
 pub(super) fn relative_label(value: Option<&str>, now_ms: i64) -> String {
-    let Some(at) = value.and_then(crate::work_log::parse_iso_ms) else { return "Not scheduled".into() };
+    let Some(at) = value.and_then(crate::timestamp::parse_ms) else { return "Not scheduled".into() };
     let diff = at - now_ms;
     if diff <= 0 {
         let minutes = -diff / 60_000;
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn relative_labels_cover_past_and_future() {
-        let now = crate::work_log::parse_iso_ms("2026-11-05T12:00:00.000Z").unwrap();
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00.000Z").unwrap();
         let at = |iso: &str| relative_label(Some(iso), now);
         assert_eq!(at("2026-11-05T11:59:30Z"), "just now");
         assert_eq!(at("2026-11-05T09:00:00Z"), "3h ago");

@@ -425,18 +425,16 @@ impl Workspace {
         if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
             return;
         }
-        let next = first
-            .map(|(request, item)| (request.id.clone(), requests::questions(item)))
-            .filter(|(_, questions)| !questions.is_empty());
+        let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
         match (self.question.take(), next) {
             (None, None) => {}
             (Some(previous), None) => self.set_composer_text(previous.prompt, window, cx),
-            (previous, Some((request_id, questions))) => {
+            (previous, Some(draft)) => {
                 let prompt = match previous {
                     Some(previous) => previous.prompt,
                     None => self.composer.read(cx).value().to_string(),
                 };
-                self.question = Some(QuestionDraft { prompt, ..QuestionDraft::new(request_id, questions) });
+                self.question = Some(QuestionDraft { prompt, ..draft });
                 self.load_custom_answer(window, cx);
             }
         }
@@ -1101,7 +1099,7 @@ impl Workspace {
         if self.model_override.is_some() || self.server_info().settings.get("fallbackModelSelection").is_null() {
             return None;
         }
-        crate::new_thread::usage_fallback(self.server_info(), default, Some(project_id), jiff::Timestamp::now())
+        crate::new_thread::usage_fallback(self.server_info(), default, Some(project_id), crate::timestamp::now_ms())
     }
 
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
@@ -1153,7 +1151,7 @@ impl Workspace {
         let resets = fallback
             .resets_at
             .as_deref()
-            .and_then(|at| crate::timestamp::upcoming(at, &jiff::Zoned::now(), hour12))
+            .and_then(|at| crate::timestamp::upcoming_local(at, hour12))
             .map(|at| format!(" · resets {at}"))
             .unwrap_or_default();
         let outline = if t.dark { white(0.05) } else { black(0.08) };

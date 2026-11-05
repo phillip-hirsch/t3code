@@ -494,7 +494,9 @@ impl SidebarState {
                         }
                     }
                     Status::Waiting => {
-                        if let Some(from) = inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()) {
+                        if let Some(from) =
+                            crate::timestamp::parse_ms(facts.latest_run_completed_at().unwrap_or_default())
+                        {
                             at(inbox::duration_changes_in(now - from));
                         }
                     }
@@ -527,7 +529,7 @@ impl SidebarState {
         }
         // Waking moves a thread between shelves even while its shelf is collapsed.
         for thread in threads {
-            if let Some(delay) = inbox::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
+            if let Some(delay) = crate::timestamp::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
                 .and_then(|until| inbox::wake_changes_in(until - now))
             {
                 at(delay);
@@ -1695,7 +1697,7 @@ impl Workspace {
         let woke_status = top.is_some_and(|(_, label, _)| label == "Woke");
         let duration_from = match status {
             Status::Working | Status::Preparing => facts.working_started_at(),
-            Status::Waiting => inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()),
+            Status::Waiting => crate::timestamp::parse_ms(facts.latest_run_completed_at().unwrap_or_default()),
             _ => None,
         };
         let status_label: AnyElement = match top {
@@ -2214,7 +2216,7 @@ impl Workspace {
                 .gap(px(4.))
                 .text_color(tokens.info_foreground)
                 .child(icon(IconName::AlarmClock, 12., tokens.info_foreground))
-                .child(inbox::format_wake(inbox::parse_ms(until).unwrap_or(now) - now))
+                .child(inbox::format_wake(crate::timestamp::parse_ms(until).unwrap_or(now) - now))
                 .into_any_element(),
             _ if woke => {
                 let color = tokens.warning_foreground;

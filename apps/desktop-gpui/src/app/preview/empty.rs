@@ -92,7 +92,7 @@ impl Workspace {
     /// `recordVisitForThread`.
     pub(super) fn record_visit(&mut self, thread_id: &str, url: &str) {
         let Some(project) = self.history_project(thread_id) else { return };
-        if self.preview.history.record_visit(&project, url, jiff::Timestamp::now().as_millisecond()) {
+        if self.preview.history.record_visit(&project, url, crate::timestamp::now_ms()) {
             self.preview.history.save_in_background();
         }
     }
@@ -165,7 +165,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project = self.history_project(thread_id);
-        let now = jiff::Timestamp::now().as_millisecond();
+        let now = crate::timestamp::now_ms();
         let recents: Vec<crate::browser_history::Entry> = project
             .as_deref()
             .map(|p| {

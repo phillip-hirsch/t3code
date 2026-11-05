@@ -70,10 +70,10 @@ impl Workspace {
             shell
                 .snoozed_until
                 .as_deref()
-                .and_then(crate::work_log::parse_iso_ms)
+                .and_then(crate::timestamp::parse_ms)
                 .map(|until_ms| StatusLine::Snoozed { until_ms })
         } else if shell.settled_override.as_deref() == Some("settled") {
-            Some(StatusLine::Settled { at_ms: shell.settled_at.as_deref().and_then(crate::work_log::parse_iso_ms) })
+            Some(StatusLine::Settled { at_ms: shell.settled_at.as_deref().and_then(crate::timestamp::parse_ms) })
         } else if facts.is_woke(now) {
             facts.woke_at(now).map(|woke_at| StatusLine::Woke { woke_at: woke_at.to_owned().into() })
         } else {
@@ -250,8 +250,8 @@ impl Workspace {
             && recovery.is_some_and(|r| {
                 r["snooze"] == true
                     && r["runId"].as_str() == shell.latest_run_id.as_deref()
-                    && r["resetAt"].as_str().and_then(crate::work_log::parse_iso_ms)
-                        == shell.snoozed_until.as_deref().and_then(crate::work_log::parse_iso_ms)
+                    && r["resetAt"].as_str().and_then(crate::timestamp::parse_ms)
+                        == shell.snoozed_until.as_deref().and_then(crate::timestamp::parse_ms)
             });
         let command = match recovery.filter(|_| recovery_snooze) {
             Some(r) => json!({"type": "thread.metadata.update", "commandId": new_id(), "threadId": thread_id,

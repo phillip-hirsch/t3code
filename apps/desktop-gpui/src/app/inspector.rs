@@ -448,13 +448,13 @@ mod tests {
             &mut running,
             &json!({"kind": "append", "text": "b", "truncated": false, "running": true}),
         );
-        assert_eq!((output.text_content().as_str(), output.truncated, running), ("a\nb", true, true));
+        assert_eq!((&*output.text_content(), output.truncated, running), ("a\nb", true, true));
         apply_frame(
             &mut output,
             &mut running,
             &json!({"kind": "replace", "text": "done", "truncated": false, "running": false}),
         );
-        assert_eq!((output.text_content().as_str(), output.truncated, running), ("done", true, false));
+        assert_eq!((&*output.text_content(), output.truncated, running), ("done", true, false));
     }
 
     #[test]

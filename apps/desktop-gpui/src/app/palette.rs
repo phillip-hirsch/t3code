@@ -700,7 +700,7 @@ impl Workspace {
             parts.push("Current thread".into());
         }
         row.description = Some(Description::Text(parts.join(" · ").into()));
-        row.time = inbox::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
+        row.time = crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
             .map(|at| ago(now - at));
         row
     }
@@ -857,7 +857,7 @@ impl Workspace {
                 };
                 let ranges = search::token_ranges(&m.snippet, query);
                 row.description = Some(Description::Snippet(m.user, search::split_ranges(&m.snippet, &ranges)));
-                row.time = m.at.as_deref().and_then(inbox::parse_ms).map(|at| ago(now - at));
+                row.time = m.at.as_deref().and_then(crate::timestamp::parse_ms).map(|at| ago(now - at));
                 Some(row)
             })
             .take(MESSAGE_LIMIT)
@@ -1524,8 +1524,8 @@ fn used_at(thread: &crate::model::ThreadShell) -> i64 {
         .as_ref()
         .and_then(Option::as_deref)
         .or(thread.latest_user_message_at.as_deref())
-        .and_then(inbox::parse_ms)
-        .or_else(|| inbox::parse_ms(&thread.updated_at))
+        .and_then(crate::timestamp::parse_ms)
+        .or_else(|| crate::timestamp::parse_ms(&thread.updated_at))
         .unwrap_or(0)
 }
 
