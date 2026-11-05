@@ -38,12 +38,16 @@ const EXPLORER_MIN: f32 = 160.;
 const EXPLORER_MAX: f32 = 560.;
 const CONTENT_MIN: f32 = 256.;
 
-/// The whole file behind a read cut at 1 MB, read-only and unhighlighted like `LargeTextViewer`.
+/// The whole file behind a read cut at 1 MB, read-only and unhighlighted like `LargeTextViewer`;
+/// a CSV or TSV file's table too, which shows in table mode.
 enum FullFile {
     Loading,
-    Ready(Entity<EditorState>),
+    Ready { editor: Entity<EditorState>, table: Option<std::rc::Rc<super::table::Table>> },
     Failed,
 }
+
+/// A loaded full file as drawn: its text, and its table in table mode.
+type FullView = (Entity<EditorState>, Option<std::rc::Rc<super::table::Table>>);
 
 enum Load {
     Loading,
@@ -359,22 +363,26 @@ impl Workspace {
         let Some(state) = self.files.previews.get_mut(&key) else { return };
         state.full = Some(FullFile::Loading);
         let request_key = key.clone();
+        let delimiter = logic::table_delimiter(&key.path);
         state._full = Some(cx.spawn_in(window, async move |this, cx| {
             let fetched = fetch_asset(client, endpoint, resource).await;
             let text = cx
                 .background_spawn(async move {
                     fetched.map(|bytes| {
-                        String::from_utf8(bytes)
-                            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+                        let text = String::from_utf8(bytes)
+                            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+                        let cells = delimiter.map(|delimiter| super::table::Cells::parse(&text, delimiter));
+                        (text, cells)
                     })
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(state) = this.files.previews.get_mut(&request_key) else { return };
                 state.full = Some(match text {
-                    Ok(text) => {
+                    Ok((text, cells)) => {
                         let editor = cx.new(|cx| EditorState::new(window, cx).language("text").default_value(text));
-                        FullFile::Ready(editor)
+                        let table = cells.map(|cells| std::rc::Rc::new(super::table::Table::new(cells)));
+                        FullFile::Ready { editor, table }
                     }
                     Err(error) => {
                         log::warn!("full file preview: {error:#}");
@@ -801,10 +809,14 @@ impl Workspace {
                 if let Some(full) = &state.full {
                     let full = match full {
                         FullFile::Loading => None,
-                        FullFile::Ready(editor) => Some(Ok(editor.clone())),
+                        FullFile::Ready { editor, table } => {
+                            // `LargeTextViewer` with the delimiter: the table, or the source.
+                            let table = table.clone().filter(|_| delimiter.is_some());
+                            Some(Ok((editor.clone(), table)))
+                        }
                         FullFile::Failed => Some(Err(())),
                     };
-                    return self.render_full_file(key, full, tokens, cx);
+                    return self.render_full_file(key, full, width, tokens, cx);
                 }
                 if logic::is_mermaid(&key.path) && render_mermaid {
                     let revision = state.revision;
@@ -847,9 +859,10 @@ impl Workspace {
 
     /// `WorkspaceLargeTextPreview`: "Full file" with Copy contents and Save file, then the text.
     fn render_full_file(
-        &self,
+        &mut self,
         key: &FileKey,
-        full: Option<Result<Entity<EditorState>, ()>>,
+        full: Option<Result<FullView, ()>>,
+        width: f32,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -869,7 +882,7 @@ impl Workspace {
                 .child(Icon::new(icon).size(px(14.)))
                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         };
-        let copied = full.clone().and_then(Result::ok);
+        let copied = full.clone().and_then(Result::ok).map(|(editor, _)| editor);
         let save_key = key.clone();
         let header = h_flex()
             .flex_none()
@@ -915,7 +928,8 @@ impl Workspace {
                         ),
                 )
                 .into_any_element(),
-            Some(Ok(editor)) => Editor::new(&editor)
+            Some(Ok((_, Some(table)))) => self.render_table(&key.path, table, width, tokens, cx),
+            Some(Ok((editor, None))) => Editor::new(&editor)
                 .appearance(false)
                 .bordered(false)
                 .readonly(true)
