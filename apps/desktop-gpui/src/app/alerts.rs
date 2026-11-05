@@ -1,6 +1,7 @@
 //! Thread alerts as sounds, in-app toasts and OS notifications, presented the
 //! way `ThreadNotificationCoordinator.tsx` does.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
@@ -27,8 +28,9 @@ pub(super) struct AlertState {
     /// Watches the shell; `None` while both notification settings are off.
     threads: Option<ThreadAlerts>,
     mode: Mode,
-    /// OS notifications may be on screen; focusing the window clears them.
-    pending: bool,
+    /// Threads whose OS notifications may be on screen, counted by the taskbar badge;
+    /// focusing the window clears them.
+    pending: HashSet<String>,
     toasts: usize,
 }
 
@@ -103,7 +105,8 @@ impl Workspace {
         if !mode.desktop() || focused {
             return;
         }
-        self.alerts.pending = true;
+        self.alerts.pending.insert(alert.thread_id.clone());
+        set_badge(window, self.alerts.pending.len());
         let notification = Notification::new()
             .id1::<ThreadSystemNotification>(SharedString::from(alert.thread_id.clone()))
             .title(alert.title())
@@ -115,9 +118,21 @@ impl Workspace {
 
     /// Retracts the OS notifications, as focusing the web app's window does.
     pub(super) fn clear_system_alerts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.alerts.pending) {
+        if !self.alerts.pending.is_empty() {
+            self.alerts.pending.clear();
             window.remove_notification::<ThreadSystemNotification>(cx);
+            set_badge(window, 0);
         }
+    }
+}
+
+/// `setNotificationBadge` through the desktop bridge.
+fn set_badge(window: &Window, count: usize) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
+    {
+        crate::desktop::badge::set(handle.hwnd.get(), count);
     }
 }
 

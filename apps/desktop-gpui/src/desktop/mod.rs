@@ -3,6 +3,7 @@
 //! and app links.
 
 pub mod activation;
+pub mod badge;
 pub mod cli;
 pub mod exposure;
 pub mod links;
