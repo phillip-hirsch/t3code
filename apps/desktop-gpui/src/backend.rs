@@ -268,15 +268,15 @@ async fn wait_ready(http_base: &str, timeout: Option<Duration>) -> Result<()> {
     let url = format!("{http_base}/.well-known/t3/environment");
     let deadline = tokio::time::Instant::now() + timeout.unwrap_or(Duration::from_secs(15));
     loop {
-        if let Ok(response) = http_client().get(&url).timeout(Duration::from_secs(1)).send().await {
-            if response.status().is_success() {
-                let descriptor: EnvironmentDescriptor = response.json().await.context("environment descriptor")?;
-                let version = descriptor.orchestration_protocol_version.unwrap_or(1);
-                if version != 2 {
-                    bail!("server speaks orchestration protocol {version}; this client needs 2");
-                }
-                return Ok(());
+        if let Ok(response) = http_client().get(&url).timeout(Duration::from_secs(1)).send().await
+            && response.status().is_success()
+        {
+            let descriptor: EnvironmentDescriptor = response.json().await.context("environment descriptor")?;
+            let version = descriptor.orchestration_protocol_version.unwrap_or(1);
+            if version != 2 {
+                bail!("server speaks orchestration protocol {version}; this client needs 2");
             }
+            return Ok(());
         }
         if tokio::time::Instant::now() > deadline {
             bail!("server at {http_base} did not become ready");
