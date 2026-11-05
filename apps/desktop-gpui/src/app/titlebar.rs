@@ -15,7 +15,7 @@ use gpui_kit::{
     rgb, svg,
 };
 
-use super::{ToggleSidebar, Workspace};
+use super::{ToggleRightPanel, ToggleSidebar, Workspace};
 use crate::theme;
 
 /// `--workspace-topbar-height` with Electron's 40px titlebar overlay on Windows.
@@ -126,17 +126,13 @@ impl Workspace {
                 toggle("toggle-terminal", "icons/panel-bottom.svg", false, false)
                     .tooltip(tooltip("Terminal drawer is unavailable")),
             )
-            .child({
-                // The browser is this client's only right-panel surface so far.
-                let browser = matches!(self.target, Some(super::Target::Thread(_)));
-                toggle("toggle-right-panel", "icons/panel-right.svg", self.preview_panel_open(), browser)
-                    .tooltip(tooltip(if browser {
-                        "Toggle browser (Ctrl+Shift+J)"
-                    } else {
-                        "Start the thread to open a browser"
-                    }))
-                    .when(browser, |el| el.on_click(cx.listener(|this, _, window, cx| this.toggle_preview(window, cx))))
-            })
+            .child(
+                toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
+                    .tooltip(tooltip("Toggle right panel (Ctrl+Alt+B)"))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleRightPanel), cx)
+                    }),
+            )
     }
 }
 

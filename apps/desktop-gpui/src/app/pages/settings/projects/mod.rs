@@ -11,7 +11,7 @@ mod actions;
 mod defaults;
 mod rows;
 mod script_editor;
-mod scripts;
+pub(in crate::app) mod scripts;
 mod favicon_picker;
 mod groups;
 mod icon;

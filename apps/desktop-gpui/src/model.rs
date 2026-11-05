@@ -371,6 +371,9 @@ pub struct ServerInfo {
     pub model_preferences: Value,
     /// `environment.capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
     pub file_upload_limit: Option<u64>,
+    /// `settings.confirmThreadArchive` / `confirmThreadDelete`.
+    pub confirm_thread_archive: bool,
+    pub confirm_thread_delete: bool,
 }
 
 impl ServerInfo {
@@ -459,7 +462,13 @@ impl ServerInfo {
             .filter_map(|f| Some((f.get("provider")?.as_str()?.to_owned(), f.get("model")?.as_str()?.to_owned())))
             .collect();
         self.model_preferences = settings.get("providerModelPreferences").cloned().unwrap_or_default();
+        self.confirm_thread_archive = settings.get("confirmThreadArchive").and_then(Value::as_bool) == Some(true);
+        self.confirm_thread_delete = settings.get("confirmThreadDelete").and_then(Value::as_bool) != Some(false);
         Ok(())
+    }
+
+    pub fn capability(&self, name: &str) -> bool {
+        self.capabilities.get(name).and_then(Value::as_bool) == Some(true)
     }
 
     /// `resolveEnvironmentMachineKind` in `packages/contracts/src/server.ts`.
@@ -766,6 +775,8 @@ pub struct ThreadShell {
     #[serde(default)]
     pub snoozed_at: Option<String>,
     #[serde(default)]
+    pub auto_settle_disabled_at: Option<String>,
+    #[serde(default)]
     pub pin_order_key: Option<String>,
     #[serde(default)]
     pub active_order_key: Option<String>,
@@ -962,6 +973,15 @@ pub struct ProviderThread {
     pub provider_session_id: Option<String>,
     #[serde(default)]
     pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub app_thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSession {
+    pub id: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -991,6 +1011,8 @@ pub struct Run {
     pub ordinal: i64,
     #[serde(default)]
     pub active_attempt_id: Option<String>,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1020,6 +1042,8 @@ pub struct Checkpoint {
     #[serde(default)]
     pub app_run_ordinal: Option<i64>,
     pub status: String,
+    #[serde(default)]
+    pub captured_at: String,
 }
 
 /// An execution node; items reach their run attempt through `parentNodeId`.
@@ -1134,6 +1158,8 @@ pub struct ThreadProjection {
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default, deserialize_with = "lossy")]
     pub nodes: Vec<ExecutionNode>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub provider_sessions: Vec<ProviderSession>,
 }
 
 impl ThreadProjection {
@@ -1152,6 +1178,24 @@ impl ThreadProjection {
             let active = self.thread.active_provider_thread_id.as_ref()?;
             self.provider_threads.iter().find(|thread| &thread.id == active)?.context_usage.as_ref()
         })
+    }
+
+    /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.
+    pub fn provider_session(&self) -> Option<&ProviderSession> {
+        let active = self.runs.iter().rev().find(|run| is_active_run_status(&run.status));
+        let provider_thread_id =
+            active.and_then(|run| run.provider_thread_id.as_ref()).or(self.thread.active_provider_thread_id.as_ref());
+        let attached = provider_thread_id
+            .and_then(|id| self.provider_threads.iter().find(|thread| &thread.id == id))
+            .or_else(|| {
+                self.provider_threads.iter().find(|thread| {
+                    thread.app_thread_id.as_ref() == Some(&self.thread.id) && thread.provider_session_id.is_some()
+                })
+            });
+        match attached.and_then(|thread| thread.provider_session_id.as_ref()) {
+            Some(id) => self.provider_sessions.iter().find(|session| &session.id == id),
+            None => self.provider_sessions.iter().rev().find(|s| !matches!(s.status.as_str(), "stopped" | "error")),
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -1235,6 +1279,15 @@ impl ThreadProjection {
             }
             "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
+            "provider-session.attached" | "provider-session.updated" => {
+                upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id)
+            }
+            "provider-session.detached" => {
+                let id = payload["providerSessionId"].as_str().unwrap_or_default();
+                if let Some(session) = self.provider_sessions.iter_mut().find(|s| s.id == id) {
+                    session.status = "stopped".into();
+                }
+            }
             "thread.pull-request-link-updated" => {}
             kind if kind.starts_with("thread.") => self.thread = AppThread::deserialize(payload)?,
             _ => {}

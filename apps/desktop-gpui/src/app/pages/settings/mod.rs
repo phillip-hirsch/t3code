@@ -4,7 +4,7 @@
 
 mod agents;
 mod chat;
-mod code;
+pub(in crate::app) mod code;
 mod connections;
 mod diffs;
 mod general;

@@ -28,6 +28,7 @@ mod composer;
 mod composer_menu;
 mod context_strip;
 mod details;
+mod git;
 mod header;
 pub(crate) mod keymap;
 mod inspector;
@@ -39,15 +40,25 @@ mod pages;
 mod palette;
 mod preview;
 mod send;
+mod right_panel;
 mod sidebar;
+mod thread_menu;
 mod titlebar;
 mod visits;
 
 gpui_kit::actions!(
     workspace,
-    [ToggleSidebar, ToggleThreadDetails, TogglePalette, NewThread, NewThreadInProject, UndoThreadAction]
+    [ToggleSidebar, ToggleThreadDetails, ToggleRightPanel, TogglePalette, NewThread, NewThreadInProject, UndoThreadAction]
 );
 pub use preview::TogglePreview;
+
+/// Runs a shell command in the thread's terminal, as a project script does.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = workspace, no_json)]
+pub struct RunInTerminal {
+    pub cwd: String,
+    pub command: String,
+}
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -144,6 +155,13 @@ pub struct Workspace {
     details_popover: bool,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
+    /// The git status of the open target's workspace.
+    vcs: git::VcsWatch,
+    /// The editor "Open in" launches, once picked.
+    preferred_editor: Option<String>,
+    right_panel: right_panel::RightPanel,
+    /// The thread title's menu and inline rename.
+    title: thread_menu::TitleState,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
     _shell_task: Option<Task<()>>,
@@ -261,6 +279,10 @@ impl Workspace {
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
+            vcs: git::VcsWatch::default(),
+            preferred_editor: None,
+            right_panel: right_panel::RightPanel::new(cx),
+            title: thread_menu::TitleState::default(),
             _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
             _shell_task: None,
@@ -806,6 +828,8 @@ impl Render for Workspace {
         let panel_open = self.preview_panel_open();
         let panel = self.render_preview_panel(window, cx);
         let mini_player = self.render_preview_mini_player(window, cx);
+        self.sync_vcs(window, cx);
+        let right_panel = self.render_right_panel(window, cx);
         let theme = cx.theme();
         div()
             .size_full()
@@ -829,6 +853,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -853,7 +878,7 @@ impl Render for Workspace {
                             .flex_1()
                             .h_full()
                             .min_w_0()
-                            .when(!panel_open, |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
+                            .when(!panel_open && right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             .child(self.render_header(cx))
                             .children(self.render_error(cx))
                             .child(
@@ -901,6 +926,10 @@ impl Render for Workspace {
                                         el.child(self.render_drop_overlay(crate::theme::tokens(cx)))
                                     }),
                             ),
+                    )
+                    .children(
+                        right_panel
+                            .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
                     )
                     .children(panel),
             )

@@ -13,7 +13,7 @@ mod worktrees;
 
 // `settings/projects/`, declared here so `settings/mod.rs` stays untouched until merge.
 #[path = "projects/mod.rs"]
-mod projects;
+pub(in crate::app) mod projects;
 
 impl Workspace {
     pub(super) fn render_settings_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
