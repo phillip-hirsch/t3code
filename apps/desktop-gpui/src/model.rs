@@ -55,6 +55,33 @@ pub struct Provider {
     pub status: String,
     #[serde(default)]
     pub models: Vec<ProviderModel>,
+    #[serde(default)]
+    pub usage_limits: Option<UsageLimits>,
+}
+
+/// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimits {
+    #[serde(default)]
+    pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub unavailable: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub id: String,
+    pub label: String,
+    pub used_percent: f64,
+}
+
+impl UsageWindow {
+    /// `remainingPercent` in `packages/shared/src/usageLimits.ts`.
+    pub fn remaining_percent(&self) -> u32 {
+        (100. - self.used_percent.clamp(0., 100.)).round() as u32
+    }
 }
 
 impl Provider {
@@ -79,6 +106,10 @@ pub struct ServerInfo {
     pub providers: Vec<Provider>,
     pub default_model_selection: Option<ModelSelection>,
     pub thread_stop: bool,
+    /// The environment's name, e.g. the machine's host name.
+    pub environment_label: Option<String>,
+    platform_machine: Option<String>,
+    environment_icon: Option<String>,
 }
 
 impl ServerInfo {
@@ -90,6 +121,9 @@ impl ServerInfo {
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
+                let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
+                self.environment_label = text("/environment/label");
+                self.platform_machine = text("/environment/platform/machine");
             }
             "providerStatuses" => self.providers = Vec::deserialize(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -101,7 +135,13 @@ impl ServerInfo {
     fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
+        self.environment_icon = settings.get("environmentIcon").and_then(Value::as_str).map(str::to_owned);
         Ok(())
+    }
+
+    /// `resolveEnvironmentMachineKind` in `packages/contracts/src/server.ts`.
+    pub fn machine_kind(&self) -> &str {
+        self.environment_icon.as_deref().or(self.platform_machine.as_deref()).unwrap_or("server")
     }
 
     /// Every model of every usable provider, labelled for a picker.
@@ -183,6 +223,8 @@ pub struct ProjectShell {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lineage {
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
     #[serde(default)]
     pub relationship_to_parent: Option<String>,
     #[serde(default)]
@@ -400,6 +442,40 @@ pub struct AppThread {
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
+}
+
+/// The token counts behind the context meter: `ThreadTokenUsageSnapshot` on a
+/// provider thread, `OrchestrationV2ProviderTurnTokenUsage` on a provider turn.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub used_tokens: u64,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderThread {
+    pub id: String,
+    #[serde(default)]
+    pub context_usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTurn {
+    pub id: String,
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -500,9 +576,30 @@ pub struct ThreadProjection {
     /// The timeline, in render order.
     #[serde(default)]
     pub visible_turn_items: Vec<VisibleRow>,
+    #[serde(default)]
+    pub provider_threads: Vec<ProviderThread>,
+    #[serde(default)]
+    pub provider_turns: Vec<ProviderTurn>,
 }
 
 impl ThreadProjection {
+    /// The newest turn report, else the active provider thread's snapshot, as
+    /// `latestProviderTurnTokenUsage` + `deriveLatestContextWindowSnapshot`
+    /// in `packages/client-runtime/src/state/contextWindow.ts`.
+    pub fn context_usage(&self) -> Option<&TokenUsage> {
+        let mut latest: Option<&TokenUsage> = None;
+        for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
+            // Ties go to the later entry, since live upserts append.
+            if latest.is_none_or(|current| usage.updated_at >= current.updated_at) {
+                latest = Some(usage);
+            }
+        }
+        latest.or_else(|| {
+            let active = self.thread.active_provider_thread_id.as_ref()?;
+            self.provider_threads.iter().find(|thread| &thread.id == active)?.context_usage.as_ref()
+        })
+    }
+
     pub fn is_running(&self) -> bool {
         self.runs.iter().any(|run| is_active_run_status(&run.status))
     }
@@ -558,6 +655,17 @@ impl ThreadProjection {
                 upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id)
             }
             "turn-item.updated" => self.apply_turn_item(TurnItem::deserialize(payload)?),
+            "provider-thread.updated" => {
+                upsert(&mut self.provider_threads, ProviderThread::deserialize(payload)?, |t| &t.id)
+            }
+            "provider-turn.updated" => {
+                let mut turn = ProviderTurn::deserialize(payload)?;
+                if turn.token_usage.is_none() {
+                    let previous = self.provider_turns.iter().find(|t| t.id == turn.id);
+                    turn.token_usage = previous.and_then(|t| t.token_usage.clone());
+                }
+                upsert(&mut self.provider_turns, turn, |t| &t.id);
+            }
             "thread.pull-request-link-updated" => {}
             kind if kind.starts_with("thread.") => self.thread = AppThread::deserialize(payload)?,
             _ => {}

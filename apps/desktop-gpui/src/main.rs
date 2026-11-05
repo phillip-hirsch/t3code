@@ -8,7 +8,7 @@ mod timeline;
 
 use std::sync::OnceLock;
 
-use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 
 /// Network and process I/O run here; GPUI owns the UI thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -30,9 +30,19 @@ fn main() {
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
+        cx.bind_keys([
+            KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
+            KeyBinding::new("ctrl-shift-b", app::ToggleThreadDetails, None),
+        ]);
+        // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {
-            titlebar: Some(TitlebarOptions { title: Some("T3 Code".into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions {
+                title: Some("T3 Code".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.), px(13.))),
+            }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))),
+            window_min_size: Some(size(px(840.), px(620.))),
             ..Default::default()
         };
         gpui_kit::open_window(options, cx, |window, cx| {

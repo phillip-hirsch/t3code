@@ -7,9 +7,10 @@ use std::time::Duration;
 use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription,
-    Task, Window,
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Subscription, Task, Window, div,
 };
 use serde_json::{Value, json};
 
@@ -21,8 +22,12 @@ use crate::timeline::{self, Row};
 
 mod chat;
 mod composer;
+mod details;
 mod header;
 mod sidebar;
+mod titlebar;
+
+gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const CONTENT_WIDTH: f32 = 820.;
@@ -65,6 +70,11 @@ pub struct Workspace {
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
     error: Option<SharedString>,
+    /// Collapsed, the sidebar column is not rendered at all.
+    sidebar_open: bool,
+    details_open: bool,
+    /// The thread whose "Previous agents" group is expanded in the details card.
+    lineage_expanded: Option<String>,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -101,6 +111,9 @@ impl Workspace {
             sending: false,
             model_override: None,
             error: None,
+            sidebar_open: true,
+            details_open: true,
+            lineage_expanded: None,
             _connection_task: Self::connect(cx),
             _stream_tasks: Vec::new(),
             _subscriptions: subscriptions,
@@ -482,22 +495,45 @@ fn project_name(project: &ProjectShell) -> SharedString {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        h_flex()
+        div()
             .size_full()
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
-            .child(self.render_sidebar(cx))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleThreadDetails, _, cx| {
+                this.details_open = !this.details_open;
+                cx.notify();
+            }))
             .child(
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .child(self.render_header(cx))
-                    .children(self.render_error(cx))
-                    .child(self.render_body(window, cx))
-                    .children(self.render_approvals(cx))
-                    .child(self.render_composer(cx)),
+                h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_sidebar(cx))).child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .pr(titlebar::RIGHT_RESIZE_INSET)
+                        .child(self.render_header(cx))
+                        .children(self.render_error(cx))
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .child(
+                                    v_flex()
+                                        .size_full()
+                                        .child(self.render_body(window, cx))
+                                        .children(self.render_approvals(cx))
+                                        .child(self.render_composer(cx)),
+                                )
+                                .children(self.render_details_card(cx)),
+                        ),
+                ),
             )
+            .child(self.render_titlebar_overlay(window, cx))
     }
 }
