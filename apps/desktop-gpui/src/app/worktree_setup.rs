@@ -34,11 +34,13 @@ impl Workspace {
             }
             _ => None,
         };
+        // Without a socket the watch waits, so it subscribes once one connects.
+        let Some(client) = self.client() else { return };
         if wanted == self.setup.thread_id {
             return;
         }
         self.setup = SetupWatch { thread_id: wanted.clone(), ..Default::default() };
-        let (Some(thread_id), Some(client)) = (wanted, self.client()) else { return };
+        let Some(thread_id) = wanted else { return };
         let stream = client.stream("subscribeWorktreeSetup", json!({"threadId": thread_id}));
         self.setup._task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {

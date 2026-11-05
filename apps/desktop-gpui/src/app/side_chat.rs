@@ -3,6 +3,7 @@
 //! The tab shows the side chat's timeline, its pending approvals and a plain-text composer;
 //! Bring back hands its last reply to the main thread's next message.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -14,7 +15,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, PromptLevel, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
     Subscription, Task, Window, div, px,
 };
@@ -47,6 +48,28 @@ pub(super) struct SideChats {
     starting: bool,
     bringing_back: bool,
     deleting: bool,
+    /// Unsent composer text of side chats not on screen, by thread id.
+    drafts: HashMap<String, String>,
+}
+
+impl SideChats {
+    /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
+    pub(super) fn disconnect(&mut self) {
+        if let Some(view) = &mut self.view {
+            view._subscription = None;
+        }
+    }
+
+    /// Releases the view on screen, keeping its unsent text for when it shows again.
+    fn release_view(&mut self, cx: &App) {
+        let Some(view) = self.view.take() else { return };
+        let text = view.composer.read(cx).value().to_string();
+        if text.is_empty() {
+            self.drafts.remove(&view.thread_id);
+        } else {
+            self.drafts.insert(view.thread_id, text);
+        }
+    }
 }
 
 /// What kind of thread would start the side chat.
@@ -270,13 +293,23 @@ impl Workspace {
 
     /// Subscribes the side chat on screen and drops the one that left it.
     pub(super) fn sync_side_chat(&mut self, shown: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.side_chat.view.as_ref().map(|view| view.thread_id.as_str()) == shown {
+        let client = self.client();
+        // While the socket is down the view keeps what it last showed.
+        if let Some(view) = &self.side_chat.view
+            && Some(view.thread_id.as_str()) == shown
+            && (view._subscription.is_some() || client.is_none())
+        {
             return;
         }
-        self.side_chat.view = None;
-        let (Some(thread_id), Some(client)) = (shown, self.client()) else { return };
+        self.side_chat.release_view(cx);
+        let (Some(thread_id), Some(client)) = (shown, client) else { return };
+        let draft = self.side_chat.drafts.remove(thread_id).unwrap_or_default();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx).auto_grow(1, 8).submit_on_enter(true).placeholder("Ask a side question")
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("Ask a side question")
+                .default_value(draft)
         });
         let events = vec![cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { secondary: false, .. } = event {

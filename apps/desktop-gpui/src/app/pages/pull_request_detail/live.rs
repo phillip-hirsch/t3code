@@ -113,6 +113,11 @@ impl Workspace {
         self.pull_requests._live = Some((refreshes, interval));
     }
 
+    /// Stops following the host with the socket it ran on; the page follows again on reconnect.
+    pub(in crate::app) fn unfollow_pull_requests(&mut self) {
+        self.pull_requests._live = None;
+    }
+
     /// Condenses the header once the shown tab has scrolled past its fold, and back near the top.
     fn track_pr_scroll(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };

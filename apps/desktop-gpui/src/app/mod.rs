@@ -548,6 +548,9 @@ impl Workspace {
             if let Some(thread) = &mut self.thread {
                 thread._subscription = None;
             }
+            self.side_chat.disconnect();
+            self.setup = Default::default();
+            self.unfollow_pull_requests();
         }
         self.connection = connection;
         self.sync_connection_banner(cx);
