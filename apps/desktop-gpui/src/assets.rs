@@ -1,6 +1,8 @@
 //! App icons layered over gpui-kit's Lucide catalog.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use gpui_kit::{AssetSource, Hsla, Result, SharedString, rgb};
 
@@ -149,12 +151,22 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "zap",
 ];
 
+/// Images fetched at runtime (e.g. ACP Registry icons), served under `remote/…` so `svg()` can tint them.
+static REMOTE: Mutex<Option<HashMap<String, Arc<[u8]>>>> = Mutex::new(None);
+
+pub fn put_remote(path: &str, bytes: Arc<[u8]>) {
+    REMOTE.lock().unwrap().get_or_insert_default().insert(path.to_owned(), bytes);
+}
+
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some((_, bytes)) = APP_ICONS.iter().chain(LUCIDE_ICONS).find(|(name, _)| *name == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        if let Some(bytes) = REMOTE.lock().unwrap().as_ref().and_then(|remote| remote.get(path)) {
+            return Ok(Some(Cow::Owned(bytes.to_vec())));
         }
         // The full catalog: a project icon can be any Lucide icon (`ProjectIconPickerDialog`).
         gpui_kit::assets::AllAssets.load(path)

@@ -6,6 +6,7 @@
 //! for the shared settings rows to take over; everything else here is environment-wide.
 
 mod accent;
+mod acp;
 mod accounts;
 mod codex_callback;
 mod usage_sources;

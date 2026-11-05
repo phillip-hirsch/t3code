@@ -133,6 +133,10 @@ pub struct Provider {
     pub compatibility_advisory: Option<Value>,
     #[serde(default)]
     pub update_state: Option<Value>,
+    #[serde(default)]
+    pub native_sessions: Option<NativeSessions>,
+    #[serde(default)]
+    pub configurable_providers: bool,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
@@ -173,6 +177,19 @@ pub struct RuntimePaths {
     pub home_path: String,
     #[serde(default)]
     pub shadow_home_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessions {
+    #[serde(default)]
+    pub can_list: bool,
+    #[serde(default)]
+    pub can_load: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub can_delete: bool,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -281,6 +298,8 @@ pub struct ServerInfo {
     pub one_time_schedules: bool,
     /// `ManagedPolicySummary`, or null when no administrator policy applies.
     pub managed_policy: Value,
+    /// `settings.providerInstances`, keyed by instance id.
+    pub provider_instances: Value,
 }
 
 impl ServerInfo {
@@ -350,6 +369,7 @@ impl ServerInfo {
         self.snooze_presets = settings.get("snoozePresets").cloned().unwrap_or_default();
         self.add_project_base_directory =
             settings.get("addProjectBaseDirectory").and_then(Value::as_str).unwrap_or_default().to_owned();
+        self.provider_instances = settings.get("providerInstances").cloned().unwrap_or_default();
         Ok(())
     }
 
