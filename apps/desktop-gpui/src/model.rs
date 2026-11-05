@@ -177,6 +177,8 @@ pub struct ServerInfo {
     pub settings: Value,
     /// The raw `config` of the last snapshot, its `settings` kept current by `settingsUpdated`.
     pub config: Value,
+    /// The raw `ServerProvider` records, for settings pages that edit them.
+    pub providers_json: Vec<Value>,
 }
 
 impl ServerInfo {
@@ -185,6 +187,7 @@ impl ServerInfo {
             "snapshot" => {
                 let config = &event["config"];
                 self.providers = lossy(&config["providers"])?;
+                self.providers_json = config["providers"].as_array().cloned().unwrap_or_default();
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
@@ -194,7 +197,10 @@ impl ServerInfo {
                 self.new_projects_root = text("/newProjectsRoot");
                 self.config = config.clone();
             }
-            "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
+            "providerStatuses" => {
+                self.providers = lossy(&event["payload"]["providers"])?;
+                self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
+            }
             "settingsUpdated" => self.set_settings(&event["payload"]["settings"])?,
             _ => {}
         }

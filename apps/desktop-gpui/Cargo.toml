@@ -34,7 +34,8 @@ hmac = "0.12"
 log = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+# Objects keep the server's key order, e.g. provider instances in the order they were added.
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = [
   "rt-multi-thread",

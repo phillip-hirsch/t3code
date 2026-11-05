@@ -8,8 +8,8 @@ use crate::app::Workspace;
 mod devices;
 
 impl Workspace {
-    pub(super) fn render_settings_providers(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Providers").into_any_element()
+    pub(super) fn render_settings_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_providers_page(window, cx)
     }
 
     pub(super) fn render_settings_threads(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
