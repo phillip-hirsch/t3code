@@ -112,8 +112,11 @@ impl Workspace {
 
     /// `captureFromShortcut`: a press during recording, a capture in flight, or the cooldown is dropped.
     fn on_snap_shot_press(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A recording left behind by closing Settings no longer holds the shortcut back.
+        let recording = self.snap_shot.recorder.recording && self.settings.as_deref() == Some("snap-shot");
         let ui = &mut self.snap_shot;
-        if ui.recorder.recording || ui.capturing {
+        ui.recorder.recording = recording;
+        if recording || ui.capturing {
             return;
         }
         ui.state.shortcut_verified = true;
