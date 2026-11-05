@@ -135,11 +135,6 @@ impl Workspace {
         &self.active_env_session().server_info
     }
 
-    pub(super) fn server_info_mut(&mut self) -> &mut ServerInfo {
-        let index = self.active_index();
-        &mut self.sessions[index].server_info
-    }
-
     /// One environment's config, to apply what it saved.
     pub(super) fn env_info_mut(&mut self, environment_id: &str) -> Option<&mut ServerInfo> {
         Some(&mut self.session_mut(environment_id)?.server_info)

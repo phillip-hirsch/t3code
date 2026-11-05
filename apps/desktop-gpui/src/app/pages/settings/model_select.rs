@@ -64,22 +64,27 @@ impl Workspace {
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let id = id.into();
-        let trigger = self.model_picker_trigger(id.clone(), selection, label, cx);
+        let environment = self.settings_environment();
+        let trigger = self.model_picker_trigger(id.clone(), selection, label, environment.as_deref(), cx);
         let on_pick: OnPick = Rc::new(on_pick);
-        self.undocked_model_picker(id, trigger, PickHost { current: selection.cloned(), include, on_pick }, cx)
+        let host = PickHost { environment, current: selection.cloned(), include, on_pick };
+        self.undocked_model_picker(id, trigger, host, cx)
     }
 
-    /// The picker's settings trigger: provider icon and short model name, or `label` (`triggerLabel`).
+    /// The picker's settings trigger: provider icon and short model name from `environment`'s
+    /// providers, or `label` (`triggerLabel`).
     pub(in crate::app) fn model_picker_trigger(
         &self,
         id: SharedString,
         selection: Option<&ModelSelection>,
         label: Option<&str>,
+        environment: Option<&str>,
         cx: &App,
     ) -> Button {
         let t = *tokens(cx);
-        let provider = selection.and_then(|s| self.settings_info().provider(&s.instance_id));
-        let model = selection.and_then(|s| self.settings_info().model(s));
+        let info = environment.and_then(|environment| self.env_info(environment));
+        let provider = selection.and_then(|s| info?.provider(&s.instance_id));
+        let model = selection.and_then(|s| info?.model(s));
         let name: SharedString = match (label, provider.zip(model), selection) {
             (Some(label), ..) => label.to_owned().into(),
             (None, Some((provider, model)), _) => model_label::trigger_model_name(model, &provider.driver).into(),

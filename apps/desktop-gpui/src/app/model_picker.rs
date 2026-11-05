@@ -39,6 +39,8 @@ pub(in crate::app) type OnPick = Rc<dyn Fn(&mut Workspace, ModelSelection, &mut 
 /// What an undocked picker picks for: its row's selection, the providers it offers, and the setter.
 #[derive(Clone)]
 pub(in crate::app) struct PickHost {
+    /// The environment whose providers and model preferences it lists; `None` is the open chat's.
+    pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
     pub include: fn(&Provider) -> bool,
     pub on_pick: OnPick,
@@ -147,6 +149,22 @@ impl Workspace {
         }
     }
 
+    /// The environment the open picker lists from: its host's, else the open chat's.
+    fn picker_environment(&self) -> Option<SharedString> {
+        match self.picker.host.as_ref().and_then(|host| host.environment.clone()) {
+            Some(environment) => Some(environment),
+            None => self.active_environment().cloned(),
+        }
+    }
+
+    /// The open picker's environment config; `None` while that environment is gone.
+    fn picker_info(&self) -> Option<&ServerInfo> {
+        match self.picker.host.as_ref().and_then(|host| host.environment.as_ref()) {
+            Some(environment) => self.env_info(environment),
+            None => Some(self.server_info()),
+        }
+    }
+
     /// The providers the open picker offers.
     fn picker_includes(&self, provider: &Provider) -> bool {
         self.picker.host.as_ref().is_none_or(|host| (host.include)(provider))
@@ -181,10 +199,12 @@ impl Workspace {
     }
 
     fn toggle_favorite(&mut self, selection: &ModelSelection, cx: &mut Context<Self>) {
-        let (Some(client), Some(environment)) = (self.client(), self.active_environment().cloned()) else { return };
+        let Some(environment) = self.picker_environment() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         let key = (selection.instance_id.clone(), selection.model.clone());
-        let favorite = !self.server_info().favorites.contains(&key);
-        set_favorite(self.server_info_mut(), &key, favorite);
+        let Some(info) = self.env_info_mut(&environment) else { return };
+        let favorite = !info.favorites.contains(&key);
+        set_favorite(info, &key, favorite);
         cx.notify();
         let patch = json!({"patch": {"setModelFavorites": [
             {"provider": selection.instance_id, "model": selection.model, "favorite": favorite}
@@ -204,9 +224,9 @@ impl Workspace {
     }
 
     /// `providerModelPreferences[id].hiddenModels`, never hiding custom models.
-    fn model_hidden(&self, provider: &Provider, model: &ProviderModel) -> bool {
+    fn model_hidden(info: &ServerInfo, provider: &Provider, model: &ProviderModel) -> bool {
         !model.is_custom
-            && self.server_info().settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
+            && info.settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
                 .as_array()
                 .is_some_and(|hidden| hidden.iter().any(|h| h.as_str() == Some(&model.slug)))
     }
@@ -214,7 +234,8 @@ impl Workspace {
     fn picker_rows<'a>(&'a self, current: Option<&ModelSelection>) -> (Vec<Row>, bool) {
         let ready =
             |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
-        let favorites = &self.server_info().favorites;
+        let Some(info) = self.picker_info() else { return (Vec::new(), false) };
+        let favorites = &info.favorites;
         let is_favorite = |p: &Provider, m: &ProviderModel| {
             favorites.iter().any(|(instance_id, slug)| *instance_id == p.instance_id && *slug == m.slug)
         };
@@ -228,8 +249,9 @@ impl Workspace {
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
         };
-        let models = |p: &'a Provider| p.models.iter().filter(move |m| !self.model_hidden(p, m)).map(move |m| (p, m));
-        let providers = self.server_info().providers.iter().filter(ready).filter(|p| self.picker_includes(p));
+        let models =
+            |p: &'a Provider| p.models.iter().filter(move |m| !Self::model_hidden(info, p, m)).map(move |m| (p, m));
+        let providers = info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -267,7 +289,7 @@ impl Workspace {
         if let Some(tab) = &self.picker.tab {
             return tab.clone();
         }
-        if !self.server_info().favorites.is_empty() {
+        if self.picker_info().is_some_and(|info| !info.favorites.is_empty()) {
             return Tab::Favorites;
         }
         match current {
@@ -314,9 +336,9 @@ impl Workspace {
         let tab = self.picker_tab(current.as_ref());
         let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
             .chain(
-                self.server_info()
-                    .providers
-                    .iter()
+                self.picker_info()
+                    .into_iter()
+                    .flat_map(|info| info.providers.iter())
                     .filter(|p| p.enabled && self.picker_includes(p))
                     .filter(|p| p.availability.as_deref() != Some("unavailable") && p.status == "ready")
                     .map(|p| Tab::Provider(p.instance_id.clone())),
@@ -563,7 +585,8 @@ impl Workspace {
                 this.picker.highlighted = 0;
                 cx.notify();
             }));
-        let providers = self.server_info().providers.iter().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
+        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
+        let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             let name = p.display_name.clone().unwrap_or_else(|| p.instance_id.clone());
             let tooltip: SharedString = match (ready, p.availability.as_deref(), &p.message) {

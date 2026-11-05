@@ -528,7 +528,10 @@ impl Render for TaskEditor {
             let disabled = disabled
                 || !connected
                 || workspace.env_info(&self.environment).is_none_or(|info| info.model_choices().is_empty());
-            let trigger = workspace.model_picker_trigger(id.clone(), selection.as_ref(), None, cx).disabled(disabled);
+            let environment = Some(self.environment.as_ref());
+            let trigger = workspace
+                .model_picker_trigger(id.clone(), selection.as_ref(), None, environment, cx)
+                .disabled(disabled);
             let on_pick: OnPick = Rc::new(move |_, picked, _, cx| {
                 editor.update(cx, |this, cx| {
                     this.draft.model_key = format!("{}:{}", picked.instance_id, picked.model);
@@ -538,7 +541,12 @@ impl Render for TaskEditor {
             workspace.undocked_model_picker(
                 id,
                 trigger,
-                PickHost { current: selection.clone(), include: |_| true, on_pick },
+                PickHost {
+                    environment: Some(self.environment.clone()),
+                    current: selection.clone(),
+                    include: |_| true,
+                    on_pick,
+                },
                 cx,
             )
         });
