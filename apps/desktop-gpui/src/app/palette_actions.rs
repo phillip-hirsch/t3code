@@ -24,8 +24,6 @@ pub(super) fn github_repository(identity: &RepositoryIdentity) -> Option<(String
     (owner_ok && name_ok).then(|| (owner.to_owned(), name.to_owned()))
 }
 
-/// `URLSearchParams` encoding of one value.
-
 /// `buildNewThreadLink` with its context: the repository, and the model once a provider is known.
 pub(super) fn prompt_link_with(
     prompt: &str,

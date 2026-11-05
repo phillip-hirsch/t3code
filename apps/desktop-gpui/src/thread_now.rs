@@ -99,17 +99,20 @@ pub fn background_work(
     tasks: &[PendingBackgroundTask],
     turn_items: &[std::rc::Rc<TurnItem>],
 ) -> Option<BackgroundWork> {
+    struct Task<'a> {
+        task: &'a PendingBackgroundTask,
+        label: String,
+        item: Option<&'a TurnItem>,
+    }
+    fn subagent<'a>(row: &Task<'a>) -> Option<&'a TurnItem> {
+        row.item.filter(|item| item.item_type == "subagent")
+    }
     if tasks.is_empty() {
         return None;
     }
     // `backgroundWorkHoldsCompletion`: commands and monitors hold only when awaited.
     let waiting =
         tasks.iter().any(|t| t.awaited == Some(true) || matches!(t.kind.as_str(), "subagent" | "background_task"));
-    struct Task<'a> {
-        task: &'a PendingBackgroundTask,
-        label: String,
-        item: Option<&'a TurnItem>,
-    }
     let mut rows: Vec<Task> = tasks
         .iter()
         .map(|task| {
@@ -134,9 +137,6 @@ pub fn background_work(
         })
         .collect();
     rows.sort_by_key(|row| kind_order(&row.task.kind).0);
-    fn subagent<'a>(row: &Task<'a>) -> Option<&'a TurnItem> {
-        row.item.filter(|item| item.item_type == "subagent")
-    }
     let activity = |row: &Task| {
         subagent(row)
             .and_then(|item| item.str("progress"))

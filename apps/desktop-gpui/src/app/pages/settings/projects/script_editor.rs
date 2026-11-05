@@ -92,7 +92,6 @@ impl Workspace {
 }
 
 impl ScriptEditor {
-    #[expect(clippy::too_many_arguments)]
     fn new(
         workspace: WeakEntity<Workspace>,
         project_id: &str,

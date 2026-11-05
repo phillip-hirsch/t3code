@@ -58,8 +58,7 @@ pub(in crate::app) struct CodeTab {
 }
 
 impl CodeTab {
-    fn new(ignore_whitespace: bool, wrap: bool, folded: bool, split: bool, cx: &mut Context<Workspace>) -> Self {
-        let mode = if split { DiffMode::Split } else { DiffMode::Unified };
+    fn new(ignore_whitespace: bool, wrap: bool, folded: bool, mode: DiffMode, cx: &mut Context<Workspace>) -> Self {
         Self {
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx).with_mode(mode)),
             commit: None,
@@ -261,10 +260,11 @@ impl Workspace {
         let settings = &self.client_settings.values;
         let (ignore, wrap, folded) =
             (settings.bool("diffIgnoreWhitespace"), settings.bool("wordWrap"), settings.bool("diffFilesCollapsed"));
-        let split = settings.get("diffLayout").as_str() == Some("split");
+        let mode =
+            if settings.get("diffLayout").as_str() == Some("split") { DiffMode::Split } else { DiffMode::Unified };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.code.is_none() {
-            panel.code = Some(CodeTab::new(ignore, wrap, folded, split, cx));
+            panel.code = Some(CodeTab::new(ignore, wrap, folded, mode, cx));
         }
         let code = panel.code.as_ref().expect("made above");
         let viewed_files = panel.detail.as_ref().is_some_and(|d| d.capabilities.viewed_files.is_some());

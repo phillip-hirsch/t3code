@@ -1791,7 +1791,6 @@ impl Workspace {
 
     /// A model a feature can dedicate: the picker while on, and a switch that turns it on with
     /// `enable_with` or off (null), so the feature falls back to its parent model.
-    #[expect(clippy::too_many_arguments)]
     fn dedicated_model_control(
         &self,
         id: &'static str,

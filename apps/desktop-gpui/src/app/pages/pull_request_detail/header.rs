@@ -178,7 +178,7 @@ impl Workspace {
             .content(move |_, _, cx| {
                 let t = *theme::tokens(cx);
                 let (attention, running, completed) = logic::group_checks(&checks);
-                let collapsible = !(attention.is_empty() && running.is_empty()) && !completed.is_empty();
+                let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
                 let visible: Vec<&Check> = attention
                     .iter()
                     .chain(running.iter())

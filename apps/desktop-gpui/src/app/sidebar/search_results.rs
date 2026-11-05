@@ -41,6 +41,7 @@ pub(super) struct SearchResult<'a> {
 }
 
 impl Workspace {
+    #[expect(clippy::unnecessary_wraps, reason = "a `search_messages` slot, which can be missing elsewhere")]
     pub(super) fn sidebar_messages(this: &mut Workspace) -> Option<&mut MessageSearch> {
         Some(&mut this.sidebar.messages)
     }

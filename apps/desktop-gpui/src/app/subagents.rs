@@ -332,7 +332,7 @@ impl Workspace {
             (None, None) => String::new(),
         };
         let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or(&[]);
+            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let effort = selection.and_then(|s| model_label::effort_label(descriptors, s));
         let status = format_status(provider_subagent_status(projection), super::sidebar::now_ms());
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
@@ -630,16 +630,16 @@ fn format_status(status: Option<(String, Option<String>, Option<String>)>, now_m
 mod tests {
     use super::*;
 
-    fn status(status: &str, completed: Option<&str>) -> Option<(String, Option<String>, Option<String>)> {
-        Some((status.into(), Some("2026-01-01T00:00:00Z".into()), completed.map(Into::into)))
+    fn status(status: &str, completed: Option<&str>) -> (String, Option<String>, Option<String>) {
+        (status.into(), Some("2026-01-01T00:00:00Z".into()), completed.map(Into::into))
     }
 
     #[test]
     fn subagent_status_reads_like_the_web() {
         let start = crate::timestamp::parse_ms("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(format_status(None, 0), "Starting");
-        assert_eq!(format_status(status("running", None), start + 12_400), "Working 12s");
-        assert_eq!(format_status(status("completed", Some("2026-01-01T00:03:02Z")), 0), "Completed in 3m 2s");
-        assert_eq!(format_status(status("failed", None), 0), "Failed");
+        assert_eq!(format_status(Some(status("running", None)), start + 12_400), "Working 12s");
+        assert_eq!(format_status(Some(status("completed", Some("2026-01-01T00:03:02Z"))), 0), "Completed in 3m 2s");
+        assert_eq!(format_status(Some(status("failed", None)), 0), "Failed");
     }
 }

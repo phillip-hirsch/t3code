@@ -369,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list of one range is the expected value")]
     fn treats_tokens_as_atoms() {
         // A chip's own underscores never open or close a style, and it keeps its own look.
         let text = "_see @src/a_b.rs now_";

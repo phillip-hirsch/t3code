@@ -291,9 +291,9 @@ impl Fonts {
 
 /// The first family of a CSS family list, unquoted (`cssFontFamilies`).
 fn first_family(list: &str) -> Option<&'static str> {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let name =
         list.split(',').map(|name| name.trim().trim_matches(['"', '\'']).trim()).find(|name| !name.is_empty())?;
-    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     Some(names.get(name).copied().unwrap_or_else(|| {
         let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
@@ -485,6 +485,7 @@ struct EditorPreview(Option<(bool, ThemeColors)>);
 
 impl Global for EditorPreview {}
 
+#[expect(clippy::large_types_passed_by_value, reason = "the preview moves into a global")]
 pub fn set_editor_preview(preview: Option<(bool, ThemeColors)>, window: &mut Window, cx: &mut App) {
     if cx.try_global::<EditorPreview>().and_then(|p| p.0) == preview {
         return;

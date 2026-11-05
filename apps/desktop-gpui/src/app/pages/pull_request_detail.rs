@@ -896,7 +896,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_pr_header(
         &mut self,
         detail: &Rc<Detail>,
@@ -1142,7 +1141,6 @@ impl Workspace {
     }
 
     /// `PullRequestPrimaryAction`.
-    #[expect(clippy::too_many_arguments)]
     fn render_pr_primary(
         &self,
         detail: &Detail,
@@ -2154,6 +2152,7 @@ impl Workspace {
     }
 
     fn render_pr_guide(&mut self, t: &Tokens, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        const HINT: &str = "Check the review guide model in Settings → Source control.";
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let result = panel.guide.clone().unwrap_or_default();
         let tour = panel.guide_tour.clone();
@@ -2161,7 +2160,6 @@ impl Workspace {
         let current = result["currentHeadSha"].as_str();
         let failure = (result["run"]["_tag"] == "Failed" && result["run"]["headSha"].as_str() == current)
             .then(|| result["run"]["detail"].as_str().unwrap_or_default().to_owned());
-        const HINT: &str = "Check the review guide model in Settings → Source control.";
         let write_button = |label: &str, cx: &mut Context<Self>| {
             outline_button("pr-write-guide", t)
                 .disabled(running)
@@ -3066,10 +3064,12 @@ fn thread_event(
                     el.child(div().flex_none().font_weight(FontWeight::MEDIUM).child("Outdated"))
                 })
                 .when(!expanded, |el| {
-                    let mut text = format!("· {}", event.actor.as_ref().map_or("ghost", |a| a.login.as_str()));
-                    if replies > 0 {
-                        text.push_str(&format!(" · {replies} {}", if replies == 1 { "reply" } else { "replies" }));
-                    }
+                    let actor = event.actor.as_ref().map_or("ghost", |a| a.login.as_str());
+                    let text = match replies {
+                        0 => format!("· {actor}"),
+                        1 => format!("· {actor} · 1 reply"),
+                        _ => format!("· {actor} · {replies} replies"),
+                    };
                     el.child(div().flex_none().child(text))
                 })
                 .child(div().ml_auto().child(

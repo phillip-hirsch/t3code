@@ -2,6 +2,8 @@
 //! engine, so formulas read as their Unicode form: Greek and operator symbols, scripts as
 //! superscript and subscript characters where Unicode has them, fractions and roots inline.
 
+use std::fmt::Write as _;
+
 const SYMBOLS: &[(&str, &str)] = &[
     ("alpha", "α"),
     ("beta", "β"),
@@ -274,7 +276,9 @@ fn convert(tex: &str) -> String {
                         out.push(c);
                         out.push_str(&body);
                     }
-                    None => out.push_str(&format!("{c}({body})")),
+                    None => {
+                        let _ = write!(out, "{c}({body})");
+                    }
                 }
                 rest = after;
             }
@@ -288,14 +292,18 @@ fn convert(tex: &str) -> String {
                         let (bottom, after) = group(after.trim_start());
                         let (top, bottom) = (convert(top), convert(bottom));
                         let wrap = |s: String| if s.chars().count() > 1 { format!("({s})") } else { s };
-                        out.push_str(&format!("{}/{}", wrap(top), wrap(bottom)));
+                        let _ = write!(out, "{}/{}", wrap(top), wrap(bottom));
                         rest = after;
                     }
                     "sqrt" => {
                         let (body, after) = group(after.trim_start());
                         let body = convert(body);
                         out.push('√');
-                        out.push_str(&if body.chars().count() > 1 { format!("({body})") } else { body });
+                        if body.chars().count() > 1 {
+                            let _ = write!(out, "({body})");
+                        } else {
+                            out.push_str(&body);
+                        }
                         rest = after;
                     }
                     "text" | "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt" | "operatorname" | "textbf"

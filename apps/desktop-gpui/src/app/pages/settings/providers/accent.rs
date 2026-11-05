@@ -35,6 +35,7 @@ struct Hsv {
 }
 
 /// `hexToHsv` in `apps/web/src/lib/color.ts`.
+#[expect(clippy::float_cmp, reason = "`max` is one of r, g and b, so equality is exact")]
 fn hex_to_hsv(hex: &str) -> Hsv {
     let numeric = u32::from_str_radix(hex.get(1..).unwrap_or_default(), 16).unwrap_or(0);
     let [r, g, b] = [16, 8, 0].map(|shift| ((numeric >> shift) & 255) as f32 / 255.);

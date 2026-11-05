@@ -377,6 +377,7 @@ pub(super) fn format_duration_micros(value: f64) -> String {
 }
 
 /// `formatSampleInterval`.
+#[expect(clippy::float_cmp, reason = "the web compares exactly: `seconds === 1`")]
 pub(super) fn format_sample_interval(ms: f64) -> String {
     if ms < 1_000. {
         return format!("{} ms", ms.round().max(0.));

@@ -38,6 +38,11 @@ use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
+/// Runs with the new account's instance id and label once it is created.
+type OnCreated = Rc<dyn Fn(String, String, &mut Window, &mut App)>;
+/// A click that needs the window.
+type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
+
 pub(in crate::app) const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/#settings/Usage";
 const MULTIPLE_ACCOUNTS_FAQ_URL: &str =
     "https://github.com/pingdotgg/t3code/blob/main/docs/user/faq.md#can-i-add-a-bunch-of-accounts-for-one-provider";
@@ -463,7 +468,7 @@ impl Workspace {
     pub(in crate::app) fn open_add_codex_account_dialog(
         &mut self,
         scope: Option<SharedString>,
-        on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+        on_created: Option<OnCreated>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -655,7 +660,7 @@ enum FollowUp {
 
 /// Options of the managed setup shown inside the add-account wizard.
 struct WizardSetup {
-    on_cancelled: Rc<dyn Fn(&mut Window, &mut App)>,
+    on_cancelled: Callback,
 }
 
 pub(in crate::app) struct AccountSection {
@@ -2031,7 +2036,7 @@ struct AddCodexAccount {
     name: Entity<InputState>,
     pending: bool,
     created: Option<(String, Entity<AccountSection>)>,
-    on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+    on_created: Option<OnCreated>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2039,7 +2044,7 @@ impl AddCodexAccount {
     fn new(
         workspace: WeakEntity<Workspace>,
         scope: Option<SharedString>,
-        on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+        on_created: Option<OnCreated>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2094,8 +2099,7 @@ impl AddCodexAccount {
                             window.close_dialog(cx);
                         }
                         None => {
-                            let close: Rc<dyn Fn(&mut Window, &mut App)> =
-                                Rc::new(gpui_kit::component::WindowExt::close_dialog);
+                            let close: Callback = Rc::new(gpui_kit::component::WindowExt::close_dialog);
                             let (workspace, scope) = (this.workspace.clone(), this.scope.clone());
                             let section_id = id.clone();
                             let wizard = Some(WizardSetup { on_cancelled: close });

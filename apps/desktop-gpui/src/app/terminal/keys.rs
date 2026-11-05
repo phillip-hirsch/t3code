@@ -54,6 +54,7 @@ pub(super) fn key_action(
 
 /// [`key_action`] as on macOS, where ⌘ (not Ctrl) copies, pastes, selects all and jumps
 /// through history, and every Ctrl chord reaches the shell (`isTerminalCopyShortcut`).
+#[expect(clippy::fn_params_excessive_bools, reason = "the terminal's modes, and the platform as a test seam")]
 fn key_action_on(
     keystroke: &Keystroke,
     app_cursor: bool,
@@ -113,6 +114,7 @@ fn key_action_on(
     encode(key, ctrl, alt, shift, app_cursor, keystroke.key_char.as_deref()).map(KeyAction::Send)
 }
 
+#[expect(clippy::fn_params_excessive_bools, reason = "xterm's modifier bits and cursor-key mode")]
 fn encode(
     key: &str,
     ctrl: bool,

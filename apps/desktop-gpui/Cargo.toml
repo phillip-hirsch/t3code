@@ -174,6 +174,13 @@ similar_names = "allow"             # `state` / `stale`, `stats` / `state`
 single_match_else = "allow"         # a `match` with a fallback arm reads as well as `if let … else`
 option_option = "allow"             # tri-state patches: absent, cleared, set
 assert_is_empty = "allow"           # its fix, `assert_eq!(x, [] as [T; 0])`, reads worse
+default_trait_access = "allow"      # `field: Default::default()` in struct literals, whose types are declared
+assigning_clones = "allow"          # `x = y.clone()` reads plainer than `x.clone_from(&y)` off hot paths
+many_single_char_names = "allow"    # colour math names its channels: r, g, b, h, s, l
+struct_field_names = "allow"        # fields mirror the wire format: `Question::question`, `checkpoint_id`
+case_sensitive_file_extension_comparisons = "allow" # fires on names already lowercased
+maybe_infinite_iter = "allow"       # `(2..).find(..)` and `take_while` end
+match_same_arms = "allow"           # explicit arms document cases a wildcard also covers
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 module_inception = "allow"

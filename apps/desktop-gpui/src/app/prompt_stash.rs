@@ -99,7 +99,7 @@ impl PendingStash {
 pub(super) fn read_blobs(paths: Vec<PathBuf>) -> Vec<Option<Vec<u8>>> {
     paths
         .into_iter()
-        .map(|path| std::fs::read(&path).inspect_err(|error| log::warn!("stash file {path:?}: {error}")).ok())
+        .map(|path| std::fs::read(&path).inspect_err(|error| log::warn!("stash file {}: {error}", path.display())).ok())
         .collect()
 }
 
@@ -168,13 +168,13 @@ impl Store {
                 return Self { dir: Some(dir), file: StashFile::default() };
             }
             Err(error) => {
-                log::warn!("prompt stash {path:?} could not be read, so stashing is off: {error}");
+                log::warn!("prompt stash {} could not be read, so stashing is off: {error}", path.display());
                 return closed();
             }
         };
         let file = StashFile::parse(&raw).unwrap_or_else(|error| {
             let aside = dir.join(format!("stash.corrupt-{}.json", crate::timestamp::now_ms()));
-            log::warn!("prompt stash {path:?} is damaged ({error}); moved it to {aside:?}");
+            log::warn!("prompt stash {} is damaged ({error}); moved it to {}", path.display(), aside.display());
             if let Err(error) = std::fs::rename(&path, &aside) {
                 log::warn!("could not move the damaged prompt stash aside: {error}");
             }

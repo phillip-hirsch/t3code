@@ -102,8 +102,8 @@ impl Workspace {
             }
             loop {
                 let idle_for = last_input.get().elapsed();
-                if idle_for < IDLE {
-                    cx.background_executor().timer(IDLE.checked_sub(idle_for).unwrap()).await;
+                if let Some(rest) = IDLE.checked_sub(idle_for).filter(|rest| !rest.is_zero()) {
+                    cx.background_executor().timer(rest).await;
                     continue;
                 }
                 let Ok(active) = cx.update(|window, _| window.is_window_active()) else { return };

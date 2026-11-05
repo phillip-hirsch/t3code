@@ -16,7 +16,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/fonts/Inter-LICENSE.txt");
-    let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("rust-licenses.json");
+    let out =
+        Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for build scripts")).join("rust-licenses.json");
     let manifest = match collect() {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -25,7 +26,7 @@ fn main() {
             json!({ "texts": [], "entries": [] })
         }
     };
-    std::fs::write(out, manifest.to_string()).unwrap();
+    std::fs::write(out, manifest.to_string()).expect("writing the licenses manifest to OUT_DIR");
 }
 
 fn dir_of_manifest() -> String {
@@ -146,7 +147,8 @@ fn notice_text(package: &Value) -> String {
     let authors: Vec<&str> = package["authors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let mut statement = format!("Licensed under {}.", package["license"].as_str().unwrap_or("its declared license"));
     if !authors.is_empty() {
-        statement.push_str(&format!("\n\nCopyright (c) {}", authors.join(", ")));
+        statement.push_str("\n\nCopyright (c) ");
+        statement.push_str(&authors.join(", "));
     }
     statement
 }

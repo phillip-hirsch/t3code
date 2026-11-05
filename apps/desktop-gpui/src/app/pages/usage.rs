@@ -1725,7 +1725,6 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
-#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,

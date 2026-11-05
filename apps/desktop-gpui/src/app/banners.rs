@@ -918,7 +918,7 @@ mod tests {
         let unsupported = provider(
             json!({"version": "1.2", "compatibilityAdvisory": {"status": "unsupported", "message": "Update it"}}),
         );
-        assert_eq!(provider_banner_key(&unsupported).as_deref(), Some("codex\0unsupported\01.2\0Update it"));
+        assert_eq!(provider_banner_key(&unsupported).as_deref(), Some("codex\0unsupported\u{0}1.2\0Update it"));
         let (title, message, variant) = provider_banner(&unsupported);
         assert_eq!(
             (title.as_str(), message.as_str(), variant),

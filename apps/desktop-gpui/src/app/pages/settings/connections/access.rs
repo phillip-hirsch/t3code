@@ -347,9 +347,9 @@ impl Workspace {
     }
 
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &App, t: &Tokens) -> AnyElement {
+        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let s = state.read(cx);
         let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
-        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =

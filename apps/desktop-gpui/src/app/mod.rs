@@ -85,6 +85,7 @@ gpui_kit::actions!(
 /// Runs a shell command in the thread's terminal, as a project script does.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, gpui_kit::Action)]
 #[action(namespace = workspace, no_json)]
+#[expect(clippy::unsafe_derive_deserialize, reason = "the unsafe is in `gpui_kit::Action`'s derive, not this type")]
 pub struct RunInTerminal {
     pub cwd: String,
     pub command: String,

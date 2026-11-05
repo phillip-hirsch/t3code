@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn saved_cursor_restores_and_moves_stay_in_the_live_lines() {
         assert_eq!(fold(&["one\x1b7\ntwo\x1b8!"]), "one!\ntwo");
-        let many: String = (0..100).map(|i| format!("{i}\n")).collect();
+        let many = (0..100).map(|i| format!("{i}\n")).collect::<Vec<_>>().concat();
         // 99 lines up stops at the first of the 64 live lines.
         assert_eq!(fold(&[&many, "\x1b[99AX"]).lines().nth(37), Some("X7"));
     }

@@ -108,6 +108,9 @@ struct TokenMatch {
 }
 
 fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
+    fn tail(s: &[char]) -> &[char] {
+        s.get(1..).unwrap_or_default()
+    }
     if left.len().abs_diff(right.len()) > usize::from(!swap_only) {
         return false;
     }
@@ -116,9 +119,6 @@ fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
     let swapped = l.len() > 1 && r.len() > 1 && l[0] == r[1] && l[1] == r[0] && l[2..] == r[2..];
     if swap_only {
         return swapped;
-    }
-    fn tail(s: &[char]) -> &[char] {
-        s.get(1..).unwrap_or_default()
     }
     swapped || l == r || tail(l) == tail(r) || tail(l) == r || l == tail(r)
 }
@@ -399,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list of one range is the expected value")]
     fn snippet_ranges_skip_short_and_mid_word_tokens() {
         assert_eq!(token_ranges("Rename sidebar row", "the side row"), vec![7..11, 15..18]);
         assert_eq!(token_ranges("another", "the"), Vec::<Range<usize>>::new(), "short tokens need a word start");

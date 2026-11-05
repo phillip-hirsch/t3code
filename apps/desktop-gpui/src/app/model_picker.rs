@@ -378,7 +378,7 @@ impl Workspace {
             (None, None) => "Choose model".into(),
         };
         let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or(&[]);
+            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
         let fast = current.as_ref().is_some_and(|s| {
             descriptors.iter().find(|d| d.id == "fastMode").and_then(|d| model_label::current_value(d, s))

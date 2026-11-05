@@ -1078,7 +1078,7 @@ pub fn build_timeline(detail: &Detail, activity: &Activity, term: &str) -> Vec<E
 /// A Timeline row: one event, or a run of plain comments folded together.
 #[derive(Clone, Debug)]
 pub enum TimelineRow {
-    Event(Event),
+    Event(Box<Event>),
     Comments(Vec<Event>),
 }
 
@@ -1092,7 +1092,7 @@ pub fn group_timeline(events: Vec<Event>) -> Vec<TimelineRow> {
         match (plain, rows.last_mut()) {
             (true, Some(TimelineRow::Comments(run))) => run.push(event),
             (true, _) => rows.push(TimelineRow::Comments(vec![event])),
-            (false, _) => rows.push(TimelineRow::Event(event)),
+            (false, _) => rows.push(TimelineRow::Event(Box::new(event))),
         }
     }
     rows
@@ -1558,12 +1558,15 @@ pub fn note_marker(index: usize) -> String {
     if index < 26 { char::from(b'A' + index as u8).to_string() } else { (index + 1).to_string() }
 }
 
+/// A line number and its notes' markers and titles.
+pub type NoteLine = (u64, Vec<(String, String)>);
+
 /// `letterStopNotes`' per-excerpt half: for each excerpt, the lines that carry notes and their markers.
-pub fn excerpt_note_lines(stop: &GuideStop) -> Vec<Vec<(u64, Vec<(String, String)>)>> {
+pub fn excerpt_note_lines(stop: &GuideStop) -> Vec<Vec<NoteLine>> {
     stop.excerpts
         .iter()
         .map(|excerpt| {
-            let mut lines: Vec<(u64, Vec<(String, String)>)> = Vec::new();
+            let mut lines: Vec<NoteLine> = Vec::new();
             for (index, note) in stop.notes.iter().enumerate() {
                 if note.path != excerpt.path || note.line < excerpt.start || note.line > excerpt.end {
                     continue;

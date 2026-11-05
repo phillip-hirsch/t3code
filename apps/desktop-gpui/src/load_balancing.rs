@@ -84,8 +84,8 @@ pub const PREFERENCES: [(i64, &str); 4] = [(100, "Prefer"), (50, "Normal"), (25,
 pub fn preference_for_weight(weight: Option<f64>) -> i64 {
     match weight {
         None => 50,
-        Some(weight) if weight == 50. => 50,
-        Some(weight) if weight == 0. => 0,
+        Some(50.) => 50,
+        Some(0.) => 0,
         Some(weight) if weight < 50. => 25,
         Some(_) => 100,
     }

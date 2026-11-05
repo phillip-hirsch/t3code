@@ -144,6 +144,9 @@ impl Embed {
 }
 
 fn embed(item: &TurnItem) -> Option<Embed> {
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())
+    }
     if item.item_type != "dynamic_tool" {
         return None;
     }
@@ -152,9 +155,6 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         return None;
     }
     let tool = item.str("toolName").unwrap_or_default();
-    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-        value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())
-    }
     if let Some(app) = output.get("t3McpApp") {
         let (server, name) = (text(app, "server")?, text(app, "tool")?);
         if tool != format!("{server}.{name}") && tool != format!("mcp__{server}__{name}") {
@@ -925,6 +925,14 @@ fn turn_folds(
     latest_run: Option<&Run>,
     unfolded: &HashSet<SharedString>,
 ) -> HashMap<usize, Fold> {
+    struct Group {
+        entries: Vec<usize>,
+        terminal: Option<usize>,
+        streaming: bool,
+        start: Option<SharedString>,
+        anchor: usize,
+        steers: Vec<(usize, usize)>,
+    }
     let mut interrupted: HashSet<&SharedString> = HashSet::new();
     let mut prompt_index: HashMap<&SharedString, usize> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -940,14 +948,6 @@ fn turn_folds(
         }
     }
 
-    struct Group {
-        entries: Vec<usize>,
-        terminal: Option<usize>,
-        streaming: bool,
-        start: Option<SharedString>,
-        anchor: usize,
-        steers: Vec<(usize, usize)>,
-    }
     let mut groups: Vec<(SharedString, Group)> = Vec::new();
     let mut positions: HashMap<SharedString, usize> = HashMap::new();
     let mut runless_failed: HashSet<SharedString> = HashSet::new();

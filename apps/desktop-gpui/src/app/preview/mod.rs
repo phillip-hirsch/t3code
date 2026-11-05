@@ -660,7 +660,6 @@ impl Workspace {
         .detach();
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn adopt_view(
         &mut self,
         thread_id: String,

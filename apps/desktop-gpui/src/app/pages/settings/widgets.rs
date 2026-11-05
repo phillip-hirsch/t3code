@@ -968,7 +968,6 @@ impl Workspace {
         )
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_inheritance(
         &self,
         view: &SettingsView,
@@ -1145,7 +1144,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_control(
         &mut self,
         view: &SettingsView,
@@ -1232,7 +1230,6 @@ impl Workspace {
 
     /// A select over JSON values that writes `key` through the scope; `trigger` is what the
     /// closed select shows.
-    #[expect(clippy::too_many_arguments)]
     pub(in crate::app) fn value_select(
         &self,
         id: impl Into<SharedString>,
@@ -1279,7 +1276,6 @@ impl Workspace {
     }
 
     /// The text field of a `.text()` or `.textarea()` row, writing through the scope.
-    #[expect(clippy::too_many_arguments)]
     fn setting_field(
         &mut self,
         id: &SharedString,
@@ -1296,7 +1292,6 @@ impl Workspace {
     }
 
     /// The slider entity for `key`, kept in sync with the setting while it is not being dragged.
-    #[expect(clippy::too_many_arguments)]
     fn settings_slider(
         &mut self,
         key: &'static str,

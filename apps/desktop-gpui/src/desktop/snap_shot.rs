@@ -653,6 +653,7 @@ mod mac_window {
     }
 
     /// A thin strip sharing an edge with `reference` and lying along its top or left side.
+    #[expect(clippy::float_cmp, reason = "window bounds are whole pixels, so shared edges compare exactly")]
     fn is_helper_strip(strip: &Rect, reference: &Rect) -> bool {
         let r = HELPER_STRIP_RATIO;
         (strip.x == reference.x

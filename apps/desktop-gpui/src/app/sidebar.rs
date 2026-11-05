@@ -122,7 +122,7 @@ impl SidebarState {
             cx.subscribe(&search, |this, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => this.on_search_changed(cx),
                 InputEvent::Focus | InputEvent::Blur => this.notify_sidebar(cx),
-                _ => {}
+                InputEvent::PressEnter { .. } => {}
             }),
             cx.on_focus(&list_focus, window, |this, _, cx| this.notify_sidebar(cx)),
             cx.on_blur(&list_focus, window, |this, _, cx| this.notify_sidebar(cx)),
@@ -380,7 +380,6 @@ fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::A
 impl SidebarState {
     /// The rows to draw, in order: the web's `sidebarListItemsFresh`. `boring` folds the
     /// active threads into project folders (`useSidebarThreads` `folderGroups`).
-    #[expect(clippy::too_many_arguments)]
     fn items<'a>(
         &mut self,
         shell: &'a ShellState,
@@ -391,6 +390,9 @@ impl SidebarState {
         boring: bool,
         now: i64,
     ) -> Vec<Item<'a>> {
+        fn route_only<'a>(list: Vec<Facts<'a>>, expanded: bool, route: Option<&str>) -> Vec<Facts<'a>> {
+            if expanded { list } else { list.into_iter().filter(|f| Some(f.thread.id.as_str()) == route).collect() }
+        }
         let route = match target {
             Some(Target::Thread { id, .. }) => Some(id.as_str()),
             _ => None,
@@ -434,9 +436,6 @@ impl SidebarState {
             }
         } else {
             items.extend(sections.active.into_iter().map(Item::Card));
-        }
-        fn route_only<'a>(list: Vec<Facts<'a>>, expanded: bool, route: Option<&str>) -> Vec<Facts<'a>> {
-            if expanded { list } else { list.into_iter().filter(|f| Some(f.thread.id.as_str()) == route).collect() }
         }
         let mut first = true;
         if !sections.working.is_empty() {
@@ -1674,7 +1673,6 @@ impl Workspace {
         Some(svg().path(path).size(px(14.)).flex_none().text_color(color.opacity(0.6)).into_any_element())
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_card(
         &self,
         facts: Facts,
@@ -1914,7 +1912,6 @@ impl Workspace {
 
     /// A boring sidebar folder header (`SidebarProjectFolderHeader`): it reads like a shelf
     /// header, with the hidden count and a status dot only while it is closed.
-    #[expect(clippy::too_many_arguments)]
     fn render_folder(
         &self,
         group: &ProjectGroup,
@@ -2050,7 +2047,6 @@ impl Workspace {
 
     /// A one-line thread row in a folder (`variant="folder"`), or with the card's branch line
     /// under it (`folder-multiline`). Titles line up with the folder name, past its icon.
-    #[expect(clippy::too_many_arguments)]
     fn render_folder_row(
         &self,
         facts: Facts,
@@ -2180,7 +2176,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_slim(
         &self,
         facts: Facts,
@@ -2200,9 +2195,7 @@ impl Workspace {
         let draft = !active && self.has_unsent_draft(&thread.id);
         let recede = inbox::recedes(status, unread, woke, active || selected);
         let settled = shelf == Some(Shelf::Settled);
-        let title_color = if settled && !active {
-            sb.secondary_label
-        } else if recede {
+        let title_color = if (settled && !active) || recede {
             sb.secondary_label
         } else if active || woke || matches!(status, Status::Input | Status::Request) {
             sb.foreground

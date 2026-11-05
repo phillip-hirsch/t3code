@@ -441,10 +441,12 @@ pub(super) fn render_row(
                 body,
                 actions,
                 steer.filter(|_| !*continues_steer),
-                *grouped_with_previous,
-                *grouped_with_next,
-                expanded,
-                *sent_by_t3code,
+                UserRowLook {
+                    grouped_with_previous: *grouped_with_previous,
+                    grouped_with_next: *grouped_with_next,
+                    expanded,
+                    sent_by_t3code: *sent_by_t3code,
+                },
                 this,
                 &t,
             )
@@ -992,19 +994,25 @@ fn working_duration(ms: i64) -> String {
 // ---------------------------------------------------------------------------
 // Messages
 
+/// How a user message bubble sits among its neighbours, and how much of it shows.
+struct UserRowLook {
+    grouped_with_previous: bool,
+    grouped_with_next: bool,
+    expanded: bool,
+    sent_by_t3code: bool,
+}
+
 fn user_row(
     id: &SharedString,
     text: &SharedString,
     body: AnyElement,
     actions: gpui_kit::Div,
     steer: Option<Steer>,
-    grouped_with_previous: bool,
-    grouped_with_next: bool,
-    expanded: bool,
-    sent_by_t3code: bool,
+    look: UserRowLook,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
+    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code } = look;
     let collapsible = should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
@@ -1115,9 +1123,9 @@ fn markdown_view(
                 if let Some(target) = target {
                     let _ = link_this.update(cx, |workspace, cx| {
                         if right {
-                            workspace.open_file_menu(target, event.position(), window, cx)
+                            workspace.open_file_menu(target, event.position(), window, cx);
                         } else {
-                            workspace.open_file_link(&target, window, cx)
+                            workspace.open_file_link(&target, window, cx);
                         }
                     });
                     return;

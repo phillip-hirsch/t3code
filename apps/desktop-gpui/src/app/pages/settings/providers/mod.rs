@@ -84,7 +84,7 @@ fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
 
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
 fn card_height(window: &Window) -> f32 {
-    (f32::from(window.viewport_size().height) - 176.).min(704.).max(512.)
+    (f32::from(window.viewport_size().height) - 176.).clamp(512., 704.)
 }
 
 impl Workspace {
@@ -533,7 +533,6 @@ impl Workspace {
         self.providers_request_on(environment, method, payload, failure, window, cx, done);
     }
 
-    #[expect(clippy::too_many_arguments, reason = "providers_request_then with its environment")]
     fn providers_request_on(
         &mut self,
         environment: SharedString,
@@ -568,7 +567,6 @@ impl Workspace {
 
     /// A text field that commits like the web's `DraftInput`: on blur or Enter, when it differs from
     /// the saved `value`, which it follows while unfocused.
-    #[expect(clippy::too_many_arguments)]
     pub(super) fn draft_input(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -618,7 +616,6 @@ impl Workspace {
     }
 
     /// Gets or creates the page's input under `key`; `on_event` sees all of its events.
-    #[expect(clippy::too_many_arguments)]
     pub(super) fn page_input(
         &mut self,
         page: &Entity<ProvidersPage>,

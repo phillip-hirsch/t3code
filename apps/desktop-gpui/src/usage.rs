@@ -352,14 +352,6 @@ pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
 }
 
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
-    let mut merged = Merged::default();
-    if !summary.compatible() {
-        return merged;
-    }
-    let visible = |provider: &str| !hidden.iter().any(|h| h == provider);
-    let mut owned_providers: Vec<&str> = Vec::new();
-    let mut owned_sources: Vec<(&str, &str)> = Vec::new();
-    let mut providers: Vec<ProviderTotals> = Vec::new();
     fn provider_slot<'a>(providers: &'a mut Vec<ProviderTotals>, kind: &str) -> &'a mut ProviderTotals {
         let index = match providers.iter().position(|p| p.provider == kind) {
             Some(index) => index,
@@ -370,6 +362,14 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         };
         &mut providers[index]
     }
+    let mut merged = Merged::default();
+    if !summary.compatible() {
+        return merged;
+    }
+    let visible = |provider: &str| !hidden.iter().any(|h| h == provider);
+    let mut owned_providers: Vec<&str> = Vec::new();
+    let mut owned_sources: Vec<(&str, &str)> = Vec::new();
+    let mut providers: Vec<ProviderTotals> = Vec::new();
     for source in &summary.sources {
         let provider = source.fingerprint.provider.as_str();
         if source.status == "missing" || !visible(provider) {
@@ -1257,6 +1257,9 @@ pub fn alias_cell(aliases: &Value, model: &str) -> String {
     aliases.get(model).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
+/// A settings patch: keys to their new values.
+type Patch = serde_json::Map<String, Value>;
+
 /// `usagePriceTableChanges` for this environment: the `usagePriceOverrides` and
 /// `usageModelAliases` patches (`null` removes), or each failing row's error.
 pub fn price_table_changes(
@@ -1264,7 +1267,7 @@ pub fn price_table_changes(
     aliases: &Value,
     label: &str,
     drafts: &[PriceDraft],
-) -> Result<(serde_json::Map<String, Value>, serde_json::Map<String, Value>), Vec<(usize, String)>> {
+) -> Result<(Patch, Patch), Vec<(usize, String)>> {
     let mut price_patch = serde_json::Map::new();
     let mut alias_patch = serde_json::Map::new();
     let mut errors = Vec::new();

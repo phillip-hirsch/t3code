@@ -1237,7 +1237,6 @@ fn mix(a: Hsla, b: Hsla, share: f32) -> Hsla {
     gpui_kit::Rgba { r: lerp(a.r, b.r), g: lerp(a.g, b.g), b: lerp(a.b, b.b), a: 1. }.into()
 }
 
-#[expect(clippy::too_many_arguments)]
 fn pull_request_row(
     entry: &Rc<Entry>,
     stat: Option<(u64, u64)>,
@@ -1266,7 +1265,6 @@ fn pull_request_row(
         .text_color(t.muted_foreground)
         .child(format!("#{}", entry.number))
         .context_menu({
-            let url = url;
             move |menu, _, _| {
                 let (copy, open) = (url.clone(), url.clone());
                 menu.item(

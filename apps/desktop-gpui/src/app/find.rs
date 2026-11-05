@@ -723,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list of one range is the expected value")]
     fn occurrences_fold_case_and_apostrophes_without_overlap() {
         assert_eq!(occurrences("Find the find, FIND", "find"), [0..4, 9..13, 15..19]);
         assert_eq!(occurrences("aaaa", "aa"), [0..2, 2..4]);

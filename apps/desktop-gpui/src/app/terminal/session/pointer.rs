@@ -234,7 +234,7 @@ impl TerminalSession {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
                 MouseButton::Right => 2,
-                _ => return false,
+                MouseButton::Navigate(_) => return false,
             };
             let (column, row) = self.screen_cell(event.position);
             if let Some(data) = mouse::encode(mode, MouseAction::Press, button, modifiers.alt, column, row) {

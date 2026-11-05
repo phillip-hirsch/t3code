@@ -47,7 +47,7 @@ fn preview(prompt: &str, attachments: usize) -> String {
             text.replace_range(range, &label);
         }
     }
-    let line = text.trim().split('\n').next().unwrap_or_default().to_owned();
+    let line = text.trim().lines().next().unwrap_or_default().to_owned();
     if !line.is_empty() {
         return line;
     }

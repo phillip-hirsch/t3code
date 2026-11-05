@@ -287,11 +287,12 @@ impl AccessSnapshot {
     pub fn summary(&self) -> String {
         let sessions = self.client_sessions.len();
         let links = self.pairing_links.len();
-        let mut summary = format!("{sessions} {}", if sessions == 1 { "client" } else { "clients" });
-        if links > 0 {
-            summary.push_str(&format!(" · {links} {}", if links == 1 { "pairing link" } else { "pairing links" }));
+        let clients = format!("{sessions} {}", if sessions == 1 { "client" } else { "clients" });
+        match links {
+            0 => clients,
+            1 => format!("{clients} · 1 pairing link"),
+            _ => format!("{clients} · {links} pairing links"),
         }
-        summary
     }
 
     /// `canRevokeOtherClients`.

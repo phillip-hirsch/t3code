@@ -172,7 +172,6 @@ impl Workspace {
     }
 
     /// `GuideStop`.
-    #[expect(clippy::too_many_arguments)]
     fn render_pr_guide_stop(
         &mut self,
         stop: &GuideStop,

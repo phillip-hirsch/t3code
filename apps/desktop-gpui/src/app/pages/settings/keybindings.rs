@@ -967,7 +967,7 @@ const EDITORS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 impl Render for KeybindingsPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let rows = filter_rows(&self.catalog.rows, &self.query);
         let groups = group_rows(&rows);
@@ -983,7 +983,7 @@ impl Render for KeybindingsPanel {
         }
         let mut body = Vec::new();
         if self.adding.is_some() {
-            body.push(card([self.render_new_row(&t, window, cx)], &t));
+            body.push(card([self.render_new_row(&t, cx)], &t));
         }
         if groups.is_empty() {
             body.push(card(
@@ -999,7 +999,7 @@ impl Render for KeybindingsPanel {
             ));
         }
         for (_, title, rows) in groups {
-            let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, window, cx)).collect();
+            let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, cx)).collect();
             body.push(settings_section(SharedString::from(title), title, rendered, &t));
         }
         children.push(v_flex().gap(px(32.)).children(body).into_any_element());
@@ -1060,7 +1060,7 @@ impl KeybindingsPanel {
             .into_any_element()
     }
 
-    fn render_row(&self, row: &KeyRow, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, row: &KeyRow, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let (key, when, when_valid) = self.draft_parts(row);
         let expression = when_expression(when);
         let dirty = key != row.key || expression != row.when;
@@ -1077,7 +1077,7 @@ impl KeybindingsPanel {
             .child(label)
             .when(row.source != Source::Default, |el| el.child(badge(row.source.label(), t)))
             .tooltip(move |window, cx| Tooltip::new(command.clone()).build(window, cx));
-        let description = self.render_when_line(&row.id, &expression, when, t, window, cx);
+        let description = self.render_when_line(&row.id, &expression, when, t, cx);
         let saving = self.saving.as_deref() == Some(row.command.as_str());
         let control = h_flex()
             .flex_wrap()
@@ -1184,7 +1184,6 @@ impl KeybindingsPanel {
         expression: &str,
         when: Option<&When>,
         t: &Tokens,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.when_open.as_deref() == Some(id);
@@ -1224,7 +1223,7 @@ impl KeybindingsPanel {
                         deferred(
                             anchored()
                                 .snap_to_window_with_margin(px(8.))
-                                .child(self.render_when_builder(id, when, t, window, cx)),
+                                .child(self.render_when_builder(id, when, t, cx)),
                         )
                         .with_priority(1),
                     ),
@@ -1234,14 +1233,7 @@ impl KeybindingsPanel {
     }
 
     /// `WhenExpressionBuilder`.
-    fn render_when_builder(
-        &self,
-        id: &str,
-        when: Option<&When>,
-        t: &Tokens,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_when_builder(&self, id: &str, when: Option<&When>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let text = self.when_input.read(cx).value();
         let parsed = parse_when_draft(&text);
         let unknown = parsed.as_ref().map(|when| unknown_variables(when.as_ref())).unwrap_or_default();
@@ -1259,7 +1251,7 @@ impl KeybindingsPanel {
                 .on_click(cx.listener(move |this, _, window, cx| this.add_to_root(&owned, group, window, cx)))
         };
         let tree = match when {
-            Some(node) => self.render_when_node(id, node, Vec::new(), 0, true, t, window, cx),
+            Some(node) => self.render_when_node(id, node, Vec::new(), 0, true, t, cx),
             None => h_flex()
                 .flex_wrap()
                 .gap(px(8.))
@@ -1339,7 +1331,6 @@ impl KeybindingsPanel {
     }
 
     /// `WhenExpressionNodeEditor`, one node and its operands.
-    #[expect(clippy::too_many_arguments)]
     fn render_when_node(
         &self,
         id: &str,
@@ -1348,7 +1339,6 @@ impl KeybindingsPanel {
         depth: usize,
         removable: bool,
         t: &Tokens,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = format!("kb-node-{id}-{path:?}");
@@ -1408,7 +1398,7 @@ impl KeybindingsPanel {
                 .border_color(t.border.opacity(if depth > 0 { 0.5 } else { 0.7 }))
                 .bg(if depth > 0 { t.background.opacity(0.5) } else { t.muted.opacity(0.2) })
                 .child(h_flex().gap(px(8.)).child(not_toggle(true, cx)).child(div().flex_1()).children(remove))
-                .child(branch(self.render_when_node(id, inner, inner_path, depth + 1, false, t, window, cx)))
+                .child(branch(self.render_when_node(id, inner, inner_path, depth + 1, false, t, cx)))
                 .into_any_element();
         }
         let or = is_or(node);
@@ -1446,7 +1436,7 @@ impl KeybindingsPanel {
             .map(|(index, child)| {
                 let mut child_path = path.clone();
                 child_path.push(index);
-                branch(self.render_when_node(id, child, child_path, depth + 1, true, t, window, cx))
+                branch(self.render_when_node(id, child, child_path, depth + 1, true, t, cx))
             })
             .collect();
         v_flex()
@@ -1510,7 +1500,7 @@ impl KeybindingsPanel {
     }
 
     /// `NewKeybindingSettingsRow`.
-    fn render_new_row(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_new_row(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(adding) = &self.adding else { return div().into_any_element() };
         let draft = &adding.draft;
         let expression = when_expression(draft.when.as_ref());
@@ -1542,7 +1532,7 @@ impl KeybindingsPanel {
                 menu.max_h(px(288.)).scrollable(true)
             },
         );
-        let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, window, cx);
+        let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, cx);
         let row = RowFrame::new("New keybinding").description(description).control(
             h_flex()
                 .flex_wrap()

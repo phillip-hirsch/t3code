@@ -106,7 +106,7 @@ pub struct Extension {
 }
 
 fn short_hash(value: &str) -> String {
-    Sha256::digest(value.as_bytes())[..6].iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::hex::lower_hex(&Sha256::digest(value.as_bytes())[..6])
 }
 
 fn theme_id(extension_id: &str, source: &str) -> String {
@@ -633,7 +633,7 @@ pub async fn import(extension: Extension) -> Result<Vec<ThemeDefinition>, String
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("That Open VSX theme has an invalid checksum.".to_owned());
         }
-        let actual: String = Sha256::digest(&package).iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual = crate::hex::lower_hex(&Sha256::digest(&package));
         if !actual.eq_ignore_ascii_case(&expected) {
             return Err("That Open VSX theme failed its integrity check.".to_owned());
         }

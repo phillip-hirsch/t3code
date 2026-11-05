@@ -562,7 +562,7 @@ impl Workspace {
         stream.buttons |= bit;
         stream.send(json!({
             "type": "mouse", "action": "down", "x": x, "y": y, "button": button, "buttons": stream.buttons,
-            "clickCount": event.click_count, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": event.click_count, "modifiers": modifier_bits(event.modifiers),
         }));
         cx.stop_propagation();
     }
@@ -577,7 +577,7 @@ impl Workspace {
         stream.buttons &= !bit;
         stream.send(json!({
             "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": stream.buttons,
-            "clickCount": event.click_count, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": event.click_count, "modifiers": modifier_bits(event.modifiers),
         }));
         cx.stop_propagation();
     }
@@ -597,7 +597,7 @@ impl Workspace {
         };
         stream.send(json!({
             "type": "mouse", "action": "move", "x": x, "y": y, "button": button, "buttons": held,
-            "clickCount": 0, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": 0, "modifiers": modifier_bits(event.modifiers),
         }));
     }
 
@@ -610,7 +610,7 @@ impl Workspace {
         // GPUI's deltas point where the content moves; the DOM's where the page scrolls.
         self.send_server_input(
             tab_id,
-            json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(&event.modifiers)}),
+            json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(event.modifiers)}),
         )
     }
 
@@ -630,7 +630,7 @@ impl Workspace {
         let Some(key) = dom_key(keystroke) else { return false };
         let mut input = json!({
             "type": "key", "action": action, "key": key.key, "code": key.code, "keyCode": key.key_code,
-            "modifiers": modifier_bits(m),
+            "modifiers": modifier_bits(*m),
         });
         if action == "down"
             && let Some(text) = key.text
@@ -707,7 +707,7 @@ fn viewport_json(viewport: &Viewport) -> Value {
 }
 
 /// `previewStreamModifiers`: alt 1, ctrl 2, meta 4, shift 8.
-fn modifier_bits(m: &Modifiers) -> u8 {
+fn modifier_bits(m: Modifiers) -> u8 {
     u8::from(m.alt) | u8::from(m.control) << 1 | u8::from(m.platform) << 2 | u8::from(m.shift) << 3
 }
 
@@ -744,17 +744,17 @@ fn page_fit(area: Bounds<Pixels>, frame: (u32, u32), viewport: Option<(f32, f32)
 
 impl PageFit {
     /// A window point as page px; outside the frame only while a button is held (`captured`).
-    fn to_page(&self, point: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
+    fn to_page(self, point: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
         let x = (f32::from(point.x) - self.origin.0) / self.size.0;
         let y = (f32::from(point.y) - self.origin.1) / self.size.1;
-        if !captured && !((0. ..=1.).contains(&x) && (0. ..=1.).contains(&y)) {
+        if !(captured || ((0. ..=1.).contains(&x) && (0. ..=1.).contains(&y))) {
             return None;
         }
         Some((x.clamp(0., 1.) * self.viewport.0, y.clamp(0., 1.) * self.viewport.1))
     }
 
     /// A page point relative to the frame area, for overlays drawn in it.
-    fn to_local(&self, x: f32, y: f32) -> (f32, f32) {
+    fn to_local(self, x: f32, y: f32) -> (f32, f32) {
         (
             self.origin.0 - f32::from(self.area.origin.x) + x / self.viewport.0 * self.size.0,
             self.origin.1 - f32::from(self.area.origin.y) + y / self.viewport.1 * self.size.1,
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(key("left").key, "ArrowLeft");
         assert_eq!(key("space").text.as_deref(), Some(" "));
         assert!(dom_key(&Keystroke::parse("f13").ok().unwrap()).is_none());
-        assert_eq!(modifier_bits(&Modifiers { shift: true, control: true, ..Default::default() }), 10);
+        assert_eq!(modifier_bits(Modifiers { shift: true, control: true, ..Default::default() }), 10);
     }
 
     #[test]

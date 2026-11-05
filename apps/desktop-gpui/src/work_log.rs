@@ -1217,7 +1217,7 @@ impl Entry {
     pub fn succeeded(&self) -> bool {
         self.is_tool_like()
             && !self.failed()
-            && !(self.tone == Tone::Thinking && !self.is_reasoning())
+            && (self.tone != Tone::Thinking || self.is_reasoning())
             && !matches!(
                 self.status,
                 Some(Status::Failed | Status::Declined | Status::InProgress | Status::Stopped | Status::Idle)
@@ -1482,16 +1482,16 @@ fn lowercase_first(text: &str) -> String {
 /// `summarizeToolGroup`: "Ran 2 commands and read 1 file". Returns the
 /// summary and whether any summarized call failed.
 pub fn summarize_tool_group(entries: &[&Entry]) -> (String, bool) {
-    let tools: Vec<&Entry> = entries.iter().copied().filter(|e| !e.is_reasoning()).collect();
-    if !entries.is_empty() && tools.is_empty() {
-        let summary = if entries.len() == 1 { "Thought".into() } else { format!("Thought (×{})", entries.len()) };
-        return (summary, false);
-    }
     struct Group<'a> {
         key: &'static str,
         action: Action,
         t3: bool,
         entries: Vec<&'a Entry>,
+    }
+    let tools: Vec<&Entry> = entries.iter().copied().filter(|e| !e.is_reasoning()).collect();
+    if !entries.is_empty() && tools.is_empty() {
+        let summary = if entries.len() == 1 { "Thought".into() } else { format!("Thought (×{})", entries.len()) };
+        return (summary, false);
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut sources: Vec<&ToolSource> = Vec::new();
@@ -1812,7 +1812,7 @@ pub fn command_program_name(command: &str) -> Option<String> {
     for segment in segments {
         let tokens = shell_tokens(segment).unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
         let program = tokens.iter().map(String::as_str).find(|t| {
-            !(t.contains('=') && !t.starts_with('=')) && !matches!(*t, "sudo" | "env" | "time" | "exec" | "command")
+            (!t.contains('=') || t.starts_with('=')) && !matches!(*t, "sudo" | "env" | "time" | "exec" | "command")
         });
         let Some(program) = program else { continue };
         let name = program_basename(program);

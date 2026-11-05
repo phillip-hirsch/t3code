@@ -182,7 +182,9 @@ fn inert_edits(node: &markdown::mdast::Node, edits: &mut Vec<(std::ops::Range<us
                 // Formatted labels keep their markup; only the brackets and destination go.
                 Some(inner) => {
                     edits.push((range.start..inner.start, String::new()));
-                    children.iter().for_each(|child| inert_edits(child, edits));
+                    for child in children {
+                        inert_edits(child, edits);
+                    }
                     edits.push((inner.end..range.end, String::new()));
                 }
                 // Plain labels, autolinks and bare URLs become escaped text, which no longer links.

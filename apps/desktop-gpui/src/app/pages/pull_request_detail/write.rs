@@ -506,7 +506,6 @@ impl Workspace {
         )
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_pr_composer_body(
         &self,
         detail: &Detail,

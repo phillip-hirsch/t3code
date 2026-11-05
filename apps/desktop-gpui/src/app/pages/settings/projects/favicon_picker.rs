@@ -76,7 +76,6 @@ pub(super) struct FaviconPicker {
 }
 
 impl FaviconPicker {
-    #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
         cwd: String,
         project_name: SharedString,

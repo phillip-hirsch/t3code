@@ -163,7 +163,8 @@ impl SavedEnvironments {
                     return;
                 }
                 let attempt_result = runtime().spawn(connect(environment.clone())).await;
-                let result = attempt_result.unwrap_or_else(|error| Err((Failure::transport(error.to_string()), None)));
+                let result =
+                    attempt_result.unwrap_or_else(|error| Err(Box::new((Failure::transport(error.to_string()), None))));
                 match result {
                     Ok((client, descriptor)) => {
                         failures = 0;
@@ -198,7 +199,8 @@ impl SavedEnvironments {
                         }
                         cx.background_executor().timer(Duration::from_millis(delay)).await;
                     }
-                    Err((failure, descriptor)) => {
+                    Err(error) => {
+                        let (failure, descriptor) = *error;
                         let blocks = failure.reason.blocks();
                         let delay = (!blocks).then(|| {
                             failures += 1;
@@ -240,25 +242,29 @@ fn retry_at(delay_ms: u64) -> i64 {
     crate::app::sidebar::now_ms().saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX))
 }
 
+/// Why an attempt failed, with the descriptor when it was read. Boxed: the pair is large.
+type ConnectError = Box<(Failure, Option<environments::Descriptor>)>;
+
 /// One attempt: the descriptor (identity and protocol), then the socket. Runs on the tokio runtime.
-async fn connect(
-    environment: SavedEnvironment,
-) -> Result<(RpcClient, environments::Descriptor), (Failure, Option<environments::Descriptor>)> {
+async fn connect(environment: SavedEnvironment) -> Result<(RpcClient, environments::Descriptor), ConnectError> {
     let Some(endpoint) = environment.endpoint() else {
-        return Err((Failure::credential_missing(&environment), None));
+        return Err(Box::new((Failure::credential_missing(&environment), None)));
     };
-    let descriptor = environments::fetch_descriptor(&endpoint.http_base).await.map_err(|failure| (failure, None))?;
+    let descriptor =
+        environments::fetch_descriptor(&endpoint.http_base).await.map_err(|failure| Box::new((failure, None)))?;
     if descriptor.environment_id != environment.environment_id {
         let failure = Failure::environment_mismatch(&environment.environment_id, &descriptor.environment_id);
-        return Err((failure, Some(descriptor)));
+        return Err(Box::new((failure, Some(descriptor))));
     }
     if let Some(failure) = descriptor.compatibility_error() {
-        return Err((failure, Some(descriptor)));
+        return Err(Box::new((failure, Some(descriptor))));
     }
     let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
     match RpcClient::connect(runtime().handle(), options).await {
         Ok(client) => Ok((client, descriptor)),
-        Err(error) if rpc::is_unauthorized(&error) => Err((Failure::http(401, &endpoint.ws_url()), Some(descriptor))),
-        Err(error) => Err((Failure::transport(format!("{error:#}")), Some(descriptor))),
+        Err(error) if rpc::is_unauthorized(&error) => {
+            Err(Box::new((Failure::http(401, &endpoint.ws_url()), Some(descriptor))))
+        }
+        Err(error) => Err(Box::new((Failure::transport(format!("{error:#}")), Some(descriptor)))),
     }
 }

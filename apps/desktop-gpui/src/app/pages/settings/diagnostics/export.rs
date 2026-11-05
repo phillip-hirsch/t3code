@@ -156,14 +156,14 @@ impl Workspace {
         });
         // Another client's save replaces the fields this one has not edited.
         inputs.update(cx, |inputs, cx| {
-            for index in 0..3 {
-                if inputs.saved[index] != saved[index] {
+            for (index, next) in saved.iter().enumerate() {
+                if inputs.saved[index] != *next {
                     let input = inputs.inputs[index].clone();
                     if input.read(cx).value().trim() == inputs.saved[index] {
-                        let value = saved[index].clone();
+                        let value = next.clone();
                         input.update(cx, |input, cx| input.set_value(value, window, cx));
                     }
-                    inputs.saved[index] = saved[index].clone();
+                    inputs.saved[index] = next.clone();
                 }
             }
         });
@@ -180,7 +180,6 @@ impl Workspace {
                     is_http_url(&url).then_some((i, url))
                 })
                 .collect();
-            let client = client.clone();
             state.update(cx, |s, cx| {
                 s.export.checks_started = true;
                 for (index, url) in initial {
@@ -307,10 +306,10 @@ impl Workspace {
                     state.update(cx, |s, cx| {
                         s.export.message = None;
                         if can_check {
-                            for index in 0..3 {
-                                let stale = s.export.checks[index].as_ref().is_none_or(|c| c.url != saved[index]);
+                            for (index, url) in saved.iter().enumerate() {
+                                let stale = s.export.checks[index].as_ref().is_none_or(|c| c.url != *url);
                                 if running_override(&running, index).is_none() && stale {
-                                    s.check_endpoint(client.clone(), index, saved[index].clone(), cx);
+                                    s.check_endpoint(client.clone(), index, url.clone(), cx);
                                 }
                             }
                         }

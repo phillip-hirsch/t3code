@@ -759,11 +759,14 @@ fn trace_id_cell(state: &Entity<DiagnosticsState>, row: &str, trace_id: &str, co
         .into_any_element()
 }
 
+/// Whether a process row is expanded, and the click that flips it.
+type Toggle = (bool, Box<dyn Fn(&mut App)>);
+
 /// The indent, chevron and dot in front of a process name.
 fn tree_name(
     id: ElementId,
     depth: u32,
-    toggle: Option<(bool, Box<dyn Fn(&mut App)>)>,
+    toggle: Option<Toggle>,
     dot: Hsla,
     name: String,
     full: String,

@@ -78,28 +78,6 @@ pub(super) fn turn_summaries(projection: &ThreadProjection) -> Vec<TurnSummary> 
     turns
 }
 
-/// `revertThreadCheckpoint`: roll the thread back to the checkpoint that closes
-/// `turn_count` (0 is the scope's base snapshot). `None` when it is not ready.
-pub(super) fn rollback_command(projection: &ThreadProjection, turn_count: u32, restore_files: bool) -> Option<Value> {
-    let checkpoint = projection.checkpoints.iter().rev().find(|c| {
-        if turn_count == 0 {
-            c.ordinal_within_scope == 0 && c.app_run_ordinal.is_none()
-        } else {
-            c.app_run_ordinal == Some(i64::from(turn_count))
-        }
-    })?;
-    (checkpoint.status == "ready").then(|| {
-        json!({
-            "type": "checkpoint.rollback",
-            "restoreFiles": restore_files,
-            "commandId": super::new_id(),
-            "threadId": projection.thread.id,
-            "scopeId": checkpoint.scope_id,
-            "checkpointId": checkpoint.id,
-        })
-    })
-}
-
 /// One tab of the panel (`RightPanelSurface`): the Diff, one browser tab by its preview tab id,
 /// the Files tree, or a file (or folder) by its workspace path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -954,67 +932,6 @@ impl Workspace {
             });
         }));
         cx.notify();
-    }
-
-    /// "Edit from here?" (`RevertConfirmHost`): rewind the thread to before a user message,
-    /// optionally restoring files, and put the message back in the composer. The timeline's
-    /// per-message revert button calls this with the message's turn count and text.
-    #[expect(dead_code)]
-    pub(super) fn confirm_revert(
-        &mut self,
-        turn_count: u32,
-        prompt: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use gpui_kit::component::WindowExt as _;
-        use gpui_kit::component::dialog::{DialogClose, DialogFooter};
-        if self.open_projection().is_some_and(ThreadProjection::is_running) {
-            self.error = Some("Interrupt the current turn before reverting checkpoints.".into());
-            cx.notify();
-            return;
-        }
-        let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let choice = |id: &'static str, label: &'static str, restore_files: bool| {
-                let (view, prompt) = (view.clone(), prompt.clone());
-                let button = Button::new(id).label(label);
-                let button = if restore_files { button.outline().text_color(gpui_kit::red()) } else { button.primary() };
-                button.on_click(move |_, window, cx| {
-                    window.close_dialog(cx);
-                    let prompt = prompt.clone();
-                    view.update(cx, |this, cx| this.revert_to_turn(turn_count, restore_files, prompt, window, cx));
-                })
-            };
-            alert
-                .title("Edit from here?")
-                .description(
-                    "Rewind chat to before this message. Your prompt and attachments return to the composer.                      “Revert files too” also undoes your own edits.",
-                )
-                .footer(
-                    DialogFooter::new()
-                        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
-                        .child(choice("revert-files", "Revert files too", true))
-                        .child(choice("revert-keep", "Revert and keep changes", false)),
-                )
-        });
-    }
-
-    fn revert_to_turn(
-        &mut self,
-        turn_count: u32,
-        restore_files: bool,
-        prompt: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(command) = self.open_projection().and_then(|p| rollback_command(p, turn_count, restore_files)) else {
-            self.error = Some(format!("Checkpoint for turn {turn_count} is unavailable.").into());
-            cx.notify();
-            return;
-        };
-        self.dispatch(command, cx);
-        self.set_composer_text(prompt, window, cx);
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -2227,28 +2144,6 @@ mod tests {
         let turns = turn_summaries(state.projection.as_ref().unwrap());
         assert_eq!(turns.iter().map(|t| t.turn_count).collect::<Vec<_>>(), [2, 1]);
         assert_eq!(short_time(&turns[0].completed_at), "00:02");
-    }
-
-    #[test]
-    fn rollback_targets_the_ready_checkpoint_closing_the_turn() {
-        let mut state = ThreadState::default();
-        let checkpoint = |id: &str, ordinal: u32, run: Option<u32>, status: &str| {
-            json!({"id": id, "threadId": "t", "scopeId": "s", "runId": run.map(|r| format!("r{r}")), "nodeId": "n",
-                "parentCheckpointId": null, "ordinalWithinScope": ordinal, "appRunOrdinal": run, "ref": "r",
-                "status": status, "files": [], "capturedAt": "2026-01-01T00:00:00Z"})
-        };
-        state
-            .apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": {
-                "thread": {"id": "t", "title": "T"},
-                "checkpoints": [checkpoint("c0", 0, None, "ready"), checkpoint("c1", 1, Some(1), "ready"), checkpoint("c2", 2, Some(2), "missing")],
-            }}))
-            .unwrap();
-        let projection = state.projection.as_ref().unwrap();
-        let command = rollback_command(projection, 1, true).unwrap();
-        assert_eq!((command["checkpointId"].as_str(), command["scopeId"].as_str()), (Some("c1"), Some("s")));
-        assert_eq!(command["restoreFiles"], true);
-        assert_eq!(rollback_command(projection, 0, false).unwrap()["checkpointId"], "c0");
-        assert!(rollback_command(projection, 2, false).is_none(), "a missing checkpoint cannot be restored");
     }
 
     #[test]

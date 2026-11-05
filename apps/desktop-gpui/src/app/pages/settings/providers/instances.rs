@@ -1377,7 +1377,6 @@ impl Workspace {
     }
 
     /// One `environmentFields` row, e.g. Cursor's API key, kept as a sensitive variable.
-    #[expect(clippy::too_many_arguments)]
     fn render_environment_field(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -1555,7 +1554,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn render_environment_variable(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -1756,7 +1754,6 @@ impl Workspace {
     }
 
     /// `confirmProviderInstanceRemoval`, then the `remove` mutation.
-    #[expect(clippy::too_many_arguments)]
     fn confirm_instance_removal(
         &mut self,
         instance_id: String,

@@ -579,6 +579,7 @@ pub fn update_family(dark_appearance: bool, colors: &Roles, role: &str, value: &
 }
 
 /// `hexToHsv` (`lib/color.ts`): hue in degrees, saturation and value in 0..=1.
+#[expect(clippy::float_cmp, reason = "`max` is one of r, g and b, so equality is exact")]
 pub fn hex_to_hsv(hex: &str) -> [f32; 3] {
     let value = u32::from_str_radix(hex.trim_start_matches('#').get(..6).unwrap_or("000000"), 16).unwrap_or(0);
     let [r, g, b] = [16, 8, 0].map(|shift| ((value >> shift) & 255) as f32 / 255.);

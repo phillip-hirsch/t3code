@@ -418,12 +418,6 @@ mod tests {
 
     #[test]
     fn a_thread_message_carries_what_the_server_reads() {
-        let without_ids = |mut command: Value| {
-            let object = command.as_object_mut().unwrap();
-            assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
-            assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
-            command
-        };
         fn message<'a>(model: Option<&'a ModelSelection>, source_plan: Option<&'a str>) -> ThreadMessage<'a> {
             ThreadMessage {
                 thread_id: "t1",
@@ -435,6 +429,12 @@ mod tests {
                 source_plan,
             }
         }
+        let without_ids = |mut command: Value| {
+            let object = command.as_object_mut().unwrap();
+            assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
+            assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
+            command
+        };
         assert_eq!(
             without_ids(message(None, None).command()),
             json!({

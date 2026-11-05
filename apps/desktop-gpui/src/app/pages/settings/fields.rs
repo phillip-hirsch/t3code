@@ -20,7 +20,6 @@ impl Workspace {
     /// A text field kept across frames, synced to `saved` and committing trimmed text on blur
     /// or Enter when it was edited (`DraftInput` and the uncontrolled `Textarea`s in the web).
     /// `normalize` rewrites each change from the previous text, as `resolvePastedPath` does.
-    #[expect(clippy::too_many_arguments)]
     pub(in crate::app) fn text_field(
         &mut self,
         key: &str,
@@ -49,7 +48,6 @@ impl Workspace {
         self.field(key, "", placeholder, FieldKind::Secret, None, window, cx, on_commit)
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn field(
         &mut self,
         key: &str,
@@ -84,7 +82,6 @@ impl Workspace {
 
     /// A whole-number stepper kept across frames (`NumberField`): typing stays local until
     /// blur, Enter or a `step` commits it, clamped to `min..=max`; anything else reverts.
-    #[expect(clippy::too_many_arguments)]
     pub(in crate::app) fn number_field(
         &mut self,
         key: &str,

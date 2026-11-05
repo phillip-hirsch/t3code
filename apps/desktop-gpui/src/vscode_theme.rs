@@ -397,11 +397,11 @@ pub fn parse_vscode_theme(value: &Value) -> Result<ThemeDefinition, String> {
     parse_theme_file(&Value::Object(file))
 }
 
+/// Names the theme a light and dark pair become.
+type PairedId<'a> = &'a dyn Fn(&ThemeDefinition, &ThemeDefinition) -> String;
+
 /// `pairVsCodeThemes`: "X Light" and "X Dark" become one two-appearance theme named "X".
-pub fn pair_themes(
-    themes: Vec<ThemeDefinition>,
-    paired_id: Option<&dyn Fn(&ThemeDefinition, &ThemeDefinition) -> String>,
-) -> Vec<ThemeDefinition> {
+pub fn pair_themes(themes: Vec<ThemeDefinition>, paired_id: Option<PairedId<'_>>) -> Vec<ThemeDefinition> {
     struct Group {
         key: String,
         order: usize,

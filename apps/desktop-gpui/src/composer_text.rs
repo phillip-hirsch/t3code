@@ -3,6 +3,7 @@
 //! (`packages/shared/src/composerTrigger.ts`, `composerInlineTokens.ts`) and
 //! prompt history (`composerPromptHistory.ts`). Offsets are UTF-8 bytes.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +98,7 @@ fn encode_destination(path: &str) -> String {
         if byte.is_ascii_alphanumeric() || ";,/:@&=+$-_.!~*'".contains(c) {
             out.push(c);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out

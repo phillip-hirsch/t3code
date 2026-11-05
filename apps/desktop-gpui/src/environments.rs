@@ -493,7 +493,8 @@ impl Catalog {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().context("No T3 home directory.")?;
-        crate::settings::write_atomically(&path, &self.document()?).with_context(|| format!("writing {path:?}"))
+        crate::settings::write_atomically(&path, &self.document()?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn get(&self, environment_id: &str) -> Option<&SavedEnvironment> {

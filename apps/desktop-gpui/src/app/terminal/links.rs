@@ -22,7 +22,7 @@ fn overlaps(a: Range, b: Range) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-/// `[^\s"'`<>]`.
+/// ``[^\s"'`<>]``.
 fn is_link_char(c: char) -> bool {
     !c.is_whitespace() && !matches!(c, '"' | '\'' | '`' | '<' | '>')
 }
@@ -253,7 +253,7 @@ pub(super) fn extract(line: &str) -> Vec<LinkMatch> {
             let (start, raw_len, raw, position) = if quoted {
                 match match_quoted(&chars, at) {
                     Some((path, position, total)) => {
-                        (at + 1, total, text(at + 1, path) + &text(at + path + 2, position), position)
+                        (at + 1, total, format!("{}{}", text(at + 1, path), text(at + path + 2, position)), position)
                     }
                     None => {
                         at += 1;

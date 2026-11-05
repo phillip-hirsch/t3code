@@ -46,7 +46,7 @@ fn address(home: &Path) -> String {
     // Windows paths are case-insensitive.
     let key = if cfg!(windows) { key.to_lowercase() } else { key.into_owned() };
     let digest = Sha256::digest(key.as_bytes());
-    let id: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let id = crate::hex::lower_hex(&digest[..8]);
     if cfg!(windows) {
         format!(r"\\.\pipe\t3code-gpui-{id}")
     } else {

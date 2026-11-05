@@ -3,6 +3,7 @@
 //! the file's signed asset URL. Also "Open file in preview browser".
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
@@ -184,14 +185,13 @@ fn font_mime(bytes: &[u8]) -> Option<&'static str> {
 /// `FontViewer`'s specimen, its font served beside it.
 fn font_specimen(background: &str, foreground: &str, dark: bool) -> String {
     let scheme = if dark { "dark" } else { "light" };
-    let sizes: String = [12, 16, 24, 40, 64]
-        .iter()
-        .map(|size| {
-            format!(
-                "<p style=\"font-size:{size}px\"><small>{size} px</small>The quick brown fox jumps over the lazy dog.</p>"
-            )
-        })
-        .collect();
+    let mut sizes = String::new();
+    for size in [12, 16, 24, 40, 64] {
+        let _ = write!(
+            sizes,
+            "<p style=\"font-size:{size}px\"><small>{size} px</small>The quick brown fox jumps over the lazy dog.</p>"
+        );
+    }
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
          content=\"default-src 'none'; font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">\

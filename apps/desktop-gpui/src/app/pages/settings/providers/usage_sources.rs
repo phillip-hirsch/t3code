@@ -100,7 +100,8 @@ impl Workspace {
             let mut description =
                 format!("CLI Proxy{}", if source["enabled"].as_bool() == Some(false) { " · Disabled" } else { "" });
             if label != url {
-                description.push_str(&format!(" · {url}"));
+                description.push_str(" · ");
+                description.push_str(&url);
             }
             let id = id.clone();
             let remove_label = label.clone();

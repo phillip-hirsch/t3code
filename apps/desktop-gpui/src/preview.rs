@@ -2,6 +2,8 @@
 //! the per-thread reducer of `apps/web/src/previewStateStore.ts`, and the address
 //! bar's URL resolution from `packages/shared/src/preview.ts`.
 
+use std::fmt::Write as _;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -604,7 +606,7 @@ fn encode_uri_component(input: &str) -> String {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -805,9 +807,7 @@ pub fn partition(profile_id: Option<&str>) -> Partition {
     match profile_id {
         None | Some(DEFAULT_PROFILE_ID) => Partition::Default,
         Some(INCOGNITO_PROFILE_ID) => Partition::Incognito,
-        Some(id) => {
-            Partition::Folder(sha2::Sha256::digest(id.as_bytes())[..16].iter().map(|b| format!("{b:02x}")).collect())
-        }
+        Some(id) => Partition::Folder(crate::hex::lower_hex(&sha2::Sha256::digest(id.as_bytes())[..16])),
     }
 }
 

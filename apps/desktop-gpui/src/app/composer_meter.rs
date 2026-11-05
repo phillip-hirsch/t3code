@@ -28,7 +28,7 @@ fn format_percentage(value: f64) -> String {
     if value < 10. {
         // `toFixed` rounds ties up, where `{:.1}` rounds them to even.
         let text = format!("{:.1}", (value * 10.).round() / 10.);
-        text.strip_suffix(".0").map(str::to_owned).unwrap_or(text) + "%"
+        format!("{}%", text.strip_suffix(".0").unwrap_or(&text))
     } else {
         format!("{}%", value.round())
     }

@@ -1400,9 +1400,9 @@ pub(super) fn format_context_tokens(value: u64) -> String {
     let trim = |text: String| text.strip_suffix(".0").map(str::to_owned).unwrap_or(text);
     match value {
         0..1_000 => value.to_string(),
-        1_000..10_000 => trim(format!("{:.1}", value as f64 / 1_000.)) + "k",
+        1_000..10_000 => format!("{}k", trim(format!("{:.1}", value as f64 / 1_000.))),
         10_000..999_500 => format!("{}k", (value as f64 / 1_000.).round()),
-        _ => trim(format!("{:.1}", value as f64 / 1_000_000.)) + "m",
+        _ => format!("{}m", trim(format!("{:.1}", value as f64 / 1_000_000.))),
     }
 }
 

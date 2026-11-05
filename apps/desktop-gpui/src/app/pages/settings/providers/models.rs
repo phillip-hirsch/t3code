@@ -3,6 +3,7 @@
 //! custom models saved in the instance's `config.customModels`.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::InputEvent;
@@ -705,10 +706,10 @@ impl Workspace {
         // Toolbar: filter, bulk toggle and counts, add.
         let mut counts = format!("{} model{}", view.models.len(), if view.models.len() == 1 { "" } else { "s" });
         if favorite_count > 0 {
-            counts += &format!(" · {favorite_count} favorite{}", if favorite_count == 1 { "" } else { "s" });
+            let _ = write!(counts, " · {favorite_count} favorite{}", if favorite_count == 1 { "" } else { "s" });
         }
         if hidden_count > 0 {
-            counts += &format!(" · {hidden_count} hidden");
+            let _ = write!(counts, " · {hidden_count} hidden");
         }
         let bulk_id = row.id.clone();
         let add_page = page.clone();
@@ -868,7 +869,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::fn_params_excessive_bools, reason = "row facts its one caller computes per model")]
     fn render_model_row(
         &mut self,
         page: &Entity<ProvidersPage>,

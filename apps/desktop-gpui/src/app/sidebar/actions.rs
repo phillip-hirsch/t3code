@@ -767,7 +767,7 @@ impl SnoozeItems {
         let (view, thread_id, advance) = (view.clone(), self.thread_id.clone(), self.advance);
         menu.item(PopupMenuItem::new("Custom…").on_click(move |_, window, cx| {
             let _ = view.update(cx, |workspace, cx| {
-                workspace.open_custom_snooze(std::slice::from_ref(&thread_id), advance, window, cx)
+                workspace.open_custom_snooze(std::slice::from_ref(&thread_id), advance, window, cx);
             });
         }))
     }
