@@ -838,14 +838,17 @@ impl Workspace {
         let detail = item.and_then(|i| i.str("prompt")).filter(|p| !p.is_empty()).unwrap_or(label).to_owned();
         let app_name = item.and_then(|i| i.str("appName")).map(str::to_owned);
         let reason = item.and_then(|i| i.str("reason")).map(str::to_owned);
-        let options: Vec<(String, String)> = item
+        // (decision, label, warning)
+        let options: Vec<(String, String, Option<SharedString>)> = item
             .and_then(|i| i.raw.get("options"))
             .and_then(Value::as_array)
             .map(|options| {
                 options
                     .iter()
                     .filter_map(|o| {
-                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned()))
+                        let warning =
+                            o.get("warning").and_then(Value::as_str).map(|w| SharedString::from(w.to_owned()));
+                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned(), warning))
                     })
                     .collect()
             })
@@ -856,28 +859,34 @@ impl Workspace {
                     ("acceptForSession", "Always allow this session"),
                     ("accept", "Approve"),
                 ]
-                .map(|(d, l)| (d.to_owned(), l.to_owned()))
+                .map(|(d, l)| (d.to_owned(), l.to_owned(), None))
                 .to_vec()
             });
         let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
-        let inline = |decision: &str, label: &str, tone: Hsla, cx: &mut Context<Self>| {
-            let request_id = request.id.clone();
-            let decision = decision.to_owned();
-            div()
-                .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tone)
-                .child(label.to_owned())
-                .when(!enabled, |el| el.opacity(0.64))
-                .when(enabled, |el| {
-                    el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                        move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
-                    ))
-                })
-        };
-        let primary: Vec<_> = options.iter().filter(|(d, _)| d == "decline" || d == "accept").collect();
-        let more: Rc<Vec<(String, String)>> =
-            Rc::new(options.iter().filter(|(d, _)| d != "decline" && d != "accept").cloned().collect());
+        let inline =
+            |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
+                let request_id = request.id.clone();
+                let decision = decision.to_owned();
+                h_flex()
+                    .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
+                    .gap(px(4.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tone)
+                    .when(warning.is_some(), |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
+                    .child(label.to_owned())
+                    .when_some(warning, |el, warning| {
+                        el.tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx))
+                    })
+                    .when(!enabled, |el| el.opacity(0.64))
+                    .when(enabled, |el| {
+                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
+                            move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
+                        ))
+                    })
+            };
+        let primary: Vec<_> = options.iter().filter(|(d, ..)| d == "decline" || d == "accept").collect();
+        let more: Rc<Vec<_>> =
+            Rc::new(options.iter().filter(|(d, ..)| d != "decline" && d != "accept").cloned().collect());
         let mut actions = h_flex().flex_wrap().items_center().gap_x(px(8.)).gap_y(px(4.));
         if request.is_live() {
             actions = actions
@@ -889,9 +898,9 @@ impl Workspace {
                         .child("Waiting for approval"),
                 )
                 .child(div().text_color(t.muted_foreground).child("·"));
-            for (decision, label) in primary {
+            for (decision, label, warning) in primary {
                 let tone = if decision == "accept" { t.foreground } else { t.muted_foreground };
-                actions = actions.child(inline(decision, label, tone, cx));
+                actions = actions.child(inline(decision, label, warning.clone(), tone, cx));
             }
             if !more.is_empty() {
                 let view = cx.entity();
@@ -908,15 +917,15 @@ impl Workspace {
                         .text_color(t.muted_foreground)
                         .disabled(!enabled)
                         .dropdown_menu(move |mut menu, window, _| {
-                            for (decision, label) in more.iter() {
+                            for (decision, label, warning) in more.iter() {
                                 let request_id = request_id.clone();
                                 let decision = decision.clone();
-                                menu = menu.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
-                                    &view,
-                                    move |this, _, _, cx| {
-                                        this.respond(request_id.clone(), json!({"decision": decision}), cx)
-                                    },
-                                )));
+                                let item = PopupMenuItem::new(label.clone());
+                                let item =
+                                    if warning.is_some() { item.icon(Icon::new(Lucide::TriangleAlert)) } else { item };
+                                menu = menu.item(item.on_click(window.listener_for(&view, move |this, _, _, cx| {
+                                    this.respond(request_id.clone(), json!({"decision": decision}), cx)
+                                })));
                             }
                             menu
                         }),
