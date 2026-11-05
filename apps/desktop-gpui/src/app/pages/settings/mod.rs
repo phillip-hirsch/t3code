@@ -393,6 +393,10 @@ impl Workspace {
         if matches!(target.as_str(), "panel-animations" | "environment-identification" | "composer-context") {
             self.settings_ui.advanced_open.insert("appearance");
         }
+        if matches!(target.as_str(), "browser-default-viewport" | "browser-default-zoom" | "browser-default-appearance")
+        {
+            self.settings_ui.advanced_open.insert("browser");
+        }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());
         self.settings_ui.scroll_pending.set(true);

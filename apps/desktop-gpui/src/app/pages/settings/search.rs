@@ -29,6 +29,11 @@ pub(super) fn available(item: &SearchItem) -> bool {
         && !item.managed_tunnel_only
         && !item.peer_links_only
         && !item.mac_provider_settings_only
+        // Browser rows for surfaces this client doesn't have (see `browser.rs`).
+        && !matches!(
+            item.id.as_str(),
+            "browser-auto-show-floating-preview" | "browser-recording-key-presses" | "browser-recording-mouse-presses"
+        )
 }
 
 /// Matches every query token somewhere in the title, section label or search terms, and

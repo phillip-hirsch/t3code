@@ -30,9 +30,9 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value};
 
-use crate::project_groups::ProjectGroup;
 use super::code::projects::icon::project_icon;
 use crate::app::{Workspace, project_name};
+use crate::project_groups::ProjectGroup;
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
 use crate::settings::{Settings, contract};
 use crate::theme::{self, Tokens};
@@ -613,6 +613,7 @@ impl Workspace {
             cx.notify();
             // The sidebar is a cached view and reads several device settings.
             self.notify_sidebar(cx);
+            self.report_browser_profiles(cx);
         }
         let Some(patch) = plan.server_patch else { return done(self, true, cx) };
         let Some(client) = self.client() else { return done(self, false, cx) };
