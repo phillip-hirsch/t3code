@@ -1123,6 +1123,6 @@ impl Render for Workspace {
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
             .children(self.render_quit_hint(cx))
-            .children(titlebar::render_resize_edges(window))
+            .children(titlebar::render_resize_edges(window, cx))
     }
 }

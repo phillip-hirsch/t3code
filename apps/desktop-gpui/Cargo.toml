@@ -136,3 +136,5 @@ zbus = "5"
 gpui-base = { path = "vendor/gpui-base" }
 # gpui-pre-windows 0.3.11: a setter that turns off DirectComposition.
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }

@@ -113,8 +113,9 @@ fn main() {
 }
 
 /// Opens the app's window where it was last closed. The app draws its own titlebar: Windows
-/// keeps the native resize frame, macOS its traffic lights, and Linux asks for client-side
-/// decorations like Electron's frameless `titleBarOverlay` window.
+/// keeps the native resize frame, macOS its traffic lights, and Linux draws client-side
+/// decorations like Electron's frameless `titleBarOverlay` window, on Wayland and X11, with or
+/// without a compositor.
 fn open_main_window(cx: &mut gpui_kit::App) {
     let (x, y) = app::TRAFFIC_LIGHTS;
     let options = WindowOptions {

@@ -1842,15 +1842,12 @@ impl PlatformWindow for X11Window {
     fn window_decorations(&self) -> gpui::Decorations {
         let state = self.0.state.borrow();
 
-        // Client window decorations require compositor support
-        if !state.client_side_decorations_supported {
-            return Decorations::Server;
-        }
-
         match state.decorations {
             WindowDecorations::Server => Decorations::Server,
             WindowDecorations::Client => {
-                let tiling = if state.fullscreen {
+                // Without a compositor that honors `_GTK_FRAME_EXTENTS` nothing can show a shadow
+                // outside the frame, so the frame sits flush on every side, as if tiled.
+                let tiling = if state.fullscreen || !state.client_side_decorations_supported {
                     Tiling::tiled()
                 } else if let Some(edge_constraints) = &state.edge_constraints {
                     edge_constraints.to_tiling()
@@ -1873,7 +1870,8 @@ impl PlatformWindow for X11Window {
 
         let dp = (f32::from(inset) * state.scale_factor) as u32;
 
-        let insets = if state.fullscreen {
+        // Without frame extents support nothing draws the shadow, so the frame has no extents.
+        let insets = if state.fullscreen || !state.client_side_decorations_supported {
             [0, 0, 0, 0]
         } else if let Some(edge_constraints) = &state.edge_constraints {
             let left = if edge_constraints.left_tiled { 0 } else { dp };
@@ -1915,16 +1913,15 @@ impl PlatformWindow for X11Window {
         }
     }
 
-    fn request_decorations(&self, mut decorations: gpui::WindowDecorations) {
+    fn request_decorations(&self, decorations: gpui::WindowDecorations) {
         let mut state = self.0.state.borrow_mut();
 
+        // Without a compositor that honors `_GTK_FRAME_EXTENTS` the window can't show a shadow
+        // outside its frame, but it still draws its own titlebar, as GTK's solid CSD does.
         if matches!(decorations, gpui::WindowDecorations::Client)
             && !state.client_side_decorations_supported
         {
-            log::info!(
-                "x11: no compositor present, falling back to server-side window decorations"
-            );
-            decorations = gpui::WindowDecorations::Server;
+            log::info!("x11: no frame extents support, drawing client-side decorations without a shadow");
         }
 
         // https://github.com/rust-windowing/winit/blob/master/src/platform_impl/linux/x11/util/hint.rs#L53-L87
