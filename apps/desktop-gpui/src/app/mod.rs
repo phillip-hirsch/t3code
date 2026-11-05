@@ -56,6 +56,7 @@ mod thread_menu;
 mod thread_now;
 mod titlebar;
 mod visits;
+mod worktree_setup;
 
 gpui_kit::actions!(
     workspace,
@@ -222,6 +223,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
@@ -346,6 +348,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            setup: Default::default(),
             chat_menu: None,
             requests: Default::default(),
             subagents: Default::default(),
@@ -700,6 +703,8 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
+        self.sync_worktree_setup(cx);
+        self.insert_worktree_setup(&mut new_rows);
         new_rows.extend(self.now_rows(cx));
         new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();

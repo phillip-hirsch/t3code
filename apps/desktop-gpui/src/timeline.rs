@@ -91,6 +91,11 @@ pub enum Row {
     },
     /// A line of what the thread is doing now, before the queue (`ThreadNow`).
     Now(Rc<crate::thread_now::NowLine>),
+    /// A new worktree's setup (`WorktreeSetupCard`); `embedded` folds it to a summary once the agent runs.
+    WorktreeSetup {
+        snapshot: Rc<crate::worktree_setup::Snapshot>,
+        embedded: bool,
+    },
     /// "Show all N queued" under a long queue.
     QueueToggle {
         total: usize,
@@ -1544,6 +1549,7 @@ mod tests {
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
+                Row::WorktreeSetup { snapshot, .. } => format!("setup {}", snapshot.phase),
                 Row::System(divider) => format!("system {}", divider.label),
                 Row::Request(card) => format!("request {}", card.item_id),
             })

@@ -132,6 +132,7 @@ impl Workspace {
         let working = rows.iter().any(|row| match row {
             Row::Working { started_at: Some(_) } => true,
             Row::Now(line) => line.ticks(),
+            Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
             _ => false,
         });
         if !working {
@@ -528,6 +529,9 @@ fn render_row(
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
         Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::WorktreeSetup { snapshot, embedded } => {
+            super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
+        }
         Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
         Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
     }

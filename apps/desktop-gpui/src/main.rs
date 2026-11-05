@@ -29,6 +29,7 @@ mod timeline;
 mod timestamp;
 mod usage;
 mod work_log;
+mod worktree_setup;
 
 use std::sync::OnceLock;
 
