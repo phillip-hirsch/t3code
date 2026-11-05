@@ -9,6 +9,7 @@ import { issueRemoteWebSocketTicket } from "@t3tools/client-runtime/authorizatio
 import { layerRemoteHttpClient } from "@t3tools/client-runtime/rpc";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 import * as RpcClient from "effect/rpc/RpcClient";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
@@ -27,7 +28,7 @@ export const fetchServerConfig = Effect.fn("tr3x.fetchServerConfig")(
       use: "rpc",
     });
     const url = new URL("/ws", input.wsBaseUrl);
-    url.searchParams.set("wsTicket", issued.ticket);
+    url.searchParams.set("wsTicket", Redacted.value(issued.ticket));
     url.searchParams.set(
       ORCHESTRATION_PROTOCOL_QUERY_PARAM,
       String(ORCHESTRATION_PROTOCOL_VERSION),
