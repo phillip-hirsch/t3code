@@ -24,6 +24,7 @@ mod terminal_text;
 mod theme;
 mod themes;
 mod thread_details;
+mod thread_now;
 mod timeline;
 mod timestamp;
 mod usage;

@@ -225,6 +225,36 @@ pub fn child_requests(threads: &[ThreadShell]) -> HashMap<&str, ChildRequest> {
     requests
 }
 
+/// `childThreadInputsAtom`: the subagents and side chats under `parent`, at any depth,
+/// that ask the user something (`subagentRequest`, `sideChatRequest`).
+pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], parent: &str) -> Vec<&'a ThreadShell> {
+    let is_child = |t: &ThreadShell| {
+        t.lineage.relationship_to_parent.as_deref() == Some("subagent") || t.lineage.side_chat == Some(true)
+    };
+    let asks = |t: &ThreadShell| {
+        let Some(kind) = t.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { return false };
+        kind != "auth_refresh"
+            && (t.lineage.side_chat == Some(true)
+                || (t.creation_source.as_deref() != Some("provider") && is_child_run_live(t)))
+    };
+    let mut seen = vec![parent];
+    let mut pending = vec![parent];
+    let mut inputs = Vec::new();
+    while let Some(id) = pending.pop() {
+        for child in threads.iter().filter(|t| t.lineage.parent_thread_id.as_deref() == Some(id) && is_child(t)) {
+            if seen.contains(&child.id.as_str()) {
+                continue;
+            }
+            seen.push(&child.id);
+            pending.insert(0, &child.id);
+            if asks(child) {
+                inputs.push(child);
+            }
+        }
+    }
+    inputs
+}
+
 /// The facts the sidebar derives from one shell (`presentThreadShell`).
 #[derive(Clone, Copy)]
 pub struct Facts<'a> {

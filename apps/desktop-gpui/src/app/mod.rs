@@ -50,6 +50,7 @@ mod send;
 mod sidebar;
 mod terminal;
 mod thread_menu;
+mod thread_now;
 mod titlebar;
 mod visits;
 
@@ -217,6 +218,7 @@ pub struct Workspace {
     alerts: alerts::AlertState,
     quit: quit::QuitState,
     queue: queue::QueueUi,
+    now: thread_now::NowUi,
     banners: banners::BannerUi,
     _subscriptions: Vec<Subscription>,
 }
@@ -337,6 +339,7 @@ impl Workspace {
             alerts: Default::default(),
             quit: Default::default(),
             queue: Default::default(),
+            now: Default::default(),
             banners: Default::default(),
             _subscriptions: subscriptions,
         }
@@ -551,6 +554,7 @@ impl Workspace {
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
+                this.sync_now(cx);
             },
         ));
     }
@@ -686,6 +690,7 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
+        new_rows.extend(self.now_rows(cx));
         new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);

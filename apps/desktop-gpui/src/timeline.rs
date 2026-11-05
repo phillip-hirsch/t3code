@@ -85,6 +85,8 @@ pub enum Row {
         message: Rc<crate::queue::QueuedMessage>,
         last: bool,
     },
+    /// A line of what the thread is doing now, before the queue (`ThreadNow`).
+    Now(Rc<crate::thread_now::NowLine>),
     /// "Show all N queued" under a long queue.
     QueueToggle {
         total: usize,
@@ -174,7 +176,7 @@ pub struct SubagentCard {
 }
 
 /// `formatSubagentDisplayTitle`: drops "Subagent: " and names a `/root/.../name_x` path "Name X".
-fn subagent_title(title: &str) -> String {
+pub(crate) fn subagent_title(title: &str) -> String {
     let title = match title.get(..9) {
         Some(prefix) if prefix.eq_ignore_ascii_case("subagent:") => title[9..].trim_start(),
         _ => title,
@@ -1390,6 +1392,7 @@ mod tests {
                 Row::Embed(embed) => format!("embed {}", embed.title),
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
+                Row::Now(_) => "now".into(),
             })
             .collect()
     }

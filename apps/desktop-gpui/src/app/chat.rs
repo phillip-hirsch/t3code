@@ -127,7 +127,11 @@ impl Workspace {
 
     /// Keeps a once-a-second repaint alive while a "Working for …" row shows.
     pub(super) fn sync_working_tick(&mut self, rows: &[Row], cx: &mut Context<Self>) {
-        let working = rows.iter().any(|row| matches!(row, Row::Working { started_at: Some(_) }));
+        let working = rows.iter().any(|row| match row {
+            Row::Working { started_at: Some(_) } => true,
+            Row::Now(line) => line.ticks(),
+            _ => false,
+        });
         if !working {
             self._working_tick = None;
         } else if self._working_tick.is_none() {
@@ -356,7 +360,7 @@ fn centered_note(text: &'static str, t: &Tokens) -> AnyElement {
 }
 
 /// A row in the lane (the scroller insets rows to it); owns its bottom space.
-fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
+pub(super) fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
     div().w_full().pb(px(bottom)).child(child)
 }
 
@@ -515,6 +519,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut 
         }
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
+        Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
     }
 }
 

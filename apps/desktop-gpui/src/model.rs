@@ -657,12 +657,28 @@ pub struct PendingBackgroundTask {
     pub kind: String,
     #[serde(default)]
     pub awaited: Option<bool>,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadGoal {
     pub status: String,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub time_used_seconds: Option<u64>,
+    #[serde(default)]
+    pub checks: Option<u64>,
 }
 
 /// Keeps "absent" (`None`) apart from an explicit `null` (`Some(None)`).
