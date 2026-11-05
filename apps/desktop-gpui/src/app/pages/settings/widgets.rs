@@ -321,7 +321,7 @@ pub(in crate::app) struct RowFrame {
     marker: Option<AnyElement>,
     reset: Option<AnyElement>,
     description: Option<AnyElement>,
-    status: Option<SharedString>,
+    status: Option<AnyElement>,
     control: Option<AnyElement>,
     body: Option<AnyElement>,
     dimmed: bool,
@@ -346,8 +346,8 @@ impl RowFrame {
         self
     }
 
-    pub(in crate::app) fn status(mut self, status: Option<impl Into<SharedString>>) -> Self {
-        self.status = status.map(Into::into);
+    pub(in crate::app) fn status(mut self, status: Option<impl IntoElement>) -> Self {
+        self.status = status.map(IntoElement::into_any_element);
         self
     }
 
