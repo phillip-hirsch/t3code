@@ -551,7 +551,16 @@ fn event_label(item: &TurnItem) -> String {
     match item.item_type.as_str() {
         "fork" => "Forked thread".into(),
         "handoff" => "Switched provider".into(),
-        "secret_request" => "Asked for a secret".into(),
+        // `secretRequestDisplay` for an answered request.
+        "secret_request" => {
+            let outcome = match item.str("secretStatus") {
+                Some("saved") => "Saved securely and kept private",
+                Some("declined") => "Declined",
+                Some("cancelled") => "Request ended",
+                _ => return "Asked for a secret".into(),
+            };
+            format!("{} · {outcome}", text("label").unwrap_or_else(|| "Secret".into()))
+        }
         "link_request" => "Asked to link an environment".into(),
         "subagent" => text("title")
             .or_else(|| text("prompt").and_then(|p| p.lines().next().map(str::to_owned)))
@@ -1408,6 +1417,18 @@ mod tests {
         assert!(timeline_entry(&queued).is_none());
         assert!(timeline_entry(&checkpoint).is_none());
         assert!(matches!(timeline_entry(&started).unwrap().kind, Kind::User { steer: None, .. }));
+    }
+
+    #[test]
+    fn answered_secret_requests_name_their_outcome() {
+        let label = |status: &str| {
+            let raw = json!({"id": "s", "type": "secret_request", "label": "GitHub token", "secretStatus": status});
+            event_label(&serde_json::from_value::<TurnItem>(raw).unwrap())
+        };
+        assert_eq!(label("saved"), "GitHub token · Saved securely and kept private");
+        assert_eq!(label("declined"), "GitHub token · Declined");
+        assert_eq!(label("cancelled"), "GitHub token · Request ended");
+        assert_eq!(label("pending"), "Asked for a secret");
     }
 
     fn command(id: &str, run: &str, at: &str) -> Value {
