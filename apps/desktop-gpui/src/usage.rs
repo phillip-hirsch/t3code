@@ -1047,9 +1047,11 @@ pub fn limit_accounts(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&
         if limits_notice(&hub.usage_limits).is_some() {
             continue;
         }
+        // Hubs on two machines can share an address, hence a source id: only an e-mail or a
+        // credential fingerprint (the resolved key) makes their accounts one.
         let own_key = match &hub.workspace_id {
-            Some(workspace) => format!("{source_id}:{}:{workspace}", hub.id),
-            None => format!("{source_id}:{}", hub.id),
+            Some(workspace) => format!("{}:{source_id}:{}:{workspace}", environment.id, hub.id),
+            None => format!("{}:{source_id}:{}", environment.id, hub.id),
         };
         let base = base_key(&hub.driver, hub.email.as_deref(), Some(&hub.usage_limits));
         let key = resolve_key(base, hub.workspace_id.as_deref(), &workspaces).unwrap_or_else(|| own_key.clone());
@@ -1869,6 +1871,29 @@ mod tests {
         assert_eq!(session.next_refill, Some(10), "me@'s 20% back, as a share of two accounts");
         assert!(pool.windows[1].columns[0].is_none(), "me@ has no weekly window");
         assert!(limit_accounts(&here(&providers, &Value::Null), &["claudeAgent"]).is_empty());
+    }
+
+    #[test]
+    fn same_named_hub_accounts_on_two_machines_stay_apart_without_an_identity() {
+        let window = |used: u32| json!([{"id": "w", "kind": "session", "label": "5-hour", "usedPercent": used}]);
+        let hub = |used: u32| {
+            json!([{"id": "http://127.0.0.1:8317", "label": "Local hub", "accounts": [
+                {"id": "a.json", "driver": "codex", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window(used),
+                    "resetCredits": {"availableCount": 1, "nextCreditId": "c"}}},
+                {"id": "me.json", "driver": "codex", "email": "me@x.dev", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window(used)}},
+            ]}])
+        };
+        let (on_a, on_b) = (hub(10), hub(90));
+        let environments = [
+            LimitEnvironment { id: "env-a", label: "Laptop", providers: &[], sources: &on_a },
+            LimitEnvironment { id: "env-b", label: "Server", providers: &[], sources: &on_b },
+        ];
+        let accounts = limit_accounts(&environments, &[]);
+        let anonymous: Vec<&Account> = accounts.iter().filter(|a| a.email.is_none()).collect();
+        assert_eq!(anonymous.len(), 2, "a file name alone is no identity");
+        let routed: Vec<&str> = anonymous.iter().filter_map(|a| Some(a.redeem.as_ref()?.0.as_str())).collect();
+        assert_eq!(routed, ["env-a", "env-b"], "each credit is spent on its own machine");
+        assert_eq!(accounts.iter().filter(|a| a.email.is_some()).count(), 1, "the same e-mail is one account");
     }
 
     #[test]
