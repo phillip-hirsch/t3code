@@ -59,8 +59,9 @@ pub fn contract() -> &'static Contract {
 }
 
 impl Contract {
+    /// Optional keys such as `defaultThreadEnvMode` have no default but are still the server's.
     pub fn is_server_key(&self, key: &str) -> bool {
-        self.server_defaults.contains_key(key)
+        self.server_defaults.contains_key(key) || self.is_project_scoped(key)
     }
 
     /// A key only this device stores. Keys both documents know are the server's, as in

@@ -10,7 +10,8 @@
 //! the selected project's overrides (`crate::settings::scope`). Rows on server keys show where
 //! their value comes from, "Mixed", and reset to the inherited value under a project scope;
 //! other rows reset to the built-in default. Custom controls go in `.control(element)` and read
-//! values from `view` (`SettingsView::value`). See `general.rs` for both kinds.
+//! values from `view` (`SettingsView::value`). See `general.rs` for both kinds. Rows that are
+//! not one setting (a keybinding, a host, a task) draw the same chrome with [`RowFrame`].
 
 use std::rc::Rc;
 
@@ -24,8 +25,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use serde_json::{Map, Value};
 
@@ -92,16 +93,36 @@ impl SettingsView {
 pub(in crate::app) struct SettingRow {
     id: SharedString,
     title: SharedString,
-    description: Option<SharedString>,
+    description: Option<AnyElement>,
+    status: Option<SharedString>,
+    body: Option<AnyElement>,
     keys: Vec<&'static str>,
     control: Control,
+    unavailable: bool,
 }
 
 enum Control {
     None,
     Switch,
-    Select { options: &'static [(&'static str, &'static str)], width: f32 },
-    Slider { min: f32, max: f32, step: f32, unit: &'static str },
+    Select {
+        options: &'static [(&'static str, &'static str)],
+        width: f32,
+    },
+    Slider {
+        min: f32,
+        max: f32,
+        step: f32,
+        unit: &'static str,
+    },
+    /// A field saved trimmed on blur or Enter (`DraftInput`), `width` px wide.
+    Text {
+        placeholder: &'static str,
+        width: f32,
+    },
+    /// A four-row field under the row's text, saved trimmed on blur.
+    Textarea {
+        placeholder: &'static str,
+    },
     Element(AnyElement),
 }
 
@@ -114,11 +135,38 @@ impl SettingRow {
 
     /// A row with no search item.
     pub(in crate::app) fn titled(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), title: title.into(), description: None, keys: Vec::new(), control: Control::None }
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            status: None,
+            body: None,
+            keys: Vec::new(),
+            control: Control::None,
+            unavailable: false,
+        }
     }
 
-    pub(in crate::app) fn description(mut self, description: impl Into<SharedString>) -> Self {
-        self.description = Some(description.into());
+    pub(in crate::app) fn description(mut self, description: impl IntoElement) -> Self {
+        self.description = Some(description.into_any_element());
+        self
+    }
+
+    /// A muted line under the description, such as a save in flight.
+    pub(in crate::app) fn status(mut self, status: Option<impl Into<SharedString>>) -> Self {
+        self.status = status.map(Into::into);
+        self
+    }
+
+    /// Content under the row's text and control, such as a list.
+    pub(in crate::app) fn body(mut self, body: impl IntoElement) -> Self {
+        self.body = Some(body.into_any_element());
+        self
+    }
+
+    /// `SettingsUnavailableGroup`: dimmed text and an inert control.
+    pub(in crate::app) fn unavailable(mut self) -> Self {
+        self.unavailable = true;
         self
     }
 
@@ -133,7 +181,7 @@ impl SettingRow {
         self
     }
 
-    /// A select over `(value, label)` pairs, `width` px wide like the web's `sm:w-*`.
+    /// A select over `(value, label)` pairs, `width` px wide like the web's `sm:w-*`; 0 sizes it to its label.
     pub(in crate::app) fn select(mut self, options: &'static [(&'static str, &'static str)], width: f32) -> Self {
         self.control = Control::Select { options, width };
         self
@@ -142,6 +190,16 @@ impl SettingRow {
     /// A range slider with the value and `unit` beside it, like the web's `.settings-slider` rows.
     pub(in crate::app) fn slider(mut self, min: f32, max: f32, step: f32, unit: &'static str) -> Self {
         self.control = Control::Slider { min, max, step, unit };
+        self
+    }
+
+    pub(in crate::app) fn text(mut self, placeholder: &'static str, width: f32) -> Self {
+        self.control = Control::Text { placeholder, width };
+        self
+    }
+
+    pub(in crate::app) fn textarea(mut self, placeholder: &'static str) -> Self {
+        self.control = Control::Textarea { placeholder };
         self
     }
 
@@ -154,8 +212,19 @@ impl SettingRow {
 
 /// A titled card of rows (`SettingsSection` with the grouped `SettingsGroup`).
 pub(in crate::app) fn settings_section(
-    id: &'static str,
-    title: &'static str,
+    id: impl Into<ElementId>,
+    title: impl IntoElement,
+    rows: impl IntoIterator<Item = AnyElement>,
+    t: &Tokens,
+) -> AnyElement {
+    section_with_action(id, title, None, rows, t)
+}
+
+/// A section whose header carries an action on the right, such as "Add source".
+pub(in crate::app) fn section_with_action(
+    id: impl Into<ElementId>,
+    title: impl IntoElement,
+    action: Option<AnyElement>,
     rows: impl IntoIterator<Item = AnyElement>,
     t: &Tokens,
 ) -> AnyElement {
@@ -166,9 +235,142 @@ pub(in crate::app) fn settings_section(
             h_flex()
                 .min_h(px(28.))
                 .px(px(16.))
-                .child(div().text_size(px(16.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child(title)),
+                .justify_between()
+                .gap(px(16.))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(8.))
+                        .text_size(px(16.))
+                        .line_height(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .children(action),
         )
         .child(card(rows, t))
+        .into_any_element()
+}
+
+/// `SettingsRow`'s chrome: the title line with an optional marker and reset, the description
+/// and a status line on the left, the control on the right, and a body below.
+pub(in crate::app) struct RowFrame {
+    title: AnyElement,
+    marker: Option<AnyElement>,
+    reset: Option<AnyElement>,
+    description: Option<AnyElement>,
+    status: Option<SharedString>,
+    control: Option<AnyElement>,
+    body: Option<AnyElement>,
+    dimmed: bool,
+}
+
+impl RowFrame {
+    pub(in crate::app) fn new(title: impl IntoElement) -> Self {
+        Self {
+            title: title.into_any_element(),
+            marker: None,
+            reset: None,
+            description: None,
+            status: None,
+            control: None,
+            body: None,
+            dimmed: false,
+        }
+    }
+
+    pub(in crate::app) fn description(mut self, description: impl IntoElement) -> Self {
+        self.description = Some(description.into_any_element());
+        self
+    }
+
+    pub(in crate::app) fn status(mut self, status: Option<impl Into<SharedString>>) -> Self {
+        self.status = status.map(Into::into);
+        self
+    }
+
+    pub(in crate::app) fn reset(mut self, reset: Option<impl IntoElement>) -> Self {
+        self.reset = reset.map(IntoElement::into_any_element);
+        self
+    }
+
+    pub(in crate::app) fn control(mut self, control: impl IntoElement) -> Self {
+        self.control = Some(control.into_any_element());
+        self
+    }
+
+    pub(in crate::app) fn body(mut self, body: impl IntoElement) -> Self {
+        self.body = Some(body.into_any_element());
+        self
+    }
+
+    /// `SettingsUnavailableGroup` dims titles and descriptions to 64%.
+    pub(in crate::app) fn dimmed(mut self, dimmed: bool) -> Self {
+        self.dimmed = dimmed;
+        self
+    }
+
+    pub(in crate::app) fn render(self, t: &Tokens) -> gpui_kit::Div {
+        let text = if self.dimmed { 0.64 } else { 1. };
+        let has_body = self.body.is_some();
+        v_flex()
+            .px(px(16.))
+            .pt(px(12.))
+            .pb(px(if has_body { 4. } else { 12. }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(px(32.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(4.))
+                            .child(
+                                h_flex()
+                                    .min_h(px(20.))
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .line_height(px(20.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.foreground.opacity(text))
+                                            .child(self.title),
+                                    )
+                                    .children(self.marker)
+                                    .child(
+                                        div().size(px(20.)).flex().items_center().justify_center().children(self.reset),
+                                    ),
+                            )
+                            .children(self.description.map(|description| {
+                                div()
+                                    .max_w(px(672.))
+                                    .text_size(px(12.))
+                                    .line_height(px(18.))
+                                    .text_color(t.muted_foreground.opacity(text))
+                                    .child(description)
+                            }))
+                            .children(self.status.map(|status| {
+                                div().pt(px(2.)).text_size(px(12.)).text_color(t.muted_foreground).child(status)
+                            })),
+                    )
+                    .children(
+                        self.control.map(|control| h_flex().flex_none().justify_end().gap(px(8.)).child(control)),
+                    ),
+            )
+            .children(self.body)
+    }
+}
+
+/// A footnote line inside a card (`px-3 py-2.5 text-xs text-muted-foreground`).
+pub(in crate::app) fn note(text: impl Into<SharedString>, t: &Tokens) -> AnyElement {
+    div()
+        .px(px(16.))
+        .py(px(10.))
+        .text_size(px(12.))
+        .text_color(t.muted_foreground)
+        .child(text.into())
         .into_any_element()
 }
 
@@ -194,6 +396,12 @@ pub(in crate::app) fn subheading(text: impl Into<SharedString>) -> impl IntoElem
         .line_height(px(24.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(text.into())
+}
+
+/// Where a row's control goes: beside its text, or under it like a textarea.
+enum RowControl {
+    Side(AnyElement),
+    Body(AnyElement),
 }
 
 /// Sections whose rows apply to this device only show no scope sentence
@@ -233,17 +441,55 @@ impl Workspace {
 
     /// Writes a unified patch (`useUpdateScopedSettings`).
     pub(in crate::app) fn update_settings(&mut self, patch: Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_settings_then(patch, window, cx, |_, _, _| {});
+    }
+
+    /// [`Self::update_settings`], then `done` with whether the environment saved it.
+    pub(in crate::app) fn update_settings_then(
+        &mut self,
+        patch: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+    ) {
         let Value::Object(patch) = patch else { return };
         let view = self.settings_view();
         let plan = scope::plan_patch(&view.scope, &view.projects, &view.environment(), &patch);
-        self.run_settings_plan(plan, window, cx);
+        self.run_settings_plan(plan, window, cx, done);
+    }
+
+    /// A plain `server.updateSettings` on the connected environment, for settings the web keeps
+    /// per environment whatever the scope (source control discovery, hosts and tokens).
+    pub(in crate::app) fn update_environment_settings(
+        &mut self,
+        patch: Value,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+    ) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
+            let _ = this.update(cx, |this, cx| {
+                match &result {
+                    Ok(saved) => {
+                        if let Err(error) = this.server_info.apply_settings(saved) {
+                            log::warn!("bad saved settings: {error}");
+                        }
+                    }
+                    Err(error) => this.error = Some(format!("Could not save settings: {error}").into()),
+                }
+                done(this, result.is_ok(), cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Resets the selected project's overrides of `keys` (`useClearScopedSettings`).
     fn clear_setting_overrides(&mut self, keys: &[&str], window: &mut Window, cx: &mut Context<Self>) {
         let view = self.settings_view();
         let plan = scope::plan_clear(&view.scope, &view.environment(), keys);
-        self.run_settings_plan(plan, window, cx);
+        self.run_settings_plan(plan, window, cx, |_, _, _| {});
     }
 
     /// Resets other projects' overrides of `keys` (`useClearProjectOverrides`).
@@ -257,25 +503,34 @@ impl Workspace {
         let view = self.settings_view();
         let ids: Vec<&str> = project_ids.iter().map(String::as_str).collect();
         let plan = scope::plan_clear_projects(&view.environment(), &ids, keys);
-        self.run_settings_plan(plan, window, cx);
+        self.run_settings_plan(plan, window, cx, |_, _, _| {});
     }
 
     /// Applies device keys now and sends the server's part (`persistScopedSettingsPatch`).
-    fn run_settings_plan(&mut self, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_settings_plan(
+        &mut self,
+        plan: Plan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+    ) {
         if let Some(reason) = plan.unavailable {
             window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+            done(self, false, cx);
             return;
         }
         if !plan.client_patch.is_empty() {
             self.client_settings.apply(&plan.client_patch);
             cx.notify();
         }
-        let (Some(patch), Some(client)) = (plan.server_patch, self.client()) else { return };
+        let Some(patch) = plan.server_patch else { return done(self, true, cx) };
+        let Some(client) = self.client() else { return done(self, false, cx) };
         let previous = self.server_info.settings.clone();
         let label = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                done(this, result.is_ok(), cx);
                 let message = match result {
                     Ok(saved) => {
                         let saved_settings = Settings::layered(&contract().server_defaults, &saved);
@@ -353,7 +608,7 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
-        let SettingRow { id, title, description, control, .. } = row;
+        let SettingRow { id, title, description, status, body, control, unavailable, .. } = row;
         let (state, summary) = scope::row_inheritance(&view.scope, &view.targets, &view.environment(), &keys);
         let inheritance = (server_scoped && !keys.is_empty() && !view.targets.is_empty())
             .then(|| self.render_inheritance(view, &id, &keys, state, summary, overriding, &t, cx));
@@ -368,71 +623,45 @@ impl Workspace {
             None
         };
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
+        let (control, body) = match control {
+            Some(RowControl::Body(field)) => (None, Some(field)),
+            Some(RowControl::Side(control)) => (Some(control), body),
+            None => (None, body),
+        };
+        let inert = if unavailable { Some("") } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
-        v_flex()
+        let mut frame = RowFrame::new(title).dimmed(unavailable).status(status);
+        frame.marker = inheritance.map(|marker| {
+            div()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(quiet_marker, |el| el.invisible().group_hover(group.clone(), |s| s.visible()))
+                .child(marker)
+                .into_any_element()
+        });
+        frame.reset = reset.filter(|_| !unavailable);
+        frame.description = description;
+        frame.body = body;
+        frame.control = control.map(|control| match inert {
+            Some(message) => div()
+                .id(SharedString::from(format!("{id}-inert")))
+                .flex_none()
+                .opacity(0.5)
+                .occlude()
+                .when(!message.is_empty(), |el| el.tooltip(move |window, cx| Tooltip::new(message).build(window, cx)))
+                .child(control)
+                .into_any_element(),
+            None => control,
+        });
+        frame
+            .render(&t)
             .id(group.clone())
-            .group(group.clone())
-            .px(px(16.))
+            .group(group)
             .relative()
-            .py(px(12.))
             .when(target, |el| el.bg(t.accent).child(self.scroll_target_marker()))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap(px(32.))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(4.))
-                            .child(
-                                h_flex()
-                                    .min_h(px(20.))
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .text_size(px(14.))
-                                            .line_height(px(20.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(title),
-                                    )
-                                    .children(inheritance.map(|marker| {
-                                        div()
-                                            .size(px(20.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(quiet_marker, |el| {
-                                                el.invisible().group_hover(group.clone(), |s| s.visible())
-                                            })
-                                            .child(marker)
-                                    }))
-                                    .child(div().size(px(20.)).flex().items_center().justify_center().children(reset)),
-                            )
-                            .children(description.map(|description| {
-                                div()
-                                    .max_w(px(672.))
-                                    .text_size(px(12.))
-                                    .line_height(px(18.))
-                                    .text_color(t.muted_foreground)
-                                    .child(description)
-                            })),
-                    )
-                    .children(control.map(|control| {
-                        match inert {
-                            Some(message) => div()
-                                .id(SharedString::from(format!("{id}-inert")))
-                                .flex_none()
-                                .opacity(0.5)
-                                .occlude()
-                                .tooltip(move |window, cx| Tooltip::new(message).build(window, cx))
-                                .child(control)
-                                .into_any_element(),
-                            None => h_flex().flex_none().justify_end().gap(px(8.)).child(control).into_any_element(),
-                        }
-                    })),
-            )
             .into_any_element()
     }
 
@@ -650,6 +879,7 @@ impl Workspace {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_control(
         &mut self,
         view: &SettingsView,
@@ -659,9 +889,17 @@ impl Workspace {
         mixed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<RowControl> {
         let t = *theme::tokens(cx);
         let element = match (control, key) {
+            (Control::Text { placeholder, width }, Some(key)) => {
+                let field = self.setting_field(id, key, view.str(key), placeholder, false, window, cx);
+                field.sized(px(width)).into_any_element()
+            }
+            (Control::Textarea { placeholder }, Some(key)) => {
+                let field = self.setting_field(id, key, view.str(key), placeholder, true, window, cx);
+                return Some(RowControl::Body(super::fields::textarea_body(&field)));
+            }
             (Control::Element(element), _) => element,
             (Control::Switch, Some(key)) => {
                 let checked = view.bool(key);
@@ -717,7 +955,72 @@ impl Workspace {
             }
             _ => return None,
         };
-        Some(element)
+        Some(RowControl::Side(element))
+    }
+
+    /// A select over JSON values that writes `key` through the scope; `trigger` is what the
+    /// closed select shows.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::app) fn value_select(
+        &self,
+        id: impl Into<SharedString>,
+        key: &'static str,
+        current: &Value,
+        options: Vec<(Value, SharedString)>,
+        trigger: impl IntoElement,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = current.clone();
+        let options = options.into_iter().map(|(value, label)| (value.clone(), label, value == current)).collect();
+        self.menu_select(id, options, trigger, width, cx, move |this, value, window, cx| {
+            this.update_settings(serde_json::json!({ key: value }), window, cx)
+        })
+    }
+
+    /// `SelectTrigger size="sm"` with its menu of `(value, label, checked)` items.
+    pub(in crate::app) fn menu_select<T: Clone + 'static>(
+        &self,
+        id: impl Into<SharedString>,
+        options: Vec<(T, SharedString, bool)>,
+        trigger: impl IntoElement,
+        width: f32,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let workspace = cx.entity();
+        let on_pick = Rc::new(on_pick);
+        select_trigger(&id.into(), trigger, width, &t)
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
+                for (value, label, checked) in &options {
+                    let (value, on_pick) = (value.clone(), on_pick.clone());
+                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(*checked).on_click(
+                        window.listener_for(&workspace, move |this, _, window, cx| {
+                            on_pick(this, value.clone(), window, cx)
+                        }),
+                    ));
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// The text field of a `.text()` or `.textarea()` row, writing through the scope.
+    #[allow(clippy::too_many_arguments)]
+    fn setting_field(
+        &mut self,
+        id: &SharedString,
+        key: &'static str,
+        saved: &str,
+        placeholder: &str,
+        multiline: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> super::fields::FieldInput {
+        self.text_field(id, saved, placeholder, multiline, None, window, cx, move |this, text, window, cx| {
+            this.update_settings(serde_json::json!({ key: text }), window, cx)
+        })
     }
 
     /// The slider entity for `key`, kept in sync with the setting while it is not being dragged.
@@ -948,15 +1251,10 @@ pub(in crate::app) fn switch(
 }
 
 /// The web's `SelectTrigger size="sm"`.
-pub(in crate::app) fn select_trigger(
-    id: &SharedString,
-    label: impl Into<SharedString>,
-    width: f32,
-    t: &Tokens,
-) -> Button {
+pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement, width: f32, t: &Tokens) -> Button {
     Button::new(SharedString::from(format!("{id}-select")))
         .ghost()
-        .w(px(width))
+        .when(width > 0., |b| b.w(px(width)))
         .h(px(28.))
         .px(px(9.))
         .rounded(px(8.))
@@ -971,7 +1269,7 @@ pub(in crate::app) fn select_trigger(
                 .w_full()
                 .justify_between()
                 .gap(px(8.))
-                .child(div().min_w_0().truncate().child(label.into()))
+                .child(h_flex().min_w_0().gap(px(8.)).overflow_hidden().child(label))
                 .child(Icon::new(IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground.opacity(0.7))),
         )
 }

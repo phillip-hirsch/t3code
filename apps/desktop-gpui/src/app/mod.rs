@@ -193,8 +193,6 @@ pub struct Workspace {
     installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
     /// Settings → Keybindings, created the first time it opens.
     keybindings_panel: Option<gpui_kit::AnyView>,
-    /// Open "Advanced" folds in Settings sections, by section id.
-    settings_folds: HashSet<&'static str>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
@@ -307,7 +305,6 @@ impl Workspace {
             devices: Default::default(),
             installed_keybindings: Rc::default(),
             keybindings_panel: None,
-            settings_folds: HashSet::new(),
             palette: None,
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,

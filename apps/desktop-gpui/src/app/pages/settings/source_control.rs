@@ -3,7 +3,7 @@
 //! category="source-control"`, `SourceControlAppSignInSettings`, `SourceControlTokenSettings`,
 //! `SourceControlAccountSettings`, `SourceControlHostSettings` and `SourceControlWritingSettings`).
 //!
-//! Scoped in the web: the Repositories and Writing & review rows (`serverScoped`). Discovery,
+//! The Repositories and Writing & review rows write through the settings scope. Discovery,
 //! sign-in, tokens, accounts and host fields are per environment (`server.updateSettings` on the
 //! environment discovery ran against). The web's secret-provider picker beside token fields
 //! belongs to Settings › Secrets; here a token is always a typed value.
@@ -25,68 +25,13 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::pending::{
-    Control, Row, SERVER_SCOPES, SettingRowSpec, advanced, generates_text, muted, page, reset_button,
-    resolve_text_generation, section, select, switch,
-};
+use super::super::fields::textarea_body;
+use super::super::model_select::{generates_text, muted, resolve_text_generation};
+use super::super::widgets::{SettingRow, SettingsView, section_with_action, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
 use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{FONT_MONO, Tokens, tokens};
-
-const ROWS: &[SettingRowSpec] = &[
-    SettingRowSpec {
-        id: "automatic-pull",
-        label: "Automatically pull",
-        description: "Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.",
-        path: "defaultAutoPull",
-        control: Control::Switch,
-        default: Some("false"),
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "remove-agent-credits-on-merge",
-        label: "Remove agent credits when merging",
-        description: "Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.",
-        path: "removeAgentCreditsOnMerge",
-        control: Control::Switch,
-        default: Some("false"),
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "review-guides",
-        label: "Review guides (beta)",
-        description: "Add a Guide tab to pull requests. An agent explains the changes and points out decisions that need review.",
-        path: "reviewGuidesEnabled",
-        control: Control::Switch,
-        default: None,
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "review-guide-instructions",
-        label: "Review guide instructions",
-        description: "Your preferences for review guides: what to show first, dwell on, or skip. The guide's format and coverage stay the same.",
-        path: "reviewGuideInstructions",
-        control: Control::Textarea(
-            "Show service interfaces before implementations. Skip test files unless they change behavior. Keep summaries to two sentences.",
-        ),
-        default: Some("\"\""),
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "follow-change-request-templates",
-        label: "Follow change request templates",
-        description: "Use the repository's template for change request descriptions when available.",
-        path: "sourceControlWritingStyle.followChangeRequestTemplates",
-        control: Control::Switch,
-        default: Some("true"),
-        scopes: SERVER_SCOPES,
-    },
-];
-
-fn spec(id: &str) -> &'static SettingRowSpec {
-    ROWS.iter().find(|row| row.id == id).expect("settings row")
-}
 
 const MERGE_METHODS: &[(&str, &str)] =
     &[("last", "Last selected"), ("merge", "Merge"), ("squash", "Squash and merge"), ("rebase", "Rebase and merge")];
@@ -417,40 +362,51 @@ impl Workspace {
             }
             state
         });
-        let repositories = vec![
-            self.render_spec(spec("automatic-pull"), window, cx).render(&t),
-            self.render_spec(spec("remove-agent-credits-on-merge"), window, cx).render(&t),
-            self.merge_method_row(cx),
+        let view = self.settings_view();
+        let stored = view.value("pullRequestMergeMethod").clone();
+        let method = stored.as_str().unwrap_or("last");
+        let merge_method = self.value_select(
+            "merge-method",
+            "pullRequestMergeMethod",
+            &stored,
+            MERGE_METHODS
+                .iter()
+                .map(|(id, label)| (if *id == "last" { Value::Null } else { json!(id) }, (*label).into()))
+                .collect(),
+            MERGE_METHODS.iter().find(|(id, _)| *id == method).map_or("", |(_, label)| label),
+            208.,
+            cx,
+        );
+        let discovery = self.discovery_sections(&state, client.is_some(), window, cx);
+        let writing = self.writing_rows(&view, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let repositories = [
+            row(
+                self,
+                SettingRow::new("automatic-pull")
+                    .description("Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.")
+                    .setting("defaultAutoPull")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("remove-agent-credits-on-merge")
+                    .description("Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.")
+                    .setting("removeAgentCreditsOnMerge")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("pull-request-merge-method")
+                    .description("Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.")
+                    .setting("pullRequestMergeMethod")
+                    .control(merge_method),
+            ),
         ];
-        let mut sections = vec![section("Repositories", None, repositories, &t)];
-        sections.extend(self.discovery_sections(&state, client.is_some(), window, cx));
-        sections.push(section("Writing & review", None, self.writing_rows(window, cx), &t));
-        page("settings-source-control", sections)
-    }
-
-    fn merge_method_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *tokens(cx);
-        let stored = self.setting("pullRequestMergeMethod").as_str().map(str::to_owned);
-        let value = stored.clone().unwrap_or_else(|| "last".into());
-        let label = MERGE_METHODS.iter().find(|(id, _)| *id == value).map_or("", |(_, label)| label);
-        Row::new("pull-request-merge-method", "Default merge method")
-            .description("Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.")
-            .reset(stored.is_some().then(|| {
-                reset_button("merge-method", cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "pullRequestMergeMethod": null }), cx)))
-                    .tooltip("Reset to last selected")
-            }))
-            .control(select(
-                "merge-method",
-                label,
-                MERGE_METHODS.iter().map(|(id, label)| ((*id).into(), (*label).into())).collect(),
-                Some(value.into()),
-                cx,
-                |this, picked, cx| {
-                    let method = if picked.as_ref() == "last" { Value::Null } else { json!(picked.as_ref()) };
-                    this.pending_update_settings(json!({ "pullRequestMergeMethod": method }), cx)
-                },
-            ))
-            .render(&t)
+        let mut sections = vec![settings_section("repositories", "Repositories", repositories, &t)];
+        sections.extend(discovery);
+        sections.push(settings_section("writing-review", "Writing & review", writing, &t));
+        self.settings_page("source-control", &view, sections, cx)
     }
 
     fn scan_button(&self, state: &Entity<SourceControlState>, cx: &mut Context<Self>) -> AnyElement {
@@ -491,7 +447,7 @@ impl Workspace {
                 muted("Connect an environment to inspect its version control tools and hosting integrations.", &t)
                     .px(px(16.))
                     .py(px(12.));
-            return vec![section("Server environment", None, [note.into_any_element()], &t)];
+            return vec![settings_section("Server environment", "Server environment", [note.into_any_element()], &t)];
         }
         let (discovery, pending, error) = {
             let state = state.read(cx);
@@ -500,8 +456,14 @@ impl Workspace {
         let Some(discovery) = discovery else {
             if pending || error.is_none() {
                 return vec![
-                    section("Version Control", Some(self.scan_button(state, cx)), skeleton_rows(&t), &t),
-                    section("Source control providers", None, skeleton_rows(&t), &t),
+                    section_with_action(
+                        "Version Control",
+                        "Version Control",
+                        Some(self.scan_button(state, cx)),
+                        skeleton_rows(&t),
+                        &t,
+                    ),
+                    settings_section("Source control providers", "Source control providers", skeleton_rows(&t), &t),
                 ];
             }
             return vec![self.empty_discovery(state, error, pending, cx)];
@@ -515,7 +477,13 @@ impl Workspace {
         let mut sections = Vec::new();
         if !vcs.is_empty() {
             let rows: Vec<AnyElement> = vcs.iter().map(|item| self.discovery_row(state, item, None, cx)).collect();
-            sections.push(section("Version Control", Some(self.scan_button(state, cx)), rows, &t));
+            sections.push(section_with_action(
+                "Version Control",
+                "Version Control",
+                Some(self.scan_button(state, cx)),
+                rows,
+                &t,
+            ));
         }
         if !providers.is_empty() {
             let mut rows = Vec::new();
@@ -532,7 +500,13 @@ impl Workspace {
                 rows.push(self.discovery_row(state, item, panel, cx));
             }
             let action = vcs.is_empty().then(|| self.scan_button(state, cx));
-            sections.push(section("Source control providers", action, rows, &t));
+            sections.push(section_with_action(
+                "Source control providers",
+                "Source control providers",
+                action,
+                rows,
+                &t,
+            ));
         }
         sections
     }
@@ -590,7 +564,7 @@ impl Workspace {
                         }
                     }),
             );
-        section("Server environment", None, [body.into_any_element()], &t)
+        settings_section("Server environment", "Server environment", [body.into_any_element()], &t)
     }
 
     /// `DiscoveryItemRow`: mark, label, version, badges and summary, the read-only availability
@@ -843,7 +817,7 @@ impl Workspace {
     }
 
     fn host_settings(&self, kind: &str) -> Value {
-        self.setting("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
+        self.server_info.settings.get("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
     }
 
     /// `SourceControlAppSignInSettings`: the device-code sign-in card.
@@ -907,7 +881,7 @@ impl Workspace {
                     let mut sessions = sign_ins.as_object().cloned().unwrap_or_default();
                     sessions.insert(app.host.into(), json!(""));
                     let state = state.clone();
-                    this.update_settings_then(
+                    this.update_environment_settings(
                         json!({ "sourceControlHosts": { kind: { "signIns": sessions } } }),
                         cx,
                         move |this, ok, cx| {
@@ -1233,7 +1207,7 @@ impl Workspace {
                 let mut tokens = tokens_map.as_object().cloned().unwrap_or_default();
                 tokens.insert(host, json!(token));
                 let state = state.clone();
-                this.update_settings_then(
+                this.update_environment_settings(
                     json!({ "sourceControlHosts": { kind: { "tokens": tokens } } }),
                     cx,
                     move |this, ok, cx| {
@@ -1391,7 +1365,7 @@ impl Workspace {
                 state.update(cx, |state, _| state.saving = true);
                 let choices = next_host_choices(&hosts, host, enabled, account);
                 let state = state.clone();
-                this.update_settings_then(
+                this.update_environment_settings(
                     json!({ "sourceControlHosts": { kind: { "hosts": choices } } }),
                     cx,
                     move |this, ok, cx| {
@@ -1496,13 +1470,17 @@ impl Workspace {
                     )
                 }));
                 let (pick, host_id) = (save.clone(), group.host.clone());
-                let picker = select(
-                    &format!("account-{}", group.host),
-                    label,
+                let options = options
+                    .into_iter()
+                    .map(|(value, label)| (value.clone(), label, value == current.as_str()))
+                    .collect();
+                let picker = self.menu_select(
+                    format!("account-{}", group.host),
                     options,
-                    Some(current.clone().into()),
+                    label,
+                    256.,
                     cx,
-                    move |this, value, cx| {
+                    move |this, value: SharedString, _, cx| {
                         let account = (value.as_ref() != ACTIVE_ACCOUNT).then_some(value.as_ref());
                         pick(this, &host_id, None, Some(account), cx);
                     },
@@ -1580,9 +1558,9 @@ impl Workspace {
             let stored = &saved[key];
             let commit = {
                 let state = state.clone();
-                move |this: &mut Self, text: String, cx: &mut Context<Self>| {
+                move |this: &mut Self, text: String, _: &mut Window, cx: &mut Context<Self>| {
                     let state = state.clone();
-                    this.update_settings_then(
+                    this.update_environment_settings(
                         json!({ "sourceControlHosts": { kind: { key: text } } }),
                         cx,
                         move |this, ok, cx| {
@@ -1620,7 +1598,7 @@ impl Workspace {
                 Button::new(SharedString::from(format!("remove-{kind}"))).outline().xsmall().label("Remove").on_click(
                     cx.listener(move |this, _, _, cx| {
                         let state = state.clone();
-                        this.update_settings_then(
+                        this.update_environment_settings(
                             json!({ "sourceControlHosts": { kind: cleared.clone() } }),
                             cx,
                             move |this, ok, cx| {
@@ -1637,22 +1615,14 @@ impl Workspace {
     }
 
     /// `SourceControlWritingSettingsSection`: writing style, review guides, and the writer model.
-    fn writing_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn writing_rows(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let connected = self.client().is_some();
-        let style = self.setting("sourceControlWritingStyle").clone();
+        let style = view.value("sourceControlWritingStyle").clone();
         let mode = style["mode"].as_str().unwrap_or("repo_conventions").to_owned();
         let instructions = style["customInstructions"].as_str().unwrap_or_default().to_owned();
         let (_, mode_label, mode_description) =
             WRITING_STYLES.iter().find(|(id, ..)| *id == mode).copied().unwrap_or(WRITING_STYLES[0]);
-        let dirty = mode != "repo_conventions" || !instructions.is_empty();
-        let mut style_row = Row::new("source-control-writing-style", "Source control writing style")
-            .description(mode_description)
-            .reset(dirty.then(|| {
-                reset_button("writing-style", cx.listener(|this, _, _, cx| {
-                    this.pending_update_settings(json!({ "sourceControlWritingStyle": { "mode": "repo_conventions", "customInstructions": "" } }), cx)
-                }))
-            }));
         let instructions_field = self.text_field(
             "source-control-custom-instructions",
             &instructions,
@@ -1661,154 +1631,188 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, text, cx| {
-                this.pending_update_settings(json!({ "sourceControlWritingStyle": { "customInstructions": text } }), cx)
+            |this, text, window, cx| {
+                this.update_settings(json!({ "sourceControlWritingStyle": { "customInstructions": text } }), window, cx)
             },
         );
         let typed = instructions_field.clone();
-        style_row = style_row.control(select(
+        let custom = mode == "custom";
+        let style_options =
+            WRITING_STYLES.iter().map(|(id, label, _)| (*id, SharedString::from(*label), *id == mode)).collect();
+        let style_select = self.menu_select(
             "writing-style",
+            style_options,
             mode_label,
-            WRITING_STYLES.iter().map(|(id, label, _)| ((*id).into(), (*label).into())).collect(),
-            Some(mode.clone().into()),
+            224.,
             cx,
-            move |this, picked, cx| {
+            move |this, picked: &str, window, cx| {
                 // Carries what was typed into the custom instructions along with the mode.
-                let mut style = json!({ "mode": picked.as_ref() });
-                if this.setting("sourceControlWritingStyle.mode") == "custom" {
+                let mut style = json!({ "mode": picked });
+                if custom {
                     style["customInstructions"] = json!(typed.value(cx).trim());
                 }
-                this.pending_update_settings(json!({ "sourceControlWritingStyle": style }), cx)
+                this.update_settings(json!({ "sourceControlWritingStyle": style }), window, cx)
             },
-        ));
-        if mode == "custom" {
-            style_row = style_row.body(super::pending::textarea_body(&instructions_field));
-        }
-        let mut rows = vec![style_row.render(&t), self.render_spec(spec("review-guides"), window, cx).render(&t)];
+        );
 
         let providers = &self.server_info.providers;
         let usable: Vec<&crate::model::Provider> =
             providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
         let stored_text: Option<ModelSelection> =
-            serde_json::from_value(self.setting("textGenerationModelSelection").clone()).ok();
+            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
         let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
         let writer: Option<ModelSelection> =
-            serde_json::from_value(self.setting("sourceControlWriterModelSelection").clone()).ok();
+            serde_json::from_value(view.value("sourceControlWriterModelSelection").clone()).ok();
         let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
         let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
         let can_dedicate =
             default_selection.as_ref().is_some_and(|s| usable.iter().any(|p| p.instance_id == s.instance_id));
-
-        if self.setting("reviewGuidesEnabled") == true {
+        let guides = view.bool("reviewGuidesEnabled");
+        let guide_control = (guides && connected).then(|| {
             let guide: Option<ModelSelection> =
-                serde_json::from_value(self.setting("reviewGuideModelSelection").clone()).ok();
+                serde_json::from_value(view.value("reviewGuideModelSelection").clone()).ok();
             let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
             let guide_selection = guide_usable.cloned().or_else(|| active.clone());
-            let control: AnyElement = if !connected {
-                muted("Connect an environment to choose its review guide model.", &t).into_any_element()
-            } else {
-                let set = |this: &mut Self, value: Value, cx: &mut Context<Self>| {
-                    this.pending_update_settings(json!({ "reviewGuideModelSelection": value }), cx)
-                };
-                let enable_with = active.clone();
-                h_flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap(px(8.))
-                    .when_some(guide_selection.filter(|_| guide.is_some() && can_dedicate), |el, selection| {
-                        el.child(self.model_picker(
-                            "review-guide-model",
-                            &selection,
-                            None,
-                            generates_text,
-                            cx,
-                            move |this, pick, cx| {
-                                set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), cx)
-                            },
-                        ))
-                        .children(self.traits_picker(
-                            "review-guide-traits",
-                            &selection,
-                            cx,
-                            move |this, pick, cx| set(this, pick.to_json(), cx),
-                        ))
-                    })
-                    .child(switch("review-guide-model", guide.is_some(), cx, move |this, on, cx| {
-                        match (on, &enable_with) {
-                            (false, _) => set(this, Value::Null, cx),
-                            (true, Some(selection)) => set(this, selection.to_json(), cx),
-                            (true, None) => {}
-                        }
-                    }))
-                    .when(guide.is_none() && !can_dedicate, |el| el.opacity(0.5))
-                    .into_any_element()
-            };
-            rows.push(
-                Row::new("review-guide-model", "Review guide model")
-                    .description("Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.")
-                    .control(control)
-                    .render(&t),
-            );
-            rows.push(self.render_spec(spec("review-guide-instructions"), window, cx).render(&t));
-        }
+            self.dedicated_model_control(
+                "review-guide-model",
+                "reviewGuideModelSelection",
+                guide.is_some(),
+                guide_selection.filter(|_| guide.is_some() && can_dedicate),
+                active.clone(),
+                guide.is_none() && !can_dedicate,
+                None,
+                cx,
+            )
+        });
+        let writer_control = connected.then(|| {
+            let note =
+                (writer.is_some() && !can_dedicate).then(|| muted("No text generation providers available.", &t));
+            self.dedicated_model_control(
+                "writer-model",
+                "sourceControlWriterModelSelection",
+                writer.is_some(),
+                active.clone().filter(|_| writer.is_some() && can_dedicate),
+                default_selection.clone(),
+                false,
+                note,
+                cx,
+            )
+        });
 
-        let open = window.use_keyed_state("settings-source-control-advanced", cx, |_, _| false);
-        let mut folded = Vec::new();
-        if *open.read(cx) {
-            folded.push(self.render_spec(spec("follow-change-request-templates"), window, cx).render(&t));
-            let control: AnyElement = if !connected {
-                muted("Connect an environment to choose its source control writer model.", &t).into_any_element()
-            } else {
-                let set = |this: &mut Self, value: Value, cx: &mut Context<Self>| {
-                    this.pending_update_settings(json!({ "sourceControlWriterModelSelection": value }), cx)
-                };
-                let enable_with = default_selection.clone();
-                h_flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap(px(8.))
-                    .when(writer.is_some() && !can_dedicate, |el| {
-                        el.child(muted("No text generation providers available.", &t))
-                    })
-                    .when_some(active.clone().filter(|_| writer.is_some() && can_dedicate), |el, selection| {
-                        el.child(self.model_picker(
-                            "writer-model",
-                            &selection,
-                            None,
-                            generates_text,
-                            cx,
-                            move |this, pick, cx| {
-                                set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), cx)
-                            },
-                        ))
-                        .children(self.traits_picker(
-                            "writer-traits",
-                            &selection,
-                            cx,
-                            move |this, pick, cx| set(this, pick.to_json(), cx),
-                        ))
-                    })
-                    .child(switch("writer-model", writer.is_some(), cx, move |this, on, cx| match (on, &enable_with) {
-                        (false, _) => set(this, Value::Null, cx),
-                        (true, Some(selection)) => set(this, selection.to_json(), cx),
-                        (true, None) => {}
-                    }))
-                    .into_any_element()
-            };
-            folded.push(
-                Row::new("source-control-writer-model", "Source control writer model")
-                    .description("Model for source control text and branch or bookmark names. When disabled, use the text generation model configured for this environment.")
-                    .control(control)
-                    .render(&t),
-            );
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
+        let mut style_row = SettingRow::new("source-control-writing-style")
+            .description(mode_description)
+            .setting("sourceControlWritingStyle")
+            .control(style_select);
+        if custom {
+            style_row = style_row.body(textarea_body(&instructions_field));
         }
-        rows.push(advanced("source-control-advanced", *open.read(cx), folded, &t, move |_, _, cx| {
-            open.update(cx, |open, cx| {
-                *open = !*open;
-                cx.notify();
-            })
-        }));
+        let mut rows = vec![
+            row(self, style_row),
+            row(
+                self,
+                SettingRow::new("review-guides")
+                    .description("Add a Guide tab to pull requests. An agent explains the changes and points out decisions that need review.")
+                    .setting("reviewGuidesEnabled")
+                    .switch(),
+            ),
+        ];
+        if guides {
+            let control = guide_control.unwrap_or_else(|| {
+                muted("Connect an environment to choose its review guide model.", &t).into_any_element()
+            });
+            rows.push(row(
+                self,
+                SettingRow::new("review-guide-model")
+                    .description("Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.")
+                    .setting("reviewGuideModelSelection")
+                    .control(control),
+            ));
+            rows.push(row(
+                self,
+                SettingRow::new("review-guide-instructions")
+                    .description("Your preferences for review guides: what to show first, dwell on, or skip. The guide's format and coverage stay the same.")
+                    .setting("reviewGuideInstructions")
+                    .textarea("Show service interfaces before implementations. Skip test files unless they change behavior. Keep summaries to two sentences."),
+            ));
+        }
+        let follow = style["followChangeRequestTemplates"] != false;
+        let follow = switch(&"follow-change-request-templates".into(), follow, false, &t).on_click(cx.listener(
+            move |this, _, window, cx| {
+                this.update_settings(
+                    json!({ "sourceControlWritingStyle": { "followChangeRequestTemplates": !follow } }),
+                    window,
+                    cx,
+                )
+            },
+        ));
+        let writer_control = writer_control.unwrap_or_else(|| {
+            muted("Connect an environment to choose its source control writer model.", &t).into_any_element()
+        });
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
+        let folded = [
+            row(
+                self,
+                SettingRow::titled("follow-change-request-templates", "Follow change request templates")
+                    .description("Use the repository's template for change request descriptions when available.")
+                    .control(follow),
+            ),
+            row(
+                self,
+                SettingRow::new("source-control-writer-model")
+                    .description("Model for source control text and branch or bookmark names. When disabled, use the text generation model configured for this environment.")
+                    .setting("sourceControlWriterModelSelection")
+                    .control(writer_control),
+            ),
+        ];
+        rows.push(self.advanced_fold("source-control", folded, cx));
         rows
+    }
+
+    /// A model a feature can dedicate: the picker while on, and a switch that turns it on with
+    /// `enable_with` or off (null), so the feature falls back to its parent model.
+    #[allow(clippy::too_many_arguments)]
+    fn dedicated_model_control(
+        &self,
+        id: &'static str,
+        key: &'static str,
+        on: bool,
+        selection: Option<ModelSelection>,
+        enable_with: Option<ModelSelection>,
+        dimmed: bool,
+        note: Option<gpui_kit::Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *tokens(cx);
+        let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
+            this.update_settings(json!({ key: value }), window, cx)
+        };
+        let traits_id: &'static str = if id == "writer-model" { "writer-traits" } else { "review-guide-traits" };
+        h_flex()
+            .flex_wrap()
+            .justify_end()
+            .gap(px(8.))
+            .children(note)
+            .when_some(selection, |el, selection| {
+                el.child(self.model_picker(id, &selection, None, generates_text, cx, move |this, pick, window, cx| {
+                    set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx)
+                }))
+                .children(self.traits_picker(
+                    traits_id,
+                    &selection,
+                    cx,
+                    move |this, pick, window, cx| set(this, pick.to_json(), window, cx),
+                ))
+            })
+            .child(switch(&id.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+                match (on, &enable_with) {
+                    (true, _) => set(this, Value::Null, window, cx),
+                    (false, Some(selection)) => set(this, selection.to_json(), window, cx),
+                    (false, None) => {}
+                }
+            })))
+            .when(dimmed, |el| el.opacity(0.5))
+            .into_any_element()
     }
 }
 

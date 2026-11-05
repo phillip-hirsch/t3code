@@ -101,16 +101,6 @@ pub(super) fn next_candidate(presets: &[Preset]) -> Preset {
         .unwrap_or(after(60))
 }
 
-/// Row order is only display order, so it does not make a list differ.
-pub(super) fn same_presets(left: &[Preset], right: &[Preset]) -> bool {
-    let ids = |presets: &[Preset]| {
-        let mut ids: Vec<String> = presets.iter().map(id).collect();
-        ids.sort();
-        ids
-    };
-    ids(left) == ids(right)
-}
-
 /// The other kind's last value, so switching "When" back restores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct KindMemory {
@@ -380,7 +370,6 @@ mod tests {
         assert_eq!(split_minutes(2 * 24 * 60), (2, Unit::Days));
         assert_eq!(next_candidate(&defaults()), after(30));
         assert_eq!(next_candidate(&[after(60)]), after(180));
-        assert!(same_presets(&defaults().into_iter().rev().collect::<Vec<_>>(), &defaults()));
         let memory = KindMemory { minutes: 45, time: "07:30".into() };
         assert_eq!(with_when(&after(60), "friday", &memory), Some(at("friday", "07:30")));
         assert_eq!(with_when(&at("today", "18:00"), "after", &memory), Some(after(45)));

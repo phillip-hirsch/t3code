@@ -7,9 +7,11 @@ mod chat;
 pub(in crate::app) mod code;
 mod connections;
 mod diffs;
+mod fields;
 mod general;
 mod keybindings;
-mod placeholder;
+mod model_select;
+
 mod providers;
 mod search;
 mod snap_shot;
