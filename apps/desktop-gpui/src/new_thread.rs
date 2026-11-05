@@ -4,9 +4,10 @@
 //! `BranchToolbarBranchSelector.tsx`, and the launch `workspaceStrategy` built by
 //! `startThreadTurn` in `packages/client-runtime/src/operations/commands.ts`.
 
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
-use crate::model::{ProjectShell, ServerInfo};
+use crate::model::{ModelSelection, ProjectShell, Provider, ServerInfo, UsageWindow};
 use crate::rpc::RpcClient;
 
 /// `VCS_REF_LIST_LIMIT` in `apps/web/src/state/queries.ts`.
@@ -247,6 +248,69 @@ fn normalize_path(path: &str) -> String {
     if windows { path.replace('/', "\\").to_lowercase() } else { path.to_owned() }
 }
 
+/// `exhaustedUsageWindow` (`packages/shared/src/usageLimits.ts`): a spent window
+/// that has not reset, limited to the pool `model` draws from.
+fn exhausted_window<'a>(provider: &'a Provider, now: jiff::Timestamp, model: &str) -> Option<&'a UsageWindow> {
+    let windows = provider.usage_limits.as_ref().map(|limits| limits.windows.as_slice()).unwrap_or_default();
+    let mut exhausted = windows.iter().filter(|window| {
+        window.used_percent >= 100.
+            && window.resets_at.as_deref().and_then(|at| at.parse::<jiff::Timestamp>().ok()).is_none_or(|at| at > now)
+    });
+    match provider.driver.as_str() {
+        "cursor" => {
+            let spent: Vec<_> = exhausted.collect();
+            let find = |id: &str| spent.iter().copied().find(|window| window.id == id);
+            let api = find("apiPercentUsed");
+            let auto = ["auto", "default", "grok", "composer"].iter().any(|prefix| model.starts_with(prefix));
+            if auto { find("autoPercentUsed").and(api) } else { api }
+        }
+        "antigravity" => {
+            let pool =
+                |id: &str| ["gemini", "claude", "gpt", "3p"].into_iter().find(|p| id.starts_with(&format!("{p}-")));
+            let family = ["gemini", "claude", "gpt"].into_iter().find(|f| model.starts_with(&format!("{f}-")));
+            exhausted.find(|window| match (pool(&window.id), family) {
+                (None, _) | (_, None) => true,
+                (Some(pool), Some(family)) => pool == family || (pool == "3p" && family != "gemini"),
+            })
+        }
+        "opencode" => exhausted.find(|window| !window.id.starts_with("go_") || model.starts_with("opencode-go/")),
+        _ => exhausted.next(),
+    }
+}
+
+/// A new thread's model moved to `fallbackModelSelection` because the default's provider is out of usage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageFallback {
+    pub selection: ModelSelection,
+    /// The provider instance that ran out.
+    pub exhausted_instance: String,
+    pub resets_at: Option<String>,
+}
+
+/// `resolveNewThreadModelSelection` for a draft without an explicit pick.
+pub fn usage_fallback(
+    info: &ServerInfo,
+    default: &ModelSelection,
+    project_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> Option<UsageFallback> {
+    let fallback = ModelSelection::deserialize(info.settings.get("fallbackModelSelection")).ok()?;
+    let provider = info.provider(&default.instance_id)?;
+    let window = exhausted_window(provider, now, &default.model)?;
+    let target = info.provider(&fallback.instance_id)?;
+    let usable = target.enabled
+        && target.installed
+        && target.auth.status != "unauthenticated"
+        && target.availability.as_deref() != Some("unavailable")
+        && exhausted_window(target, now, &fallback.model).is_none()
+        && crate::settings::scope::provider_instance_enabled(&info.settings, project_id, &target.instance_id);
+    usable.then(|| UsageFallback {
+        selection: fallback,
+        exhausted_instance: provider.instance_id.clone(),
+        resets_at: window.resets_at.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +394,70 @@ mod tests {
         );
         assert!(launch_strategy(Worktree, &none, &json!({"isRepo": true, "refs": []}), false).is_err());
         assert_eq!(launch_strategy(Worktree, &none, &json!({"isRepo": false}), true).unwrap(), json!({"type": "root"}));
+    }
+
+    #[test]
+    fn spent_usage_moves_new_threads_to_a_usable_fallback() {
+        let now: jiff::Timestamp = "2026-11-05T12:00:00Z".parse().unwrap();
+        let window =
+            |used: f64, resets: &str| json!({"id": "w", "label": "5h", "usedPercent": used, "resetsAt": resets});
+        let provider = |id: &str, driver: &str, windows: Value, extra: Value| {
+            let mut value = json!({
+                "instanceId": id, "driver": driver, "enabled": true, "installed": true, "status": "ready",
+                "auth": {"status": "authenticated"}, "usageLimits": {"windows": windows},
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            value
+        };
+        let resolve = |default_windows: Value, fallback_extra: Value, settings: Value| {
+            let mut info = ServerInfo::default();
+            info.apply(&json!({"type": "snapshot", "config": {
+                "providers": [
+                    provider("claude", "claudeAgent", default_windows, json!({})),
+                    provider("codex", "codex", json!([]), fallback_extra),
+                ],
+                "settings": settings,
+            }}))
+            .unwrap();
+            let default = ModelSelection { instance_id: "claude".into(), model: "opus".into(), options: None };
+            usage_fallback(&info, &default, Some("p"), now).map(|f| (f.selection.instance_id, f.resets_at))
+        };
+        let fallback = json!({"fallbackModelSelection": {"instanceId": "codex", "model": "gpt"}});
+        let spent = json!([window(100., "2026-11-05T15:00:00Z")]);
+        assert_eq!(
+            resolve(spent.clone(), json!({}), fallback.clone()),
+            Some(("codex".into(), Some("2026-11-05T15:00:00Z".into())))
+        );
+        assert_eq!(resolve(json!([window(99., "2026-11-05T15:00:00Z")]), json!({}), fallback.clone()), None);
+        assert_eq!(resolve(json!([window(100., "2026-11-05T11:00:00Z")]), json!({}), fallback.clone()), None, "reset");
+        assert_eq!(resolve(spent.clone(), json!({}), json!({})), None, "no fallback configured");
+        assert_eq!(resolve(spent.clone(), json!({"auth": {"status": "unauthenticated"}}), fallback.clone()), None);
+        assert_eq!(resolve(spent.clone(), json!({"availability": "unavailable"}), fallback.clone()), None);
+        let disabled_here = json!({
+            "fallbackModelSelection": {"instanceId": "codex", "model": "gpt"},
+            "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": false}}}},
+        });
+        assert_eq!(resolve(spent, json!({}), disabled_here), None, "disabled for the project");
+    }
+
+    #[test]
+    fn cursor_and_opencode_limits_apply_to_their_own_pools() {
+        let now: jiff::Timestamp = "2026-11-05T12:00:00Z".parse().unwrap();
+        let provider = |driver: &str, ids: &[&str]| -> Provider {
+            let windows: Vec<Value> = ids.iter().map(|id| json!({"id": id, "label": id, "usedPercent": 100})).collect();
+            serde_json::from_value(json!({"instanceId": "x", "driver": driver, "usageLimits": {"windows": windows}}))
+                .unwrap()
+        };
+        let cursor = provider("cursor", &["apiPercentUsed"]);
+        assert!(exhausted_window(&cursor, now, "gpt-5").is_some());
+        assert!(exhausted_window(&cursor, now, "auto").is_none(), "auto needs both pools spent");
+        assert!(exhausted_window(&provider("cursor", &["apiPercentUsed", "autoPercentUsed"]), now, "auto").is_some());
+        let opencode = provider("opencode", &["go_monthly"]);
+        assert!(exhausted_window(&opencode, now, "opencode-go/kimi").is_some());
+        assert!(exhausted_window(&opencode, now, "anthropic/claude").is_none());
+        let antigravity = provider("antigravity", &["3p-weekly"]);
+        assert!(exhausted_window(&antigravity, now, "claude-sonnet").is_some());
+        assert!(exhausted_window(&antigravity, now, "gemini-pro").is_none());
     }
 
     #[test]

@@ -37,6 +37,21 @@ pub fn day_aware(iso: &str, now: &Zoned, hour12: bool) -> Option<String> {
     })
 }
 
+/// `formatUpcomingTimestamp`: "3:04 PM", "tomorrow at 3:04 PM", "11/9 3:04 PM"; past times read as `day_aware`.
+pub fn upcoming(iso: &str, now: &Zoned, hour12: bool) -> Option<String> {
+    let time = local(iso, now.time_zone())?;
+    let days = (time.date() - now.date()).get_days();
+    if days < 0 {
+        return day_aware(iso, now, hour12);
+    }
+    Some(match days {
+        0 => clock(&time, hour12),
+        1 => format!("tomorrow at {}", clock(&time, hour12)),
+        _ if time.year() == now.year() => format!("{}/{} {}", time.month(), time.day(), clock(&time, hour12)),
+        _ => format!("{}/{}/{} {}", time.month(), time.day(), time.year(), clock(&time, hour12)),
+    })
+}
+
 /// `formatChatTimestampTooltip`: "3:04 PM, 5th November 2026".
 pub fn tooltip(iso: &str, zone: &TimeZone, hour12: bool) -> Option<String> {
     let time = local(iso, zone)?;
@@ -76,6 +91,16 @@ mod tests {
         assert_eq!(day_aware("not a time", &now, true), None);
         assert_eq!(day_aware("2026-11-05T14:04:00Z", &now, hour12("24-hour")).unwrap(), "09:04");
         assert_eq!(day_aware("2026-11-04T20:04:00Z", &now, false).unwrap(), "yesterday at 15:04");
+    }
+
+    #[test]
+    fn upcoming_text_names_tomorrow_and_dates_later_days() {
+        let now = at("2026-11-05T20:00:00Z");
+        assert_eq!(upcoming("2026-11-05T23:30:00Z", &now, true).unwrap(), "6:30 PM");
+        assert_eq!(upcoming("2026-11-06T15:00:00Z", &now, true).unwrap(), "tomorrow at 10:00 AM");
+        assert_eq!(upcoming("2026-11-09T15:00:00Z", &now, true).unwrap(), "11/9 10:00 AM");
+        assert_eq!(upcoming("2027-01-09T15:00:00Z", &now, false).unwrap(), "1/9/2027 10:00");
+        assert_eq!(upcoming("2026-11-04T20:04:00Z", &now, true).unwrap(), "yesterday at 3:04 PM");
     }
 
     #[test]

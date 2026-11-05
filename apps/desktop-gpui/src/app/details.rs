@@ -1306,7 +1306,7 @@ fn meter_grid(meters: Vec<Meter>, colors: &CardColors) -> AnyElement {
 }
 
 /// `formatContextWindowTokens` in `apps/web/src/lib/contextWindow.ts`.
-fn format_context_tokens(value: u64) -> String {
+pub(super) fn format_context_tokens(value: u64) -> String {
     let trim = |text: String| text.strip_suffix(".0").map(str::to_owned).unwrap_or(text);
     match value {
         0..1_000 => value.to_string(),

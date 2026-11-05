@@ -190,7 +190,7 @@ fn project_overrides(settings: &Settings, project: Option<&Project>) -> Map<Stri
 }
 
 /// `resolveProjectProviderInstanceEnabled`, treating an unconfigured instance as enabled.
-fn provider_instance_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
+pub fn provider_instance_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
     let project_override = project_id.and_then(|id| {
         settings
             .get("projectSettingsOverrides")
