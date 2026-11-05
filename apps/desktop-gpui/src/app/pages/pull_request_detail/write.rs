@@ -236,7 +236,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
-        let (Some(client), Some(key)) = (self.client(), self.shown_pr_key()) else { return };
+        let (Some(client), Some(key)) = (self.pull_request_client(), self.shown_pr_key()) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1467,7 +1467,7 @@ impl Workspace {
     // Reviewers and labels (`PullRequestReviewerPicker`, `PullRequestLabelPicker`).
 
     fn open_pr_picker(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let (key, input) = (panel.reference.key(), panel.reference.to_json());
         let placeholder = if kind == PickerKind::Reviewers { "Search people with access" } else { "Search labels" };

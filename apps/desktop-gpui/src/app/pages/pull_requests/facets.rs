@@ -83,7 +83,10 @@ impl Workspace {
 
     /// Asks the host for options matching the typed text, within the listing's host and project.
     fn search_facets(&mut self, debounce: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let targets = self.pull_request_targets();
+        if targets.is_empty() {
+            return;
+        }
         let (host, project) = (self.pull_requests.host.clone(), self.pull_requests.project.clone());
         let Some(search) = self.pull_requests.facet_search.as_mut() else { return };
         let typed = search.typed(cx);
@@ -102,19 +105,36 @@ impl Workspace {
             if debounce {
                 cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             }
-            let answer = client.request("pullRequests.filterOptions", input).await;
+            // Each machine answers for its own projects; the options are their union.
+            let reads = targets.into_iter().map(|(_, client, project_ids)| {
+                let mut input = input.clone();
+                if let Some(project_ids) = project_ids {
+                    input["projectIds"] = json!(project_ids);
+                }
+                async move { client.request("pullRequests.filterOptions", input).await }
+            });
+            let answers: Vec<Value> =
+                futures::future::join_all(reads).await.into_iter().filter_map(Result::ok).collect();
             let _ = this.update(cx, |this, cx| {
                 let Some(search) = this.pull_requests.facet_search.as_mut() else { return };
                 let text = |v: &Value, key: &str| v[key].as_str().map(str::to_owned);
-                match answer {
-                    Ok(options) => {
-                        let list = |key: &str| options[key].as_array().cloned().unwrap_or_default();
-                        search.authors = list("authors").iter().filter_map(|a| text(a, "login")).collect();
-                        search.labels =
-                            list("labels").iter().filter_map(|l| Some((text(l, "name")?, text(l, "color")))).collect();
-                        search.failed = false;
+                search.failed = answers.is_empty();
+                search.authors.clear();
+                search.labels.clear();
+                for options in &answers {
+                    let list = |key: &str| options[key].as_array().cloned().unwrap_or_default();
+                    for login in list("authors").iter().filter_map(|a| text(a, "login")) {
+                        if !search.authors.contains(&login) {
+                            search.authors.push(login);
+                        }
                     }
-                    Err(_) => search.failed = true,
+                    for (name, color) in
+                        list("labels").iter().filter_map(|l| Some((text(l, "name")?, text(l, "color"))))
+                    {
+                        if !search.labels.iter().any(|(held, _)| *held == name) {
+                            search.labels.push((name, color));
+                        }
+                    }
                 }
                 search.answered = Some(typed);
                 cx.notify();
