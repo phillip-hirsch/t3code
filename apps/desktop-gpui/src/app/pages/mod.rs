@@ -2,6 +2,7 @@
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
 mod pull_request_detail;
+mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
 mod usage;

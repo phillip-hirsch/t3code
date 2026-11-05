@@ -105,6 +105,12 @@ pub(super) enum Surface {
     Browser(String),
     Files,
     File(String),
+    /// A side chat's tab, by its thread id.
+    SideChat(String),
+    /// A pull request in the detail panel.
+    PullRequest(crate::pull_request_detail::Reference),
+    /// The thread's linked pull requests.
+    PullRequests,
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -201,7 +207,8 @@ impl PanelState {
                 self.surfaces.push(surface);
             }
         }
-        if self.active.as_ref().is_some_and(|active| !self.surfaces.contains(active)) {
+        // Nothing active, as after a restart, also falls back to a browser tab.
+        if self.active.as_ref().is_none_or(|active| !self.surfaces.contains(active)) {
             let browser = self.surfaces.iter().find(|s| matches!(s, Surface::Browser(_)));
             self.active = browser.or(self.surfaces.first()).cloned();
         }
@@ -380,9 +387,12 @@ impl Workspace {
     }
 
     /// Closes a tab; a browser tab's session closes with it.
-    fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = self.user_panel_state() {
             panel.close(&surface);
+        }
+        if let Surface::SideChat(thread_id) = &surface {
+            self.release_side_chat(thread_id, cx);
         }
         if let (Surface::Browser(tab), Some(Target::Thread(thread_id))) = (&surface, self.target.clone()) {
             self.close_preview_tab(thread_id, tab.clone(), window, cx);
@@ -763,6 +773,11 @@ impl Workspace {
             self.right_panel.diff_mount = mount;
             (self.right_panel.wrap, self.right_panel.ignore_whitespace) = (None, None);
         }
+        let side_chat = match self.active_surface() {
+            Some(Surface::SideChat(thread_id)) => Some(thread_id.clone()),
+            _ => None,
+        };
+        self.sync_side_chat(side_chat.as_deref(), window, cx);
         let width = self.right_panel_width(window)?;
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
@@ -788,6 +803,9 @@ impl Workspace {
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
+            (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
+            (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
+            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -848,6 +866,8 @@ impl Workspace {
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
         let (diff, browser, files) = (self.diff_available(), self.browser_available(), self.project_target().is_some());
+        let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
+        let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -886,7 +906,8 @@ impl Workspace {
                     .size(px(24.))
                     .rounded(px(8.))
                     .dropdown_menu(move |menu: PopupMenu, window, _| {
-                        menu.min_w(px(200.))
+                        let menu = menu
+                            .min_w(px(200.))
                             .item(
                                 PopupMenuItem::new("Browser")
                                     .icon(Icon::new(IconName::Globe))
@@ -907,6 +928,35 @@ impl Workspace {
                                     window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
                                 ),
                             )
+                            .item(
+                                PopupMenuItem::new("Pull request")
+                                    .icon(Icon::new(IconName::GitPullRequest))
+                                    .disabled(pull_request.is_none())
+                                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                                        if let Some(reference) = this.thread_pull_request_target() {
+                                            this.open_surface(Surface::PullRequest(reference), window, cx);
+                                        }
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new("Linked pull requests")
+                                    .icon(Icon::new(IconName::Link))
+                                    .disabled(!linked)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.open_surface(Surface::PullRequests, window, cx)
+                                    })),
+                            );
+                        match side_chat {
+                            Some(available) => menu.item(
+                                PopupMenuItem::new("Side chat")
+                                    .icon(Icon::new(IconName::MessagesSquare))
+                                    .disabled(!available)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.add_side_chat_surface(window, cx)
+                                    })),
+                            ),
+                            None => menu,
+                        }
                     })
                     .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                         this.right_panel.add_menu_open = *open;
@@ -939,6 +989,33 @@ impl Workspace {
                 format!("file:{path}").into(),
                 path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(),
                 Icon::new(IconName::File).size(px(12.)).into_any_element(),
+            ),
+            Surface::SideChat(thread_id) => {
+                let (title, state) = self.side_chat_tab(thread_id);
+                // Static dots: a side chat tab can stay open for a whole run.
+                let dot = state.map(|state| {
+                    div().absolute().top(px(-2.)).right(px(-2.)).size(px(6.)).rounded_full().bg(if state == "running" {
+                        tokens.muted_foreground
+                    } else {
+                        tokens.info
+                    })
+                });
+                let glyph = div()
+                    .relative()
+                    .child(Icon::new(IconName::MessagesSquare).size(px(12.)))
+                    .children(dot)
+                    .into_any_element();
+                (format!("side-chat:{thread_id}").into(), title, glyph)
+            }
+            Surface::PullRequest(reference) => (
+                format!("pull-request:{}:{}#{}", reference.project_id, reference.repository, reference.number).into(),
+                format!("#{}", reference.number).into(),
+                Icon::new(IconName::GitPullRequest).size(px(12.)).into_any_element(),
+            ),
+            Surface::PullRequests => (
+                "pull-requests".into(),
+                "Pull requests".into(),
+                Icon::new(IconName::Link).size(px(12.)).into_any_element(),
             ),
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
@@ -1062,6 +1139,46 @@ impl Workspace {
             "Available for Git repositories.",
         )
         .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
+        let target = self.thread_pull_request_target();
+        let pull_request = row(
+            "right-panel-open-pull-request",
+            Icon::new(IconName::GitPullRequest).size(px(16.)).into_any_element(),
+            "Pull request",
+            "P",
+            target.is_some(),
+            "No pull request on this branch yet.",
+        )
+        .when_some(target, |el, reference| {
+            el.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_surface(Surface::PullRequest(reference.clone()), window, cx)
+            }))
+        });
+        let linked = self.thread_links_pull_requests();
+        let linked_pull_requests = row(
+            "right-panel-open-pull-requests",
+            Icon::new(IconName::Link).size(px(16.)).into_any_element(),
+            "Linked pull requests",
+            "L",
+            linked,
+            "No linked pull requests available.",
+        )
+        .when(linked, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::PullRequests, window, cx)))
+        });
+        let side_chat = self.side_chats_offered().then(|| {
+            let reason = self.side_chat_disabled_reason();
+            row(
+                "right-panel-open-side-chat",
+                Icon::new(IconName::MessagesSquare).size(px(16.)).into_any_element(),
+                "Side chat",
+                "S",
+                reason.is_none(),
+                reason.unwrap_or("Available after the first message."),
+            )
+            .when(reason.is_none(), |el| {
+                el.on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
+            })
+        });
         div()
             .flex_1()
             .min_h_0()
@@ -1084,7 +1201,16 @@ impl Workspace {
                             .text_color(tokens.foreground)
                             .child("Open a surface"),
                     )
-                    .child(v_flex().gap(px(2.)).child(browser).child(files).child(diff)),
+                    .child(
+                        v_flex()
+                            .gap(px(2.))
+                            .child(browser)
+                            .child(files)
+                            .child(diff)
+                            .child(pull_request)
+                            .child(linked_pull_requests)
+                            .children(side_chat),
+                    ),
             )
             .into_any_element()
     }
@@ -1685,6 +1811,9 @@ mod tests {
         only_browser.upsert(browser("a"));
         only_browser.reconcile_browsers(&[]);
         assert!(!only_browser.open, "losing the last session hides the panel");
+        let mut restarted = PanelState::default();
+        restarted.reconcile_browsers(&["left"]);
+        assert_eq!(restarted.active, Some(browser("left")), "a tab listed after a restart is selected");
     }
 
     #[test]

@@ -768,6 +768,12 @@ pub struct ThreadShell {
     /// Absent on servers without visit tracking; `Some(None)` when never visited.
     #[serde(default, deserialize_with = "present")]
     pub last_visited_at: Option<Option<String>>,
+    #[serde(default)]
+    pub linked_pull_request: Option<crate::thread_pull_requests::LinkedPullRequest>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub pull_requests: Vec<crate::thread_pull_requests::PullRequestLink>,
+    #[serde(default)]
+    pub branch_pull_request: Option<crate::thread_pull_requests::LinkedPullRequest>,
 }
 
 impl ThreadShell {
@@ -1051,6 +1057,8 @@ pub struct Run {
     /// Set on the run that delivers subagent results back, which the user can't edit.
     #[serde(default)]
     pub delegated_completion: Option<Value>,
+    #[serde(default)]
+    pub workspace_preparation: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
