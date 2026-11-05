@@ -134,11 +134,10 @@ impl Workspace {
         if wanted == current {
             return;
         }
-        let Some(urls) = wanted.filter(|_| self.client().is_some()) else {
+        let (Some(urls), Some(client)) = (wanted, self.client()) else {
             self.preview.discovery = Discovery::default();
             return;
         };
-        let client = self.client().expect("checked above");
         let input = if urls.is_empty() { json!({}) } else { json!({"configuredUrls": urls}) };
         let stream = client.stream("subscribeDiscoveredLocalServers", input);
         let configured = urls.clone();
