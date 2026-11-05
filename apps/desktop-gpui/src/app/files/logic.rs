@@ -226,6 +226,13 @@ pub(super) fn is_markdown(path: &str) -> bool {
     [".md", ".mdx", ".markdown", ".mdown", ".mkd"].iter().any(|ext| lower.ends_with(ext))
 }
 
+/// Whether a read cut at 1 MB loads the whole file instead (`WorkspaceLargeTextPreview`): not for
+/// drafts, Markdown or HTML, which keep the first 1 MB with a notice.
+pub(super) fn loads_full_file(path: &str, draft: bool) -> bool {
+    let lower = path.to_lowercase();
+    !draft && !is_markdown(path) && !lower.ends_with(".html") && !lower.ends_with(".htm")
+}
+
 /// `isWorkspaceImagePreviewPath`; the formats GPUI decodes render, the rest fall back to "binary".
 pub(super) fn is_image(path: &str) -> bool {
     let lower = path.to_lowercase();

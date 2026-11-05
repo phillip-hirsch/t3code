@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, DragMoveEvent, ElementId, Empty, Entity, InteractiveElement as _,
     IntoElement, ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -24,6 +25,9 @@ use crate::app::{Target, Workspace};
 use crate::rpc::RpcError;
 use crate::theme::Tokens;
 
+/// `LARGE_TEXT_MAX_BYTES`.
+const FULL_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 /// `fileSaveSessions` debounce.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// `FileExplorerPane`: default, bounds, and the room the file keeps beside it.
@@ -31,6 +35,13 @@ const EXPLORER_WIDTH: f32 = 256.;
 const EXPLORER_MIN: f32 = 160.;
 const EXPLORER_MAX: f32 = 560.;
 const CONTENT_MIN: f32 = 256.;
+
+/// The whole file behind a read cut at 1 MB, read-only and unhighlighted like `LargeTextViewer`.
+enum FullFile {
+    Loading,
+    Ready(Entity<EditorState>),
+    Failed,
+}
 
 enum Load {
     Loading,
@@ -51,12 +62,14 @@ pub(super) struct PreviewState {
     /// A write is waiting or in flight.
     saving: bool,
     markdown: Option<Entity<TextViewState>>,
+    full: Option<FullFile>,
     /// The word wrap toggle; unset, it follows `wordWrap`.
     wrap: Option<bool>,
     applied_wrap: Option<bool>,
     mutation: Option<(Option<String>, Option<String>)>,
     revealed: Option<u64>,
     _read: Option<Task<()>>,
+    _full: Option<Task<()>>,
     _save: Option<Task<()>>,
     _subscription: Option<Subscription>,
 }
@@ -70,11 +83,13 @@ impl PreviewState {
             dirty: false,
             saving: false,
             markdown: None,
+            full: None,
             wrap: None,
             applied_wrap: None,
             mutation: None,
             revealed: None,
             _read: None,
+            _full: None,
             _save: None,
             _subscription: None,
         }
@@ -138,6 +153,14 @@ impl Workspace {
         } else if fresh || (changed && !dirty) {
             self.read_file(key.clone(), window, cx);
         }
+        let draft = !matches!(self.target, Some(Target::Thread(_)));
+        let Some(state) = self.files.previews.get_mut(key) else { return };
+        if matches!(state.load, Load::Text { truncated: true, .. })
+            && state.full.is_none()
+            && logic::loads_full_file(&key.1, draft)
+        {
+            self.load_full_file(key.clone(), window, cx);
+        }
         let Some(state) = self.files.previews.get_mut(key) else { return };
         let Some(editor) = state.editor.clone() else { return };
         let wrap = state.wrap.unwrap_or(wrap_default);
@@ -177,6 +200,8 @@ impl Workspace {
             Ok(value) => {
                 let contents = value["contents"].as_str().unwrap_or_default().to_owned();
                 let truncated = value["truncated"].as_bool().unwrap_or(false);
+                // A new read (after a workspace mutation) loads the whole file again.
+                state.full = None;
                 state.load = Load::Text { truncated, byte_length: value["byteLength"].as_u64().unwrap_or(0) };
                 if let Some(markdown) = &state.markdown {
                     markdown.update(cx, |view, cx| view.set_text(&contents, cx));
@@ -223,6 +248,66 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// The `media-file` resource for a workspace file of the open thread.
+    fn media_resource(&self, key: &Key) -> Option<Value> {
+        let Some(Target::Thread(thread_id)) = &self.target else { return None };
+        let path = logic::absolute_path(&key.0, &key.1);
+        Some(json!({"_tag": "media-file", "threadId": thread_id, "path": path, "disposition": "attachment"}))
+    }
+
+    fn load_full_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(client), Some(endpoint), Some(resource)) =
+            (self.client(), self.endpoint.clone(), self.media_resource(&key))
+        else {
+            return;
+        };
+        let Some(state) = self.files.previews.get_mut(&key) else { return };
+        state.full = Some(FullFile::Loading);
+        let request_key = key.clone();
+        state._full = Some(cx.spawn_in(window, async move |this, cx| {
+            let bytes = fetch_asset(client, endpoint, resource).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(state) = this.files.previews.get_mut(&request_key) else { return };
+                state.full = Some(match bytes {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let editor = cx.new(|cx| EditorState::new(window, cx).language("text").default_value(text));
+                        FullFile::Ready(editor)
+                    }
+                    Err(error) => {
+                        log::warn!("full file preview: {error:#}");
+                        FullFile::Failed
+                    }
+                });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Save file: fetches the file again and writes it where the user picks.
+    fn save_full_file(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(client), Some(endpoint), Some(resource)) =
+            (self.client(), self.endpoint.clone(), self.media_resource(key))
+        else {
+            return;
+        };
+        let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
+        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.1)));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            let written = match fetch_asset(client, endpoint, resource).await {
+                Ok(bytes) => std::fs::write(&path, bytes).map_err(anyhow::Error::from),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = written {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(error.to_string()).title("Could not read file"), cx)
+                });
+            }
+        })
+        .detach();
     }
 
     /// Saves the editor's text 500 ms after the last edit (`FileSaveCoordinator`).
@@ -291,8 +376,9 @@ impl Workspace {
         let reveal = self.files.reveals.get(&key).map_or(0, |(_, request)| *request);
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
         let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
+        let draft = !matches!(self.target, Some(Target::Thread(_)));
         let notice = self.files.previews.get(&key).and_then(|state| match state.load {
-            Load::Text { truncated: true, byte_length } => Some(
+            Load::Text { truncated: true, byte_length } if !logic::loads_full_file(&path, draft) => Some(
                 div()
                     .flex_none()
                     .px(px(12.))
@@ -546,6 +632,14 @@ impl Workspace {
             }
             Load::Folder => div().into_any_element(),
             Load::Text { truncated, .. } => {
+                if let Some(full) = &state.full {
+                    let full = match full {
+                        FullFile::Loading => None,
+                        FullFile::Ready(editor) => Some(Ok(editor.clone())),
+                        FullFile::Failed => Some(Err(())),
+                    };
+                    return self.render_full_file(key, full, tokens, cx);
+                }
                 if render_markdown && logic::is_markdown(&key.1) {
                     let saved = state.saved.clone();
                     let view =
@@ -572,6 +666,87 @@ impl Workspace {
         }
     }
 
+    /// `WorkspaceLargeTextPreview`: "Full file" with Copy contents and Save file, then the text.
+    fn render_full_file(
+        &self,
+        key: &Key,
+        full: Option<Result<Entity<EditorState>, ()>>,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = tokens.muted_foreground;
+        let action = |id: &'static str, icon: IconName, label: &'static str| {
+            div()
+                .id(id)
+                .size(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_color(muted)
+                .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
+                .child(Icon::new(icon).size(px(14.)))
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        };
+        let copied = full.clone().and_then(Result::ok);
+        let save_key = key.clone();
+        let header = h_flex()
+            .flex_none()
+            .h(px(28.))
+            .mb(px(12.))
+            .gap(px(8.))
+            .px(px(12.))
+            .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("Full file"))
+            .child(action("full-file-copy", IconName::Copy, "Copy contents").on_click(move |_, _, cx| {
+                if let Some(editor) = &copied {
+                    let text = editor.read(cx).value().to_string();
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                }
+            }))
+            .child(
+                action("full-file-save", IconName::Download, "Save file")
+                    .on_click(cx.listener(move |this, _, window, cx| this.save_full_file(&save_key, window, cx))),
+            );
+        let retry_key = key.clone();
+        let body = match full {
+            None => div().p(px(24.)).text_xs().text_color(muted).child("Loading…").into_any_element(),
+            Some(Err(())) => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
+                .px(px(24.))
+                .text_xs()
+                .child(div().text_color(tokens.error).child("Unable to load file preview."))
+                .child(
+                    div()
+                        .id("full-file-retry")
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(tokens.input)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(tokens.accent))
+                        .child("Retry")
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.load_full_file(retry_key.clone(), window, cx)),
+                        ),
+                )
+                .into_any_element(),
+            Some(Ok(editor)) => Editor::new(&editor)
+                .appearance(false)
+                .bordered(false)
+                .readonly(true)
+                .h_full()
+                .font_family(tokens.fonts.mono)
+                .into_any_element(),
+        };
+        v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
+    }
+
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.
     fn workspace_image(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
         let absolute = logic::absolute_path(&key.0, &key.1);
@@ -589,4 +764,29 @@ impl Workspace {
         let available = &self.server_info.available_editors;
         self.preferred_editor.clone().filter(|editor| available.contains(editor)).or_else(|| available.first().cloned())
     }
+}
+
+/// `assets.createUrl`, then the file's bytes over HTTP; refused past 256 MB like the web's viewer.
+async fn fetch_asset(
+    client: crate::rpc::RpcClient,
+    endpoint: crate::backend::Endpoint,
+    resource: Value,
+) -> anyhow::Result<Vec<u8>> {
+    let minted = client.request("assets.createUrl", json!({"resource": resource})).await?;
+    let relative = minted["relativeUrl"].as_str().unwrap_or_default().to_owned();
+    let url = if relative.starts_with("http") {
+        relative
+    } else {
+        format!("{}/{}", endpoint.http_base, relative.trim_start_matches('/'))
+    };
+    crate::runtime()
+        .spawn(async move {
+            let response = reqwest::Client::new().get(url).bearer_auth(&endpoint.bearer_token).send().await?;
+            let response = response.error_for_status()?;
+            if response.content_length().is_some_and(|length| length > FULL_FILE_MAX_BYTES) {
+                anyhow::bail!("Text previews support files up to 256 MB.");
+            }
+            anyhow::Ok(response.bytes().await?.to_vec())
+        })
+        .await?
 }
