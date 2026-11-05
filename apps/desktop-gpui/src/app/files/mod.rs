@@ -24,10 +24,24 @@ pub(super) use overlay::{FileOverlay, OverlayMode};
 
 use super::Workspace;
 
+/// A checkout on one environment: two machines can hold the same path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Checkout {
+    pub env: SharedString,
+    pub cwd: String,
+}
+
+/// A file or folder of a checkout: what its preview and its reveal requests are kept by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct FileKey {
+    pub checkout: Checkout,
+    pub path: String,
+}
+
 /// `useActiveProjectTarget`: the open thread's or draft's checkout and project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProjectTarget {
-    pub cwd: String,
+    pub checkout: Checkout,
     pub project_name: SharedString,
 }
 
@@ -35,11 +49,11 @@ pub(super) struct ProjectTarget {
 pub(super) struct FilesState {
     pub(super) overlay: Option<FileOverlay>,
     /// The file tree of each checkout, kept while the window lives like the web's query cache.
-    trees: HashMap<String, tree::TreeState>,
-    /// Each opened file's preview, by checkout and path.
-    previews: HashMap<(String, String), preview::PreviewState>,
+    trees: HashMap<Checkout, tree::TreeState>,
+    /// Each opened file's preview.
+    previews: HashMap<FileKey, preview::PreviewState>,
     /// A line to scroll each opened file to, with the request it came from (`revealLine`).
-    reveals: HashMap<(String, String), (u32, u64)>,
+    reveals: HashMap<FileKey, (u32, u64)>,
     reveal_requests: u64,
     /// `t3code.fileExplorerOpen`: the explorer beside a previewed file.
     explorer_hidden: bool,
@@ -58,7 +72,8 @@ pub(super) struct FilesState {
     /// A menu of the file surfaces is open; native document views hide so it shows.
     pub(super) menu_open: bool,
     _menu: Option<gpui_kit::Subscription>,
-    images: Option<Entity<super::pages::settings::code::projects::icon::Images>>,
+    /// Workspace images, per environment: a draft's resource names only its path.
+    images: HashMap<SharedString, Entity<super::pages::settings::code::projects::icon::Images>>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.
     mutation: (Option<String>, Option<String>),
 }
@@ -102,6 +117,7 @@ impl Workspace {
     pub(super) fn project_target(&self) -> Option<ProjectTarget> {
         let project = self.target_project()?;
         let cwd = self.composer_cwd().filter(|cwd| !cwd.is_empty())?;
-        Some(ProjectTarget { cwd, project_name: super::project_name(project) })
+        let env = self.target.as_ref()?.environment().clone();
+        Some(ProjectTarget { checkout: Checkout { env, cwd }, project_name: super::project_name(project) })
     }
 }

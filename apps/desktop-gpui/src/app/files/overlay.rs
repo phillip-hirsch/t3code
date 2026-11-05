@@ -186,9 +186,10 @@ impl Workspace {
 
     /// Starts the debounced search for the current query and options.
     fn run_file_search(&mut self, cx: &mut Context<Self>) {
-        let client = self.client();
+        let Some(target) = self.files.overlay.as_ref().and_then(|o| o.target.clone()) else { return };
+        // The project the search opened on, even if another thread opened since.
+        let client = self.env_client(&target.checkout.env);
         let Some(overlay) = &mut self.files.overlay else { return };
-        let Some(target) = overlay.target.clone() else { return };
         let raw = overlay.query(cx);
         overlay.search.generation += 1;
         let generation = overlay.search.generation;
@@ -197,7 +198,8 @@ impl Workspace {
                 let query: String = raw.trim().to_owned();
                 overlay.picks = Rc::default();
                 overlay.highlight = 0;
-                let payload = json!({"cwd": target.cwd, "query": query, "limit": logic::PICKER_LIMIT, "kind": "file"});
+                let payload =
+                    json!({"cwd": target.checkout.cwd, "query": query, "limit": logic::PICKER_LIMIT, "kind": "file"});
                 ("projects.searchEntries", payload)
             }
             OverlayMode::Content => {
@@ -210,7 +212,7 @@ impl Workspace {
                     return;
                 }
                 let payload = json!({
-                    "cwd": target.cwd,
+                    "cwd": target.checkout.cwd,
                     "query": raw.chars().take(256).collect::<String>(),
                     "limit": CONTENT_LIMIT,
                     "caseSensitive": overlay.case_sensitive,

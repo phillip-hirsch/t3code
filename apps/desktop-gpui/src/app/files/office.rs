@@ -343,7 +343,7 @@ fn word_block(block: &Block, index: usize) -> AnyElement {
 }
 
 impl Workspace {
-    fn office_mut(&mut self, key: &(String, String)) -> Option<&mut OfficeDoc> {
+    fn office_mut(&mut self, key: &super::FileKey) -> Option<&mut OfficeDoc> {
         match self.files.assets.viewer_mut(key)? {
             super::asset::Viewer::Office(doc) => Some(doc),
             _ => None,
@@ -352,7 +352,7 @@ impl Workspace {
 
     pub(super) fn render_office(
         &mut self,
-        key: &(String, String),
+        key: &super::FileKey,
         width: f32,
         tokens: &Tokens,
         cx: &mut Context<Self>,
@@ -383,7 +383,7 @@ impl Workspace {
                     ))
                     .child(
                         div()
-                            .id(ElementId::Name(format!("word:{}", key.1).into()))
+                            .id(ElementId::Name(format!("word:{}", key.path).into()))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -409,7 +409,7 @@ impl Workspace {
                 let rows = &sheets[page].1;
                 let table = doc.tables.entry(page).or_insert_with(|| Rc::new(Table::grid(rows))).clone();
                 let count = sheets.len();
-                let id = format!("{}#{page}", key.1);
+                let id = format!("{}#{page}", key.path);
                 let grid = self.render_table(&id, table, width, tokens, cx);
                 let tabs = h_flex()
                     .id("sheet-tabs")
@@ -538,7 +538,7 @@ impl Workspace {
                     ))
                     .child(
                         div()
-                            .id(ElementId::Name(format!("slides:{}", key.1).into()))
+                            .id(ElementId::Name(format!("slides:{}", key.path).into()))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()

@@ -21,7 +21,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::{asset, document, logic};
+use super::{FileKey, asset, document, logic};
 use crate::app::right_panel::Surface;
 use crate::app::{Target, Workspace};
 use crate::rpc::RpcError;
@@ -131,8 +131,6 @@ fn read_error_message(error: &Value) -> String {
     }
 }
 
-type Key = (String, String);
-
 /// A file with a rendered view (`renderedMode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Rendered {
@@ -208,18 +206,19 @@ impl Workspace {
         let path = logic::normalize_open_path(path);
         if let (Some(line), Some(target)) = (line, self.project_target()) {
             self.files.reveal_requests += 1;
-            self.files.reveals.insert((target.cwd, path.clone()), (line.max(1), self.files.reveal_requests));
+            let key = FileKey { checkout: target.checkout, path: path.clone() };
+            self.files.reveals.insert(key, (line.max(1), self.files.reveal_requests));
         }
         self.open_file_surface(path, window, cx);
     }
 
     /// Reads the file once, and again after a workspace mutation unless edits are unsaved; then
     /// applies the wrap toggle and a pending line reveal.
-    fn sync_preview(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_preview(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let mutation = self.files.mutation.clone();
         let wrap_default = self.client_settings.values.bool("wordWrap");
         let reveal = self.files.reveals.get(key).copied();
-        let state = self.files.previews.entry(key.clone()).or_insert_with(|| PreviewState::new(&key.1));
+        let state = self.files.previews.entry(key.clone()).or_insert_with(|| PreviewState::new(&key.path));
         let fresh = state.mutation.is_none();
         let changed = state.mutation.as_ref().is_some_and(|m| *m != mutation);
         let dirty = state.save.pending();
@@ -235,7 +234,7 @@ impl Workspace {
         let Some(state) = self.files.previews.get_mut(key) else { return };
         if matches!(state.load, Load::Text { truncated: true, .. })
             && state.full.is_none()
-            && logic::loads_full_file(&key.1, draft)
+            && logic::loads_full_file(&key.path, draft)
         {
             self.load_full_file(key.clone(), window, cx);
         }
@@ -254,11 +253,11 @@ impl Workspace {
         }
     }
 
-    fn read_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+    fn read_file(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&key.checkout.env) else { return };
         let Some(state) = self.files.previews.get_mut(&key) else { return };
         let revision = state.save.revision();
-        let payload = json!({"cwd": key.0, "relativePath": key.1});
+        let payload = json!({"cwd": key.checkout.cwd, "relativePath": key.path});
         let request_key = key.clone();
         state._read = Some(cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.readFile", payload).await;
@@ -269,7 +268,7 @@ impl Workspace {
     /// Applies a read requested at edit `revision`; edits made since win, like the web's unsaved draft.
     fn apply_read(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         revision: u64,
         result: Result<Value, RpcError>,
         window: &mut Window,
@@ -283,7 +282,7 @@ impl Workspace {
         match result {
             Ok(value) if value["exists"] == false => {
                 state.load =
-                    Load::Failed { message: format!("'{}' does not exist.", key.1), attempted: None, cwd: None };
+                    Load::Failed { message: format!("'{}' does not exist.", key.path), attempted: None, cwd: None };
             }
             Ok(value) => {
                 let contents = value["contents"].as_str().unwrap_or_default().to_owned();
@@ -301,7 +300,7 @@ impl Workspace {
                     }
                     Some(_) => {}
                     None => {
-                        let language = logic::language_for_path(&key.1);
+                        let language = logic::language_for_path(&key.path);
                         let text = contents.clone();
                         let editor = cx.new(|cx| EditorState::new(window, cx).language(language).default_value(text));
                         let save_key = key.clone();
@@ -341,16 +340,20 @@ impl Workspace {
     }
 
     /// The `media-file` resource for a workspace file of the open thread.
-    fn media_resource(&self, key: &Key) -> Option<Value> {
+    fn media_resource(&self, key: &FileKey) -> Option<Value> {
         let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return None };
-        let path = logic::absolute_path(&key.0, &key.1);
+        let path = logic::absolute_path(&key.checkout.cwd, &key.path);
         Some(json!({"_tag": "media-file", "threadId": thread_id, "path": path, "disposition": "attachment"}))
     }
 
-    fn load_full_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint().cloned(), self.media_resource(&key))
-        else {
+    /// The socket and address of the environment `key`'s checkout is on.
+    pub(super) fn file_connection(&self, key: &FileKey) -> Option<(crate::rpc::RpcClient, crate::backend::Endpoint)> {
+        let env = &key.checkout.env;
+        Some((self.env_client(env)?, self.env_endpoint(env)?.clone()))
+    }
+
+    fn load_full_file(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some((client, endpoint)), Some(resource)) = (self.file_connection(&key), self.media_resource(&key)) else {
             return;
         };
         let Some(state) = self.files.previews.get_mut(&key) else { return };
@@ -384,14 +387,12 @@ impl Workspace {
     }
 
     /// Save file: fetches the file again and writes it where the user picks.
-    fn save_full_file(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint().cloned(), self.media_resource(key))
-        else {
+    fn save_full_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some((client, endpoint)), Some(resource)) = (self.file_connection(key), self.media_resource(key)) else {
             return;
         };
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
-        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.1)));
+        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.path)));
         cx.spawn_in(window, async move |_, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
             let written = match fetch_asset(client, endpoint, resource).await {
@@ -414,7 +415,7 @@ impl Workspace {
 
     /// An edit: writes the editor's text 500 ms after the last edit, one write at a time
     /// (`FileSaveCoordinator`). While a write is in flight the loop running it picks the edit up.
-    fn change_file(&mut self, key: &Key, cx: &mut Context<Self>) {
+    fn change_file(&mut self, key: &FileKey, cx: &mut Context<Self>) {
         let Some(state) = self.files.previews.get_mut(key) else { return };
         if matches!(state.load, Load::Text { truncated: true, .. }) {
             return;
@@ -432,7 +433,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                let payload = json!({"cwd": key.0, "relativePath": key.1, "contents": contents});
+                let payload = json!({"cwd": key.checkout.cwd, "relativePath": key.path, "contents": contents});
                 let result = client.request("projects.writeFile", payload).await;
                 let finished = this.update(cx, |this, cx| this.finish_write(&key, revision, contents, result, cx));
                 let Ok(Some(next)) = finished else { return };
@@ -441,8 +442,9 @@ impl Workspace {
         }));
     }
 
-    fn start_write(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<(crate::rpc::RpcClient, u64, String)> {
-        let client = self.client()?;
+    /// The write's socket is the environment the file was opened on, whatever is open now.
+    fn start_write(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<(crate::rpc::RpcClient, u64, String)> {
+        let client = self.env_client(&key.checkout.env)?;
         let state = self.files.previews.get_mut(key)?;
         let contents = state.editor.as_ref()?.read(cx).value().to_string();
         Some((client, state.save.start()?, contents))
@@ -451,7 +453,7 @@ impl Workspace {
     /// Settles a write; the delay before the next one when edits arrived meanwhile.
     fn finish_write(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         revision: u64,
         contents: String,
         result: Result<Value, RpcError>,
@@ -467,7 +469,7 @@ impl Workspace {
                 state.saved = contents;
             }
             Err(error) => {
-                self.error = Some(format!("Could not save {}: {}", key.1, logic::error_message(&error)).into())
+                self.error = Some(format!("Could not save {}: {}", key.path, logic::error_message(&error)).into())
             }
         }
         cx.notify();
@@ -491,12 +493,12 @@ impl Workspace {
                 .child("Files are only available when a project is open.")
                 .into_any_element();
         };
-        let cwd = target.cwd.clone();
+        let checkout = target.checkout;
         self.files.mutation = self.current_workspace_mutation();
         let Some(path) = path else {
-            return self.render_tree(&cwd, None, 0, window, cx);
+            return self.render_tree(&checkout, None, 0, window, cx);
         };
-        let key = (cwd.clone(), path.clone());
+        let key = FileKey { checkout: checkout.clone(), path: path.clone() };
         self.sync_preview(&key, window, cx);
         let reveal = self.files.reveals.get(&key).map_or(0, |(_, request)| *request);
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
@@ -521,7 +523,7 @@ impl Workspace {
             _ => None,
         });
         let body = if folder {
-            self.render_tree(&cwd, Some(&path), reveal, window, cx)
+            self.render_tree(&checkout, Some(&path), reveal, window, cx)
         } else {
             let max = EXPLORER_MAX.min(width - CONTENT_MIN).max(EXPLORER_MIN);
             let explorer_width = self.files.explorer_width.unwrap_or(EXPLORER_WIDTH).clamp(EXPLORER_MIN, max);
@@ -530,7 +532,7 @@ impl Workspace {
             let content_width = if explorer_shown { width - explorer_width } else { width };
             let content = self.render_file_content(&key, &tokens, content_width, window, cx);
             let explorer = explorer_shown.then(|| {
-                let tree = self.render_tree(&cwd, Some(&path), reveal, window, cx);
+                let tree = self.render_tree(&checkout, Some(&path), reveal, window, cx);
                 div()
                     .id("file-explorer")
                     .relative()
@@ -579,13 +581,13 @@ impl Workspace {
     /// The crumbs, then Open in, the rendered toggle, word wrap and the explorer toggle.
     fn render_file_subheader(
         &self,
-        key: &Key,
+        key: &FileKey,
         project_name: &SharedString,
         folder: bool,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let path = key.1.clone();
+        let path = key.path.clone();
         let state = self.files.previews.get(key);
         let source = Surface::File(path.clone());
         let crumbs = logic::breadcrumbs(&path, project_name);
@@ -606,7 +608,7 @@ impl Workspace {
                         .text_color(tokens.muted_foreground.opacity(0.6))
                         .into_any_element()
                 } else {
-                    self.crumb_menu(&key.0, &parent, &path, tokens, cx)
+                    self.crumb_menu(&key.checkout, &parent, &path, tokens, cx)
                 });
             }
             parent = crumb.clone();
@@ -661,7 +663,7 @@ impl Workspace {
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
         let wrap = state.and_then(|s| s.wrap).unwrap_or_else(|| self.client_settings.values.bool("wordWrap"));
-        let absolute = logic::absolute_path(&key.0, &path);
+        let absolute = logic::absolute_path(&key.checkout.cwd, &path);
         // `revealsInFileManager`: a read file (not a folder) reveals in the file manager.
         let file_manager = if !folder
             && state.is_some_and(|s| !matches!(s.load, Load::Loading))
@@ -727,14 +729,14 @@ impl Workspace {
 
     fn render_file_content(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         tokens: &Tokens,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let render_markdown = self.files.render_markdown;
-        let delimiter = logic::table_delimiter(&key.1).filter(|_| self.files.shows_rendered(Rendered::Table));
+        let delimiter = logic::table_delimiter(&key.path).filter(|_| self.files.shows_rendered(Rendered::Table));
         let render_mermaid = self.files.shows_rendered(Rendered::Mermaid);
         let kind = self.files.previews.get(key).map_or(logic::FileKind::Text, |s| s.kind);
         match self.files.previews.get(key).map(|s| &s.load) {
@@ -775,7 +777,7 @@ impl Workspace {
             }),
             Load::Binary | Load::Asset => div().into_any_element(),
             Load::Failed { message, attempted, cwd } => {
-                let workspace = cwd.clone().unwrap_or_else(|| key.0.clone());
+                let workspace = cwd.clone().unwrap_or_else(|| key.checkout.cwd.clone());
                 centered(
                     v_flex()
                         .gap(px(12.))
@@ -804,7 +806,7 @@ impl Workspace {
                     };
                     return self.render_full_file(key, full, tokens, cx);
                 }
-                if logic::is_mermaid(&key.1) && render_mermaid {
+                if logic::is_mermaid(&key.path) && render_mermaid {
                     let revision = state.revision;
                     let source = self.files.documents.stale(key, revision).then(|| state.saved.clone());
                     return self.render_mermaid(key, revision, source, window, cx);
@@ -815,9 +817,9 @@ impl Workspace {
                         .table
                         .get_or_insert_with(|| std::rc::Rc::new(super::table::Table::parse(saved, delimiter)))
                         .clone();
-                    return self.render_table(&key.1, table, width, tokens, cx);
+                    return self.render_table(&key.path, table, width, tokens, cx);
                 }
-                if render_markdown && logic::is_markdown(&key.1) {
+                if render_markdown && logic::is_markdown(&key.path) {
                     let saved = state.saved.clone();
                     let view =
                         state.markdown.get_or_insert_with(|| cx.new(|cx| TextViewState::markdown(&saved, cx))).clone();
@@ -846,7 +848,7 @@ impl Workspace {
     /// `WorkspaceLargeTextPreview`: "Full file" with Copy contents and Save file, then the text.
     fn render_full_file(
         &self,
-        key: &Key,
+        key: &FileKey,
         full: Option<Result<Entity<EditorState>, ()>>,
         tokens: &Tokens,
         cx: &mut Context<Self>,
@@ -925,16 +927,17 @@ impl Workspace {
     }
 
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.
-    fn workspace_image(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
-        let absolute = logic::absolute_path(&key.0, &key.1);
+    fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
+        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
         let resource = match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
             }
-            _ => json!({"_tag": "draft-workspace-file", "cwd": key.0, "path": absolute}),
+            _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
         };
-        let (client, endpoint) = (self.client(), self.endpoint().cloned());
-        let images = self.files.images.get_or_insert_with(|| cx.new(|_| Default::default())).clone();
+        let env = &key.checkout.env;
+        let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
+        let images = self.files.images.entry(env.clone()).or_insert_with(|| cx.new(|_| Default::default())).clone();
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 

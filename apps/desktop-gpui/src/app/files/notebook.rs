@@ -199,7 +199,7 @@ impl Notebook {
 impl Workspace {
     pub(super) fn render_notebook(
         &mut self,
-        key: &(String, String),
+        key: &super::FileKey,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -319,7 +319,7 @@ impl Workspace {
             .child(chrome::notice("Saved outputs only. Code is never executed.", tokens))
             .child(
                 div()
-                    .id(ElementId::Name(format!("notebook:{}", key.1).into()))
+                    .id(ElementId::Name(format!("notebook:{}", key.path).into()))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

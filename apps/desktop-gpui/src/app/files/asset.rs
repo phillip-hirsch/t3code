@@ -15,11 +15,9 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{self, FileKind, Office};
-use super::{archive, chrome, document, notebook, office};
+use super::{FileKey, archive, chrome, document, notebook, office};
 use crate::app::{Target, Workspace};
 use crate::theme::Tokens;
-
-type Key = (String, String);
 
 /// What a parsed file shows.
 pub(super) enum Viewer {
@@ -49,11 +47,11 @@ struct AssetState {
 
 #[derive(Default)]
 pub(super) struct Assets {
-    states: HashMap<Key, AssetState>,
+    states: HashMap<FileKey, AssetState>,
 }
 
 impl Assets {
-    pub(super) fn viewer_mut(&mut self, key: &Key) -> Option<&mut Viewer> {
+    pub(super) fn viewer_mut(&mut self, key: &FileKey) -> Option<&mut Viewer> {
         match &mut self.states.get_mut(key)?.load {
             AssetLoad::Ready(viewer) => Some(viewer),
             _ => None,
@@ -121,8 +119,8 @@ pub(super) async fn fetch_bounded(url: String, limit: u64, too_large: &'static s
 impl Workspace {
     /// The resource a document reads: a draft's `draft-workspace-file`, else the thread's
     /// `media-file` (an attachment download for files without a viewer).
-    fn document_asset(&self, key: &Key, attachment: bool) -> Value {
-        let absolute = logic::absolute_path(&key.0, &key.1);
+    fn document_asset(&self, key: &FileKey, attachment: bool) -> Value {
+        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
         match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 let mut resource = json!({"_tag": "media-file", "threadId": thread_id, "path": absolute});
@@ -131,16 +129,16 @@ impl Workspace {
                 }
                 resource
             }
-            _ => json!({"_tag": "draft-workspace-file", "cwd": key.0, "path": absolute}),
+            _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
         }
     }
 
-    fn load_asset(&mut self, key: &Key, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_asset(&mut self, key: &FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some((limit, too_large)) = read_limit(kind) else { return };
-        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+        let Some((client, endpoint)) = self.file_connection(key) else { return };
         let resource = self.document_asset(key, false);
         let request_key = key.clone();
-        let name = logic::file_name(&key.1).to_owned();
+        let name = logic::file_name(&key.path).to_owned();
         let task = cx.spawn_in(window, async move |this, cx| {
             let fetched = match document::mint_asset_url(client, endpoint.http_base, resource).await {
                 Ok((url, _)) => fetch_bounded(url, limit, too_large).await,
@@ -176,11 +174,11 @@ impl Workspace {
     }
 
     /// Save file: the file's bytes, written where the user picks.
-    fn save_asset_file(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+    fn save_asset_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, endpoint)) = self.file_connection(key) else { return };
         let resource = self.document_asset(key, true);
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
-        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.1)));
+        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.path)));
         cx.spawn_in(window, async move |_, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
             let written = match document::mint_asset_url(client, endpoint.http_base, resource).await {
@@ -202,7 +200,7 @@ impl Workspace {
     /// `AttachmentFilePreview` with origin "File": its subheader, then the viewer.
     pub(super) fn render_asset_file(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         kind: FileKind,
         width: f32,
         window: &mut Window,
@@ -214,7 +212,7 @@ impl Workspace {
         if stale && read_limit(kind).is_some() {
             self.load_asset(key, kind, window, cx);
         }
-        let name = logic::file_name(&key.1).to_owned();
+        let name = logic::file_name(&key.path).to_owned();
         let save_key = key.clone();
         let header = h_flex()
             .flex_none()
@@ -255,7 +253,7 @@ impl Workspace {
 
     fn render_asset_body(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         kind: FileKind,
         width: f32,
         tokens: &Tokens,
@@ -266,7 +264,7 @@ impl Workspace {
             return self.render_document(key, kind, window, cx);
         }
         if read_limit(kind).is_none() {
-            let extension = logic::file_name(&key.1)
+            let extension = logic::file_name(&key.path)
                 .rsplit_once('.')
                 .map(|(_, e)| e)
                 .filter(|e| !e.is_empty())

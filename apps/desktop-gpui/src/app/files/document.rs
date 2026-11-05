@@ -14,10 +14,9 @@ use gpui_kit::{
 use gpui_webview::WebView;
 use serde_json::{Value, json};
 
+use super::FileKey;
 use super::logic::{self, FileKind};
 use crate::app::{Target, Workspace};
-
-type Key = (String, String);
 
 /// Document views kept alive while not drawn, so switching tabs back keeps the page.
 const KEPT_VIEWS: usize = 2;
@@ -38,16 +37,16 @@ struct DocView {
 
 impl Documents {
     /// Whether `key`'s diagram must be built for source `revision`.
-    pub(super) fn stale(&self, key: &Key, revision: u64) -> bool {
+    pub(super) fn stale(&self, key: &FileKey, revision: u64) -> bool {
         self.views.get(key).is_none_or(|doc| doc.content != revision)
     }
 }
 
 #[derive(Default)]
 pub(super) struct Documents {
-    views: HashMap<Key, DocView>,
+    views: HashMap<FileKey, DocView>,
     /// The document drawn this frame.
-    drawn: Option<Key>,
+    drawn: Option<FileKey>,
     frame: u64,
 }
 
@@ -235,14 +234,14 @@ pub(super) async fn mint_asset_url(
 impl Workspace {
     /// `workspaceAssetResource`: a draft reads `draft-workspace-file`; a thread reads `kind`
     /// inside the workspace, else the host `media-file`.
-    pub(super) fn asset_resource(&self, key: &Key, kind: &'static str) -> Value {
-        let absolute = logic::absolute_path(&key.0, &key.1);
+    pub(super) fn asset_resource(&self, key: &FileKey, kind: &'static str) -> Value {
+        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
         match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
-                let inside = !logic::is_host_path(&key.1);
+                let inside = !logic::is_host_path(&key.path);
                 json!({"_tag": if inside { kind } else { "media-file" }, "threadId": thread_id, "path": absolute})
             }
-            _ => json!({"_tag": "draft-workspace-file", "cwd": key.0, "path": absolute}),
+            _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
         }
     }
 
@@ -250,7 +249,7 @@ impl Workspace {
     /// the file a new revision.
     pub(super) fn render_document(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         kind: FileKind,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -322,12 +321,12 @@ impl Workspace {
         }
     }
 
-    fn document_resource(&self, key: &Key, kind: FileKind) -> Value {
+    fn document_resource(&self, key: &FileKey, kind: FileKind) -> Value {
         self.asset_resource(key, if kind == FileKind::Html { "workspace-file" } else { "media-file" })
     }
 
-    fn start_document(&mut self, key: Key, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+    fn start_document(&mut self, key: FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, endpoint)) = self.file_connection(&key) else { return };
         let resource = self.document_resource(&key, kind);
         let tokens = *crate::theme::tokens(cx);
         let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
@@ -400,7 +399,7 @@ impl Workspace {
     /// Builds `key`'s native view from a task: see [`build_view`](crate::app::preview::build_view).
     fn build_view(
         &mut self,
-        key: Key,
+        key: FileKey,
         builder: wry::WebViewBuilder<'static>,
         revision: Option<String>,
         window: &mut Window,
@@ -434,7 +433,7 @@ impl Workspace {
         .detach();
     }
 
-    fn fail_view(&mut self, key: &Key, error: String, cx: &mut Context<Self>) {
+    fn fail_view(&mut self, key: &FileKey, error: String, cx: &mut Context<Self>) {
         let Some(state) = self.files.documents.views.get_mut(key) else { return };
         log::warn!("file preview: {error}");
         state._task = None;
@@ -445,7 +444,7 @@ impl Workspace {
     /// A Mermaid file's diagram (`MermaidViewer`), rebuilt when its source changes.
     pub(super) fn render_mermaid(
         &mut self,
-        key: &Key,
+        key: &FileKey,
         revision: u64,
         source: Option<String>,
         window: &mut Window,
@@ -509,13 +508,13 @@ impl Workspace {
 
     /// Mints the URL again after a workspace mutation; a new `fileRevision` (or, for HTML on
     /// servers without one, any mutation) reloads the page.
-    fn refresh_document(&mut self, key: Key, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_document(&mut self, key: FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
         if kind == FileKind::Font {
             // The page holds the font's bytes: a changed font needs a new view.
             self.files.documents.views.remove(&key);
             return;
         }
-        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+        let Some((client, endpoint)) = self.file_connection(&key) else { return };
         let resource = self.document_resource(&key, kind);
         let tokens = *crate::theme::tokens(cx);
         let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
@@ -575,8 +574,8 @@ impl Workspace {
     }
 
     /// `openFileInPreview`: the file's asset URL in a new tab of the integrated browser.
-    pub(super) fn open_file_in_browser(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+    pub(super) fn open_file_in_browser(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, endpoint)) = self.file_connection(key) else { return };
         let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
         let resource = self.asset_resource(key, "workspace-file");
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
