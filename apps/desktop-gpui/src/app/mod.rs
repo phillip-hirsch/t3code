@@ -46,6 +46,7 @@ mod keymap;
 mod layout;
 mod markdown_images;
 mod markdown_ui;
+pub mod menu;
 mod message_actions;
 mod minimap;
 mod model_picker;
@@ -88,6 +89,7 @@ pub struct RunInTerminal {
     pub command: String,
 }
 pub use terminal::key_bindings as terminal_key_bindings;
+pub use titlebar::TRAFFIC_LIGHTS;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -1037,7 +1039,7 @@ impl Render for Workspace {
                             .h_full()
                             .min_w_0()
                             .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
-                            .child(self.render_header(cx))
+                            .child(self.render_header(window, cx))
                             .child(
                                 div()
                                     .id("chat-canvas")
@@ -1099,5 +1101,6 @@ impl Render for Workspace {
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
             .children(self.render_quit_hint(cx))
+            .children(titlebar::render_resize_edges(window))
     }
 }

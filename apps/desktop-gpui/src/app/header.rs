@@ -6,15 +6,15 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, WindowControlArea, canvas, div, px, rgb,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px, rgb,
 };
 
-use super::titlebar::{CAPTION_BUTTONS_WIDTH, COLLAPSED_CONTENT_LEFT, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
+use super::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
 use crate::theme;
 
 impl Workspace {
-    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
@@ -24,10 +24,10 @@ impl Workspace {
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
-            .pl(if self.sidebar_open { px(20.) } else { COLLAPSED_CONTENT_LEFT })
+            .pl(if self.sidebar_open { px(20.) } else { titlebar::collapsed_content_left(window) })
             .pr(if panel_open { px(0.) } else { controls_inset })
-            .bg(tokens.background)
-            .window_control_area(WindowControlArea::Drag);
+            .bg(tokens.background);
+        let header = titlebar::drag_region(header);
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }

@@ -25,11 +25,12 @@ use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DismissEvent, DragMoveEvent, EmptyView,
     Entity, FocusHandle, Focusable as _, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
     ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, StyledImage as _, Subscription, Task, WeakEntity, Window, WindowControlArea, anchored, deferred, div,
-    img, prelude::FluentBuilder as _, px, rgb, svg,
+    Styled as _, StyledImage as _, Subscription, Task, WeakEntity, Window, anchored, deferred, div, img,
+    prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::json;
 
+use super::titlebar::{self, TITLEBAR_HEIGHT};
 use super::{Connection, Target, Workspace, project_name};
 use crate::inbox::{self, Facts, FolderDot, Status};
 use crate::model::{ProjectShell, ShellState, ThreadShell};
@@ -1304,7 +1305,7 @@ impl Workspace {
                 cx.notify();
             }))
             .children(backdrop)
-            .child(self.render_chrome_row(&tokens, cx))
+            .child(self.render_chrome_row(&tokens, window, cx))
             .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(
                 div()
@@ -1329,7 +1330,7 @@ impl Workspace {
             .children(self.render_open_menu())
     }
 
-    fn render_chrome_row(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_chrome_row(&self, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
         // On the stage art the brand turns white and the arrows take `media-navigation`.
         let on_art = self.stage_art().is_some();
@@ -1355,15 +1356,11 @@ impl Workspace {
                 .child(icon(name, 14., arrow_color))
         };
         let (back, forward) = (self.history.can_go_back(), self.history.can_go_forward());
-        h_flex()
-            .id("sidebar-chrome")
-            .h(px(40.))
-            .flex_none()
-            .pr(px(12.))
-            .window_control_area(WindowControlArea::Drag)
+        let chrome = h_flex().id("sidebar-chrome").h(TITLEBAR_HEIGHT).flex_none().pr(px(12.));
+        titlebar::drag_region(chrome)
             .child(
                 h_flex()
-                    .ml(px(52.))
+                    .ml(titlebar::collapsed_content_left(window))
                     .h(px(28.))
                     .gap(px(4.))
                     .child(svg().path("icons/app/t3-wordmark.svg").w(px(16.9)).h(px(10.2)).mt(px(1.)).text_color(brand))

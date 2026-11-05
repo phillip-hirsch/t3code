@@ -478,7 +478,7 @@ impl Workspace {
                     Run::NewThread(p.id.clone()),
                 );
                 row.description = Some(Description::Text(format!("Local · {}", p.workspace_root).into()));
-                row.shortcut = (i < 9).then(|| format!("Ctrl+{}", i + 1).into());
+                row.shortcut = (i < 9).then(|| self.shortcut(&format!("thread.jump.{}", i + 1))).flatten();
                 row
             })
             .collect()
@@ -1191,15 +1191,13 @@ impl Workspace {
             "backspace" if query.is_empty() && !self.palette.as_ref().is_some_and(|p| p.stack.is_empty()) => {
                 self.pop_palette_view(window, cx)
             }
-            key if modifiers.control
+            key if modifiers.secondary(cx)
                 && view == View::NewThreadIn
                 && key.len() == 1
                 && key.as_bytes()[0].is_ascii_digit() =>
             {
-                let label = format!("Ctrl+{key}");
-                if let Some(run) =
-                    rows.iter().find(|r| r.shortcut.as_deref() == Some(label.as_str())).map(|r| r.run.clone())
-                {
+                let label = self.shortcut(&format!("thread.jump.{key}"));
+                if let Some(run) = rows.iter().find(|r| label.is_some() && r.shortcut == label).map(|r| r.run.clone()) {
                     self.run_palette_row(run, window, cx);
                 }
             }

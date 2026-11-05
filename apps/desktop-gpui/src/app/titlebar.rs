@@ -1,7 +1,9 @@
-//! Window chrome on the 40px top row: the sidebar toggle, the panel layout
-//! toggles and, on Windows, the caption buttons Electron's titlebar overlay
-//! draws. Windows maps each `WindowControlArea` to its native hit-test code,
-//! so drag, double-click maximize, snap layouts and the resize edges stay native.
+//! Window chrome on the top row: the sidebar toggle, the panel layout toggles
+//! and, on Windows and Linux, the caption buttons Electron's titlebar overlay
+//! draws (macOS keeps its traffic lights, as Electron's `hiddenInset` does).
+//! Windows maps each `WindowControlArea` to its native hit-test code, so drag,
+//! double-click maximize, snap layouts and the resize edges stay native; macOS
+//! and Linux get the same through [`drag_region`] and [`render_resize_edges`].
 //!
 //! A button inside a drag area must `occlude()`: otherwise the drag area is
 //! still under the pointer and Windows treats the press as a caption drag.
@@ -9,29 +11,128 @@
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
+use std::cell::Cell;
+
 use gpui_kit::{
-    App, Context, Div, FontFallbacks, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    Pixels, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, font,
-    hsla, px, rgb, svg,
+    AnyElement, App, Context, CursorStyle, Decorations, Div, FontFallbacks, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
 };
 
 use super::{ToggleRightPanel, ToggleSidebar, Workspace};
 use crate::theme;
 
-/// `--workspace-topbar-height` with Electron's 40px titlebar overlay on Windows.
-pub(super) const TITLEBAR_HEIGHT: Pixels = px(40.);
+/// `--workspace-topbar-height`: 52px beside macOS's traffic lights, else Electron's 40px titlebar overlay.
+pub(super) const TITLEBAR_HEIGHT: Pixels = px(if cfg!(target_os = "macos") { 52. } else { 40. });
 /// `#root` keeps this much free at the right so the resize edge stays grabbable (`index.css:1764`).
 pub(super) const RIGHT_RESIZE_INSET: Pixels = px(6.);
-/// Header content starts here while the sidebar is collapsed, clearing its toggle.
-pub(super) const COLLAPSED_CONTENT_LEFT: Pixels = px(52.);
-/// The three caption buttons, 46px each.
-const CAPTION_BUTTONS: f32 = if cfg!(target_os = "windows") { 138. } else { 0. };
+/// The three caption buttons, 46px each; macOS draws traffic lights at the left instead.
+const CAPTION_BUTTONS: f32 = if cfg!(target_os = "macos") { 0. } else { 138. };
 pub(super) const CAPTION_BUTTONS_WIDTH: Pixels = px(CAPTION_BUTTONS);
 
 const CONTROL_SIZE: Pixels = px(28.);
+/// `--workspace-controls-left` (0.75rem) plus `ml-px`.
 const CONTROLS_LEFT: Pixels = px(13.);
+/// `MACOS_TRAFFIC_LIGHTS_LEFT_INSET` (90px) plus `ml-px`: the traffic lights' room.
+const MACOS_CONTROLS_LEFT: Pixels = px(91.);
+/// Where macOS's traffic lights sit, as Electron's `syncMacosWindowButtons` places them: 16px in
+/// and centered on the 52px top row (14px buttons).
+pub const TRAFFIC_LIGHTS: (f32, f32) = (16., 19.);
+/// Linux client-side decorations: how far in from each edge a press resizes the window.
+const RESIZE_EDGE: Pixels = px(5.);
 /// The panel toggles end 12px + 1px left of the caption buttons.
 const CONTROLS_RIGHT: Pixels = px(CAPTION_BUTTONS + 13.);
+
+/// The sidebar toggle's left edge: past the traffic lights on macOS, except in fullscreen where they hide.
+fn controls_left(window: &Window) -> Pixels {
+    if cfg!(target_os = "macos") && !window.is_fullscreen() { MACOS_CONTROLS_LEFT } else { CONTROLS_LEFT }
+}
+
+/// Header content starts here while the sidebar is collapsed, clearing its toggle.
+pub(super) fn collapsed_content_left(window: &Window) -> Pixels {
+    controls_left(window) + CONTROL_SIZE + px(11.)
+}
+
+thread_local! {
+    /// A press in a drag region, waiting for the pointer to move before it drags the window.
+    static DRAG_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes `element` the window's drag region (`-webkit-app-region: drag`). Windows hit-tests
+/// [`WindowControlArea::Drag`] itself; macOS and Linux drag on a press-and-move and zoom on a
+/// double click, as their native titlebars do.
+pub(super) fn drag_region<E: InteractiveElement>(element: E) -> E {
+    let element = element.window_control_area(WindowControlArea::Drag);
+    if cfg!(windows) {
+        return element;
+    }
+    element
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            let double = event.click_count == 2;
+            DRAG_ARMED.set(!double);
+            if double {
+                // macOS follows the user's "double-click a window's title bar to" setting.
+                if cfg!(target_os = "macos") { window.titlebar_double_click() } else { window.zoom_window() }
+            }
+        })
+        .on_mouse_up(MouseButton::Left, |_, _, _| DRAG_ARMED.set(false))
+        .on_mouse_move(|event, window, _| {
+            if DRAG_ARMED.replace(false) && event.pressed_button == Some(MouseButton::Left) {
+                window.start_window_move();
+            }
+        })
+}
+
+/// Linux client-side decorations: the resize edges a native frame has, while the window floats
+/// (a maximized or tiled edge doesn't resize). Nothing on Windows and macOS.
+pub(super) fn render_resize_edges(window: &Window) -> Option<AnyElement> {
+    let Decorations::Client { tiling } = window.window_decorations() else { return None };
+    if window.is_maximized() || window.is_fullscreen() {
+        return None;
+    }
+    let corner = RESIZE_EDGE * 2.;
+    let edge = |id: &'static str, resize: ResizeEdge, cursor: CursorStyle| {
+        div().id(id).absolute().occlude().cursor(cursor).on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            window.start_window_resize(resize);
+        })
+    };
+    let (vertical, horizontal) = (CursorStyle::ResizeUpDown, CursorStyle::ResizeLeftRight);
+    let (falling, rising) = (CursorStyle::ResizeUpLeftDownRight, CursorStyle::ResizeUpRightDownLeft);
+    let sides = [
+        (edge("resize-top", ResizeEdge::Top, vertical).top_0().left(corner).right(corner).h(RESIZE_EDGE), tiling.top),
+        (
+            edge("resize-bottom", ResizeEdge::Bottom, vertical).bottom_0().left(corner).right(corner).h(RESIZE_EDGE),
+            tiling.bottom,
+        ),
+        (
+            edge("resize-left", ResizeEdge::Left, horizontal).left_0().top(corner).bottom(corner).w(RESIZE_EDGE),
+            tiling.left,
+        ),
+        (
+            edge("resize-right", ResizeEdge::Right, horizontal).right_0().top(corner).bottom(corner).w(RESIZE_EDGE),
+            tiling.right,
+        ),
+        (
+            edge("resize-top-left", ResizeEdge::TopLeft, falling).top_0().left_0().size(corner),
+            tiling.top || tiling.left,
+        ),
+        (
+            edge("resize-top-right", ResizeEdge::TopRight, rising).top_0().right_0().size(corner),
+            tiling.top || tiling.right,
+        ),
+        (
+            edge("resize-bottom-left", ResizeEdge::BottomLeft, rising).bottom_0().left_0().size(corner),
+            tiling.bottom || tiling.left,
+        ),
+        (
+            edge("resize-bottom-right", ResizeEdge::BottomRight, falling).bottom_0().right_0().size(corner),
+            tiling.bottom || tiling.right,
+        ),
+    ];
+    let edges = sides.into_iter().filter(|(_, tiled)| !tiled).map(|(edge, _)| edge);
+    Some(div().absolute().inset_0().children(edges).into_any_element())
+}
 
 pub(super) fn icon(path: &'static str) -> Icon {
     Icon::empty().path(path)
@@ -64,17 +165,21 @@ impl Workspace {
             .left_0()
             .right_0()
             .h(TITLEBAR_HEIGHT)
-            .child(self.render_sidebar_toggle(cx))
+            .child(self.render_sidebar_toggle(window, cx))
             .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
-            .when(cfg!(target_os = "windows"), |el| el.child(render_caption_buttons(window, cx)))
+            .when(cfg!(windows), |el| el.child(render_caption_buttons(window, cx)))
+            .when(
+                cfg!(target_os = "linux") && matches!(window.window_decorations(), Decorations::Client { .. }),
+                |el| el.child(render_linux_caption_buttons(window, cx)),
+            )
     }
 
     /// `SidebarTrigger` in its `ghost` variant: we draw no stage art behind it.
-    fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
         let (color, hover_bg, hover_color) = (tokens.muted_foreground, tokens.accent, tokens.foreground);
         let path = if self.sidebar_open { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
-        div().absolute().left(CONTROLS_LEFT).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
+        div().absolute().left(controls_left(window)).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
             control("toggle-sidebar")
                 .group("toggle-sidebar")
                 .hover(|style| style.bg(hover_bg))
@@ -189,4 +294,39 @@ fn render_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
         .child(button("minimize", "\u{E921}", WindowControlArea::Min, hover, pressed, glyph))
         .child(button(maximize.0, maximize.1, WindowControlArea::Max, hover, pressed, glyph))
         .child(button("close", "\u{E8BB}", WindowControlArea::Close, close_hover, close_pressed, white(1.)))
+}
+
+/// Minimize, maximize/restore and close as Electron's titlebar overlay draws them on Linux, with
+/// Lucide glyphs since Linux has no system caption font. Shown only while the compositor lets the
+/// app draw its own decorations.
+fn render_linux_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
+    let dark = theme::tokens(cx).dark;
+    let glyph: Hsla = rgb(if dark { 0xf8fafc } else { 0x1f2937 }).into();
+    let hover = if dark { white(0.0605) } else { black(0.0373) };
+    let close_hover: Hsla = rgb(0xc42b1c).into();
+    let button = |id: &'static str, path: &'static str, hover: Hsla, hover_glyph: Hsla| {
+        div()
+            .id(id)
+            .group(id)
+            .w(px(46.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .hover(|style| style.bg(hover))
+            .child(
+                svg().path(path).size(px(14.)).text_color(glyph).group_hover(id, |style| style.text_color(hover_glyph)),
+            )
+    };
+    let maximize = if window.is_maximized() { "icons/copy.svg" } else { "icons/square.svg" };
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .h(TITLEBAR_HEIGHT)
+        .flex()
+        .child(button("minimize", "icons/minus.svg", hover, glyph).on_click(|_, window, _| window.minimize_window()))
+        .child(button("maximize", maximize, hover, glyph).on_click(|_, window, _| window.zoom_window()))
+        .child(button("close", "icons/x.svg", close_hover, white(1.)).on_click(|_, window, _| window.remove_window()))
 }

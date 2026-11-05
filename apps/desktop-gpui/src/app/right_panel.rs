@@ -21,7 +21,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
     Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
     MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, WindowControlArea, deferred, div, px,
+    Styled as _, Subscription, Task, Window, deferred, div, px,
 };
 use serde_json::{Value, json};
 
@@ -1126,15 +1126,9 @@ impl Workspace {
             .iter()
             .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, cx))
             .collect();
-        h_flex()
-            .id("right-panel-tabbar")
-            .h(TITLEBAR_HEIGHT)
-            .flex_none()
-            .min_w_0()
-            .pl_2()
-            .pr(reserve)
-            .gap_1()
-            .window_control_area(WindowControlArea::Drag)
+        let tab_bar =
+            h_flex().id("right-panel-tabbar").h(TITLEBAR_HEIGHT).flex_none().min_w_0().pl_2().pr(reserve).gap_1();
+        super::titlebar::drag_region(tab_bar)
             .child(
                 h_flex()
                     .id("right-panel-tabs")
