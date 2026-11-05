@@ -426,6 +426,29 @@ impl Workspace {
         });
     }
 
+    /// The selection's Unpin: one question for all of them, unlike the web's one per thread.
+    pub(super) fn unpin_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        if let [id] = ids {
+            self.unpin_thread(id, window, cx);
+            return;
+        }
+        let ids = ids.to_vec();
+        let question = Confirm {
+            setting: "confirmThreadUnpin",
+            message: format!("Unpin {} threads?", ids.len()),
+            detail: Some("This will move the threads out of your pinned section."),
+            ok: "Unpin",
+            level: PromptLevel::Info,
+        };
+        self.confirm_then(question, window, cx, move |this, _, cx| {
+            for id in &ids {
+                let entry = this.undo_entry(id);
+                this.thread_command("thread.unpin", id, json!({}), cx);
+                this.push_undo(UndoAction::Unpinned, entry, cx);
+            }
+        });
+    }
+
     /// `thread.archive`, asked first when `confirmThreadArchive` is on; the open thread
     /// gives way to a new draft in its project.
     pub(in crate::app) fn archive_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {

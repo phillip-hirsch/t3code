@@ -22,7 +22,8 @@ static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(ImageFormat::Png, PNG.to_vec()))
 });
 
-/// Loaded images by the destination the markdown wrote.
+/// Loaded images by the destination the markdown wrote, for one thread: a relative
+/// destination resolves against that thread's checkout. `None` is loading or failed.
 #[derive(Clone, Default)]
 pub(super) struct ImageCache(Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>);
 
@@ -104,7 +105,9 @@ pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Sourc
     // A network share loads only from inside the project's own.
     if path.starts_with("\\\\") || path.starts_with("//") {
         return match workspace_root {
-            Some(root) if path.starts_with(root) => Source::WorkspaceFile(path.to_owned()),
+            Some(root) if path.strip_prefix(root).is_some_and(|rest| rest.starts_with(['\\', '/'])) => {
+                Source::WorkspaceFile(path.to_owned())
+            }
             _ => Source::Blocked,
         };
     }
@@ -139,26 +142,11 @@ fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
     Some((format, base64(payload)?))
 }
 
+/// Padding is optional and whitespace is ignored, as browsers do.
 fn base64(text: &str) -> Option<Vec<u8>> {
-    let value = |c: u8| match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' | b'-' => Some(62),
-        b'/' | b'_' => Some(63),
-        _ => None,
-    };
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut buffer, mut bits) = (0u32, 0);
-    for byte in text.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=') {
-        buffer = (buffer << 6) | value(byte)? as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Some(out)
+    use base64::Engine as _;
+    let compact: String = text.split_ascii_whitespace().collect();
+    base64::engine::general_purpose::STANDARD_NO_PAD.decode(compact.trim_end_matches('=')).ok()
 }
 
 impl Workspace {
@@ -169,9 +157,10 @@ impl Workspace {
         }
         let root = self.git_cwd();
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
+        let cache = self.markdown_images.clone();
         for destination in image_destinations(markdown) {
             {
-                let Ok(mut cache) = self.markdown_images.0.lock() else { return };
+                let Ok(mut cache) = cache.0.lock() else { return };
                 if cache.contains_key(&destination) {
                     continue;
                 }
@@ -179,13 +168,14 @@ impl Workspace {
             }
             let source = classify(&destination, root.as_deref());
             let (client, base, thread_id) = (self.client(), self.http_base().map(str::to_owned), thread_id.clone());
-            let key = key.clone();
+            let (key, cache) = (key.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
                 let fetched: Option<(Option<String>, Vec<u8>)> = match source {
                     Source::Blocked => None,
                     Source::Data(format, bytes) => {
                         let image = Arc::new(Image::from_bytes(format, bytes));
-                        let _ = this.update(cx, |this, cx| this.image_loaded(destination, Some(image), &key, cx));
+                        let _ =
+                            this.update(cx, |this, cx| this.image_loaded(&cache, destination, Some(image), &key, cx));
                         return;
                     }
                     Source::Direct(url) => fetch(url).await,
@@ -197,7 +187,10 @@ impl Workspace {
                                     Some(relative) => fetch(format!("{base}{relative}")).await,
                                     None => None,
                                 },
-                                Err(_) => None,
+                                Err(error) => {
+                                    log::debug!("assets.createUrl for a markdown image: {error}");
+                                    None
+                                }
                             }
                         }
                         _ => None,
@@ -207,24 +200,30 @@ impl Workspace {
                     let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
                     Some(Arc::new(Image::from_bytes(format, bytes)))
                 });
-                let _ = this.update(cx, |this, cx| this.image_loaded(destination, image, &key, cx));
+                let _ = this.update(cx, |this, cx| this.image_loaded(&cache, destination, image, &key, cx));
             })
             .detach();
         }
     }
 
+    /// Stores a finished load in the cache it started from; a load that outlived its
+    /// thread changes nothing on screen.
     fn image_loaded(
         &mut self,
+        cache: &ImageCache,
         destination: String,
         image: Option<Arc<Image>>,
         key: &SharedString,
         cx: &mut Context<Self>,
     ) {
         let Some(image) = image else { return };
-        if let Ok(mut cache) = self.markdown_images.0.lock() {
+        if let Ok(mut cache) = cache.0.lock() {
             cache.insert(destination, Some(image));
         }
-        if let Some(index) = self.rows.iter().position(|row| super::chat::shows_markdown(row, key)) {
+        if !Arc::ptr_eq(&cache.0, &self.markdown_images.0) {
+            return;
+        }
+        if let Some(index) = self.rows.iter().rposition(|row| super::chat::shows_markdown(row, key)) {
             self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
         }
         cx.notify();
@@ -243,20 +242,35 @@ fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// The largest image a message loads: an agent can link any URL.
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// The image's MIME type and bytes, or `None` when it fails or passes [`MAX_IMAGE_BYTES`].
 async fn fetch(url: String) -> Option<(Option<String>, Vec<u8>)> {
     crate::runtime()
         .spawn(async move {
-            let response = reqwest::get(url).await?.error_for_status()?;
+            let mut response = reqwest::get(url).await?.error_for_status()?;
+            if response.content_length().is_some_and(|length| length > MAX_IMAGE_BYTES as u64) {
+                return Ok(None);
+            }
             let mime = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.split(';').next().unwrap_or_default().trim().to_owned());
-            Ok::<_, reqwest::Error>((mime, response.bytes().await?.to_vec()))
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                    return Ok(None);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, reqwest::Error>(Some((mime, bytes)))
         })
         .await
         .ok()?
         .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -279,6 +293,9 @@ mod tests {
         assert_eq!(classify("docs/a.png", None), Source::Blocked);
         assert_eq!(classify("~/a.png", Some("/repo")), Source::Blocked);
         assert_eq!(classify("javascript:alert(1)", Some("/repo")), Source::Blocked);
+        let share = Some(r"\\srv\proj");
+        assert_eq!(classify(r"\\srv\proj\a.png", share), Source::WorkspaceFile(r"\\srv\proj\a.png".into()));
+        assert_eq!(classify(r"\\srv\proj-secrets\a.png", share), Source::Blocked);
         assert_eq!(
             classify("data:image/png;base64,iVBO", None),
             Source::Data(ImageFormat::Png, vec![0x89, 0x50, 0x4e])

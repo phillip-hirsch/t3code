@@ -107,9 +107,7 @@ impl BulkMenu {
         if !self.pinned.is_empty() {
             let pinned = self.pinned.clone();
             menu = menu.item(act!(counted("Unpin", pinned.len()), |this, window, cx| {
-                for id in &pinned {
-                    this.unpin_thread(id, window, cx);
-                }
+                this.unpin_threads(&pinned, window, cx);
                 this.clear_selection(cx);
             }));
         }

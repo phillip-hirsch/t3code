@@ -545,6 +545,8 @@ impl Workspace {
             self._stream_tasks.clear();
             self._shell_task = None;
             self.preview.disconnect();
+            self.setup.disconnect();
+            self.details = inspector::Details::default();
             if let Some(thread) = &mut self.thread {
                 thread._subscription = None;
             }
@@ -601,6 +603,9 @@ impl Workspace {
         self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);
         self.subscribe_previews(window, cx);
+        // Rows that come back unchanged would not resync these.
+        self.sync_worktree_setup(cx);
+        self.sync_details(cx);
         cx.notify();
     }
 
@@ -861,6 +866,7 @@ impl Workspace {
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
+        self.markdown_images = markdown_images::ImageCache::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
