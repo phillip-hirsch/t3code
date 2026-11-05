@@ -3,7 +3,7 @@
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
 mod prices;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -53,6 +53,63 @@ pub(in crate::app) struct UsageState {
     scroll: ScrollHandle,
     /// Reset credits being confirmed, spent, or spent with the outcome, one per account key.
     redeemed: Vec<Redeem>,
+    /// The chart's data, kept across pointer moves; render may refill it, hence the cell.
+    chart: RefCell<Option<Rc<ChartData>>>,
+    /// The limit pools and what they were built from: server revision, hidden drivers, `limits_now`.
+    pools: Option<((u64, Vec<String>, i64), Rc<Vec<Pool>>)>,
+}
+
+/// What the usage chart draws, derived when its inputs change rather than on every pointer move.
+pub(in crate::app) struct ChartData {
+    /// The merged answer (held, so its address stays unique), window, providers and metric it was built from.
+    key: (Rc<Merged>, UsageWindow, Vec<&'static str>, bool),
+    periods: Vec<PeriodKey>,
+    columns: Vec<Vec<f64>>,
+    peak: f64,
+    max: f64,
+    ticks: Vec<f64>,
+    step_x: f32,
+    /// Each provider's slot, curve and total, the largest total first.
+    series: Rc<Vec<(usize, Vec<logic::Segment>, f64)>>,
+}
+
+impl ChartData {
+    fn new(merged: &Rc<Merged>, window: &UsageWindow, providers: &[&'static str], tokens: bool) -> Self {
+        let periods = window.periods();
+        let columns: Vec<Vec<f64>> = periods
+            .iter()
+            .map(|key| {
+                let period = key.find(merged);
+                providers.iter().map(|p| period.map_or(0., |period| period.value(p, tokens))).collect()
+            })
+            .collect();
+        let peak = columns.iter().flatten().fold(0f64, |max, v| max.max(*v));
+        let (max, ticks) = logic::nice_scale(peak);
+        let step_x = if periods.len() < 2 { 0. } else { logic::VIEW_WIDTH / (periods.len() - 1) as f32 };
+        // Each series is drawn from zero; the largest total sits at the back.
+        let mut series: Vec<(usize, Vec<logic::Segment>, f64)> = (0..providers.len())
+            .map(|slot| {
+                let points: Vec<(f32, f32)> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| (index as f32 * step_x, logic::value_to_y(column[slot], max)))
+                    .collect();
+                let total = columns.iter().map(|c| c[slot]).sum();
+                (slot, logic::smooth_curve(&points), total)
+            })
+            .collect();
+        series.sort_by(|l, r| r.2.total_cmp(&l.2));
+        Self {
+            key: (merged.clone(), window.clone(), providers.to_vec(), tokens),
+            periods,
+            columns,
+            peak,
+            max,
+            ticks,
+            step_x,
+            series: Rc::new(series),
+        }
+    }
 }
 
 pub(in crate::app) struct Redeem {
@@ -105,6 +162,8 @@ impl Default for UsageState {
             hover: None,
             scroll: ScrollHandle::new(),
             redeemed: Vec::new(),
+            pools: None,
+            chart: RefCell::default(),
         }
     }
 }
@@ -570,7 +629,7 @@ impl Workspace {
             )
     }
 
-    fn render_usage_body(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_usage_body(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         if !usage.environment_selected {
@@ -593,13 +652,27 @@ impl Workspace {
         }
     }
 
-    fn render_limits(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The limit pools, rebuilt only when the server config, the hidden drivers or the clock moved.
+    fn limit_pools(&mut self) -> Rc<Vec<Pool>> {
+        let key = (self.server_info.revision, self.usage.hidden.clone(), self.usage.limits_now);
+        if let Some((held, pools)) = &self.usage.pools
+            && *held == key
+        {
+            return pools.clone();
+        }
+        let sources = &self.server_info.config["usageLimitSources"];
+        let accounts = logic::limit_accounts(&self.server_info.providers, sources, &self.usage.hidden_drivers());
+        let pools = Rc::new(logic::limit_pools(accounts, self.usage.limits_now));
+        self.usage.pools = Some((key, pools.clone()));
+        pools
+    }
+
+    fn render_limits(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let pools = self.limit_pools();
         let usage = &self.usage;
         let providers = &self.server_info.providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let sources = &self.server_info.config["usageLimitSources"];
-        let pools = logic::limit_pools(logic::limit_accounts(providers, sources, &hidden), now);
         let notices = logic::limit_notices(providers, &hidden);
         let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
         let links = logic::external_links(providers, &environment, &hidden);
@@ -609,7 +682,7 @@ impl Workspace {
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
         let environment_label = self.server_info.environment_label.clone();
-        for pool in &pools {
+        for pool in pools.iter() {
             let view = cx.weak_entity();
             let redeemed = &self.usage.redeemed;
             body = body.child(pool_section(pool, now, environment_label.as_deref(), redeemed, &view, t));
@@ -880,32 +953,20 @@ impl Workspace {
     ) -> impl IntoElement {
         let tokens = self.usage.tokens();
         let tz = self.usage.tz.clone();
-        let periods = window.periods();
-        let columns: Vec<Vec<f64>> = periods
-            .iter()
-            .map(|key| {
-                let period = key.find(merged);
-                providers.iter().map(|p| period.map_or(0., |period| period.value(p, tokens))).collect()
-            })
-            .collect();
-        let peak = columns.iter().flatten().fold(0f64, |max, v| max.max(*v));
-        let (max, ticks) = logic::nice_scale(peak);
-        let step_x = if periods.len() < 2 { 0. } else { logic::VIEW_WIDTH / (periods.len() - 1) as f32 };
-        // Each series is drawn from zero; the largest total sits at the back.
-        let mut series: Vec<(Hsla, Vec<logic::Segment>, f64)> = providers
-            .iter()
-            .enumerate()
-            .map(|(slot, kind)| {
-                let points: Vec<(f32, f32)> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(index, column)| (index as f32 * step_x, logic::value_to_y(column[slot], max)))
-                    .collect();
-                let total = columns.iter().map(|c| c[slot]).sum();
-                (provider_color(kind, t), logic::smooth_curve(&points), total)
-            })
-            .collect();
-        series.sort_by(|l, r| r.2.total_cmp(&l.2));
+        let data = {
+            let mut held = self.usage.chart.borrow_mut();
+            let fresh = |d: &&Rc<ChartData>| {
+                Rc::ptr_eq(&d.key.0, merged) && d.key.1 == *window && d.key.2 == providers && d.key.3 == tokens
+            };
+            match held.as_ref().filter(fresh) {
+                Some(data) => data.clone(),
+                None => held.insert(Rc::new(ChartData::new(merged, window, providers, tokens))).clone(),
+            }
+        };
+        let (periods, columns, ticks) = (&data.periods, &data.columns, &data.ticks);
+        let (peak, max, step_x) = (data.peak, data.max, data.step_x);
+        let colors: Vec<Hsla> = providers.iter().map(|kind| provider_color(kind, t)).collect();
+        let series = data.series.clone();
         let format = move |value: f64| if tokens { logic::format_tokens(value) } else { logic::format_usd(value) };
         let grid = t.border;
         let hover = self.usage.hover;
@@ -944,7 +1005,8 @@ impl Workspace {
                         builder.cubic_bezier_to(at(to.0, to.1), at(c1.0, c1.1), at(c2.0, c2.1));
                     }
                 };
-                for (color, segments, _) in &series {
+                for (slot, segments, _) in series.iter() {
+                    let color = &colors[*slot];
                     let mut area = PathBuilder::fill();
                     curve(&mut area, segments);
                     if !segments.is_empty() {
@@ -956,7 +1018,8 @@ impl Workspace {
                         window.paint_path(path, Hsla { a: color.a * 0.12, ..*color });
                     }
                 }
-                for (color, segments, _) in &series {
+                for (slot, segments, _) in series.iter() {
+                    let color = &colors[*slot];
                     let mut line = PathBuilder::stroke(px(2.));
                     curve(&mut line, segments);
                     if let Ok(path) = line.build() {
@@ -1135,7 +1198,7 @@ impl Workspace {
         let row_border = Hsla { a: t.border.a * 0.5, ..t.border };
         let mut table = v_flex().text_sm();
         if !by_time {
-            let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.clone() };
+            let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.iter().collect() };
             let peak =
                 models.iter().fold(0f64, |max, m| max.max(if tokens { m.total_tokens as f64 } else { m.cost_usd }));
             table = table.child(

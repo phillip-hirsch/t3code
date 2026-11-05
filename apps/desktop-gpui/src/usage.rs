@@ -427,8 +427,8 @@ pub fn active_providers(merged: &Merged) -> Vec<&'static str> {
 }
 
 /// `sortModelsByTokens`.
-pub fn models_by_tokens(models: &[ModelTotals]) -> Vec<ModelTotals> {
-    let mut sorted = models.to_vec();
+pub fn models_by_tokens(models: &[ModelTotals]) -> Vec<&ModelTotals> {
+    let mut sorted: Vec<&ModelTotals> = models.iter().collect();
     sorted.sort_by(|l, r| r.total_tokens.cmp(&l.total_tokens).then(r.cost_usd.total_cmp(&l.cost_usd)));
     sorted
 }
@@ -907,7 +907,7 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|account| serde_json::from_value(account.clone()).ok())
+                .filter_map(|account| HubAccount::deserialize(account).ok())
                 .collect();
             accounts.into_iter().map(move |account| (id.clone(), label.clone(), account))
         })
@@ -1383,12 +1383,7 @@ pub fn limit_pools(accounts: Vec<Account>, now: i64) -> Vec<Pool> {
             let sort_name = |a: &Account| {
                 a.display_name.clone().or_else(|| a.email.clone()).unwrap_or(a.key.clone()).to_lowercase()
             };
-            accounts.sort_by(|l, r| {
-                order_reset(l)
-                    .cmp(&order_reset(r))
-                    .then_with(|| sort_name(l).cmp(&sort_name(r)))
-                    .then_with(|| l.key.cmp(&r.key))
-            });
+            accounts.sort_by_cached_key(|account| (order_reset(account), sort_name(account), account.key.clone()));
             let windows = pool_windows(&driver, &accounts, now);
             Pool { driver, accounts, windows }
         })
