@@ -109,8 +109,8 @@ pub struct Workspace {
     /// Shell twin of [`OpenThread::snapshot_failed`] / [`OpenThread::retried`].
     shell_snapshot_failed: bool,
     shell_retried: bool,
-    /// The last-opened thread is reopened once, after the first shell snapshot.
-    route_restored: bool,
+    /// The launch landing ran (once, after the first shell snapshot).
+    landed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -169,7 +169,7 @@ impl Workspace {
             _shell_task: None,
             shell_snapshot_failed: false,
             shell_retried: false,
-            route_restored: false,
+            landed: false,
             _subscriptions: subscriptions,
         }
     }
@@ -346,9 +346,12 @@ impl Workspace {
                         this.subscribe_shell(window, cx);
                         return;
                     }
-                    this.error = Some("Couldn't read the thread list from the server. Reconnect to retry.".into());
+                    this.error =
+                        Some("Couldn't read the thread list from the server. Restart T3 Code to retry.".into());
+                } else if this.shell.sequence > 0 {
+                    this.shell_retried = false;
                 }
-                this.restore_last_thread(window, cx);
+                this.land(window, cx);
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
@@ -430,7 +433,11 @@ impl Workspace {
                         this.subscribe_thread(window, cx);
                         return;
                     }
-                    this.error = Some("Couldn't read this thread from the server. Open it again to retry.".into());
+                    this.error = Some(
+                        "Couldn't read this thread from the server. Open another thread and come back to retry.".into(),
+                    );
+                } else if thread.state.projection.is_some() {
+                    thread.retried = false;
                 }
                 let Some(thread) = this.thread.as_ref() else { return };
                 if thread.state.deleted {
@@ -443,21 +450,20 @@ impl Workspace {
         ));
     }
 
-    /// Reopens the thread open at the last launch, as the web restores its route.
-    fn restore_last_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.route_restored || self.shell.sequence == 0 {
+    /// Electron always opens the index route, which starts a draft in the most
+    /// recently active project (`IndexDraftLanding`); this is that landing.
+    fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.landed || self.shell.sequence == 0 {
             return;
         }
-        self.route_restored = true;
+        self.landed = true;
         if self.target.is_some() {
             return;
         }
-        let Some(thread_id) = last_thread_file().and_then(|path| std::fs::read_to_string(path).ok()) else { return };
-        let thread_id = thread_id.trim();
-        let exists =
-            self.shell.threads.iter().any(|t| t.id == thread_id && t.archived_at.is_none() && t.deleted_at.is_none());
-        if exists {
-            self.select_thread(thread_id.to_owned(), window, cx);
+        if let Some(project_id) =
+            crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
+        {
+            self.start_draft(project_id, window, cx);
         }
     }
 
@@ -513,11 +519,6 @@ impl Workspace {
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
         self.open_visit(&thread_id, cx);
-        // Best effort: a missing file only means the next launch starts on the empty view.
-        if let Some(path) = last_thread_file() {
-            let _ = path.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(path, &thread_id);
-        }
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
@@ -725,14 +726,6 @@ impl Workspace {
         })
         .detach();
     }
-}
-
-/// Where the last-opened thread id is kept between launches.
-fn last_thread_file() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))?;
-    Some(base.join("t3-desktop-gpui").join("last-thread"))
 }
 
 fn new_id() -> String {

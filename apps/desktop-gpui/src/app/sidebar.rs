@@ -335,8 +335,8 @@ impl Workspace {
         if self.sidebar_open {
             return;
         }
-        let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
-        self.sidebar.items(&self.shell, self.target.as_ref(), connected && self.shell.live, now_ms(), "");
+        let requests = inbox::child_requests(&self.shell.threads);
+        self.sidebar.returns.observe(&self.shell.threads, &requests, now_ms());
     }
 
     pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

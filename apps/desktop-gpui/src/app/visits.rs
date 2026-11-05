@@ -138,16 +138,6 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn servers_without_visit_tracking_get_no_visits() {
-        let mut state = VisitState { open_pending: true, ..VisitState::default() };
-        let mut thread = shell(T0, None, None);
-        thread.last_visited_at = None;
-        let now = inbox::parse_ms(T2).unwrap();
-        assert_eq!(decide(&mut state, &thread, None, now), Visit::Skip);
-        assert!(state.open_pending, "the open waits for a server that tracks visits");
-    }
-
     use super::*;
 
     fn shell(updated_at: &str, last_visited_at: Option<&str>, completed_at: Option<&str>) -> ThreadShell {
@@ -204,5 +194,15 @@ mod tests {
         let now = inbox::parse_ms(T2).unwrap();
         assert_eq!(decide(&mut state, &shell(T1, Some(T1), None), None, now), Visit::Skip);
         assert_eq!(state.last_dispatched, inbox::parse_ms(T1));
+    }
+
+    #[test]
+    fn servers_without_visit_tracking_get_no_visits() {
+        let mut state = VisitState { open_pending: true, ..VisitState::default() };
+        let mut thread = shell(T0, None, None);
+        thread.last_visited_at = None;
+        let now = inbox::parse_ms(T2).unwrap();
+        assert_eq!(decide(&mut state, &thread, None, now), Visit::Skip);
+        assert!(state.open_pending, "the open waits for a server that tracks visits");
     }
 }

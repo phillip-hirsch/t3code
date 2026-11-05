@@ -277,6 +277,10 @@ pub struct RepositoryIdentity {
 pub struct ProjectShell {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
     pub workspace_root: String,
     #[serde(default)]
     pub repository_identity: Option<RepositoryIdentity>,
@@ -474,12 +478,15 @@ impl ShellState {
                 let roots = item.get("resolvedRepositoryIdentityRoots").and_then(Value::as_array);
                 let snapshot = match ShellSnapshot::deserialize(&item["snapshot"]) {
                     Ok(snapshot) => snapshot,
+                    // An enrichment patch only refines names; the list stays usable without it.
+                    Err(error) if roots.is_some() => {
+                        log::warn!("skipping undecodable shell enrichment: {error}");
+                        return Ok(());
+                    }
                     Err(error) => {
                         // Resume from scratch, so a resubscribe fetches a fresh snapshot.
-                        if roots.is_none() {
-                            self.sequence = 0;
-                            self.needs_snapshot = true;
-                        }
+                        self.sequence = 0;
+                        self.needs_snapshot = true;
                         return Err(error);
                     }
                 };
@@ -515,9 +522,11 @@ impl ShellState {
                     }
                 }
             }
-            "project.updated" => {
-                let mut project = ProjectShell::deserialize(&item["project"])?;
-                match self.projects.iter_mut().find(|p| p.id == project.id) {
+            // An undecodable delta is skipped but still advances the cursor, like the
+            // thread reducer: replaying it after a resubscribe would fail the same way.
+            "project.updated" => match ProjectShell::deserialize(&item["project"]) {
+                Err(error) => log::warn!("skipping undecodable project update: {error}"),
+                Ok(mut project) => match self.projects.iter_mut().find(|p| p.id == project.id) {
                     Some(existing) => {
                         if project.repository_identity.is_none() {
                             project.repository_identity = existing.repository_identity.take();
@@ -525,24 +534,26 @@ impl ShellState {
                         *existing = project;
                     }
                     None => self.projects.push(project),
-                }
-            }
+                },
+            },
             "project.removed" => {
                 let id = item["projectId"].as_str().unwrap_or_default();
                 self.projects.retain(|p| p.id != id);
             }
-            "thread.updated" => {
-                let thread = ThreadShell::deserialize(&item["thread"])?;
-                let active = item.get("location").and_then(Value::as_str) == Some("active");
-                match (self.threads.iter().position(|t| t.id == thread.id), active) {
-                    (Some(index), true) => self.threads[index] = thread,
-                    (None, true) => self.threads.push(thread),
-                    (Some(index), false) => {
-                        self.threads.remove(index);
+            "thread.updated" => match ThreadShell::deserialize(&item["thread"]) {
+                Err(error) => log::warn!("skipping undecodable thread update: {error}"),
+                Ok(thread) => {
+                    let active = item.get("location").and_then(Value::as_str) == Some("active");
+                    match (self.threads.iter().position(|t| t.id == thread.id), active) {
+                        (Some(index), true) => self.threads[index] = thread,
+                        (None, true) => self.threads.push(thread),
+                        (Some(index), false) => {
+                            self.threads.remove(index);
+                        }
+                        (None, false) => {}
                     }
-                    (None, false) => {}
                 }
-            }
+            },
             "thread.removed" => {
                 let id = item["threadId"].as_str().unwrap_or_default();
                 self.threads.retain(|t| t.id != id);
@@ -1030,6 +1041,16 @@ mod tests {
         assert_eq!(shell.threads.len(), 1);
         assert_eq!(shell.projects.len(), 2);
         assert_eq!(shell.projects[0].repository_identity.as_ref().unwrap().display_name.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn an_undecodable_shell_delta_is_skipped_but_advances_the_cursor() {
+        let mut shell = ShellState::default();
+        shell.apply(&json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
+        // Not an error: only a failed full snapshot asks for a resubscribe.
+        shell.apply(&json!({"kind":"thread.updated","sequence":6,"location":"active","thread":{"id": 1}})).unwrap();
+        assert_eq!(shell.sequence, 6);
+        assert_eq!(shell.threads.len(), 1);
     }
 
     #[test]

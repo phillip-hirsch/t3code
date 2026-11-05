@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
-use crate::model::ThreadShell;
+use crate::model::{ProjectShell, ThreadShell};
 
 /// Milliseconds since the Unix epoch for an ISO-8601 timestamp (`Date.parse`).
 pub fn parse_ms(iso: &str) -> Option<i64> {
@@ -66,6 +66,33 @@ pub fn format_relative(elapsed_ms: i64) -> String {
         60..1440 => format!("{}h", minutes / 60),
         _ => format!("{}d", minutes / 1440),
     }
+}
+
+/// The project the web's index route opens a draft in at launch
+/// (`IndexDraftLanding`): `sortScopedProjectsForSidebar(.., "updated_at")[0]`
+/// over unarchived projects. A project's time is its newest unarchived
+/// thread's latest user message (else updated, else created), or its own
+/// updated/created time without threads; ties go by title, then id.
+pub fn most_recent_project<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Option<&'a ProjectShell> {
+    let thread_time = |t: &ThreadShell| {
+        ms(t.latest_user_message_at.as_deref()).or_else(|| parse_ms(&t.updated_at)).or_else(|| parse_ms(&t.created_at))
+    };
+    let project_time = |p: &ProjectShell| {
+        let mut latest: Option<i64> = None;
+        for thread in threads.iter().filter(|t| t.project_id == p.id && t.archived_at.is_none()) {
+            let time = thread_time(thread).unwrap_or(i64::MIN);
+            latest = Some(latest.map_or(time, |l| l.max(time)));
+        }
+        latest.or_else(|| ms(p.updated_at.as_deref().or(p.created_at.as_deref()))).unwrap_or(i64::MIN)
+    };
+    projects
+        .iter()
+        .filter(|p| p.archived_at.is_none())
+        .map(|p| (project_time(p), p))
+        .max_by(|(a_time, a), (b_time, b)| {
+            a_time.cmp(b_time).then_with(|| b.title.cmp(&a.title)).then_with(|| b.id.cmp(&a.id))
+        })
+        .map(|(_, p)| p)
 }
 
 /// Milliseconds until [`format_relative`] shows a different label.
@@ -677,6 +704,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn launch_opens_a_draft_in_the_most_recently_active_project() {
+        let project = |id: &str, title: &str, updated: Option<&str>, archived: bool| -> ProjectShell {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": title, "workspaceRoot": id, "updatedAt": updated,
+                "archivedAt": if archived { Some("2026-01-01T00:00:00.000Z") } else { None },
+            }))
+            .unwrap()
+        };
+        let thread = |project: &str, at: &str| -> ThreadShell {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("t-{project}-{at}"), "projectId": project, "title": "t", "status": "idle",
+                "updatedAt": "2026-01-01T00:00:00.000Z", "createdAt": "2026-01-01T00:00:00.000Z", "latestUserMessageAt": at,
+            }))
+            .unwrap()
+        };
+        let projects = [
+            project("a", "Alpha", Some("2026-11-04T09:00:00.000Z"), false),
+            project("b", "Beta", None, false),
+            project("z", "Zulu", Some("2026-12-01T00:00:00.000Z"), true),
+        ];
+        // Thread activity wins over a project's own time; archived projects never land.
+        let threads = [thread("b", "2026-11-04T10:00:00.000Z")];
+        assert_eq!(most_recent_project(&projects, &threads).map(|p| p.id.as_str()), Some("b"));
+        assert_eq!(most_recent_project(&projects, &[]).map(|p| p.id.as_str()), Some("a"));
+        // Equal times fall back to the title.
+        let tied = [project("y", "Yak", Some("2026-11-04T09:00:00.000Z"), false), projects[0].clone()];
+        assert_eq!(most_recent_project(&tied, &[]).map(|p| p.id.as_str()), Some("a"));
+    }
     use serde::Deserialize as _;
     use serde_json::{Value, json};
 
