@@ -351,7 +351,7 @@ pub fn subagent_group_status(cards: &[Rc<SubagentCard>]) -> (String, bool, bool)
 
 /// `subagentGroupTiming`: the earliest start to the latest end, open while any runs.
 pub fn subagent_group_timing(cards: &[Rc<SubagentCard>]) -> (Option<i64>, Option<i64>, bool) {
-    let ms = |at: &Option<SharedString>| at.as_deref().and_then(work_log::parse_iso_ms);
+    let ms = |at: &Option<SharedString>| at.as_deref().and_then(crate::timestamp::parse_ms);
     let start = cards.iter().filter_map(|c| ms(&c.started_at)).min();
     let live = cards.iter().any(|c| c.live);
     let end_unknown = cards.iter().any(|c| ms(&c.completed_at).is_none());
@@ -878,7 +878,7 @@ fn terminal_assistant_messages(entries: &[Rc<TimelineEntry>]) -> HashSet<usize> 
 }
 
 fn elapsed_ms(start: &str, end: &str) -> Option<i64> {
-    Some((work_log::parse_iso_ms(end)? - work_log::parse_iso_ms(start)?).max(0))
+    Some((crate::timestamp::parse_ms(end)? - crate::timestamp::parse_ms(start)?).max(0))
 }
 
 fn later<'a>(a: &'a str, b: &'a str) -> &'a str {
@@ -917,6 +917,7 @@ fn turn_folds(
         steers: Vec<(usize, usize)>,
     }
     let mut groups: Vec<(SharedString, Group)> = Vec::new();
+    let mut positions: HashMap<SharedString, usize> = HashMap::new();
     let mut runless_failed: HashSet<SharedString> = HashSet::new();
     let mut runless: Option<SharedString> = None;
     let mut response: Option<SharedString> = None;
@@ -931,7 +932,7 @@ fn turn_folds(
         }
         if entry.is_steer() {
             let run = entry.run_id.as_ref().or(response.as_ref());
-            if let Some((_, group)) = groups.iter_mut().find(|(key, _)| Some(key) == run) {
+            if let Some((_, group)) = run.and_then(|run| positions.get(run)).map(|position| &mut groups[*position]) {
                 if !group.entries.is_empty() {
                     if group.steers.last().is_some_and(|(start, _)| *start == group.entries.len()) {
                         group.steers.pop();
@@ -950,8 +951,8 @@ fn turn_folds(
         if Some(&run) == runless.as_ref() && entry.failure.is_some() {
             runless_failed.insert(run.clone());
         }
-        let position = match groups.iter().position(|(key, _)| *key == run) {
-            Some(position) => position,
+        let position = match positions.get(&run) {
+            Some(position) => *position,
             None => {
                 let (start, anchor) = match boundary.take() {
                     Some((start, anchor)) => (Some(start), anchor),
@@ -959,6 +960,7 @@ fn turn_folds(
                 };
                 let group =
                     Group { entries: Vec::new(), terminal: None, streaming: false, start, anchor, steers: Vec::new() };
+                positions.insert(run.clone(), groups.len());
                 groups.push((run, group));
                 groups.len() - 1
             }
@@ -1052,21 +1054,24 @@ fn turn_folds(
     folds
 }
 
-/// `findRevertCheckpoint`: the ready checkpoint that ends run `turn_count`, or starts the thread.
-fn revert_checkpoint(checkpoints: &[model::Checkpoint], turn_count: i64) -> Option<Checkpoint> {
-    let checkpoint = checkpoints.iter().rev().find(|c| {
-        c.status == "ready"
-            && if turn_count == 0 {
-                c.ordinal_within_scope == 0 && c.app_run_ordinal.is_none()
-            } else {
-                c.app_run_ordinal == Some(turn_count)
-            }
-    })?;
-    Some(Checkpoint {
-        scope_id: checkpoint.scope_id.clone().into(),
-        checkpoint_id: checkpoint.id.clone().into(),
-        turn_count,
-    })
+/// `findRevertCheckpoint` for every turn count: the last ready checkpoint that ends
+/// each run, and under 0 the one that starts the thread.
+fn revert_checkpoints(checkpoints: &[model::Checkpoint]) -> HashMap<i64, Checkpoint> {
+    let mut by_turn = HashMap::new();
+    for checkpoint in checkpoints.iter().filter(|c| c.status == "ready") {
+        let turn_count = match checkpoint.app_run_ordinal {
+            None if checkpoint.ordinal_within_scope == 0 => 0,
+            Some(ordinal) if ordinal != 0 => ordinal,
+            _ => continue,
+        };
+        let target = Checkpoint {
+            scope_id: checkpoint.scope_id.clone().into(),
+            checkpoint_id: checkpoint.id.clone().into(),
+            turn_count,
+        };
+        by_turn.insert(turn_count, target);
+    }
+    by_turn
 }
 
 /// `deriveAvailableRevertTurnCounts`: the runs whose provider turn is on the live provider
@@ -1082,17 +1087,27 @@ fn available_revert_turn_counts(projection: &ThreadProjection) -> HashSet<i64> {
         return available;
     }
     available.insert(0);
+    // `max_by_key` keeps the last of equal ordinals; `find` keeps the first id.
+    let mut latest_by_attempt: HashMap<&str, &model::ProviderTurn> = HashMap::new();
+    let mut turns_by_id: HashMap<&str, &model::ProviderTurn> = HashMap::new();
+    for turn in &projection.provider_turns {
+        if let Some(attempt) = turn.run_attempt_id.as_deref() {
+            let latest = latest_by_attempt.entry(attempt).or_insert(turn);
+            if turn.ordinal >= latest.ordinal {
+                *latest = turn;
+            }
+        }
+        turns_by_id.entry(turn.id.as_str()).or_insert(turn);
+    }
+    let mut attempts: HashMap<&str, &model::RunAttempt> = HashMap::new();
+    for attempt in &projection.attempts {
+        attempts.entry(attempt.id.as_str()).or_insert(attempt);
+    }
     for run in &projection.runs {
         let Some(attempt_id) = run.active_attempt_id.as_deref() else { continue };
-        let latest = projection
-            .provider_turns
-            .iter()
-            .filter(|turn| turn.run_attempt_id.as_deref() == Some(attempt_id))
-            .max_by_key(|turn| turn.ordinal);
-        let turn = latest.or_else(|| {
-            let attempt = projection.attempts.iter().find(|a| a.id == attempt_id)?;
-            let turn_id = attempt.provider_turn_id.as_deref()?;
-            projection.provider_turns.iter().find(|turn| turn.id == turn_id)
+        let turn = latest_by_attempt.get(attempt_id).copied().or_else(|| {
+            let turn_id = attempts.get(attempt_id)?.provider_turn_id.as_deref()?;
+            turns_by_id.get(turn_id).copied()
         });
         if turn.and_then(|turn| turn.provider_thread_id.as_deref()) == Some(provider_thread.id.as_str()) {
             available.insert(run.ordinal);
@@ -1115,7 +1130,8 @@ fn revert_targets(
             ready.insert(run, count);
         }
     }
-    let start_ready = revert_checkpoint(&projection.checkpoints, 0).is_some();
+    let checkpoints = revert_checkpoints(&projection.checkpoints);
+    let start_ready = checkpoints.contains_key(&0);
     let mut target_by_run: HashMap<&SharedString, Option<i64>> = HashMap::new();
     let mut previous: Option<&SharedString> = None;
     let mut targets = HashMap::new();
@@ -1140,7 +1156,7 @@ fn revert_targets(
         }
         let checkpoint = target_by_run[run]
             .filter(|target| available.contains(target))
-            .and_then(|target| revert_checkpoint(&projection.checkpoints, target));
+            .and_then(|target| checkpoints.get(&target).cloned());
         if let Some(checkpoint) = checkpoint {
             targets.insert(entry.id.clone(), checkpoint);
         }
@@ -1148,24 +1164,45 @@ fn revert_targets(
     targets
 }
 
-/// `resolveAttempt`: the run attempt an item belongs to, through its node's ancestry.
-fn entry_attempt<'a>(entry: &TimelineEntry, projection: &'a ThreadProjection) -> Option<&'a model::RunAttempt> {
-    let run = entry.run_id.as_deref()?;
-    let by_root =
-        |node: &str| projection.attempts.iter().find(|a| a.root_node_id.as_deref() == Some(node) && a.run_id == run);
-    let mut node_id = entry.node_id.as_deref();
-    let mut visited = HashSet::new();
-    while let Some(id) = node_id.filter(|id| visited.insert(*id)) {
-        if let Some(attempt) = by_root(id) {
-            return Some(attempt);
+/// `resolveAttempt`'s lookups, indexed once per rebuild; the first match wins, as with `find`.
+struct AttemptIndex<'a> {
+    by_root: HashMap<(&'a str, &'a str), &'a model::RunAttempt>,
+    nodes: HashMap<&'a str, &'a model::ExecutionNode>,
+}
+
+impl<'a> AttemptIndex<'a> {
+    fn new(projection: &'a ThreadProjection) -> Self {
+        let mut by_root = HashMap::new();
+        for attempt in &projection.attempts {
+            if let Some(root) = attempt.root_node_id.as_deref() {
+                by_root.entry((root, attempt.run_id.as_str())).or_insert(attempt);
+            }
         }
-        let node = projection.nodes.iter().find(|node| node.id == id)?;
-        if let Some(attempt) = node.root_node_id.as_deref().and_then(by_root) {
-            return Some(attempt);
+        let mut nodes = HashMap::new();
+        for node in &projection.nodes {
+            nodes.entry(node.id.as_str()).or_insert(node);
         }
-        node_id = node.parent_node_id.as_deref();
+        Self { by_root, nodes }
     }
-    None
+
+    /// `resolveAttempt`: the run attempt an item belongs to, through its node's ancestry.
+    fn of(&self, entry: &TimelineEntry) -> Option<&'a model::RunAttempt> {
+        let run = entry.run_id.as_deref()?;
+        let by_root = |node: &str| self.by_root.get(&(node, run)).copied();
+        let mut node_id = entry.node_id.as_deref();
+        let mut visited = HashSet::new();
+        while let Some(id) = node_id.filter(|id| visited.insert(*id)) {
+            if let Some(attempt) = by_root(id) {
+                return Some(attempt);
+            }
+            let node = *self.nodes.get(id)?;
+            if let Some(attempt) = node.root_node_id.as_deref().and_then(by_root) {
+                return Some(attempt);
+            }
+            node_id = node.parent_node_id.as_deref();
+        }
+        None
+    }
 }
 
 struct AttemptFold {
@@ -1269,8 +1306,8 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     }
     let unfolded: HashSet<SharedString> = active_responses.iter().chain(&failed_runs).cloned().collect();
     let folds = turn_folds(&entries, &terminal, latest_run, &unfolded);
-    let attempts: Vec<Option<&model::RunAttempt>> =
-        entries.iter().map(|entry| entry_attempt(entry, projection)).collect();
+    let attempt_index = AttemptIndex::new(projection);
+    let attempts: Vec<Option<&model::RunAttempt>> = entries.iter().map(|entry| attempt_index.of(entry)).collect();
     let attempt_folds = attempt_folds(&entries, &attempts, &failed_runs);
     let attempt_hidden: HashSet<usize> = attempt_folds
         .values()

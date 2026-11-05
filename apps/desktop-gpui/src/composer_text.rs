@@ -30,7 +30,7 @@ pub fn is_currency(c: char) -> bool {
 
 /// The completion the caret is in, if any.
 pub fn detect(text: &str, cursor: usize) -> Option<Trigger> {
-    let cursor = cursor.min(text.len());
+    let cursor = text.floor_char_boundary(cursor);
     let start = text[..cursor].rfind(is_space).map(|i| i + 1).unwrap_or(0);
     let token = &text[start..cursor];
     let trigger = |kind, query: &str| Some(Trigger { kind, query: query.to_owned(), range: start..cursor });

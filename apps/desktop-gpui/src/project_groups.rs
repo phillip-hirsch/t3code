@@ -120,18 +120,39 @@ impl SortOrder {
     }
 }
 
-/// `normalizeProjectPathForComparison`: no trailing separators; Windows paths compare
-/// case-insensitively with backslashes.
+/// `normalizeProjectPathForComparison` (`packages/shared/src/path.ts`): no trailing
+/// separators except on a root; drive and UNC paths compare case-insensitively with
+/// backslashes.
 pub fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim();
-    let mut normalized = trimmed.trim_end_matches(['/', '\\']);
-    if normalized.is_empty() && !trimmed.is_empty() {
-        normalized = &trimmed[..1];
+    let normalized = trim_trailing_separators(path.trim());
+    if is_drive_path(&normalized) || normalized.starts_with("\\\\") {
+        normalized.replace('/', "\\").to_lowercase()
+    } else {
+        normalized
     }
-    let bytes = normalized.as_bytes();
-    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    let unc = normalized.starts_with("\\\\") || normalized.starts_with("//");
-    if drive || unc { normalized.replace('/', "\\").to_lowercase() } else { normalized.to_owned() }
+}
+
+/// `isWindowsDrivePath`: `C:` followed by a separator or nothing.
+fn is_drive_path(path: &str) -> bool {
+    match path.as_bytes() {
+        [drive, b':', rest @ ..] => drive.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/' | b'\\')),
+        _ => false,
+    }
+}
+
+/// `trimTrailingPathSeparators`: roots (`/`, `\`, `C:\`) stay, a bare drive gains its
+/// separator, and a POSIX path only sheds forward slashes.
+fn trim_trailing_separators(path: &str) -> String {
+    let is_root = |p: &str| matches!(p, "/" | "\\") || (p.len() == 3 && is_drive_path(p));
+    if path.is_empty() || is_root(path) {
+        return path.to_owned();
+    }
+    let trimmed = if path.starts_with('/') { path.trim_end_matches('/') } else { path.trim_end_matches(['/', '\\']) };
+    match trimmed {
+        "" => path.to_owned(),
+        _ if trimmed.len() == 2 && is_drive_path(trimmed) => format!("{trimmed}\\"),
+        _ => trimmed.to_owned(),
+    }
 }
 
 /// `derivePhysicalProjectKey`.
@@ -270,7 +291,9 @@ pub fn build_groups(
     let mut groups: Vec<ProjectGroup> = Vec::new();
     let mut index_by_key: HashMap<String, usize> = HashMap::new();
     for (physical_key, entries) in physical {
-        let winner = entries.iter().copied().reduce(|best, p| if fresher(p, best) { p } else { best }).unwrap();
+        let Some(winner) = entries.iter().copied().reduce(|best, p| if fresher(p, best) { p } else { best }) else {
+            continue;
+        };
         let identity_source = if winner.repository_identity.is_some() {
             winner
         } else {
@@ -319,7 +342,7 @@ pub fn build_groups(
 }
 
 fn parse_ms(value: Option<&str>) -> Option<i64> {
-    value.and_then(crate::inbox::parse_ms)
+    value.and_then(crate::timestamp::parse_ms)
 }
 
 /// `sortLogicalProjectsForSidebar` over the sidebar's listed threads: newest activity first
@@ -361,13 +384,9 @@ pub fn sort_groups(groups: &mut Vec<ProjectGroup>, threads: &[ThreadShell], orde
         })
         .collect();
     let mut keyed: Vec<(i64, ProjectGroup)> = times.into_iter().zip(std::mem::take(groups)).collect();
-    keyed.sort_by(|(a_time, a), (b_time, b)| {
-        let (a_title, b_title) = (&a.representative().title, &b.representative().title);
-        b_time
-            .cmp(a_time)
-            .then_with(|| a_title.to_lowercase().cmp(&b_title.to_lowercase()))
-            .then_with(|| a_title.cmp(b_title))
-            .then_with(|| a.key.cmp(&b.key))
+    keyed.sort_by_cached_key(|(time, group)| {
+        let title = &group.representative().title;
+        (std::cmp::Reverse(*time), title.to_lowercase(), title.clone(), group.key.clone())
     });
     *groups = keyed.into_iter().map(|(_, group)| group).collect();
 }
@@ -440,6 +459,24 @@ mod tests {
         assert_eq!(normalize_path("C:/Dev/T3/"), "c:\\dev\\t3");
         assert_eq!(normalize_path("/home/me/app//"), "/home/me/app");
         assert_eq!(normalize_path("/"), "/");
+        // Roots keep their separator; only backslash pairs are UNC (`isUncPath`).
+        for (path, want) in [
+            ("  C:\\  ", "c:\\"),
+            ("C:/", "c:\\"),
+            ("C:", "c:\\"),
+            ("c:\\\\", "c:\\"),
+            ("\\", "\\"),
+            ("///", "///"),
+            ("\\\\Server\\Share\\", "\\\\server\\share"),
+            ("//Server/Share/", "//Server/Share"),
+            ("/home/Me\\", "/home/Me\\"),
+            ("C:foo", "C:foo"),
+            ("", ""),
+            ("é:\\Ä/", "é:\\Ä"),
+            ("Ä", "Ä"),
+        ] {
+            assert_eq!(normalize_path(path), want, "{path:?}");
+        }
         assert_eq!(physical_key("env", "H:\\Dev\\App"), "env:h:\\dev\\app");
     }
 

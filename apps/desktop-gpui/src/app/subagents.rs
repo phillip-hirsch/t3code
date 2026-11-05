@@ -607,7 +607,7 @@ fn format_status(status: Option<(String, Option<String>, Option<String>)>, now_m
     if !live && status != "completed" {
         return label.into();
     }
-    let parse = |at: Option<&str>| at.and_then(crate::work_log::parse_iso_ms);
+    let parse = |at: Option<&str>| at.and_then(crate::timestamp::parse_ms);
     let (Some(start), Some(end)) =
         (parse(started.as_deref()), if live { Some(now_ms) } else { parse(completed.as_deref()) })
     else {
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn subagent_status_reads_like_the_web() {
-        let start = crate::work_log::parse_iso_ms("2026-01-01T00:00:00Z").unwrap();
+        let start = crate::timestamp::parse_ms("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(format_status(None, 0), "Starting");
         assert_eq!(format_status(status("running", None), start + 12_400), "Working 12s");
         assert_eq!(format_status(status("completed", Some("2026-01-01T00:03:02Z")), 0), "Completed in 3m 2s");

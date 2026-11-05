@@ -52,7 +52,7 @@ impl PullRequestLink {
 
     fn updated_ms(&self) -> i64 {
         let at = self.snapshot.as_ref().and_then(|s| s.updated_at.as_deref()).unwrap_or(&self.linked_at);
-        crate::inbox::parse_ms(at).unwrap_or(0)
+        crate::timestamp::parse_ms(at).unwrap_or(0)
     }
 }
 
@@ -64,7 +64,7 @@ pub fn visible(links: &[PullRequestLink]) -> impl Iterator<Item = &PullRequestLi
 /// `resolveThreadCurrentPullRequestLink` without native stacks: the newest open link, else the
 /// most recently updated one.
 fn current(links: &[PullRequestLink]) -> Option<&PullRequestLink> {
-    let newest_open = visible(links).filter(|l| l.is_open()).max_by_key(|l| crate::inbox::parse_ms(&l.linked_at));
+    let newest_open = visible(links).filter(|l| l.is_open()).max_by_key(|l| crate::timestamp::parse_ms(&l.linked_at));
     newest_open.or_else(|| visible(links).max_by_key(|l| l.updated_ms()))
 }
 

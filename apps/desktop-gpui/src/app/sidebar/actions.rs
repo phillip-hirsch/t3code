@@ -277,7 +277,7 @@ impl Workspace {
             let resnooze = entry
                 .snoozed_until
                 .as_ref()
-                .filter(|until| inbox::parse_ms(until).is_some_and(|until| until > now))
+                .filter(|until| crate::timestamp::parse_ms(until).is_some_and(|until| until > now))
                 .map(|until| command("thread.snooze", json!({"snoozedUntil": until})));
             let mut steps = Vec::new();
             match action {
@@ -382,7 +382,12 @@ impl Workspace {
             return;
         }
         let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.snooze", thread_id, json!({"snoozedUntil": inbox::iso(wake_ms)}), cx);
+        self.thread_command(
+            "thread.snooze",
+            thread_id,
+            json!({"snoozedUntil": crate::timestamp::iso(wake_ms).unwrap_or_default()}),
+            cx,
+        );
         self.push_undo(UndoAction::Snoozed, entry, cx);
         if advance {
             self.leave_thread(thread_id, window, cx);

@@ -5,13 +5,12 @@
 
 use std::collections::HashMap;
 
-use jiff::tz::TimeZone;
-use jiff::{Timestamp, ToSpan as _, civil::Date};
+use chrono::{DateTime, Datelike as _, Days, NaiveDate, TimeZone, Timelike as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::inbox::parse_ms;
 use crate::model::{Provider, UsageLimits, UsageWindow};
+use crate::timestamp::{iso, parse_ms};
 
 /// `USAGE_CONTRACT_VERSION` and `USAGE_MERGE_COMPATIBLE_SINCE`.
 const CONTRACT_VERSION: f64 = 6.;
@@ -427,25 +426,30 @@ pub fn models_by_tokens(models: &[ModelTotals]) -> Vec<ModelTotals> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
     pub days: u32,
-    pub since_day: Date,
-    pub until_day: Date,
+    pub since_day: NaiveDate,
+    pub until_day: NaiveDate,
     pub time_zone: String,
     /// Past 24h reads by the hour, ending on the minute.
     pub hours: Option<(i64, i64)>,
 }
 
 impl Window {
-    pub fn new(days: u32, now: Timestamp, tz: &TimeZone) -> Self {
-        let time_zone = tz.iana_name().unwrap_or("UTC").to_owned();
-        let day_of = |ms: i64| Timestamp::from_millisecond(ms).unwrap_or(now).to_zoned(tz.clone()).date();
-        let now_ms = now.as_millisecond();
-        let until_day = day_of(now_ms);
+    /// `time_zone` is `tz`'s IANA name, which the server buckets days by.
+    pub fn new<Tz: TimeZone>(days: u32, now_ms: i64, tz: &Tz, time_zone: String) -> Self {
+        let day_of = |ms: i64| zoned(ms, tz).map(|time| time.date_naive());
+        let until_day = day_of(now_ms).unwrap_or_default();
         if days == 1 {
             let until = now_ms.div_euclid(MINUTE) * MINUTE;
             let since = until - DAY;
-            return Self { days, since_day: day_of(since), until_day, time_zone, hours: Some((since, until)) };
+            return Self {
+                days,
+                since_day: day_of(since).unwrap_or(until_day),
+                until_day,
+                time_zone,
+                hours: Some((since, until)),
+            };
         }
-        let since_day = until_day.checked_sub((i64::from(days) - 1).days()).unwrap_or(until_day);
+        let since_day = until_day.checked_sub_days(Days::new(u64::from(days.saturating_sub(1)))).unwrap_or(until_day);
         Self { days, since_day, until_day, time_zone, hours: None }
     }
 
@@ -457,8 +461,8 @@ impl Window {
             "resolution": if self.hours.is_some() { "hour" } else { "day" },
         });
         if let Some((since, until)) = self.hours {
-            input["sinceTime"] = json!(iso(since));
-            input["untilTime"] = json!(iso(until));
+            input["sinceTime"] = json!(iso(since).unwrap_or_default());
+            input["untilTime"] = json!(iso(until).unwrap_or_default());
         }
         input
     }
@@ -474,9 +478,9 @@ impl Window {
                 let mut day = self.since_day;
                 while day <= self.until_day {
                     days.push(PeriodKey::Day(day.to_string()));
-                    match day.tomorrow() {
-                        Ok(next) => day = next,
-                        Err(_) => break,
+                    match day.succ_opt() {
+                        Some(next) => day = next,
+                        None => break,
                     }
                 }
                 days
@@ -499,7 +503,7 @@ impl PeriodKey {
         }
     }
 
-    pub fn label(&self, tz: &TimeZone) -> String {
+    pub fn label<Tz: TimeZone>(&self, tz: &Tz) -> String {
         match self {
             PeriodKey::Day(day) => format_day_short(day),
             PeriodKey::Hour(ms) => format_hour_short(*ms, tz),
@@ -507,8 +511,14 @@ impl PeriodKey {
     }
 }
 
-fn iso(ms: i64) -> String {
-    Timestamp::from_millisecond(ms).map(|t| t.strftime("%Y-%m-%dT%H:%M:%S.000Z").to_string()).unwrap_or_default()
+fn zoned<Tz: TimeZone>(ms: i64, tz: &Tz) -> Option<DateTime<Tz>> {
+    Some(DateTime::from_timestamp_millis(ms)?.with_timezone(tz))
+}
+
+/// "3 PM".
+fn hour_label<Tz: TimeZone>(time: &DateTime<Tz>) -> String {
+    let (pm, hour) = time.hour12();
+    format!("{hour} {}", if pm { "PM" } else { "AM" })
 }
 
 fn thousands(value: u64) -> String {
@@ -581,24 +591,23 @@ pub fn format_day_short(day: &str) -> String {
 }
 
 /// `formatHourShort` with a 12-hour clock: "3 PM".
-pub fn format_hour_short(ms: i64, tz: &TimeZone) -> String {
-    Timestamp::from_millisecond(ms).map(|t| t.to_zoned(tz.clone()).strftime("%-I %p").to_string()).unwrap_or_default()
+pub fn format_hour_short<Tz: TimeZone>(ms: i64, tz: &Tz) -> String {
+    zoned(ms, tz).map(|time| hour_label(&time)).unwrap_or_default()
 }
 
 /// `formatDateTimeShort`: "Nov 4, 3 PM".
-pub fn format_date_time_short(ms: i64, tz: &TimeZone) -> String {
-    let Ok(time) = Timestamp::from_millisecond(ms) else { return String::new() };
-    let zoned = time.to_zoned(tz.clone());
-    format!("{} {}, {}", MONTHS[zoned.month() as usize - 1], zoned.day(), zoned.strftime("%-I %p"))
+pub fn format_date_time_short<Tz: TimeZone>(ms: i64, tz: &Tz) -> String {
+    let Some(time) = zoned(ms, tz) else { return String::new() };
+    format!("{} {}, {}", MONTHS[time.month0() as usize], time.day(), hour_label(&time))
 }
 
 /// `formatRelativeHourShort`: "3 PM today", "3 PM yesterday", else the date and hour.
-pub fn format_relative_hour_short(ms: i64, reference_ms: i64, tz: &TimeZone) -> String {
-    let day = |ms: i64| Timestamp::from_millisecond(ms).ok().map(|t| t.to_zoned(tz.clone()).date());
+pub fn format_relative_hour_short<Tz: TimeZone>(ms: i64, reference_ms: i64, tz: &Tz) -> String {
+    let day = |ms: i64| zoned(ms, tz).map(|time| time.date_naive());
     let (Some(at), Some(reference)) = (day(ms), day(reference_ms)) else { return format_date_time_short(ms, tz) };
-    match at.until(reference).map(|span| span.get_days()) {
-        Ok(0) => format!("{} today", format_hour_short(ms, tz)),
-        Ok(1) => format!("{} yesterday", format_hour_short(ms, tz)),
+    match (reference - at).num_days() {
+        0 => format!("{} today", format_hour_short(ms, tz)),
+        1 => format!("{} yesterday", format_hour_short(ms, tz)),
         _ => format_date_time_short(ms, tz),
     }
 }
@@ -1565,16 +1574,17 @@ mod tests {
 
     #[test]
     fn windows_cover_calendar_days_or_the_past_24_hours() {
-        let tz = TimeZone::get("America/Los_Angeles").unwrap();
-        let now: Timestamp = "2026-11-05T18:30:42Z".parse().unwrap();
-        let month = Window::new(30, now, &tz);
+        // Pacific Standard Time, as America/Los_Angeles reads in November 2026.
+        let tz = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let now = parse_ms("2026-11-05T18:30:42Z").unwrap();
+        let month = Window::new(30, now, &tz, "America/Los_Angeles".into());
         assert_eq!(
             (month.since_day.to_string(), month.until_day.to_string()),
             ("2026-10-07".into(), "2026-11-05".into())
         );
         assert_eq!(month.periods().len(), 30);
         assert_eq!(month.to_json()["resolution"], "day");
-        let day = Window::new(1, now, &tz);
+        let day = Window::new(1, now, &tz, "America/Los_Angeles".into());
         let input = day.to_json();
         assert_eq!(
             (input["sinceTime"].as_str(), input["untilTime"].as_str()),

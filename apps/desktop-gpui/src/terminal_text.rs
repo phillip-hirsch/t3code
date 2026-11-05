@@ -3,6 +3,8 @@
 //! Carriage returns, cursor moves, saves and erases apply, so progress bars
 //! fold in place; colors and other escapes are dropped.
 
+use gpui_kit::SharedString;
+
 /// `TERMINAL_OUTPUT_TAIL_CHARS`: older output is dropped and flagged.
 const TAIL_CHARS: usize = 64 * 1024;
 /// `LIVE_LINES`: lines further up are settled and cursor moves cannot reach them.
@@ -23,6 +25,8 @@ enum Parse {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TerminalText {
     lines: Vec<Vec<char>>,
+    /// [`Self::text_content`], rebuilt once per append so rendering only clones it.
+    folded: SharedString,
     row: usize,
     col: usize,
     saved: Option<(usize, usize)>,
@@ -62,6 +66,7 @@ impl TerminalText {
             }
         }
         self.trim();
+        self.folded = self.fold().into();
     }
 
     /// Starts over, keeping [`Self::truncated`].
@@ -101,15 +106,11 @@ impl TerminalText {
         let top = self.lines.len().saturating_sub(LIVE_LINES);
         match command {
             'A' => self.row = self.row.saturating_sub(count).max(top),
-            'B' => {
-                self.row += count;
-                while self.lines.len() <= self.row {
-                    self.lines.push(Vec::new());
-                }
-            }
-            'C' => self.col += count,
+            // `moveTo`: rows stay on existing lines, columns within the tail budget.
+            'B' => self.row = self.row.saturating_add(count).min(self.lines.len() - 1),
+            'C' => self.col = self.col.saturating_add(count).min(TAIL_CHARS),
             'D' => self.col = self.col.saturating_sub(count),
-            'G' => self.col = count - 1,
+            'G' => self.col = (count - 1).min(TAIL_CHARS),
             'K' => {
                 let line = &mut self.lines[self.row];
                 match n.unwrap_or(0) {
@@ -152,7 +153,11 @@ impl TerminalText {
     }
 
     /// The folded text, without trailing blank lines.
-    pub fn text_content(&self) -> String {
+    pub fn text_content(&self) -> SharedString {
+        self.folded.clone()
+    }
+
+    fn fold(&self) -> String {
         let end = self.lines.iter().rposition(|line| !line.is_empty()).map_or(0, |i| i + 1);
         let mut out = String::new();
         for (index, line) in self.lines[..end].iter().enumerate() {
@@ -174,7 +179,7 @@ mod tests {
         for chunk in chunks {
             text.append(chunk);
         }
-        text.text_content()
+        text.text_content().to_string()
     }
 
     #[test]
@@ -208,5 +213,16 @@ mod tests {
         }
         assert!(text.truncated);
         assert!(text.text_content().len() <= TAIL_CHARS);
+    }
+
+    #[test]
+    fn huge_cursor_moves_stay_bounded() {
+        let mut text = TerminalText::default();
+        text.append("a\nb\x1b[99999999Bc");
+        assert_eq!(&*text.text_content(), "a\nbc", "moving down stops at the last line");
+        text.append("\x1b[99999999Cd\x1b[99999999Ge");
+        text.append(&format!("\x1b[{}B\x1b[{}C!", usize::MAX, usize::MAX));
+        assert!(text.lines.iter().all(|line| line.len() <= TAIL_CHARS + 1));
+        assert!(text.text_content().ends_with('!'));
     }
 }

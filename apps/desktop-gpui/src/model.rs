@@ -1297,7 +1297,7 @@ pub struct ThreadProjection {
 impl ThreadProjection {
     /// `latestExecutedRun`: the run that ran last, unfinished runs counting as latest.
     pub fn latest_executed_run(&self) -> Option<&Run> {
-        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::inbox::parse_ms).unwrap_or(i64::MAX);
+        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::timestamp::parse_ms).unwrap_or(i64::MAX);
         self.runs
             .iter()
             .filter(|run| run.status != "queued" && !(run.status == "cancelled" && run.started_at.is_none()))
@@ -1324,7 +1324,8 @@ impl ThreadProjection {
                     && item.node_id == run.root_node_id
             })
             .max_by(|a, b| {
-                let at = |item: &TurnItem| item.str("updatedAt").and_then(crate::inbox::parse_ms).unwrap_or_default();
+                let at =
+                    |item: &TurnItem| item.str("updatedAt").and_then(crate::timestamp::parse_ms).unwrap_or_default();
                 at(a).cmp(&at(b)).then(a.ordinal.cmp(&b.ordinal)).then(a.id.cmp(&b.id))
             })?;
         (failure.raw["failure"]["class"] == "usage_limit").then_some(run.id.as_str())

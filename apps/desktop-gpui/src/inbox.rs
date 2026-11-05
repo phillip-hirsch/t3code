@@ -10,48 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use crate::model::{ProjectShell, ThreadShell};
-
-/// Milliseconds since the Unix epoch for an ISO-8601 timestamp (`Date.parse`).
-pub fn parse_ms(iso: &str) -> Option<i64> {
-    let bytes = iso.as_bytes();
-    let num = |range: std::ops::Range<usize>| -> Option<i64> {
-        let part = iso.get(range)?;
-        part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse().ok())?
-    };
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    let mut rest = &iso[19..];
-    let mut millis = 0;
-    if let Some(fraction) = rest.strip_prefix('.') {
-        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        let padded = fraction.bytes().take(digits.min(3)).chain(std::iter::repeat(b'0')).take(3);
-        millis = padded.fold(0, |ms, b| ms * 10 + i64::from(b - b'0'));
-        rest = &fraction[digits..];
-    }
-    let offset_minutes = match rest {
-        "Z" | "z" => 0,
-        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) => {
-            let sign = if rest.starts_with('-') { -1 } else { 1 };
-            sign * (rest[1..3].parse::<i64>().ok()? * 60 + rest[4..6].parse::<i64>().ok()?)
-        }
-        _ => return None,
-    };
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    // Days from civil, Howard Hinnant's algorithm.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(((days * 24 + hour) * 60 + minute - offset_minutes) * 60_000 + second * 1000 + millis)
-}
+use crate::timestamp::parse_ms;
 
 fn ms(value: Option<&str>) -> Option<i64> {
     value.and_then(parse_ms)
@@ -95,9 +54,7 @@ pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadSh
             .unwrap_or(i64::MIN)
     };
     let mut sorted: Vec<&ProjectShell> = projects.iter().filter(|p| p.archived_at.is_none()).collect();
-    sorted.sort_by(|a, b| {
-        project_time(b).cmp(&project_time(a)).then_with(|| a.title.cmp(&b.title)).then_with(|| a.id.cmp(&b.id))
-    });
+    sorted.sort_by_cached_key(|p| (Reverse(project_time(p)), p.title.clone(), p.id.clone()));
     sorted
 }
 
@@ -821,7 +778,11 @@ impl SnoozeSetting {
     }
 }
 
-/// The server's `snoozePresets`, else `DEFAULT_SNOOZE_PRESETS`.
+/// `MAX_SNOOZE_PRESET_MINUTES`: a duration preset is 1 minute to 30 days.
+pub const MAX_SNOOZE_PRESET_MINUTES: i64 = 30 * 24 * 60;
+
+/// The server's `snoozePresets`, else `DEFAULT_SNOOZE_PRESETS`. Entries the
+/// contract rejects are skipped, keeping the rest.
 pub fn snooze_settings(value: &serde_json::Value) -> Vec<SnoozeSetting> {
     let Some(entries) = value.as_array() else {
         let at = |day: &str, hour| SnoozeSetting::At { day: day.into(), hour, minute: 0 };
@@ -836,7 +797,10 @@ pub fn snooze_settings(value: &serde_json::Value) -> Vec<SnoozeSetting> {
     entries
         .iter()
         .filter_map(|entry| match entry["kind"].as_str()? {
-            "after" => Some(SnoozeSetting::After { minutes: entry["minutes"].as_i64()? }),
+            "after" => entry["minutes"]
+                .as_i64()
+                .filter(|minutes| (1..=MAX_SNOOZE_PRESET_MINUTES).contains(minutes))
+                .map(|minutes| SnoozeSetting::After { minutes }),
             "at" => {
                 let (hour, minute) = entry["time"].as_str()?.split_once(':')?;
                 let day = entry["day"].as_str()?.to_owned();
@@ -890,7 +854,8 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
             } else {
                 plural(*minutes, "minute")
             };
-            (now.clone() + chrono::Duration::minutes(*minutes), format!("In {duration}"), false)
+            let wake = now.clone().checked_add_signed(chrono::TimeDelta::try_minutes(*minutes)?)?;
+            (wake, format!("In {duration}"), false)
         }
         SnoozeSetting::At { day, hour, minute } => {
             let today = now.weekday().num_days_from_sunday() as i64;
@@ -959,11 +924,6 @@ pub fn pick_snooze<Tz: chrono::TimeZone>(
         return Some(preset.wake_ms);
     }
     shown.iter().find(|p| p.id == id).map(|p| p.wake_ms).filter(|wake| *wake > now.timestamp_millis())
-}
-
-/// An ISO-8601 UTC timestamp, as `Date#toISOString`.
-pub fn iso(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 const PIN_DIGITS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
@@ -1048,7 +1008,10 @@ pub fn resolve_custom_snooze<Tz: chrono::TimeZone>(
             if !amount.is_finite() || amount <= 0. {
                 return Err(ERROR);
             }
-            Ok(now_ms + (amount * unit_ms).round() as i64)
+            // `as` saturates a huge amount; anything past chrono's range is no date at all.
+            let wake = now_ms.checked_add((amount * unit_ms).round() as i64).ok_or(ERROR)?;
+            chrono::DateTime::from_timestamp_millis(wake).ok_or(ERROR)?;
+            Ok(wake)
         }
         CustomSnooze::Date { date, time } => {
             const ERROR: &str = "Choose a valid date and time in the future.";
@@ -1128,17 +1091,6 @@ mod tests {
 
     fn now() -> i64 {
         parse_ms(NOW).unwrap()
-    }
-
-    #[test]
-    fn parses_iso_timestamps() {
-        assert_eq!(parse_ms("1970-01-01T00:00:00.000Z"), Some(0));
-        assert_eq!(parse_ms("2026-11-04T10:15:00.000Z"), Some(1_793_787_300_000));
-        assert_eq!(parse_ms("2026-11-04T10:15:00.5Z"), Some(1_793_787_300_500));
-        assert_eq!(parse_ms("2026-11-04T12:15:00+02:00"), Some(1_793_787_300_000));
-        assert_eq!(parse_ms("2026-11-04T12:15:00.5+02:00"), Some(1_793_787_300_500));
-        assert_eq!(parse_ms("2026-11-04"), None);
-        assert_eq!(parse_ms("garbage"), None);
     }
 
     #[test]
@@ -1472,10 +1424,11 @@ mod tests {
         let late = zone.with_ymd_and_hms(2026, 11, 3, 23, 30, 0).unwrap();
         assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 90 }, &late).unwrap().when_label, "Wed 1:00 AM");
         assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 2880 }, &late).unwrap().label, "In 2 days");
+        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: i64::MAX }, &late), None);
+        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: i64::MAX / 60_000 }, &late), None);
         let later = now + chrono::Duration::minutes(10);
         assert_eq!(pick_snooze(&presets, "after:60", &settings, &later), Some(later.timestamp_millis() + 3_600_000));
         assert_eq!(pick_snooze(&presets, "at:tomorrow:09:00", &settings, &later), Some(presets[3].wake_ms));
-        assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]
@@ -1503,6 +1456,22 @@ mod tests {
         assert!(resolve_custom_snooze(&at("2026-02-30", "09:00"), &now).is_err(), "no such day");
         assert_eq!(resolve_custom_snooze(&after("1.5"), &now), Ok(now.timestamp_millis() + 5_400_000));
         assert_eq!(resolve_custom_snooze(&after("0"), &now), Err("Enter a positive duration."));
+        for huge in ["1e20", "1e300", "9223372036854775807"] {
+            assert_eq!(resolve_custom_snooze(&after(huge), &now), Err("Enter a positive duration."), "{huge}");
+        }
+    }
+
+    #[test]
+    fn snooze_settings_skip_presets_the_contract_rejects_and_keep_the_rest() {
+        let value = serde_json::json!([
+            {"kind": "after", "minutes": 30},
+            {"kind": "after", "minutes": i64::MAX},
+            {"kind": "after", "minutes": 0},
+            {"kind": "after", "minutes": 1e30},
+            {"kind": "at", "day": "today", "time": "18:00"},
+        ]);
+        let at = SnoozeSetting::At { day: "today".into(), hour: 18, minute: 0 };
+        assert_eq!(snooze_settings(&value), [SnoozeSetting::After { minutes: 30 }, at]);
     }
 
     #[test]

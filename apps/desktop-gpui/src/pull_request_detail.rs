@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::inbox::parse_ms;
+use crate::timestamp::parse_ms;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

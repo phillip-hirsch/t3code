@@ -390,7 +390,7 @@ pub(super) fn one_click_update_candidates(providers: &[Value]) -> Vec<(String, S
 /// "Checked 5m ago" from the newest `checkedAt` (`ProviderLastChecked`).
 pub(super) fn last_checked_label(providers: &[Value], now_ms: i64) -> Option<String> {
     let latest = providers.iter().filter_map(|p| p["checkedAt"].as_str()).max()?;
-    let Some(checked) = crate::inbox::parse_ms(latest) else { return Some("Checked unavailable".into()) };
+    let Some(checked) = crate::timestamp::parse_ms(latest) else { return Some("Checked unavailable".into()) };
     let minutes = (now_ms - checked).max(0) / 60_000;
     Some(match minutes {
         0 => "Checked just now".into(),

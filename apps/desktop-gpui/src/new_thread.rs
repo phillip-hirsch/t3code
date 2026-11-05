@@ -8,6 +8,7 @@ use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use crate::model::{ModelSelection, ProjectShell, Provider, ServerInfo, UsageWindow};
+use crate::project_groups::normalize_path;
 use crate::rpc::RpcClient;
 
 /// `VCS_REF_LIST_LIMIT` in `apps/web/src/state/queries.ts`.
@@ -238,23 +239,13 @@ fn is_new_project_folder(root: &str, folder: &str) -> bool {
     folder.strip_prefix(&prefix).is_some_and(|rest| !rest.is_empty() && !rest.contains(separator))
 }
 
-fn normalize_path(path: &str) -> String {
-    let path = path.trim();
-    let trimmed = if path.starts_with('/') { path.trim_end_matches('/') } else { path.trim_end_matches(['/', '\\']) };
-    // Roots like "/" and "C:\" keep their separator.
-    let path = if trimmed.is_empty() || trimmed.ends_with(':') { path } else { trimmed };
-    let bytes = path.as_bytes();
-    let windows = (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') || path.starts_with("\\\\");
-    if windows { path.replace('/', "\\").to_lowercase() } else { path.to_owned() }
-}
-
 /// `exhaustedUsageWindow` (`packages/shared/src/usageLimits.ts`): a spent window
 /// that has not reset, limited to the pool `model` draws from.
-fn exhausted_window<'a>(provider: &'a Provider, now: jiff::Timestamp, model: &str) -> Option<&'a UsageWindow> {
+fn exhausted_window<'a>(provider: &'a Provider, now_ms: i64, model: &str) -> Option<&'a UsageWindow> {
     let windows = provider.usage_limits.as_ref().map(|limits| limits.windows.as_slice()).unwrap_or_default();
     let mut exhausted = windows.iter().filter(|window| {
         window.used_percent >= 100.
-            && window.resets_at.as_deref().and_then(|at| at.parse::<jiff::Timestamp>().ok()).is_none_or(|at| at > now)
+            && window.resets_at.as_deref().and_then(crate::timestamp::parse_ms).is_none_or(|at| at > now_ms)
     });
     match provider.driver.as_str() {
         "cursor" => {
@@ -292,17 +283,17 @@ pub fn usage_fallback(
     info: &ServerInfo,
     default: &ModelSelection,
     project_id: Option<&str>,
-    now: jiff::Timestamp,
+    now_ms: i64,
 ) -> Option<UsageFallback> {
     let fallback = ModelSelection::deserialize(info.settings.get("fallbackModelSelection")).ok()?;
     let provider = info.provider(&default.instance_id)?;
-    let window = exhausted_window(provider, now, &default.model)?;
+    let window = exhausted_window(provider, now_ms, &default.model)?;
     let target = info.provider(&fallback.instance_id)?;
     let usable = target.enabled
         && target.installed
         && target.auth.status != "unauthenticated"
         && target.availability.as_deref() != Some("unavailable")
-        && exhausted_window(target, now, &fallback.model).is_none()
+        && exhausted_window(target, now_ms, &fallback.model).is_none()
         && crate::settings::scope::provider_instance_enabled(&info.settings, project_id, &target.instance_id);
     usable.then(|| UsageFallback {
         selection: fallback,
@@ -398,7 +389,7 @@ mod tests {
 
     #[test]
     fn spent_usage_moves_new_threads_to_a_usable_fallback() {
-        let now: jiff::Timestamp = "2026-11-05T12:00:00Z".parse().unwrap();
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
         let window =
             |used: f64, resets: &str| json!({"id": "w", "label": "5h", "usedPercent": used, "resetsAt": resets});
         let provider = |id: &str, driver: &str, windows: Value, extra: Value| {
@@ -442,7 +433,7 @@ mod tests {
 
     #[test]
     fn cursor_and_opencode_limits_apply_to_their_own_pools() {
-        let now: jiff::Timestamp = "2026-11-05T12:00:00Z".parse().unwrap();
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
         let provider = |driver: &str, ids: &[&str]| -> Provider {
             let windows: Vec<Value> = ids.iter().map(|id| json!({"id": id, "label": id, "usedPercent": 100})).collect();
             serde_json::from_value(json!({"instanceId": "x", "driver": driver, "usageLimits": {"windows": windows}}))

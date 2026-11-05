@@ -477,8 +477,9 @@ impl Workspace {
 
     fn snooze_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
-        let saved: Vec<Preset> =
-            serde_json::from_value(view.value("snoozePresets").clone()).unwrap_or_else(|_| snooze::defaults());
+        let saved: Vec<Preset> = serde_json::from_value::<Vec<Preset>>(view.value("snoozePresets").clone())
+            .map(|presets| presets.into_iter().filter(Preset::in_range).collect())
+            .unwrap_or_else(|_| snooze::defaults());
         let editor = window.use_keyed_state("settings-snooze-editor", cx, |_, _| SnoozeEditor::default());
         editor.update(cx, |editor, _| editor.adopt(&saved));
         let presets = editor.read(cx).presets();

@@ -19,7 +19,8 @@ use crate::worktree_setup::{self, Snapshot, Stage};
 #[derive(Default)]
 pub(super) struct SetupWatch {
     thread_id: Option<String>,
-    pub(super) snapshot: Option<Snapshot>,
+    /// Shared with the timeline row, so a refresh never copies the stage logs.
+    pub(super) snapshot: Option<Rc<Snapshot>>,
     details_open: bool,
     _task: Option<Task<()>>,
 }
@@ -44,7 +45,7 @@ impl Workspace {
             while let Some(event) = stream.next().await {
                 let ended = this.update(cx, |this, cx| match event {
                     StreamEvent::Item(value) if this.setup.thread_id.as_deref() == Some(thread_id.as_str()) => {
-                        let next = serde_json::from_value::<Option<Snapshot>>(value).ok().flatten();
+                        let next = serde_json::from_value::<Option<Rc<Snapshot>>>(value).ok().flatten();
                         // Keep the newer of the two: a late event never rolls the card back.
                         let newer = match (&this.setup.snapshot, &next) {
                             (Some(held), Some(next)) => {
@@ -98,9 +99,9 @@ impl Workspace {
 }
 
 fn elapsed(start: Option<&str>, end: Option<&str>, live: bool) -> Option<String> {
-    let start = crate::work_log::parse_iso_ms(start?)?;
+    let start = crate::timestamp::parse_ms(start?)?;
     let end = match end {
-        Some(end) => crate::work_log::parse_iso_ms(end)?,
+        Some(end) => crate::timestamp::parse_ms(end)?,
         None if live => super::sidebar::now_ms(),
         None => return None,
     };

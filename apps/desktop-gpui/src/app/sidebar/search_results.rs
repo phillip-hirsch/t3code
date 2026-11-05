@@ -55,7 +55,7 @@ impl Workspace {
                     let mut title_field = Weighted::new(&title, 1.);
                     title_field.mid_word = true;
                     let found = search::match_fields(&tokens, &[title_field, Weighted::new(&branch, 0.6)], typos)?;
-                    let used = inbox::parse_ms(
+                    let used = crate::timestamp::parse_ms(
                         thread
                             .latest_user_authored_message_at
                             .clone()
@@ -170,8 +170,9 @@ impl Workspace {
                 let muted_icon = settled && !active;
                 let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
                 let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-                let time = inbox::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
-                    .map(|at| inbox::format_relative(now - at));
+                let time =
+                    crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
+                        .map(|at| inbox::format_relative(now - at));
                 let title_color = if active {
                     sb.foreground
                 } else if settled {

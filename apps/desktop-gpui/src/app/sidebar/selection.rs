@@ -237,7 +237,7 @@ impl Workspace {
             return;
         }
         self.clear_selection(cx);
-        let until = inbox::iso(wake_ms);
+        let until = crate::timestamp::iso(wake_ms).unwrap_or_default();
         let mut commands = Vec::new();
         for id in ids {
             let entry = self.undo_entry(id);

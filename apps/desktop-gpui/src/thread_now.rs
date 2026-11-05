@@ -68,7 +68,7 @@ pub fn run_stop(runs: &[Run], turn_items: &[std::rc::Rc<TurnItem>]) -> Option<Ru
     Some(RunStop {
         unresponsive,
         run_id: run.id.clone().into(),
-        requested_at_ms: work_log::parse_iso_ms(requested_at)?,
+        requested_at_ms: crate::timestamp::parse_ms(requested_at)?,
         background: active.is_none(),
     })
 }
@@ -157,7 +157,7 @@ pub fn background_work(
             title: title.into(),
             description: activity(only).map(Into::into),
             commands_only,
-            started_at_ms: only.item.and_then(|item| item.str("startedAt")).and_then(work_log::parse_iso_ms),
+            started_at_ms: only.item.and_then(|item| item.str("startedAt")).and_then(crate::timestamp::parse_ms),
             open_thread: only
                 .task
                 .child_thread_id
@@ -184,8 +184,9 @@ pub fn background_work(
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
         _ => groups.join(""),
     };
-    let updated =
-        |row: &Task| subagent(row).and_then(|item| item.str("updatedAt")).and_then(work_log::parse_iso_ms).unwrap_or(0);
+    let updated = |row: &Task| {
+        subagent(row).and_then(|item| item.str("updatedAt")).and_then(crate::timestamp::parse_ms).unwrap_or(0)
+    };
     let newest = rows.iter().filter(|row| activity(row).is_some()).max_by_key(|row| updated(row));
     let description = match newest {
         Some(row) => format!("{}: {}", row.label, activity(row).unwrap_or_default()),
@@ -224,8 +225,9 @@ pub fn goal(goal: &ThreadGoal, working: bool) -> Goal {
             None => format!("{} tokens", goal_tokens(used)),
         });
     }
-    if let Some(seconds) = goal.time_used_seconds.filter(|s| *s >= 60) {
-        usage.push(work_log::format_duration(seconds as i64 * 1000));
+    let used_ms = goal.time_used_seconds.filter(|s| *s >= 60).and_then(|s| i64::try_from(s).ok()?.checked_mul(1000));
+    if let Some(ms) = used_ms {
+        usage.push(work_log::format_duration(ms));
     }
     if let Some(checks) = goal.checks.filter(|c| *c > 0) {
         usage.push(format!("{checks} {}", if checks == 1 { "check" } else { "checks" }));
@@ -261,9 +263,10 @@ impl StatusLine {
         match self {
             StatusLine::Snoozed { until_ms } => {
                 let remaining = until_ms - now;
-                let label = match crate::inbox::format_wake(remaining) {
-                    wake if wake == "now" => "Snoozed".to_owned(),
-                    wake => format!("Snoozed, {wake} left"),
+                let label = if remaining <= 0 {
+                    "Snoozed".to_owned()
+                } else {
+                    format!("Snoozed, {} left", crate::inbox::format_wake(remaining))
                 };
                 (label, crate::inbox::wake_changes_in(remaining))
             }
@@ -279,10 +282,7 @@ impl StatusLine {
 
 /// `formatRelativeTimeLabel`.
 fn relative_label(elapsed_ms: i64) -> String {
-    match crate::inbox::format_relative(elapsed_ms) {
-        now if now == "now" => "just now".into(),
-        value => format!("{value} ago"),
-    }
+    if elapsed_ms < 60_000 { "just now".into() } else { format!("{} ago", crate::inbox::format_relative(elapsed_ms)) }
 }
 
 /// `childThreadInputsTitle`.

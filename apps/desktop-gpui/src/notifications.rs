@@ -64,7 +64,7 @@ impl Observation {
             matches!(status, Status::Input | Status::Request | Status::Approval | Status::Failed | Status::Limited)
                 .then(|| (thread.latest_run_id.clone(), status));
         let settled = status == Status::Ready && facts.latest_run_status() == Some("completed");
-        let completed_at = facts.latest_run_completed_at().filter(|_| settled).and_then(inbox::parse_ms);
+        let completed_at = facts.latest_run_completed_at().filter(|_| settled).and_then(crate::timestamp::parse_ms);
         (Self { attention, settled, completed_at }, status)
     }
 }
