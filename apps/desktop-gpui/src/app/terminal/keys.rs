@@ -49,16 +49,41 @@ pub(super) fn key_action(
     alt_screen: bool,
     has_selection: bool,
 ) -> Option<KeyAction> {
+    key_action_on(keystroke, app_cursor, alt_screen, has_selection, cfg!(target_os = "macos"))
+}
+
+/// [`key_action`] as on macOS, where ⌘ (not Ctrl) copies, pastes, selects all and jumps
+/// through history, and every Ctrl chord reaches the shell (`isTerminalCopyShortcut`).
+fn key_action_on(
+    keystroke: &Keystroke,
+    app_cursor: bool,
+    alt_screen: bool,
+    has_selection: bool,
+    mac: bool,
+) -> Option<KeyAction> {
     let m = &keystroke.modifiers;
+    let key = keystroke.key.as_str();
+    if mac && m.platform && !m.control && !m.alt && !m.function {
+        return match (key, m.shift) {
+            ("a", false) => Some(KeyAction::SelectAll),
+            // macOS keeps the selection after a copy.
+            ("c", _) if has_selection => Some(KeyAction::Copy { keep_selection: true }),
+            ("v", false) => Some(KeyAction::Paste),
+            ("home", true) if !alt_screen => Some(KeyAction::Scroll(History::Top)),
+            ("end", true) if !alt_screen => Some(KeyAction::Scroll(History::Bottom)),
+            _ => None,
+        };
+    }
     if m.platform || m.function {
         return None;
     }
-    let key = keystroke.key.as_str();
     let (ctrl, alt, shift) = (m.control, m.alt, m.shift);
-    if ctrl && shift && !alt && key == "a" {
+    // Off macOS, Ctrl (with Shift where the shell needs the plain chord) is the terminal's own.
+    let shortcuts = !mac;
+    if shortcuts && ctrl && shift && !alt && key == "a" {
         return Some(KeyAction::SelectAll);
     }
-    if shift && !alt && !alt_screen {
+    if shift && !alt && !alt_screen && (shortcuts || !ctrl) {
         let scroll = match (key, ctrl) {
             ("pageup", false) => Some(History::PageUp),
             ("pagedown", false) => Some(History::PageDown),
@@ -71,10 +96,10 @@ pub(super) fn key_action(
         }
     }
     // `isTerminalCopyShortcut` / `isTerminalPasteShortcut` on Windows and Linux.
-    if has_selection && ctrl && !alt && (key == "c" || (key == "insert" && !shift)) {
+    if shortcuts && has_selection && ctrl && !alt && (key == "c" || (key == "insert" && !shift)) {
         return Some(KeyAction::Copy { keep_selection: shift });
     }
-    if (ctrl && !alt && key == "v") || (shift && !ctrl && !alt && key == "insert") {
+    if shortcuts && ((ctrl && !alt && key == "v") || (shift && !ctrl && !alt && key == "insert")) {
         return Some(KeyAction::Paste);
     }
     // `terminalNavigationShortcutData`: Alt+arrows move by word.
@@ -187,6 +212,25 @@ mod tests {
 
     fn key(spec: &'static str) -> Keystroke {
         Keystroke::parse(spec).unwrap()
+    }
+
+    /// Windows and Linux keys; [`macos_keys_use_command`] checks macOS.
+    fn key_action(keystroke: &Keystroke, app_cursor: bool, alt_screen: bool, has_selection: bool) -> Option<KeyAction> {
+        key_action_on(keystroke, app_cursor, alt_screen, has_selection, false)
+    }
+
+    #[test]
+    fn macos_keys_use_command() {
+        let mac = |spec: &'static str, selection: bool| key_action_on(&key(spec), false, false, selection, true);
+        assert_eq!(mac("cmd-c", true), Some(KeyAction::Copy { keep_selection: true }));
+        assert_eq!(mac("cmd-c", false), None);
+        assert_eq!(mac("cmd-v", false), Some(KeyAction::Paste));
+        assert_eq!(mac("cmd-a", false), Some(KeyAction::SelectAll));
+        assert_eq!(mac("cmd-shift-home", false), Some(KeyAction::Scroll(History::Top)));
+        assert_eq!(mac("cmd-k", false), None, "other ⌘ chords are the app's");
+        assert_eq!(mac("ctrl-c", true), Some(KeyAction::Send("".into())), "Ctrl+C interrupts even over a selection");
+        assert_eq!(mac("ctrl-v", false), Some(KeyAction::Send("".into())));
+        assert_eq!(mac("shift-pageup", false), Some(KeyAction::Scroll(History::PageUp)));
     }
 
     fn send(spec: &'static str) -> Option<String> {
