@@ -154,6 +154,23 @@ fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
     }
 }
 
+/// How long a card stream that ended while still wanted waits before it subscribes again.
+const RESUBSCRIBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clears an ended stream's task after [`RESUBSCRIBE_AFTER`], so the next render subscribes
+/// again without looping on a server that keeps failing.
+async fn resubscribe_after_backoff(
+    this: &WeakEntity<Workspace>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+    clear: impl FnOnce(&mut Workspace),
+) {
+    cx.background_executor().timer(RESUBSCRIBE_AFTER).await;
+    let _ = this.update(cx, |this, cx| {
+        clear(this);
+        cx.notify();
+    });
+}
+
 impl Workspace {
     /// Whether the card is on screen, inline or as the popover.
     pub(super) fn details_shown(&self, window: &Window) -> bool {

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::{Shelf, now_ms};
 use crate::app::thread_menu::hosted_thread_link;
-use crate::app::{Target, Workspace, new_id};
+use crate::app::{Workspace, new_id};
 use crate::inbox::{self, Facts};
 
 /// The undoable actions (`showThreadUndoNotice`).
@@ -332,7 +332,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.target.as_ref() != Some(&Target::Thread(thread_id.to_owned())) {
+        if self.route_thread() != Some(thread_id) {
             return;
         }
         let order = &self.sidebar.inbox_order;
@@ -476,7 +476,7 @@ impl Workspace {
                 return;
             }
             this.push_undo(UndoAction::Archived, entry, cx);
-            if this.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
+            if this.route_thread() == Some(thread_id.as_str()) {
                 this.start_draft(project_id, window, cx);
             }
         });

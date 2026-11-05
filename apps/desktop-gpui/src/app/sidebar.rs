@@ -70,6 +70,7 @@ pub(super) struct SidebarState {
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
     groups: RefCell<GroupsCache>,
+    search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
     collapsed_folders: HashSet<String>,
     /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
@@ -141,6 +142,7 @@ impl SidebarState {
             undo: None,
             scope: Vec::new(),
             groups: RefCell::default(),
+            search_ranking: RefCell::default(),
             collapsed_folders: HashSet::new(),
             inbox_order: Vec::new(),
             thread_order: Vec::new(),

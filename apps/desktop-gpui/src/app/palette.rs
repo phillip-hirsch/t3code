@@ -435,6 +435,7 @@ impl Workspace {
                 let Some(search) = slot(this).filter(|s| s.query == query) else { return };
                 search.pending = false;
                 search.matches = result
+                    .inspect_err(|error| log::warn!("orchestration.searchThreads: {error}"))
                     .ok()
                     .and_then(|value| value["matches"].as_array().cloned())
                     .into_iter()
