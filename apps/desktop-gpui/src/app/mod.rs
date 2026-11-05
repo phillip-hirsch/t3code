@@ -421,6 +421,8 @@ impl Workspace {
         };
         workspace.sync_snap_shot(window, cx);
         workspace.sync_saved_sessions(window, cx);
+        #[cfg(windows)]
+        preview::PreviewState::warm_up(window, cx);
         workspace
     }
 
