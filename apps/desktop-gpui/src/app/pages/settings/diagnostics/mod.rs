@@ -31,6 +31,7 @@ use super::connections::logic::{DIAGNOSTICS_READ, ENVIRONMENT_MAINTAIN, ORCHESTR
 use super::connections::ui::WebButton;
 use super::widgets::section_with_action;
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
@@ -815,12 +816,16 @@ fn tree_name(
 }
 
 impl Workspace {
-    pub(super) fn render_settings_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_diagnostics(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-diagnostics", cx, |_, _| DiagnosticsState::default());
         let (client, endpoint) = (self.client(), self.endpoint.clone());
         state.update(cx, |s, cx| s.start(client.clone(), endpoint, cx));
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let s = state.read(cx);
         let blocked = match (&client, &s.session) {
             (None, _) => Some("Connect an environment to see diagnostics."),

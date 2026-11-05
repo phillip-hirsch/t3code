@@ -28,6 +28,7 @@ use super::widgets::{RowFrame, card, select_trigger, settings_section};
 
 const MOD_LABEL: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::keybindings::{
     self, Rule, STATIC_COMMANDS, Shortcut, When, defaults, parse_shortcut, parse_when, shortcut_input, when_expression,
 };
@@ -1707,17 +1708,21 @@ impl Workspace {
         panel.is_some_and(|panel| panel.read(cx).recording.is_some())
     }
 
-    pub(super) fn render_keybindings_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_keybindings_section(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (workspace, source, connected) =
             (cx.entity(), self.server_info.keybindings.clone(), self.client().is_some());
-        let view = self
+        let panel = self
             .keybindings_panel
             .get_or_insert_with(|| cx.new(|cx| KeybindingsPanel::new(workspace, source, connected, window, cx)).into())
             .clone();
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.
-        let settings = self.settings_view();
-        self.settings_page("keybindings", &settings, [div().child(view).into_any_element()], cx)
+        self.settings_page("keybindings", view, [div().child(panel).into_any_element()], cx)
     }
 }
 

@@ -39,9 +39,13 @@ fn cleanup_patch(project_scope: bool, field: &str, value: Value) -> Value {
 }
 
 impl Workspace {
-    pub(super) fn render_worktrees_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_worktrees_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
-        let view = self.settings_view();
         let directory = self.server_info.capability("worktreesDirectory").then(|| {
             let saved = view.str("worktreesDirectory").to_owned();
             self.text_field(

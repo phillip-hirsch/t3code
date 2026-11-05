@@ -351,7 +351,12 @@ impl SourceControlState {
 }
 
 impl Workspace {
-    pub(super) fn render_source_control_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_source_control_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
         let client = self.client();
         let first_scan = client.clone();
@@ -362,7 +367,6 @@ impl Workspace {
             }
             state
         });
-        let view = self.settings_view();
         let stored = view.value("pullRequestMergeMethod").clone();
         let method = stored.as_str().unwrap_or("last");
         let merge_method = self.value_select(

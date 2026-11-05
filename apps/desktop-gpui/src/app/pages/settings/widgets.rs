@@ -1517,14 +1517,18 @@ impl Workspace {
 
     /// Keeps the searchable project picker on the current projects and scope; it needs a window,
     /// which the scope sentence does not get.
-    pub(super) fn sync_scope_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn sync_scope_project_picker(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Groups never outnumber projects, so few projects skip the grouping.
         if self.shell.projects.len() <= SCOPE_MENU_LIMIT {
             self.settings_ui.project_picker = None;
             return;
         }
-        let view = self.settings_view();
-        let projects = self.scope_projects(&view);
+        let projects = self.scope_projects(view);
         if projects.len() <= SCOPE_MENU_LIMIT {
             self.settings_ui.project_picker = None;
             return;

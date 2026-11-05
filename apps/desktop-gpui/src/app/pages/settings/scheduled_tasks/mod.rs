@@ -32,13 +32,19 @@ use serde_json::json;
 use self::logic::{ScheduledTask, decode_tasks, relative_label, schedule_label};
 use super::super::widgets::{RowFrame, section_with_action};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
 const SECTION: &str = "scheduled-tasks";
 
 /// The section body: one retained view, so its subscription outlives a frame.
-pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
+pub(super) fn render(
+    workspace: &mut Workspace,
+    settings: &SettingsView,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let view = workspace
         .scheduled_tasks_view
         .get_or_insert_with(|| {
@@ -46,7 +52,6 @@ pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
             AnyView::from(cx.new(|cx| ScheduledTasksView::new(owner, cx)))
         })
         .clone();
-    let settings = workspace.settings_view();
     // `scope.kind === "unavailable"`: the selection names a project or machine that is gone.
     if let crate::settings::scope::ScopeKind::Unavailable { message } = settings.scope.kind {
         let t = *crate::theme::tokens(cx);

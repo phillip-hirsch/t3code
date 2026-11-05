@@ -20,6 +20,7 @@ use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone, Session};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, success_toast};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
@@ -51,7 +52,12 @@ impl EnvironmentsState {
 }
 
 impl Workspace {
-    pub(super) fn render_environments(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_environments(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-environments", cx, |_, _| EnvironmentsState::default());
         let (client, endpoint) = (self.client(), self.endpoint.clone());
         if client.is_some() && !state.read(cx).started {
@@ -79,7 +85,6 @@ impl Workspace {
         if offers_links && readable && self.client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));
         }
-        let view = self.settings_view();
         self.settings_page("connections", &view, sections, cx)
     }
 

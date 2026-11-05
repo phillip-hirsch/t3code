@@ -46,9 +46,13 @@ struct Removal {
 }
 
 impl Workspace {
-    pub(super) fn render_browser_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_browser_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let agent_description = if view.scope.is_project() {
             "Allow agents in this project to use the shared browser. Applies when the agent session next starts."
         } else {

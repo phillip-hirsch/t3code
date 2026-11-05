@@ -23,6 +23,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::pages::settings::widgets::{RowFrame, settings_section};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcError;
@@ -46,8 +47,12 @@ impl Workspace {
         )
     }
 
-    pub(super) fn render_devices_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let view = self.settings_view();
+    pub(super) fn render_devices_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sections = [self.render_device_integration(cx), self.render_device_sources(window, cx)];
         self.settings_page("devices", &view, sections, cx)
     }

@@ -7,6 +7,7 @@ use serde_json::json;
 use super::widgets::{SettingRow, select_trigger, settings_section, switch};
 use crate::app::Workspace;
 use crate::app::details::thread_details_items_menu;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
@@ -29,9 +30,13 @@ const ENVIRONMENT_IDENTIFICATIONS: &[(&str, &str)] =
 
 impl Workspace {
     /// `GeneralSettingsPanel`. Desktop notifications need no permission prompt in a desktop app.
-    pub(super) fn render_settings_general(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_general(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let grouping = view.str("sidebarProjectGroupingMode").to_owned();
         let grouping_switch = switch(&"project-grouping".into(), grouping != "separate", false, &t).on_click(
             cx.listener(move |this, _, window, cx| {
@@ -118,9 +123,13 @@ impl Workspace {
     }
 
     /// `AppearanceSettingsPanel`: the theme library, the Interface rows and Typography.
-    pub(super) fn render_settings_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_appearance(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let details_row = self.thread_details_row(&t, cx);
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
         let interface = [
@@ -171,7 +180,7 @@ impl Workspace {
         ];
         let fold = self.advanced_fold("appearance", advanced, cx);
         let interface = settings_section("appearance-interface", "Interface", interface.into_iter().chain([fold]), &t);
-        let sections = [self.render_theme_library(cx), interface, self.render_typography(window, cx)];
+        let sections = [self.render_theme_library(cx), interface, self.render_typography(view, window, cx)];
         self.settings_page("appearance", &view, sections, cx)
     }
 
@@ -189,19 +198,39 @@ impl Workspace {
 }
 
 impl Workspace {
-    pub(super) fn render_settings_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_chat_section(window, cx)
+    pub(super) fn render_settings_chat(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_chat_section(view, window, cx)
     }
 
-    pub(super) fn render_settings_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_diffs_section(window, cx)
+    pub(super) fn render_settings_diffs(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_diffs_section(view, window, cx)
     }
 
-    pub(super) fn render_settings_keybindings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_keybindings_section(window, cx)
+    pub(super) fn render_settings_keybindings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_keybindings_section(view, window, cx)
     }
 
-    pub(super) fn render_settings_snap_shot(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_snap_shot_section(window, cx)
+    pub(super) fn render_settings_snap_shot(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_snap_shot_section(view, window, cx)
     }
 }

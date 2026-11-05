@@ -19,6 +19,7 @@ use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft, Session};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, update_settings};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -32,7 +33,12 @@ pub(super) struct SecretsState {
 }
 
 impl Workspace {
-    pub(super) fn render_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_secrets(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-secrets", cx, |_, _| SecretsState::default());
         let endpoint = self.endpoint.clone();
         if self.client().is_some() && !state.read(cx).started {
@@ -62,7 +68,6 @@ impl Workspace {
                 &t,
             )
         };
-        let view = self.settings_view();
         self.settings_page("secrets", &view, [section], cx)
     }
 

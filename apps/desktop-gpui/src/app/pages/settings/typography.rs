@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use super::widgets::{SettingRow, settings_section, switch};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS, Fonts, Tokens};
 
@@ -86,9 +87,13 @@ const PROMPT_PREVIEW_TEXT: &str = "Use $frontend-design to fix the flaky test in
 
 impl Workspace {
     /// `TypographySection`: one interface and one monospace font, or all four set separately.
-    pub(super) fn render_typography(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_typography(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let separate = self.client_settings.values.bool(TYPOGRAPHY_ADVANCED_KEY);
         let interface_family: SharedString = match view.str("fontFamilySans").trim() {
             "" => FONT_SANS.into(),

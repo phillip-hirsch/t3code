@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, settings_section};
 use super::{notify_error, now_ms, relative_label, text};
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::{Workspace, new_id, sidebar};
 use crate::model::ProjectShell;
 use crate::rpc::RpcClient;
@@ -78,7 +79,12 @@ fn groups(snapshot: &Value) -> Vec<(ProjectShell, Vec<ArchivedThread>)> {
 }
 
 impl Workspace {
-    pub(super) fn render_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_archive(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let client = self.client();
         let state = window.use_keyed_state("settings-archive", cx, |_, cx| {
@@ -105,7 +111,6 @@ impl Workspace {
             };
             let title = h_flex().gap_2().child(icon).child(title);
             let row = RowFrame::new(title).description(text(description)).render(&t).into_any_element();
-            let view = self.settings_view();
             return self.settings_page(
                 "archived",
                 &view,
@@ -124,7 +129,6 @@ impl Workspace {
                 settings_section(SharedString::from(format!("archived-{}", project.id)), title, rows, &t)
             })
             .collect();
-        let view = self.settings_view();
         self.settings_page("archived", &view, sections, cx)
     }
 

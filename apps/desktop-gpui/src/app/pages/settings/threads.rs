@@ -85,9 +85,13 @@ impl SnoozeEditor {
 }
 
 impl Workspace {
-    pub(super) fn render_threads_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_threads_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
-        let view = self.settings_view();
         let connected = self.client().is_some();
         let base = self.add_project_field(&view, window, cx);
         let new_threads = self.new_threads_section(&view, true, window, cx);

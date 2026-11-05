@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use super::connections::ui::WebButton;
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
 /// One notice row (`ThirdPartyLicenseEntry`).
@@ -369,12 +370,16 @@ fn notice_row(state: &Entity<LicensesState>, entry: &Entry, open: bool, t: &Toke
 }
 
 impl Workspace {
-    pub(super) fn render_settings_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_licenses(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let endpoint = self.endpoint.clone();
         let state =
             window.use_keyed_state("settings-licenses", cx, |window, cx| LicensesState::new(endpoint, window, cx));
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let s = state.read(cx);
         let (filtered, total) = (s.visible.len(), s.entries.len());
         let count = div().whitespace_nowrap().text_xs().text_color(t.muted_foreground).child(if filtered == total {

@@ -15,6 +15,7 @@ use gpui_kit::{
 use super::keybindings::command_label;
 use super::widgets::{SettingRow, select_trigger, settings_section};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::desktop::snap_shot as platform;
 use crate::snap_shot::{self, Shortcut, Sound};
 use crate::theme::{self, Tokens};
@@ -23,11 +24,15 @@ use crate::theme::{self, Tokens};
 const UNAVAILABLE: &str = "Update the desktop app to use snapshots.";
 
 impl Workspace {
-    pub(super) fn render_snap_shot_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_snap_shot_section(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         if !platform::available() {
-            return self.render_snap_shot_unavailable(window, cx);
+            return self.render_snap_shot_unavailable(view, window, cx);
         }
         let enabled = view.bool("snapShotEnabled");
         let description = "Capture a window and attach it to your current draft.";
@@ -61,9 +66,13 @@ impl Workspace {
         self.settings_page("snap-shot", &view, sections, cx)
     }
 
-    fn render_snap_shot_unavailable(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_snap_shot_unavailable(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let notice = h_flex()
             .items_start()
             .gap(px(8.))

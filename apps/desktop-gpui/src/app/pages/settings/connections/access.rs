@@ -29,6 +29,7 @@ use super::logic::{
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
 use super::{auth_request, error_toast, success_toast, update_settings};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
 use crate::rpc::{RpcClient, StreamEvent};
@@ -245,7 +246,12 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
 }
 
 impl Workspace {
-    pub(super) fn render_access(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_access(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-access", cx, |_, _| AccessState::default());
         let (client, endpoint) = (self.client(), self.endpoint.clone());
         state.update(cx, |state, cx| state.start(client, endpoint, cx));
@@ -256,7 +262,6 @@ impl Workspace {
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
-        let view = self.settings_view();
         self.settings_page("access", &view, sections, cx)
     }
 

@@ -77,13 +77,21 @@ fn toast_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString>
 }
 
 impl Workspace {
-    pub(super) fn render_settings_projects_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_projects_panel(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let panel = window.use_keyed_state("settings-projects-panel", cx, ProjectsPanel::new);
         self.watch_project_name(&panel, window, cx);
-        let mut view = self.settings_view();
-        if self.follow_regrouped_project(&panel, &view, cx) {
-            view = self.settings_view();
-        }
+        let regrouped;
+        let view = if self.follow_regrouped_project(&panel, view, cx) {
+            regrouped = self.settings_view();
+            &regrouped
+        } else {
+            view
+        };
         let t = *theme::tokens(cx);
         let group = self.scoped_project_group(&view);
         let detail = group.is_some();

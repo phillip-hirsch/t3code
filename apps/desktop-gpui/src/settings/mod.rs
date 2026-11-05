@@ -8,7 +8,7 @@
 pub mod scope;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -87,9 +87,10 @@ impl Contract {
     }
 }
 
-/// A settings document: the contract's defaults with the stored values over them.
+/// A settings document: the contract's defaults with the stored values over them. Clones
+/// share the document; a write copies it only while another clone still holds it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Settings(Value);
+pub struct Settings(Arc<Value>);
 
 impl Settings {
     /// `stored`'s fields over `defaults`; a non-object `stored` leaves the defaults.
@@ -98,11 +99,11 @@ impl Settings {
         if let Some(stored) = stored.as_object() {
             values.extend(stored.iter().map(|(key, value)| (key.clone(), value.clone())));
         }
-        Self(Value::Object(values))
+        Self(Arc::new(Value::Object(values)))
     }
 
     pub fn server_defaults() -> Self {
-        Self(Value::Object(contract().server_defaults.clone()))
+        Self(Arc::new(Value::Object(contract().server_defaults.clone())))
     }
 
     pub fn get(&self, key: &str) -> &Value {
@@ -130,7 +131,7 @@ impl Settings {
     }
 
     fn map_mut(&mut self) -> &mut Map<String, Value> {
-        self.0.as_object_mut().expect("settings are an object")
+        Arc::make_mut(&mut self.0).as_object_mut().expect("settings are an object")
     }
 }
 

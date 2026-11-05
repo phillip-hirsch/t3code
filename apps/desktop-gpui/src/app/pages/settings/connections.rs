@@ -25,20 +25,36 @@ use gpui_kit::{AnyElement, App, Context, SharedString, Window};
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
 
 impl Workspace {
-    pub(super) fn render_settings_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_environments(window, cx)
+    pub(super) fn render_settings_connections(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_environments(view, window, cx)
     }
 
-    pub(super) fn render_settings_access(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_access(window, cx)
+    pub(super) fn render_settings_access(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_access(view, window, cx)
     }
 
-    pub(super) fn render_settings_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_secrets(window, cx)
+    pub(super) fn render_settings_secrets(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_secrets(view, window, cx)
     }
 
     /// The environment's name, as the web's `EnvironmentPresentation.label`.

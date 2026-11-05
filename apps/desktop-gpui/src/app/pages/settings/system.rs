@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use self::background::Profile;
 use super::widgets::{Part, RowFrame, SettingRow, rich_text, settings_section};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
 const GUEST_LINKS: &[Part] = &[
@@ -74,9 +75,13 @@ const MOBILE_STORES: [(&str, &str, &str, &str); 2] = [
 ];
 
 impl Workspace {
-    pub(super) fn render_settings_maintenance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_maintenance(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let connected = self.client().is_some();
         let background = self.render_background_row(cx);
         let storage = self.render_storage_sections(window, cx);
@@ -125,9 +130,13 @@ impl Workspace {
         self.settings_page("maintenance", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_labs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_labs(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         // The web also shows this on while the removed legacy sidebar's opt-in
         // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
         let boring = view.bool("boringSidebarEnabled") || view.bool("legacySidebarEnabled");
@@ -199,7 +208,12 @@ impl Workspace {
         self.settings_page("labs", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_about(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let cli_row = self.about_cli_row(&t, window, cx);
         let policy = &self.server_info.managed_policy;
@@ -266,13 +280,17 @@ impl Workspace {
                 .render(&t)
                 .into_any_element(),
         ];
-        let view = self.settings_view();
         let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
         self.settings_page("about", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_archived(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_archive(window, cx)
+    pub(super) fn render_settings_archived(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_archive(view, window, cx)
     }
 
     fn settings_json(&self) -> &Value {
