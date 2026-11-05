@@ -1,6 +1,7 @@
 //! Where the window is: a chat target, a page beside the chat (Pull requests,
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
+mod pull_request_detail;
 mod pull_requests;
 pub(super) mod settings;
 mod usage;

@@ -827,11 +827,20 @@ fn markdown_view(
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
-        .on_link_click(move |url, _, window, cx| match thread_link(url) {
+        .on_link_click(move |url, event, window, cx| match thread_link(url) {
             Some(thread_id) => {
                 let _ = link_this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
             }
-            None => cx.open_url(url),
+            None => {
+                let external = event.modifiers().secondary(cx);
+                let opened = !external
+                    && link_this
+                        .update(cx, |workspace, cx| workspace.open_change_request_link(url, cx))
+                        .unwrap_or(false);
+                if !opened {
+                    cx.open_url(url);
+                }
+            }
         })
 }
 
@@ -913,7 +922,7 @@ fn code_background(t: &Tokens) -> Hsla {
     if t.dark { alpha(t.input, 0.32) } else { t.secondary }
 }
 
-fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyle {
+pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyle {
     let code_background = code_background(t);
     let code_border = if t.dark { gpui_kit::transparent_black() } else { alpha(t.border, 0.7) };
     // The web's header row (6px + 24px toolbar) sits above the code's own 12.8px.
