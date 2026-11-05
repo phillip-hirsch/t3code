@@ -557,10 +557,13 @@ impl Workspace {
     ) -> AnyElement {
         let folder = row.kind == EntryKind::Directory;
         let glyph = match (folder, row.expanded, loading) {
-            (true, true, true) => IconName::LoaderCircle,
-            (true, true, false) => IconName::ChevronDown,
-            (true, false, _) => IconName::ChevronRight,
-            (false, _, _) => IconName::File,
+            (true, true, true) => Icon::new(IconName::LoaderCircle),
+            (true, true, false) => Icon::new(IconName::ChevronDown),
+            (true, false, _) => Icon::new(IconName::ChevronRight),
+            (false, _, _) => {
+                let (asset, color) = crate::file_icons::file_icon(&row.path, self.dark_theme(cx));
+                Icon::empty().path(asset).text_color(color)
+            }
         };
         let fg = tokens.foreground;
         let (click_key, click_row) = (cwd.to_owned(), row.clone());
@@ -587,10 +590,10 @@ impl Workspace {
                 }
             }))
             .child(
-                Icon::new(glyph)
+                glyph
                     .size(px(16.))
                     .flex_none()
-                    .text_color(tokens.muted_foreground)
+                    .when(folder, |el| el.text_color(tokens.muted_foreground))
                     .when(loading, |el| el.opacity(0.6)),
             )
             .child(div().min_w_0().truncate().child(row.label.clone()))

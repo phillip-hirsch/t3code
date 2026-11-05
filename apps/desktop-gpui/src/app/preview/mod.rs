@@ -115,7 +115,7 @@ impl PreviewState {
 }
 
 /// The GPUI window's native handle, owned so a view can be built after the borrow ends.
-struct ParentWindow(RawWindowHandle);
+pub(super) struct ParentWindow(pub(super) RawWindowHandle);
 
 impl HasWindowHandle for ParentWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
@@ -173,7 +173,7 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
 }
 
 impl Workspace {
-    fn preview_thread_id(&self) -> Option<&str> {
+    pub(super) fn preview_thread_id(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread(id) => Some(id),
             Target::Draft { .. } => None,
@@ -243,7 +243,7 @@ impl Workspace {
     }
 
     /// Whether GPUI draws over the browser's area: a native view would cover it on Windows.
-    fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
+    pub(super) fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
         self.page.is_some()
             || self.settings.is_some()
             || self.palette.is_some()

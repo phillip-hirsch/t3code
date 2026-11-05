@@ -241,6 +241,89 @@ pub(super) fn is_image(path: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// The extension after the last dot of the file name, lowercased (`""` without one).
+fn extension(path: &str) -> String {
+    file_name(path).rsplit_once('.').map(|(_, ext)| ext.to_lowercase()).unwrap_or_default()
+}
+
+/// `officePreviewKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Office {
+    Docx,
+    Xlsx,
+    Pptx,
+    Odt,
+    Ods,
+    Odp,
+    Rtf,
+    Epub,
+    Ipynb,
+}
+
+/// How the panel shows a workspace file (`FilePreviewPanel`'s `isVideo`, `isAudio`, `isImage`,
+/// `isPdf`, `isDocument` and `isHtml`, in that order of precedence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileKind {
+    Video,
+    Audio,
+    Image,
+    Pdf,
+    /// `binaryPreviewKind`: zip, jar, tar and gzip archives.
+    Archive,
+    Sqlite,
+    Office(Office),
+    Font,
+    Html,
+    /// Read with `projects.readFile`: source, Markdown, Mermaid and tables.
+    Text,
+}
+
+impl FileKind {
+    /// Read through an asset URL, never as text (`isMedia || isPdf || isDocument`).
+    pub(super) fn is_asset(self) -> bool {
+        !matches!(self, Self::Html | Self::Text)
+    }
+}
+
+pub(super) fn file_kind(path: &str) -> FileKind {
+    let ext = extension(path);
+    match ext.as_str() {
+        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "ogv" | "webm" => FileKind::Video,
+        "mp3" | "wav" | "ogg" | "oga" | "flac" | "aac" | "m4a" | "opus" | "aiff" | "webm-audio" | "weba" => {
+            FileKind::Audio
+        }
+        _ if is_image(path) => FileKind::Image,
+        "pdf" => FileKind::Pdf,
+        "zip" | "jar" | "tar" | "gz" | "tgz" => FileKind::Archive,
+        "sqlite" | "sqlite3" | "db" => FileKind::Sqlite,
+        "docx" => FileKind::Office(Office::Docx),
+        "xlsx" => FileKind::Office(Office::Xlsx),
+        "pptx" => FileKind::Office(Office::Pptx),
+        "odt" => FileKind::Office(Office::Odt),
+        "ods" => FileKind::Office(Office::Ods),
+        "odp" => FileKind::Office(Office::Odp),
+        "rtf" => FileKind::Office(Office::Rtf),
+        "epub" => FileKind::Office(Office::Epub),
+        "ipynb" => FileKind::Office(Office::Ipynb),
+        "ttf" | "otf" | "woff" | "woff2" => FileKind::Font,
+        "htm" | "html" => FileKind::Html,
+        _ => FileKind::Text,
+    }
+}
+
+/// `filePreviewDelimiter` by name.
+pub(super) fn table_delimiter(path: &str) -> Option<char> {
+    match extension(path).as_str() {
+        "csv" => Some(','),
+        "tsv" => Some('\t'),
+        _ => None,
+    }
+}
+
+pub(super) fn is_mermaid(path: &str) -> bool {
+    matches!(extension(path).as_str(), "mmd" | "mermaid")
+}
+
 /// The highlighter language for a file, by extension or well-known name.
 pub(super) fn language_for_path(path: &str) -> &'static str {
     let name = file_name(path).to_lowercase();
@@ -417,10 +500,14 @@ pub(super) fn merge_search_entries(listed: &[Entry], hits: &[Entry]) -> Vec<Entr
     merged
 }
 
+/// `isHostPath`: an absolute path rather than one in the workspace.
+pub(super) fn is_host_path(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':')
+}
+
 /// `resolvePathLinkTarget` for a workspace path: joined onto `cwd` with its separator.
 pub(super) fn absolute_path(cwd: &str, path: &str) -> String {
-    let bytes = path.as_bytes();
-    if path.starts_with('/') || path.starts_with('\\') || (bytes.len() >= 2 && bytes[1] == b':') {
+    if is_host_path(path) {
         return path.to_owned();
     }
     let windows = cwd.as_bytes().get(1) == Some(&b':') || cwd.starts_with("\\\\");
@@ -551,6 +638,25 @@ mod tests {
         assert_eq!(labels, [("src/app", true), ("files.rs", false)]);
         assert!(tree_search_matches(&merged, "rail").is_empty());
         assert_eq!(ancestors("a/b/c.rs"), ["a", "a/b"]);
+    }
+
+    #[test]
+    fn file_kinds_follow_the_web_precedence() {
+        assert_eq!(file_kind("clip.webm"), FileKind::Video, "webm is video before audio");
+        assert_eq!(file_kind("a/song.MP3"), FileKind::Audio);
+        assert_eq!(file_kind("logo.svg"), FileKind::Image);
+        assert_eq!(file_kind("doc.pdf"), FileKind::Pdf);
+        assert_eq!(file_kind("x.tgz"), FileKind::Archive);
+        assert_eq!(file_kind("app.db"), FileKind::Sqlite);
+        assert_eq!(file_kind("r.docx"), FileKind::Office(Office::Docx));
+        assert_eq!(file_kind("n.ipynb"), FileKind::Office(Office::Ipynb));
+        assert_eq!(file_kind("Inter.woff2"), FileKind::Font);
+        assert_eq!(file_kind("index.HTM"), FileKind::Html);
+        assert_eq!(file_kind("main.rs"), FileKind::Text);
+        assert!(!FileKind::Html.is_asset() && FileKind::Font.is_asset());
+        assert_eq!(table_delimiter("a.TSV"), Some('\t'));
+        assert_eq!((table_delimiter("a.csv"), table_delimiter("a.txt")), (Some(','), None));
+        assert!(is_mermaid("flow.mmd") && is_host_path(r"C:\x") && !is_host_path("src/x"));
     }
 
     #[test]

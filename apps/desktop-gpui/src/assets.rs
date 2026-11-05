@@ -203,7 +203,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = APP_ICONS.iter().chain(LUCIDE_ICONS).find(|(name, _)| *name == path) {
+        if let Some((_, bytes)) =
+            APP_ICONS.iter().chain(LUCIDE_ICONS).chain(crate::file_icons::SVGS).find(|(name, _)| *name == path)
+        {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         if let Some(bytes) = REMOTE.lock().unwrap().as_ref().and_then(|remote| remote.get(path)) {

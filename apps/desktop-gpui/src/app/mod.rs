@@ -949,6 +949,7 @@ impl Render for Workspace {
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);
         self.sync_preview_views(window, cx);
+        self.sync_document_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()

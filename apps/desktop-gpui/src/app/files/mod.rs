@@ -2,9 +2,16 @@
 //! (`ProjectContentSearchDialog.tsx`), and the right panel's Files tree (`FileBrowserPanel.tsx`)
 //! and file preview (`FilePreviewPanel.tsx`).
 
+mod archive;
+mod asset;
+mod chrome;
+mod document;
 mod logic;
+mod notebook;
+mod office;
 mod overlay;
 mod preview;
+mod table;
 mod tree;
 
 use std::collections::HashMap;
@@ -37,12 +44,26 @@ pub(super) struct FilesState {
     explorer_width: Option<f32>,
     /// `t3code.renderMarkdown`: Markdown files show rendered.
     render_markdown: bool,
+    /// `t3code.renderBrowserFile`, `t3code.renderTable` and `t3code.renderMermaid`, which
+    /// default to rendered: HTML, tables and diagrams show their source.
+    html_source: bool,
+    table_source: bool,
+    mermaid_source: bool,
+    /// PDFs, rendered HTML and media in native views.
+    documents: document::Documents,
+    /// Parsed documents and archives.
+    assets: asset::Assets,
     images: Option<Entity<super::pages::settings::code::projects::icon::Images>>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.
     mutation: (Option<String>, Option<String>),
 }
 
 impl Workspace {
+    /// Whether the dark theme is showing, for icons with a colour per theme.
+    pub(super) fn dark_theme(&self, cx: &gpui_kit::App) -> bool {
+        gpui_kit::component::ActiveTheme::theme(cx).is_dark()
+    }
+
     pub(super) fn project_target(&self) -> Option<ProjectTarget> {
         let project = self.target_project()?;
         let cwd = self.composer_cwd().filter(|cwd| !cwd.is_empty())?;
