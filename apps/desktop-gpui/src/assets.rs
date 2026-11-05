@@ -13,6 +13,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/acp.svg", include_bytes!("../assets/icons/acp.svg")),
     ("icons/app/send.svg", include_bytes!("../assets/icons/send.svg")),
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
+    ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
+    ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),
 ];
 
 /// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
@@ -27,11 +29,13 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "alarm-clock",
     "alarm-clock-off",
     "bot",
+    "brain",
     "chart-no-axes-column",
     "chevron-down",
     "circle-dashed",
     "circle-dot-dashed",
     "cloud",
+    "code-xml",
     "corner-left-up",
     "corner-up-right",
     "folder",
@@ -43,8 +47,11 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "hammer",
     "laptop",
     "list-filter",
+    "list-todo",
     "lock",
+    "message-circle",
     "message-circle-question-mark",
+    "minimize-2",
     "monitor",
     "panel-bottom",
     "panel-left",
@@ -57,6 +64,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "shield",
     "shield-off",
     "shield-question-mark",
+    "smartphone",
     "sparkles",
     "square-menu",
     "square-pen",
@@ -64,6 +72,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "user-round",
     "wrench",
     "x",
+    "zap",
 ];
 
 pub struct Assets;

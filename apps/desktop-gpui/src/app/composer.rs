@@ -28,7 +28,6 @@ use crate::theme::{FONT_MONO, Tokens, tokens};
 
 /// `max-h-52` (208px) over the 22.75px line.
 pub(super) const EDITOR_MAX_ROWS: usize = 9;
-const LANE_WIDTH: f32 = 736.;
 const LINE_HEIGHT: f32 = 22.75;
 const DEFAULT_RUNTIME_MODE: &str = "full-access";
 const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
@@ -255,7 +254,8 @@ impl Workspace {
         DEFAULT_PLACEHOLDER
     }
 
-    pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (lane, _) = self.chat_layout(window);
         let t = *tokens(cx);
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let approvals = projection.map(|p| p.pending_approvals()).unwrap_or_default();
@@ -306,11 +306,9 @@ impl Workspace {
                     }),
             )
             .child(self.render_footer(&t, cx));
-        div().w_full().flex_none().pt(px(8.)).px(px(48.)).pb(px(20.)).child(
+        div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
-                .max_w(px(LANE_WIDTH))
-                .mx_auto()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
                 .children(self.render_question(&t, cx))
                 .child(surface),

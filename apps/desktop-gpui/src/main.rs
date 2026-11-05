@@ -8,6 +8,7 @@ mod requests;
 mod rpc;
 mod theme;
 mod timeline;
+mod work_log;
 
 use std::sync::OnceLock;
 

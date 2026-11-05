@@ -35,6 +35,9 @@ pub(super) struct SidebarState {
     snoozed_expanded: bool,
     settled_expanded: bool,
     settled_visible: usize,
+    /// The card under the pointer. Its controls replace the status label, which
+    /// changes layout, so it is state rather than a paint-time group hover.
+    hovered: Option<String>,
     search: Entity<InputState>,
     /// The one-second repaint, alive only while a row shows a running duration.
     ticking: bool,
@@ -57,6 +60,7 @@ impl SidebarState {
             snoozed_expanded: false,
             settled_expanded: false,
             settled_visible: SETTLED_INITIAL,
+            hovered: None,
             search,
             ticking: false,
             _tick: None,
@@ -248,6 +252,10 @@ impl Workspace {
             None => None,
         };
         current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(|p| p.id.clone()))
+    }
+
+    pub(super) fn sidebar_width(&self) -> Pixels {
+        self.sidebar.width
     }
 
     pub(super) fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -670,6 +678,7 @@ impl Workspace {
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
                 .into_any_element(),
         };
+        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
         let thread_id = thread.id.clone();
         let settle = div()
             .id(SharedString::from(format!("settle-{}", thread.id)))
@@ -696,17 +705,7 @@ impl Workspace {
             .min_w(px(32.))
             .flex_none()
             .justify_end()
-            .child(h_flex().h_full().group_hover(ROW_GROUP, |s| s.absolute().right_0().invisible()).child(status_label))
-            .child(
-                h_flex()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .invisible()
-                    .group_hover(ROW_GROUP, |s| s.relative().visible())
-                    .child(settle),
-            );
+            .child(if hovered { h_flex().child(settle) } else { h_flex().h_full().child(status_label) });
         let provider = self.provider_mark(&facts, sb.foreground);
         let meta = thread.branch.as_ref().map(|branch| {
             text_xs(h_flex())
@@ -738,6 +737,7 @@ impl Workspace {
         };
         let regenerating = thread.title_regeneration.is_some();
         let open_id = thread.id.clone();
+        let hover_id = thread.id.clone();
         let has_meta = meta.is_some();
         div()
             .py(px(2.))
@@ -745,6 +745,14 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("thread-{}", thread.id)))
                     .group(ROW_GROUP)
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.sidebar.hovered = Some(hover_id.clone());
+                        } else if this.sidebar.hovered.as_ref() == Some(&hover_id) {
+                            this.sidebar.hovered = None;
+                        }
+                        cx.notify();
+                    }))
                     .rounded(px(6.))
                     .overflow_hidden()
                     .cursor_pointer()
