@@ -3,9 +3,9 @@
 //! and `deriveMessagesTimelineRows` in
 //! `apps/web/src/components/chat/MessagesTimeline.logic.ts`.
 //!
-//! Not ported yet: superseded-attempt folds (groups ignore attempts), subagent
-//! cards, worktree-setup rows, HTML-render and MCP-app cards, and the
-//! compaction-run special cases.
+//! Not ported yet: worktree-setup rows, grouped subagent batches ("3 subagents"),
+//! the separate assistant-meta row after trailing work, and the compaction-run
+//! special cases.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -13,7 +13,7 @@ use std::rc::Rc;
 use gpui_kit::SharedString;
 use serde_json::Value;
 
-use crate::model::{Run, ThreadProjection, TurnItem, is_active_run_status};
+use crate::model::{self, Run, ThreadProjection, TurnItem, is_active_run_status};
 use crate::work_log::{self, Activity, Entry, Status, Tone, WorkIcon};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +26,9 @@ pub enum Row {
         grouped_with_next: bool,
         /// The message above is a steer too, so the "Steer" label shows once.
         continues_steer: bool,
+        created_at: SharedString,
+        /// The checkpoint "Edit from here" rewinds to.
+        revert: Option<Checkpoint>,
     },
     Assistant {
         id: SharedString,
@@ -33,6 +36,11 @@ pub enum Row {
         streaming: bool,
         /// The turn's last reply once the turn finished.
         terminal: bool,
+        updated_at: SharedString,
+        /// The item's status, shown as a pill unless it completed.
+        status: SharedString,
+        /// The thread and run "Fork from this response" forks at.
+        fork: Option<(SharedString, SharedString)>,
     },
     Plan {
         id: SharedString,
@@ -54,11 +62,205 @@ pub enum Row {
         id: SharedString,
         label: SharedString,
         failed: bool,
+        /// A failed compaction's summary.
+        failure: Option<SharedString>,
     },
     Event {
         id: SharedString,
         label: SharedString,
     },
+    /// A subagent's card, opening its thread (`SubagentTimelineLink`).
+    Subagent(Rc<SubagentCard>),
+    /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
+    Embed(Rc<Embed>),
+    /// "Superseded attempt": the work a steer cut off, folded.
+    AttemptFold {
+        key: SharedString,
+        expanded: bool,
+    },
+}
+
+/// An `html_render` page or an MCP app's attachment (`htmlRenderFromToolItem`, `mcpAppFromToolItem`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Embed {
+    pub id: SharedString,
+    pub title: SharedString,
+    pub attachment_id: SharedString,
+    /// The MCP server, for an app; `None` for a rendered page.
+    pub app_server: Option<SharedString>,
+}
+
+impl Embed {
+    /// `htmlRenderFileName`: the title made safe for a file name.
+    pub fn file_name(&self) -> String {
+        let cleaned: String =
+            self.title.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) || c.is_control() { ' ' } else { c }).collect();
+        let name: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect();
+        let name = name.trim();
+        format!("{}.html", if name.is_empty() { "Page" } else { name })
+    }
+}
+
+fn embed(item: &TurnItem) -> Option<Embed> {
+    if item.item_type != "dynamic_tool" {
+        return None;
+    }
+    let output = item.raw.get("output")?;
+    if output.get("isError").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let tool = item.str("toolName").unwrap_or_default();
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())
+    }
+    if let Some(app) = output.get("t3McpApp") {
+        let (server, name) = (text(app, "server")?, text(app, "tool")?);
+        if tool != format!("{server}.{name}") && tool != format!("mcp__{server}__{name}") {
+            return None;
+        }
+        return Some(Embed {
+            id: item.id.clone().into(),
+            title: format!("{server} app").into(),
+            attachment_id: text(app, "attachmentId")?.to_owned().into(),
+            app_server: Some(server.to_owned().into()),
+        });
+    }
+    let page = output.get("htmlRender").filter(|_| item.status == "completed" && tool.ends_with("html_render"))?;
+    let title: String = text(page, "title").unwrap_or("HTML").chars().take(200).collect();
+    Some(Embed {
+        id: item.id.clone().into(),
+        title: title.into(),
+        attachment_id: text(page, "attachmentId")?.to_owned().into(),
+        app_server: None,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dot {
+    Info,
+    Muted,
+    Success,
+    Destructive,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubagentCard {
+    pub id: SharedString,
+    pub title: SharedString,
+    pub status_label: &'static str,
+    pub dot: Dot,
+    /// The result or progress, as plain text.
+    pub detail: Option<SharedString>,
+    pub failed: bool,
+    /// The status shows beside the detail too, until the subagent completes.
+    pub status_beside_detail: bool,
+    pub live: bool,
+    pub started_at: Option<SharedString>,
+    pub completed_at: Option<SharedString>,
+    pub child_thread_id: Option<SharedString>,
+    pub driver: SharedString,
+}
+
+/// `formatSubagentDisplayTitle`: drops "Subagent: " and names a `/root/.../name_x` path "Name X".
+fn subagent_title(title: &str) -> String {
+    let title = match title.get(..9) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("subagent:") => title[9..].trim_start(),
+        _ => title,
+    };
+    let Some(path) = title.strip_prefix("/root/") else { return title.to_owned() };
+    let Some(name) = path.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()) else {
+        return title.to_owned();
+    };
+    let words: Vec<String> = name
+        .split(|c: char| c == '_' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+        })
+        .collect();
+    if words.is_empty() { title.to_owned() } else { words.join(" ") }
+}
+
+/// `plainDetail`: markdown links and backticks dropped, list markers removed, whitespace collapsed.
+pub fn plain_detail(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        match after.find("](").and_then(|close| after[close + 2..].find(')').map(|end| (close, close + 2 + end))) {
+            Some((close, end)) if !after[..close].contains(']') => {
+                out.push_str(&rest[..open]);
+                out.push_str(&after[..close]);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    let lines: Vec<&str> = out
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).unwrap_or(line)
+        })
+        .collect();
+    lines.join(" ").replace('`', "").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn subagent_card(item: &TurnItem) -> SubagentCard {
+    let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty());
+    let (status_label, dot) = match item.status.as_str() {
+        "pending" => ("Queued", Dot::Info),
+        "running" => ("Running", Dot::Info),
+        "waiting" => ("Waiting", Dot::Info),
+        "idle" => ("Idle · resumable", Dot::Muted),
+        "completed" => ("Completed", Dot::Success),
+        "failed" => ("Failed", Dot::Destructive),
+        _ => ("Stopped", Dot::Muted),
+    };
+    let settled = matches!(item.status.as_str(), "completed" | "failed" | "cancelled" | "interrupted");
+    let (result, progress) = (text("result"), text("progress"));
+    let raw = if settled { result.or(progress) } else { progress.or(result) };
+    let detail = raw
+        .filter(|raw| !raw.to_ascii_lowercase().starts_with("child task ended with status"))
+        .map(plain_detail)
+        .filter(|detail| !detail.is_empty());
+    SubagentCard {
+        id: item.id.clone().into(),
+        title: subagent_title(text("title").unwrap_or("Subagent")).into(),
+        status_label,
+        dot,
+        status_beside_detail: detail.is_some() && item.status != "completed",
+        detail: detail.map(Into::into),
+        failed: item.status == "failed",
+        live: matches!(item.status.as_str(), "pending" | "running" | "waiting"),
+        started_at: text("startedAt").map(|s| s.to_owned().into()),
+        completed_at: text("completedAt").map(|s| s.to_owned().into()),
+        child_thread_id: text("childThreadId").map(|s| s.to_owned().into()),
+        driver: text("driver").unwrap_or_default().to_owned().into(),
+    }
+}
+
+/// `formatElapsedSeconds`: "12s", "3m 05s", "1h 02m".
+pub fn agent_elapsed(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    let minutes = seconds / 60;
+    match (minutes, minutes / 60) {
+        (0, _) => format!("{seconds}s"),
+        (_, 0) => format!("{minutes}m {:02}s", seconds % 60),
+        (_, hours) => format!("{hours}h {:02}m", minutes % 60),
+    }
+}
+
+/// A checkpoint `checkpoint.rollback` can target.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checkpoint {
+    pub scope_id: SharedString,
+    pub checkpoint_id: SharedString,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,16 +330,35 @@ pub fn fold_key(run_key: &str) -> SharedString {
     format!("fold:{run_key}").into()
 }
 
+pub fn attempt_key(attempt_id: &str) -> SharedString {
+    format!("attempt:{attempt_id}").into()
+}
+
 pub fn entry_key(entry_id: &str) -> SharedString {
     format!("entry:{entry_id}").into()
 }
 
 enum Kind {
-    User { text: SharedString, steer: Option<Steer> },
-    Assistant { text: SharedString, streaming: bool },
-    Plan { markdown: SharedString },
+    /// `revertible`: a turn start or queued turn, which "Edit from here" can rewind.
+    User {
+        text: SharedString,
+        steer: Option<Steer>,
+        revertible: bool,
+    },
+    Assistant {
+        text: SharedString,
+        streaming: bool,
+    },
+    Plan {
+        markdown: SharedString,
+    },
     Work(Rc<Entry>),
-    Event { label: SharedString, item_type: SharedString },
+    Event {
+        label: SharedString,
+        item_type: SharedString,
+        subagent: Option<Rc<SubagentCard>>,
+    },
+    Embed(Rc<Embed>),
 }
 
 struct TimelineEntry {
@@ -148,6 +369,13 @@ struct TimelineEntry {
     end: SharedString,
     /// The run of a top-level failed `error` item, and whether it was a usage limit.
     failure: Option<(SharedString, bool)>,
+    status: SharedString,
+    /// The thread the item lives in; another one for inherited history.
+    source_thread_id: SharedString,
+    inherited: bool,
+    node_id: Option<SharedString>,
+    /// The item's own `completedAt`.
+    completed_at: Option<SharedString>,
     kind: Kind,
 }
 
@@ -178,7 +406,7 @@ impl TimelineEntry {
     /// `timelineEntryRunId`.
     fn response_run(&self) -> Option<&SharedString> {
         match self.kind {
-            Kind::Assistant { .. } | Kind::Plan { .. } | Kind::Work(_) => self.run_id.as_ref(),
+            Kind::Assistant { .. } | Kind::Plan { .. } | Kind::Work(_) | Kind::Embed(_) => self.run_id.as_ref(),
             _ => None,
         }
     }
@@ -217,7 +445,12 @@ fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Ve
             let item = &row.item;
             let entry = match cache.0.get(&item.id) {
                 Some((revision, entry)) if *revision == item.revision && item.revision != 0 => entry.clone(),
-                _ => Rc::new(timeline_entry(item)?),
+                _ => {
+                    let mut entry = timeline_entry(item)?;
+                    entry.source_thread_id = row.source_thread_id.clone().into();
+                    entry.inherited = row.visibility == "inherited";
+                    Rc::new(entry)
+                }
             };
             next.insert(item.id.clone(), (item.revision, entry.clone()));
             Some(entry)
@@ -227,7 +460,7 @@ fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Ve
     entries
 }
 
-fn timeline_entry(item: &TurnItem) -> Option<TimelineEntry> {
+fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
     let raw = &item.raw;
     let text = |key: &str| SharedString::from(item.str(key).unwrap_or_default().to_owned());
     let created_at = text("startedAt");
@@ -253,7 +486,8 @@ fn timeline_entry(item: &TurnItem) -> Option<TimelineEntry> {
                 Some("promoted_queued_to_steer") => Some(Steer::Promoted),
                 _ => None,
             };
-            Kind::User { text: text("text"), steer }
+            let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
+            Kind::User { text: text("text"), steer, revertible }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
         "proposed_plan" => Kind::Plan { markdown: text("markdown") },
@@ -263,8 +497,15 @@ fn timeline_entry(item: &TurnItem) -> Option<TimelineEntry> {
         | "run_interrupt_result"
         | "secret_request"
         | "link_request"
-        | "subagent" => Kind::Event { label: event_label(item).into(), item_type: item.item_type.clone().into() },
-        _ => Kind::Work(Rc::new(work_log::entry_from_item(item))),
+        | "subagent" => Kind::Event {
+            label: event_label(item).into(),
+            item_type: item.item_type.clone().into(),
+            subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
+        },
+        _ => match embed(item) {
+            Some(embed) => Kind::Embed(Rc::new(embed)),
+            None => Kind::Work(Rc::new(work_log::entry_from_item(item))),
+        },
     };
     let end = match kind {
         Kind::User { .. } | Kind::Assistant { .. } => text("updatedAt"),
@@ -281,6 +522,11 @@ fn timeline_entry(item: &TurnItem) -> Option<TimelineEntry> {
         created_at,
         end,
         failure,
+        status: item.status.clone().into(),
+        source_thread_id: item.thread_id.clone().into(),
+        inherited: false,
+        node_id: item.node_id.clone().map(Into::into),
+        completed_at: item.str("completedAt").map(|at| at.to_owned().into()),
         kind,
     })
 }
@@ -443,6 +689,9 @@ fn turn_folds(
             if matches!(&entry.kind, Kind::Event { item_type, .. } if is_resource_card(item_type)) {
                 continue;
             }
+            if matches!(&entry.kind, Kind::Event { subagent: Some(card), .. } if card.live) {
+                continue;
+            }
             if entry.work().is_some_and(|e| e.item_type == "notification" || e.question_answered) {
                 continue;
             }
@@ -497,6 +746,180 @@ fn turn_folds(
     folds
 }
 
+/// `findRevertCheckpoint`: the ready checkpoint that ends run `turn_count`, or starts the thread.
+fn revert_checkpoint(checkpoints: &[model::Checkpoint], turn_count: i64) -> Option<Checkpoint> {
+    let checkpoint = checkpoints.iter().rev().find(|c| {
+        c.status == "ready"
+            && if turn_count == 0 {
+                c.ordinal_within_scope == 0 && c.app_run_ordinal.is_none()
+            } else {
+                c.app_run_ordinal == Some(turn_count)
+            }
+    })?;
+    Some(Checkpoint { scope_id: checkpoint.scope_id.clone().into(), checkpoint_id: checkpoint.id.clone().into() })
+}
+
+/// `deriveAvailableRevertTurnCounts`: the runs whose provider turn is on the live provider
+/// thread, so the provider conversation can rewind with the files; 0 is the thread start.
+fn available_revert_turn_counts(projection: &ThreadProjection) -> HashSet<i64> {
+    let mut available = HashSet::new();
+    let active = projection.thread.active_provider_thread_id.as_deref();
+    let Some(provider_thread) = projection.provider_threads.iter().find(|t| Some(t.id.as_str()) == active) else {
+        return available;
+    };
+    let instance = projection.thread.model_selection.as_ref().map(|m| m.instance_id.as_str());
+    if provider_thread.provider_session_id.is_none() || provider_thread.provider_instance_id.as_deref() != instance {
+        return available;
+    }
+    available.insert(0);
+    for run in &projection.runs {
+        let Some(attempt_id) = run.active_attempt_id.as_deref() else { continue };
+        let latest = projection
+            .provider_turns
+            .iter()
+            .filter(|turn| turn.run_attempt_id.as_deref() == Some(attempt_id))
+            .max_by_key(|turn| turn.ordinal);
+        let turn = latest.or_else(|| {
+            let attempt = projection.attempts.iter().find(|a| a.id == attempt_id)?;
+            let turn_id = attempt.provider_turn_id.as_deref()?;
+            projection.provider_turns.iter().find(|turn| turn.id == turn_id)
+        });
+        if turn.and_then(|turn| turn.provider_thread_id.as_deref()) == Some(provider_thread.id.as_str()) {
+            available.insert(run.ordinal);
+        }
+    }
+    available
+}
+
+/// `deriveRevertTurnCountByUserMessageId`: each turn-starting message rewinds to the
+/// checkpoint the previous visible run ended on.
+fn revert_targets(
+    projection: &ThreadProjection,
+    entries: &[Rc<TimelineEntry>],
+    unsettled: Option<&SharedString>,
+) -> HashMap<SharedString, Checkpoint> {
+    let available = available_revert_turn_counts(projection);
+    let mut ready: HashMap<&str, i64> = HashMap::new();
+    for checkpoint in projection.checkpoints.iter().filter(|c| c.status == "ready") {
+        if let (Some(run), Some(count)) = (checkpoint.run_id.as_deref(), checkpoint.app_run_ordinal) {
+            ready.insert(run, count);
+        }
+    }
+    let start_ready = revert_checkpoint(&projection.checkpoints, 0).is_some();
+    let mut target_by_run: HashMap<&SharedString, Option<i64>> = HashMap::new();
+    let mut previous: Option<&SharedString> = None;
+    let mut targets = HashMap::new();
+    for entry in entries.iter().filter(|entry| !entry.inherited) {
+        let run = match &entry.kind {
+            Kind::User { .. } | Kind::Assistant { .. } => entry.run_id.as_ref(),
+            Kind::Work(work) if work.item_type == "notification" => entry.run_id.as_ref(),
+            _ => None,
+        };
+        let Some(run) = run else { continue };
+        if !target_by_run.contains_key(run) {
+            let target = match previous {
+                None => start_ready.then_some(0),
+                Some(previous) => ready.get(previous.as_ref()).copied(),
+            };
+            target_by_run.insert(run, target);
+            previous = Some(run);
+        }
+        let Kind::User { revertible: true, .. } = entry.kind else { continue };
+        if Some(run) == unsettled {
+            continue;
+        }
+        let checkpoint = target_by_run[run]
+            .filter(|target| available.contains(target))
+            .and_then(|target| revert_checkpoint(&projection.checkpoints, target));
+        if let Some(checkpoint) = checkpoint {
+            targets.insert(entry.id.clone(), checkpoint);
+        }
+    }
+    targets
+}
+
+/// `resolveAttempt`: the run attempt an item belongs to, through its node's ancestry.
+fn entry_attempt<'a>(entry: &TimelineEntry, projection: &'a ThreadProjection) -> Option<&'a model::RunAttempt> {
+    let run = entry.run_id.as_deref()?;
+    let by_root =
+        |node: &str| projection.attempts.iter().find(|a| a.root_node_id.as_deref() == Some(node) && a.run_id == run);
+    let mut node_id = entry.node_id.as_deref();
+    let mut visited = HashSet::new();
+    while let Some(id) = node_id.filter(|id| visited.insert(*id)) {
+        if let Some(attempt) = by_root(id) {
+            return Some(attempt);
+        }
+        let node = projection.nodes.iter().find(|node| node.id == id)?;
+        if let Some(attempt) = node.root_node_id.as_deref().and_then(by_root) {
+            return Some(attempt);
+        }
+        node_id = node.parent_node_id.as_deref();
+    }
+    None
+}
+
+struct AttemptFold {
+    key: SharedString,
+    hidden: HashSet<usize>,
+}
+
+/// `deriveSupersededAttemptFolds`, by anchor index: a steer's restart folds the attempt
+/// it cut off, unless that attempt had already finished its reply.
+fn attempt_folds(
+    entries: &[Rc<TimelineEntry>],
+    attempts: &[Option<&model::RunAttempt>],
+    failed_runs: &HashSet<SharedString>,
+) -> HashMap<usize, AttemptFold> {
+    let superseded = |index: usize| attempts[index].filter(|attempt| attempt.status == "superseded");
+    let mut last_output: HashMap<&str, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(attempt) = superseded(index) else { continue };
+        let output = match &entry.kind {
+            Kind::Assistant { .. } => true,
+            Kind::Work(work) => !matches!(work.item_type.as_ref(), "system_notice" | "notification"),
+            _ => false,
+        };
+        if output {
+            last_output.insert(attempt.id.as_str(), index);
+        }
+    }
+    let complete: HashSet<&str> = last_output
+        .iter()
+        .filter(|(attempt, index)| {
+            let entry = &entries[**index];
+            let superseded_at = attempts[**index].and_then(|a| a.completed_at.as_deref());
+            matches!(entry.kind, Kind::Assistant { streaming: false, .. })
+                && entry.status == "completed"
+                && matches!((entry.completed_at.as_deref(), superseded_at), (Some(done), Some(cut)) if done < cut)
+                && !attempt.is_empty()
+        })
+        .map(|(attempt, _)| *attempt)
+        .collect();
+    let mut by_attempt: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(attempt) = superseded(index) else { continue };
+        let skip = complete.contains(attempt.id.as_str())
+            || failed_runs.contains(attempt.run_id.as_str())
+            || matches!(&entry.kind, Kind::User { .. })
+            || matches!(&entry.kind, Kind::Event { item_type, .. } if item_type == "handoff" || is_resource_card(item_type))
+            || matches!(&entry.kind, Kind::Event { subagent: Some(card), .. } if card.live)
+            || entry.work().is_some_and(|work| work.item_type == "system_notice" || work.item_type == "thread_created");
+        if skip {
+            continue;
+        }
+        match by_attempt.iter_mut().find(|(id, _)| *id == attempt.id) {
+            Some((_, indexes)) => indexes.push(index),
+            None => by_attempt.push((attempt.id.as_str(), vec![index])),
+        }
+    }
+    by_attempt
+        .into_iter()
+        .map(|(attempt, indexes)| {
+            (indexes[0], AttemptFold { key: attempt_key(attempt), hidden: indexes.into_iter().collect() })
+        })
+        .collect()
+}
+
 /// The chat rows for a thread. `expanded` holds the keys of open groups,
 /// folds and entries ([`group_key`], [`fold_key`], [`entry_key`]).
 pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cache: &mut EntryCache) -> Vec<Row> {
@@ -509,6 +932,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     let unsettled: Option<SharedString> =
         latest_run.filter(|run| is_active_run_status(&run.status)).map(|run| run.id.clone().into());
     let terminal = terminal_assistant_messages(&entries);
+    let reverts = revert_targets(projection, &entries, unsettled.as_ref());
 
     let mut failed_runs: HashSet<SharedString> = HashSet::new();
     let (mut usage_limited, mut other_failures) = (HashSet::new(), HashSet::new());
@@ -535,6 +959,14 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     }
     let unfolded: HashSet<SharedString> = active_responses.iter().chain(&failed_runs).cloned().collect();
     let folds = turn_folds(&entries, &terminal, latest_run, &unfolded);
+    let attempts: Vec<Option<&model::RunAttempt>> =
+        entries.iter().map(|entry| entry_attempt(entry, projection)).collect();
+    let attempt_folds = attempt_folds(&entries, &attempts, &failed_runs);
+    let attempt_hidden: HashSet<usize> = attempt_folds
+        .values()
+        .filter(|fold| !expanded.contains(&fold.key))
+        .flat_map(|fold| fold.hidden.iter().copied())
+        .collect();
     let mut collapsed: HashSet<usize> = folds
         .values()
         .filter(|fold| !expanded.contains(&fold_key(&fold.key)))
@@ -656,11 +1088,24 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
             index += 1;
             continue;
         }
+        if let Some(fold) = attempt_folds.get(&index) {
+            rows.push(Row::AttemptFold { expanded: expanded.contains(&fold.key), key: fold.key.clone() });
+        }
+        if attempt_hidden.contains(&index) {
+            index += 1;
+            continue;
+        }
         match &entry.kind {
             Kind::Work(work) if entry.is_compaction() => rows.push(Row::Divider {
                 id: entry.id.clone(),
                 label: work.label.clone(),
                 failed: work.status == Some(Status::Failed),
+                failure: work
+                    .detail
+                    .as_ref()
+                    .filter(|_| work.status == Some(Status::Failed))
+                    .map(|summary| summary.trim().to_owned().into())
+                    .filter(|summary: &SharedString| !summary.is_empty()),
             }),
             Kind::Work(work) => {
                 let standalone = |e: &Entry| {
@@ -690,6 +1135,9 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                         || active_ids.contains(&cursor)
                         || collapsed.contains(&cursor)
                         || folds.contains_key(&cursor)
+                        || attempt_folds.contains_key(&cursor)
+                        || attempt_hidden.contains(&cursor)
+                        || attempts[cursor].map(|a| &a.id) != attempts[index].map(|a| &a.id)
                         || next_work.run_id != work.run_id
                     {
                         break;
@@ -745,20 +1193,32 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                 continue;
             }
             Kind::Plan { markdown } => rows.push(Row::Plan { id: entry.id.clone(), markdown: markdown.clone() }),
+            Kind::Event { subagent: Some(card), .. } => rows.push(Row::Subagent(card.clone())),
+            Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
-            Kind::User { text, steer } => rows.push(Row::User {
+            Kind::User { text, steer, .. } => rows.push(Row::User {
                 id: entry.id.clone(),
                 text: text.clone(),
                 steer: *steer,
                 grouped_with_previous: false,
                 grouped_with_next: false,
                 continues_steer: false,
+                created_at: entry.created_at.clone(),
+                revert: reverts.get(&entry.id).cloned(),
             }),
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
                 id: entry.id.clone(),
                 text: text.clone(),
                 streaming: *streaming,
                 terminal: terminal.contains(&index) && !is_active_response(entry.run_id.as_ref()),
+                updated_at: entry.end.clone(),
+                status: entry.status.clone(),
+                // `canForkProjectedAssistantItem`.
+                fork: entry
+                    .run_id
+                    .clone()
+                    .filter(|_| entry.status == "completed")
+                    .map(|run| (entry.source_thread_id.clone(), run)),
             }),
         }
         index += 1;
@@ -851,6 +1311,8 @@ mod tests {
             grouped_with_previous: false,
             grouped_with_next: false,
             continues_steer: false,
+            created_at: SharedString::default(),
+            revert: None,
         }
     }
 
@@ -893,6 +1355,9 @@ mod tests {
                 Row::Plan { .. } => "plan".into(),
                 Row::Divider { label, .. } => format!("divider {label}"),
                 Row::Event { label, .. } => format!("event {label}"),
+                Row::Subagent(card) => format!("subagent {}", card.title),
+                Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
+                Row::Embed(embed) => format!("embed {}", embed.title),
             })
             .collect()
     }
@@ -909,7 +1374,7 @@ mod tests {
 
     #[test]
     fn pending_queued_messages_and_checkpoints_are_hidden() {
-        let item = |value: Value| serde_json::from_value::<TurnItem>(value).unwrap();
+        let item = |value: Value| Rc::new(serde_json::from_value::<TurnItem>(value).unwrap());
         let queued = item(
             json!({"id": "q", "type": "user_message", "inputIntent": "queued_turn", "status": "pending", "text": "later"}),
         );
@@ -1041,6 +1506,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live(&state), "live Running cargo");
+    }
+
+    #[test]
+    fn a_steer_folds_the_attempt_it_cut_off() {
+        let at = |s: u32| format!("2026-11-04T10:00:{s:02}.000Z");
+        let node = |id: &str, extra: Value| {
+            let mut value = item(id, "command_execution", "r1", &at(2), json!({"input": "ls", "nodeId": id}));
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            value
+        };
+        let mut items = vec![
+            item("u", "user_message", "r1", &at(0), json!({"text": "go", "inputIntent": "turn_start"})),
+            node("n1", json!({})),
+            node("n2", json!({})),
+            item("s", "user_message", "r1", &at(3), json!({"text": "stop", "inputIntent": "steer", "nodeId": "n3"})),
+            node("n4", json!({})),
+        ];
+        items.push(item("a", "assistant_message", "r1", &at(5), json!({"text": "done", "nodeId": "n4"})));
+        let mut value = projection_value(items, json!([{"id": "r1", "status": "running"}]));
+        value["attempts"] = json!([
+            {"id": "a1", "runId": "r1", "rootNodeId": "root1", "status": "superseded", "completedAt": at(3)},
+            {"id": "a2", "runId": "r1", "rootNodeId": "root2", "status": "running"},
+        ]);
+        value["nodes"] = json!([
+            {"id": "n1", "rootNodeId": "root1"}, {"id": "n2", "parentNodeId": "n1"},
+            {"id": "n3", "rootNodeId": "root2"}, {"id": "n4", "rootNodeId": "root2"},
+        ]);
+        let p: ThreadProjection = serde_json::from_value(value).unwrap();
+        let shown = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        assert_eq!(
+            shown,
+            ["user go", "working", "attempt-fold false", "user stop", "work ls", "assistant done", "thinking"]
+        );
+        let open = describe(&rows(&p, &HashSet::from([attempt_key("a1")]), &mut EntryCache::default()));
+        assert_eq!(open[2..4], ["attempt-fold true", "toggle Ran 2 commands"]);
+    }
+
+    #[test]
+    fn rendered_pages_and_mcp_apps_become_embeds() {
+        let tool = |tool: &str, output: Value| {
+            let value =
+                json!({"id": "t", "type": "dynamic_tool", "status": "completed", "toolName": tool, "output": output});
+            embed(&serde_json::from_value(value).unwrap())
+        };
+        let page =
+            tool("mcp__t3-code__html_render", json!({"htmlRender": {"attachmentId": "a1", "title": "Q3: plan?"}}));
+        assert_eq!(
+            page.as_ref().map(|p| (p.attachment_id.as_ref(), p.file_name())),
+            Some(("a1", "Q3 plan.html".into()))
+        );
+        let app =
+            tool("mcp__maps__show", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}}));
+        assert_eq!(app.map(|a| a.title), Some("maps app".into()));
+        // An app reference from another tool is ignored, so tools cannot pose as an app.
+        assert_eq!(
+            tool("mcp__other__x", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}})),
+            None
+        );
+        assert_eq!(
+            tool("mcp__t3-code__html_render", json!({"isError": true, "htmlRender": {"attachmentId": "a1"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn subagent_cards_read_like_the_web() {
+        assert_eq!(subagent_title("Subagent: /root/work/code_reviewer"), "Code Reviewer");
+        assert_eq!(subagent_title("subagent: Fix the build"), "Fix the build");
+        assert_eq!(
+            plain_detail("See [the PR](https://x/1) and `cargo test`\n- done"),
+            "See the PR and cargo test done"
+        );
+        let card = |extra: Value| {
+            let mut value = json!({"id": "s", "type": "subagent", "status": "completed", "title": "Review"});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            subagent_card(&serde_json::from_value(value).unwrap())
+        };
+        let done = card(json!({"result": "All good", "progress": "Reading", "childThreadId": "child"}));
+        assert_eq!(
+            (done.detail.as_deref(), done.status_beside_detail, done.child_thread_id.as_deref()),
+            (Some("All good"), false, Some("child"))
+        );
+        let running = card(json!({"status": "running", "result": "Old", "progress": "Reading"}));
+        assert_eq!((running.detail.as_deref(), running.status_label, running.live), (Some("Reading"), "Running", true));
+        let generic = card(json!({"status": "failed", "result": "Child task ended with status failed"}));
+        assert_eq!((generic.detail, generic.failed), (None, true));
+        assert_eq!([5_000, 185_000, 3_725_000].map(agent_elapsed), ["5s", "3m 05s", "1h 02m"]);
     }
 
     #[test]

@@ -2,24 +2,25 @@
 //! colors follow `apps/web/src/components/chat/MessagesTimeline.tsx`, `WorkLog.tsx`
 //! and `index.css` (`.chat-markdown`).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::message_scroller::MessageScroller;
-use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, ElementId, FontWeight, HighlightStyle, Hsla,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, WeakEntity, Window, div, linear_color_stop, linear_gradient,
+    StyleRefinement, Styled as _, Subscription, WeakEntity, Window, div, linear_color_stop, linear_gradient,
     prelude::FluentBuilder as _, px, relative, rems,
 };
 
 use gpui_kit::assets::IconName;
 
-use super::{Target, Workspace, project_name};
+use super::{Target, Workspace, message_actions, project_name};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timeline::{self, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
@@ -49,13 +50,16 @@ impl Workspace {
                 let rows = self.rows.clone();
                 let this = cx.weak_entity();
                 let background = t.background;
+                let minimap = self.render_minimap(lane.left, window, cx);
+                let lane_width = lane.width;
                 div()
                     .flex_1()
                     .min_h_0()
+                    .relative()
                     .child(
                         MessageScroller::new("timeline", self.scroller.clone(), move |index, window, cx| {
                             match rows.get(index) {
-                                Some(row) => render_row(row, &this, window, cx),
+                                Some(row) => render_row(row, &this, lane_width, window, cx),
                                 None => div().into_any_element(),
                             }
                         })
@@ -69,8 +73,46 @@ impl Workspace {
                         .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t))
                         .with_bottom_fade(background),
                     )
+                    .children(minimap)
                     .into_any_element()
             }
+        }
+    }
+
+    /// The parsed markdown for `key`, kept across frames; see [`MarkdownStates`].
+    fn markdown_state(
+        &mut self,
+        key: SharedString,
+        text: &SharedString,
+        breaks: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        let source = |text: &SharedString| if breaks { hard_breaks(text) } else { text.to_string() };
+        if let Some(state) = self.markdown.0.get_mut(&key) {
+            if state.text != *text {
+                state.text = text.clone();
+                state.view.update(cx, |view, cx| view.set_text(&source(text), cx));
+            }
+            return state.view.clone();
+        }
+        let view = cx.new(|cx| TextViewState::markdown(&source(text), cx));
+        let row_key = key.clone();
+        let _changed = cx.observe(&view, move |this, _, cx| {
+            if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
+                this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+            }
+        });
+        self.markdown.0.insert(key, MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        view
+    }
+
+    fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.markdown.0.get_mut(key) {
+            state.nowrap = !state.nowrap;
+            if let Some(index) = self.rows.iter().position(|row| shows_markdown(row, key)) {
+                self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+            }
+            cx.notify();
         }
     }
 
@@ -99,6 +141,101 @@ impl Workspace {
             }));
         }
     }
+}
+
+/// Each message's markdown, owned here instead of in GPUI's per-frame element
+/// state. That state drops when a row leaves the list's rendered range, and a
+/// document over 4 KiB parses on a background thread, so a row measured off
+/// screen reported a near-empty height that the list kept: the scroll extent
+/// came up short, the tail never resumed and "Scroll to end" stuck. Owned, a
+/// parse survives scrolling, and a landed parse remeasures its row.
+#[derive(Default)]
+pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>);
+
+struct MarkdownState {
+    view: Entity<TextViewState>,
+    text: SharedString,
+    /// The code-block wrap toggle is off (`wordWrap` defaults on).
+    nowrap: bool,
+    _changed: Subscription,
+}
+
+/// The key a row's markdown is cached under: its message id, or `thought:{entry}`.
+fn thought_key(entry_id: &str) -> SharedString {
+    format!("thought:{entry_id}").into()
+}
+
+fn shows_markdown(row: &Row, key: &str) -> bool {
+    match row {
+        Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
+        Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought_key(&entry.id) == key,
+        Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
+            entries.iter().any(|(entry, _)| thought_key(&entry.id) == key)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MarkdownKind {
+    Assistant {
+        streaming: bool,
+    },
+    /// `lineBreaks` and `headingLevelOffset={3}`: a typed newline is a line break.
+    User,
+}
+
+/// `ChatMarkdown` for `text`, parsed once per `key` for as long as the thread is open.
+fn markdown(
+    this: &WeakEntity<Workspace>,
+    key: SharedString,
+    text: &SharedString,
+    streaming: bool,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, t, cx)
+}
+
+fn markdown_with(
+    this: &WeakEntity<Workspace>,
+    key: SharedString,
+    text: &SharedString,
+    kind: MarkdownKind,
+    width: Option<f32>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    let user = kind == MarkdownKind::User;
+    let key_for_view = key.clone();
+    match this.update(cx, |workspace, cx| {
+        let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
+        (workspace.markdown_state(key, text, user, cx), wrap)
+    }) {
+        Ok((state, wrap)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t).into_any_element(),
+        Err(_) => div().into_any_element(),
+    }
+}
+
+/// remark-breaks: single newlines outside code fences become hard breaks.
+fn hard_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut fenced = false;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
+        if fence {
+            fenced = !fenced;
+        }
+        out.push_str(line);
+        if let Some(next) = lines.peek() {
+            if !fenced && !fence && !line.trim().is_empty() && !next.trim().is_empty() {
+                out.push('\\');
+            }
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn scroll_to_end_button(
@@ -234,15 +371,28 @@ fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEven
     }
 }
 
-fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut App) -> AnyElement {
+fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut Window, cx: &mut App) -> AnyElement {
     let t = *theme::tokens(cx);
     match row {
-        Row::User { id, text, steer, grouped_with_previous, grouped_with_next, continues_steer } => {
+        Row::User {
+            id,
+            text,
+            steer,
+            grouped_with_previous,
+            grouped_with_next,
+            continues_steer,
+            created_at,
+            revert,
+        } => {
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
+            let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
+            let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
             user_row(
                 id,
                 text,
+                body,
+                actions,
                 steer.filter(|_| !*continues_steer),
                 *grouped_with_previous,
                 *grouped_with_next,
@@ -251,28 +401,33 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
                 &t,
             )
         }
-        Row::Assistant { id, text, streaming, terminal } => {
+        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork } => {
             let body = div()
                 .px(px(4.))
                 .py(px(2.))
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(alpha(t.foreground, 0.9))
-                .child(markdown(id, text, *streaming, &t));
-            // The finished reply's copy row (`AssistantMessageMeta`) holds its space while hidden.
+                .child(markdown_with(
+                    this,
+                    id.clone(),
+                    text,
+                    MarkdownKind::Assistant { streaming: *streaming },
+                    Some(lane_width - 8.),
+                    &t,
+                    cx,
+                ));
+            // The finished reply's actions (`AssistantMessageMeta`) hold their space while hidden.
             let meta = terminal.then(|| {
-                h_flex()
-                    .mt(px(6.))
-                    .gap(px(8.))
+                message_actions::assistant_meta(this, id, text, *streaming, updated_at, status, fork.as_ref(), &t, cx)
                     .opacity(0.)
                     .group_hover("timeline-row", |style| style.opacity(1.))
-                    .child(copy_button(format!("copy:{id}"), text.clone(), &t))
             });
             lane(if *terminal { 16. } else { 8. }, v_flex().group("timeline-row").child(body).children(meta))
                 .into_any_element()
         }
-        Row::Plan { id, markdown: text } => plan_card(id, text, this, cx, &t),
-        Row::Work(work) => work_row(work, this, &t),
+        Row::Plan { id, markdown: text } => plan_card(id, text, this, lane_width, cx, &t),
+        Row::Work(work) => work_row(work, this, &t, cx),
         Row::Working { started_at } => {
             let label = match started_at.as_deref().and_then(work_log::parse_iso_ms) {
                 Some(start) => format!("Working for {}", working_duration(now_ms() - start)),
@@ -296,7 +451,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
                 .on_click(toggle(this, key.clone()));
             lane(6., rule_row(&t).child(button)).into_any_element()
         }
-        Row::Divider { label, failed, .. } => {
+        Row::Divider { label, failed, failure, .. } => {
             let color = if *failed { t.error } else { t.muted_foreground };
             let line_color = if *failed { alpha(t.error, 0.3) } else { alpha(t.border, 0.7) };
             let line = || div().flex_1().h(px(1.)).bg(line_color);
@@ -306,7 +461,20 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
                 .text_xs()
                 .text_color(color)
                 .child(line())
-                .child(h_flex().gap(px(6.)).child(Icon::new(IconName::Minimize2).size(px(12.))).child(label.clone()))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(
+                            Icon::new(if *failed { IconName::CircleAlert } else { IconName::Minimize2 }).size(px(12.)),
+                        )
+                        .children(compaction_label(label))
+                        .children(
+                            failure
+                                .as_ref()
+                                .map(|failure| div().min_w_0().truncate().opacity(0.8).child(format!("· {failure}"))),
+                        ),
+                )
                 .child(line());
             lane(16., content).into_any_element()
         }
@@ -314,6 +482,221 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
             let line = work_line(WorkIcon::Bot, icon_color(&t), label.clone(), t.muted_foreground, None);
             lane(8., div().px(px(2.)).py(px(2.)).child(line)).into_any_element()
         }
+        // Subagent rows carry no bottom space of their own.
+        Row::Subagent(card) => lane(0., subagent_card(card, this, &t)).into_any_element(),
+        Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
+        Row::AttemptFold { key, expanded } => {
+            let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+            let button = h_flex()
+                .id(ElementId::Name(key.clone()))
+                .w_full()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(alpha(t.border, 0.6))
+                .bg(alpha(t.muted, 0.2))
+                .hover(|style| style.bg(alpha(t.muted, 0.35)))
+                .cursor_pointer()
+                .child(Icon::new(chevron).size(px(14.)).text_color(t.muted_foreground))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(alpha(t.foreground, 0.8))
+                        .child("Superseded attempt"),
+                )
+                .child(div().text_size(px(11.)).text_color(t.muted_foreground).child("Cut off by a steer"))
+                .on_click(toggle(this, key.clone()));
+            lane(8., button).into_any_element()
+        }
+    }
+}
+
+/// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
+/// chevron when the subagent's thread can open.
+fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+    let muted = t.muted_foreground;
+    let detail_color = if card.failed { t.error } else { muted };
+    let dot = match card.dot {
+        timeline::Dot::Info => t.info,
+        timeline::Dot::Muted => alpha(muted, 0.6),
+        timeline::Dot::Success => t.success_foreground,
+        timeline::Dot::Destructive => t.error,
+    };
+    let logo = crate::assets::provider_icon(&card.driver);
+    let avatar = div()
+        .relative()
+        .size(px(24.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(t.secondary)
+        .child(match logo {
+            Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(IconName::Bot).size(px(14.)).text_color(muted),
+        })
+        .child(
+            div()
+                .absolute()
+                .right(px(-1.))
+                .bottom(px(-1.))
+                .size(px(8.))
+                .rounded_full()
+                .border_2()
+                .border_color(t.background)
+                .bg(dot),
+        );
+    let elapsed = card.started_at.as_deref().and_then(work_log::parse_iso_ms).and_then(|start| {
+        let end = match card.completed_at.as_deref().and_then(work_log::parse_iso_ms) {
+            Some(end) => end,
+            None if card.live => now_ms(),
+            None => return None,
+        };
+        Some(timeline::agent_elapsed(end - start))
+    });
+    let text = v_flex()
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.foreground)
+                .child(card.title.clone()),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(11.))
+                .line_height(relative(1.625))
+                .text_color(detail_color)
+                .child(card.detail.clone().unwrap_or_else(|| card.status_label.into())),
+        );
+    let row = h_flex()
+        .id(ElementId::Name(format!("subagent:{}", card.id).into()))
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .child(avatar)
+        .child(text)
+        .children(
+            card.status_beside_detail
+                .then(|| div().flex_none().text_xs().text_color(detail_color).child(card.status_label)),
+        )
+        .children(elapsed.map(|elapsed| div().flex_none().text_xs().text_color(muted).child(elapsed)));
+    match card.child_thread_id.clone() {
+        Some(child) => {
+            let this = this.clone();
+            row.cursor_pointer()
+                .hover(|style| style.bg(alpha(t.accent, 0.2)))
+                .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(alpha(muted, 0.6)))
+                .on_click(move |_, window, cx| {
+                    let _ = this.update(cx, |workspace, cx| workspace.select_thread(child.to_string(), window, cx));
+                })
+                .into_any_element()
+        }
+        None => row.into_any_element(),
+    }
+}
+
+/// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.
+fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+    let open = {
+        let (this, embed) = (this.clone(), embed.clone());
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let _ = this.update(cx, |workspace, cx| workspace.open_embed(&embed, cx));
+        }
+    };
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(alpha(t.border, 0.6))
+        .bg(alpha(t.card, 0.3))
+        .child(
+            Icon::new(if embed.app_server.is_some() { IconName::AppWindow } else { IconName::Globe })
+                .size(px(16.))
+                .text_color(icon_color(t)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(embed.title.clone()))
+                .child(div().text_xs().text_color(t.muted_foreground).child(match &embed.app_server {
+                    Some(_) => "MCP app",
+                    None => "HTML page",
+                })),
+        )
+        .child(
+            h_flex()
+                .id(ElementId::Name(format!("embed-open:{}", embed.id).into()))
+                .flex_none()
+                .h(px(24.))
+                .px(px(7.))
+                .gap(px(4.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(t.input)
+                .cursor_pointer()
+                .text_xs()
+                .hover(|style| style.bg(t.accent))
+                .child(Icon::new(IconName::ExternalLink).size(px(12.)))
+                .child("Open in browser")
+                .on_click(open),
+        )
+        .into_any_element()
+}
+
+impl Workspace {
+    /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
+    fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base.clone()) else { return };
+        let mut resource = serde_json::json!({
+            "_tag": "attachment",
+            "attachmentId": embed.attachment_id,
+            "mimeType": "text/html",
+            "disposition": "inline",
+        });
+        match &embed.app_server {
+            Some(_) => resource["renderIntent"] = "mcp-app".into(),
+            None => resource["fileName"] = embed.file_name().into(),
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client.request("assets.createUrl", serde_json::json!({"resource": resource})).await;
+            let _ = this.update(cx, |this, cx| {
+                match result.as_ref().ok().and_then(|r| r.get("relativeUrl")).and_then(|u| u.as_str()) {
+                    Some(url) => cx.open_url(&format!("{base}{url}")),
+                    None => this.error = Some("Page unavailable. Reconnect to the environment and try again.".into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// "Context compacted 120K → 40K tokens", with the arrow drawn as `ArrowRight`.
+fn compaction_label(label: &SharedString) -> Vec<AnyElement> {
+    match label.split_once(" → ") {
+        Some((before, after)) => vec![
+            div().child(before.to_owned()).into_any_element(),
+            Icon::new(IconName::ArrowRight).size(px(12.)).into_any_element(),
+            div().child(after.to_owned()).into_any_element(),
+        ],
+        None => vec![div().child(label.clone()).into_any_element()],
     }
 }
 
@@ -344,6 +727,8 @@ fn working_duration(ms: i64) -> String {
 fn user_row(
     id: &SharedString,
     text: &SharedString,
+    body: AnyElement,
+    actions: gpui_kit::Div,
     steer: Option<Steer>,
     grouped_with_previous: bool,
     grouped_with_next: bool,
@@ -364,7 +749,7 @@ fn user_row(
         .line_height(px(LINE))
         .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
         .when(grouped_with_next, |this| this.rounded_br(px(6.)))
-        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(text.clone()));
+        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body));
     if collapsed {
         bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
             180.,
@@ -404,7 +789,7 @@ fn user_row(
         .pr(px(4.))
         .opacity(0.)
         .group_hover("timeline-row", |style| style.opacity(1.))
-        .child(copy_button(format!("copy:{id}"), text.clone(), t));
+        .child(actions);
     let column = v_flex()
         .group("timeline-row")
         .items_end()
@@ -416,71 +801,123 @@ fn user_row(
     lane(if grouped_with_next { 4. } else { 16. }, column).into_any_element()
 }
 
-/// A ghost-muted `icon-xs` button that copies `text`.
-fn copy_button(id: String, text: SharedString, t: &Tokens) -> impl IntoElement {
-    div()
-        .id(ElementId::Name(id.into()))
-        .size(px(24.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(8.))
-        .cursor_pointer()
-        .text_color(t.muted_foreground)
-        .hover(|style| style.bg(t.accent).text_color(t.foreground))
-        .child(Icon::new(IconName::Copy).size(px(12.)))
-        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
-}
-
-fn markdown(id: &SharedString, text: &SharedString, streaming: bool, t: &Tokens) -> TextView {
+fn markdown_view(
+    state: &Entity<TextViewState>,
+    kind: MarkdownKind,
+    key: SharedString,
+    wrap: bool,
+    width: Option<f32>,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> TextView {
+    let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
     let inline_code = StyleRefinement::default()
         .bg(alpha(t.foreground, 0.1))
         .rounded(px(4.))
         .px(px(4.9))
         .py(px(1.4))
         .text_size(px(11.9));
-    let label_color = alpha(t.foreground, 0.72);
-    let button_hover = t.accent;
-    TextView::markdown(ElementId::Name(id.clone()), text.clone())
-        .style(markdown_style(t))
+    let t = *t;
+    let (header_this, link_this) = (this.clone(), this.clone());
+    TextView::new(state)
+        .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
         .selectable(true)
         .stream_fade(streaming)
-        .code_block_actions(move |block, _, _| {
-            let code = block.code();
-            h_flex()
-                .gap(px(6.))
-                .children(
-                    block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
-                        div().font_family(FONT_MONO).text_size(px(11.)).text_color(label_color).child(lang)
-                    }),
-                )
-                .child(
-                    div()
-                        .id("copy")
-                        .size(px(24.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(8.))
-                        .cursor_pointer()
-                        .text_color(label_color)
-                        .hover(|style| style.bg(button_hover))
-                        .child(Icon::new(IconName::Copy).size(px(12.)))
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()))),
-                )
+        .code_block_actions(move |block, _, cx| {
+            code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
+        })
+        .on_link_click(move |url, _, window, cx| match thread_link(url) {
+            Some(thread_id) => {
+                let _ = link_this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
+            }
+            None => cx.open_url(url),
         })
 }
 
+/// `parseThreadLink`: `t3-thread://v1/{thread}` or `t3-thread://v2/{environment}/{thread}`.
+fn thread_link(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("t3-thread://")?;
+    let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["v1", thread] | ["v2", _, thread] if !thread.is_empty() => Some((*thread).to_owned()),
+        _ => None,
+    }
+}
+
+/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
+/// TextView pins the actions 8px into the block's top-right corner over its own fill,
+/// so given the block's `width` the row spans it and paints the block's color.
+fn code_block_header(
+    this: &WeakEntity<Workspace>,
+    key: &SharedString,
+    block: &gpui_kit::base::text::CodeBlock,
+    wrap: bool,
+    streaming: bool,
+    width: Option<f32>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    let label_color = alpha(t.foreground, 0.72);
+    let code: SharedString = block.code();
+    let id: SharedString = format!("code:{key}:{:x}", fxhash(&code)).into();
+    let wrap_key = key.clone();
+    let wrap_this = this.clone();
+    let wrap_button = div()
+        .id("wrap")
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .cursor_pointer()
+        .text_color(label_color)
+        .when(wrap, |button| button.bg(t.secondary).text_color(t.foreground))
+        .hover(|style| style.bg(t.accent).text_color(t.foreground))
+        .child(Icon::new(IconName::TextWrap).size(px(12.)))
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(if wrap { "Disable line wrap" } else { "Wrap lines" })
+                .build(window, cx)
+        })
+        .on_click(move |_, _, cx| {
+            let _ = wrap_this.update(cx, |workspace, cx| workspace.toggle_code_wrap(&wrap_key, cx));
+        });
+    let copy = message_actions::code_copy_button(this, id, code, t, cx);
+    let fill = t.background.blend(code_background(t));
+    h_flex()
+        .when_some(width, |row, width| row.w(px(width - 8.)).pl(px(10.)).justify_between())
+        .mt(px(-2.))
+        .mr(px(-2.))
+        .rounded(px(6.))
+        .bg(fill)
+        .gap(px(8.))
+        .child(
+            div()
+                .font_family(FONT_MONO)
+                .text_size(px(11.))
+                .text_color(label_color)
+                .children(block.lang().filter(|lang| !lang.is_empty())),
+        )
+        .child(h_flex().gap(px(2.)).child(wrap_button).children((!streaming).then_some(copy)))
+        .into_any_element()
+}
+
+/// A short stable hash, to tell a message's code blocks apart.
+fn fxhash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100000001b3))
+}
+
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
-fn markdown_style(t: &Tokens) -> TextViewStyle {
-    let (code_background, code_border) = if t.dark {
-        (alpha(t.input, 0.32), gpui_kit::transparent_black())
-    } else {
-        (t.secondary, alpha(t.border, 0.7))
-    };
+/// The code block fill: `input/32` in dark mode, `secondary` in light.
+fn code_background(t: &Tokens) -> Hsla {
+    if t.dark { alpha(t.input, 0.32) } else { t.secondary }
+}
+
+fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyle {
+    let code_background = code_background(t);
+    let code_border = if t.dark { gpui_kit::transparent_black() } else { alpha(t.border, 0.7) };
     // The web's header row (6px + 24px toolbar) sits above the code's own 12.8px.
-    let code_block = StyleRefinement::default()
+    let mut code_block = StyleRefinement::default()
         .pt(px(42.8))
         .pb(px(12.8))
         .px(px(14.4))
@@ -489,10 +926,15 @@ fn markdown_style(t: &Tokens) -> TextViewStyle {
         .border_color(code_border)
         .text_size(px(13.))
         .line_height(relative(1.375));
+    if !wrap {
+        code_block = code_block.whitespace_nowrap();
+        code_block.overflow.x = Some(gpui_kit::Overflow::Scroll);
+    }
     let mut style = TextViewStyle::default()
         .paragraph_gap(rems(0.65))
-        .heading_font_size(|level, _| {
+        .heading_font_size(move |level, _| {
             px(match level {
+                _ if user => 14.,
                 1 => 20.,
                 2 => 18.,
                 3 => 16.,
@@ -602,7 +1044,14 @@ static PIERRE_DARK: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_them
 static PIERRE_LIGHT: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_theme(false));
 
 /// `ProposedPlanCard.tsx`.
-fn plan_card(id: &SharedString, text: &SharedString, this: &WeakEntity<Workspace>, cx: &App, t: &Tokens) -> AnyElement {
+fn plan_card(
+    id: &SharedString,
+    text: &SharedString,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    cx: &mut App,
+    t: &Tokens,
+) -> AnyElement {
     let title: SharedString = text
         .lines()
         .find_map(|line| line.trim_start().strip_prefix('#').map(|h| h.trim_start_matches('#').trim().to_owned()))
@@ -629,7 +1078,15 @@ fn plan_card(id: &SharedString, text: &SharedString, this: &WeakEntity<Workspace
         .text_size(px(TEXT))
         .line_height(px(LINE))
         .text_color(alpha(t.foreground, 0.9))
-        .child(markdown(id, text, false, t));
+        .child(markdown_with(
+            this,
+            id.clone(),
+            text,
+            MarkdownKind::Assistant { streaming: false },
+            Some(lane_width - 42.),
+            t,
+            cx,
+        ));
     if collapsed {
         body = body.max_h(px(416.)).overflow_hidden().child(
             div().absolute().left_0().right_0().bottom_0().h(px(96.)).bg(linear_gradient(
@@ -758,11 +1215,11 @@ fn work_bottom(work: &WorkRow) -> f32 {
     }
 }
 
-fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
-        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t),
+        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
         WorkRowKind::Toggle { group, summary, icon, .. } => row
             .id(ElementId::Name(work.id.clone()))
             .cursor_pointer()
@@ -774,7 +1231,9 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElem
             .max_h(px(288.))
             .overflow_y_scroll()
             .rounded(px(6.))
-            .children(entries.iter().map(|(entry, expanded)| detail_entry(entry, *expanded, this, t)))
+            .children(
+                entries.iter().map(|(entry, expanded)| detail_entry(entry, *expanded, this, t, cx)).collect::<Vec<_>>(),
+            )
             .into_any_element(),
         WorkRowKind::Live { group, entry, label, thought, expanded, .. } => {
             let failed = entry.failed();
@@ -845,6 +1304,14 @@ fn entry_body(entry: &Entry, label: &str) -> Option<String> {
     (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
+fn expandable(entry: &Entry, label: &str) -> bool {
+    if entry.is_reasoning() {
+        entry.detail.is_some()
+    } else {
+        super::inspector::has_inspector(entry) || entry_body(entry, label).is_some()
+    }
+}
+
 fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
     let icon = Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
         .size(px(12.))
@@ -859,7 +1326,13 @@ fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-fn entry_details(entry: &Entry, label: &str, t: &Tokens) -> Option<AnyElement> {
+fn entry_details(
+    entry: &Entry,
+    label: &str,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> Option<AnyElement> {
     if entry.is_reasoning() {
         let text = entry.detail.clone()?;
         return Some(
@@ -873,9 +1346,12 @@ fn entry_details(entry: &Entry, label: &str, t: &Tokens) -> Option<AnyElement> {
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(t.foreground)
-                .child(markdown(&format!("thought-md:{}", entry.id).into(), &text, false, t))
+                .child(markdown(this, thought_key(&entry.id), &text.into(), false, t, cx))
                 .into_any_element(),
         );
+    }
+    if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
+        return Some(div().mt(px(2.)).mb(px(6.)).pb(px(8.)).child(inspector).into_any_element());
     }
     let body = entry_body(entry, label)?;
     Some(
@@ -901,6 +1377,7 @@ fn single_entry(
     expanded: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
+    cx: &mut App,
 ) -> AnyElement {
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
@@ -947,8 +1424,8 @@ fn single_entry(
         label.clone()
     };
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
-    let details = expanded.then(|| entry_details(entry, label, t)).flatten();
-    let expandable = if entry.is_reasoning() { entry.detail.is_some() } else { entry_body(entry, label).is_some() };
+    let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
+    let expandable = expandable(entry, label);
     let line = work_line(entry.icon(), color, label_text, label_color, Some(chevron(expandable, expanded, t)));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
@@ -959,14 +1436,20 @@ fn single_entry(
 }
 
 /// An entry inside an open group (`WorkEntryLogRow`): no vertical padding.
-fn detail_entry(entry: &Rc<Entry>, expanded: bool, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn detail_entry(
+    entry: &Rc<Entry>,
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
     let label: SharedString = work_log::collapse_whitespace(&work_log::display_label(entry)).into();
     let failed = entry.failed() && entry.status != Some(Status::Declined);
     let color = if failed { failed_icon_color(t) } else { icon_color(t) };
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
-    let expandable = if entry.is_reasoning() { entry.detail.is_some() } else { entry_body(entry, &label).is_some() };
+    let expandable = expandable(entry, &label);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
-    let details = expanded.then(|| entry_details(entry, &label, t)).flatten();
+    let details = if expanded { entry_details(entry, &label, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
         .w_full()
@@ -978,4 +1461,24 @@ fn detail_entry(entry: &Rc<Entry>, expanded: bool, this: &WeakEntity<Workspace>,
         .children(details)
         .when(expandable, |row| row.on_click(toggle(this, timeline::entry_key(&entry.id))))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_links_open_their_thread() {
+        assert_eq!(thread_link("t3-thread://v1/abc").as_deref(), Some("abc"));
+        assert_eq!(thread_link("t3-thread://v2/env/abc/").as_deref(), Some("abc"));
+        assert_eq!(thread_link("https://example.com"), None);
+        assert_eq!(thread_link("t3-thread://v3/x"), None);
+    }
+
+    #[test]
+    fn typed_newlines_break_lines_except_in_code_and_between_paragraphs() {
+        assert_eq!(hard_breaks("one\ntwo"), "one\\\ntwo");
+        assert_eq!(hard_breaks("one\n\ntwo"), "one\n\ntwo");
+        assert_eq!(hard_breaks("```\na\nb\n```\nafter"), "```\na\nb\n```\nafter");
+    }
 }

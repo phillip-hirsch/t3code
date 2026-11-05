@@ -13,9 +13,11 @@ mod requests;
 mod rpc;
 mod settings;
 mod search;
+mod terminal_text;
 mod theme;
 mod timeline;
 mod usage;
+mod timestamp;
 mod work_log;
 
 use std::sync::OnceLock;

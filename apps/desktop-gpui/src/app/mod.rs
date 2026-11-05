@@ -28,7 +28,10 @@ mod composer;
 mod details;
 mod header;
 pub(crate) mod keymap;
+mod inspector;
 mod layout;
+mod message_actions;
+mod minimap;
 mod pages;
 mod palette;
 mod preview;
@@ -87,6 +90,12 @@ pub struct Workspace {
     /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
     expanded: HashSet<SharedString>,
     entry_cache: timeline::EntryCache,
+    markdown: chat::MarkdownStates,
+    /// Output of the open tool entries.
+    details: inspector::Details,
+    copy_feedback: message_actions::CopyFeedback,
+    /// The minimap tick under the pointer.
+    minimap_hover: Option<usize>,
     /// Repaints the "Working for …" timer once a second while a turn runs.
     _working_tick: Option<Task<()>>,
     scroller: Entity<MessageScrollerState>,
@@ -185,6 +194,10 @@ impl Workspace {
             rows: Rc::default(),
             expanded: HashSet::new(),
             entry_cache: timeline::EntryCache::default(),
+            markdown: chat::MarkdownStates::default(),
+            details: inspector::Details::default(),
+            copy_feedback: message_actions::CopyFeedback::default(),
+            minimap_hover: None,
             _working_tick: None,
             scroller,
             composer,
@@ -567,6 +580,7 @@ impl Workspace {
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);
+        self.sync_details(cx);
         self.scroller.update(cx, |scroller, cx| {
             if was_empty {
                 scroller.reset(total, cx);
@@ -625,6 +639,8 @@ impl Workspace {
         self.rows = Rc::default();
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
+        self.markdown = chat::MarkdownStates::default();
+        self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
     }
