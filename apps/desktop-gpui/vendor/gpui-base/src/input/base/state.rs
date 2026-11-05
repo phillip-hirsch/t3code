@@ -9787,6 +9787,42 @@ mod tests {
         });
     }
 
+    /// A textarea's decorations follow edits beside its inline tokens, which survive them.
+    #[gpui::test]
+    fn test_textarea_decorations_follow_edits_beside_tokens(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.auto_grow(1, 4));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let collection = cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let content = crate::input::InputContent::new("**a** @f x")
+                    .with_token(6..8, crate::input::InlineToken::new("f", "@f"))
+                    .unwrap();
+                state.set_value(content, window, cx);
+                let bold = gpui::HighlightStyle {
+                    font_weight: Some(gpui::FontWeight::BOLD),
+                    ..Default::default()
+                };
+                let collection = state.create_decorations_collection(
+                    vec![
+                        crate::input::TextDecoration::new(2..3, bold),
+                        crate::input::TextDecoration::new(9..10, bold),
+                    ],
+                    cx,
+                );
+                state.set_selected_range(0..0, cx);
+                state.insert("> ", window, cx);
+                collection
+            })
+        });
+        cx.update(|_, cx| {
+            assert_eq!(collection.get_ranges(cx), vec![4..5, 11..12]);
+            assert_eq!(input.read(cx).tokens()[0].range(), 8..10);
+            collection.clear(cx);
+            assert!(input.read(cx).extras.decoration_layers()[0].is_empty());
+        });
+    }
+
     /// The mode marker is the only source of truth for the kind of input.
     ///
     /// An auto-growing textarea capped at one row used to report itself as

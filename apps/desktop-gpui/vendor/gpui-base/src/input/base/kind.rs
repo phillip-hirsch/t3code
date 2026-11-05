@@ -366,8 +366,32 @@ impl InputModeKind for InputMode {
 impl InputModeKind for TextareaMode {
     const MULTI_LINE: bool = true;
 
-    /// Ordinary multi-line text needs nothing beyond the shared engine.
-    type Extras = ();
+    /// Ordinary multi-line text adds only application text decorations.
+    type Extras = TextareaExtras;
+
+    fn reset_annotations(state: &mut InputBaseState<Self>) {
+        state.extras.decorations.clear();
+    }
+
+    fn adjust_annotations(
+        state: &mut InputBaseState<Self>,
+        range: &std::ops::Range<usize>,
+        new_len: usize,
+    ) {
+        state.extras.decorations.adjust_for_edit(range, new_len);
+    }
+}
+
+/// What a textarea adds on top of the shared engine: the editor's text decorations.
+#[derive(Default)]
+pub struct TextareaExtras {
+    pub(crate) decorations: DecorationCollections,
+}
+
+impl InputExtras for TextareaExtras {
+    fn decoration_layers(&self) -> Vec<&[TextDecoration]> {
+        self.decorations.iter().collect()
+    }
 }
 // `EditorMode`'s implementation lives with the editor code, next to the
 // language features it dispatches to.
