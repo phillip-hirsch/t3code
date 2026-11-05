@@ -38,6 +38,8 @@ pub(super) struct FilesState {
     /// `t3code.renderMarkdown`: Markdown files show rendered.
     render_markdown: bool,
     images: Option<Entity<super::pages::settings::code::projects::icon::Images>>,
+    /// The open thread's workspace mutation, read once per frame for the tree and preview.
+    mutation: (Option<String>, Option<String>),
 }
 
 impl Workspace {

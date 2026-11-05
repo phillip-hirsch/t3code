@@ -384,6 +384,13 @@ pub(super) fn search_paths(matches: &[Entry]) -> HashSet<String> {
     paths
 }
 
+/// The tree's own search (Pierre `hide-non-matches`): every known path that contains the
+/// typed text, ignoring case.
+pub(super) fn tree_search_matches(entries: &[Entry], typed: &str) -> Vec<Entry> {
+    let needle = typed.to_lowercase();
+    entries.iter().filter(|e| e.path.to_lowercase().contains(&needle)).cloned().collect()
+}
+
 /// `buildTreeEntries`: listed entries plus search hits and the folders above them.
 pub(super) fn merge_search_entries(listed: &[Entry], hits: &[Entry]) -> Vec<Entry> {
     let mut known: HashSet<String> = listed.iter().map(|e| e.path.clone()).collect();
@@ -529,10 +536,13 @@ mod tests {
         let listed = [dir("src"), file("README.md")];
         let hits = [file("src/app/files.rs")];
         let merged = merge_search_entries(&listed, &hits);
-        let filter = search_paths(&hits);
+        let matches = tree_search_matches(&merged, "FILES");
+        assert_eq!(matches, [file("src/app/files.rs")], "server hits pass through the tree's own filter");
+        let filter = search_paths(&matches);
         let rows = tree_rows(&merged, &HashSet::new(), Some(&filter));
         let labels: Vec<(&str, bool)> = rows.iter().map(|r| (r.label.as_str(), r.expanded)).collect();
         assert_eq!(labels, [("src/app", true), ("files.rs", false)]);
+        assert!(tree_search_matches(&merged, "rail").is_empty());
         assert_eq!(ancestors("a/b/c.rs"), ["a", "a/b"]);
     }
 

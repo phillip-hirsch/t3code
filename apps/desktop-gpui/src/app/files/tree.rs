@@ -32,6 +32,9 @@ const SEARCH_LIMIT: usize = 200;
 
 #[derive(Default)]
 struct PathSearch {
+    /// What the box holds, lowercased, for the tree's own filter.
+    typed: String,
+    /// The trimmed query sent to the server.
     query: String,
     hits: Vec<Entry>,
     truncated: bool,
@@ -57,6 +60,11 @@ pub(super) struct TreeState {
     search: PathSearch,
     rows: Rc<Vec<TreeRow>>,
     rows_dirty: bool,
+    /// Derived with the rows: the first folder error still in the tree, whether every folder
+    /// "Expand all" would open is open, and whether any folder shows.
+    error: Option<String>,
+    all_open: bool,
+    has_folders: bool,
     scroll: UniformListScrollHandle,
     /// The selection last revealed, with its request.
     revealed: Option<(String, u64)>,
@@ -80,27 +88,33 @@ impl TreeState {
         out
     }
 
+    /// The rows; while searching, the matching paths with their folders open. Server hits join
+    /// the listed entries once they arrive (`buildTreeEntries`).
     fn rebuild_rows(&mut self) {
         let entries = self.reachable();
-        let searching = !self.search.query.is_empty() && !self.search.pending;
-        self.rows = Rc::new(if searching {
-            let merged = logic::merge_search_entries(&entries, &self.search.hits);
-            logic::tree_rows(&merged, &self.expanded, Some(&logic::search_paths(&self.search.hits)))
-        } else {
+        let folders: HashSet<&str> = std::iter::once("")
+            .chain(entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.as_str()))
+            .collect();
+        self.error = self.errors.iter().find(|(path, _)| folders.contains(path.as_str())).map(|(_, e)| e.clone());
+        let expandable = self.expandable_in(&entries);
+        self.all_open =
+            self.expand_all || (!expandable.is_empty() && expandable.iter().all(|p| self.expanded.contains(p)));
+        self.has_folders = folders.len() > 1;
+        self.rows = Rc::new(if self.search.query.is_empty() {
             logic::tree_rows(&entries, &self.expanded, None)
+        } else {
+            let hits: &[Entry] = if self.search.pending { &[] } else { &self.search.hits };
+            let merged = logic::merge_search_entries(&entries, hits);
+            self.has_folders |= merged.iter().any(|e| e.kind == EntryKind::Directory);
+            let matches = logic::tree_search_matches(&merged, &self.search.typed);
+            logic::tree_rows(&merged, &self.expanded, Some(&logic::search_paths(&matches)))
         });
         self.rows_dirty = false;
     }
 
-    fn expandable(&self) -> Vec<String> {
-        self.reachable().into_iter().filter(|e| e.kind == EntryKind::Directory && !e.ignored).map(|e| e.path).collect()
-    }
-
-    fn error(&self) -> Option<&String> {
-        let reachable: HashSet<String> = std::iter::once(String::new())
-            .chain(self.reachable().into_iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path))
-            .collect();
-        self.errors.iter().find(|(path, _)| reachable.contains(*path)).map(|(_, error)| error)
+    /// The folders "Expand all" opens: every listed one but ignored folders such as `node_modules`.
+    fn expandable_in(&self, entries: &[Entry]) -> Vec<String> {
+        entries.iter().filter(|e| e.kind == EntryKind::Directory && !e.ignored).map(|e| e.path.clone()).collect()
     }
 }
 
@@ -137,6 +151,9 @@ impl Workspace {
                 search: PathSearch::default(),
                 rows: Rc::default(),
                 rows_dirty: true,
+                error: None,
+                all_open: false,
+                has_folders: false,
                 scroll: UniformListScrollHandle::new(),
                 revealed: None,
                 mutation: None,
@@ -246,7 +263,7 @@ impl Workspace {
 
     fn toggle_all_folders(&mut self, cwd: &str, cx: &mut Context<Self>) {
         let Some(tree) = self.tree(cwd) else { return };
-        let expandable = tree.expandable();
+        let expandable = tree.expandable_in(&tree.reachable());
         let all_open = tree.expand_all || expandable.iter().all(|p| tree.expanded.contains(p));
         if all_open {
             tree.expanded.clear();
@@ -279,7 +296,10 @@ impl Workspace {
         let client = self.client();
         let Some(tree) = self.tree(cwd) else { return };
         let query: String = value.chars().take(256).collect::<String>().trim().to_owned();
+        tree.search.typed = value.to_lowercase();
+        tree.rows_dirty = true;
         if tree.search.query == query {
+            cx.notify();
             return;
         }
         tree.search.generation += 1;
@@ -336,7 +356,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mutation = self.current_workspace_mutation();
+        let mutation = self.files.mutation.clone();
         let Some(tree) = self.tree(cwd) else { return };
         let previous = tree.mutation.replace(mutation.clone());
         if previous.is_some_and(|p| p != mutation) {
@@ -390,14 +410,10 @@ impl Workspace {
         let rows = tree.rows.clone();
         let ready = tree.listed.contains_key("");
         let pending = !tree.loading.is_empty();
-        let error = tree.error().cloned().or_else(|| tree.search.error.clone());
+        let error = tree.error.clone().or_else(|| tree.search.error.clone());
         let searching = !tree.search.query.is_empty();
-        let has_folders = rows.iter().any(|r| r.kind == EntryKind::Directory);
-        let all_open = tree.expand_all || {
-            let expandable = tree.expandable();
-            !expandable.is_empty() && expandable.iter().all(|p| tree.expanded.contains(p))
-        };
-        let no_matches = searching && !tree.search.pending && tree.search.hits.is_empty();
+        let (has_folders, all_open) = (tree.has_folders, tree.all_open);
+        let no_matches = searching && rows.is_empty();
         let truncated = searching && tree.search.truncated && !tree.search.pending;
         let loading_line = (!ready || tree.search.pending) && (rows.is_empty() || no_matches);
         let query = tree.query.clone();
@@ -462,8 +478,11 @@ impl Workspace {
                 )
             });
         let retry_key = key.clone();
+        let settled = ready && !pending && !tree.search.pending && error.is_none();
         let list: AnyElement = if no_matches {
-            div().px(px(12.)).py(px(16.)).text_xs().text_color(muted).child("No matching files.").into_any_element()
+            div()
+                .when(settled, |el| el.px(px(12.)).py(px(16.)).text_xs().text_color(muted).child("No matching files."))
+                .into_any_element()
         } else {
             let selected = selected.map(str::to_owned);
             let list_key = key.clone();

@@ -46,6 +46,8 @@ pub(super) struct PreviewState {
     editor: Option<Entity<EditorState>>,
     /// The contents as last read or written; edits that match it don't save.
     saved: String,
+    /// The editor holds edits not yet written.
+    dirty: bool,
     /// A write is waiting or in flight.
     saving: bool,
     markdown: Option<Entity<TextViewState>>,
@@ -65,6 +67,7 @@ impl PreviewState {
             load: Load::Loading,
             editor: None,
             saved: String::new(),
+            dirty: false,
             saving: false,
             markdown: None,
             wrap: None,
@@ -122,13 +125,13 @@ impl Workspace {
     /// Reads the file once, and again after a workspace mutation unless edits are unsaved; then
     /// applies the wrap toggle and a pending line reveal.
     fn sync_preview(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
-        let mutation = self.current_workspace_mutation();
+        let mutation = self.files.mutation.clone();
         let wrap_default = self.client_settings.values.bool("wordWrap");
         let reveal = self.files.reveals.get(key).copied();
         let state = self.files.previews.entry(key.clone()).or_insert_with(PreviewState::new);
         let fresh = state.mutation.is_none();
         let changed = state.mutation.as_ref().is_some_and(|m| *m != mutation);
-        let dirty = state.saving || state.editor.as_ref().is_some_and(|e| *e.read(cx).value() != *state.saved);
+        let dirty = state.saving || state.dirty;
         state.mutation = Some(mutation);
         if logic::is_image(&key.1) {
             state.load = Load::Image;
@@ -231,7 +234,8 @@ impl Workspace {
             return;
         }
         let contents = editor.read(cx).value().to_string();
-        if contents == state.saved {
+        state.dirty = contents != state.saved;
+        if !state.dirty {
             state._save = None;
             state.saving = false;
             return;
@@ -247,7 +251,10 @@ impl Workspace {
                 let Some(state) = this.files.previews.get_mut(&key) else { return };
                 state.saving = false;
                 match result {
-                    Ok(_) => state.saved = contents,
+                    Ok(_) => {
+                        state.dirty = state.editor.as_ref().is_some_and(|e| *e.read(cx).value() != *contents);
+                        state.saved = contents;
+                    }
                     Err(error) => {
                         this.error = Some(format!("Could not save {}: {}", key.1, logic::error_message(&error)).into())
                     }
@@ -275,6 +282,7 @@ impl Workspace {
                 .into_any_element();
         };
         let cwd = target.cwd.clone();
+        self.files.mutation = self.current_workspace_mutation();
         let Some(path) = path else {
             return self.render_tree(&cwd, None, 0, window, cx);
         };
