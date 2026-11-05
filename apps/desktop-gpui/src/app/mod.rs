@@ -776,9 +776,9 @@ impl Workspace {
         }
         self.page = None;
         self.stash_composer(cx);
-        self.target = Some(target);
-        if let Some(old) = self.thread.take() {
-            self.retire_thread(old.id, old.state, cx);
+        let leaving = self.target.replace(target);
+        if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
+            self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
         let state = self.take_warm_thread(&thread_id).unwrap_or_default();
         let resumed = state.projection.is_some();
@@ -808,9 +808,9 @@ impl Workspace {
         let Some(env) = self.project_environment(&project_id) else { return };
         self.page = None;
         self.stash_composer(cx);
-        self.target = Some(Target::Draft { env, project_id });
-        if let Some(old) = self.thread.take() {
-            self.retire_thread(old.id, old.state, cx);
+        let leaving = self.target.replace(Target::Draft { env, project_id });
+        if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
+            self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
         self.model_override = None;
         self.runtime_mode_override = None;
