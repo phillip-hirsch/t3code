@@ -346,8 +346,8 @@ mod os {
 
     use gpui_kit::{
         Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _, Bounds, Context, IntoElement,
-        ParentElement as _, Render, RenderImage, Styled as _, Window, WindowBounds, WindowKind, WindowOptions, div,
-        img, point, px, size, white,
+        ParentElement as _, Render, RenderImage, Styled as _, Task, Window, WindowBounds, WindowKind, WindowOptions,
+        div, img, point, px, size, white,
     };
     use image::RgbaImage;
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
@@ -521,8 +521,8 @@ mod os {
 
     /// `SnapShotFlash`: the window lit white, fading out when `animated`. With DirectComposition off
     /// (for WebView2) GPUI can't draw a see-through window, so an opaque, never-focused popup shows
-    /// the captured pixels under the white.
-    pub fn show_flash(flash: Flash, animated: bool, cx: &mut App) {
+    /// the captured pixels under the white. The task ends when the flash has played.
+    pub fn show_flash(flash: Flash, animated: bool, cx: &mut App) -> Task<()> {
         retire_flash(cx);
         let options = WindowOptions {
             titlebar: None,
@@ -547,7 +547,7 @@ mod os {
             };
             cx.new(|_| FlashView { image: flash.image, animated })
         });
-        let (Ok(window), Some(hwnd)) = (opened, hwnd) else { return };
+        let (Ok(window), Some(hwnd)) = (opened, hwnd) else { return Task::ready(()) };
         let window: AnyWindowHandle = window.into();
         FLASH.set(Some(window));
         cx.spawn(async move |cx| {
@@ -574,7 +574,6 @@ mod os {
                 }
             });
         })
-        .detach();
     }
 
     struct FlashView {
@@ -731,8 +730,8 @@ mod os {
 
     use gpui_kit::{
         Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _, Bounds, Context, IntoElement, Render,
-        Styled as _, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
-        white,
+        Styled as _, Task, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px,
+        size, white,
     };
     use objc2_app_kit::NSWorkspace;
     use objc2_core_graphics::{CGEventSource, CGEventSourceStateID};
@@ -912,8 +911,8 @@ function run() {
     }
 
     /// `SnapShotFlash`: the window lit white through a see-through, never-focused popup,
-    /// fading out when `animated`.
-    pub fn show_flash(flash: Flash, animated: bool, cx: &mut App) {
+    /// fading out when `animated`. The task ends when the flash has played.
+    pub fn show_flash(flash: Flash, animated: bool, cx: &mut App) -> Task<()> {
         retire_flash(cx);
         let options = WindowOptions {
             titlebar: None,
@@ -929,7 +928,9 @@ function run() {
             ))),
             ..Default::default()
         };
-        let Ok(window) = cx.open_window(options, |_, cx| cx.new(|_| FlashView { animated })) else { return };
+        let Ok(window) = cx.open_window(options, |_, cx| cx.new(|_| FlashView { animated })) else {
+            return Task::ready(());
+        };
         let window: AnyWindowHandle = window.into();
         FLASH.set(Some(window));
         cx.spawn(async move |cx| {
@@ -940,7 +941,6 @@ function run() {
                 }
             });
         })
-        .detach();
     }
 
     struct FlashView {
@@ -1009,5 +1009,7 @@ mod imp {
 
     pub fn retire_flash(_: &mut App) {}
 
-    pub fn show_flash(_: Flash, _: bool, _: &mut App) {}
+    pub fn show_flash(_: Flash, _: bool, _: &mut App) -> gpui_kit::Task<()> {
+        gpui_kit::Task::ready(())
+    }
 }

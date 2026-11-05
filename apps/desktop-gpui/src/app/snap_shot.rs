@@ -155,16 +155,19 @@ impl Workspace {
             self.snap_shot.capturing = false;
             return self.snap_shot_failed(snap_shot::CAPTURE_FAILED.into(), window, cx);
         }
-        if let Some(animated) = flash {
+        // The flash plays while the capture encodes; the capture lands once both are done.
+        let feedback = flash.map(|animated| {
             cx.spawn(async move |_, cx| {
                 if let Ok(flash) = flashes.await {
-                    let () = cx.update(|cx| platform::show_flash(flash, animated, cx));
+                    cx.update(|cx| platform::show_flash(flash, animated, cx)).await;
                 }
             })
-            .detach();
-        }
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = result.await.unwrap_or(Err(snap_shot::CAPTURE_FAILED));
+            if let Some(feedback) = feedback {
+                feedback.await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.snap_shot.capturing = false;
                 match result {
@@ -191,7 +194,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // No flight animation started, so the app comes forward (`desktopWindow.activate`).
+        // No flight animation started, so once the flash has played the app comes forward
+        // (`desktopWindow.activate`): Electron's reveal steals focus on macOS, then focuses the window.
+        #[cfg(target_os = "macos")]
+        cx.activate(true);
         window.activate_window();
         self.snap_shot.state.message = None;
         let values = &self.client_settings.values;
