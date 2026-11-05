@@ -9,6 +9,12 @@ pub struct WorkflowRow {
     pub opening: Opening,
     pub phases: Vec<(String, usize, Vec<std::rc::Rc<crate::timeline::SubagentCard>>)>,
     pub unphased: Vec<std::rc::Rc<crate::timeline::SubagentCard>>,
+    /// [`Opening::headline`], built with the row rather than per frame.
+    pub headline: (String, Option<String>, Option<String>),
+    /// [`script_markdown`] of the opening's script.
+    pub script_markdown: gpui_kit::SharedString,
+    /// The script is long enough to fold.
+    pub foldable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

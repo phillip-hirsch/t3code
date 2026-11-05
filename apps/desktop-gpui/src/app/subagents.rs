@@ -437,7 +437,7 @@ impl gpui_kit::Render for NativeWork {
             None => note("Loading…".into(), t.muted_foreground).into_any_element(),
             Some(Err(error)) => note(error.to_string(), t.error_foreground).into_any_element(),
             Some(Ok(value)) => {
-                let children = value["children"].as_array().cloned().unwrap_or_default();
+                let children = value["children"].as_array().map(Vec::as_slice).unwrap_or_default();
                 if children.is_empty() {
                     note("The provider has no record of which subagents this call started.".into(), t.muted_foreground)
                         .into_any_element()

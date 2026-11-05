@@ -22,7 +22,7 @@ use gpui_kit::assets::IconName;
 
 use super::{Target, Workspace, message_actions, project_name};
 use crate::theme::{self, Tokens};
-use crate::timeline::{self, Row, Steer, WorkRow, WorkRowKind};
+use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
 
 /// Prose: `text-sm` at `leading-relaxed`.
@@ -32,9 +32,9 @@ const LINE: f32 = 22.75;
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
 
-/// `shouldCollapseUserMessage`.
+/// `shouldCollapseUserMessage`; it stops counting at the limits.
 pub(super) fn should_collapse(text: &str) -> bool {
-    text.chars().count() > COLLAPSE_CHARS || text.lines().count() > COLLAPSE_LINES
+    text.chars().nth(COLLAPSE_CHARS).is_some() || text.lines().nth(COLLAPSE_LINES).is_some()
 }
 
 impl Workspace {
@@ -106,7 +106,8 @@ impl Workspace {
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let row_key = key.clone();
         let _changed = cx.observe(&view, move |this, _, cx| {
-            if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
+            // The streaming message is near the end.
+            if let Some(index) = this.rows.iter().rposition(|row| shows_markdown(row, &row_key)) {
                 this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             } else if let Some(side) = &this.side_chat.view
                 && let Some(index) = side.rows.iter().position(|row| shows_markdown(row, &row_key))
@@ -134,7 +135,7 @@ impl Workspace {
     fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(state) = self.markdown.0.get_mut(key) {
             state.nowrap = !state.nowrap;
-            if let Some(index) = self.rows.iter().position(|row| shows_markdown(row, key)) {
+            if let Some(index) = self.rows.iter().rposition(|row| shows_markdown(row, key)) {
                 self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             }
             cx.notify();
@@ -199,12 +200,13 @@ fn thought_key(entry_id: &str) -> SharedString {
 }
 
 pub(super) fn shows_markdown(row: &Row, key: &str) -> bool {
+    let thought = key.strip_prefix("thought:");
     match row {
         Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
         Row::Workflow { row, .. } => key.strip_prefix("workflow-script:") == Some(row.opening.message_id.as_str()),
-        Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought_key(&entry.id) == key,
+        Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought == Some(&*entry.id),
         Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
-            entries.iter().any(|(entry, _)| thought_key(&entry.id) == key)
+            thought.is_some_and(|id| entries.iter().any(|detail| *detail.entry.id == *id))
         }
         _ => false,
     }
@@ -479,7 +481,7 @@ pub(super) fn render_row(
             lane(if *terminal { 16. } else { 8. }, v_flex().group("timeline-row").child(body).children(meta))
                 .into_any_element()
         }
-        Row::Plan { id, markdown: text } => plan_card(id, text, this, lane_width, cx, &t),
+        Row::Plan { id, plan } => plan_card(id, plan, this, lane_width, cx, &t),
         Row::Work(work) => work_row(work, this, &t, cx),
         Row::Working { started_at } => {
             let label = match started_at.as_deref().and_then(work_log::parse_iso_ms) {
@@ -1005,7 +1007,7 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let collapsible = text.chars().count() > COLLAPSE_CHARS || text.lines().count() > COLLAPSE_LINES;
+    let collapsible = should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
         .relative()
@@ -1160,7 +1162,9 @@ fn code_block_header(
 ) -> AnyElement {
     let label_color = alpha(t.foreground, 0.72);
     let code: SharedString = block.code();
-    let id: SharedString = format!("code:{key}:{:x}", fxhash(&code)).into();
+    // Its place in the source keeps two identical blocks apart and skips hashing every frame.
+    let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
+    let id: SharedString = format!("code:{key}:{at:x}").into();
     let wrap_key = key.clone();
     let wrap_this = this.clone();
     let wrap_button = div()
@@ -1241,8 +1245,8 @@ fn runnable_command(lang: &str, code: &str) -> Option<String> {
     (shell && !command.is_empty() && !command.ends_with('\\') && !body.chars().any(hidden)).then(|| command.to_owned())
 }
 
-/// A short stable hash, to tell a message's code blocks apart.
-fn fxhash(text: &str) -> u64 {
+/// FNV-1a, to tell apart code blocks that carry no source span.
+fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100000001b3))
 }
 
@@ -1385,22 +1389,20 @@ static PIERRE_LIGHT: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_the
 /// `ProposedPlanCard.tsx`.
 fn plan_card(
     id: &SharedString,
-    text: &SharedString,
+    plan: &timeline::PlanText,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
     cx: &mut App,
     t: &Tokens,
 ) -> AnyElement {
-    let title: SharedString = crate::proposed_plan::title(text).unwrap_or("Proposed plan").to_owned().into();
     let key = timeline::entry_key(id);
     let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&key));
-    let collapsible = crate::proposed_plan::can_collapse(text);
-    let collapsed = collapsible && !expanded;
-    let (body_key, body_text): (SharedString, SharedString) = if collapsed {
-        (format!("{id}:preview").into(), crate::proposed_plan::collapsed_preview(text, 10).into())
-    } else {
-        (id.clone(), crate::proposed_plan::displayed(text).into())
+    let collapsible = plan.preview.is_some();
+    let (body_key, body_text): (SharedString, &SharedString) = match &plan.preview {
+        Some(preview) if !expanded => (format!("{id}:preview").into(), preview),
+        _ => (id.clone(), &plan.displayed),
     };
+    let collapsed = collapsible && !expanded;
     let card_background = alpha(t.card, 0.7);
     let badge = div()
         .h(px(18.))
@@ -1421,7 +1423,7 @@ fn plan_card(
         .child(markdown_with(
             this,
             body_key,
-            &body_text,
+            body_text,
             MarkdownKind::Assistant { streaming: false },
             Some(lane_width - 42.),
             t,
@@ -1454,24 +1456,30 @@ fn plan_card(
                 .on_click(toggle(this, key.clone())),
         )
     });
-    let card =
-        v_flex()
-            .p(px(20.))
-            .rounded(px(16.))
-            .border_1()
-            .border_color(alpha(t.border, 0.8))
-            .bg(card_background)
-            .child(
-                h_flex()
-                    .gap(px(12.))
-                    .justify_between()
-                    .child(h_flex().min_w_0().gap(px(8.)).child(badge).child(
-                        div().min_w_0().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(title),
-                    ))
-                    .child(super::plan_actions::plan_actions_button(this, id, text, cx)),
-            )
-            .child(body)
-            .children(toggle_button);
+    let card = v_flex()
+        .p(px(20.))
+        .rounded(px(16.))
+        .border_1()
+        .border_color(alpha(t.border, 0.8))
+        .bg(card_background)
+        .child(
+            h_flex()
+                .gap(px(12.))
+                .justify_between()
+                .child(
+                    h_flex().min_w_0().gap(px(8.)).child(badge).child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(TEXT))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(plan.title.clone()),
+                    ),
+                )
+                .child(super::plan_actions::plan_actions_button(this, id, &plan.markdown, cx)),
+        )
+        .child(body)
+        .children(toggle_button);
     lane(16., card).into_any_element()
 }
 
@@ -1575,9 +1583,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             .max_h(px(288.))
             .overflow_y_scroll()
             .rounded(px(6.))
-            .children(
-                entries.iter().map(|(entry, expanded)| detail_entry(entry, *expanded, this, t, cx)).collect::<Vec<_>>(),
-            )
+            .children(entries.iter().map(|detail| detail_entry(detail, this, t, cx)).collect::<Vec<_>>())
             .into_any_element(),
         WorkRowKind::Live { group, entry, label, thought, expanded, .. } => {
             let failed = entry.failed();
@@ -1648,11 +1654,30 @@ fn entry_body(entry: &Entry, label: &str) -> Option<String> {
     (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
+/// Whether [`entry_body`] has anything, without building it.
+fn has_body(entry: &Entry, label: &str) -> bool {
+    let label = label.trim();
+    let shows = |text: &str| {
+        let text = text.trim();
+        !text.is_empty() && text != label
+    };
+    let slash = |c: char| if c == '\\' { '/' } else { c };
+    let files_show = match entry.changed_files.as_slice() {
+        [] => false,
+        [file] => {
+            let file = file.trim();
+            !file.is_empty() && !file.chars().map(slash).eq(label.chars())
+        }
+        _ => true,
+    };
+    entry.command.as_deref().is_some_and(shows) || entry.detail.as_deref().is_some_and(shows) || files_show
+}
+
 fn expandable(entry: &Entry, label: &str) -> bool {
     if entry.is_reasoning() {
         entry.detail.is_some()
     } else {
-        super::inspector::has_inspector(entry) || entry_body(entry, label).is_some()
+        super::inspector::has_inspector(entry) || has_body(entry, label)
     }
 }
 
@@ -1782,20 +1807,15 @@ fn single_entry(
 }
 
 /// An entry inside an open group (`WorkEntryLogRow`): no vertical padding.
-fn detail_entry(
-    entry: &Rc<Entry>,
-    expanded: bool,
-    this: &WeakEntity<Workspace>,
-    t: &Tokens,
-    cx: &mut App,
-) -> AnyElement {
-    let label: SharedString = work_log::collapse_whitespace(&work_log::display_label(entry)).into();
+fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+    let DetailEntry { entry, label, expanded } = detail;
+    let expanded = *expanded;
     let failed = entry.failed() && entry.status != Some(Status::Declined);
     let color = if failed { failed_icon_color(t) } else { icon_color(t) };
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
-    let expandable = expandable(entry, &label);
+    let expandable = expandable(entry, label);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
-    let details = if expanded { entry_details(entry, &label, this, t, cx) } else { None };
+    let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
         .w_full()

@@ -54,7 +54,7 @@ pub enum Row {
     },
     Plan {
         id: SharedString,
-        markdown: SharedString,
+        plan: Rc<PlanText>,
     },
     Work(WorkRow),
     /// "Working for 12s" at the top of a running turn.
@@ -504,6 +504,40 @@ pub struct WorkRow {
     pub continues: bool,
 }
 
+/// An entry in an open group's list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetailEntry {
+    pub entry: Rc<Entry>,
+    /// `display_label`, whitespace collapsed.
+    pub label: SharedString,
+    /// The entry's own expansion.
+    pub expanded: bool,
+}
+
+/// A proposed plan and the text its card shows, derived once per item revision.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlanText {
+    pub markdown: SharedString,
+    pub title: SharedString,
+    /// The plan without its title line (`stripDisplayedPlanMarkdown`).
+    pub displayed: SharedString,
+    /// The folded card's first lines, when the plan is long enough to fold.
+    pub preview: Option<SharedString>,
+}
+
+impl PlanText {
+    fn new(markdown: SharedString) -> Self {
+        use crate::proposed_plan;
+        Self {
+            title: proposed_plan::title(&markdown).unwrap_or("Proposed plan").to_owned().into(),
+            displayed: proposed_plan::displayed(&markdown).into(),
+            preview: proposed_plan::can_collapse(&markdown)
+                .then(|| proposed_plan::collapsed_preview(&markdown, 10).into()),
+            markdown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkRowKind {
     /// One entry on its own: a lone tool call, an error, a notice.
@@ -520,9 +554,9 @@ pub enum WorkRowKind {
         expanded: bool,
         run_id: Option<SharedString>,
     },
-    /// The open list under an expanded group header; `bool` is each entry's own expansion.
+    /// The open list under an expanded group header.
     Details {
-        entries: Vec<(Rc<Entry>, bool)>,
+        entries: Vec<DetailEntry>,
     },
     /// The running turn's latest activity.
     Live {
@@ -607,9 +641,7 @@ enum Kind {
         text: SharedString,
         streaming: bool,
     },
-    Plan {
-        markdown: SharedString,
-    },
+    Plan(Rc<PlanText>),
     Work(Rc<Entry>),
     Event {
         label: SharedString,
@@ -666,7 +698,7 @@ impl TimelineEntry {
     /// `timelineEntryRunId`.
     fn response_run(&self) -> Option<&SharedString> {
         match self.kind {
-            Kind::Assistant { .. } | Kind::Plan { .. } | Kind::Work(_) | Kind::Embed(_) => self.run_id.as_ref(),
+            Kind::Assistant { .. } | Kind::Plan(_) | Kind::Work(_) | Kind::Embed(_) => self.run_id.as_ref(),
             _ => None,
         }
     }
@@ -763,7 +795,7 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
             }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
-        "proposed_plan" => Kind::Plan { markdown: text("markdown") },
+        "proposed_plan" => Kind::Plan(Rc::new(PlanText::new(text("markdown")))),
         "secret_request" if item.str("secretStatus") == Some("pending") && !inherited => {
             Kind::Request(Rc::new(request_card(item)))
         }
@@ -1343,7 +1375,14 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     let anchor = active_tools.first().map(|i| entries[*i].id.clone());
     let visible_active_entries: Vec<Rc<Entry>> = visible_active.iter().map(|i| work_at(*i)).collect();
     let details_row = |group: &SharedString, entries: &[Rc<Entry>]| {
-        let entries = entries.iter().map(|e| (e.clone(), expanded.contains(&entry_key(&e.id)))).collect();
+        let entries = entries
+            .iter()
+            .map(|e| DetailEntry {
+                entry: e.clone(),
+                label: work_log::collapse_whitespace(&work_log::display_label(e)).into(),
+                expanded: expanded.contains(&entry_key(&e.id)),
+            })
+            .collect();
         Row::Work(WorkRow {
             id: format!("{group}:details").into(),
             kind: WorkRowKind::Details { entries },
@@ -1541,7 +1580,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                 index = cursor;
                 continue;
             }
-            Kind::Plan { markdown } => rows.push(Row::Plan { id: entry.id.clone(), markdown: markdown.clone() }),
+            Kind::Plan(plan) => rows.push(Row::Plan { id: entry.id.clone(), plan: plan.clone() }),
             Kind::Event { subagent: Some(card), .. } => push_subagent(&mut rows, card.clone(), expanded),
             Kind::Event { system: Some(divider), .. } => rows.push(Row::System(divider.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
@@ -1661,7 +1700,7 @@ fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
                     }
                 }
                 WorkRowKind::Details { entries }
-                    if trailing && entries.iter().any(|(e, _)| e.run_id.as_ref() == Some(run)) =>
+                    if trailing && entries.iter().any(|d| d.entry.run_id.as_ref() == Some(run)) =>
                 {
                     last = Some(candidate_index)
                 }

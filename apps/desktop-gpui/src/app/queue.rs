@@ -342,7 +342,7 @@ fn merge_records(kept: &[Value], added: Vec<Value>) -> Vec<Value> {
 
 /// One queued message: the dashed bubble, then its time and controls (`QueuedMessage`).
 pub(super) fn queued_row(
-    message: &QueuedMessage,
+    message: &Rc<QueuedMessage>,
     last: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
@@ -421,7 +421,7 @@ pub(super) fn queued_row(
                 }
             }
         };
-        let (edit_this, edit_message) = (this.clone(), message.clone());
+        let (edit_this, edit_message) = (this.clone(), Rc::clone(message));
         let (remove_this, run) = (this.clone(), id.clone());
         controls = controls
             .child(

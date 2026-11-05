@@ -50,18 +50,27 @@ impl CopyFeedback {
     }
 }
 
+/// Whether `prompt` makes a prompt link: not blank and at most [`PROMPT_LINK_MAX`] UTF-16 units.
+fn prompt_link_fits(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    // UTF-16 never takes more units than UTF-8 takes bytes, so short text skips the count.
+    !prompt.is_empty() && (prompt.len() <= PROMPT_LINK_MAX || prompt.encode_utf16().count() <= PROMPT_LINK_MAX)
+}
+
 /// `promptLinkFor`: a link that starts a new thread with this prompt.
 pub(super) fn prompt_link(prompt: &str) -> Option<String> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() || prompt.encode_utf16().count() > PROMPT_LINK_MAX {
+    use std::fmt::Write as _;
+    if !prompt_link_fits(prompt) {
         return None;
     }
     let mut url = String::from("https://app.t3.codes/new?prompt=");
-    for byte in prompt.bytes() {
+    for byte in prompt.trim().bytes() {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => url.push(byte as char),
             b' ' => url.push('+'),
-            _ => url.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(url, "%{byte:02X}");
+            }
         }
     }
     Some(url)
@@ -332,11 +341,25 @@ pub(super) fn copy_button(
     t: &Tokens,
     cx: &App,
 ) -> impl IntoElement {
+    copy_button_with(this, id, label, icon, t, cx, move || Some(text.to_string()))
+}
+
+/// [`copy_button`] for text that is derived only when clicked.
+fn copy_button_with(
+    this: &WeakEntity<Workspace>,
+    id: SharedString,
+    label: &'static str,
+    icon: IconName,
+    t: &Tokens,
+    cx: &App,
+    text: impl Fn() -> Option<String> + 'static,
+) -> impl IntoElement {
     let copied = this.upgrade().is_some_and(|w| w.read(cx).copy_feedback.id.as_ref() == Some(&id));
     let glyph = if copied { Icon::new(IconName::Check).text_color(t.primary) } else { Icon::new(icon) };
     let this = this.clone();
     icon_button(id.clone(), glyph, if copied { "Copied!" } else { label }, true, t).on_click(move |_, _, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        let Some(text) = text() else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
         let _ = this.update(cx, |workspace, cx| workspace.copied(id.clone(), COPIED_FOR, cx));
     })
 }
@@ -360,26 +383,24 @@ pub(super) fn code_copy_button(
         })
 }
 
-/// `TimelineRowTimestamp` text: "3:04 PM", with the full date as its tooltip.
+/// `TimelineRowTimestamp` text: "3:04 PM", with the full date as its tooltip (built on hover).
 pub(super) fn timestamp(
     this: &WeakEntity<Workspace>,
     id: SharedString,
-    iso: &str,
+    iso: &SharedString,
     t: &Tokens,
     cx: &App,
 ) -> Option<impl IntoElement> {
-    let format = this.upgrade().map(|w| w.read(cx).client_settings.values.get("timestampFormat").clone());
-    let hour12 = crate::timestamp::hour12(format.as_ref().and_then(Value::as_str).unwrap_or_default());
-    let (text, tooltip) = crate::timestamp::now_local(iso, hour12)?;
-    let tooltip: SharedString = tooltip.into();
-    Some(
-        div()
-            .id(ElementId::Name(id))
-            .text_xs()
-            .text_color(t.muted_foreground)
-            .child(text)
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
-    )
+    let format = this.upgrade().and_then(|w| w.read(cx).client_settings.values.get("timestampFormat").as_str());
+    let hour12 = crate::timestamp::hour12(format.unwrap_or_default());
+    let text = crate::timestamp::day_aware(iso, &jiff::Zoned::now(), hour12)?;
+    let iso = iso.clone();
+    Some(div().id(ElementId::Name(id)).text_xs().text_color(t.muted_foreground).child(text).tooltip(
+        move |window, cx| {
+            let tooltip = crate::timestamp::tooltip(&iso, &jiff::tz::TimeZone::system(), hour12).unwrap_or_default();
+            Tooltip::new(tooltip).build(window, cx)
+        },
+    ))
 }
 
 /// The row under a user message: time, then edit, copy and prompt link.
@@ -387,7 +408,7 @@ pub(super) fn user_actions(
     this: &WeakEntity<Workspace>,
     id: &SharedString,
     text: &SharedString,
-    created_at: &str,
+    created_at: &SharedString,
     revert: Option<&Checkpoint>,
     t: &Tokens,
     cx: &App,
@@ -409,8 +430,11 @@ pub(super) fn user_actions(
                 }
             })
     });
-    let link = prompt_link(text).map(|link| {
-        copy_button(this, format!("link:{id}").into(), link.into(), "Copy prompt link", IconName::Link, t, cx)
+    let link = prompt_link_fits(text).then(|| {
+        let text = text.clone();
+        copy_button_with(this, format!("link:{id}").into(), "Copy prompt link", IconName::Link, t, cx, move || {
+            prompt_link(&text)
+        })
     });
     gpui_kit::component::h_flex()
         .gap(px(8.))
@@ -438,7 +462,7 @@ pub(super) fn assistant_meta(
     id: &SharedString,
     text: &SharedString,
     streaming: bool,
-    updated_at: &str,
+    updated_at: &SharedString,
     status: &str,
     fork: Option<&(SharedString, SharedString)>,
     t: &Tokens,

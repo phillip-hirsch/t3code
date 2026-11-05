@@ -252,7 +252,7 @@ impl Workspace {
     /// The open find, while it belongs to the thread on screen.
     fn open_find(&self) -> Option<&ThreadFind> {
         let find = self.find.as_ref()?;
-        (self.target.as_ref() == Some(&Target::Thread(find.thread_id.clone()))).then_some(find)
+        matches!(&self.target, Some(Target::Thread(id)) if *id == find.thread_id).then_some(find)
     }
 
     /// `chat.find`: opens find, or refocuses it and restarts its search from the viewport.
@@ -485,7 +485,7 @@ impl Workspace {
             if opened {
                 self.refresh_rows(cx);
             }
-            let index = self.rows.iter().position(|row| searchable_row(row) == Some(&SharedString::from(item_id)));
+            let index = self.rows.iter().position(|row| searchable_row(row).is_some_and(|id| **id == *item_id));
             let moved = self.find.as_ref().is_some_and(|f| f.revealed.as_ref() != Some(item_id));
             if let (Some(index), true) = (index, moved) {
                 self.scroller.update(cx, |scroller, cx| scroller.scroll_to_item(index, cx));
@@ -517,8 +517,11 @@ impl Workspace {
     /// Paints the find's matches in the markdown view under `key`; a no-op when nothing changed,
     /// so the view's own notifications don't repaint it.
     pub(super) fn paint_find(&mut self, key: &SharedString, cx: &mut Context<Self>) {
-        let Some(view) = self.markdown_view(key) else { return };
         let open = self.open_find().is_some();
+        if !open {
+            return;
+        }
+        let Some(view) = self.markdown_view(key) else { return };
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let entry = projection.and_then(|p| item_entry(p, key));
         let dark = crate::theme::tokens(cx).dark;
