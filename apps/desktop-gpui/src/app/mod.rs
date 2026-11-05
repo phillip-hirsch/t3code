@@ -29,11 +29,13 @@ mod details;
 mod header;
 mod layout;
 mod pages;
+mod preview;
 mod sidebar;
 mod titlebar;
 mod visits;
 
 gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
+pub use preview::TogglePreview;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -117,6 +119,7 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    preview: preview::PreviewState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +182,7 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            preview: preview::PreviewState::new(window, cx),
             _subscriptions: subscriptions,
         }
     }
@@ -295,6 +299,7 @@ impl Workspace {
         if !matches!(connection, Connection::Connected(_)) {
             self._stream_tasks.clear();
             self._shell_task = None;
+            self.preview.disconnect();
             if let Some(thread) = &mut self.thread {
                 thread._subscription = None;
             }
@@ -328,6 +333,7 @@ impl Workspace {
         self.shell_retried = false;
         self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);
+        self.subscribe_previews(window, cx);
         cx.notify();
     }
 
@@ -532,6 +538,7 @@ impl Workspace {
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
+        self.load_previews(&thread_id, window, cx);
         self.open_visit(&thread_id, cx);
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
@@ -772,6 +779,9 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
+        let panel_open = self.preview_panel_open();
+        let panel = self.render_preview_panel(window, cx);
+        let mini_player = self.render_preview_mini_player(window, cx);
         let theme = cx.theme();
         div()
             .size_full()
@@ -784,6 +794,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -794,31 +805,40 @@ impl Render for Workspace {
                 this.escape_details_popover(event, window, cx);
             }))
             .child(
-                h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_cached_sidebar())).child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .min_w_0()
-                        .pr(titlebar::RIGHT_RESIZE_INSET)
-                        .child(self.render_header(cx))
-                        .children(self.render_error(cx))
-                        .child(div().relative().flex_1().min_h_0().map(|el| {
-                            match (self.page, self.target.clone()) {
-                                (Some(page), _) => el.child(self.render_page(page, window, cx)),
-                                (None, Some(Target::Draft { project_id })) => el
-                                    .child(self.render_draft_stage(&project_id, window, cx))
-                                    .children(self.render_details_card(window, cx)),
-                                (None, _) => el
-                                    .child(
-                                        v_flex()
-                                            .size_full()
-                                            .child(self.render_body(window, cx))
-                                            .child(self.render_composer(window, cx)),
-                                    )
-                                    .children(self.render_details_card(window, cx)),
-                            }
-                        })),
-                ),
+                h_flex()
+                    .size_full()
+                    .when(self.sidebar_open, |el| el.child(self.render_cached_sidebar()))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .when(!panel_open, |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
+                            .child(self.render_header(cx))
+                            .children(self.render_error(cx))
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .map(|el| match (self.page, self.target.clone()) {
+                                        (Some(page), _) => el.child(self.render_page(page, window, cx)),
+                                        (None, Some(Target::Draft { project_id })) => el
+                                            .child(self.render_draft_stage(&project_id, window, cx))
+                                            .children(self.render_details_card(window, cx)),
+                                        (None, _) => el
+                                            .child(
+                                                v_flex()
+                                                    .size_full()
+                                                    .child(self.render_body(window, cx))
+                                                    .child(self.render_composer(window, cx)),
+                                            )
+                                            .children(self.render_details_card(window, cx)),
+                                    })
+                                    .children(mini_player),
+                            ),
+                    )
+                    .children(panel),
             )
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_settings(window, cx))

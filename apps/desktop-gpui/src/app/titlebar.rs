@@ -126,10 +126,17 @@ impl Workspace {
                 toggle("toggle-terminal", "icons/panel-bottom.svg", false, false)
                     .tooltip(tooltip("Terminal drawer is unavailable")),
             )
-            .child(
-                toggle("toggle-right-panel", "icons/panel-right.svg", false, false)
-                    .tooltip(tooltip("Right panel is unavailable")),
-            )
+            .child({
+                // The browser is this client's only right-panel surface so far.
+                let browser = matches!(self.target, Some(super::Target::Thread(_)));
+                toggle("toggle-right-panel", "icons/panel-right.svg", self.preview_panel_open(), browser)
+                    .tooltip(tooltip(if browser {
+                        "Toggle browser (Ctrl+Shift+J)"
+                    } else {
+                        "Start the thread to open a browser"
+                    }))
+                    .when(browser, |el| el.on_click(cx.listener(|this, _, window, cx| this.toggle_preview(window, cx))))
+            })
     }
 }
 
