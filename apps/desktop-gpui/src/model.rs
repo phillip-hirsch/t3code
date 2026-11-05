@@ -271,6 +271,10 @@ pub struct ServerInfo {
     pub snooze_presets: Value,
     /// Where "Add project" starts browsing; empty means `~/`.
     pub add_project_base_directory: String,
+    /// `capabilities.projectOrganization`: the server keeps project pin and archive.
+    pub project_organization: bool,
+    /// The "No project" workspace; a project rooted there is the scratch project.
+    pub scratch_workspace_root: Option<String>,
 }
 
 impl ServerInfo {
@@ -297,6 +301,10 @@ impl ServerInfo {
                     .as_array()
                     .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
                     .unwrap_or_default();
+                self.project_organization =
+                    config.pointer("/environment/capabilities/projectOrganization").and_then(Value::as_bool)
+                        == Some(true);
+                self.scratch_workspace_root = text("/scratchWorkspaceRoot");
             }
             "keybindingsUpdated" => {
                 self.keybindings = Rc::new(crate::keybindings::decode_rules(&event["payload"]["keybindings"]))
@@ -396,6 +404,23 @@ impl ServerInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryIdentity {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub canonical_key: Option<String>,
+    /// Work tree root, or the git dir for a bare repository.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub origin: Option<RepositoryOrigin>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryOrigin {
+    pub canonical_key: String,
     #[serde(default)]
     pub display_name: Option<String>,
 }

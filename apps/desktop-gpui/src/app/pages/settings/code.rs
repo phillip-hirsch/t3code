@@ -1,6 +1,6 @@
 //! Settings sections in the code group; see `SETTINGS` in `mod.rs`.
 
-use gpui_kit::{AnyElement, Context, IntoElement, ParentElement as _, Window, div};
+use gpui_kit::{AnyElement, Context, Window};
 
 use crate::app::Workspace;
 
@@ -11,9 +11,13 @@ mod source_control;
 #[path = "worktrees.rs"]
 mod worktrees;
 
+// `settings/projects/`, declared here so `settings/mod.rs` stays untouched until merge.
+#[path = "projects/mod.rs"]
+mod projects;
+
 impl Workspace {
-    pub(super) fn render_settings_projects(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Projects").into_any_element()
+    pub(super) fn render_settings_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_settings_projects_panel(window, cx)
     }
 
     pub(super) fn render_settings_source_control(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
