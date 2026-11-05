@@ -429,7 +429,14 @@ fn render_row(
                 &t,
             )
         }
-        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork } => {
+        Row::AssistantMeta { id, text, updated_at, status, fork } => {
+            let meta =
+                message_actions::assistant_meta(this, id, text, false, updated_at, status, fork.as_ref(), &t, cx)
+                    .opacity(0.)
+                    .group_hover("timeline-meta", |style| style.opacity(1.));
+            lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
+        }
+        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, .. } => {
             let body = div()
                 .px(px(4.))
                 .py(px(2.))

@@ -43,6 +43,15 @@ pub enum Row {
         status: SharedString,
         /// The thread and run "Fork from this response" forks at.
         fork: Option<(SharedString, SharedString)>,
+        run_id: Option<SharedString>,
+    },
+    /// A finished reply's actions, moved under the tool groups that ran after it.
+    AssistantMeta {
+        id: SharedString,
+        text: SharedString,
+        updated_at: SharedString,
+        status: SharedString,
+        fork: Option<(SharedString, SharedString)>,
     },
     Plan {
         id: SharedString,
@@ -510,6 +519,7 @@ pub enum WorkRowKind {
         summary: SharedString,
         icon: WorkIcon,
         expanded: bool,
+        run_id: Option<SharedString>,
     },
     /// The open list under an expanded group header; `bool` is each entry's own expansion.
     Details {
@@ -1481,6 +1491,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                     .clone()
                     .filter(|_| entry.status == "completed")
                     .map(|run| (entry.source_thread_id.clone(), run)),
+                run_id: entry.run_id.clone(),
             }),
         }
         index += 1;
@@ -1502,6 +1513,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         }
     }
 
+    let mut rows = attach_trailing_meta(rows);
     let flags: Vec<(bool, bool, bool)> = rows
         .iter()
         .map(|row| (row.is_work(), row.is_own_user_message(), matches!(row, Row::User { steer: Some(_), .. })))
@@ -1520,6 +1532,75 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         }
     }
     rows
+}
+
+/// `attachTrailingToolGroupsToAssistant`: when tool groups of the same run follow a finished
+/// reply, its actions move under the last of them.
+fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
+    let failed_or_tool = |e: &Entry| e.is_tool_like() || (e.item_type == "error" && e.status == Some(Status::Failed));
+    let mut meta_after: HashMap<usize, usize> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Row::Assistant { terminal: true, run_id: Some(run), .. } = row else { continue };
+        let mut last = None;
+        let mut trailing = false;
+        for (candidate_index, candidate) in rows.iter().enumerate().skip(index + 1) {
+            let Row::Work(work) = candidate else {
+                if matches!(candidate, Row::User { .. } | Row::Assistant { .. }) {
+                    break;
+                }
+                continue;
+            };
+            match &work.kind {
+                WorkRowKind::Toggle { run_id: Some(toggle_run), expanded: false, .. } if toggle_run == run => {
+                    trailing = true;
+                    last = Some(candidate_index);
+                }
+                WorkRowKind::Toggle { run_id: Some(toggle_run), expanded: true, .. }
+                    if toggle_run == run && trailing =>
+                {
+                    last = Some(candidate_index)
+                }
+                WorkRowKind::Single { entry, .. } if entry.run_id.as_ref() == Some(run) => {
+                    trailing |= failed_or_tool(entry);
+                    if trailing {
+                        last = Some(candidate_index);
+                    }
+                }
+                WorkRowKind::Details { entries }
+                    if trailing && entries.iter().any(|(e, _)| e.run_id.as_ref() == Some(run)) =>
+                {
+                    last = Some(candidate_index)
+                }
+                _ => {}
+            }
+        }
+        if let Some(last) = last {
+            meta_after.insert(last, index);
+        }
+    }
+    if meta_after.is_empty() {
+        return rows;
+    }
+    let moved: HashSet<usize> = meta_after.values().copied().collect();
+    let mut out = Vec::with_capacity(rows.len() + meta_after.len());
+    for (index, mut row) in rows.iter().cloned().enumerate() {
+        if let (true, Row::Assistant { terminal, .. }) = (moved.contains(&index), &mut row) {
+            *terminal = false;
+        }
+        out.push(row);
+        if let Some(Row::Assistant { id, text, updated_at, status, fork, .. }) =
+            meta_after.get(&index).map(|i| &rows[*i])
+        {
+            out.push(Row::AssistantMeta {
+                id: id.clone(),
+                text: text.clone(),
+                updated_at: updated_at.clone(),
+                status: status.clone(),
+                fork: fork.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn single_row(entry: &Rc<Entry>, label: String, expanded: &HashSet<SharedString>) -> Row {
@@ -1542,6 +1623,7 @@ fn toggle_row(id: &str, group: &SharedString, summary: SharedString, entries: &[
             summary,
             icon: work_log::summary_icon(work_log::summary_kind(entries)),
             expanded,
+            run_id: entries.first().and_then(|e| e.run_id.clone()),
         },
         continues: false,
     })
@@ -1625,6 +1707,7 @@ mod tests {
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
+                Row::AssistantMeta { .. } => "meta".into(),
                 Row::Workflow { row, .. } => format!("workflow {}", row.opening.message_id),
                 Row::WorktreeSetup { snapshot, .. } => format!("setup {}", snapshot.phase),
                 Row::System(divider) => format!("system {}", divider.label),
@@ -1668,6 +1751,19 @@ mod tests {
         assert_eq!(label("declined"), "GitHub token · Declined");
         assert_eq!(label("cancelled"), "GitHub token · Request ended");
         assert_eq!(label("pending"), "GitHub token · Waiting for an answer in the original thread");
+    }
+
+    #[test]
+    fn a_replys_actions_follow_the_tools_that_ran_after_it() {
+        let mut items = turn("r1");
+        items.push(command("r1-late", "r1", "2026-11-04T10:01:06.000Z"));
+        let p = projection(items, json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
+        let mut expanded = HashSet::new();
+        expanded.insert(fold_key("r1"));
+        let described = describe(&rows(&p, &expanded, &mut EntryCache::default()));
+        let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
+        assert!(described[reply + 1].starts_with("work"), "{described:?}");
+        assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
     }
 
     #[test]
