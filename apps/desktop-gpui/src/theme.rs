@@ -189,6 +189,10 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.primary_hover = tokens.primary_hover;
         colors.primary_active = tokens.primary_hover;
         colors.primary_foreground = tokens.primary_foreground;
+        colors.button_primary = tokens.primary;
+        colors.button_primary_hover = tokens.primary_hover;
+        colors.button_primary_active = tokens.primary_hover;
+        colors.button_primary_foreground = tokens.primary_foreground;
         colors.secondary = tokens.secondary;
         colors.secondary_hover = tokens.accent;
         colors.secondary_active = tokens.accent;

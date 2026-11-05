@@ -117,6 +117,7 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    devices: crate::device::Devices,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +180,7 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            devices: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -325,6 +327,8 @@ impl Workspace {
             },
             |this, _, cx| this.notify_sidebar(cx),
         )];
+        let devices = self.subscribe_device_state(window, cx);
+        self._stream_tasks.push(devices);
         self.shell_retried = false;
         self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);

@@ -1,6 +1,7 @@
 mod app;
 mod assets;
 mod backend;
+mod device;
 mod inbox;
 mod model;
 mod model_label;

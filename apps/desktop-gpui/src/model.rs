@@ -173,6 +173,8 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The raw `ServerSettings`, for settings rows not yet modelled above.
+    pub settings: Value,
 }
 
 impl ServerInfo {
@@ -205,6 +207,7 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.settings = settings.clone();
         Ok(())
     }
 

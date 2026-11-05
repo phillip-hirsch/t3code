@@ -4,6 +4,9 @@ use gpui_kit::{AnyElement, Context, IntoElement, ParentElement as _, Window, div
 
 use crate::app::Workspace;
 
+#[path = "devices/mod.rs"]
+mod devices;
+
 impl Workspace {
     pub(super) fn render_settings_providers(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
         div().child("Providers").into_any_element()
@@ -13,12 +16,12 @@ impl Workspace {
         div().child("Threads").into_any_element()
     }
 
-    pub(super) fn render_settings_browser(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Browser").into_any_element()
+    pub(super) fn render_settings_browser(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_agent_browser_access(cx)
     }
 
-    pub(super) fn render_settings_devices(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Devices").into_any_element()
+    pub(super) fn render_settings_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_devices_settings(window, cx)
     }
 
     pub(super) fn render_settings_scheduled_tasks(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
