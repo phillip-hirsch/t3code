@@ -32,6 +32,8 @@ const SECTION: &str = "scheduled-tasks";
 
 #[derive(Default)]
 pub(in crate::app) struct AutomationsWatch {
+    /// The environment the tasks are scheduled on.
+    environment: Option<SharedString>,
     tasks: Rc<Vec<ScheduledTask>>,
     error: Option<SharedString>,
     task: Option<Task<()>>,
@@ -51,24 +53,25 @@ fn schedule_line(task: &ScheduledTask, now_ms: i64) -> String {
 }
 
 impl Workspace {
-    fn automations_wanted(&self, window: &Window) -> bool {
-        matches!(self.target, Some(Target::Thread { .. }))
+    /// The connected environment whose tasks the section shows, while it can show.
+    fn automations_wanted(&self, window: &Window) -> Option<SharedString> {
+        let shown = matches!(self.target, Some(Target::Thread { .. }))
             && self.details_shown(window)
-            && self.details_item_shown("automations")
-            && self.client().is_some()
+            && self.details_item_shown("automations");
+        let environment = self.active_environment().filter(|_| shown)?;
+        self.env_client(environment).is_some().then(|| environment.clone())
     }
 
-    /// Starts or drops the subscription as the section comes and goes; called each render.
+    /// Starts or drops the subscription as the section and its environment come and go; called each render.
     pub(in crate::app) fn sync_automations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let wanted = self.automations_wanted(window);
-        if wanted == self.automations.task.is_some() {
+        if wanted == self.automations.environment && (wanted.is_none() || self.automations.task.is_some()) {
             return;
         }
-        if !wanted {
-            self.automations = AutomationsWatch::default();
-            return;
+        if wanted != self.automations.environment {
+            self.automations = AutomationsWatch { environment: wanted.clone(), ..AutomationsWatch::default() };
         }
-        let Some(client) = self.client() else { return };
+        let Some(client) = wanted.as_deref().and_then(|environment| self.env_client(environment)) else { return };
         let stream = client.stream("scheduledTasks.subscribe", json!({}));
         self.automations.task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = stream.next().await {
@@ -96,7 +99,8 @@ impl Workspace {
     }
 
     fn automation_action(&mut self, id: String, enabled: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let client = self.automations.environment.as_deref().and_then(|environment| self.env_client(environment));
+        let Some(client) = client else { return };
         if self.automations.busy.is_some() {
             return;
         }

@@ -65,6 +65,8 @@ impl LocalServer {
 /// The discovered servers, subscribed only while the section can show.
 #[derive(Default)]
 pub(in crate::app) struct ServersWatch {
+    /// The environment the servers run on.
+    environment: Option<SharedString>,
     servers: Rc<Vec<LocalServer>>,
     task: Option<Task<()>>,
     stopping: Option<(Option<u32>, u16)>,
@@ -72,24 +74,25 @@ pub(in crate::app) struct ServersWatch {
 }
 
 impl Workspace {
-    fn servers_wanted(&self, window: &Window) -> bool {
-        matches!(self.target, Some(Target::Thread { .. }))
+    /// The connected environment whose servers the section shows, while it can show.
+    fn servers_wanted(&self, window: &Window) -> Option<SharedString> {
+        let shown = matches!(self.target, Some(Target::Thread { .. }))
             && self.details_shown(window)
-            && self.details_item_shown("servers")
-            && self.client().is_some()
+            && self.details_item_shown("servers");
+        let environment = self.active_environment().filter(|_| shown)?;
+        self.env_client(environment).is_some().then(|| environment.clone())
     }
 
-    /// Starts or drops the subscription as the section comes and goes; called each render.
+    /// Starts or drops the subscription as the section and its environment come and go; called each render.
     pub(in crate::app) fn sync_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let wanted = self.servers_wanted(window);
-        if wanted == self.servers.task.is_some() {
+        if wanted == self.servers.environment && (wanted.is_none() || self.servers.task.is_some()) {
             return;
         }
-        if !wanted {
-            self.servers = ServersWatch::default();
-            return;
+        if wanted != self.servers.environment {
+            self.servers = ServersWatch { environment: wanted.clone(), ..ServersWatch::default() };
         }
-        let Some(client) = self.client() else { return };
+        let Some(client) = wanted.as_deref().and_then(|environment| self.env_client(environment)) else { return };
         let stream = client.stream("subscribeDiscoveredLocalServers", json!({}));
         self.servers.task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = stream.next().await {
@@ -134,7 +137,8 @@ impl Workspace {
 
     /// `preview.stopLocalServer`.
     fn stop_server(&mut self, server: &LocalServer, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(pid), Some(client)) = (server.pid, self.client()) else { return };
+        let client = self.servers.environment.as_deref().and_then(|environment| self.env_client(environment));
+        let (Some(pid), Some(client)) = (server.pid, client) else { return };
         if self.servers.stopping.is_some() {
             return;
         }

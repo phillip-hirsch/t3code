@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Target, Workspace, new_id};
-use crate::rpc::{RpcError, StreamEvent};
+use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::Tokens;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -325,14 +325,23 @@ pub fn group_thousands(value: u64) -> String {
     grouped
 }
 
-/// The open target's status subscription; it follows the git cwd.
+/// The open target's status subscription; it follows the git cwd and its environment.
 #[derive(Default)]
 pub(super) struct VcsWatch {
+    /// The environment `cwd` is on: the same path on two machines is two checkouts.
+    pub env: Option<SharedString>,
     pub cwd: Option<String>,
     pub status: Option<VcsStatus>,
     /// The label of the git action in flight, as its progress reports it.
     pub running: Option<SharedString>,
     task: Option<Task<()>>,
+}
+
+impl VcsWatch {
+    /// Whether a reply for `cwd` on `env` is about the checkout watched now.
+    fn watches(&self, env: Option<&str>, cwd: &str) -> bool {
+        self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
+    }
 }
 
 impl Workspace {
@@ -353,16 +362,19 @@ impl Workspace {
 
     /// Keeps one `subscribeVcsStatus` stream on the current cwd; an ended stream resubscribes after a backoff.
     pub(super) fn sync_vcs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let env = self.active_environment().cloned();
         let cwd = self.git_cwd();
-        if cwd == self.vcs.cwd && (self.vcs.task.is_some() || cwd.is_none()) {
+        let same = cwd == self.vcs.cwd && env == self.vcs.env;
+        if same && (self.vcs.task.is_some() || cwd.is_none()) {
             return;
         }
-        if cwd != self.vcs.cwd {
+        if !same {
             self.vcs.status = None;
         }
         self.vcs.cwd = cwd.clone();
+        self.vcs.env = env.clone();
         self.vcs.task = None;
-        let (Some(cwd), Some(client)) = (cwd, self.client()) else { return };
+        let (Some(cwd), Some(client)) = (cwd, self.vcs_client()) else { return };
         let stream = client.stream("subscribeVcsStatus", json!({"cwd": cwd}));
         self.vcs.task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = stream.next().await {
@@ -372,7 +384,7 @@ impl Workspace {
                     let mut ended = false;
                     for event in events {
                         match event {
-                            StreamEvent::Item(value) if this.vcs.cwd.as_deref() == Some(cwd.as_str()) => {
+                            StreamEvent::Item(value) if this.vcs.watches(env.as_deref(), &cwd) => {
                                 this.vcs.status = VcsStatus::apply(this.vcs.status.take(), &value);
                             }
                             StreamEvent::Item(_) => {}
@@ -399,6 +411,11 @@ impl Workspace {
         }));
     }
 
+    /// The socket of the environment the watched checkout is on.
+    pub(super) fn vcs_client(&self) -> Option<RpcClient> {
+        self.env_client(self.vcs.env.as_deref()?)
+    }
+
     /// `git.runStackedAction` with the server writing the commit message, as the quick action does.
     pub(super) fn run_git_action(
         &mut self,
@@ -406,7 +423,7 @@ impl Workspace {
         commit_message: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
         if self.vcs.running.is_some() {
             return;
         }
@@ -458,7 +475,7 @@ impl Workspace {
 
     /// A one-shot git RPC (`vcs.init`, `vcs.pull`) on the current cwd.
     pub(super) fn run_vcs_request(&mut self, method: &'static str, label: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
         if self.vcs.running.is_some() {
             return;
         }
@@ -480,7 +497,8 @@ impl Workspace {
 
     /// `vcs.refreshStatus` after a git operation, so the card does not wait on the watcher.
     pub(super) fn refresh_vcs(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
+        let env = self.vcs.env.clone();
         cx.spawn(async move |this, cx| {
             let value = match client.request("vcs.refreshStatus", json!({"cwd": cwd})).await {
                 Ok(value) => value,
@@ -490,7 +508,7 @@ impl Workspace {
                 }
             };
             let _ = this.update(cx, |this, cx| {
-                if this.vcs.cwd.as_deref() != Some(cwd.as_str()) {
+                if !this.vcs.watches(env.as_deref(), &cwd) {
                     return;
                 }
                 match VcsLocal::deserialize(&value) {
@@ -607,5 +625,13 @@ mod tests {
         assert_eq!(group_thousands(7), "7");
         assert_eq!(group_thousands(11_314), "11,314");
         assert_eq!(group_thousands(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn a_status_reply_lands_only_on_the_checkout_it_was_asked_on() {
+        let watch = VcsWatch { env: Some("b".into()), cwd: Some("/repo".into()), ..VcsWatch::default() };
+        assert!(watch.watches(Some("b"), "/repo"));
+        assert!(!watch.watches(Some("a"), "/repo"), "the same path on another machine is another checkout");
+        assert!(!watch.watches(Some("b"), "/other"));
     }
 }
