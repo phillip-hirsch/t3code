@@ -3314,8 +3314,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-linux"
 version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cac5cbd3485c1e3db8eafd5dc69019188f5cb0a39846946af772efa386f624"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -8432,6 +8430,7 @@ dependencies = [
  "lb-wry",
  "log",
  "markdown",
+ "nix",
  "objc2-app-kit 0.3.2",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",

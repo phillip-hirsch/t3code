@@ -16,7 +16,7 @@ use std::cell::Cell;
 use gpui_kit::{
     AnyElement, App, Context, CursorStyle, Decorations, Div, FontFallbacks, Hsla, InteractiveElement, IntoElement,
     MouseButton, ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
+    Styled as _, Tiling, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
 };
 
 use super::{ToggleRightPanel, ToggleSidebar, Workspace};
@@ -85,10 +85,15 @@ pub(super) fn drag_region<E: InteractiveElement>(element: E) -> E {
 
 /// Linux client-side decorations: the resize edges a native frame has, while the window floats
 /// (a maximized or tiled edge doesn't resize). Nothing on Windows and macOS.
-pub(super) fn render_resize_edges(window: &Window) -> Option<AnyElement> {
-    let Decorations::Client { tiling } = window.window_decorations() else { return None };
+pub(super) fn render_resize_edges(window: &Window, cx: &App) -> Option<AnyElement> {
+    let Decorations::Client { mut tiling } = window.window_decorations() else { return None };
     if window.is_maximized() || window.is_fullscreen() {
         return None;
+    }
+    // An X11 window manager that can't show a shadow outside the frame reports a floating window
+    // as tiled on every side (see `vendor/README.md`); its edges still resize.
+    if cx.compositor_name() == "X11" && tiling == Tiling::tiled() {
+        tiling = Tiling::default();
     }
     let corner = RESIZE_EDGE * 2.;
     let edge = |id: &'static str, resize: ResizeEdge, cursor: CursorStyle| {
@@ -297,8 +302,8 @@ fn render_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
 }
 
 /// Minimize, maximize/restore and close as Electron's titlebar overlay draws them on Linux, with
-/// Lucide glyphs since Linux has no system caption font. Shown only while the compositor lets the
-/// app draw its own decorations.
+/// Lucide glyphs since Linux has no system caption font. Shown whenever the window draws its own
+/// decorations, which on X11 includes running without a compositor.
 fn render_linux_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
     let dark = theme::tokens(cx).dark;
     let glyph: Hsla = rgb(if dark { 0xf8fafc } else { 0x1f2937 }).into();

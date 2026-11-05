@@ -100,10 +100,15 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         // Windows shows OS notifications under this identity.
-        cx.set_app_identity("com.t3tools.t3code.gpui", "T3 Code");
+        cx.set_app_identity(desktop::APP_ID, "T3 Code");
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
+        // Quitting stops the local server, as Electron's backend manager does. GPUI waits only
+        // briefly for this; `main` waits for the rest after `run` returns.
+        cx.on_app_quit(|_| backend::stop_local_servers()).detach();
+        #[cfg(unix)]
+        desktop::quit_on_signals(cx);
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
         if let Some(socket) = socket {
@@ -118,11 +123,18 @@ fn main() {
         cx.set_global(desktop::Desktop::load(launches, cx));
         open_main_window(cx);
     });
+    // Linux and Windows return here once the app quits (macOS exits inside `run`).
+    let stopped = runtime()
+        .block_on(async { tokio::time::timeout(backend::STOP_TIMEOUT * 2, backend::stop_local_servers()).await });
+    if stopped.is_err() {
+        log::warn!("the local server had not stopped when the app exited");
+    }
 }
 
 /// Opens the app's window where it was last closed. The app draws its own titlebar: Windows
-/// keeps the native resize frame, macOS its traffic lights, and Linux asks for client-side
-/// decorations like Electron's frameless `titleBarOverlay` window.
+/// keeps the native resize frame, macOS its traffic lights, and Linux draws client-side
+/// decorations like Electron's frameless `titleBarOverlay` window, on Wayland and X11, with or
+/// without a compositor.
 fn open_main_window(cx: &mut gpui_kit::App) {
     let (x, y) = app::TRAFFIC_LIGHTS;
     let options = WindowOptions {
@@ -134,6 +146,10 @@ fn open_main_window(cx: &mut gpui_kit::App) {
         window_bounds: Some(cx.global::<desktop::Desktop>().window_bounds(cx)),
         window_min_size: Some(size(px(840.), px(620.))),
         window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+        // Linux docks group the window under its desktop entry by this id (Wayland `app_id`, X11 `WM_CLASS`).
+        app_id: Some(desktop::APP_ID.to_owned()),
+        #[cfg(target_os = "linux")]
+        icon: desktop::window_icon(),
         ..Default::default()
     };
     let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {

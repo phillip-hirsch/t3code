@@ -26,7 +26,6 @@ use serde_json::{Value, json};
 
 use super::widgets::{RowFrame, card, select_trigger, settings_section};
 
-const MOD_LABEL: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::keybindings::{
@@ -1595,17 +1594,22 @@ fn connector(child: AnyElement, depth: usize, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// One key cap's label: macOS glyphs there, and elsewhere the names `formatShortcutLabel` uses.
+fn key_cap(part: &str, mac: bool) -> SharedString {
+    match part {
+        "mod" => (if mac { "⌘" } else { "Ctrl" }).into(),
+        "shift" => (if mac { "⇧" } else { "Shift" }).into(),
+        "alt" => (if mac { "⌥" } else { "Alt" }).into(),
+        "ctrl" => (if mac { "⌃" } else { "Ctrl" }).into(),
+        part if part.chars().count() == 1 => part.to_uppercase().into(),
+        part => part.to_owned().into(),
+    }
+}
+
 /// `KeybindingPill`: one key cap per `+`-separated part.
 fn pill(value: &str, t: &Tokens) -> Div {
     h_flex().gap(px(4.)).children(value.split('+').map(|part| {
-        let label: SharedString = match part {
-            "mod" => MOD_LABEL.into(),
-            "shift" => "⇧".into(),
-            "alt" => (if MAC { "⌥" } else { "Alt" }).into(),
-            "ctrl" => "⌃".into(),
-            part if part.chars().count() == 1 => part.to_uppercase().into(),
-            part => part.to_owned().into(),
-        };
+        let label = key_cap(part, MAC);
         div()
             .h(px(20.))
             .min_w(px(20.))
@@ -1768,6 +1772,13 @@ mod tests {
 
     fn rule(key: &str, command: &str, when: Option<&str>) -> Rule {
         compile(key, command, when).unwrap()
+    }
+
+    #[test]
+    fn key_caps_name_modifiers_off_macos() {
+        let caps = |mac| ["mod", "shift", "alt", "ctrl", "k"].map(|part| key_cap(part, mac));
+        assert_eq!(caps(false), ["Ctrl", "Shift", "Alt", "Ctrl", "K"]);
+        assert_eq!(caps(true), ["⌘", "⇧", "⌥", "⌃", "K"]);
     }
 
     #[test]

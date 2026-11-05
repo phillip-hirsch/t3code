@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// This app's desktop entry, named after its app id (`set_app_identity`); the launcher badge
+/// This app's desktop entry, named after its app id ([`super::APP_ID`]); the launcher badge
 /// names it too.
 pub const DESKTOP_ENTRY: &str = "com.t3tools.t3code.gpui.desktop";
 const SCHEME: &str = "t3code";
@@ -100,6 +100,17 @@ fn render(display_name: &str, exec_target: &str, scheme: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_entry_is_named_after_the_window_app_id() {
+        assert_eq!(DESKTOP_ENTRY, format!("{}.desktop", super::super::APP_ID));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_window_icon_decodes() {
+        assert!(super::super::window_icon().is_some());
+    }
 
     #[test]
     fn entries_quote_exec_targets_like_electron() {

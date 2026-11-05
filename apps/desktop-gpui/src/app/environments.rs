@@ -71,17 +71,17 @@ impl SavedEnvironments {
     }
 
     fn save(&self) -> Result<(), String> {
-        self.catalog.save().map_err(|error| {
-            log::warn!("could not save environments: {error:#}");
-            format!("Could not save environments: {error:#}")
-        })
+        write(&self.catalog)
     }
 
-    /// Saves a paired environment and connects it (`registerPairingConnection`).
+    /// Saves a paired environment and connects it (`registerPairingConnection`). Lists it only
+    /// once it is saved.
     pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Result<(), String> {
         let id = environment.environment_id.clone();
-        self.catalog.upsert(environment);
-        self.save()?;
+        let mut catalog = self.catalog.clone();
+        catalog.upsert(environment);
+        write(&catalog)?;
+        self.catalog = catalog;
         self.restart(&id, cx);
         cx.notify();
         Ok(())
@@ -261,4 +261,12 @@ async fn connect(
         Err(error) if rpc::is_unauthorized(&error) => Err((Failure::http(401, &endpoint.ws_url()), Some(descriptor))),
         Err(error) => Err((Failure::transport(format!("{error:#}")), Some(descriptor))),
     }
+}
+
+/// Writes the catalog; the error is the message to show.
+fn write(catalog: &Catalog) -> Result<(), String> {
+    catalog.save().map_err(|error| {
+        log::warn!("could not save environments: {error:#}");
+        format!("Could not save environments: {error:#}")
+    })
 }

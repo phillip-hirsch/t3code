@@ -31,6 +31,23 @@ pub struct Desktop {
 
 impl Global for Desktop {}
 
+/// The app's id: its Windows notification identity and, on Linux, the window's app id, which
+/// names the desktop entry (`linux_url_handler::DESKTOP_ENTRY`).
+pub const APP_ID: &str = "com.t3tools.t3code.gpui";
+
+/// The window icon X11 docks show (`_NET_WM_ICON`); Wayland docks show the desktop entry's.
+#[cfg(target_os = "linux")]
+pub fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
+    let png = include_bytes!("../../assets/icons/app-icon.png");
+    match image::load_from_memory_with_format(png, image::ImageFormat::Png) {
+        Ok(icon) => Some(std::sync::Arc::new(icon.into_rgba8())),
+        Err(error) => {
+            log::warn!("could not decode the window icon: {error}");
+            None
+        }
+    }
+}
+
 /// This process's top-level window whose handle is `hwnd`, as winsafe's handle type.
 #[cfg(windows)]
 pub fn top_level_window(hwnd: isize) -> Option<winsafe::HWND> {
@@ -44,6 +61,33 @@ pub fn top_level_window(hwnd: isize) -> Option<winsafe::HWND> {
         false
     });
     found
+}
+
+/// SIGTERM and SIGINT quit the app as its Quit command does, so the local server stops first.
+#[cfg(unix)]
+pub fn quit_on_signals(cx: &mut App) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (received, signals) = async_channel::bounded(1);
+    crate::runtime().spawn(async move {
+        let (mut terminate, mut interrupt) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(terminate), Ok(interrupt)) => (terminate, interrupt),
+            (Err(error), _) | (_, Err(error)) => {
+                log::warn!("could not listen for SIGTERM and SIGINT: {error}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = received.send(()).await;
+    });
+    cx.spawn(async move |cx| {
+        if signals.recv().await.is_ok() {
+            cx.update(|cx| cx.quit());
+        }
+    })
+    .detach();
 }
 
 /// This launch's arguments; one that isn't valid Unicode (an unpaired surrogate) is read lossily.
