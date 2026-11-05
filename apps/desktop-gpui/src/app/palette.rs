@@ -3,8 +3,9 @@
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
 //! with the native dialog, then `projects.mutate`).
 //!
-//! Actions this client has no surface for (file picker, content search,
-//! themes, guest sharing, PR linking, triage, scratch threads, clone) are left out.
+//! Go to file and Search project contents open the child searches in `files/`.
+//! Actions this client has no surface for (themes, guest sharing, PR linking,
+//! triage, scratch threads, clone) are left out.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -68,6 +69,8 @@ enum Run {
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
+    /// Go to file or Search project contents, returning here on Esc.
+    FileSearch(super::files::OverlayMode),
 }
 
 enum RowIcon {
@@ -211,6 +214,11 @@ impl Workspace {
             self.push_palette_view(view, window, cx);
         }
         cx.notify();
+    }
+
+    /// Puts back the query the palette had before a child search opened.
+    pub(super) fn restore_palette_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_palette_query(query, window, cx);
     }
 
     pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -433,6 +441,22 @@ impl Workspace {
             row.chevron = true;
             rows.push(row);
         }
+        let mut files = Row::new(
+            "open-file-picker",
+            RowIcon::Lucide(IconName::FileSearch),
+            "Go to file",
+            Run::FileSearch(super::files::OverlayMode::Files),
+        );
+        files.shortcut = Some("Ctrl+P".into());
+        rows.push(files);
+        let mut contents = Row::new(
+            "search-project-contents",
+            RowIcon::Lucide(IconName::TextSearch),
+            "Search project contents",
+            Run::FileSearch(super::files::OverlayMode::Content),
+        );
+        contents.shortcut = Some("Ctrl+Shift+F".into());
+        rows.push(contents);
         rows.push(Row::new(
             "add-project",
             RowIcon::Lucide(IconName::FolderPlus),
@@ -728,6 +752,10 @@ impl Workspace {
         match run {
             Run::Open(view) => return self.push_palette_view(view, window, cx),
             Run::BrowseTo(path) => return self.set_palette_query(&path, window, cx),
+            Run::FileSearch(mode) => {
+                let query = self.palette_query(cx);
+                return self.open_file_overlay(mode, Some(query), window, cx);
+            }
             _ => {}
         }
         self.close_palette(window, cx);
@@ -737,7 +765,7 @@ impl Workspace {
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Page(page) => self.open_page(page, cx),
-            Run::Open(_) | Run::BrowseTo(_) => {}
+            Run::Open(_) | Run::BrowseTo(_) | Run::FileSearch(_) => {}
         }
     }
 

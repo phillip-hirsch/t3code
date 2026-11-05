@@ -31,6 +31,7 @@ mod composer_meter;
 mod composer_plan;
 mod context_strip;
 mod details;
+mod files;
 mod git;
 mod header;
 mod inspector;
@@ -60,7 +61,9 @@ gpui_kit::actions!(
         TogglePalette,
         NewThread,
         NewThreadInProject,
-        UndoThreadAction
+        UndoThreadAction,
+        ToggleFilePicker,
+        ToggleProjectSearch
     ]
 );
 pub use preview::TogglePreview;
@@ -203,6 +206,8 @@ pub struct Workspace {
     keybindings_panel: Option<gpui_kit::AnyView>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
+    /// Go to file, Search project contents, and the Files and file panel surfaces.
+    files: files::FilesState,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
@@ -325,6 +330,7 @@ impl Workspace {
             installed_keybindings: Rc::default(),
             keybindings_panel: None,
             palette: None,
+            files: files::FilesState::default(),
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
@@ -890,6 +896,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFilePicker, window, cx| {
+                this.toggle_file_overlay(files::OverlayMode::Files, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
+                this.toggle_file_overlay(files::OverlayMode::Content, window, cx)
+            }))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
@@ -982,6 +994,7 @@ impl Render for Workspace {
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
             .children(self.render_palette(window, cx))
+            .children(self.render_file_overlay(window, cx))
             .children(self.render_quit_hint(cx))
     }
 }

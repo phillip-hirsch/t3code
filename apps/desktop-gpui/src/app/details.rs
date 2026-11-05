@@ -109,7 +109,7 @@ struct Section {
 }
 
 /// `EDITORS` labels, with the file manager named for Windows.
-fn editor_label(id: &str) -> &str {
+pub(super) fn editor_label(id: &str) -> &str {
     match id {
         "cursor" => "Cursor",
         "trae" => "Trae",
