@@ -30,9 +30,9 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value};
 
-use crate::project_groups::ProjectGroup;
 use super::code::projects::icon::project_icon;
 use crate::app::{Workspace, project_name};
+use crate::project_groups::ProjectGroup;
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
 use crate::settings::{Settings, contract};
 use crate::theme::{self, Tokens};
@@ -1268,11 +1268,7 @@ impl Workspace {
                                 .child(project_icon(icon.as_ref(), title, favicon.clone(), 14., t))
                                 .child(v_flex().min_w_0().child(div().truncate().child(name.clone())).children(
                                     secondary.clone().map(|secondary| {
-                                        div()
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(t.muted_foreground)
-                                            .child(secondary)
+                                        div().truncate().text_xs().text_color(t.muted_foreground).child(secondary)
                                     }),
                                 ))
                         });

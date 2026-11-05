@@ -1234,7 +1234,11 @@ impl Workspace {
                 })
                 .child({
                     // `--diffs-font-size`, the Code font size.
-                    let diff = Diff::new(&self.right_panel.diff).soft_wrap(wrap).flex_1().min_h_0().text_size(px(tokens.fonts.code_size));
+                    let diff = Diff::new(&self.right_panel.diff)
+                        .soft_wrap(wrap)
+                        .flex_1()
+                        .min_h_0()
+                        .text_size(px(tokens.fonts.code_size));
                     match scheme {
                         DiffColorScheme::RedGreen => diff.into_any_element(),
                         DiffColorScheme::BlueOrange => DiffTint {
