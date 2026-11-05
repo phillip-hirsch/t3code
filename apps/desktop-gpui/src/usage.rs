@@ -1057,6 +1057,207 @@ pub fn reset_outcome_text(result: &Value) -> String {
     .into()
 }
 
+/// `USAGE_PRICE_FIELDS`: settings key, column label, and whether a blank is allowed.
+pub const PRICE_FIELDS: [(&str, &str, bool); 4] = [
+    ("inputCostPerMillionTokens", "Input", false),
+    ("outputCostPerMillionTokens", "Output", false),
+    ("cacheReadCostPerMillionTokens", "Cache read", true),
+    ("cacheWriteCostPerMillionTokens", "Cache write", true),
+];
+
+/// One Model prices row as edited (`UsagePriceDraft`): a `None` value or alias keeps the saved one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PriceDraft {
+    pub model: String,
+    pub is_new: bool,
+    pub values: [Option<String>; 4],
+    pub alias: Option<String>,
+    pub removed: bool,
+}
+
+impl PriceDraft {
+    /// `isEmptyUsagePriceDraft`.
+    pub fn is_empty(&self) -> bool {
+        self.is_new
+            && self.model.trim().is_empty()
+            && self.alias.as_deref().unwrap_or_default().trim().is_empty()
+            && self.values.iter().flatten().all(|v| v.trim().is_empty())
+    }
+
+    /// Nothing differs from what is saved.
+    pub fn is_unchanged(&self) -> bool {
+        !self.is_new && !self.removed && self.alias.is_none() && self.values.iter().all(Option::is_none)
+    }
+}
+
+/// A rate as JavaScript prints a number.
+fn format_rate(value: f64) -> String {
+    format!("{value}")
+}
+
+/// `usagePriceForm`: a saved price's four rates as text, blank where unset.
+pub fn price_form(price: Option<&Value>) -> [String; 4] {
+    PRICE_FIELDS.map(|(key, ..)| price.and_then(|p| p[key].as_f64()).map(format_rate).unwrap_or_default())
+}
+
+/// A non-negative decimal (`,` as the point allowed), optionally with an exponent.
+fn parse_rate(raw: &str) -> Option<f64> {
+    let raw = raw.trim().replacen(',', ".", 1);
+    let (mantissa, exponent) = match raw.find(['e', 'E']) {
+        Some(at) => (&raw[..at], Some(&raw[at + 1..])),
+        None => (raw.as_str(), None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((whole, fraction)) => {
+            (digits(whole) && (fraction.is_empty() || digits(fraction))) || (whole.is_empty() && digits(fraction))
+        }
+        None => digits(mantissa),
+    };
+    let exponent_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    if !mantissa_ok || !exponent_ok {
+        return None;
+    }
+    raw.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.)
+}
+
+/// `parseUsagePriceForm`: blank cache rates use the input rate; zero means free.
+pub fn parse_price_form(form: &[String; 4]) -> Option<Value> {
+    let mut price = serde_json::Map::new();
+    for ((key, _, optional), raw) in PRICE_FIELDS.iter().zip(form) {
+        if raw.trim().is_empty() {
+            if *optional {
+                continue;
+            }
+            return None;
+        }
+        price.insert((*key).into(), json!(parse_rate(raw)?));
+    }
+    Some(Value::Object(price))
+}
+
+/// `usagePriceCell`: the saved rate and the placeholder its cell shows.
+pub fn price_cell(prices: &Value, model: &str, field: usize) -> (String, &'static str) {
+    let price = prices.get(model).filter(|p| p.is_object());
+    let value = price.map(|p| price_form(Some(p))[field].clone());
+    let placeholder = match (&value, PRICE_FIELDS[field].2) {
+        (None, _) => "Automatic",
+        (Some(_), true) => "Input rate",
+        (Some(_), false) => "0.00",
+    };
+    (value.unwrap_or_default(), placeholder)
+}
+
+/// `usageAliasCell`: the saved "Map to" model.
+pub fn alias_cell(aliases: &Value, model: &str) -> String {
+    aliases.get(model).and_then(Value::as_str).unwrap_or_default().to_owned()
+}
+
+/// `usagePriceTableChanges` for this environment: the `usagePriceOverrides` and
+/// `usageModelAliases` patches (`null` removes), or each failing row's error.
+pub fn price_table_changes(
+    prices: &Value,
+    aliases: &Value,
+    label: &str,
+    drafts: &[PriceDraft],
+) -> Result<(serde_json::Map<String, Value>, serde_json::Map<String, Value>), Vec<(usize, String)>> {
+    let mut price_patch = serde_json::Map::new();
+    let mut alias_patch = serde_json::Map::new();
+    let mut errors = Vec::new();
+    let saved_price = |model: &str| prices.get(model).filter(|p| p.is_object());
+    let saved_alias = |model: &str| aliases.get(model).and_then(Value::as_str);
+    for (index, draft) in drafts.iter().enumerate() {
+        if draft.is_empty() || draft.is_unchanged() {
+            continue;
+        }
+        let model = draft.model.trim();
+        let current_alias = saved_alias(model);
+        if draft.removed {
+            if saved_price(model).is_some() {
+                price_patch.insert(model.into(), Value::Null);
+            }
+            if current_alias.is_some() {
+                alias_patch.insert(model.into(), Value::Null);
+            }
+            continue;
+        }
+        let alias = draft.alias.as_deref().or(current_alias).unwrap_or_default().trim();
+        if !alias.is_empty() {
+            if draft.alias.is_none() && draft.values.iter().any(Option::is_some) {
+                errors.push((
+                    index,
+                    format!("{label} maps this model. Remove it from \"Apply to\" or clear its mapping first."),
+                ));
+            } else if model.is_empty() {
+                errors.push((index, "Enter a model ID.".into()));
+            } else if alias == model {
+                errors.push((index, "Map to a different model.".into()));
+            } else {
+                if Some(alias) != current_alias {
+                    alias_patch.insert(model.into(), json!(alias));
+                }
+                if saved_price(model).is_some() {
+                    price_patch.insert(model.into(), Value::Null);
+                }
+            }
+            continue;
+        }
+        if current_alias.is_some() {
+            alias_patch.insert(model.into(), Value::Null);
+            if saved_price(model).is_none() && draft.values.iter().flatten().all(|v| v.trim().is_empty()) {
+                continue;
+            }
+        }
+        let original = price_form(saved_price(model));
+        let form: [String; 4] = std::array::from_fn(|i| draft.values[i].clone().unwrap_or_else(|| original[i].clone()));
+        let Some(price) = parse_price_form(&form).filter(|_| !model.is_empty()) else {
+            let missing =
+                PRICE_FIELDS.iter().zip(&form).find(|((_, _, optional), raw)| !optional && raw.trim().is_empty());
+            errors.push((
+                index,
+                match missing {
+                    _ if model.is_empty() => "Enter a model ID.".into(),
+                    Some(((_, field, _), _)) => format!("{field} is required on {label}."),
+                    None => "Use non-negative numbers for prices.".into(),
+                },
+            ));
+            continue;
+        };
+        if price_form(Some(&price)) != original {
+            price_patch.insert(model.into(), price);
+        }
+    }
+    // Mappings must not chain back to themselves once the batch applies.
+    let mut final_aliases: std::collections::HashMap<String, String> = aliases
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+        .collect();
+    for (model, alias) in &alias_patch {
+        match alias.as_str() {
+            Some(alias) => final_aliases.insert(model.clone(), alias.to_owned()),
+            None => final_aliases.remove(model),
+        };
+    }
+    for (index, draft) in drafts.iter().enumerate() {
+        if draft.removed || errors.iter().any(|(i, _)| *i == index) {
+            continue;
+        }
+        let mut model = draft.model.trim().to_owned();
+        let mut seen = Vec::new();
+        while let Some(next) = final_aliases.get(&model) {
+            if seen.contains(&model) {
+                errors.push((index, format!("Model mappings cannot form a cycle on {label}.")));
+                break;
+            }
+            seen.push(model.clone());
+            model = next.clone();
+        }
+    }
+    if errors.is_empty() { Ok((price_patch, alias_patch)) } else { Err(errors) }
+}
+
 /// `WINDOW_KIND_ORDER`.
 fn kind_order(kind: &str) -> u8 {
     match kind {
@@ -1406,6 +1607,45 @@ mod tests {
             "usageLimits": {"checkedAt": "2026-11-05T00:00:00Z", "windows": windows},
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn model_price_rows_become_settings_patches() {
+        let prices = json!({"old": {"inputCostPerMillionTokens": 1, "outputCostPerMillionTokens": 2}});
+        let aliases = json!({"b": "a"});
+        let row = |model: &str, values: [Option<&str>; 4]| PriceDraft {
+            model: model.into(),
+            is_new: true,
+            values: values.map(|v| v.map(str::to_owned)),
+            ..Default::default()
+        };
+        let (price_patch, alias_patch) =
+            price_table_changes(&prices, &aliases, "Here", &[row("m1", [Some("3"), Some("15"), Some(""), None])])
+                .unwrap();
+        assert_eq!(
+            Value::Object(price_patch),
+            json!({"m1": {"inputCostPerMillionTokens": 3.0, "outputCostPerMillionTokens": 15.0}})
+        );
+        assert!(alias_patch.is_empty());
+        let reset = PriceDraft { model: "old".into(), removed: true, ..Default::default() };
+        let (price_patch, _) = price_table_changes(&prices, &aliases, "Here", &[reset]).unwrap();
+        assert_eq!(Value::Object(price_patch), json!({"old": null}));
+        let errors =
+            price_table_changes(&prices, &aliases, "Here", &[row("m2", [Some("3"), None, None, None])]).unwrap_err();
+        assert_eq!(errors, [(0, "Output is required on Here.".to_owned())]);
+        let cycle = PriceDraft { model: "a".into(), is_new: true, alias: Some("b".into()), ..Default::default() };
+        let errors = price_table_changes(&prices, &aliases, "Here", &[cycle]).unwrap_err();
+        assert_eq!(errors, [(0, "Model mappings cannot form a cycle on Here.".to_owned())]);
+        let same = PriceDraft { model: "c".into(), is_new: true, alias: Some("c".into()), ..Default::default() };
+        assert_eq!(
+            price_table_changes(&prices, &aliases, "Here", &[same]).unwrap_err()[0].1,
+            "Map to a different model."
+        );
+        assert_eq!(parse_rate(",5"), Some(0.5));
+        assert_eq!(parse_rate("1e-3"), Some(0.001));
+        assert_eq!(parse_rate("-1"), None);
+        assert_eq!(price_cell(&prices, "old", 2), (String::new(), "Input rate"));
+        assert_eq!(price_cell(&prices, "new", 0), (String::new(), "Automatic"));
     }
 
     #[test]

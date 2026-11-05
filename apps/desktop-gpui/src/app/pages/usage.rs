@@ -2,6 +2,7 @@
 //! over the last main view). Cost and Tokens read `server.getUsageSummary`; Limits shows the
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
+mod prices;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -390,6 +391,12 @@ impl Workspace {
                         })),
                     )
                     .when_some(error_line.filter(|_| !limits), |menu, error| menu.separator().label(error))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
+                            window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
+                        ),
+                    )
                 }
             });
 

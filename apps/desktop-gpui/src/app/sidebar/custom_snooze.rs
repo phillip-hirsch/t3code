@@ -204,7 +204,11 @@ impl Workspace {
             error: None,
         });
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title(SharedString::from("Custom snooze")).width(px(384.)).child(form.clone())
+            dialog
+                .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+                .title(SharedString::from("Custom snooze"))
+                .width(px(384.))
+                .child(form.clone())
         });
     }
 }
