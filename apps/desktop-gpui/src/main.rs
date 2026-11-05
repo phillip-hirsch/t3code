@@ -99,7 +99,7 @@ fn main() {
     app.run(|cx| {
         gpui_kit::init(cx);
         // Windows shows OS notifications under this identity.
-        cx.set_app_identity("com.t3tools.t3code.gpui", "T3 Code");
+        cx.set_app_identity(desktop::APP_ID, "T3 Code");
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
@@ -138,6 +138,10 @@ fn open_main_window(cx: &mut gpui_kit::App) {
         window_bounds: Some(cx.global::<desktop::Desktop>().window_bounds(cx)),
         window_min_size: Some(size(px(840.), px(620.))),
         window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+        // Linux docks group the window under its desktop entry by this id (Wayland `app_id`, X11 `WM_CLASS`).
+        app_id: Some(desktop::APP_ID.to_owned()),
+        #[cfg(target_os = "linux")]
+        icon: desktop::window_icon(),
         ..Default::default()
     };
     let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {

@@ -31,6 +31,23 @@ pub struct Desktop {
 
 impl Global for Desktop {}
 
+/// The app's id: its Windows notification identity and, on Linux, the window's app id, which
+/// names the desktop entry (`linux_url_handler::DESKTOP_ENTRY`).
+pub const APP_ID: &str = "com.t3tools.t3code.gpui";
+
+/// The window icon X11 docks show (`_NET_WM_ICON`); Wayland docks show the desktop entry's.
+#[cfg(target_os = "linux")]
+pub fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
+    let png = include_bytes!("../../assets/icons/app-icon.png");
+    match image::load_from_memory_with_format(png, image::ImageFormat::Png) {
+        Ok(icon) => Some(std::sync::Arc::new(icon.into_rgba8())),
+        Err(error) => {
+            log::warn!("could not decode the window icon: {error}");
+            None
+        }
+    }
+}
+
 /// This process's top-level window whose handle is `hwnd`, as winsafe's handle type.
 #[cfg(windows)]
 pub fn top_level_window(hwnd: isize) -> Option<winsafe::HWND> {
