@@ -80,6 +80,8 @@ pub enum Row {
         key: SharedString,
         expanded: bool,
     },
+    /// A secret or link an agent asked for, while it waits on the user (`SecretRequestCard`, `LinkRequestCard`).
+    Request(Rc<RequestCard>),
     /// A queued follow-up, after the timeline (`QueuedRunsControl`).
     Queued {
         message: Rc<crate::queue::QueuedMessage>,
@@ -147,6 +149,87 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         attachment_id: text(page, "attachmentId")?.to_owned().into(),
         app_server: None,
     })
+}
+
+/// A pending `secret_request` or `link_request` asked in this thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestCard {
+    pub item_id: SharedString,
+    pub thread_id: SharedString,
+    pub reason: SharedString,
+    pub kind: RequestKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RequestKind {
+    Secret {
+        label: SharedString,
+        placeholder: Option<SharedString>,
+        /// `delivery: "file"`: the agent's commands can read the value.
+        file: bool,
+    },
+    Link {
+        label: Option<SharedString>,
+        url: Option<SharedString>,
+        environment_id: Option<SharedString>,
+        requested_access: Option<SharedString>,
+    },
+}
+
+impl RequestCard {
+    /// `linkRequestTargetName`.
+    pub fn link_target(&self) -> String {
+        match &self.kind {
+            RequestKind::Link { label, url, .. } => label
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .or(url.as_deref())
+                .unwrap_or("a machine")
+                .to_owned(),
+            RequestKind::Secret { label, .. } => label.to_string(),
+        }
+    }
+
+    /// The agent left the machine for the user to pick (`picksMachine`).
+    pub fn picks_machine(&self) -> bool {
+        matches!(&self.kind, RequestKind::Link { environment_id: None, url: None, .. })
+    }
+}
+
+fn request_card(item: &TurnItem) -> RequestCard {
+    let text = |key: &str| item.str(key).map(|v| SharedString::from(v.to_owned()));
+    let kind = match item.item_type.as_str() {
+        "secret_request" => RequestKind::Secret {
+            label: text("label").unwrap_or_else(|| "Secret".into()),
+            placeholder: text("placeholder"),
+            file: item.str("delivery") == Some("file"),
+        },
+        _ => RequestKind::Link {
+            label: text("label"),
+            url: text("url"),
+            environment_id: text("environmentId"),
+            requested_access: text("requestedAccess"),
+        },
+    };
+    RequestCard {
+        item_id: item.id.clone().into(),
+        thread_id: item.thread_id.clone().into(),
+        reason: text("reason").unwrap_or_default(),
+        kind,
+    }
+}
+
+/// `accessConfig[access].label`.
+pub fn access_label(access: &str) -> &'static str {
+    match access {
+        "read-only" => "Read only",
+        "approval-required" => "Supervised",
+        "auto-accept-edits" => "Auto-accept edits",
+        "auto" => "Auto",
+        "full-access" => "Full access",
+        _ => "Unknown",
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +459,7 @@ enum Kind {
         subagent: Option<Rc<SubagentCard>>,
     },
     Embed(Rc<Embed>),
+    Request(Rc<RequestCard>),
 }
 
 struct TimelineEntry {
@@ -463,7 +547,7 @@ fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Ve
             let entry = match cache.0.get(&item.id) {
                 Some((revision, entry)) if *revision == item.revision && item.revision != 0 => entry.clone(),
                 _ => {
-                    let mut entry = timeline_entry(item)?;
+                    let mut entry = timeline_entry(item, row.visibility == "inherited")?;
                     entry.source_thread_id = row.source_thread_id.clone().into();
                     entry.inherited = row.visibility == "inherited";
                     Rc::new(entry)
@@ -477,7 +561,7 @@ fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Ve
     entries
 }
 
-fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
+fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry> {
     let raw = &item.raw;
     let text = |key: &str| SharedString::from(item.str(key).unwrap_or_default().to_owned());
     let created_at = text("startedAt");
@@ -508,6 +592,12 @@ fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
         "proposed_plan" => Kind::Plan { markdown: text("markdown") },
+        "secret_request" if item.str("secretStatus") == Some("pending") && !inherited => {
+            Kind::Request(Rc::new(request_card(item)))
+        }
+        "link_request" if item.str("linkStatus") == Some("pending") && !inherited => {
+            Kind::Request(Rc::new(request_card(item)))
+        }
         "fork"
         | "handoff"
         | "run_interrupt_request"
@@ -515,7 +605,7 @@ fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
         | "secret_request"
         | "link_request"
         | "subagent" => Kind::Event {
-            label: event_label(item).into(),
+            label: event_label(item, inherited).into(),
             item_type: item.item_type.clone().into(),
             subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
         },
@@ -548,7 +638,7 @@ fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
     })
 }
 
-fn event_label(item: &TurnItem) -> String {
+fn event_label(item: &TurnItem, inherited: bool) -> String {
     let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
     match item.item_type.as_str() {
         "fork" => "Forked thread".into(),
@@ -559,11 +649,28 @@ fn event_label(item: &TurnItem) -> String {
                 Some("saved") => "Saved securely and kept private",
                 Some("declined") => "Declined",
                 Some("cancelled") => "Request ended",
+                Some("pending") if inherited => "Waiting for an answer in the original thread",
                 _ => return "Asked for a secret".into(),
             };
             format!("{} · {outcome}", text("label").unwrap_or_else(|| "Secret".into()))
         }
-        "link_request" => "Asked to link an environment".into(),
+        // `linkRequestDisplay`.
+        "link_request" => match item.str("linkStatus") {
+            Some("linked") => {
+                let target = text("linkedLabel").unwrap_or_else(|| request_card(item).link_target());
+                match item.str("linkedAccess") {
+                    Some(access) => format!("Linked {target} · {}", access_label(access)),
+                    None => format!("Linked {target}"),
+                }
+            }
+            Some("declined") => "Declined".into(),
+            Some("failed") => {
+                format!("Could not link: {}", item.str("failure").unwrap_or("the other environment refused"))
+            }
+            Some("cancelled") => "Request ended".into(),
+            _ if inherited => "Waiting for an answer in the original thread".into(),
+            _ => "Asked to link an environment".into(),
+        },
         "subagent" => text("title")
             .or_else(|| text("prompt").and_then(|p| p.lines().next().map(str::to_owned)))
             .unwrap_or_else(|| "Subagent".into()),
@@ -930,7 +1037,7 @@ fn attempt_folds(
         let Some(attempt) = superseded(index) else { continue };
         let skip = complete.contains(attempt.id.as_str())
             || failed_runs.contains(attempt.run_id.as_str())
-            || matches!(&entry.kind, Kind::User { .. })
+            || matches!(&entry.kind, Kind::User { .. } | Kind::Request(_))
             || matches!(&entry.kind, Kind::Event { item_type, .. } if item_type == "handoff" || is_resource_card(item_type))
             || matches!(&entry.kind, Kind::Event { subagent: Some(card), .. } if card.live)
             || entry.work().is_some_and(|work| work.item_type == "system_notice" || work.item_type == "thread_created");
@@ -1225,6 +1332,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
             Kind::Plan { markdown } => rows.push(Row::Plan { id: entry.id.clone(), markdown: markdown.clone() }),
             Kind::Event { subagent: Some(card), .. } => rows.push(Row::Subagent(card.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
+            Kind::Request(card) => rows.push(Row::Request(card.clone())),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
             Kind::User { text, steer, sent_by_t3code, .. } => rows.push(Row::User {
                 id: entry.id.clone(),
@@ -1393,6 +1501,7 @@ mod tests {
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
+                Row::Request(card) => format!("request {}", card.item_id),
             })
             .collect()
     }
@@ -1417,21 +1526,39 @@ mod tests {
         let started = item(
             json!({"id": "s", "type": "user_message", "inputIntent": "queued_turn", "status": "completed", "text": "now"}),
         );
-        assert!(timeline_entry(&queued).is_none());
-        assert!(timeline_entry(&checkpoint).is_none());
-        assert!(matches!(timeline_entry(&started).unwrap().kind, Kind::User { steer: None, .. }));
+        assert!(timeline_entry(&queued, false).is_none());
+        assert!(timeline_entry(&checkpoint, false).is_none());
+        assert!(matches!(timeline_entry(&started, false).unwrap().kind, Kind::User { steer: None, .. }));
     }
 
     #[test]
     fn answered_secret_requests_name_their_outcome() {
         let label = |status: &str| {
             let raw = json!({"id": "s", "type": "secret_request", "label": "GitHub token", "secretStatus": status});
-            event_label(&serde_json::from_value::<TurnItem>(raw).unwrap())
+            event_label(&serde_json::from_value::<TurnItem>(raw).unwrap(), true)
         };
         assert_eq!(label("saved"), "GitHub token · Saved securely and kept private");
         assert_eq!(label("declined"), "GitHub token · Declined");
         assert_eq!(label("cancelled"), "GitHub token · Request ended");
-        assert_eq!(label("pending"), "Asked for a secret");
+        assert_eq!(label("pending"), "GitHub token · Waiting for an answer in the original thread");
+    }
+
+    #[test]
+    fn link_requests_card_while_pending_and_name_their_outcome() {
+        let item = |extra: Value| {
+            let mut raw = json!({"id": "l", "type": "link_request", "threadId": "t", "reason": "Run tests there"});
+            raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            Rc::new(serde_json::from_value::<TurnItem>(raw).unwrap())
+        };
+        let pending = item(json!({"linkStatus": "pending", "hint": "my box"}));
+        let Kind::Request(card) = timeline_entry(&pending, false).unwrap().kind else { panic!("expected a card") };
+        assert!(card.picks_machine());
+        assert_eq!(card.link_target(), "a machine");
+        assert!(matches!(timeline_entry(&pending, true).unwrap().kind, Kind::Event { .. }));
+        let linked = item(json!({"linkStatus": "linked", "url": "https://box.ts.net", "linkedAccess": "full-access"}));
+        assert_eq!(event_label(&linked, false), "Linked https://box.ts.net · Full access");
+        let failed = item(json!({"linkStatus": "failed"}));
+        assert_eq!(event_label(&failed, false), "Could not link: the other environment refused");
     }
 
     fn command(id: &str, run: &str, at: &str) -> Value {

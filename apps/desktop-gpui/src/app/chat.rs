@@ -375,7 +375,13 @@ fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEven
     }
 }
 
-fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut Window, cx: &mut App) -> AnyElement {
+fn render_row(
+    row: &Row,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let t = *theme::tokens(cx);
     match row {
         Row::User {
@@ -520,6 +526,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut 
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
         Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
     }
 }
 

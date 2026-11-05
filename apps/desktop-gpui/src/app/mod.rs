@@ -45,6 +45,7 @@ mod palette;
 mod preview;
 mod queue;
 mod quit;
+mod request_cards;
 mod right_panel;
 mod send;
 mod sidebar;
@@ -220,6 +221,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
     _subscriptions: Vec<Subscription>,
@@ -342,6 +344,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),
             _subscriptions: subscriptions,
