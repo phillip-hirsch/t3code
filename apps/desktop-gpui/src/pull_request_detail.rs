@@ -76,6 +76,8 @@ pub struct EditCapabilities {
     pub change_request: bool,
     #[serde(default)]
     pub comment: bool,
+    #[serde(default)]
+    pub maintainer_edits: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -95,6 +97,12 @@ pub struct Capabilities {
     pub reviewers: ReviewerCapabilities,
     #[serde(default)]
     pub edit: Option<EditCapabilities>,
+    #[serde(default)]
+    pub update_methods: Vec<String>,
+    #[serde(default)]
+    pub stacks: Option<bool>,
+    #[serde(default)]
+    pub stack_actions: Option<bool>,
     #[serde(default)]
     pub actions: Vec<String>,
     #[serde(default)]
@@ -123,6 +131,12 @@ pub struct Permissions {
     pub labels: Option<bool>,
     #[serde(default)]
     pub edit_change_request: Option<bool>,
+    #[serde(default)]
+    pub update_methods: Vec<String>,
+    #[serde(default)]
+    pub maintainer_edits: Option<bool>,
+    #[serde(default)]
+    pub stack_rebase: Option<bool>,
 }
 
 impl Default for Permissions {
@@ -135,6 +149,9 @@ impl Default for Permissions {
             request_reviewers: true,
             labels: None,
             edit_change_request: None,
+            update_methods: Vec::new(),
+            maintainer_edits: None,
+            stack_rebase: None,
         }
     }
 }
@@ -162,6 +179,12 @@ pub struct Detail {
     pub capabilities: Capabilities,
     #[serde(default)]
     pub viewer: Option<String>,
+    #[serde(default)]
+    pub base_comparison: Option<String>,
+    #[serde(default)]
+    pub behind_by: Option<u64>,
+    #[serde(default)]
+    pub maintainer_can_modify: Option<bool>,
     #[serde(default)]
     pub viewer_permissions: Permissions,
     pub project_id: String,
@@ -431,6 +454,114 @@ pub fn can_edit_comment(detail: &Detail, kind: &str, author: Option<&Actor>, can
 /// `canResolvePullRequestThread`: the thread's answer can only narrow the reader's permission.
 pub fn can_resolve_thread(detail: &Detail, thread: &ReviewThread) -> bool {
     detail.viewer_permissions.resolve && thread.can_resolve != Some(false)
+}
+
+/// `canEditPullRequestMaintainerEdits`.
+pub fn can_edit_maintainer_edits(detail: &Detail) -> bool {
+    detail.state == "open"
+        && detail.capabilities.edit.and_then(|e| e.maintainer_edits) == Some(true)
+        && detail.viewer_permissions.maintainer_edits == Some(true)
+        && detail.maintainer_can_modify.is_some()
+}
+
+/// `resolveBaseFreshness`: how far an open, mergeable branch is behind its base, and the ways
+/// this reader may bring it up to date.
+pub fn base_freshness(detail: &Detail) -> Option<(Option<u64>, Vec<String>)> {
+    if detail.state != "open"
+        || detail.base_comparison.as_deref() != Some("behind")
+        || detail.mergeability != "mergeable"
+    {
+        return None;
+    }
+    let methods = detail
+        .capabilities
+        .update_methods
+        .iter()
+        .filter(|m| detail.viewer_permissions.update_methods.contains(m))
+        .cloned()
+        .collect();
+    Some((detail.behind_by, methods))
+}
+
+/// `groupPullRequestChecks`: what needs attention, what is running, and what finished.
+pub fn group_checks(checks: &[Check]) -> (Vec<&Check>, Vec<&Check>, Vec<&Check>) {
+    let pick = |statuses: &[&str]| checks.iter().filter(|c| statuses.contains(&c.status.as_str())).collect::<Vec<_>>();
+    (pick(&["failure", "cancelled", "action-required"]), pick(&["pending"]), pick(&["success", "skipped", "neutral"]))
+}
+
+/// One layer of a native stack (`PullRequestStack.layers`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackLayer {
+    pub number: u64,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    pub head_branch: String,
+    pub state: String,
+}
+
+/// `PullRequestStack`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stack {
+    pub number: u64,
+    pub base: String,
+    #[serde(default)]
+    pub layers: Vec<StackLayer>,
+}
+
+/// What the stack menu offers for the layer shown (`PullRequestStackMenu`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct StackPlan {
+    /// One-based place of the shown layer.
+    pub position: usize,
+    /// Unmerged layers up to the shown one, which "Merge stack" merges.
+    pub merge: Vec<u64>,
+    pub merge_disabled: bool,
+    /// Every unmerged layer, which "Rebase stack" rebases.
+    pub rebase: Vec<u64>,
+    pub rebase_disabled: bool,
+    /// A layer being merged is closed or still a draft.
+    pub merge_blocked: bool,
+    pub selected_open: bool,
+}
+
+pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
+    let position = stack.layers.iter().position(|l| l.number == number).map_or(0, |i| i + 1);
+    let unmerged: Vec<&StackLayer> = stack.layers.iter().filter(|l| l.state != "merged").collect();
+    let merge: Vec<&StackLayer> = stack.layers[..position].iter().filter(|l| l.state != "merged").collect();
+    let selected_open = position > 0 && stack.layers[position - 1].state == "open";
+    let merge_blocked = merge.iter().any(|l| l.state != "open" || l.is_draft);
+    StackPlan {
+        position,
+        merge_disabled: !selected_open
+            || merge.is_empty()
+            || merge.iter().any(|l| l.head_sha.is_none())
+            || merge_blocked,
+        merge: merge.iter().map(|l| l.number).collect(),
+        rebase_disabled: unmerged.is_empty()
+            || unmerged.iter().any(|l| l.head_sha.is_none())
+            || unmerged.iter().any(|l| l.state != "open"),
+        rebase: unmerged.iter().map(|l| l.number).collect(),
+        merge_blocked,
+        selected_open,
+    }
+}
+
+/// `expectedStackHeads` for the layers an action covers.
+pub fn stack_heads(stack: &Stack, numbers: &[u64]) -> Value {
+    Value::Array(
+        stack
+            .layers
+            .iter()
+            .filter(|l| numbers.contains(&l.number))
+            .filter_map(|l| Some(json!({"number": l.number, "headSha": l.head_sha.as_ref()?})))
+            .collect(),
+    )
 }
 
 /// The header's one prominent control (`resolvePullRequestPrimaryControl`).
@@ -1042,6 +1173,10 @@ pub fn action_failure(action: &str, term: &str) -> (String, String) {
             format!("Could not open a revert {term}"),
             format!("The host refused it. Check that you have write access and that this {term} was merged on the host."),
         ),
+        "update-branch" => (
+            "Could not update this branch".into(),
+            "The host refused it. Check that you have write access to the branch (a fork branch also needs its author to allow edits from maintainers), and that it does not conflict with the base.".into(),
+        ),
         "delete-branch" => (
             "Could not delete this branch".into(),
             "The host refused it. Check that you have write access to the source repository and that the branch has not moved since this page loaded.".into(),
@@ -1187,6 +1322,55 @@ mod tests {
         assert!(!can_resolve_thread(&mine, &thread));
         let open: ReviewThread = serde_json::from_value(json!({"id": "t", "path": "a"})).unwrap();
         assert!(can_resolve_thread(&mine, &open) && open.side == "right");
+    }
+
+    #[test]
+    fn a_branch_behind_its_base_offers_the_updates_both_sides_allow() {
+        let behind = detail(json!({
+            "baseComparison": "behind", "behindBy": 3,
+            "capabilities": {"actions": [], "mergeMethods": [], "updateMethods": ["merge", "rebase"]},
+            "viewerPermissions": {"actions": [], "updateMethods": ["merge"]},
+        }));
+        assert_eq!(base_freshness(&behind), Some((Some(3), vec!["merge".to_owned()])));
+        let conflicting = detail(json!({"baseComparison": "behind", "mergeability": "conflicting"}));
+        assert_eq!(base_freshness(&conflicting), None, "a conflicting branch shows Resolve instead");
+        assert_eq!(base_freshness(&detail(json!({"baseComparison": "up-to-date"}))), None);
+    }
+
+    #[test]
+    fn a_stack_merges_up_to_the_shown_layer_and_rebases_every_unmerged_one() {
+        let stack: Stack = serde_json::from_value(json!({
+            "number": 9, "base": "main",
+            "layers": [
+                {"number": 1, "headBranch": "a", "state": "merged", "headSha": "a1"},
+                {"number": 2, "headBranch": "b", "state": "open", "headSha": "b1"},
+                {"number": 3, "headBranch": "c", "state": "open", "headSha": "c1"},
+                {"number": 4, "headBranch": "d", "state": "open", "isDraft": true},
+            ],
+        }))
+        .unwrap();
+        let plan = stack_plan(&stack, 3);
+        assert_eq!((plan.position, plan.merge.as_slice(), plan.merge_disabled), (3, &[2, 3][..], false));
+        assert_eq!(plan.rebase, [2, 3, 4]);
+        assert!(plan.rebase_disabled, "a layer without a known head cannot be rebased safely");
+        assert!(stack_plan(&stack, 4).merge_disabled, "a draft layer blocks the merge");
+        assert_eq!(
+            stack_heads(&stack, &[2, 3]),
+            json!([{"number": 2, "headSha": "b1"}, {"number": 3, "headSha": "c1"}])
+        );
+    }
+
+    #[test]
+    fn checks_group_by_what_they_need() {
+        let checks: Vec<Check> = ["failure", "pending", "success", "action-required", "skipped"]
+            .iter()
+            .map(|status| Check { name: (*status).into(), status: (*status).into(), url: None })
+            .collect();
+        let (attention, running, completed) = group_checks(&checks);
+        let names = |list: Vec<&Check>| list.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(attention), ["failure", "action-required"]);
+        assert_eq!(names(running), ["pending"]);
+        assert_eq!(names(completed), ["success", "skipped"]);
     }
 
     #[test]

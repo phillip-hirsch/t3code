@@ -36,6 +36,7 @@ use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
 
 mod code;
+mod header;
 pub(in crate::app) mod write;
 
 const CONVERSATION_PAGE: usize = 10;
@@ -92,6 +93,14 @@ pub(in crate::app) struct Panel {
     _guide_poll: Option<Task<()>>,
     code: Option<code::CodeTab>,
     write: write::WriteState,
+    stack: Option<Rc<logic::Stack>>,
+    stack_failed: bool,
+    linked: Option<Vec<header::LinkedThread>>,
+    checks_all: bool,
+    maintainer_saving: bool,
+    /// A maintainer-edits choice saved and not yet read back.
+    maintainer_choice: Option<bool>,
+    _picker_search: Option<Subscription>,
 }
 
 impl Panel {
@@ -131,6 +140,13 @@ impl Panel {
             _guide_poll: None,
             code: None,
             write: write::WriteState::default(),
+            stack: None,
+            stack_failed: false,
+            linked: None,
+            checks_all: false,
+            maintainer_saving: false,
+            maintainer_choice: None,
+            _picker_search: None,
         }
     }
 
@@ -256,8 +272,13 @@ impl Workspace {
                 panel.detail_loading = false;
                 match result.map(serde_json::from_value::<Detail>) {
                     Ok(Ok(detail)) => {
+                        let first = panel.detail.is_none();
                         panel.detail = Some(Rc::new(detail));
                         panel.detail_error = None;
+                        panel.maintainer_choice = None;
+                        if first {
+                            this.read_pr_extras(cx);
+                        }
                     }
                     Ok(Err(error)) => {
                         panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false))
@@ -321,6 +342,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.perform_pr_action_with(action, method, None, window, cx);
+    }
+
+    /// `perform` with the update method `update-branch` takes.
+    fn perform_pr_action_with(
+        &mut self,
+        action: &'static str,
+        method: Option<&'static str>,
+        update_method: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.pending.is_some() {
@@ -335,6 +368,9 @@ impl Workspace {
         if let Some(method) = method {
             input["mergeMethod"] = json!(method);
         }
+        if let Some(update) = update_method {
+            input["updateMethod"] = json!(update);
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("pullRequests.runAction", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -343,7 +379,10 @@ impl Workspace {
                 }
                 match result {
                     Err(error) => {
-                        let (title, hint) = logic::action_failure(action, term);
+                        let (title, mut hint) = logic::action_failure(action, term);
+                        if update_method == Some("rebase") {
+                            hint = "The host refused it. A rebase stops at the first commit that does not apply cleanly; updating with a merge commit may still work.".into();
+                        }
                         toast_error(
                             window,
                             cx,
@@ -765,6 +804,8 @@ impl Workspace {
             .h(px(28.))
             .mr(px(16.))
             .gap(px(4.))
+            .children(self.render_pr_thread_count(t, cx))
+            .children(self.render_pr_stack(detail, method, t, cx))
             .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
             .child(self.render_pr_menu(detail, primary, method, guides, &view, t))
             .child(collapse_button(t, cx));
@@ -811,7 +852,7 @@ impl Workspace {
                     .gap(px(6.))
                     .font_family(FONT_MONO)
                     .text_color(Hsla { a: 0.7, ..t.muted_foreground })
-                    .child(div().flex_none().child(detail.base_branch.clone()))
+                    .child(self.render_pr_base_branch(detail, t, cx))
                     .child(
                         Icon::new(Lucide::ArrowLeft)
                             .with_size(px(14.))
@@ -1042,6 +1083,9 @@ impl Workspace {
         let refreshing = panel.refreshing || panel.detail_loading;
         let guide_running = panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running");
         let guide_written = panel.guide.as_ref().is_some_and(|g| !g["guide"].is_null());
+        let maintainer = logic::can_edit_maintainer_edits(detail)
+            .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
+        let can_link = logic::parse_change_request_url(&detail.url).is_some();
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1083,7 +1127,24 @@ impl Workspace {
                             .on_click(on(|this, window, cx| this.write_pr_guide(window, cx))),
                     );
                 }
+                if can_link {
+                    menu = menu.item(
+                        PopupMenuItem::new("Link to thread")
+                            .icon(Lucide::Link)
+                            .on_click(on(|this, window, cx| this.open_pr_thread_picker(window, cx))),
+                    );
+                }
                 menu = menu.separator();
+                if let Some((allowed, saving)) = maintainer {
+                    let label = if saving { "Allow edits from maintainers (saving…)" } else { "Allow edits from maintainers" };
+                    menu = menu
+                        .item(PopupMenuItem::new(label).checked(allowed).disabled(saving).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| this.save_pr_maintainer_edits(!allowed, window, cx),
+                        )))
+                        .label("Maintainers can push to this branch. If your fork has workflows, this can also give access to its secrets.")
+                        .separator();
+                }
                 if detail.state == "open" {
                     if actions.draft_toggle {
                         let (label, action, icon) = if detail.is_draft {
@@ -1302,8 +1363,8 @@ impl Workspace {
         } else {
             logic::summarize_checks(&detail.checks)
         };
-        let icon = match state.and_then(|s| checks_glyph(s, t)) {
-            Some((icon, color, tip)) => glyph("pr-checks-state".into(), icon, 14., color, tip).into_any_element(),
+        let icon = match state.filter(|s| checks_glyph(s, t).is_some()) {
+            Some(state) => self.render_pr_checks_popover(detail, state, stale, t, cx),
             None => Icon::new(Lucide::CircleDot).with_size(px(14.)).text_color(t.muted_foreground).into_any_element(),
         };
         h_flex()
@@ -2181,16 +2242,6 @@ fn outcome_icon(outcome: &str) -> Lucide {
         "changes-requested" => Lucide::CircleX,
         _ => Lucide::CircleDashed,
     }
-}
-
-fn glyph(id: String, icon: Lucide, size: f32, color: Hsla, label: impl Into<SharedString>) -> impl IntoElement {
-    let label: SharedString = label.into();
-    div()
-        .id(ElementId::Name(id.into()))
-        .flex_none()
-        .flex()
-        .child(Icon::new(icon).with_size(px(size)).text_color(color))
-        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
 }
 
 /// `Badge size="control"`: an icon and label in a tinted pill, with the label as its tooltip.
