@@ -79,6 +79,8 @@ pub(super) struct SidebarState {
     /// Draft rows by project, newest first.
     draft_order: Vec<String>,
     provider_pill: provider_update::PillState,
+    /// Each local checkout's current branch, read when a hover card opens, by workspace root.
+    checkout_branches: HashMap<String, String>,
     filter: Option<filter::FilterMenu>,
     filter_closed_at: Option<std::time::Instant>,
     /// The search result Up/Down or the pointer picked; `None` paints none.
@@ -134,6 +136,7 @@ impl SidebarState {
             selection: Default::default(),
             draft_order: Vec::new(),
             provider_pill: Default::default(),
+            checkout_branches: HashMap::new(),
             filter: None,
             filter_closed_at: None,
             search_highlight: None,
@@ -801,6 +804,7 @@ impl Workspace {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.sidebar.hovered.as_ref() == Some(&thread_id) {
+                        this.read_checkout_branch(&thread_id, cx);
                         this.sidebar.hover_card = Some(thread_id);
                         this.notify_sidebar(cx);
                     }
@@ -812,6 +816,32 @@ impl Workspace {
             self.sidebar._hover_card_delay = None;
         }
         self.notify_sidebar(cx);
+    }
+
+    /// A local thread's checkout may have moved to another branch since; the hover card warns
+    /// then (`resolveLocalCheckoutBranchMismatch`). Read fresh each time a card opens.
+    fn read_checkout_branch(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        if thread.worktree_path.is_some() || thread.branch.is_none() {
+            return;
+        }
+        let Some(cwd) =
+            self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.workspace_root.clone())
+        else {
+            return;
+        };
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let Ok(status) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
+            let Some(branch) = status["refName"].as_str().map(str::to_owned) else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar.checkout_branches.get(&cwd) != Some(&branch) {
+                    this.sidebar.checkout_branches.insert(cwd, branch);
+                    this.notify_sidebar(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// The row's hover card, drawn to the right of the row (`SidebarThreadTooltip`).
@@ -862,6 +892,19 @@ impl Workspace {
                     div().min_w_0().truncate().child(if limit { "Usage limit reached" } else { "Error occurred" }),
                 )
             });
+        let mismatch = thread.worktree_path.is_none()
+            && project
+                .and_then(|p| self.sidebar.checkout_branches.get(&p.workspace_root))
+                .is_some_and(|current| thread.branch.as_ref().is_some_and(|branch| branch != current));
+        let mismatch = mismatch.then(|| {
+            h_flex()
+                .min_w_0()
+                .items_start()
+                .gap(px(8.))
+                .text_color(tokens.warning)
+                .child(div().mt(px(2.)).child(icon(IconName::CircleAlert, 12., tokens.warning)))
+                .child(div().min_w_0().flex_1().child("You're currently checked out on another branch."))
+        });
         let card = text_xs(v_flex())
             .max_w(px(320.))
             .px(px(12.))
@@ -893,6 +936,7 @@ impl Workspace {
                         self.server_info.environment_label.clone().map(|label| line(muted_icon(machine), label.into())),
                     )
                     .children(thread.branch.clone().map(|branch| line(muted_icon(IconName::GitBranch), branch.into())))
+                    .children(mismatch)
                     .children(provider_line)
                     .children(error),
             );
