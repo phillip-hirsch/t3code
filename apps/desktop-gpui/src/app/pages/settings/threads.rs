@@ -90,8 +90,8 @@ impl Workspace {
         let view = self.settings_view();
         let connected = self.client().is_some();
         let base = self.add_project_field(&view, window, cx);
-        let new_thread = self.new_thread_controls(&view, cx);
-        let snooze = view.scope.project_id().is_none().then(|| self.snooze_row(&view, window, cx));
+        let new_threads = self.new_threads_section(&view, true, window, cx);
+        let snooze = (!view.scope.is_project()).then(|| self.snooze_row(&view, window, cx));
         let auto_settle = connected.then(|| self.auto_settle_rows(&view, window, cx));
         let text_generation = self.text_generation_rows(&view, window, cx);
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
@@ -111,42 +111,6 @@ impl Workspace {
                     .switch(),
             ),
         ];
-        let [model, fallback, permissions, workspace] = new_thread;
-        let automatic = view.value("defaultModelSelection").is_null() && connected;
-        let new_threads = [
-            row(
-                self,
-                SettingRow::titled("default-model", "Model")
-                    .description(if automatic {
-                        "Default model for new threads, selected automatically. Projects can override it."
-                    } else {
-                        "Default model for new threads. Projects can override it."
-                    })
-                    .setting("defaultModelSelection")
-                    .control(model),
-            ),
-            row(
-                self,
-                SettingRow::new("fallback-model")
-                    .description("Used for new threads when the default model's provider is out of usage.")
-                    .setting("fallbackModelSelection")
-                    .control(fallback),
-            ),
-            row(
-                self,
-                SettingRow::new("default-permissions")
-                    .description("Default permissions for new threads. Projects can override them.")
-                    .setting("defaultRuntimeMode")
-                    .control(permissions),
-            ),
-            row(
-                self,
-                SettingRow::titled("new-threads", "Workspace")
-                    .description("Where new threads start. Projects and their t3.json can override it.")
-                    .setting("defaultThreadEnvMode")
-                    .control(workspace),
-            ),
-        ];
         let usage = [
             row(
                 self,
@@ -163,10 +127,7 @@ impl Workspace {
                     .switch(),
             ),
         ];
-        let mut sections = vec![
-            settings_section("new-projects", "New projects", new_projects, &t),
-            settings_section("new-threads", "New threads", new_threads, &t),
-        ];
+        let mut sections = vec![settings_section("new-projects", "New projects", new_projects, &t), new_threads];
         sections.extend(snooze.map(|snooze| settings_section("snooze", "Snooze", [snooze], &t)));
         sections.push(settings_section("usage-limits", "Usage limits", usage, &t));
         sections.extend(auto_settle.map(|rows| settings_section("auto-settle", "Auto-settle", rows, &t)));
@@ -191,78 +152,179 @@ impl Workspace {
         .into_any_element()
     }
 
-    /// `ProjectDefaultsSettings category="general"`: the Model, Fallback model, Permissions and
-    /// Workspace controls.
-    fn new_thread_controls(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> [AnyElement; 4] {
+    /// `ProjectDefaultsSettings`: the "New threads" section of Threads (`category="general"`, with
+    /// Permissions) and of Projects (`category="project"`). Every row writes through the scope;
+    /// the fallback model is the environment's alone.
+    pub(in crate::app) fn new_threads_section(
+        &mut self,
+        view: &SettingsView,
+        with_permissions: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
-        // The scope's own default when its provider is usable, else what a new thread would get.
-        let selection = serde_json::from_value::<ModelSelection>(view.value("defaultModelSelection").clone())
-            .ok()
-            .filter(|s| self.server_info.provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
-            .or_else(|| self.server_info.new_thread_model(None));
+        let project_scope = view.scope.is_project();
+        let mixed = view.mixed(&["defaultModelSelection"]);
+        let automatic =
+            !view.targets.is_empty() && view.targets.iter().all(|t| t.settings.get("defaultModelSelection").is_null());
         let pick = |key: &'static str| {
             move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
                 this.update_settings(json!({ key: pick.to_json() }), window, cx)
             }
         };
+        let stored: Option<ModelSelection> = serde_json::from_value(view.value("defaultModelSelection").clone()).ok();
+        let selection = stored
+            .filter(|s| self.server_info.provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
+            .or_else(|| self.server_info.automatic_model());
         let model: AnyElement = match &selection {
-            Some(selection) if self.server_info.provider(&selection.instance_id).is_some() => h_flex()
+            Some(selection) => h_flex()
                 .gap(px(6.))
                 .child(self.model_picker(
                     "default-model",
                     Some(selection),
-                    None,
+                    mixed.then_some(if automatic { "Automatic (mixed)" } else { "Mixed" }),
                     |_| true,
                     cx,
                     pick("defaultModelSelection"),
                 ))
-                .children(self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection")))
+                .children(if mixed {
+                    None
+                } else {
+                    self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection"))
+                })
                 .into_any_element(),
-            _ => muted("No providers available", &t).into_any_element(),
+            None => muted(if mixed { "Mixed" } else { "No providers available" }, &t).into_any_element(),
         };
-        let fallback_stored: Option<ModelSelection> =
-            serde_json::from_value(view.value("fallbackModelSelection").clone()).ok();
-        let fallback: AnyElement = match fallback_stored.as_ref().or(selection.as_ref()) {
-            Some(shown) => h_flex()
-                .gap(px(6.))
-                .child(self.model_picker(
-                    "fallback-model",
-                    Some(shown),
-                    fallback_stored.is_none().then_some("None"),
-                    |_| true,
+        let model_status = mixed.then(|| {
+            let differ = if automatic { "Automatic defaults differ." } else { "Defaults differ." };
+            format!("{differ} Select one environment or choose a shared model to edit effort.")
+        });
+        let mut rows = vec![
+            self.setting_row(
+                view,
+                SettingRow::titled("default-model", "Model")
+                    .description(if project_scope {
+                        "Model for new threads in this project."
+                    } else if automatic {
+                        "Default model for new threads, selected automatically. Projects can override it."
+                    } else {
+                        "Default model for new threads. Projects can override it."
+                    })
+                    .status(model_status)
+                    .setting("defaultModelSelection")
+                    .control(model),
+                window,
+                cx,
+            ),
+        ];
+        if !project_scope {
+            let fallback = self.fallback_model_control(view, selection.as_ref(), cx);
+            rows.push(
+                self.setting_row(
+                    view,
+                    SettingRow::new("fallback-model")
+                        .description("Used for new threads when the default model's provider is out of usage.")
+                        .setting("fallbackModelSelection")
+                        .control(fallback),
+                    window,
                     cx,
-                    pick("fallbackModelSelection"),
-                ))
-                .children(fallback_stored.as_ref().and_then(|stored| {
-                    self.traits_picker("fallback-model-traits", stored, cx, pick("fallbackModelSelection"))
-                }))
-                .into_any_element(),
-            None => muted("No providers available", &t).into_any_element(),
-        };
+                ),
+            );
+        }
+        if with_permissions {
+            let permissions = self.permissions_control(view, cx);
+            rows.push(
+                self.setting_row(
+                    view,
+                    SettingRow::new("default-permissions")
+                        .description(if project_scope {
+                            "Permissions for new threads in this project."
+                        } else {
+                            "Default permissions for new threads. Projects can override them."
+                        })
+                        .setting("defaultRuntimeMode")
+                        .control(permissions),
+                    window,
+                    cx,
+                ),
+            );
+        }
+        let mixed_mode = view.mixed(&["defaultThreadEnvMode"]);
         let mode = view.str("defaultThreadEnvMode");
         let mode = if mode.is_empty() { "local" } else { mode };
         let workspace = self.value_select(
             "default-workspace",
             "defaultThreadEnvMode",
-            &json!(mode),
+            &if mixed_mode { serde_json::Value::Null } else { json!(mode) },
             ["local", "worktree"].map(|mode| (json!(mode), env_mode_label(mode).into())).to_vec(),
-            env_mode_label(mode),
+            if mixed_mode { "Mixed" } else { env_mode_label(mode) },
             0.,
             cx,
         );
-        [model, fallback, self.permissions_control(view, cx), workspace]
+        rows.push(
+            self.setting_row(
+                view,
+                SettingRow::titled("new-threads", "Workspace")
+                    .description(if project_scope {
+                        "Where new threads in this project start."
+                    } else {
+                        "Where new threads start. Projects and their t3.json can override it."
+                    })
+                    .setting("defaultThreadEnvMode")
+                    .control(workspace),
+                window,
+                cx,
+            ),
+        );
+        settings_section("new-threads", "New threads", rows, &t)
+    }
+
+    /// The fallback picker: the stored model, else the default shown as "None".
+    fn fallback_model_control(
+        &mut self,
+        view: &SettingsView,
+        default: Option<&ModelSelection>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *tokens(cx);
+        let mixed = view.mixed(&["fallbackModelSelection"]);
+        let pick = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
+            this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx)
+        };
+        let stored: Option<ModelSelection> = serde_json::from_value(view.value("fallbackModelSelection").clone()).ok();
+        let Some(shown) = stored.as_ref().or(default) else {
+            return muted("No providers available", &t).into_any_element();
+        };
+        let label = if mixed { Some("Mixed") } else { stored.is_none().then_some("None") };
+        h_flex()
+            .gap(px(6.))
+            .child(self.model_picker("fallback-model", Some(shown), label, |_| true, cx, pick))
+            .children(
+                stored
+                    .as_ref()
+                    .filter(|_| !mixed)
+                    .and_then(|stored| self.traits_picker("fallback-model-traits", stored, cx, pick)),
+            )
+            .into_any_element()
     }
 
     fn permissions_control(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
+        let mixed = view.mixed(&["defaultRuntimeMode"]);
         let current = view.str("defaultRuntimeMode");
-        let current = if current.is_empty() { DEFAULT_RUNTIME_MODE.to_owned() } else { current.to_owned() };
+        let current = if mixed {
+            String::new()
+        } else if current.is_empty() {
+            DEFAULT_RUNTIME_MODE.to_owned()
+        } else {
+            current.to_owned()
+        };
         let (_, label, _, icon) =
             RUNTIME_MODES.iter().find(|(id, ..)| *id == current).copied().unwrap_or(RUNTIME_MODES[3]);
         let view = cx.entity();
         trigger("default-permissions", &t)
-            .child(Icon::new(icon).with_size(px(14.)).text_color(t.muted_foreground))
-            .child(div().flex_1().child(label))
+            .children((!mixed).then(|| Icon::new(icon).with_size(px(14.)).text_color(t.muted_foreground)))
+            .child(div().flex_1().child(if mixed { "Mixed" } else { label }))
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                 for (mode, label, description, icon) in RUNTIME_MODES {

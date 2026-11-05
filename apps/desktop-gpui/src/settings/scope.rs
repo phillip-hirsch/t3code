@@ -1,8 +1,9 @@
 //! Which environment or project a settings page applies to, where each value comes from,
 //! and the write a change becomes. Ports `settingsScope.ts`, `scopedSettings.ts`,
 //! `SettingInheritance.tsx` and `resolveProjectSettings` (`packages/shared/src/projectSettings.ts`)
-//! for this client's one environment. Projects are not grouped across checkouts here, as in
-//! the sidebar, so the web's checkout axis never applies and a project has one member.
+//! for this client's one environment. A project scope is a project group (checkouts grouped by
+//! repository, as Settings groups them): it reads each checkout and writes them all. The web's
+//! checkout axis is not ported.
 
 use std::collections::HashMap;
 
@@ -37,8 +38,8 @@ pub struct Environment<'a> {
     pub settings: Option<&'a Settings>,
 }
 
-/// A project as the scope layer needs it.
-#[derive(Clone, Debug)]
+/// One checkout of a project group, as the scope layer needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -48,11 +49,19 @@ pub struct Project {
     pub legacy_thread_env_mode: Option<String>,
 }
 
+/// A project group (`SidebarProjectSnapshot`): its key, name and checkouts.
+#[derive(Clone, Debug)]
+pub struct Group {
+    pub key: String,
+    pub name: String,
+    pub members: Vec<Project>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeKind {
     All,
     Environment,
-    Project { project_id: String },
+    Project { members: Vec<Project> },
     Unavailable { message: &'static str },
 }
 
@@ -64,29 +73,26 @@ pub struct Scope {
 }
 
 impl Scope {
-    pub fn project_id(&self) -> Option<&str> {
-        match &self.kind {
-            ScopeKind::Project { project_id } => Some(project_id),
-            _ => None,
-        }
+    pub fn is_project(&self) -> bool {
+        matches!(self.kind, ScopeKind::Project { .. })
     }
 }
 
 /// `resolveSettingsScope`. A stale selection reads as unavailable, never as "all".
-pub fn resolve(search: &ScopeSearch, projects: &[Project], environment: &Environment) -> Scope {
+pub fn resolve(search: &ScopeSearch, groups: &[Group], environment: &Environment) -> Scope {
     let unavailable =
         |message| Scope { kind: ScopeKind::Unavailable { message }, label: "Unavailable selection".into() };
     if search.machine.as_deref().is_some_and(|machine| machine != environment.id) {
         return unavailable("This environment is no longer available.");
     }
-    if let Some(project_id) = &search.project {
-        let Some(project) = projects.iter().find(|p| &p.id == project_id) else {
+    if let Some(key) = &search.project {
+        let Some(group) = groups.iter().find(|g| &g.key == key) else {
             return unavailable("This project is no longer available.");
         };
         let machine = if search.machine.is_some() { environment.label } else { "All checkouts" };
         return Scope {
-            kind: ScopeKind::Project { project_id: project.id.clone() },
-            label: format!("{} / {machine}", project.name),
+            kind: ScopeKind::Project { members: group.members.clone() },
+            label: format!("{} / {machine}", group.name),
         };
     }
     if search.machine.is_some() {
@@ -120,16 +126,15 @@ impl Target {
     }
 }
 
-/// `resolveScopedSettingsTargets`: nothing while disconnected or unavailable.
-pub fn targets(scope: &Scope, projects: &[Project], environment: &Environment) -> Vec<Target> {
+/// `resolveScopedSettingsTargets`: one per checkout at project scope; nothing while
+/// disconnected or unavailable.
+pub fn targets(scope: &Scope, environment: &Environment) -> Vec<Target> {
     let Some(settings) = environment.settings else { return Vec::new() };
     match &scope.kind {
         ScopeKind::Unavailable { .. } => Vec::new(),
-        ScopeKind::Project { project_id } => projects
-            .iter()
-            .filter(|p| &p.id == project_id)
-            .map(|project| resolve_project_settings(settings, Some(project)))
-            .collect(),
+        ScopeKind::Project { members } => {
+            members.iter().map(|project| resolve_project_settings(settings, Some(project))).collect()
+        }
         ScopeKind::All | ScopeKind::Environment => vec![resolve_project_settings(settings, None)],
     }
 }
@@ -247,7 +252,7 @@ pub fn row_inheritance(
     environment: &Environment,
     keys: &[&str],
 ) -> (InheritanceState, String) {
-    let project_scope = scope.project_id().is_some();
+    let project_scope = scope.is_project();
     let has_scoped = keys.iter().any(|k| contract().is_project_scoped(k));
     let source = project_scope.then(|| row_source(targets, keys));
     let customized = environment
@@ -393,23 +398,19 @@ pub struct Plan {
     pub unavailable: Option<String>,
 }
 
-/// Splits a unified patch into the device's keys and a write to the environment or to the
-/// project's overrides.
-pub fn plan_patch(scope: &Scope, projects: &[Project], environment: &Environment, patch: &Map<String, Value>) -> Plan {
+/// Splits a unified patch into the device's keys and a write to the environment or to every
+/// checkout's overrides.
+pub fn plan_patch(scope: &Scope, environment: &Environment, patch: &Map<String, Value>) -> Plan {
     let contract = contract();
     let client_patch: Map<String, Value> =
         patch.iter().filter(|(k, _)| contract.is_client_key(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let server_patch: Map<String, Value> =
         patch.iter().filter(|(k, _)| contract.is_server_key(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let project_id = scope.project_id();
-    let unscopable = project_id.is_some() && server_patch.keys().any(|k| !contract.is_project_scoped(k));
+    let unscopable = scope.is_project() && server_patch.keys().any(|k| !contract.is_project_scoped(k));
     let write = match (environment.settings, server_patch.is_empty()) {
         (_, true) | (None, _) => None,
         (Some(settings), false) => match &scope.kind {
-            ScopeKind::Project { project_id } if !unscopable => projects
-                .iter()
-                .find(|p| &p.id == project_id)
-                .map(|project| override_patch(settings, project, &server_patch)),
+            ScopeKind::Project { members } if !unscopable => Some(override_patch(settings, members, &server_patch)),
             ScopeKind::All | ScopeKind::Environment => Some(for_destination(settings, server_patch)),
             _ => None,
         },
@@ -426,10 +427,13 @@ pub fn plan_patch(scope: &Scope, projects: &[Project], environment: &Environment
     Plan { client_patch, server_patch: write, unavailable }
 }
 
-/// `planScopedSettingsClear`: removes the project's overrides of `keys`.
+/// `planScopedSettingsClear`: removes every checkout's overrides of `keys`.
 pub fn plan_clear(scope: &Scope, environment: &Environment, keys: &[&str]) -> Plan {
-    let write = match (scope.project_id(), environment.settings) {
-        (Some(project_id), Some(settings)) => Some(clear_overrides_patch(settings, &[project_id], keys)),
+    let write = match (&scope.kind, environment.settings) {
+        (ScopeKind::Project { members }, Some(settings)) => {
+            let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+            Some(clear_overrides_patch(settings, &ids, keys))
+        }
         _ => None,
     };
     let unavailable = write
@@ -464,9 +468,15 @@ fn clear_overrides_patch(settings: &Settings, project_ids: &[&str], keys: &[&str
     single("projectSettingsOverrides", Value::Object(entries))
 }
 
+/// Each checkout's override entry with `patch` folded in, in one write (`projectOverrideWrites`).
+fn override_patch(settings: &Settings, members: &[Project], patch: &Map<String, Value>) -> Map<String, Value> {
+    let entries = members.iter().map(|project| (project.id.clone(), override_entry(settings, project, patch)));
+    single("projectSettingsOverrides", Value::Object(entries.collect()))
+}
+
 /// The project's override entry with `patch` folded in. Entries store whole values, so a
 /// partial object patch is completed from the project's effective value.
-fn override_patch(settings: &Settings, project: &Project, patch: &Map<String, Value>) -> Map<String, Value> {
+fn override_entry(settings: &Settings, project: &Project, patch: &Map<String, Value>) -> Value {
     let contract = contract();
     let effective = resolve_project_settings(settings, Some(project)).settings;
     let mut next = settings
@@ -506,7 +516,7 @@ fn override_patch(settings: &Settings, project: &Project, patch: &Map<String, Va
             next.insert(key.clone(), value.clone());
         }
     }
-    single("projectSettingsOverrides", Value::Object(Map::from_iter([(project.id.clone(), Value::Object(next))])))
+    Value::Object(next)
 }
 
 /// Environment writes, in the form the destination reads: the idle compaction mode by the
@@ -543,7 +553,6 @@ fn for_destination(previous: &Settings, mut patch: Map<String, Value>) -> Map<St
     patch
 }
 
-/// `resolveWorktreeCleanup`.
 /// `resolveWorktreeCleanup`: the worktree rules a project's cleanup mode resolves to.
 pub fn worktree_cleanup_rules(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
     const RULES: [&str; 6] = [
@@ -620,6 +629,11 @@ mod tests {
         Project { id: id.into(), name: "Repo".into(), legacy_model_selection: None, legacy_thread_env_mode: None }
     }
 
+    /// A group keyed by its first checkout's id.
+    fn group(ids: &[&str]) -> Group {
+        Group { key: ids[0].into(), name: "Repo".into(), members: ids.iter().map(|id| project(id)).collect() }
+    }
+
     fn env(settings: &Settings) -> Environment<'_> {
         Environment { id: "env-1", label: "Studio", settings: Some(settings) }
     }
@@ -631,7 +645,7 @@ mod tests {
     #[test]
     fn scope_resolves_each_axis_and_stale_ids_never_broaden() {
         let s = Settings::server_defaults();
-        let (e, projects) = (env(&s), [project("p1")]);
+        let (e, projects) = (env(&s), [group(&["p1"])]);
         assert_eq!(resolve(&search(None, None), &projects, &e).kind, ScopeKind::All);
         let environment = resolve(&search(None, Some("env-1")), &projects, &e);
         assert_eq!((environment.kind, environment.label.as_str()), (ScopeKind::Environment, "Studio"));
@@ -698,15 +712,15 @@ mod tests {
     fn row_inheritance_explains_the_winning_tier() {
         let s = settings(json!({"projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "approval-required"}}}));
         let e = env(&s);
-        let projects = [project("p1"), project("p2")];
+        let projects = [group(&["p1"]), group(&["p2"])];
         let state = |search: ScopeSearch, keys: &[&str]| {
             let scope = resolve(&search, &projects, &e);
-            row_inheritance(&scope, &targets(&scope, &projects, &e), &e, keys).0
+            row_inheritance(&scope, &targets(&scope, &e), &e, keys).0
         };
         assert_eq!(state(search(Some("p1"), None), &["defaultRuntimeMode"]), InheritanceState::Overridden);
         let (inherited, summary) = {
             let scope = resolve(&search(Some("p2"), None), &projects, &e);
-            row_inheritance(&scope, &targets(&scope, &projects, &e), &e, &["defaultRuntimeMode"])
+            row_inheritance(&scope, &targets(&scope, &e), &e, &["defaultRuntimeMode"])
         };
         assert_eq!((inherited, summary.as_str()), (InheritanceState::Inherited, "Inherited from Studio"));
         assert_eq!(state(search(None, None), &["defaultRuntimeMode"]), InheritanceState::Default);
@@ -715,7 +729,7 @@ mod tests {
         );
         let e = env(&customized);
         let scope = resolve(&search(None, None), &projects, &e);
-        let t = targets(&scope, &projects, &e);
+        let t = targets(&scope, &e);
         assert_eq!(row_inheritance(&scope, &t, &e, &["enableDeviceSupport"]).0, InheritanceState::Environment);
     }
 
@@ -749,28 +763,26 @@ mod tests {
     fn patches_split_by_owner_and_scope() {
         let s = Settings::server_defaults();
         let e = env(&s);
-        let projects = [project("p1")];
+        let projects = [group(&["p1"])];
         let patch = json!({"confirmThreadDelete": false, "defaultRuntimeMode": "full-access"});
-        let all = plan_patch(&resolve(&search(None, None), &projects, &e), &projects, &e, patch.as_object().unwrap());
+        let all = plan_patch(&resolve(&search(None, None), &projects, &e), &e, patch.as_object().unwrap());
         assert_eq!(all.client_patch, *json!({"confirmThreadDelete": false}).as_object().unwrap());
         assert_eq!(all.server_patch, json!({"defaultRuntimeMode": "full-access"}).as_object().cloned());
 
         let scope = resolve(&search(Some("p1"), None), &projects, &e);
-        let project =
-            plan_patch(&scope, &projects, &e, json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
+        let project = plan_patch(&scope, &e, json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
         assert_eq!(
             project.server_patch,
             json!({"projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "full-access"}}}).as_object().cloned()
         );
-        let wide = plan_patch(&scope, &projects, &e, json!({"enableDeviceSupport": true}).as_object().unwrap());
+        let wide = plan_patch(&scope, &e, json!({"enableDeviceSupport": true}).as_object().unwrap());
         assert_eq!(wide.server_patch, None);
         assert_eq!(
             wide.unavailable.as_deref(),
             Some("This setting is environment-wide and cannot be overridden by a project.")
         );
         let offline = Environment { settings: None, ..env(&s) };
-        let disconnected =
-            plan_patch(&scope, &projects, &offline, json!({"defaultRuntimeMode": "x"}).as_object().unwrap());
+        let disconnected = plan_patch(&scope, &offline, json!({"defaultRuntimeMode": "x"}).as_object().unwrap());
         assert!(disconnected.unavailable.is_some());
     }
 
@@ -781,10 +793,9 @@ mod tests {
             "projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "full-access"}},
         }));
         let e = env(&s);
-        let projects = [project("p1")];
+        let projects = [group(&["p1"])];
         let scope = resolve(&search(Some("p1"), None), &projects, &e);
-        let plan =
-            plan_patch(&scope, &projects, &e, json!({"defaultModelSelection": {"model": "o3"}}).as_object().unwrap());
+        let plan = plan_patch(&scope, &e, json!({"defaultModelSelection": {"model": "o3"}}).as_object().unwrap());
         assert_eq!(
             plan.server_patch.unwrap()["projectSettingsOverrides"]["p1"],
             json!({"defaultRuntimeMode": "full-access", "defaultModelSelection": {"instanceId": "codex", "model": "o3"}})
@@ -799,10 +810,36 @@ mod tests {
         let e = env(&s);
         let scope = resolve(&search(Some("p1"), None), &projects, &e);
         let rule = json!({"worktreeCleanup": {"mode": "custom", "rules": {"worktreeOnMerge": true}}});
-        let plan = plan_patch(&scope, &projects, &e, rule.as_object().unwrap());
+        let plan = plan_patch(&scope, &e, rule.as_object().unwrap());
         let rules = &plan.server_patch.unwrap()["projectSettingsOverrides"]["p1"]["worktreeCleanup"]["rules"];
         assert_eq!((&rules["worktreeOnDelete"], &rules["worktreeAfterDays"]), (&json!(true), &json!(14)));
         assert_eq!(rules["worktreeOnMerge"], true);
+    }
+
+    #[test]
+    fn a_project_group_reads_every_checkout_and_writes_them_all() {
+        let s = settings(json!({
+            "projectSettingsOverrides": {"a": {"defaultRuntimeMode": "auto", "defaultAutoPull": true}},
+        }));
+        let e = env(&s);
+        let groups = [group(&["a", "b"])];
+        let scope = resolve(&search(Some("a"), None), &groups, &e);
+        let t = targets(&scope, &e);
+        assert_eq!(t.iter().map(|t| t.project_id.as_deref()).collect::<Vec<_>>(), [Some("a"), Some("b")]);
+        assert_eq!(row_inheritance(&scope, &t, &e, &["defaultRuntimeMode"]).0, InheritanceState::Mixed);
+        let plan = plan_patch(&scope, &e, json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
+        assert_eq!(
+            plan.server_patch.unwrap()["projectSettingsOverrides"],
+            json!({
+                "a": {"defaultRuntimeMode": "full-access", "defaultAutoPull": true},
+                "b": {"defaultRuntimeMode": "full-access"},
+            })
+        );
+        let clear = plan_clear(&scope, &e, &["defaultRuntimeMode"]);
+        assert_eq!(
+            clear.server_patch.unwrap()["projectSettingsOverrides"],
+            json!({"a": {"defaultAutoPull": true}, "b": null})
+        );
     }
 
     #[test]

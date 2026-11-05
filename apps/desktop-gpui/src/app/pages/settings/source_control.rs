@@ -379,12 +379,17 @@ impl Workspace {
         );
         let discovery = self.discovery_sections(&state, client.is_some(), window, cx);
         let writing = self.writing_rows(&view, window, cx);
+        let project_scope = view.scope.is_project();
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
         let repositories = [
             row(
                 self,
                 SettingRow::new("automatic-pull")
-                    .description("Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.")
+                    .description(if project_scope {
+                        "Keeps this project's default branch current when the checkout has no local changes or commits."
+                    } else {
+                        "Keeps the default branch current when the checkout has no local changes or commits. Projects can override it."
+                    })
                     .setting("defaultAutoPull")
                     .switch(),
             ),
@@ -398,7 +403,11 @@ impl Workspace {
             row(
                 self,
                 SettingRow::new("pull-request-merge-method")
-                    .description("Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.")
+                    .description(if project_scope {
+                        "Pull requests in this project start with this method."
+                    } else {
+                        "Pull requests start with this method. Last selected reuses whatever you chose most recently on this device."
+                    })
                     .setting("pullRequestMergeMethod")
                     .control(merge_method),
             ),

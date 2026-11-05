@@ -30,6 +30,8 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value};
 
+use super::code::projects::groups::ProjectGroup;
+use super::code::projects::icon::project_icon;
 use crate::app::{Workspace, project_name};
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
 use crate::settings::{Settings, contract};
@@ -39,7 +41,8 @@ use crate::theme::{self, Tokens};
 pub(in crate::app) struct SettingsView {
     pub(in crate::app) scope: Scope,
     pub(in crate::app) targets: Vec<Target>,
-    projects: Vec<scope::Project>,
+    /// Settings' project groups, archived ones included (`useSettingsProjectGroups`).
+    pub(in crate::app) groups: Vec<ProjectGroup>,
     environment_id: String,
     environment_label: String,
     /// `None` while disconnected.
@@ -84,8 +87,9 @@ impl SettingsView {
         self.value(key) == contract().default_value(key)
     }
 
-    fn project_name(&self, id: &str) -> Option<&str> {
-        self.projects.iter().find(|p| p.id == id).map(|p| p.name.as_str())
+    /// The group a checkout belongs to.
+    fn group_of(&self, project_id: &str) -> Option<&ProjectGroup> {
+        self.groups.iter().find(|g| g.members.iter().any(|m| m.project.id == project_id))
     }
 }
 
@@ -485,30 +489,36 @@ pub(super) fn device_only(section: &str) -> bool {
 
 impl Workspace {
     pub(in crate::app) fn settings_view(&self) -> SettingsView {
-        let projects: Vec<scope::Project> = self
-            .shell
-            .projects
+        let groups = self.settings_project_groups();
+        let scope_groups: Vec<scope::Group> = groups
             .iter()
-            .filter(|p| p.archived_at.is_none())
-            .map(|p| scope::Project {
-                id: p.id.clone(),
-                name: project_name(p).to_string(),
-                legacy_model_selection: p.default_model_selection.as_ref().map(|m| m.to_json()),
-                legacy_thread_env_mode: p.default_thread_env_mode.clone(),
+            .map(|group| scope::Group {
+                key: group.key.clone(),
+                name: group.display_name.clone(),
+                members: group
+                    .members
+                    .iter()
+                    .map(|m| scope::Project {
+                        id: m.project.id.clone(),
+                        name: project_name(&m.project).to_string(),
+                        legacy_model_selection: m.project.default_model_selection.as_ref().map(|m| m.to_json()),
+                        legacy_thread_env_mode: m.project.default_thread_env_mode.clone(),
+                    })
+                    .collect(),
             })
             .collect();
         let connected = self.client().is_some() && self.server_info.environment_id.is_some();
         let mut view = SettingsView {
             scope: Scope { kind: ScopeKind::All, label: String::new() },
             targets: Vec::new(),
-            projects,
+            groups,
             environment_id: self.server_info.environment_id.clone().unwrap_or_default(),
             environment_label: self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
             environment_settings: connected.then(|| self.server_info.settings.clone()),
             client: self.client_settings.values.clone(),
         };
-        view.scope = scope::resolve(&self.settings_ui.scope, &view.projects, &view.environment());
-        view.targets = scope::targets(&view.scope, &view.projects, &view.environment());
+        view.scope = scope::resolve(&self.settings_ui.scope, &scope_groups, &view.environment());
+        view.targets = scope::targets(&view.scope, &view.environment());
         view
     }
 
@@ -527,7 +537,7 @@ impl Workspace {
     ) {
         let Value::Object(patch) = patch else { return };
         let view = self.settings_view();
-        let plan = scope::plan_patch(&view.scope, &view.projects, &view.environment(), &patch);
+        let plan = scope::plan_patch(&view.scope, &view.environment(), &patch);
         self.run_settings_plan(plan, window, cx, done);
     }
 
@@ -643,6 +653,18 @@ impl Workspace {
         content: impl IntoIterator<Item = AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.settings_page_with_gap(section, view, 32., content, cx)
+    }
+
+    /// [`Self::settings_page`] with its own gap between blocks, like the web's `className="gap-6"`.
+    pub(in crate::app) fn settings_page_with_gap(
+        &mut self,
+        section: &str,
+        view: &SettingsView,
+        gap: f32,
+        content: impl IntoIterator<Item = AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .id("settings-page-scroll")
             .flex_1()
@@ -657,7 +679,7 @@ impl Workspace {
                     .px(px(24.))
                     .pt(px(24.))
                     .pb(px(48.))
-                    .gap(px(32.))
+                    .gap(px(gap))
                     .when(!device_only(section), |el| el.child(self.render_scope_sentence(view, cx)))
                     .children(content),
             )
@@ -675,7 +697,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let keys = row.keys.clone();
         let server_scoped = keys.iter().any(|k| contract().is_server_key(k));
-        let project_scope = view.scope.project_id().is_some();
+        let project_scope = view.scope.is_project();
         let scoped_keys: Vec<&'static str> = keys.iter().copied().filter(|k| contract().is_project_scoped(k)).collect();
         let mixed = !keys.is_empty() && view.mixed(&keys);
         let environment_wide = project_scope && server_scoped && scoped_keys.is_empty();
@@ -753,21 +775,11 @@ impl Workspace {
         disconnected: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if let Some(custom) = &row.reset {
-            let patch = custom.clone().filter(|_| !disconnected)?;
-            return Some(
-                reset_button(&row.id, "Reset to default", cx)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.update_settings(patch.clone(), window, cx);
-                    }))
-                    .into_any_element(),
-            );
-        }
-        if row.keys.is_empty() || disconnected {
+        if disconnected {
             return None;
         }
-        if view.scope.project_id().is_some() && !scoped_keys.is_empty() {
+        // At project scope a scoped row only resets its override, whatever its own reset.
+        if view.scope.is_project() && !scoped_keys.is_empty() {
             let source = scope::row_source(&view.targets, scoped_keys);
             if !matches!(source, scope::RowSource::Project | scope::RowSource::Mixed) {
                 return None;
@@ -782,7 +794,18 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        if !mixed && row.keys.iter().all(|k| view.is_default(k)) {
+        if let Some(custom) = &row.reset {
+            let patch = custom.clone()?;
+            return Some(
+                reset_button(&row.id, "Reset to default", cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.update_settings(patch.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if row.keys.is_empty() || (!mixed && row.keys.iter().all(|k| view.is_default(k))) {
             return None;
         }
         let patch: Map<String, Value> =
@@ -827,7 +850,8 @@ impl Workspace {
                 .map(|target| {
                     let label = match &target.project_id {
                         Some(project) => {
-                            format!("{} · {}", view.environment_label, view.project_name(project).unwrap_or(project))
+                            let name = view.group_of(project).map_or(project.as_str(), |g| g.display_name.as_str());
+                            format!("{} · {name}", view.environment_label)
                         }
                         None => view.environment_label.clone(),
                     };
@@ -835,17 +859,20 @@ impl Workspace {
                 })
                 .collect(),
         );
-        let overriding: Rc<Vec<(String, String, String)>> = Rc::new(
+        // (project id, its group's key and name, value); overrides of ungrouped ids are skipped.
+        let overriding: Rc<Vec<(String, String, String, String)>> = Rc::new(
             overriding
                 .iter()
-                .map(|project| {
+                .filter_map(|project| {
+                    let group = view.group_of(project)?;
                     let value =
                         environment_settings.get("projectSettingsOverrides").get(project).and_then(|o| o.get(key));
-                    (
+                    Some((
                         project.clone(),
-                        view.project_name(project).unwrap_or(project).to_owned(),
+                        group.key.clone(),
+                        group.display_name.clone(),
                         value.map(|v| scope::format_value(key, v)).unwrap_or_default(),
-                    )
+                    ))
                 })
                 .collect(),
         );
@@ -879,11 +906,11 @@ impl Workspace {
                     .tooltip(tooltip),
             )
             .content(move |_, _, _| {
-                let open_project = |id: String| {
+                let open_project = |key: String| {
                     let workspace = workspace.clone();
                     move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
                         workspace.update(cx, |this, cx| {
-                            this.settings_ui.scope = this.settings_ui.scope.with_project(Some(id.clone()));
+                            this.settings_ui.scope = this.settings_ui.scope.with_project(Some(key.clone()));
                             cx.notify();
                         });
                         window.refresh();
@@ -938,7 +965,7 @@ impl Workspace {
                                                 .on_click(clear.clone()),
                                         ),
                                 )
-                                .children(overriding.iter().map(|(id, name, value)| {
+                                .children(overriding.iter().map(|(id, group, name, value)| {
                                     h_flex()
                                         .px(px(8.))
                                         .py(px(4.))
@@ -953,7 +980,7 @@ impl Workspace {
                                                 .cursor_pointer()
                                                 .hover(|s| s.underline())
                                                 .child(name.clone())
-                                                .on_click(open_project(id.clone())),
+                                                .on_click(open_project(group.clone())),
                                         )
                                         .child(
                                             div()
@@ -1169,30 +1196,43 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let search = self.settings_ui.scope.clone();
         let workspace = cx.entity();
-        let project_label = match (&search.project, &view.scope.kind) {
-            (Some(id), _) => view.project_name(id).map_or_else(|| "Unavailable project".to_owned(), str::to_owned),
-            (None, _) => "All projects".to_owned(),
+        let selected = search.project.as_ref().and_then(|key| view.groups.iter().find(|g| &g.key == key));
+        let project_label = match (&search.project, selected) {
+            (_, Some(group)) => group.display_name.clone(),
+            (Some(_), None) => "Unavailable project".to_owned(),
+            (None, None) => "All projects".to_owned(),
         };
         let environment_label = match &search.machine {
             Some(id) if *id == view.environment_id => view.environment_label.clone(),
             Some(_) => "Unavailable environment".to_owned(),
             None => "All environments".to_owned(),
         };
-        // Sorted by name; a name shared by several projects shows where each lives.
-        let mut projects: Vec<(String, String, Option<String>)> = view
-            .projects
-            .iter()
-            .map(|project| {
-                let shared = view.projects.iter().filter(|other| other.name == project.name).count() > 1;
-                let root = shared
-                    .then(|| self.shell.projects.iter().find(|p| p.id == project.id))
-                    .flatten()
-                    .map(|p| format!("{} · {}", view.environment_label, p.workspace_root));
-                (project.id.clone(), project.name.clone(), root)
-            })
-            .collect();
-        projects.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        let projects = Rc::new(projects);
+        // Groups come sorted by name; a name shared by several shows where each lives, and
+        // archived ones say so (`ProjectScopeMenu`).
+        let projects: Rc<Vec<ScopeProject>> = Rc::new(
+            view.groups
+                .iter()
+                .map(|group| {
+                    let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
+                    let representative = group.representative();
+                    let location =
+                        shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
+                    let secondary = match (group.archived, location) {
+                        (true, Some(location)) => Some(format!("Archived · {location}")),
+                        (true, None) => Some("Archived".to_owned()),
+                        (false, location) => location,
+                    };
+                    ScopeProject {
+                        key: group.key.clone(),
+                        name: group.display_name.clone(),
+                        secondary,
+                        icon: representative.project_icon.clone(),
+                        title: representative.title.clone(),
+                        favicon: self.favicon(representative),
+                    }
+                })
+                .collect(),
+        );
         let environment = (view.environment_id.clone(), view.environment_label.clone());
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
@@ -1205,7 +1245,11 @@ impl Workspace {
         };
         let project_menu = {
             let (search, workspace, projects) = (search.clone(), workspace.clone(), projects.clone());
-            scope_trigger("settings-scope-project", project_label, &t).dropdown_menu_with_anchor(
+            let icon = selected.map(|group| {
+                let project = group.representative();
+                project_icon(project.project_icon.as_ref(), &project.title, self.favicon(project), 14., &t)
+            });
+            scope_trigger("settings-scope-project", icon, project_label, &t).dropdown_menu_with_anchor(
                 gpui_kit::Anchor::TopLeft,
                 move |mut menu, _, _| {
                     menu = menu
@@ -1215,26 +1259,28 @@ impl Workspace {
                                 .on_click(pick(workspace.clone(), search.with_project(None))),
                         )
                         .separator();
-                    for (id, name, location) in projects.iter() {
-                        let item = match location.clone() {
-                            None => PopupMenuItem::new(name.clone()),
-                            Some(location) => {
-                                let name = name.clone();
-                                PopupMenuItem::element(move |_, cx| {
-                                    let t = theme::tokens(cx);
-                                    v_flex().min_w_0().child(div().truncate().child(name.clone())).child(
+                    for project in projects.iter() {
+                        let shown = project.clone();
+                        let item = PopupMenuItem::element(move |_, cx| {
+                            let t = theme::tokens(cx);
+                            let ScopeProject { name, secondary, icon, title, favicon, .. } = &shown;
+                            h_flex()
+                                .min_w_0()
+                                .gap(px(8.))
+                                .child(project_icon(icon.as_ref(), title, favicon.clone(), 14., t))
+                                .child(v_flex().min_w_0().child(div().truncate().child(name.clone())).children(
+                                    secondary.clone().map(|secondary| {
                                         div()
                                             .truncate()
                                             .text_size(px(12.))
                                             .text_color(t.muted_foreground)
-                                            .child(location.clone()),
-                                    )
-                                })
-                            }
-                        };
+                                            .child(secondary)
+                                    }),
+                                ))
+                        });
                         menu = menu.item(
-                            item.checked(search.project.as_deref() == Some(id.as_str()))
-                                .on_click(pick(workspace.clone(), search.with_project(Some(id.clone())))),
+                            item.checked(search.project.as_deref() == Some(project.key.as_str()))
+                                .on_click(pick(workspace.clone(), search.with_project(Some(project.key.clone())))),
                         );
                     }
                     menu.max_w(px(320.)).max_h(px(360.)).scrollable(true)
@@ -1243,7 +1289,7 @@ impl Workspace {
         };
         let environment_menu = {
             let (search, workspace) = (search.clone(), workspace.clone());
-            scope_trigger("settings-scope-environment", environment_label, &t).dropdown_menu_with_anchor(
+            scope_trigger("settings-scope-environment", None, environment_label, &t).dropdown_menu_with_anchor(
                 gpui_kit::Anchor::TopLeft,
                 move |menu, _, _| {
                     menu.item(
@@ -1364,8 +1410,19 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
         )
 }
 
+/// A project group as the scope sentence's menu lists it.
+#[derive(Clone)]
+struct ScopeProject {
+    key: String,
+    name: String,
+    secondary: Option<String>,
+    icon: Option<Value>,
+    title: String,
+    favicon: Option<std::sync::Arc<gpui_kit::Image>>,
+}
+
 /// The outline `sm` button the scope sentence's menus open from.
-fn scope_trigger(id: &'static str, label: String, t: &Tokens) -> Button {
+fn scope_trigger(id: &'static str, icon: Option<AnyElement>, label: String, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .max_w(px(288.))
@@ -1380,6 +1437,7 @@ fn scope_trigger(id: &'static str, label: String, t: &Tokens) -> Button {
         .child(
             h_flex()
                 .gap(px(6.))
+                .children(icon)
                 .child(div().min_w_0().truncate().child(label))
                 .child(Icon::new(IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground.opacity(0.7))),
         )

@@ -16,7 +16,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
-        let description = if view.scope.project_id().is_some() {
+        let description = if view.scope.is_project() {
             "Allow agents in this project to use the shared browser. Applies when the agent session next starts."
         } else {
             "Allow agents to use the shared browser. Projects can override it."

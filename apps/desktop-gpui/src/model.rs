@@ -467,6 +467,11 @@ impl ServerInfo {
                 return Some(selection);
             }
         }
+        self.automatic_model()
+    }
+
+    /// The model new threads get when no usable default is set: a ready provider's default.
+    pub fn automatic_model(&self) -> Option<ModelSelection> {
         let provider = self
             .providers
             .iter()

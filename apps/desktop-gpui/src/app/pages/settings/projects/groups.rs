@@ -4,26 +4,25 @@
 //! `planProjectRemoval`). This client talks to one environment, so every member shares it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 
 use crate::model::{ProjectShell, RepositoryIdentity, ThreadShell};
 
-pub(super) const SCRATCH_PROJECT_TITLE: &str = "No project";
+pub(in crate::app) const SCRATCH_PROJECT_TITLE: &str = "No project";
 const SCRATCH_ICON_NAME: &str = "message-square-dashed";
 const SCRATCH_ICON_COLOR: &str = "gray";
 
 /// `SidebarProjectGroupingMode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GroupingMode {
+pub(in crate::app) enum GroupingMode {
     Repository,
     RepositoryPath,
     Separate,
 }
 
 impl GroupingMode {
-    pub(super) const ALL: [Self; 3] = [Self::Repository, Self::RepositoryPath, Self::Separate];
+    pub(in crate::app) const ALL: [Self; 3] = [Self::Repository, Self::RepositoryPath, Self::Separate];
 
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -43,7 +42,7 @@ impl GroupingMode {
     }
 
     /// `PROJECT_GROUPING_MODE_LABELS`.
-    pub(super) fn label(self) -> &'static str {
+    pub(in crate::app) fn label(self) -> &'static str {
         match self {
             Self::Repository => "Group by repository",
             Self::RepositoryPath => "Group by repository path",
@@ -55,7 +54,7 @@ impl GroupingMode {
 /// The client settings that group projects: `sidebarProjectGroupingMode` and
 /// `sidebarProjectGroupingOverrides` (keyed by physical project key).
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct GroupingSettings {
+pub(in crate::app) struct GroupingSettings {
     pub mode: GroupingMode,
     pub overrides: BTreeMap<String, GroupingMode>,
 }
@@ -67,7 +66,7 @@ impl Default for GroupingSettings {
 }
 
 impl GroupingSettings {
-    fn from_json(settings: &Value) -> Self {
+    pub(in crate::app) fn from_json(settings: &Value) -> Self {
         let mode = settings["sidebarProjectGroupingMode"].as_str().and_then(GroupingMode::parse);
         let overrides = settings["sidebarProjectGroupingOverrides"]
             .as_object()
@@ -83,50 +82,22 @@ impl GroupingSettings {
     }
 
     /// `withProjectGroupingOverride`: `None` follows the global default again.
-    pub(super) fn set_override(&mut self, physical_key: &str, mode: Option<GroupingMode>) {
+    pub(in crate::app) fn set_override(&mut self, physical_key: &str, mode: Option<GroupingMode>) {
         match mode {
             Some(mode) => self.overrides.insert(physical_key.to_owned(), mode),
             None => self.overrides.remove(physical_key),
         };
     }
 
-    /// Reads them from the client settings file; a missing or unreadable file means defaults.
-    pub(super) fn load() -> Self {
-        let text = std::fs::read_to_string(client_settings_path()).unwrap_or_default();
-        Self::from_json(&serde_json::from_str(&text).unwrap_or_default())
+    /// The `sidebarProjectGroupingOverrides` value these settings store.
+    pub(in crate::app) fn overrides_json(&self) -> Value {
+        self.overrides.iter().map(|(key, mode)| (key.clone(), Value::from(mode.as_str()))).collect::<Map<_, _>>().into()
     }
-
-    /// Writes them into the client settings file, keeping its other settings.
-    pub(super) fn save(&self) -> std::io::Result<()> {
-        let path = client_settings_path();
-        let mut settings: Map<String, Value> =
-            std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-        settings.insert("sidebarProjectGroupingMode".into(), self.mode.as_str().into());
-        let overrides: Map<String, Value> =
-            self.overrides.iter().map(|(key, mode)| (key.clone(), mode.as_str().into())).collect();
-        settings.insert("sidebarProjectGroupingOverrides".into(), overrides.into());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&settings)?)?;
-        std::fs::rename(temporary, path)
-    }
-}
-
-/// Electron keeps client settings in `<state dir>/client-settings.json`; this client's
-/// state lives in its own T3 home (`backend::Config`), so it never shares Electron's file.
-fn client_settings_path() -> PathBuf {
-    let home = std::env::var_os("T3CODE_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let user = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap_or_default();
-        PathBuf::from(user).join(".t3-gpui")
-    });
-    home.join("userdata").join("client-settings.json")
 }
 
 /// `normalizeProjectPathForComparison`: no trailing separators; Windows paths compare
 /// case-insensitively with backslashes.
-pub(super) fn normalize_path(path: &str) -> String {
+pub(in crate::app) fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
     let mut normalized = trimmed.trim_end_matches(['/', '\\']);
     if normalized.is_empty() && !trimmed.is_empty() {
@@ -139,7 +110,7 @@ pub(super) fn normalize_path(path: &str) -> String {
 }
 
 /// `derivePhysicalProjectKey`.
-pub(super) fn physical_key(environment_id: &str, workspace_root: &str) -> String {
+pub(in crate::app) fn physical_key(environment_id: &str, workspace_root: &str) -> String {
     format!("{environment_id}:{}", normalize_path(workspace_root))
 }
 
@@ -218,7 +189,7 @@ fn fresher(candidate: &ProjectShell, existing: &ProjectShell) -> bool {
 
 /// One checkout of a project group (`SidebarProjectGroupMember`).
 #[derive(Clone, Debug)]
-pub(super) struct Member {
+pub(in crate::app) struct Member {
     pub project: ProjectShell,
     pub physical_key: String,
     pub is_scratch: bool,
@@ -226,7 +197,7 @@ pub(super) struct Member {
 
 /// A project as Settings lists it (`SidebarProjectSnapshot`).
 #[derive(Clone, Debug)]
-pub(super) struct ProjectGroup {
+pub(in crate::app) struct ProjectGroup {
     pub key: String,
     pub display_name: String,
     /// Grouped checkouts in first-seen order; the first is the representative.
@@ -237,13 +208,13 @@ pub(super) struct ProjectGroup {
 }
 
 impl ProjectGroup {
-    pub(super) fn representative(&self) -> &ProjectShell {
+    pub(in crate::app) fn representative(&self) -> &ProjectShell {
         &self.members[0].project
     }
 }
 
 /// `useSettingsProjectGroups`: grouped projects, sorted by name.
-pub(super) fn build_groups(
+pub(in crate::app) fn build_groups(
     projects: &[ProjectShell],
     settings: &GroupingSettings,
     environment_id: &str,
@@ -306,17 +277,17 @@ pub(super) fn build_groups(
 }
 
 /// The group a former selection's checkouts joined after a grouping rule moved them.
-pub(super) fn successor<'a>(groups: &'a [ProjectGroup], member_keys: &[String]) -> Option<&'a ProjectGroup> {
+pub(in crate::app) fn successor<'a>(groups: &'a [ProjectGroup], member_keys: &[String]) -> Option<&'a ProjectGroup> {
     groups.iter().find(|group| group.members.iter().any(|m| member_keys.contains(&m.physical_key)))
 }
 
 /// `projectGroupTitleNeedsUpdate`.
-pub(super) fn title_needs_update(member_titles: &[&str], next: &str, was_edited: bool) -> bool {
+pub(in crate::app) fn title_needs_update(member_titles: &[&str], next: &str, was_edited: bool) -> bool {
     was_edited && member_titles.iter().any(|title| *title != next)
 }
 
 /// `defaultProjectIcon`, as the update fields it writes.
-pub(super) fn default_icon_update(is_scratch: bool) -> Value {
+pub(in crate::app) fn default_icon_update(is_scratch: bool) -> Value {
     let icon = if is_scratch {
         json!({"kind": "lucide", "name": SCRATCH_ICON_NAME, "color": SCRATCH_ICON_COLOR})
     } else {
@@ -326,7 +297,7 @@ pub(super) fn default_icon_update(is_scratch: bool) -> Value {
 }
 
 /// `hasDefaultProjectIcon`.
-pub(super) fn has_default_icon(member: &Member) -> bool {
+pub(in crate::app) fn has_default_icon(member: &Member) -> bool {
     if member.project.favicon_path.is_some() {
         return false;
     }
@@ -341,7 +312,7 @@ pub(super) fn has_default_icon(member: &Member) -> bool {
 }
 
 /// `planProjectRemoval`: whether the whole group goes, and the confirmation to show.
-pub(super) fn plan_removal(
+pub(in crate::app) fn plan_removal(
     members: &[&Member],
     group_member_count: usize,
     has_other_members: bool,
@@ -477,6 +448,7 @@ mod tests {
         assert_eq!(settings.mode, GroupingMode::Separate);
         assert_eq!(settings.overrides.len(), 1);
         assert_eq!(GroupingSettings::from_json(&Value::Null), GroupingSettings::default());
+        assert_eq!(settings.overrides_json(), json!({"env:/a": "repository"}));
     }
 
     #[test]
