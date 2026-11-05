@@ -92,7 +92,7 @@ fn load_icon(url: &str) -> IconFuture {
         .entry(url.to_owned())
         .or_insert_with(|| {
             let url = url.to_owned();
-            let path: SharedString = format!("remote/acp/{:016x}.svg", fxhash(&url)).into();
+            let path: SharedString = format!("remote/acp/{:016x}.svg", fnv1a(&url)).into();
             let fetch = crate::runtime().spawn(fetch_icon(url));
             async move {
                 let bytes = fetch.await.ok().flatten()?;
@@ -134,7 +134,8 @@ async fn fetch_icon(url: String) -> Option<Arc<[u8]>> {
     Some(body.into())
 }
 
-fn fxhash(text: &str) -> u64 {
+/// FNV-1a: the asset paths depend on it, so it must not change.
+fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 

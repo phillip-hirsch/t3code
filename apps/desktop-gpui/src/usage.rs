@@ -1483,7 +1483,7 @@ pub fn external_links(
     for provider in providers.iter().filter(|p| reports_limits(p) && !hidden_drivers.contains(&p.driver.as_str())) {
         let Some(limits) = &provider.usage_limits else { continue };
         let Some(external) = &limits.external_usage else { continue };
-        if Some(&provider.auth).map(|a| a.status.as_str()) != Some("authenticated") {
+        if provider.auth.status != "authenticated" {
             continue;
         }
         let account = format!("{} on {environment}", provider.display_name.as_deref().unwrap_or(&provider.instance_id));

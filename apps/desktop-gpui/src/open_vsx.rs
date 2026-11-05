@@ -361,12 +361,14 @@ impl<'a> Zip<'a> {
         if start + size != end {
             return Err(invalid());
         }
-        let (mut entries, mut total, mut offset) = (HashMap::new(), 0u64, start);
+        let (mut entries, mut total, mut offset, mut count) = (HashMap::new(), 0u64, start, 0);
         while offset < end {
             if offset + 46 > end || u32_at(offset) != Some(0x02014b50) {
                 return Err(invalid());
             }
-            if entries.len() >= MAX_ZIP_ENTRIES {
+            // Directory records, not distinct names: duplicates must not slip past the cap.
+            count += 1;
+            if count > MAX_ZIP_ENTRIES {
                 return Err("That extension package has too many files.".into());
             }
             let (compressed, uncompressed) =
@@ -414,6 +416,9 @@ impl<'a> Zip<'a> {
         }
         let unreadable = || format!("{description} could not be read.");
         let header = entry.local_offset;
+        if self.bytes.get(header..header + 4) != Some(&0x04034b50u32.to_le_bytes()[..]) {
+            return Err(unreadable());
+        }
         let field =
             |at: usize| self.bytes.get(header + at..header + at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
         let data = header + 30 + field(26).ok_or_else(unreadable)? + field(28).ok_or_else(unreadable)?;

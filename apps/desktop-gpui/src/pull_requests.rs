@@ -4,7 +4,7 @@
 //! `pullRequestListGroups.logic.ts`, `packages/client-runtime/src/pullRequestQuery.ts`).
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -801,8 +801,9 @@ pub fn label_color(color: Option<&str>) -> Option<u32> {
 /// Appends a continuation's rows the list does not hold yet, newest first and ranked by the
 /// search, after the rows already shown (a continuation never reorders what was read).
 pub fn append_page(held: &mut ListResult, mut next: ListResult, query: &str) {
+    let held_keys: HashSet<String> = held.entries.iter().map(|entry| entry.key()).collect();
     let mut arrived: Vec<Rc<Entry>> =
-        next.entries.drain(..).filter(|entry| !held.entries.iter().any(|h| h.key() == entry.key())).collect();
+        next.entries.drain(..).filter(|entry| !held_keys.contains(&entry.key())).collect();
     arrived.sort_by(|l, r| by_recency(l, r));
     rank_matches(&mut arrived, query);
     held.entries.extend(arrived);
