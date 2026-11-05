@@ -349,7 +349,8 @@ impl Workspace {
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &App, t: &Tokens) -> AnyElement {
         let s = state.read(cx);
         let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
-        let snapshot = s.access.clone().unwrap_or_default();
+        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
+        let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =
             snapshot.sorted_links().into_iter().filter(|l| logic::ms(&l.expires_at) > now).collect();
@@ -395,7 +396,7 @@ impl Workspace {
                     .child("This connection can create access links but cannot view authorized clients.")
                     .into_any_element(),
             );
-        } else {
+        } else if open {
             if let Some(error) = s.mutation_error.clone().or(s.access_error.clone()) {
                 body.push(
                     ui::item_row(text_xs(div().text_color(t.error_foreground)).child(error), None).into_any_element(),

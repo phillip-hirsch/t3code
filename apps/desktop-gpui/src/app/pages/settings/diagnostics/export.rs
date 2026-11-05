@@ -128,7 +128,7 @@ impl Workspace {
             return self.export_scope_notice(view, &t, cx);
         }
         let client = self.settings_client().expect("checked above");
-        let saved_values = &self.settings_info().settings.get("observability").clone();
+        let saved_values = self.settings_info().settings.get("observability");
         let saved: [String; 3] =
             SIGNALS.map(|(key, ..)| saved_values[key].as_str().unwrap_or_default().trim().to_owned());
         let running = self.settings_info().config.get("observability").cloned().unwrap_or_default();

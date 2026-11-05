@@ -1674,10 +1674,10 @@ impl Workspace {
         let usable: Vec<&crate::model::Provider> =
             providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
         let stored_text: Option<ModelSelection> =
-            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
         let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
         let writer: Option<ModelSelection> =
-            serde_json::from_value(view.value("sourceControlWriterModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
         let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
         let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
         let can_dedicate =
@@ -1685,7 +1685,7 @@ impl Workspace {
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
             let guide: Option<ModelSelection> =
-                serde_json::from_value(view.value("reviewGuideModelSelection").clone()).ok();
+                serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
             let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
             let guide_selection = guide_usable.cloned().or_else(|| active.clone());
             self.dedicated_model_control(

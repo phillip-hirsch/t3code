@@ -68,7 +68,8 @@ impl Workspace {
         let s = state.read(cx);
         // Provider settings and secret providers need the same grant.
         let read_only = !s.session.grants(PROVIDERS_MANAGE);
-        let providers = self.server_settings()["secretProviders"].as_object().cloned().unwrap_or_default();
+        let empty = serde_json::Map::new();
+        let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
         let ids: Vec<String> = providers.keys().cloned().collect();
         let client = self.settings_client();
         let add = (!read_only).then(|| {

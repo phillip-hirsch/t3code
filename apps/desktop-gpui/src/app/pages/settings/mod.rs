@@ -283,6 +283,13 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Agent browser access", &["enableAgentBrowserAccess"]),
 ];
 
+/// One HTTP client for the settings pages, so requests share its connection pool. Use it
+/// only on `crate::runtime()`, where its connections live.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(reqwest::Client::new);
+    &CLIENT
+}
+
 /// `formatRelativeTimeLabel` for a past time: "just now", "5m ago", "3h ago", "2d ago".
 fn ago_label(elapsed_ms: i64) -> String {
     match crate::inbox::format_relative(elapsed_ms) {

@@ -361,7 +361,7 @@ async fn fetch(client: &RpcClient, endpoint: Endpoint, resource: Value) -> anyho
         .then_some(endpoint.bearer_token);
     let response = crate::runtime()
         .spawn(async move {
-            let mut request = reqwest::Client::new().get(url);
+            let mut request = crate::app::pages::settings::http().get(url);
             if let Some(token) = token {
                 request = request.bearer_auth(token);
             }

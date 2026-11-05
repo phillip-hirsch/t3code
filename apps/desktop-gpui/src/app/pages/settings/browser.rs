@@ -155,7 +155,7 @@ impl Workspace {
     fn browser_viewport_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let viewport: Viewport =
-            serde_json::from_value(view.value("browserDefaultViewport").clone()).unwrap_or_default();
+            serde::Deserialize::deserialize(view.value("browserDefaultViewport")).unwrap_or_default();
         let choice = viewport.choice().to_owned();
         let label = match choice.as_str() {
             "fill" => "Fill panel",
@@ -200,7 +200,7 @@ impl Workspace {
                 let range = (preview::VIEWPORT_MIN_DIMENSION, preview::VIEWPORT_MAX_DIMENSION, 1);
                 let input = this.number_field(key, value as i64, range, window, cx, move |this, value, window, cx| {
                     let current: Viewport =
-                        serde_json::from_value(this.client_settings.values.get("browserDefaultViewport").clone())
+                        serde::Deserialize::deserialize(this.client_settings.values.get("browserDefaultViewport"))
                             .unwrap_or_default();
                     if let Some(next) = current.with_dimension(width_axis, value) {
                         this.update_settings(json!({"browserDefaultViewport": next.to_json()}), window, cx);

@@ -4,6 +4,7 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::{Context, Keystroke, Task, Window};
+use serde::Deserialize as _;
 use serde_json::{Map, Value, json};
 
 use crate::app::Workspace;
@@ -176,7 +177,7 @@ pub(super) fn next_project_script_id<'a>(name: &str, existing: impl IntoIterator
 }
 
 fn scripts_at(value: Option<&Value>) -> Option<Vec<ProjectScript>> {
-    serde_json::from_value(value?.clone()).ok()
+    Vec::<ProjectScript>::deserialize(value?).ok()
 }
 
 fn override_entry<'a>(settings: &'a Value, project_id: &str) -> Option<&'a Map<String, Value>> {

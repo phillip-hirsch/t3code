@@ -128,7 +128,7 @@ pub(super) async fn auth_request(
 ) -> Result<Value, String> {
     let endpoint = endpoint.ok_or("Not connected to the environment.")?;
     let request = async move {
-        let client = reqwest::Client::new();
+        let client = crate::app::pages::settings::http();
         let url = format!("{}{path}", endpoint.http_base);
         let request = match &body {
             Some(body) => client.post(url).json(body),

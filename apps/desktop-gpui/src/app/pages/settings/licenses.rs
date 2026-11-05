@@ -261,13 +261,15 @@ async fn fetch_manifest(endpoint: Option<crate::backend::Endpoint>) -> Result<Ve
     let request = async move {
         let url = format!("{}/third-party-licenses.json", endpoint.http_base.trim_end_matches('/'));
         let response =
-            reqwest::Client::new().get(url).timeout(Duration::from_secs(30)).send().await.map_err(|error| {
-                if error.is_timeout() {
-                    "The license manifest took too long to load.".to_owned()
-                } else {
-                    error.to_string()
-                }
-            })?;
+            crate::app::pages::settings::http().get(url).timeout(Duration::from_secs(30)).send().await.map_err(
+                |error| {
+                    if error.is_timeout() {
+                        "The license manifest took too long to load.".to_owned()
+                    } else {
+                        error.to_string()
+                    }
+                },
+            )?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("The license manifest request failed with status {}.", status.as_u16()));

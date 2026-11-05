@@ -272,14 +272,14 @@ impl AccessSnapshot {
     /// Newest first (`sortDesktopPairingLinks`).
     pub fn sorted_links(&self) -> Vec<&PairingLink> {
         let mut links: Vec<_> = self.pairing_links.iter().collect();
-        links.sort_by_key(|l| std::cmp::Reverse(ms(&l.created_at)));
+        links.sort_by_cached_key(|l| std::cmp::Reverse(ms(&l.created_at)));
         links
     }
 
     /// This device, then connected ones, then newest (`sortDesktopClientSessions`).
     pub fn sorted_sessions(&self) -> Vec<&ClientSession> {
         let mut sessions: Vec<_> = self.client_sessions.iter().collect();
-        sessions.sort_by_key(|s| (!s.current, !s.connected, std::cmp::Reverse(ms(&s.issued_at))));
+        sessions.sort_by_cached_key(|s| (!s.current, !s.connected, std::cmp::Reverse(ms(&s.issued_at))));
         sessions
     }
 

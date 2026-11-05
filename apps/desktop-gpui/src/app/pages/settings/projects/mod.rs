@@ -352,6 +352,16 @@ impl Workspace {
     }
 
     /// `removeMembers`: confirm, then delete each checkout entry with its threads.
+    /// Removes one checkout of the group with this key, or all of them, looked up at the click
+    /// so rows don't hold copies of their group.
+    fn remove_group_members(&mut self, key: &str, checkout: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let view = self.settings_view();
+        let Some(group) = view.groups.iter().find(|group| group.key == key) else { return };
+        let members: Vec<Member> =
+            group.members.iter().filter(|m| checkout.is_none_or(|c| m.physical_key == c)).cloned().collect();
+        self.remove_project_members(group, members, window, cx);
+    }
+
     fn remove_project_members(
         &mut self,
         group: &ProjectGroup,
@@ -747,13 +757,13 @@ impl Workspace {
                         })
                 };
             let remove = several.then(|| {
-                let (group, member) = (group.clone(), member.clone());
-                Button::new(ElementId::Name(format!("remove-checkout-{}", member.physical_key).into()))
+                let (key, checkout) = (group.key.clone(), member.physical_key.clone());
+                Button::new(ElementId::Name(format!("remove-checkout-{checkout}").into()))
                     .outline()
                     .small()
                     .label("Remove")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.remove_project_members(&group, vec![member.clone()], window, cx)
+                        this.remove_group_members(&key, Some(&checkout), window, cx)
                     }))
             });
             rows.push(
@@ -786,17 +796,14 @@ impl Workspace {
             )
         };
         let remove = {
-            let group = group.clone();
+            let key = group.key.clone();
             Button::new("remove-project")
                 .danger()
                 .outline()
                 .small()
                 .icon(Icon::new(IconName::Trash).size(px(16.)))
                 .label(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let members = group.members.clone();
-                    this.remove_project_members(&group, members, window, cx)
-                }))
+                .on_click(cx.listener(move |this, _, window, cx| this.remove_group_members(&key, None, window, cx)))
         };
         settings_section(
             "danger",

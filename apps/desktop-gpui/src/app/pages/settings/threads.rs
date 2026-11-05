@@ -176,7 +176,7 @@ impl Workspace {
                 this.update_settings(json!({ key: pick.to_json() }), window, cx)
             }
         };
-        let stored: Option<ModelSelection> = serde_json::from_value(view.value("defaultModelSelection").clone()).ok();
+        let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("defaultModelSelection")).ok();
         let selection = stored
             .filter(|s| self.settings_info().provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
             .or_else(|| self.settings_info().automatic_model());
@@ -295,7 +295,7 @@ impl Workspace {
         let pick = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx)
         };
-        let stored: Option<ModelSelection> = serde_json::from_value(view.value("fallbackModelSelection").clone()).ok();
+        let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("fallbackModelSelection")).ok();
         let Some(shown) = stored.as_ref().or(default) else {
             return muted("No providers available", &t).into_any_element();
         };
@@ -433,7 +433,7 @@ impl Workspace {
     ) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let stored: Option<ModelSelection> =
-            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
         let selection = resolve_text_generation(stored.as_ref(), &self.settings_info().providers);
         let connected = self.settings_client().is_some();
         let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {

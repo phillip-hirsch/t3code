@@ -227,7 +227,7 @@ impl WebhookFields {
         };
         self._link_state = Some(cx.spawn(async move |this, cx| {
             let request = async move {
-                let response = reqwest::Client::new()
+                let response = crate::app::pages::settings::http()
                     .get(format!("{}/api/connect/link-state", endpoint.http_base))
                     .bearer_auth(&endpoint.bearer_token)
                     .send()
