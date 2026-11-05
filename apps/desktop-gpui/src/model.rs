@@ -173,6 +173,12 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The raw `ServerSettings` JSON, for settings rows that read keys directly.
+    pub settings: Value,
+    /// `ResolvedKeybindingsConfig` as sent by the server.
+    pub keybindings: Value,
+    /// `environment.capabilities.projectSettingsOverrides`; older servers keep scripts in `projectScriptOverrides`.
+    pub project_settings_overrides_capability: bool,
 }
 
 impl ServerInfo {
@@ -188,7 +194,12 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.keybindings = config["keybindings"].clone();
+                self.project_settings_overrides_capability =
+                    config.pointer("/environment/capabilities/projectSettingsOverrides").and_then(Value::as_bool)
+                        == Some(true);
             }
+            "keybindingsUpdated" => self.keybindings = event["payload"]["keybindings"].clone(),
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
             _ => {}
@@ -205,6 +216,7 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.settings = settings.clone();
         Ok(())
     }
 
@@ -294,6 +306,84 @@ pub struct ProjectShell {
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,
+    /// Legacy project-record scripts; settings overrides win (`resolveProjectScripts`).
+    #[serde(default, deserialize_with = "lossy")]
+    pub scripts: Vec<ProjectScript>,
+}
+
+/// `ProjectScript` (`packages/contracts/src/project.ts`).
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectScript {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub icon: String,
+    pub run_on_worktree_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on_settle: Option<bool>,
+    #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+    pub run_async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_open_preview: Option<bool>,
+}
+
+/// The icons a project script may use (`ProjectScriptIcon`).
+pub const PROJECT_SCRIPT_ICONS: [&str; 6] = ["play", "test", "lint", "configure", "build", "debug"];
+
+/// What a checkout's `t3.json` declares (`useT3ProjectFileState` in `apps/web/src/hooks`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum T3ProjectFile {
+    Loading,
+    Missing,
+    /// Present but fails to decode, so everything it declares is ignored.
+    Invalid,
+    Valid(Vec<T3ProjectFileScript>),
+}
+
+/// `T3ProjectFileScript` (`packages/contracts/src/t3ProjectFile.ts`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct T3ProjectFileScript {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub run_on_worktree_create: Option<bool>,
+    #[serde(default)]
+    pub run_on_settle: Option<bool>,
+    #[serde(default, rename = "async")]
+    pub run_async: Option<bool>,
+    #[serde(default)]
+    pub preview_url: Option<String>,
+    #[serde(default)]
+    pub auto_open_preview: Option<bool>,
+}
+
+impl T3ProjectFile {
+    /// `parseT3ProjectFile`: one bad script invalidates the whole file, like the schema decode.
+    pub fn parse(contents: &str) -> Self {
+        let Ok(Value::Object(file)) = serde_json::from_str::<Value>(contents) else { return Self::Invalid };
+        let Some(scripts) = file.get("scripts") else { return Self::Valid(Vec::new()) };
+        let Ok(scripts) = Vec::<T3ProjectFileScript>::deserialize(scripts) else { return Self::Invalid };
+        let valid = scripts.iter().all(|script| {
+            !script.name.trim().is_empty()
+                && !script.command.trim().is_empty()
+                && script.icon.as_deref().is_none_or(|icon| PROJECT_SCRIPT_ICONS.contains(&icon))
+                && script.preview_url.as_deref().is_none_or(|url| !url.trim().is_empty())
+        });
+        if valid { Self::Valid(scripts) } else { Self::Invalid }
+    }
+
+    pub fn scripts(&self) -> &[T3ProjectFileScript] {
+        match self {
+            Self::Valid(scripts) => scripts,
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

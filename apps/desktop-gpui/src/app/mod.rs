@@ -117,6 +117,8 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
+    t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +181,7 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            t3_project_files: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
