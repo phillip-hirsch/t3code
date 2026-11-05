@@ -3,8 +3,8 @@
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
 //! with the native dialog, then `projects.mutate`).
 //!
-//! Actions this client has no surface for (file picker, content search,
-//! themes, guest sharing, PR linking, triage, scratch threads, clone) are left out.
+//! Actions this client has no surface for yet (file picker, content search, guest sharing,
+//! PR linking, new project, clone, WSL folders, the theme editor, workspace focus) are left out.
 
 use std::path::PathBuf;
 use std::time::Duration;
