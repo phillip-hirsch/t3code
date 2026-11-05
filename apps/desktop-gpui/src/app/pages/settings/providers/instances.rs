@@ -1307,7 +1307,7 @@ impl Workspace {
                                         None,
                                         window,
                                         cx,
-                                        |_, result, window, cx| match result {
+                                        |_, _, result, window, cx| match result {
                                             Ok(reply) if reply["accepted"] == false => window.push_notification(
                                                 Notification::warning(
                                                     "Refresh the provider and start the authentication flow again.",
@@ -1791,18 +1791,19 @@ impl Workspace {
                             failure,
                             window,
                             cx,
-                            move |this, reply, window, cx| {
-                                let _ = this
-                                    .settings_info_mut()
-                                    .apply(&json!({"type": "settingsUpdated", "payload": {"settings": reply}}));
+                            move |this, environment, reply, window, cx| {
+                                let event = json!({"type": "settingsUpdated", "payload": {"settings": reply}});
+                                this.apply_environment_event(&environment, &event);
                                 let Some(agent_id) = uninstall_agent else { return };
-                                this.providers_request_then(
+                                // The binary lives on the environment the instance was removed from.
+                                this.providers_request_on(
+                                    environment,
                                     "server.uninstallAcpRegistryManagedBinary",
                                     json!({ "agentId": agent_id }),
                                     None,
                                     window,
                                     cx,
-                                    |_, result, window, cx| {
+                                    |_, _, result, window, cx| {
                                         if let Err(error) = result {
                                             window.push_notification(
                                                 Notification::warning(error)

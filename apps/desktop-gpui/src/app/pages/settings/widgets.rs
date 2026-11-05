@@ -601,13 +601,16 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.settings_client() else { return done(self, false, cx) };
+        let target = self.settings_environment().and_then(|id| Some((self.env_client(&id)?, id)));
+        let Some((client, environment)) = target else { return done(self, false, cx) };
         cx.spawn(async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
             let _ = this.update(cx, |this, cx| {
                 match &result {
+                    // The environment that saved it, even if Settings has moved to another.
                     Ok(saved) => {
-                        if let Err(error) = this.settings_info_mut().apply_settings(saved) {
+                        if let Some(Err(error)) = this.env_info_mut(&environment).map(|info| info.apply_settings(saved))
+                        {
                             log::warn!("bad saved settings: {error}");
                         }
                     }

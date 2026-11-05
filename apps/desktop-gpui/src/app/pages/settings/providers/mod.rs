@@ -338,9 +338,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.providers_request("server.updateSettings", payload, failure, window, cx, |this, reply, _, _| {
-            let _ = this.settings_info_mut().apply(&json!({"type": "settingsUpdated", "payload": {"settings": reply}}));
-        });
+        self.providers_request(
+            "server.updateSettings",
+            payload,
+            failure,
+            window,
+            cx,
+            |this, environment, reply, _, _| {
+                this.apply_environment_event(
+                    &environment,
+                    &json!({"type": "settingsUpdated", "payload": {"settings": reply}}),
+                );
+            },
+        );
     }
 
     /// Upserts one provider instance (`persistInstance`). Turning off the instance that writes
@@ -389,9 +399,9 @@ impl Workspace {
             None,
             window,
             cx,
-            move |this, result, _, cx| {
+            move |this, environment, result, _, cx| {
                 if let Ok(reply) = result {
-                    let _ = this.settings_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
+                    this.apply_environment_event(&environment, &json!({"type": "providerStatuses", "payload": reply}));
                 }
                 page.update(cx, |page, cx| {
                     page.refreshing = false;
@@ -426,10 +436,13 @@ impl Workspace {
             None,
             window,
             cx,
-            move |this, result, window, cx| {
+            move |this, environment, result, window, cx| {
                 match result {
                     Ok(reply) => {
-                        let _ = this.settings_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
+                        this.apply_environment_event(
+                            &environment,
+                            &json!({"type": "providerStatuses", "payload": reply}),
+                        );
                     }
                     Err(error) => window.push_notification(
                         Notification::error(error).title(SharedString::from(format!("Could not update {label}"))),
@@ -489,15 +502,24 @@ impl Workspace {
         failure: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
-        on_success: impl FnOnce(&mut Self, Value, &mut Window, &mut Context<Self>) + 'static,
+        on_success: impl FnOnce(&mut Self, SharedString, Value, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        self.providers_request_then(method, payload, Some(failure), window, cx, move |this, result, window, cx| {
-            if let Ok(reply) = result {
-                on_success(this, reply, window, cx);
-            }
-        });
+        self.providers_request_then(
+            method,
+            payload,
+            Some(failure),
+            window,
+            cx,
+            move |this, environment, result, window, cx| {
+                if let Ok(reply) = result {
+                    on_success(this, environment, reply, window, cx);
+                }
+            },
+        );
     }
 
+    /// A request to the settings environment; `done` gets that environment, so a reply lands
+    /// there even when Settings has moved on.
     fn providers_request_then(
         &mut self,
         method: &'static str,
@@ -505,20 +527,43 @@ impl Workspace {
         failure: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        done: impl FnOnce(&mut Self, Result<Value, String>, &mut Window, &mut Context<Self>) + 'static,
+        done: impl FnOnce(&mut Self, SharedString, Result<Value, String>, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.settings_client() else { return };
+        let Some(environment) = self.settings_environment() else { return };
+        self.providers_request_on(environment, method, payload, failure, window, cx, done);
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "providers_request_then with its environment")]
+    fn providers_request_on(
+        &mut self,
+        environment: SharedString,
+        method: &'static str,
+        payload: Value,
+        failure: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, SharedString, Result<Value, String>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(client) = self.env_client(&environment) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await.map_err(|error| error.to_string());
             let _ = this.update_in(cx, |this, window, cx| {
                 if let (Err(error), Some(title)) = (&result, failure) {
                     window.push_notification(Notification::error(error.clone()).title(title), cx);
                 }
-                done(this, result, window, cx);
+                done(this, environment, result, window, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Applies a server event to the environment a request went to, if it is still here.
+    fn apply_environment_event(&mut self, environment: &str, event: &Value) {
+        let Some(info) = self.env_info_mut(environment) else { return };
+        if let Err(error) = info.apply(event) {
+            log::warn!("settings reply did not decode: {error}");
+        }
     }
 
     /// A text field that commits like the web's `DraftInput`: on blur or Enter, when it differs from

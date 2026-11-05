@@ -505,7 +505,8 @@ impl Workspace {
         keybinding: Option<Option<&str>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let Some(client) = self.settings_client() else { return Task::ready(Err("Not connected.".into())) };
+        let target = self.settings_environment().and_then(|id| Some((self.env_client(&id)?, id)));
+        let Some((client, environment)) = target else { return Task::ready(Err("Not connected.".into())) };
         let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
         let next = next(&self.settings_info().settings, project);
         let write = match plan_scripts_write(
@@ -526,7 +527,7 @@ impl Workspace {
                 .map_err(|e| e.message())?;
             let _ = this.update(cx, |this, cx| {
                 let event = json!({"type": "settingsUpdated", "payload": {"settings": settings}});
-                if let Err(error) = this.settings_info_mut().apply(&event) {
+                if let Some(Err(error)) = this.env_info_mut(&environment).map(|info| info.apply(&event)) {
                     log::warn!("saved settings did not decode: {error}");
                 }
                 cx.notify();
@@ -537,7 +538,7 @@ impl Workspace {
                 let Some(keybindings) = result.get("keybindings").filter(|rules| rules.is_array()) else { continue };
                 let _ = this.update(cx, |this, cx| {
                     let event = json!({"type": "keybindingsUpdated", "payload": {"keybindings": keybindings}});
-                    if let Err(error) = this.settings_info_mut().apply(&event) {
+                    if let Some(Err(error)) = this.env_info_mut(&environment).map(|info| info.apply(&event)) {
                         log::warn!("saved keybindings did not decode: {error}");
                     }
                     cx.notify();

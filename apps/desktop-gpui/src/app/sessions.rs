@@ -468,11 +468,6 @@ impl Workspace {
         &self.sessions[self.settings_index()].server_info
     }
 
-    pub(super) fn settings_info_mut(&mut self) -> &mut ServerInfo {
-        let index = self.settings_index();
-        &mut self.sessions[index].server_info
-    }
-
     pub(super) fn settings_endpoint(&self) -> Option<&Endpoint> {
         self.sessions[self.settings_index()].endpoint.as_ref()
     }
