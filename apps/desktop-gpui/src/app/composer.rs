@@ -12,7 +12,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString,
@@ -391,14 +391,17 @@ impl Workspace {
         true
     }
 
-    /// 1-9 pick an option on an open question card while the editor is not focused.
+    /// 1-9 pick an option on an open question card while no text field, terminal or preview has focus.
     fn question_option_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let m = keystroke.modifiers;
         if m.control || m.platform || m.alt || self.page.is_some() || self.settings.is_some() {
             return false;
         }
         let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
-        if self.composer.focus_handle(cx).is_focused(window) {
+        // The web skips keys aimed at any text field; here that is any focus but the workspace's own
+        // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
+        let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
+        if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
         let Some(draft) = &self.question else { return false };
