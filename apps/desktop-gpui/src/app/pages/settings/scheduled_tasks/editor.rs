@@ -24,9 +24,10 @@ use super::logic::{
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
 use super::worktree_mode::{self, NewWorktreeMode};
-use super::{ScheduledTasksView, chevron, error_message, notify_error, select_trigger};
+use super::{ScheduledTasksView, error_message, notify_error};
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
+use crate::app::pages::settings::widgets::select_trigger;
 use crate::model::{ModelSelection, ProjectShell};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
@@ -441,11 +442,14 @@ impl Render for TaskEditor {
         let draft = &self.draft;
 
         // Runs on: the one environment this client is connected to.
-        let runs_on = select_trigger("scheduled-task-environment", &t)
-            .disabled(self.task.is_some() || disabled)
+        let environment = h_flex()
+            .min_w_0()
+            .gap(px(8.))
             .child(svg().path(machine).size(px(16.)).flex_none().text_color(t.foreground))
-            .child(div().flex_1().min_w_0().truncate().child(env_label.clone()))
-            .child(chevron(&t))
+            .child(div().min_w_0().truncate().child(env_label.clone()));
+        let runs_on = select_trigger(&"scheduled-task-environment".into(), environment, 0., &t)
+            .w_full()
+            .disabled(self.task.is_some() || disabled)
             .dropdown_menu(move |menu, _, _| menu.item(PopupMenuItem::new(env_label.clone()).checked(true)));
 
         let duplicate_titles =
@@ -455,17 +459,14 @@ impl Render for TaskEditor {
             .map(|p| (p.id.clone(), p.title.clone(), duplicate_titles(p).then(|| p.workspace_root.clone())))
             .collect();
         let selected_project_id = project.as_ref().map(|p| p.id.clone()).unwrap_or_default();
-        let project_select = select_trigger("scheduled-task-project", &t)
+        let project_label = div()
+            .min_w_0()
+            .truncate()
+            .when(project.is_none(), |this| this.text_color(t.muted_foreground))
+            .child(project.as_ref().map_or_else(|| "Select a project".to_owned(), |p| p.title.clone()));
+        let project_select = select_trigger(&"scheduled-task-project".into(), project_label, 0., &t)
+            .w_full()
             .disabled(disabled)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .when(project.is_none(), |this| this.text_color(t.muted_foreground))
-                    .child(project.as_ref().map_or_else(|| "Select a project".to_owned(), |p| p.title.clone())),
-            )
-            .child(chevron(&t))
             .dropdown_menu({
                 let editor = editor.clone();
                 move |mut menu, window, _| {
@@ -488,10 +489,10 @@ impl Render for TaskEditor {
             });
 
         let workspace_mode = draft.workspace_mode;
-        let workspace_select = select_trigger("scheduled-task-workspace", &t)
+        let workspace_label = div().min_w_0().truncate().child(workspace_mode.label());
+        let workspace_select = select_trigger(&"scheduled-task-workspace".into(), workspace_label, 0., &t)
+            .w_full()
             .disabled(disabled)
-            .child(div().flex_1().min_w_0().truncate().child(workspace_mode.label()))
-            .child(chevron(&t))
             .dropdown_menu({
                 let editor = editor.clone();
                 move |mut menu, window, _| {

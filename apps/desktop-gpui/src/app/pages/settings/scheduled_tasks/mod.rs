@@ -334,25 +334,6 @@ fn notify_error(window: &mut Window, cx: &mut App, title: &str, description: imp
     window.push_notification(Notification::error(description).title(title.to_owned()), cx);
 }
 
-/// A bordered select trigger (`SelectTrigger size="sm"`); callers add the label and a menu.
-fn select_trigger(id: impl Into<SharedString>, t: &Tokens) -> Button {
-    Button::new(id.into())
-        .outline()
-        .small()
-        .w_full()
-        .h(px(32.))
-        .px(px(9.))
-        .gap(px(8.))
-        .justify_start()
-        .text_sm()
-        .font_weight(FontWeight::NORMAL)
-        .text_color(t.foreground)
-}
-
-fn chevron(t: &Tokens) -> Icon {
-    Icon::new(Lucide::ChevronDown).with_size(px(16.)).text_color(t.muted_foreground.opacity(0.7))
-}
-
 /// `Badge` (default size) in the status colors `statusVariant` picks.
 fn badge(status: &str, t: &Tokens) -> impl IntoElement {
     let tinted = |color: Hsla| (color, color.opacity(if t.dark { 0.16 } else { 0.08 }), gpui_kit::transparent_black());
