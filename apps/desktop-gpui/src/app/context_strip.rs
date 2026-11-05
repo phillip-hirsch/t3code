@@ -6,10 +6,11 @@
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
     IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -21,6 +22,45 @@ use super::composer::runtime_modes;
 use super::{Target, Workspace};
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
 use crate::theme::Tokens;
+
+/// `formatFilePathForClipboard`: Windows paths copy with backslashes.
+fn clipboard_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let windows = path.starts_with("\\\\")
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|c| matches!(c, b'/' | b'\\')));
+    if windows { path.replace('/', "\\") } else { path.to_owned() }
+}
+
+fn with_copy_menu(
+    el: gpui_kit::Stateful<gpui_kit::Div>,
+    text: Option<String>,
+    label: &'static str,
+    toast: &'static str,
+) -> AnyElement {
+    match text {
+        Some(text) => el.context_menu(copy_menu(label, toast, text)).into_any_element(),
+        None => el.into_any_element(),
+    }
+}
+
+/// A one-item context menu that copies `text` and confirms it in a toast
+/// (`showWorkspaceContextMenu`, `handleBranchContextMenu`).
+fn copy_menu(
+    label: &'static str,
+    toast: &'static str,
+    text: String,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        let text = text.clone();
+        menu.item(PopupMenuItem::new(label).icon(Icon::new(Lucide::Copy)).on_click(move |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+            window.push_notification(Notification::success(text.clone()).title(toast), cx);
+        }))
+    }
+}
 
 /// `runtimeModeConfig.ts` descriptions, in `runtime_modes()` order.
 const MODE_DESCRIPTIONS: [&str; 4] = [
@@ -435,7 +475,10 @@ impl Workspace {
             .text_color(t.muted_foreground.opacity(0.7))
             .child(Icon::new(icon).with_size(px(12.)).flex_none())
             .child(div().max_w(px(240.)).truncate().child(label))
-            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx));
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+            .map(|el| {
+                with_copy_menu(el, self.composer_cwd().map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
+            });
         Some(
             h_flex()
                 .w_full()
@@ -493,7 +536,8 @@ impl Workspace {
         };
         let previous = self.previous_worktree();
         let view = cx.entity();
-        strip_button("env-mode", t)
+        let path = self.composer_cwd();
+        let button = strip_button("env-mode", t)
             .child(Icon::new(icon).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label))
             .tooltip(format!("{label} · Ctrl+Shift+X"))
@@ -537,8 +581,9 @@ impl Workspace {
                     );
                 }
                 menu
-            })
-            .into_any_element()
+            });
+        let wrap = div().id("env-mode-wrap").min_w_0().child(button);
+        with_copy_menu(wrap, path.map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
     }
 
     fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
@@ -598,7 +643,8 @@ impl Workspace {
         if state.branch_open {
             popover = popover.child(self.render_branch_popover(branch, worktree_base, t, cx));
         }
-        div().min_w_0().child(popover).into_any_element()
+        let wrap = div().id("branch-selector-wrap").min_w_0().child(popover);
+        with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied")
     }
 
     fn render_branch_popover(
@@ -633,6 +679,7 @@ impl Workspace {
             };
             let checked = selected == Some(name.as_str());
             let pick = name.clone();
+            let copy = name.clone();
             h_flex()
                 .id(ElementId::Name(format!("ref-{name}").into()))
                 .h(px(28.))
@@ -655,6 +702,7 @@ impl Workspace {
                         .child(badge)
                 }))
                 .on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
         });
         let start_from_origin = self.draft_start_from_origin();
         v_flex()
@@ -863,4 +911,17 @@ fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
         .when(on, |el| el.justify_end().bg(t.primary))
         .when(!on, |el| el.bg(t.input))
         .child(div().size(px(8.)).rounded_full().bg(if on { t.primary_foreground } else { t.muted_foreground }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clipboard_path;
+
+    #[test]
+    fn windows_paths_copy_with_backslashes() {
+        assert_eq!(clipboard_path("C:/Users/me/repo"), r"C:\Users\me\repo");
+        assert_eq!(clipboard_path(r"\\server\share/a"), r"\\server\share\a");
+        assert_eq!(clipboard_path("C:"), "C:");
+        assert_eq!(clipboard_path("/home/me/repo"), "/home/me/repo");
+    }
 }
