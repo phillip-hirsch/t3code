@@ -42,8 +42,10 @@ pub(super) struct WebhookContext {
 }
 
 impl WebhookContext {
-    pub(super) fn new(client: RpcClient, workspace: &Entity<Workspace>, cx: &App) -> Self {
-        Self { client, endpoint: workspace.read(cx).endpoint().cloned(), workspace: workspace.downgrade() }
+    /// `environment` is the one the task lives on, whose address the webhook URL uses.
+    pub(super) fn new(client: RpcClient, environment: &str, workspace: &Entity<Workspace>, cx: &App) -> Self {
+        let endpoint = workspace.read(cx).env_endpoint(environment).cloned();
+        Self { client, endpoint, workspace: workspace.downgrade() }
     }
 }
 

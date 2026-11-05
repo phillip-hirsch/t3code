@@ -36,12 +36,13 @@ use crate::theme::{self, Tokens};
 pub(super) fn open(
     workspace: WeakEntity<Workspace>,
     list: WeakEntity<ScheduledTasksView>,
+    environment: SharedString,
     client: RpcClient,
     task: Option<ScheduledTask>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let editor = cx.new(|cx| TaskEditor::new(workspace, list, client, task, window, cx));
+    let editor = cx.new(|cx| TaskEditor::new(workspace, list, environment, client, task, window, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         // The form keeps the dialog open while a save is in flight, as `onOpenChange` does.
         let saving = editor.read(cx).saving;
@@ -52,6 +53,8 @@ pub(super) fn open(
 pub(super) struct TaskEditor {
     workspace: WeakEntity<Workspace>,
     list: WeakEntity<ScheduledTasksView>,
+    /// The environment the task is saved on: its config, projects and models.
+    environment: SharedString,
     pub(super) client: RpcClient,
     task: Option<ScheduledTask>,
     pub(super) draft: DraftState,
@@ -75,6 +78,7 @@ impl TaskEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
         list: WeakEntity<ScheduledTasksView>,
+        environment: SharedString,
         client: RpcClient,
         task: Option<ScheduledTask>,
         window: &mut Window,
@@ -83,7 +87,12 @@ impl TaskEditor {
         let draft = match &task {
             Some(task) => logic::task_to_draft(task, &Local),
             None => {
-                let projects = workspace.upgrade().map(|w| w.read(cx).shell.projects.clone()).unwrap_or_default();
+                let projects: Vec<ProjectShell> = workspace
+                    .upgrade()
+                    .map(|w| {
+                        w.read(cx).shell.projects.iter().filter(|p| p.environment_id == environment).cloned().collect()
+                    })
+                    .unwrap_or_default();
                 DraftState { project_id: logic::default_project_id(&projects), ..DraftState::default() }
             }
         };
@@ -114,7 +123,7 @@ impl TaskEditor {
         });
         let task_json = task.as_ref().map(ScheduledTask::to_json);
         let context = match workspace.upgrade() {
-            Some(workspace) => WebhookContext::new(client.clone(), &workspace, cx),
+            Some(workspace) => WebhookContext::new(client.clone(), &environment, &workspace, cx),
             None => unreachable!("the editor opens from a live workspace"),
         };
         let webhook = cx.new(|cx| WebhookFields::new(context, task_json.clone(), window, cx));
@@ -162,6 +171,7 @@ impl TaskEditor {
         Self {
             workspace,
             list,
+            environment,
             client,
             task,
             draft,
@@ -224,9 +234,10 @@ impl TaskEditor {
     fn projects(&self, cx: &App) -> Vec<ProjectShell> {
         let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
         let keep = |p: &&ProjectShell| {
-            p.archived_at.is_none()
-                || p.id == self.draft.project_id
-                || self.task.as_ref().is_some_and(|task| task.project_id == p.id)
+            p.environment_id == self.environment
+                && (p.archived_at.is_none()
+                    || p.id == self.draft.project_id
+                    || self.task.as_ref().is_some_and(|task| task.project_id == p.id))
         };
         let mut projects: Vec<_> = workspace.read(cx).shell.projects.iter().filter(keep).cloned().collect();
         projects.sort_by_key(|p| p.pinned_at.is_none());
@@ -244,14 +255,14 @@ impl TaskEditor {
     /// The picked model while its provider is usable, else the default (`activeSelection`).
     fn active_selection(&self, project: Option<&ProjectShell>, cx: &App) -> Option<ModelSelection> {
         let workspace = self.workspace.upgrade()?;
-        let info = &workspace.read(cx).settings_info();
+        let info = workspace.read(cx).env_info(&self.environment)?;
         logic::split_model_key(&self.draft.model_key)
             .filter(|s| info.providers.iter().any(|p| p.instance_id == s.instance_id && p.enabled))
             .or_else(|| logic::default_model(info, project))
     }
 
     fn connected(&self, cx: &App) -> bool {
-        self.workspace.upgrade().is_some_and(|w| w.read(cx).client().is_some())
+        self.workspace.upgrade().is_some_and(|w| w.read(cx).env_client(&self.environment).is_some())
     }
 
     fn set_schedule_mode(&mut self, mode: ScheduleMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,7 +340,7 @@ impl TaskEditor {
             return fail(DraftError::new("Invalid interval", "Enter an interval of at least one minute."), window, cx);
         }
         let (offers_once, policy) = {
-            let info = &workspace.read(cx).settings_info();
+            let Some(info) = workspace.read(cx).env_info(&self.environment) else { return };
             (self.offers_once(info.capability("oneTimeSchedules")), info.managed_policy.clone())
         };
         if schedule["type"] == "once" && !offers_once {
@@ -422,7 +433,7 @@ impl Render for TaskEditor {
         let selection = self.active_selection(project, cx);
         let (offers_once, denial, env_label, machine, destination) = {
             let workspace = workspace.read(cx);
-            let info = &workspace.settings_info();
+            let Some(info) = workspace.env_info(&self.environment) else { return div().into_any_element() };
             let destination = (!self.draft.thread_id.is_empty()).then(|| {
                 workspace
                     .shell
@@ -514,7 +525,9 @@ impl Render for TaskEditor {
         let model = workspace.update(cx, |workspace, cx| {
             let id = SharedString::from("scheduled-task-model");
             let editor = editor.clone();
-            let disabled = disabled || !connected || workspace.settings_info().model_choices().is_empty();
+            let disabled = disabled
+                || !connected
+                || workspace.env_info(&self.environment).is_none_or(|info| info.model_choices().is_empty());
             let trigger = workspace.model_picker_trigger(id.clone(), selection.as_ref(), None, cx).disabled(disabled);
             let on_pick: OnPick = Rc::new(move |_, picked, _, cx| {
                 editor.update(cx, |this, cx| {

@@ -412,12 +412,13 @@ impl Workspace {
             }
             return None;
         }
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let id = instance_id.to_owned();
+        let key = format!("provider-account-{}-{instance_id}", scope.as_deref().unwrap_or_default());
         Some(
             window
-                .use_keyed_state(SharedString::from(format!("provider-account-{instance_id}")), cx, move |_, _| {
-                    AccountSection::new(workspace, id, None)
+                .use_keyed_state(SharedString::from(key), cx, move |_, _| {
+                    AccountSection::new(workspace, scope, id, None)
                 })
                 .into_any_element(),
         )
@@ -430,11 +431,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let id = instance_id.to_owned();
+        let key = format!("codex-runtime-{}-{instance_id}", scope.as_deref().unwrap_or_default());
         window
-            .use_keyed_state(SharedString::from(format!("codex-runtime-{instance_id}")), cx, move |_, _| {
-                RuntimeFields { workspace, instance_id: id, install: Live::default() }
+            .use_keyed_state(SharedString::from(key), cx, move |_, _| RuntimeFields {
+                workspace,
+                scope,
+                instance_id: id,
+                install: Live::default(),
             })
             .into_any_element()
     }
@@ -447,8 +452,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workspace = cx.weak_entity();
-        let dialog = cx.new(|cx| AddCodexAccount::new(workspace, on_created, window, cx));
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
+        let dialog = cx.new(|cx| AddCodexAccount::new(workspace, scope, on_created, window, cx));
         window.open_dialog(cx, move |modal, window, cx| {
             let modal = modal.entrance(DialogEntrance::None);
             dialog.update(cx, |this, cx| this.render_dialog(modal, window, cx))
@@ -639,6 +644,8 @@ struct WizardSetup {
 
 pub(in crate::app) struct AccountSection {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment the section was made for; it reads and acts only there.
+    scope: Option<SharedString>,
     instance_id: String,
     wizard: Option<WizardSetup>,
     auth: Live<AuthState>,
@@ -679,9 +686,15 @@ struct Snapshot {
 }
 
 impl AccountSection {
-    fn new(workspace: WeakEntity<Workspace>, instance_id: String, wizard: Option<WizardSetup>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
+        instance_id: String,
+        wizard: Option<WizardSetup>,
+    ) -> Self {
         Self {
             workspace,
+            scope,
             instance_id,
             wizard,
             auth: Live::default(),
@@ -713,21 +726,18 @@ impl AccountSection {
     fn snapshot(&self, cx: &App) -> Option<Snapshot> {
         let workspace = self.workspace.upgrade()?;
         let workspace = workspace.read(cx);
-        let provider = workspace.settings_info().provider(&self.instance_id)?.clone();
+        let scope = self.scope.as_ref()?;
+        let info = workspace.env_info(scope)?;
         Some(Snapshot {
-            instance: workspace.settings_info().settings["providerInstances"][self.instance_id.as_str()].clone(),
-            environment: workspace
-                .settings_info()
-                .environment_label
-                .clone()
-                .unwrap_or_else(|| "this environment".into()),
-            client: workspace.client(),
-            provider,
+            instance: info.settings["providerInstances"][self.instance_id.as_str()].clone(),
+            environment: info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
+            client: workspace.env_client(scope),
+            provider: info.provider(&self.instance_id)?.clone(),
         })
     }
 
     fn client(&self, cx: &App) -> Option<RpcClient> {
-        self.workspace.upgrade()?.read(cx).client()
+        self.workspace.upgrade()?.read(cx).env_client(self.scope.as_ref()?)
     }
 
     fn input(&self) -> Value {
@@ -1921,6 +1931,7 @@ impl AccountSection {
 
 pub(in crate::app) struct RuntimeFields {
     workspace: WeakEntity<Workspace>,
+    scope: Option<SharedString>,
     instance_id: String,
     install: Live<InstallState>,
 }
@@ -1931,10 +1942,14 @@ impl Render for RuntimeFields {
         let (client, paths) = self
             .workspace
             .upgrade()
-            .map(|workspace| {
+            .zip(self.scope.as_ref())
+            .map(|(workspace, scope)| {
                 let workspace = workspace.read(cx);
-                let paths = workspace.settings_info().provider(&self.instance_id).map(|p| p.runtime_paths.clone());
-                (workspace.client(), paths)
+                let paths = workspace
+                    .env_info(scope)
+                    .and_then(|i| i.provider(&self.instance_id))
+                    .map(|p| p.runtime_paths.clone());
+                (workspace.env_client(scope), paths)
             })
             .unwrap_or_default();
         let instance_id = self.instance_id.clone();
@@ -1995,6 +2010,8 @@ impl Render for RuntimeFields {
 
 struct AddCodexAccount {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment at open: the account is made there.
+    scope: Option<SharedString>,
     name: Entity<InputState>,
     pending: bool,
     created: Option<(String, Entity<AccountSection>)>,
@@ -2005,6 +2022,7 @@ struct AddCodexAccount {
 impl AddCodexAccount {
     fn new(
         workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
         on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2016,7 +2034,7 @@ impl AddCodexAccount {
             InputEvent::Change => cx.notify(),
             _ => {}
         });
-        Self { workspace, name, pending: false, created: None, on_created, _subscriptions: vec![subscription] }
+        Self { workspace, scope, name, pending: false, created: None, on_created, _subscriptions: vec![subscription] }
     }
 
     fn display_name(&self, cx: &App) -> String {
@@ -2028,9 +2046,11 @@ impl AddCodexAccount {
         if self.pending || self.name.read(cx).value().trim().is_empty() || self.created.is_some() {
             return;
         }
+        let Some(scope) = self.scope.as_ref() else { return };
         let (client, mut instances) = {
             let workspace = workspace.read(cx);
-            (workspace.client(), workspace.settings_info().settings["providerInstances"].clone())
+            let instances = workspace.env_info(scope).map(|i| i.settings["providerInstances"].clone());
+            (workspace.env_client(scope), instances.unwrap_or_default())
         };
         let Some(client) = client else { return };
         let id = format!("codex_{}", uuid::Uuid::new_v4());
@@ -2060,11 +2080,10 @@ impl AddCodexAccount {
                         None => {
                             let close: Rc<dyn Fn(&mut Window, &mut App)> =
                                 Rc::new(|window, cx| window.close_dialog(cx));
-                            let workspace = this.workspace.clone();
+                            let (workspace, scope) = (this.workspace.clone(), this.scope.clone());
                             let section_id = id.clone();
-                            let section = cx.new(|_| {
-                                AccountSection::new(workspace, section_id, Some(WizardSetup { on_cancelled: close }))
-                            });
+                            let wizard = Some(WizardSetup { on_cancelled: close });
+                            let section = cx.new(|_| AccountSection::new(workspace, scope, section_id, wizard));
                             this.created = Some((id, section));
                         }
                     },
@@ -2090,8 +2109,12 @@ impl AddCodexAccount {
         cx: &mut Context<Self>,
     ) -> gpui_kit::component::dialog::Dialog {
         let t = *theme::tokens(cx);
-        let providers =
-            self.workspace.upgrade().map(|w| w.read(cx).settings_info().providers.clone()).unwrap_or_default();
+        let providers = self
+            .workspace
+            .upgrade()
+            .zip(self.scope.as_ref())
+            .and_then(|(w, scope)| Some(w.read(cx).env_info(scope)?.providers.clone()))
+            .unwrap_or_default();
         let created = self.created.clone();
         let provider = created.as_ref().and_then(|(id, _)| providers.iter().find(|p| p.instance_id == *id));
         // Closes itself once the new account connects.

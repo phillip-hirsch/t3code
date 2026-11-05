@@ -24,6 +24,7 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::super::scoped_client;
 use super::add::{is_configured_acp_agent, settings_row};
 use super::drivers::DRIVERS;
 use crate::app::Workspace;
@@ -167,6 +168,8 @@ pub(super) enum AcpSearchEvent {
 
 pub(super) struct AcpRegistrySearch {
     workspace: WeakEntity<Workspace>,
+    /// The environment the agent is added on.
+    scope: Option<SharedString>,
     query: Entity<InputState>,
     /// The query the shown (or loading) results are for.
     submitted: Option<String>,
@@ -186,7 +189,12 @@ pub(super) struct AcpRegistrySearch {
 impl EventEmitter<AcpSearchEvent> for AcpRegistrySearch {}
 
 impl AcpRegistrySearch {
-    pub(super) fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search agents…"));
         let subscription = cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => {
@@ -205,6 +213,7 @@ impl AcpRegistrySearch {
         });
         let mut search = Self {
             workspace,
+            scope,
             query,
             submitted: None,
             results: None,
@@ -233,7 +242,7 @@ impl AcpRegistrySearch {
         if !refresh && self.submitted.as_deref() == Some(query.as_str()) {
             return;
         }
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = scoped_client(&self.workspace, self.scope.as_ref(), cx) else { return };
         let input = if query.is_empty() { json!({"query": "", "limit": MAX_AGENTS}) } else { json!({"query": query}) };
         self.submitted = Some(query);
         self.pending = true;
@@ -278,7 +287,7 @@ impl AcpRegistrySearch {
 
     /// `prepare`: installs or checks the agent's distribution, then hands the agent to the dialog.
     fn prepare(&mut self, agent: RegistryAgent, cx: &mut Context<Self>) {
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = scoped_client(&self.workspace, self.scope.as_ref(), cx) else { return };
         self.prepare_error = None;
         self.preparing = Some(agent.id.clone());
         cx.notify();
@@ -380,8 +389,12 @@ impl Render for AcpRegistrySearch {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *tokens(cx);
         let preparing = self.preparing.is_some();
-        let instances =
-            self.workspace.upgrade().map(|w| w.read(cx).settings_info().provider_instances.clone()).unwrap_or_default();
+        let instances = self
+            .workspace
+            .upgrade()
+            .zip(self.scope.as_ref())
+            .and_then(|(w, scope)| Some(w.read(cx).env_info(scope)?.provider_instances.clone()))
+            .unwrap_or_default();
         let search_bar = h_flex()
             .flex_wrap()
             .gap(px(8.))
@@ -534,6 +547,8 @@ fn parse_provider_headers(text: &str) -> Result<Option<Map<String, Value>>, Stri
 
 pub(super) struct AcpSessions {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment the instance lives on.
+    scope: Option<SharedString>,
     instance_id: String,
     read_only: bool,
     project_id: Option<String>,
@@ -551,9 +566,15 @@ pub(super) struct AcpSessions {
 }
 
 impl AcpSessions {
-    fn new(workspace: WeakEntity<Workspace>, instance_id: String, read_only: bool) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
+        instance_id: String,
+        read_only: bool,
+    ) -> Self {
         Self {
             workspace,
+            scope,
             instance_id,
             read_only,
             project_id: None,
@@ -597,7 +618,7 @@ impl AcpSessions {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, Result<Value, RpcError>, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = scoped_client(&self.workspace, self.scope.as_ref(), cx) else { return };
         self._tasks.push(cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1234,11 +1255,20 @@ impl AcpSessions {
 
 impl Render for AcpSessions {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
+        let Some((workspace, scope)) = self.workspace.upgrade().zip(self.scope.clone()) else {
+            return div().into_any_element();
+        };
         let (provider, projects) = {
             let workspace = workspace.read(cx);
-            let provider = workspace.settings_info().provider(&self.instance_id).cloned();
-            let projects: Vec<_> = workspace.shell.projects.iter().map(|p| (p.id.clone(), p.title.clone())).collect();
+            let provider = workspace.env_info(&scope).and_then(|info| info.provider(&self.instance_id).cloned());
+            // Sessions import into a project on the agent's own environment.
+            let projects: Vec<_> = workspace
+                .shell
+                .projects
+                .iter()
+                .filter(|p| p.environment_id == scope)
+                .map(|p| (p.id.clone(), p.title.clone()))
+                .collect();
             (provider, projects)
         };
         if self.project_id.is_none() {
@@ -1272,10 +1302,11 @@ impl Workspace {
         if !shows {
             return None;
         }
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let owned_id = instance_id.to_owned();
-        let view = window.use_keyed_state(SharedString::from(format!("acp-sessions-{instance_id}")), cx, |_, _| {
-            AcpSessions::new(workspace, owned_id, read_only)
+        let key = format!("acp-sessions-{}-{instance_id}", scope.as_deref().unwrap_or_default());
+        let view = window.use_keyed_state(SharedString::from(key), cx, |_, _| {
+            AcpSessions::new(workspace, scope, owned_id, read_only)
         });
         view.update(cx, |view, cx| {
             if view.read_only != read_only {

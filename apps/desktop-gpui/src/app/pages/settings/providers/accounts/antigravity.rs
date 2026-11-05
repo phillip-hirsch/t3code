@@ -51,11 +51,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let id = instance_id.to_owned();
+        let key = format!("antigravity-setup-{}-{instance_id}", scope.as_deref().unwrap_or_default());
         window
-            .use_keyed_state(SharedString::from(format!("antigravity-setup-{instance_id}")), cx, move |_, _| {
-                AccountSection { antigravity: true, ..AccountSection::new(workspace, id, None) }
+            .use_keyed_state(SharedString::from(key), cx, move |_, _| AccountSection {
+                antigravity: true,
+                ..AccountSection::new(workspace, scope, id, None)
             })
             .into_any_element()
     }
@@ -106,10 +108,12 @@ impl AccountSection {
 
     pub(super) fn render_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
+        let Some((workspace, scope)) = self.workspace.upgrade().zip(self.scope.clone()) else {
+            return div().into_any_element();
+        };
         let (instance, provider, environment, client) = {
             let workspace = workspace.read(cx);
-            let info = &workspace.settings_info();
+            let Some(info) = workspace.env_info(&scope) else { return div().into_any_element() };
             (
                 info.settings
                     .get("providerInstances")
@@ -118,7 +122,7 @@ impl AccountSection {
                     .unwrap_or_else(|| json!({ "driver": "antigravity" })),
                 info.provider(&self.instance_id).cloned(),
                 info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
-                workspace.client(),
+                workspace.env_client(&scope),
             )
         };
         let enabled = crate::settings::scope::instance_enabled(&instance);

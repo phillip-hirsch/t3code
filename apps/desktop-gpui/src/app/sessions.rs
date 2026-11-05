@@ -190,9 +190,14 @@ impl Workspace {
         self.env_client(&self.project_environment(project_id)?)
     }
 
-    /// The address of the environment a listed project lives on, for its HTTP routes.
+    /// One environment's address, for its HTTP routes.
+    pub(super) fn env_endpoint(&self, environment_id: &str) -> Option<&Endpoint> {
+        self.session(environment_id)?.endpoint.as_ref()
+    }
+
+    /// The address of the environment a listed project lives on.
     pub(super) fn project_endpoint(&self, project_id: &str) -> Option<&Endpoint> {
-        self.session(&self.project_environment(project_id)?)?.endpoint.as_ref()
+        self.env_endpoint(&self.project_environment(project_id)?)
     }
 
     /// The socket for an orchestration command: its thread's environment, else its project's.
@@ -474,5 +479,16 @@ impl Workspace {
 
     pub(super) fn settings_client(&self) -> Option<RpcClient> {
         self.sessions[self.settings_index()].client.clone()
+    }
+
+    /// The environment Settings reads, for a dialog or request to keep after the scope moves
+    /// (with `env_client` and `env_info`).
+    pub(super) fn settings_environment(&self) -> Option<SharedString> {
+        self.sessions[self.settings_index()].id.clone()
+    }
+
+    /// One environment's config, while it has a session.
+    pub(super) fn env_info(&self, environment_id: &str) -> Option<&ServerInfo> {
+        Some(&self.session(environment_id)?.server_info)
     }
 }

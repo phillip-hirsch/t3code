@@ -83,6 +83,8 @@ pub(super) struct ScheduledTasksView {
     /// `scheduledTasks.subscribe`, only while the section is on screen and connected.
     stream: Option<Task<()>>,
     subscribed: bool,
+    /// The settings environment and socket the list follows; its tasks act there.
+    following: Option<(SharedString, RpcClient)>,
     /// Repaints relative times once a minute (`useNowMinute`).
     _minute: Option<Task<()>>,
     /// Tasks with a toggle, run or delete in flight.
@@ -95,7 +97,7 @@ impl ScheduledTasksView {
         // Unsubscribe when Settings leaves this section or the socket drops.
         let observe = cx.observe(&workspace, |this, workspace, cx| {
             let workspace = workspace.read(cx);
-            let shown = workspace.settings.as_deref() == Some(SECTION) && workspace.client().is_some();
+            let shown = workspace.settings.as_deref() == Some(SECTION) && workspace.settings_client().is_some();
             if !shown && (this.subscribed || this.stream.is_some()) {
                 this.stop();
             }
@@ -105,6 +107,7 @@ impl ScheduledTasksView {
             tasks: Load::Loading,
             stream: None,
             subscribed: false,
+            following: None,
             _minute: None,
             busy: HashSet::new(),
             _observe: observe,
@@ -115,11 +118,13 @@ impl ScheduledTasksView {
         self.stream = None;
         self._minute = None;
         self.subscribed = false;
+        self.following = None;
         self.tasks = Load::Loading;
     }
 
-    fn subscribe(&mut self, client: RpcClient, cx: &mut Context<Self>) {
+    fn subscribe(&mut self, environment: SharedString, client: RpcClient, cx: &mut Context<Self>) {
         self.subscribed = true;
+        self.following = Some((environment, client.clone()));
         let stream = client.stream("scheduledTasks.subscribe", json!({}));
         self.stream = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {
@@ -158,7 +163,7 @@ impl ScheduledTasksView {
     }
 
     fn act(&mut self, task: &ScheduledTask, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some((_, client)) = self.following.clone() else { return };
         if !self.busy.insert(task.id.clone()) {
             return;
         }
@@ -183,9 +188,9 @@ impl ScheduledTasksView {
     }
 
     fn open_editor(&mut self, task: Option<ScheduledTask>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else { return };
-        let Some(client) = workspace.read(cx).client() else { return };
-        editor::open(workspace.downgrade(), cx.entity().downgrade(), client, task, window, cx);
+        let Some((environment, client)) = self.following.clone() else { return };
+        let list = cx.entity().downgrade();
+        editor::open(self.workspace.clone(), list, environment, client, task, window, cx);
     }
 
     /// The loaded list, for the editor's "task no longer exists" check and live webhook state.
@@ -224,10 +229,11 @@ impl ScheduledTasksView {
         let view = cx.entity();
         let menu_task = Rc::clone(task);
         let client = client.clone();
-        let context = if webhook {
-            self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx))
-        } else {
-            None
+        let context = match (&self.following, webhook) {
+            (Some((environment, _)), true) => {
+                self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), environment, &w, cx))
+            }
+            _ => None,
         };
         let menu = Button::new(SharedString::from(format!("scheduled-task-actions-{id}")))
             .ghost()
@@ -296,17 +302,26 @@ impl Render for ScheduledTasksView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
-        let (client, label) = {
+        let (target, label) = {
             let workspace = workspace.read(cx);
             let label =
                 workspace.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
-            (workspace.client(), label)
+            let target = workspace.settings_environment().and_then(|id| Some((workspace.env_client(&id)?, id)));
+            (target, label)
         };
-        if let Some(client) = &client
+        // Another environment, or the same one on a new socket, starts the list over.
+        let moved = |(id, socket): &(SharedString, RpcClient)| {
+            target.as_ref().is_none_or(|(client, target)| target != id || !client.same_socket(socket))
+        };
+        if self.following.as_ref().is_some_and(moved) {
+            self.stop();
+        }
+        let client = target.as_ref().map(|(client, _)| client.clone());
+        if let Some((client, environment)) = target
             && !self.subscribed
             && !matches!(self.tasks, Load::Failed(_))
         {
-            self.subscribe(client.clone(), cx);
+            self.subscribe(environment, client, cx);
         }
 
         let body: Vec<RowFrame> = match (&client, &self.tasks) {

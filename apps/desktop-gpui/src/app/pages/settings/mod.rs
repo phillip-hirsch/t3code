@@ -80,6 +80,16 @@ pub(in crate::app) const SETTINGS: &[(Option<&str>, &[(&str, &str)])] = &[
     (None, &[("maintenance", "Maintenance"), ("labs", "Labs"), ("about", "About"), ("archived", "Archive")]),
 ];
 
+/// The socket of `scope`, the settings environment a view or dialog was made for: it keeps
+/// acting there after Settings moves to another environment.
+pub(in crate::app) fn scoped_client(
+    workspace: &gpui_kit::WeakEntity<Workspace>,
+    scope: Option<&SharedString>,
+    cx: &gpui_kit::App,
+) -> Option<crate::rpc::RpcClient> {
+    workspace.upgrade()?.read(cx).env_client(scope?)
+}
+
 /// `isSecretsFeatureEnabled`: the web's build flag `T3CODE_FEATURE_SECRETS`, read here from
 /// the environment. Off, the Secrets section and its search items do not exist.
 pub(in crate::app) fn secrets_enabled() -> bool {
