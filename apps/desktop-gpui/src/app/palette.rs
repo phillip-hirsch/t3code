@@ -391,7 +391,7 @@ impl Workspace {
     }
 
     fn new_thread_rows(&self) -> Vec<Row> {
-        inbox::pickable_projects(&self.shell.projects, &self.shell.threads)
+        self.pickable_projects()
             .into_iter()
             .enumerate()
             .map(|(i, p)| {
@@ -525,7 +525,7 @@ impl Workspace {
                 Group { label: "Recent Threads", rows: recent },
             ];
         }
-        let projects = inbox::pickable_projects(&self.shell.projects, &self.shell.threads);
+        let projects = self.pickable_projects();
         let stem: Vec<char> = "new thread in".chars().collect();
         let names_stem = stem.starts_with(&tokens.join(&' ')[..]);
         let suggestions: Vec<Row> = if names_stem {

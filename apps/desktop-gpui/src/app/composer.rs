@@ -698,7 +698,11 @@ impl Workspace {
             && self.client().is_some()
             && disabled_reason.is_none()
             && !self.target_rewinding();
-        let (fill, icon) = if can_send || self.sending {
+        // `environmentIdentificationMode`: the stage art fills the button (`StageBackdropButtonArt`).
+        let stage = self.stage_art();
+        let (fill, icon) = if stage.is_some() {
+            (gpui_kit::transparent_black(), gpui_kit::white())
+        } else if can_send || self.sending {
             (t.primary, t.primary_foreground)
         } else {
             (t.foreground.opacity(0.12), t.muted_foreground)
@@ -729,11 +733,16 @@ impl Workspace {
             _ => None,
         };
         round_button("send", fill, t.primary)
-            .child(content)
+            .when_some(stage, |el, art| {
+                el.relative()
+                    .when(!can_send, |el| el.opacity(0.64))
+                    .child(super::sidebar::stage_button_art(art, t.dark))
+            })
+            .child(div().relative().child(content))
             .when(!can_send, |el| el.shadow(Vec::new()))
             .when(can_send, |el| {
-                el.cursor_pointer().hover(|s| s.bg(t.primary_hover)).on_click(cx.listener(
-                    |this, event: &ClickEvent, window, cx| {
+                el.cursor_pointer().when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover))).on_click(
+                    cx.listener(|this, event: &ClickEvent, window, cx| {
                         let modifiers = event.modifiers();
                         let intent = if modifiers.control || modifiers.platform {
                             Intent::Alternate
@@ -741,8 +750,8 @@ impl Workspace {
                             Intent::Foreground
                         };
                         this.submit_with(intent, window, cx)
-                    },
-                ))
+                    }),
+                )
             })
             .when_some(tooltip, |el, tooltip| {
                 el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))

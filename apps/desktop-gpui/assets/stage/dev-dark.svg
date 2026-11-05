@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="160" viewBox="0 0 1536 96" fill="none">
+<defs>
+<linearGradient id="paper" x1="60" y1="0" x2="220" y2="96" gradientUnits="userSpaceOnUse" spreadMethod="reflect">
+<stop stop-color="#101f6e"/><stop offset="0.5" stop-color="#2050ae"/><stop offset="1" stop-color="#3a7ad1"/></linearGradient>
+<radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(216 14) rotate(137) scale(120 84)" gradientUnits="userSpaceOnUse">
+<stop stop-color="#d4f6ff" stop-opacity="0.4"/><stop offset="0.52" stop-color="#65c8ff" stop-opacity="0.16"/><stop offset="1" stop-color="#101f6e" stop-opacity="0"/></radialGradient>
+<radialGradient id="celeste" cx="0" cy="0" r="1" gradientTransform="translate(474 44) rotate(166) scale(156 92)" gradientUnits="userSpaceOnUse">
+<stop stop-color="#d2ffff" stop-opacity="0.34"/><stop offset="0.5" stop-color="#48dcf5" stop-opacity="0.18"/><stop offset="1" stop-color="#101f6e" stop-opacity="0"/></radialGradient>
+<radialGradient id="violet" cx="0" cy="0" r="1" gradientTransform="translate(704 18) rotate(145) scale(132 88)" gradientUnits="userSpaceOnUse">
+<stop stop-color="#d9d8ff" stop-opacity="0.3"/><stop offset="0.52" stop-color="#7c8bff" stop-opacity="0.14"/><stop offset="1" stop-color="#101f6e" stop-opacity="0"/></radialGradient>
+<pattern id="minor" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M8 0H0V8" stroke="#eaf6ff" stroke-opacity="0.14" stroke-width="0.5"/></pattern>
+<pattern id="major" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" stroke="#eaf6ff" stroke-opacity="0.26" stroke-width="0.6"/></pattern>
+<pattern id="ruler" width="32" height="6" patternUnits="userSpaceOnUse"><path d="M4 0V2.5M12 0V2.5M20 0V4M28 0V2.5" stroke="#ddf7ff" stroke-opacity="0.5" stroke-width="0.5"/></pattern>
+<pattern id="glows" width="768" height="96" patternUnits="userSpaceOnUse"><rect width="768" height="96" fill="url(#glow)"/><rect width="768" height="96" fill="url(#celeste)"/><rect width="768" height="96" fill="url(#violet)"/></pattern>
+<pattern id="notes" width="768" height="96" patternUnits="userSpaceOnUse">
+<g stroke="#ddf7ff" stroke-linecap="round" stroke-opacity="0.6" stroke-width="0.7">
+<path d="M180 64H264" stroke-dasharray="5 4"/><path d="M180 61V67M264 61V67"/>
+<path d="M276 10V44" stroke-dasharray="4 4" stroke-opacity="0.5"/><path d="M273 10H279M273 44H279" stroke-opacity="0.5"/>
+<path d="M348 30H428" stroke-dasharray="3.5 5" stroke-opacity="0.5"/><path d="M348 27V33M428 27V33" stroke-opacity="0.5"/>
+<path d="M512 48V80" stroke-dasharray="5 3" stroke-opacity="0.45"/><path d="M509 48H515M509 80H515" stroke-opacity="0.45"/>
+<path d="M590 70H724" stroke-dasharray="7 4" stroke-opacity="0.55"/><path d="M590 67V73M724 67V73" stroke-opacity="0.55"/></g>
+<g stroke="#ddf7ff" stroke-linecap="round" stroke-opacity="0.55" stroke-width="0.6">
+<path d="M34 60L38 64M38 60L34 64"/><path d="M228 26H234M231 23V29"/><path d="M143 51H149M146 48V54"/><path d="M316 16L322 22M322 16L316 22"/>
+<path d="M468 70H476M472 66V74"/><path d="M558 28L564 34M564 28L558 34"/><path d="M742 44H750M746 40V48"/></g>
+<g stroke="#ddf7ff" stroke-opacity="0.35" stroke-width="0.6">
+<circle cx="196" cy="38" r="13" stroke-dasharray="3.5 4"/><path d="M196 33V43M191 38H201" stroke-opacity="0.6" stroke-width="0.4"/>
+<circle cx="414" cy="64" r="10" stroke-dasharray="2.5 3.5"/><path d="M414 60V68M410 64H418" stroke-opacity="0.6" stroke-width="0.4"/>
+<circle cx="648" cy="32" r="15" stroke-dasharray="4 5"/><path d="M648 26V38M642 32H654" stroke-opacity="0.6" stroke-width="0.4"/></g>
+</pattern>
+</defs>
+<rect width="1536" height="96" fill="url(#paper)"/><rect width="1536" height="96" fill="url(#glows)"/><rect width="1536" height="96" fill="url(#minor)"/>
+<rect width="1536" height="96" fill="url(#major)"/><rect width="1536" height="6" fill="url(#ruler)"/><rect width="1536" height="96" fill="url(#notes)"/>
+</svg>

@@ -37,12 +37,13 @@ impl Workspace {
     /// `searchSidebarThreads` over the scoped threads, then the message-only hits.
     pub(super) fn search_results(&self, query: &str, now: i64) -> Vec<SearchResult<'_>> {
         let tokens = search::fold_query(query);
+        let scope = self.scoped_project_ids();
         let visible: Vec<&ThreadShell> = self
             .shell
             .threads
             .iter()
             .filter(|t| t.is_listed() && t.archived_at.is_none() && t.deleted_at.is_none())
-            .filter(|t| self.sidebar.scope.is_empty() || self.sidebar.scope.contains(&t.project_id))
+            .filter(|t| scope.as_ref().is_none_or(|ids| ids.contains(&t.project_id)))
             .collect();
         let score = |typos: bool| {
             let mut found: Vec<(&ThreadShell, f32, bool)> = visible

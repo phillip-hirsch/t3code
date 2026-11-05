@@ -12,6 +12,7 @@ mod new_thread;
 mod notifications;
 mod preview;
 mod pull_request_detail;
+mod project_groups;
 mod pull_requests;
 mod quit_shortcut;
 mod requests;

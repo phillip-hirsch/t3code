@@ -7,13 +7,15 @@ mod custom_snooze;
 mod filter;
 mod search_results;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
@@ -26,8 +28,9 @@ use gpui_kit::{
 use serde_json::json;
 
 use super::{Connection, Target, Workspace, project_name};
-use crate::inbox::{self, Facts, Status};
+use crate::inbox::{self, Facts, FolderDot, Status};
 use crate::model::{ProjectShell, ShellState, ThreadShell};
+use crate::project_groups::{self, GroupingSettings, ProjectGroup, SortOrder};
 use crate::theme::{FONT_MONO, Tokens};
 
 const DEFAULT_WIDTH: f32 = 256.;
@@ -37,6 +40,9 @@ const MIN_MAIN_WIDTH: f32 = 640.;
 const SETTLED_INITIAL: usize = 10;
 const SETTLED_PAGE: usize = 25;
 const ROW_GROUP: &str = "sidebar-row";
+const FOLDER_GROUP: &str = "sidebar-folder";
+/// `bg-success` (Tailwind's emerald-500), the done dot of a closed folder.
+const SUCCESS: u32 = 0x00bc7d;
 
 pub(super) struct SidebarState {
     width: Pixels,
@@ -57,8 +63,11 @@ pub(super) struct SidebarState {
     /// The row the last single click opened, for double-click rename.
     clicked: Option<String>,
     undo: Option<actions::UndoNotice>,
-    /// The project filter: project ids, empty for all projects.
+    /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
+    groups: RefCell<GroupsCache>,
+    /// Boring sidebar folders the user closed, by group key; folders start open.
+    collapsed_folders: HashSet<String>,
     /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
     inbox_order: Vec<String>,
     filter: Option<filter::FilterMenu>,
@@ -109,6 +118,8 @@ impl SidebarState {
             clicked: None,
             undo: None,
             scope: Vec::new(),
+            groups: RefCell::default(),
+            collapsed_folders: HashSet::new(),
             inbox_order: Vec::new(),
             filter: None,
             filter_closed_at: None,
@@ -124,6 +135,102 @@ impl SidebarState {
             _subscriptions: subscriptions,
         }
     }
+}
+
+/// What the project groups are built from; they rebuild only when it changes.
+#[derive(PartialEq)]
+struct GroupsKey {
+    revision: u64,
+    order: SortOrder,
+    grouping: GroupingSettings,
+    environment: Option<String>,
+    scratch_root: Option<String>,
+}
+
+#[derive(Default)]
+struct GroupsCache {
+    key: Option<GroupsKey>,
+    groups: Rc<Vec<ProjectGroup>>,
+}
+
+/// The filter's groups that still exist and are open, in sidebar order; empty is all projects.
+fn scoped_groups<'g>(groups: &'g [ProjectGroup], scope: &[String]) -> Vec<&'g ProjectGroup> {
+    project_groups::pickable(groups).into_iter().filter(|g| scope.contains(&g.key)).collect()
+}
+
+/// `resolveSidebarStageBackdropVariant`: the stage art behind the sidebar header and on the
+/// send button. This build has no Dev or Nightly stage of its own, so `artwork` follows a
+/// Nightly server (`resolveServerBackedAppStageLabel`) and shows nothing otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StageArt {
+    Nightly,
+    Dev,
+}
+
+/// `NIGHTLY_SERVER_VERSION_PATTERN`: `<version>-nightly.<yyyymmdd>.<n>` (or `-preview.`).
+fn is_nightly_version(version: &str) -> bool {
+    let Some((base, pre)) = version.split_once('-') else { return false };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = pre.split('.');
+    !base.is_empty()
+        && !base.contains('+')
+        && matches!(parts.next(), Some("nightly" | "preview"))
+        && parts.next().is_some_and(|date| date.len() == 8 && digits(date))
+        && parts.next().is_some_and(digits)
+        && parts.next().is_none()
+}
+
+fn stage_art(mode: &str, server_version: Option<&str>) -> Option<StageArt> {
+    match mode {
+        "nightly-artwork" => Some(StageArt::Nightly),
+        "dev-artwork" => Some(StageArt::Dev),
+        "artwork" if server_version.is_some_and(is_nightly_version) => Some(StageArt::Nightly),
+        _ => None,
+    }
+}
+
+const STAGE_NIGHTLY: &str = include_str!("../../assets/stage/nightly.svg");
+const STAGE_DEV_LIGHT: &str = include_str!("../../assets/stage/dev-light.svg");
+const STAGE_DEV_DARK: &str = include_str!("../../assets/stage/dev-dark.svg");
+const STAGE_FRAME: &str = r#"width="2560" height="160" viewBox="0 0 1536 96""#;
+
+/// The art, rasterized once per variant; `dark` picks the Dev blueprint's deeper paper.
+/// `button` is the square the send button shows (`StageBackdropButtonArt`'s compact view box).
+fn stage_image(art: StageArt, dark: bool, button: bool) -> Arc<Image> {
+    fn load(svg: &str, button_left: Option<u32>) -> Arc<Image> {
+        let svg = match button_left {
+            Some(left) => svg.replacen(STAGE_FRAME, &format!(r#"width="64" height="64" viewBox="{left} 0 96 96""#), 1),
+            None => svg.to_owned(),
+        };
+        Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+    }
+    static IMAGES: LazyLock<[Arc<Image>; 6]> = LazyLock::new(|| {
+        [
+            load(STAGE_NIGHTLY, None),
+            load(STAGE_DEV_LIGHT, None),
+            load(STAGE_DEV_DARK, None),
+            load(STAGE_NIGHTLY, Some(96)),
+            load(STAGE_DEV_LIGHT, Some(64)),
+            load(STAGE_DEV_DARK, Some(64)),
+        ]
+    });
+    let variant = match (art, dark) {
+        (StageArt::Nightly, _) => 0,
+        (StageArt::Dev, false) => 1,
+        (StageArt::Dev, true) => 2,
+    };
+    IMAGES[variant + if button { 3 } else { 0 }].clone()
+}
+
+/// The art at the web's slice scale (96 art units to `height`), from its left edge.
+fn stage_backdrop(art: StageArt, dark: bool, height: f32) -> AnyElement {
+    let width = 1536. * height / 96.;
+    img(stage_image(art, dark, false)).absolute().top_0().left_0().w(px(width)).h(px(height)).into_any_element()
+}
+
+/// The send button's round art.
+pub(super) fn stage_button_art(art: StageArt, dark: bool) -> AnyElement {
+    img(stage_image(art, dark, true)).absolute().top_0().left_0().size(px(32.)).rounded_full().into_any_element()
 }
 
 /// The sidebar as its own view, so GPUI can reuse its frame while the rest of
@@ -173,14 +280,27 @@ enum Item<'a> {
     DraftDivider,
     Card(Facts<'a>),
     Slim(Facts<'a>, Option<Shelf>),
-    Header { shelf: Shelf, count: usize, expanded: bool, first: bool },
+    /// A boring sidebar project folder; its open rows follow as `FolderRow`s.
+    Folder {
+        group: &'a ProjectGroup,
+        collapsed: bool,
+        hidden: usize,
+        dot: Option<FolderDot>,
+    },
+    FolderRow(Facts<'a>),
+    Header {
+        shelf: Shelf,
+        count: usize,
+        expanded: bool,
+        first: bool,
+    },
     ShowMore(usize),
 }
 
 impl Item<'_> {
     fn thread_id(&self) -> Option<String> {
         match self {
-            Item::Card(facts) | Item::Slim(facts, _) => Some(facts.thread.id.clone()),
+            Item::Card(facts) | Item::Slim(facts, _) | Item::FolderRow(facts) => Some(facts.thread.id.clone()),
             _ => None,
         }
     }
@@ -188,7 +308,10 @@ impl Item<'_> {
     /// The keyboard-navigation key of a focusable row.
     fn nav_key(&self) -> Option<SharedString> {
         match self {
-            Item::Card(facts) | Item::Slim(facts, _) => Some(format!("thread:{}", facts.thread.id).into()),
+            Item::Card(facts) | Item::Slim(facts, _) | Item::FolderRow(facts) => {
+                Some(format!("thread:{}", facts.thread.id).into())
+            }
+            Item::Folder { group, .. } => Some(format!("folder:{}", group.key).into()),
             Item::Header { shelf, .. } => Some(format!("shelf:{}", shelf.label()).into()),
             Item::ShowMore(_) => Some("settled:more".into()),
             _ => None,
@@ -226,22 +349,31 @@ fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::A
 }
 
 impl SidebarState {
-    /// The rows to draw, in order: the web's `sidebarListItemsFresh`.
+    /// The rows to draw, in order: the web's `sidebarListItemsFresh`. `boring` folds the
+    /// active threads into project folders (`useSidebarThreads` `folderGroups`).
+    #[allow(clippy::too_many_arguments)]
     fn items<'a>(
         &mut self,
         shell: &'a ShellState,
+        groups: &'a [ProjectGroup],
         target: Option<&'a Target>,
         working_shelf: bool,
+        boring: bool,
         now: i64,
     ) -> Vec<Item<'a>> {
         let route = match target {
             Some(Target::Thread(id)) => Some(id.as_str()),
             _ => None,
         };
-        let scope = &self.scope;
-        let in_scope = |project_id: &str| scope.is_empty() || scope.iter().any(|s| s == project_id);
+        let scoped = scoped_groups(groups, &self.scope);
+        let scope_ids: Option<HashSet<&str>> = (!scoped.is_empty())
+            .then(|| scoped.iter().flat_map(|g| g.project_ids.iter().map(String::as_str)).collect());
+        let in_scope = |project_id: &str| scope_ids.as_ref().is_none_or(|ids| ids.contains(project_id));
+        // Folders already separate the work, so boring mode has no Working shelf.
         let sections =
-            inbox::partition(&shell.threads, now, working_shelf, &mut self.returns, |t| in_scope(&t.project_id));
+            inbox::partition(&shell.threads, now, working_shelf && !boring, boring, &mut self.returns, |t| {
+                in_scope(&t.project_id)
+            });
         let mut items = Vec::new();
         if let Some(Target::Draft { project_id }) =
             target.filter(|t| matches!(t, Target::Draft { project_id } if in_scope(project_id)))
@@ -249,7 +381,32 @@ impl SidebarState {
             items.push(Item::Draft(project_id));
             items.push(Item::DraftDivider);
         }
-        items.extend(sections.pinned.into_iter().chain(sections.active).map(Item::Card));
+        items.extend(sections.pinned.into_iter().map(Item::Card));
+        if boring {
+            // An archived project keeps a folder for its active threads, below the rest.
+            let folders: Vec<&ProjectGroup> = if scoped.is_empty() {
+                project_groups::pickable(groups).into_iter().chain(groups.iter().filter(|g| g.archived)).collect()
+            } else {
+                scoped.clone()
+            };
+            let keep_empty = |g: &ProjectGroup| !scoped.is_empty() || (g.pinned && !g.archived);
+            let folders =
+                project_groups::folders(&folders, sections.active, |f| f.thread.project_id.as_str(), keep_empty);
+            for (group, threads) in folders {
+                let collapsed = self.collapsed_folders.contains(&group.key);
+                // A closed folder still shows the open thread, and hints at the rest.
+                let (shown, hidden): (Vec<Facts>, Vec<Facts>) = if collapsed {
+                    threads.into_iter().partition(|f| Some(f.thread.id.as_str()) == route)
+                } else {
+                    (threads, Vec::new())
+                };
+                let dot = inbox::folder_dot(&hidden);
+                items.push(Item::Folder { group, collapsed, hidden: hidden.len(), dot });
+                items.extend(shown.into_iter().map(Item::FolderRow));
+            }
+        } else {
+            items.extend(sections.active.into_iter().map(Item::Card));
+        }
         fn route_only<'a>(list: Vec<Facts<'a>>, expanded: bool, route: Option<&str>) -> Vec<Facts<'a>> {
             if expanded { list } else { list.into_iter().filter(|f| Some(f.thread.id.as_str()) == route).collect() }
         }
@@ -290,7 +447,7 @@ impl SidebarState {
     fn settled_count_is_zero(&self, items: &[Item]) -> bool {
         items.iter().all(|item| match item {
             Item::Header { count, .. } => *count == 0,
-            Item::Card(_) | Item::Slim(..) | Item::Draft(_) => false,
+            Item::Card(_) | Item::Slim(..) | Item::Draft(_) | Item::FolderRow(_) | Item::Folder { .. } => false,
             _ => true,
         })
     }
@@ -320,6 +477,14 @@ impl SidebarState {
                         }
                     }
                 },
+                // Folder rows show a status label without a duration, else the relative time.
+                Item::FolderRow(facts) => {
+                    if facts.status() == Status::Ready && !facts.is_woke(now) && !facts.is_unread() {
+                        if let Some(from) = facts.activity_timestamp() {
+                            at(inbox::relative_changes_in(now - from));
+                        }
+                    }
+                }
                 Item::Slim(facts, shelf) => {
                     let from = if *shelf == Some(Shelf::Settled) {
                         facts.settled_timestamp()
@@ -346,6 +511,77 @@ impl SidebarState {
 }
 
 impl Workspace {
+    /// The project groups in sidebar order (`useSidebarProjectGroups`): grouped by
+    /// `sidebarProjectGroupingMode` and its overrides, ordered by `sidebarProjectSortOrder`.
+    /// They rebuild only when the shell or those settings change.
+    pub(super) fn project_groups(&self) -> Rc<Vec<ProjectGroup>> {
+        let settings = &self.client_settings.values;
+        let key = GroupsKey {
+            revision: self.shell.revision,
+            order: SortOrder::from_settings(settings),
+            grouping: GroupingSettings::from_settings(settings),
+            environment: self.server_info.environment_id.clone(),
+            scratch_root: self.server_info.scratch_workspace_root.clone(),
+        };
+        let mut cache = self.sidebar.groups.borrow_mut();
+        if cache.key.as_ref() != Some(&key) {
+            let mut groups = project_groups::build_groups(
+                &self.shell.projects,
+                &key.grouping,
+                key.environment.as_deref().unwrap_or_default(),
+                key.scratch_root.as_deref(),
+                true,
+            );
+            project_groups::sort_groups(&mut groups, &self.shell.threads, key.order);
+            *cache = GroupsCache { key: Some(key), groups: Rc::new(groups) };
+        }
+        cache.groups.clone()
+    }
+
+    /// The projects the palette and "New thread in…" offer: one per open group, pinned first.
+    pub(super) fn pickable_projects(&self) -> Vec<&ProjectShell> {
+        let groups = self.project_groups();
+        project_groups::pickable(&groups)
+            .into_iter()
+            .filter_map(|g| self.shell.projects.iter().find(|p| p.id == g.representative().id))
+            .collect()
+    }
+
+    /// The project ids the filter keeps, or `None` for all projects.
+    fn scoped_project_ids(&self) -> Option<HashSet<String>> {
+        let groups = self.project_groups();
+        let scoped = scoped_groups(&groups, &self.sidebar.scope);
+        (!scoped.is_empty()).then(|| scoped.iter().flat_map(|g| g.project_ids.iter().cloned()).collect())
+    }
+
+    /// The boring sidebar (Labs), also on for users of the removed legacy sidebar.
+    fn boring_sidebar(&self) -> bool {
+        let values = &self.client_settings.values;
+        values.bool("boringSidebarEnabled") || values.bool("legacySidebarEnabled")
+    }
+
+    /// The stage art the sidebar header and send button show (`environmentIdentificationMode`).
+    pub(super) fn stage_art(&self) -> Option<StageArt> {
+        let mode = self.client_settings.values.get("environmentIdentificationMode").as_str().unwrap_or("artwork");
+        let version = self.server_info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        stage_art(mode, version)
+    }
+
+    /// The "Nightly" pill of `pill` mode, shown only on a Nightly server.
+    fn stage_pill(&self) -> Option<&'static str> {
+        let mode = self.client_settings.values.get("environmentIdentificationMode").as_str();
+        let version = self.server_info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        (mode == Some("pill") && version.is_some_and(is_nightly_version)).then_some("Nightly")
+    }
+
+    fn toggle_folder(&mut self, key: &str, cx: &mut Context<Self>) {
+        let collapsed = &mut self.sidebar.collapsed_folders;
+        if !collapsed.remove(key) {
+            collapsed.insert(key.to_owned());
+        }
+        self.notify_sidebar(cx);
+    }
+
     fn search_query(&self, cx: &App) -> String {
         self.sidebar.search.read(cx).value().trim().to_lowercase()
     }
@@ -647,11 +883,10 @@ impl Workspace {
         let label: SharedString = if no_projects {
             "No projects yet".into()
         } else {
-            let scoped: Vec<&ProjectShell> =
-                self.shell.projects.iter().filter(|p| self.sidebar.scope.contains(&p.id)).collect();
-            match scoped.as_slice() {
+            let groups = self.project_groups();
+            match scoped_groups(&groups, &self.sidebar.scope).as_slice() {
                 [] => "No threads yet".into(),
-                [one] => format!("No threads in {} yet", project_name(one)).into(),
+                [one] => format!("No threads in {} yet", one.display_name).into(),
                 _ => "No threads in these projects yet".into(),
             }
         };
@@ -719,6 +954,16 @@ impl Workspace {
         };
         if let Some(index) = move_to {
             self.sidebar.cursor = Some(rows[index].clone());
+        } else if let Some(folder) = key.as_deref().and_then(|key| key.strip_prefix("folder:")) {
+            let collapsed = self.sidebar.collapsed_folders.contains(folder);
+            match event.keystroke.key.as_str() {
+                "enter" | "space" => {}
+                "right" if collapsed => {}
+                "left" if !collapsed => {}
+                _ => return,
+            }
+            let folder = folder.to_owned();
+            self.toggle_folder(&folder, cx);
         } else {
             let Some(key) = key else { return };
             match (event.keystroke.key.as_str(), shelf_of(&key)) {
@@ -807,16 +1052,27 @@ impl Workspace {
         let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
         let working_shelf =
             connected && self.shell.live && self.client_settings.values.bool("sidebarWorkingShelfEnabled");
-        let items = self.sidebar.items(&self.shell, self.target.as_ref(), working_shelf, now);
+        let boring = self.boring_sidebar();
+        let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
+        let groups = self.project_groups();
+        let items = self.sidebar.items(&self.shell, &groups, self.target.as_ref(), working_shelf, boring, now);
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();
-        let inbox_order: Vec<String> =
-            items.iter().filter_map(|item| matches!(item, Item::Card(_)).then(|| item.thread_id()).flatten()).collect();
+        let label_of: HashMap<&str, &str> = groups
+            .iter()
+            .flat_map(|g| g.project_ids.iter().map(move |id| (id.as_str(), g.display_name.as_str())))
+            .collect();
+        let inbox_order: Vec<String> = items
+            .iter()
+            .filter_map(|item| matches!(item, Item::Card(_) | Item::FolderRow(_)).then(|| item.thread_id()).flatten())
+            .collect();
         let nav_rows: Vec<SharedString> = items.iter().filter_map(Item::nav_key).collect();
         let list_focused = self.sidebar.list_focus.is_focused(window);
         let cursor = self.sidebar.cursor.clone().filter(|_| list_focused);
-        let has_rows = items.iter().any(|item| matches!(item, Item::Card(_) | Item::Slim(..) | Item::Draft(_)));
+        let has_rows = items.iter().any(|item| {
+            matches!(item, Item::Card(_) | Item::Slim(..) | Item::Draft(_) | Item::FolderRow(_) | Item::Folder { .. })
+        });
 
         // Under a fixed header the web drops the list group's top padding.
         let mut list = v_flex().min_h_full().px(px(8.)).pb(px(8.)).gap(px(1.));
@@ -825,7 +1081,7 @@ impl Workspace {
         } else if !has_rows && self.sidebar.settled_count_is_zero(&items) {
             list = list.child(self.render_empty_state(&tokens, cx));
         } else {
-            for item in items {
+            for (index, item) in items.into_iter().enumerate() {
                 let key = item.nav_key();
                 let element = match item {
                     Item::Draft(project_id) => self.render_draft(projects.get(project_id).copied(), &tokens, cx),
@@ -834,14 +1090,17 @@ impl Workspace {
                     }
                     Item::Card(facts) => {
                         let active = route == Some(facts.thread.id.as_str());
-                        self.render_card(
-                            facts,
-                            projects.get(facts.thread.project_id.as_str()).copied(),
-                            active,
-                            now,
-                            &tokens,
-                            cx,
-                        )
+                        let project_id = facts.thread.project_id.as_str();
+                        let label = label_of.get(project_id).map(|name| SharedString::from(name.to_string()));
+                        self.render_card(facts, projects.get(project_id).copied(), label, active, now, &tokens, cx)
+                    }
+                    Item::Folder { group, collapsed, hidden, dot } => {
+                        self.render_folder(group, collapsed, hidden, dot, index == 0, &tokens, cx)
+                    }
+                    Item::FolderRow(facts) => {
+                        let active = route == Some(facts.thread.id.as_str());
+                        let project = projects.get(facts.thread.project_id.as_str()).copied();
+                        self.render_folder_row(facts, project, multiline, active, now, &tokens, cx)
                     }
                     Item::Slim(facts, shelf) => {
                         let active = route == Some(facts.thread.id.as_str());
@@ -897,6 +1156,35 @@ impl Workspace {
                     .bg(sb.border),
             );
 
+        // `SidebarStageBackdrop`: 80 px of art behind the header, fading into the sidebar.
+        let backdrop = self.stage_art().map(|art| {
+            let fade = |from: Hsla, to: Hsla| {
+                gpui_kit::linear_gradient(
+                    180.,
+                    gpui_kit::linear_color_stop(from, 0.),
+                    gpui_kit::linear_color_stop(to, 1.),
+                )
+            };
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(80.))
+                .overflow_hidden()
+                .child(stage_backdrop(art, tokens.dark, 80.))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(22.))
+                        .h(px(53.))
+                        .bg(fade(sb.background.opacity(0.), sb.background)),
+                )
+                .child(div().absolute().left_0().right_0().top(px(74.)).bottom_0().bg(sb.background))
+        });
+
         v_flex()
             .id("sidebar")
             .relative()
@@ -912,6 +1200,7 @@ impl Workspace {
                 this.sidebar.width = (event.event.position.x - event.bounds.left()).clamp(px(MIN_WIDTH), max);
                 cx.notify();
             }))
+            .children(backdrop)
             .child(self.render_chrome_row(&tokens, cx))
             .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(
@@ -935,6 +1224,14 @@ impl Workspace {
 
     fn render_chrome_row(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
+        // On the stage art the brand turns white and the arrows take `media-navigation`.
+        let on_art = self.stage_art().is_some();
+        let white = gpui_kit::white();
+        let (brand, brand_muted, arrow_color, arrow_hover) = if on_art {
+            (white, white.opacity(0.7), white.opacity(0.9), white.opacity(0.1))
+        } else {
+            (sb.foreground, sb.muted_foreground, sb.muted_foreground, sb.row_hover)
+        };
         let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool| {
             div()
                 .id(id)
@@ -944,11 +1241,11 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .when(!enabled, |el| el.opacity(0.64))
-                .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(sb.row_hover)))
+                .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(arrow_hover)))
                 // Inside the drag region a button must occlude, or Windows takes the press as a drag.
                 .occlude()
                 .tooltip(tooltip(label))
-                .child(icon(name, 14., sb.muted_foreground))
+                .child(icon(name, 14., arrow_color))
         };
         let (back, forward) = (self.history.can_go_back(), self.history.can_go_forward());
         h_flex()
@@ -962,17 +1259,8 @@ impl Workspace {
                     .ml(px(52.))
                     .h(px(28.))
                     .gap(px(4.))
-                    .child(
-                        svg()
-                            .path("icons/app/t3-wordmark.svg")
-                            .w(px(16.9))
-                            .h(px(10.2))
-                            .mt(px(1.))
-                            .text_color(sb.foreground),
-                    )
-                    .child(
-                        text_sm(div()).font_weight(FontWeight::MEDIUM).text_color(sb.muted_foreground).child("Code"),
-                    ),
+                    .child(svg().path("icons/app/t3-wordmark.svg").w(px(16.9)).h(px(10.2)).mt(px(1.)).text_color(brand))
+                    .child(text_sm(div()).font_weight(FontWeight::MEDIUM).text_color(brand_muted).child("Code")),
             )
             .child(
                 h_flex()
@@ -986,6 +1274,16 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
                     ),
             )
+            .children(self.stage_pill().map(|label| {
+                text_xs(div())
+                    .ml(px(4.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .bg(tokens.secondary)
+                    .text_color(sb.foreground)
+                    .child(label)
+            }))
     }
 
     fn render_search_row(
@@ -1301,10 +1599,12 @@ impl Workspace {
         Some(svg().path(path).size(px(14.)).flex_none().text_color(color.opacity(0.6)).into_any_element())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_card(
         &self,
         facts: Facts,
         project: Option<&ProjectShell>,
+        label: Option<SharedString>,
         active: bool,
         now: i64,
         tokens: &Tokens,
@@ -1384,29 +1684,7 @@ impl Workspace {
                     h_flex().h_full().child(status_label)
                 },
             );
-        let provider = self.provider_mark(&facts, sb.foreground);
-        let terminals = self.render_running_terminals(&thread.id, cx);
-        let meta = (thread.branch.is_some() || terminals.is_some()).then(|| {
-            text_xs(h_flex())
-                .mt(px(2.))
-                .gap(px(6.))
-                .min_w_0()
-                .text_color(sb.secondary_label)
-                .when(thread.worktree_path.is_some() && thread.branch.is_some(), |el| {
-                    el.child(icon(IconName::FolderGit2, 14., sb.muted_foreground))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis_middle()
-                        .children(thread.branch.clone()),
-                )
-                .children(terminals)
-                .children(provider)
-        });
+        let meta = self.render_meta_line(&facts, tokens, cx);
         let title_icons = if meta.is_none() { self.provider_mark(&facts, sb.foreground) } else { None };
         let title_color = if recede {
             sb.foreground.opacity(0.75)
@@ -1465,7 +1743,7 @@ impl Workspace {
                                             .flex_1()
                                             .truncate()
                                             .text_color(sb.secondary_label)
-                                            .children(project.map(|p| p.title.clone())),
+                                            .children(label.or_else(|| project.map(|p| p.title.clone().into()))),
                                     )
                                     .child(status_slot),
                             )
@@ -1494,6 +1772,295 @@ impl Workspace {
                     )
                     .context_menu(self.row_menu(&thread.id, cx)),
             )
+            .into_any_element()
+    }
+
+    /// The card's branch and terminal line (`metaLine`), or `None` when only its trailing
+    /// icons would remain and they move to the title line.
+    fn render_meta_line(&self, facts: &Facts, tokens: &Tokens, cx: &mut Context<Self>) -> Option<gpui_kit::Div> {
+        let sb = tokens.sidebar;
+        let thread = facts.thread;
+        let terminals = self.render_running_terminals(&thread.id, cx);
+        (thread.branch.is_some() || terminals.is_some()).then(|| {
+            text_xs(h_flex())
+                .mt(px(2.))
+                .gap(px(6.))
+                .min_w_0()
+                .text_color(sb.secondary_label)
+                .when(thread.worktree_path.is_some() && thread.branch.is_some(), |el| {
+                    el.child(icon(IconName::FolderGit2, 14., sb.muted_foreground))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_middle()
+                        .children(thread.branch.clone()),
+                )
+                .children(terminals)
+                .children(self.provider_mark(facts, sb.foreground))
+        })
+    }
+
+    /// A boring sidebar folder header (`SidebarProjectFolderHeader`): it reads like a shelf
+    /// header, with the hidden count and a status dot only while it is closed.
+    #[allow(clippy::too_many_arguments)]
+    fn render_folder(
+        &self,
+        group: &ProjectGroup,
+        collapsed: bool,
+        hidden: usize,
+        dot: Option<FolderDot>,
+        first: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sb = tokens.sidebar;
+        let representative = group.representative();
+        let chevron = icon(IconName::ChevronDown, 12., sb.muted_foreground)
+            .when(collapsed, |i| i.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2)));
+        let dot = dot.map(|dot| {
+            let color = match dot {
+                FolderDot::Attention => tokens.warning,
+                FolderDot::Failed => tokens.error,
+                FolderDot::Unread => rgb(SUCCESS).into(),
+                FolderDot::Working => tokens.info,
+            };
+            div().size(px(6.)).flex_none().rounded_full().bg(color)
+        });
+        let key = group.key.clone();
+        let project_id = representative.id.clone();
+        let new_thread_label: SharedString = format!("New thread in {}", group.display_name).into();
+        let new_thread = div()
+            .id(SharedString::from(format!("folder-new-{}", group.key)))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(24.))
+            .flex()
+            .items_center()
+            .invisible()
+            .group_hover(FOLDER_GROUP, |s| s.visible())
+            .child(
+                div()
+                    .id(SharedString::from(format!("folder-new-button-{}", group.key)))
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_color(tokens.muted_foreground)
+                    .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
+                    .tooltip(move |window, cx| Tooltip::new(new_thread_label.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.start_draft(project_id.clone(), window, cx);
+                    }))
+                    .child(Icon::new(IconName::SquarePen).size(px(14.))),
+            );
+        div()
+            .id(SharedString::from(format!("folder-{}", group.key)))
+            .group(FOLDER_GROUP)
+            .relative()
+            .flex_none()
+            .when(!first, |el| el.mt(px(8.)))
+            .child(
+                text_sm(h_flex())
+                    .id(SharedString::from(format!("folder-row-{}", group.key)))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .gap(px(10.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(sb.row_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(&key, cx)))
+                    .child(project_icon(representative, tokens, false, 16., self.favicon(representative)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(sb.foreground.opacity(0.9))
+                            .child(group.display_name.clone()),
+                    )
+                    .children(dot)
+                    .when(collapsed && hidden > 0, |el| {
+                        el.child(
+                            text_xs(div())
+                                .flex_none()
+                                .text_color(sb.muted_foreground)
+                                .group_hover(FOLDER_GROUP, |s| s.invisible())
+                                .child(hidden.to_string()),
+                        )
+                    })
+                    .child(chevron)
+                    .context_menu(self.folder_menu(group, cx)),
+            )
+            .child(new_thread)
+            .into_any_element()
+    }
+
+    /// The folder's right-click menu (`handleProjectFolderContextMenu`).
+    fn folder_menu(
+        &self,
+        group: &ProjectGroup,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let workspace = cx.weak_entity();
+        let project_id = group.representative().id.clone();
+        let root = group.representative().workspace_root.clone();
+        let member_ids: Vec<String> = group.members.iter().map(|m| m.project.id.clone()).collect();
+        let pinned = group.pinned;
+        move |menu, _, _| {
+            let (new_in, pin) = (workspace.clone(), workspace.clone());
+            let settings = workspace.clone();
+            let (project_id, root, member_ids) = (project_id.clone(), root.clone(), member_ids.clone());
+            menu.item(PopupMenuItem::new("New thread").on_click(move |_, window, cx| {
+                let _ = new_in.update(cx, |this, cx| this.start_draft(project_id.clone(), window, cx));
+            }))
+            .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(root.clone()));
+            }))
+            .item(
+                PopupMenuItem::new(if pinned { "Unpin project" } else { "Pin project" })
+                    .icon(Icon::new(if pinned { IconName::PinOff } else { IconName::Pin }))
+                    .on_click(move |_, _, cx| {
+                        let _ = pin.update(cx, |this, cx| this.set_projects_pinned(&member_ids, !pinned, cx));
+                    }),
+            )
+            .item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
+                move |_, _, cx| {
+                    let _ = settings.update(cx, |this, cx| this.open_settings("projects", cx));
+                },
+            ))
+        }
+    }
+
+    /// A one-line thread row in a folder (`variant="folder"`), or with the card's branch line
+    /// under it (`folder-multiline`). Titles line up with the folder name, past its icon.
+    #[allow(clippy::too_many_arguments)]
+    fn render_folder_row(
+        &self,
+        facts: Facts,
+        project: Option<&ProjectShell>,
+        multiline: bool,
+        active: bool,
+        now: i64,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sb = tokens.sidebar;
+        let thread = facts.thread;
+        let status = facts.status();
+        let unread = facts.is_unread();
+        let woke = facts.is_woke(now);
+        let recede = inbox::recedes(status, unread, woke, active);
+        let goal = thread.goal.as_ref().is_some_and(|g| g.status == "active");
+        // Folder rows have no status line, so the status takes the time slot.
+        let label: AnyElement = match top_status(status, woke, unread, goal, tokens) {
+            Some((name, label, color)) => h_flex()
+                .gap(px(4.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .child(icon(name, 12., color))
+                .child(label)
+                .into_any_element(),
+            None => div()
+                .text_color(sb.secondary_label)
+                .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
+                .into_any_element(),
+        };
+        let thread_id = thread.id.clone();
+        let settle = h_flex()
+            .id(SharedString::from(format!("folder-settle-{}", thread.id)))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .px(px(8.))
+            .rounded(px(6.))
+            .invisible()
+            .group_hover(ROW_GROUP, |s| s.visible())
+            .text_color(tokens.muted_foreground)
+            .hover(|s| s.text_color(sb.foreground))
+            .tooltip(tooltip("Settle thread"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.settle_thread(&thread_id, true, window, cx);
+            }))
+            .child(Icon::new(IconName::Check).size(px(12.)));
+        let time_slot = text_xs(h_flex())
+            .relative()
+            .ml_auto()
+            .h(px(24.))
+            .min_w(px(32.))
+            .flex_none()
+            .justify_end()
+            .child(div().group_hover(ROW_GROUP, |s| s.invisible()).child(label))
+            .child(settle);
+        let title_color = if recede {
+            sb.foreground.opacity(0.75)
+        } else if status == Status::Failed && !unread && !woke {
+            sb.foreground.opacity(0.95)
+        } else {
+            sb.foreground
+        };
+        let title = text_sm(div())
+            .min_w_0()
+            .flex_1()
+            .truncate()
+            .font_weight(if recede { FontWeight::NORMAL } else { FontWeight::MEDIUM })
+            .text_color(title_color)
+            .when(recede, |el| el.group_hover(ROW_GROUP, |s| s.text_color(sb.foreground)))
+            .when(thread.title_regeneration.is_some(), |el| el.opacity(0.55))
+            .child(thread.title.clone());
+        let meta = if multiline { self.render_meta_line(&facts, tokens, cx) } else { None };
+        let title_icons = if multiline && meta.is_none() { self.provider_mark(&facts, sb.foreground) } else { None };
+        let line = h_flex()
+            .when(multiline, |el| el.h(px(24.)))
+            .when(!multiline, |el| el.size_full())
+            .min_w_0()
+            .gap(px(10.))
+            .child(title)
+            .map(|el| self.with_rename(el, &thread.id, 36., tokens, cx))
+            .children(title_icons);
+        let line = if multiline { line } else { line.children(self.render_running_terminals(&thread.id, cx)) };
+        let line = line.child(time_slot);
+        let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
+        let (open_id, hover_id) = (thread.id.clone(), thread.id.clone());
+        v_flex()
+            .id(SharedString::from(format!("thread-{}", thread.id)))
+            .group(ROW_GROUP)
+            .relative()
+            .flex_none()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(&hover_id, *hovered, cx)))
+            .children(self.render_hover_card(&facts, project, tokens))
+            .map(|el| if multiline { el.justify_center().py(px(6.)) } else { el.h(px(36.)) })
+            .pl(px(36.))
+            .pr(px(10.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .when(receding_run, |el| el.opacity(0.7))
+            .map(|el| {
+                if active {
+                    el.bg(sb.row_active)
+                } else {
+                    el.hover(move |s| {
+                        let s = s.bg(sb.row_hover);
+                        if receding_run { s.opacity(1.) } else { s }
+                    })
+                }
+            })
+            .on_click(
+                cx.listener(move |this, event: &ClickEvent, window, cx| this.click_row(&open_id, event, window, cx)),
+            )
+            .child(line)
+            .children(meta)
+            .context_menu(self.row_menu(&thread.id, cx))
             .into_any_element()
     }
 
@@ -1783,4 +2350,23 @@ pub(in crate::app) fn project_icon(
                 .children(glyphs.into_iter().map(|glyph| SharedString::from(glyph.to_string()))),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_art_follows_the_mode_and_a_nightly_server() {
+        assert_eq!(stage_art("dev-artwork", None), Some(StageArt::Dev));
+        assert_eq!(stage_art("nightly-artwork", Some("0.0.20")), Some(StageArt::Nightly));
+        // This build has no stage of its own: `artwork` shows art only for a Nightly server.
+        assert_eq!(stage_art("artwork", Some("0.0.20")), None);
+        assert_eq!(stage_art("artwork", Some("0.0.20-nightly.20261104.3")), Some(StageArt::Nightly));
+        assert_eq!(stage_art("artwork", Some("0.0.20-preview.20261104.12")), Some(StageArt::Nightly));
+        assert_eq!(stage_art("artwork", Some("0.0.20-nightly.2026114.3")), None);
+        assert_eq!(stage_art("artwork", Some("0.0.20-beta.1")), None);
+        assert_eq!(stage_art("pill", Some("0.0.20-nightly.20261104.3")), None);
+        assert_eq!(stage_art("none", None), None);
+    }
 }

@@ -100,7 +100,7 @@ impl Workspace {
     pub(in crate::app) fn settings_project_groups(&self) -> Vec<ProjectGroup> {
         groups::build_groups(
             &self.shell.projects,
-            &GroupingSettings::from_json(&self.client_settings.values),
+            &GroupingSettings::from_settings(&self.client_settings.values),
             self.server_info.environment_id.as_deref().unwrap_or_default(),
             self.server_info.scratch_workspace_root.as_deref(),
         )
@@ -436,9 +436,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut grouping = GroupingSettings::from_json(&self.client_settings.values);
+        let mut grouping = GroupingSettings::from_settings(&self.client_settings.values);
         grouping.set_override(&physical_key, mode);
-        self.update_settings(json!({"sidebarProjectGroupingOverrides": grouping.overrides_json()}), window, cx);
+        self.update_settings(serde_json::Value::Object(grouping.overrides_patch()), window, cx);
     }
 
     /// The project's own favicon when it shows one (no custom icon).
@@ -694,7 +694,7 @@ impl Workspace {
     fn render_checkouts(&mut self, group: &ProjectGroup, cx: &mut Context<Self>) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let several = group.members.len() > 1;
-        let grouping = GroupingSettings::from_json(&self.client_settings.values);
+        let grouping = GroupingSettings::from_settings(&self.client_settings.values);
         let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "Environment".into());
         let mut rows = vec![
             div()
