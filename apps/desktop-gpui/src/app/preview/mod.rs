@@ -252,13 +252,14 @@ impl Workspace {
     }
 
     /// Whether GPUI draws over the browser's area: a native view would cover it on Windows.
-    fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
+    pub(super) fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
         self.page.is_some()
             || self.settings.is_some()
             || self.palette.is_some()
             || self.preview.menu_open
             || self.right_panel.add_menu_open
             || self.tab_menu_open()
+            || self.files.menu_open
             || window.has_active_dialog(cx)
     }
 

@@ -131,7 +131,7 @@ pub(super) fn editor_label(id: &str) -> &str {
 }
 
 /// The editor's logo (`OpenInPicker.tsx` `resolveOpenInOptions`), full color where the web's is.
-fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
+pub(super) fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
     let size = px(16.);
     match id {
         "vscode" => img("icons/app/vscode.svg").size(size).flex_none().into_any_element(),

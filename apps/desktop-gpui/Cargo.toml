@@ -16,7 +16,7 @@ async-channel = "2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 env_logger = "0.11"
-# Inflates Open VSX theme packages; GPUI already builds this crate.
+# Inflates Open VSX theme packages and gzip archives in file previews; GPUI already builds this crate.
 flate2 = "1"
 futures = "0.3"
 getrandom = "0.3"
@@ -65,6 +65,10 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 unicode-segmentation = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+# File previews: zip archives and the Office Open XML packages inside them (read only).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# Office documents' XML parts; GPUI's SVG renderer already builds it.
+roxmltree = "0.21"
 wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 
 [build-dependencies]

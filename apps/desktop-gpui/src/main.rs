@@ -8,6 +8,7 @@ mod composer_text;
 mod desktop;
 mod device;
 mod environments;
+mod file_icons;
 mod inbox;
 mod keybindings;
 mod model;
