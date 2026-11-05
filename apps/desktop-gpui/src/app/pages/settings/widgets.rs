@@ -20,9 +20,10 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
@@ -1240,32 +1241,7 @@ impl Workspace {
             Some(_) => "Unavailable environment".to_owned(),
             None => "All environments".to_owned(),
         };
-        // Groups come sorted by name; a name shared by several shows where each lives, and
-        // archived ones say so (`ProjectScopeMenu`).
-        let projects: Rc<Vec<ScopeProject>> = Rc::new(
-            view.groups
-                .iter()
-                .map(|group| {
-                    let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
-                    let representative = group.representative();
-                    let location =
-                        shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
-                    let secondary = match (group.archived, location) {
-                        (true, Some(location)) => Some(format!("Archived · {location}")),
-                        (true, None) => Some("Archived".to_owned()),
-                        (false, location) => location,
-                    };
-                    ScopeProject {
-                        key: group.key.clone(),
-                        name: group.display_name.clone(),
-                        secondary,
-                        icon: representative.project_icon.clone(),
-                        title: representative.title.clone(),
-                        favicon: self.favicon(representative),
-                    }
-                })
-                .collect(),
-        );
+        let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
         let environment = (view.environment_id.clone(), view.environment_label.clone());
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
@@ -1276,15 +1252,30 @@ impl Workspace {
                 });
             }
         };
-        let project_menu = {
+        let picker = self.settings_ui.project_picker.as_ref().filter(|_| projects.len() > SCOPE_MENU_LIMIT);
+        let project_menu = if let Some(picker) = picker {
+            Select::new(&picker.state)
+                .small()
+                .max_w(px(288.))
+                .search_placeholder("Search projects")
+                .empty(|_, cx| {
+                    div()
+                        .p(px(8.))
+                        .text_sm()
+                        .text_color(theme::tokens(cx).muted_foreground)
+                        .child("No matches found.")
+                        .into_any_element()
+                })
+                .menu_width(px(320.))
+                .into_any_element()
+        } else {
             let (search, workspace, projects) = (search.clone(), workspace.clone(), projects.clone());
             let icon = selected.map(|group| {
                 let project = group.representative();
                 project_icon(project.project_icon.as_ref(), &project.title, self.favicon(project), 14., &t)
             });
-            scope_trigger("settings-scope-project", icon, project_label, &t).dropdown_menu_with_anchor(
-                gpui_kit::Anchor::TopLeft,
-                move |mut menu, _, _| {
+            scope_trigger("settings-scope-project", icon, project_label, &t)
+                .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
                     menu = menu
                         .item(
                             PopupMenuItem::new("All projects")
@@ -1313,8 +1304,8 @@ impl Workspace {
                         );
                     }
                     menu.max_w(px(320.)).max_h(px(360.)).scrollable(true)
-                },
-            )
+                })
+                .into_any_element()
         };
         let environment_menu = {
             let (search, workspace) = (search.clone(), workspace.clone());
@@ -1440,6 +1431,126 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
 }
 
 /// A project group as the scope sentence's menu lists it.
+/// `ScopeMenu` turns into a searchable combobox past this many projects.
+const SCOPE_MENU_LIMIT: usize = 6;
+
+/// The searchable project scope picker, rebuilt when the project list changes.
+pub(super) struct ScopeProjectPicker {
+    keys: Vec<String>,
+    state: gpui_kit::Entity<SelectState<SearchableVec<ScopeChoice>>>,
+    _subscription: gpui_kit::Subscription,
+}
+
+/// One combobox entry: All projects (`None`) or a project group.
+#[derive(Clone)]
+pub(super) struct ScopeChoice {
+    value: SharedString,
+    project: Option<ScopeProject>,
+}
+
+impl SelectItem for ScopeChoice {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.project.as_ref().map_or_else(|| "All projects".into(), |p| p.name.clone().into())
+    }
+
+    fn value(&self) -> &SharedString {
+        &self.value
+    }
+
+    /// The label, secondary line and key contain the query.
+    fn matches(&self, query: &str) -> bool {
+        let needle = query.trim().to_lowercase();
+        let secondary = self.project.as_ref().and_then(|p| p.secondary.as_deref()).unwrap_or_default();
+        format!("{} {secondary} {}", self.title(), self.value).to_lowercase().contains(&needle)
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
+        let t = theme::tokens(cx);
+        match &self.project {
+            None => h_flex().min_w_0().child("All projects"),
+            Some(ScopeProject { name, secondary, icon, title, favicon, .. }) => {
+                h_flex().min_w_0().gap(px(8.)).child(project_icon(icon.as_ref(), title, favicon.clone(), 14., t)).child(
+                    v_flex().min_w_0().child(div().truncate().child(name.clone())).children(
+                        secondary.clone().map(|secondary| {
+                            div().truncate().text_xs().text_color(t.muted_foreground).child(secondary)
+                        }),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+impl Workspace {
+    /// Groups come sorted by name; a name shared by several shows where each lives, and
+    /// archived ones say so (`ProjectScopeMenu`).
+    fn scope_projects(&self, view: &SettingsView) -> Vec<ScopeProject> {
+        view.groups
+            .iter()
+            .map(|group| {
+                let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
+                let representative = group.representative();
+                let location =
+                    shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
+                let secondary = match (group.archived, location) {
+                    (true, Some(location)) => Some(format!("Archived · {location}")),
+                    (true, None) => Some("Archived".to_owned()),
+                    (false, location) => location,
+                };
+                ScopeProject {
+                    key: group.key.clone(),
+                    name: group.display_name.clone(),
+                    secondary,
+                    icon: representative.project_icon.clone(),
+                    title: representative.title.clone(),
+                    favicon: self.favicon(representative),
+                }
+            })
+            .collect()
+    }
+
+    /// Keeps the searchable project picker on the current projects and scope; it needs a window,
+    /// which the scope sentence does not get.
+    pub(super) fn sync_scope_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Groups never outnumber projects, so few projects skip the grouping.
+        if self.shell.projects.len() <= SCOPE_MENU_LIMIT {
+            self.settings_ui.project_picker = None;
+            return;
+        }
+        let view = self.settings_view();
+        let projects = self.scope_projects(&view);
+        if projects.len() <= SCOPE_MENU_LIMIT {
+            self.settings_ui.project_picker = None;
+            return;
+        }
+        let selected: SharedString = self.settings_ui.scope.project.clone().unwrap_or_default().into();
+        let keys: Vec<String> = projects.iter().map(|p| p.key.clone()).collect();
+        if let Some(picker) = &self.settings_ui.project_picker
+            && picker.keys == keys
+        {
+            let state = picker.state.clone();
+            if state.read(cx).selected_value() != Some(&selected) {
+                state.update(cx, |state, cx| state.set_selected_value(&selected, window, cx));
+            }
+            return;
+        }
+        let mut choices = vec![ScopeChoice { value: SharedString::default(), project: None }];
+        choices.extend(projects.into_iter().map(|p| ScopeChoice { value: p.key.clone().into(), project: Some(p) }));
+        let index = choices.iter().position(|c| c.value == selected).map(gpui_kit::component::IndexPath::new);
+        let state = cx.new(|cx| SelectState::new(SearchableVec::new(choices), index, window, cx).searchable(true));
+        let subscription = cx.subscribe_in(&state, window, |this, _, event: &SelectEvent<_>, _, cx| {
+            let SelectEvent::Confirm(Some(value)) = event else { return };
+            let project = (!value.is_empty()).then(|| value.to_string());
+            this.settings_ui.scope = this.settings_ui.scope.with_project(project);
+            this.settings_ui.target = None;
+            cx.notify();
+        });
+        self.settings_ui.project_picker = Some(ScopeProjectPicker { keys, state, _subscription: subscription });
+    }
+}
+
 #[derive(Clone)]
 struct ScopeProject {
     key: String,

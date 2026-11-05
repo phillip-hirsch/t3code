@@ -158,6 +158,7 @@ pub(in crate::app) struct SettingsUi {
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
     keybinding_toasts: keybinding_toasts::KeybindingToasts,
+    project_picker: Option<widgets::ScopeProjectPicker>,
     /// `GitHubStarPrompt`'s once-per-session guard.
     star_prompt_shown: bool,
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
@@ -196,6 +197,7 @@ impl SettingsUi {
             font_pickers: HashMap::new(),
             keybinding_toasts: Default::default(),
             star_prompt_shown: false,
+            project_picker: None,
             last_grouping_mode: "repository",
             focus: cx.focus_handle(),
             focus_on_render: false,
@@ -316,6 +318,7 @@ impl Workspace {
             window.focus(&self.settings_ui.focus, cx);
         }
         let t = *theme::tokens(cx);
+        self.sync_scope_project_picker(window, cx);
         let content = self.render_settings_section(&section, window, cx);
         Some(
             div()
