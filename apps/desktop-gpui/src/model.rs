@@ -718,6 +718,9 @@ pub struct ThreadShell {
     pub latest_run_started_at: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pub latest_run_completed_at: Option<Option<String>>,
+    /// The user stopped the latest run, which then completes without a notification.
+    #[serde(default)]
+    pub latest_run_stop_requested: Option<bool>,
     #[serde(default, deserialize_with = "present")]
     pub activity_run_started_at: Option<Option<String>>,
     #[serde(default)]

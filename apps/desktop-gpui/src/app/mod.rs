@@ -22,6 +22,7 @@ use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEve
 use crate::runtime;
 use crate::timeline::{self, Row};
 
+mod alerts;
 mod attachments;
 mod chat;
 mod composer;
@@ -39,6 +40,7 @@ mod model_picker;
 mod pages;
 mod palette;
 mod preview;
+mod quit;
 mod right_panel;
 mod send;
 mod sidebar;
@@ -205,6 +207,9 @@ pub struct Workspace {
     /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
     t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
     terminals: terminal::Terminals,
+    /// Thread notifications: toasts, OS notifications and sounds.
+    alerts: alerts::AlertState,
+    quit: quit::QuitState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -239,6 +244,11 @@ impl Workspace {
             }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.clear_system_alerts(window, cx);
+                }
+            }),
         ];
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
@@ -315,6 +325,8 @@ impl Workspace {
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),
             terminals: terminal::Terminals::default(),
+            alerts: Default::default(),
+            quit: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -523,6 +535,7 @@ impl Workspace {
                     this.shell_retried = false;
                 }
                 this.land(window, cx);
+                this.observe_alerts(window, cx);
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
@@ -871,6 +884,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.quit_key_down(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
                     if this.settings_escape(window, cx) {
@@ -884,6 +901,10 @@ impl Render for Workspace {
                     return;
                 }
                 this.escape_details_popover(event, window, cx);
+            }))
+            .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| this.quit_key_up(event, cx)))
+            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
+                this.quit_modifiers_changed(event, cx)
             }))
             .child(
                 h_flex()
@@ -953,5 +974,6 @@ impl Render for Workspace {
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
             .children(self.render_palette(window, cx))
+            .children(self.render_quit_hint(cx))
     }
 }
