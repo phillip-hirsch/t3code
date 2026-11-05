@@ -63,7 +63,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(|_: &OpenSettings, cx| with_workspace(cx, |workspace, _, cx| workspace.open_settings("general", cx)));
-    cx.on_action(|_: &About, cx| with_workspace(cx, |workspace, _, cx| workspace.open_settings("about", cx)));
+    cx.on_action(|_: &About, _| show_about_panel());
     cx.on_action(|_: &CheckForUpdates, cx| {
         with_workspace(cx, |workspace, window, cx| {
             // `handleCheckForUpdatesMenuClick` while updates are disabled.
@@ -139,20 +139,44 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
-fn with_active_window(cx: &mut App, act: impl FnOnce(&mut gpui_kit::Window)) {
-    if let Some(window) = cx.active_window() {
-        let _ = window.update(cx, |_, window, _| act(window));
-    }
+/// Acts on the focused window. GPUI runs app-level action handlers while it holds that window
+/// (`App::dispatch_action`), so the update waits until it is handed back.
+fn with_active_window(cx: &mut App, act: impl FnOnce(&mut gpui_kit::Window) + 'static) {
+    cx.defer(|cx| {
+        let Some(window) = cx.active_window() else { return };
+        if let Err(error) = window.update(cx, |_, window, _| act(window)) {
+            log::warn!("menu action could not reach the active window: {error:#}");
+        }
+    });
 }
 
+/// Acts on the main window's workspace, after GPUI hands the active window back.
 fn with_workspace(
     cx: &mut App,
-    act: impl FnOnce(&mut Workspace, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>),
+    act: impl FnOnce(&mut Workspace, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>) + 'static,
 ) {
     let Some(main) = cx.try_global::<MainWindow>() else { return };
     let (window, workspace) = (main.window, main.workspace.clone());
-    let _ = window.update(cx, |_, window, cx| {
-        window.activate_window();
-        let _ = workspace.update(cx, |workspace, cx| act(workspace, window, cx));
+    cx.defer(move |cx| {
+        let updated = window.update(cx, |_, window, cx| {
+            window.activate_window();
+            workspace.update(cx, |workspace, cx| act(workspace, window, cx))
+        });
+        if let Err(error) = updated.and_then(|updated| updated) {
+            log::warn!("menu action could not reach the workspace: {error:#}");
+        }
     });
+}
+
+/// Electron's `role: "about"`: AppKit's standard About panel, which reads the bundle's name and
+/// version.
+fn show_about_panel() {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(main_thread) = objc2_foundation::MainThreadMarker::new() else {
+            log::warn!("the About panel can only open from the main thread");
+            return;
+        };
+        objc2_app_kit::NSApplication::sharedApplication(main_thread).orderFrontStandardAboutPanel(None);
+    }
 }
