@@ -71,6 +71,8 @@ pub enum Row {
         id: SharedString,
         label: SharedString,
     },
+    /// A centered lifecycle label between hairlines (`TimelineSystemDivider`): a stop, a fork.
+    System(Rc<SystemDivider>),
     /// A subagent's card, opening its thread (`SubagentTimelineLink`).
     Subagent(Rc<SubagentCard>),
     /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
@@ -148,6 +150,44 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         title: title.into(),
         attachment_id: text(page, "attachmentId")?.to_owned().into(),
         app_server: None,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemDivider {
+    pub id: SharedString,
+    pub label: SharedString,
+    pub detail: Option<SharedString>,
+    pub fork: bool,
+    /// The action's label and the thread it opens.
+    pub action: Option<(SharedString, SharedString)>,
+}
+
+/// `V2LifecycleRow`'s divider for a finished stop or a fork.
+fn system_divider(item: &TurnItem) -> Option<SystemDivider> {
+    let text = |pointer: &str| {
+        item.raw
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(|v| SharedString::from(v.to_owned()))
+    };
+    let (label, detail, action): (&str, _, _) = match item.item_type.as_str() {
+        "run_interrupt_result" => ("Run interrupted", text("/message"), None),
+        "fork" if item.raw.pointer("/source/type").and_then(Value::as_str) == Some("run") => (
+            "Forked from conversation",
+            None,
+            text("/source/threadId").map(|id| (SharedString::from("Open source conversation"), id)),
+        ),
+        "fork" => ("Conversation fork", None, text("/targetThreadId").map(|id| (SharedString::from("Open fork"), id))),
+        _ => return None,
+    };
+    Some(SystemDivider {
+        id: item.id.clone().into(),
+        label: label.into(),
+        detail,
+        fork: item.item_type == "fork",
+        action,
     })
 }
 
@@ -457,6 +497,7 @@ enum Kind {
         label: SharedString,
         item_type: SharedString,
         subagent: Option<Rc<SubagentCard>>,
+        system: Option<Rc<SystemDivider>>,
     },
     Embed(Rc<Embed>),
     Request(Rc<RequestCard>),
@@ -608,6 +649,7 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
             label: event_label(item, inherited).into(),
             item_type: item.item_type.clone().into(),
             subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
+            system: system_divider(item).map(Rc::new),
         },
         _ => match embed(item) {
             Some(embed) => Kind::Embed(Rc::new(embed)),
@@ -1331,6 +1373,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
             }
             Kind::Plan { markdown } => rows.push(Row::Plan { id: entry.id.clone(), markdown: markdown.clone() }),
             Kind::Event { subagent: Some(card), .. } => rows.push(Row::Subagent(card.clone())),
+            Kind::Event { system: Some(divider), .. } => rows.push(Row::System(divider.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Request(card) => rows.push(Row::Request(card.clone())),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
@@ -1501,6 +1544,7 @@ mod tests {
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
+                Row::System(divider) => format!("system {}", divider.label),
                 Row::Request(card) => format!("request {}", card.item_id),
             })
             .collect()
@@ -1541,6 +1585,27 @@ mod tests {
         assert_eq!(label("declined"), "GitHub token · Declined");
         assert_eq!(label("cancelled"), "GitHub token · Request ended");
         assert_eq!(label("pending"), "GitHub token · Waiting for an answer in the original thread");
+    }
+
+    #[test]
+    fn stops_and_forks_read_as_dividers() {
+        let item = |raw: Value| serde_json::from_value::<TurnItem>(raw).unwrap();
+        let stopped =
+            system_divider(&item(json!({"id": "s", "type": "run_interrupt_result", "message": "Stopped by user"})));
+        assert_eq!(
+            stopped.as_ref().map(|d| (d.label.as_ref(), d.detail.as_deref())),
+            Some(("Run interrupted", Some("Stopped by user")))
+        );
+        let forked =
+            system_divider(&item(json!({"id": "f", "type": "fork", "source": {"type": "run", "threadId": "src"}})))
+                .unwrap();
+        assert_eq!(forked.label, "Forked from conversation");
+        assert_eq!(forked.action, Some(("Open source conversation".into(), "src".into())));
+        let fork = system_divider(&item(
+            json!({"id": "f", "type": "fork", "source": {"type": "thread"}, "targetThreadId": "t"}),
+        ))
+        .unwrap();
+        assert_eq!(fork.action, Some(("Open fork".into(), "t".into())));
     }
 
     #[test]

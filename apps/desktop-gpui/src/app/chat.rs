@@ -526,8 +526,95 @@ fn render_row(
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
         Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
         Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
     }
+}
+
+/// `TimelineSystemDivider`: icon, label and detail between hairlines; a pill when it opens a thread.
+fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+    let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
+    let icon = if divider.fork { IconName::GitFork } else { IconName::CircleStop };
+    let content = |el: gpui_kit::Stateful<gpui_kit::Div>| {
+        el.flex()
+            .min_w_0()
+            .items_center()
+            .gap(px(6.))
+            .child(Icon::new(icon).size(px(12.)).flex_none())
+            .child(div().font_weight(FontWeight::MEDIUM).child(divider.label.clone()))
+            .children(
+                divider
+                    .detail
+                    .clone()
+                    .map(|d| div().min_w_0().max_w(px(320.)).opacity(0.7).child(format!("·\u{a0}{d}"))),
+            )
+    };
+    let center = match &divider.action {
+        Some((label, thread_id)) => {
+            let (this, thread_id, label) = (this.clone(), thread_id.clone(), label.clone());
+            content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded_full()
+                .border_1()
+                .border_color(alpha(t.border, 0.7))
+                .bg(t.background)
+                .cursor_pointer()
+                .hover(|style| style.bg(t.accent).text_color(t.foreground))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .on_click(move |_, window, cx| {
+                    let thread_id = thread_id.to_string();
+                    let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+                })
+                .into_any_element()
+        }
+        None => content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+            .flex_wrap()
+            .justify_center()
+            .px(px(8.))
+            .py(px(4.))
+            .into_any_element(),
+    };
+    h_flex()
+        .min_w_0()
+        .gap(px(8.))
+        .py(px(8.))
+        .text_size(px(11.))
+        .text_color(t.muted_foreground)
+        .child(line())
+        .child(center)
+        .child(line())
+        .into_any_element()
+}
+
+/// "Open chat" on a created thread, "Open subagent" on a subagent's notification (`WorkEntryLogRow`).
+fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> Option<AnyElement> {
+    let raw = &entry.item.0.raw;
+    let text = |pointer: &str| raw.pointer(pointer).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty());
+    let (label, thread_id, color) = match entry.item_type.as_ref() {
+        "thread_created" => ("Open chat", text("/targetThreadId")?, t.primary),
+        "notification" if matches!(text("/source/kind"), Some("subagent" | "delegated_task")) => {
+            ("Open subagent", text("/source/childThreadId")?, t.foreground)
+        }
+        _ => return None,
+    };
+    let (this, thread_id) = (this.clone(), thread_id.to_owned());
+    Some(
+        div()
+            .id(ElementId::Name(format!("open-thread:{}", entry.id).into()))
+            .flex_none()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|style| style.underline())
+            .child(label)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                let thread_id = thread_id.clone();
+                let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+            })
+            .into_any_element(),
+    )
 }
 
 /// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
@@ -1490,7 +1577,9 @@ fn single_entry(
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     let expandable = expandable(entry, label);
-    let line = work_line(entry.icon(), color, label_text, label_color, Some(chevron(expandable, expanded, t)));
+    let trailing =
+        h_flex().gap(px(6.)).children(entry_open_link(entry, this, t)).child(chevron(expandable, expanded, t));
+    let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
         row.cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
@@ -1521,7 +1610,19 @@ fn detail_entry(
         .px(px(2.))
         .rounded(px(6.))
         .when(expandable, |this| this.cursor_pointer())
-        .child(work_line(entry.icon(), color, shown, label_color, Some(chevron(expandable, expanded, t))))
+        .child(work_line(
+            entry.icon(),
+            color,
+            shown,
+            label_color,
+            Some(
+                h_flex()
+                    .gap(px(6.))
+                    .children(entry_open_link(entry, this, t))
+                    .child(chevron(expandable, expanded, t))
+                    .into_any_element(),
+            ),
+        ))
         .children(details)
         .when(expandable, |row| row.on_click(toggle(this, timeline::entry_key(&entry.id))))
         .into_any_element()
