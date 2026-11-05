@@ -17,6 +17,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),
     ("icons/app/apple.svg", include_bytes!("../assets/icons/apple.svg")),
     ("icons/app/android.svg", include_bytes!("../assets/icons/android.svg")),
+    ("icons/app/linux.svg", include_bytes!("../assets/icons/linux.svg")),
+    ("icons/app/mac-mini.svg", include_bytes!("../assets/icons/mac-mini.svg")),
+    ("icons/app/mac-studio.svg", include_bytes!("../assets/icons/mac-studio.svg")),
+    ("icons/app/onepassword.svg", include_bytes!("../assets/icons/onepassword.svg")),
 ];
 
 /// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
@@ -34,7 +38,9 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "archive-x",
     "bot",
     "brain",
+    "building",
     "chart-no-axes-column",
+    "chevrons-left-right-ellipsis",
     "chevron-down",
     "circle-arrow-up",
     "circle-dashed",

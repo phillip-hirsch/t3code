@@ -186,6 +186,7 @@ impl ServerInfo {
         match event.get("type").and_then(Value::as_str).unwrap_or_default() {
             "snapshot" => {
                 let config = &event["config"];
+                self.config = config.clone();
                 self.providers = lossy(&config["providers"])?;
                 self.providers_json = config["providers"].as_array().cloned().unwrap_or_default();
                 self.apply_settings(&config["settings"])?;
@@ -195,7 +196,6 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
-                self.config = config.clone();
             }
             "providerStatuses" => {
                 self.providers = lossy(&event["payload"]["providers"])?;
