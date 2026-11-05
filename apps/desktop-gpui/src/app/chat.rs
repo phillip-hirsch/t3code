@@ -132,6 +132,7 @@ impl Workspace {
         let working = rows.iter().any(|row| match row {
             Row::Working { started_at: Some(_) } => true,
             Row::Now(line) => line.ticks(),
+            Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
             Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
             _ => false,
         });
@@ -499,6 +500,9 @@ fn render_row(
         }
         // Subagent rows carry no bottom space of their own.
         Row::Subagent(card) => lane(0., subagent_card(card, this, &t)).into_any_element(),
+        Row::SubagentGroup { key, cards, expanded } => {
+            lane(0., subagent_group(key, cards, *expanded, this, &t)).into_any_element()
+        }
         Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
         Row::AttemptFold { key, expanded } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
@@ -714,6 +718,121 @@ fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t:
         }
         None => row.into_any_element(),
     }
+}
+
+/// `V2SubagentGroup`: stacked avatars, "3 subagents" with their statuses, the batch's time,
+/// and the members' cards when open.
+fn subagent_group(
+    key: &SharedString,
+    cards: &[Rc<timeline::SubagentCard>],
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let (summary, active, failed) = timeline::subagent_group_status(cards);
+    let (start, end, live) = timeline::subagent_group_timing(cards);
+    let elapsed = start.and_then(|start| {
+        let end = end.or(live.then(now_ms))?;
+        Some(timeline::agent_elapsed(end - start))
+    });
+    let avatar = |card: &timeline::SubagentCard| {
+        div()
+            .size(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.secondary)
+            .border_2()
+            .border_color(t.background)
+            .child(match crate::assets::provider_icon(&card.driver) {
+                Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+                None => Icon::new(IconName::Bot).size(px(14.)).text_color(muted),
+            })
+    };
+    let more = cards.len().saturating_sub(3);
+    let header = h_flex()
+        .id(ElementId::Name(key.clone()))
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .py(px(8.))
+        .pr(px(13.))
+        .cursor_pointer()
+        .text_color(if expanded || active { t.foreground } else { muted })
+        .when(!expanded && !active, |el| el.opacity(0.55))
+        .hover(|style| style.opacity(1.))
+        .child(
+            h_flex()
+                .flex_none()
+                .children(
+                    cards.iter().take(3).enumerate().map(|(i, card)| avatar(card).when(i > 0, |el| el.ml(px(-6.)))),
+                )
+                .when(more > 0, |el| {
+                    el.child(
+                        div()
+                            .ml(px(-6.))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(t.muted)
+                            .border_2()
+                            .border_color(t.background)
+                            .text_size(px(9.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(format!("+{more}")),
+                    )
+                }),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{} subagents", cards.len())))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(if active {
+                            t.info
+                        } else if failed {
+                            t.error
+                        } else {
+                            muted
+                        })
+                        .child(summary),
+                ),
+        )
+        .children(elapsed.map(|e| div().flex_none().text_xs().text_color(muted).child(e)))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .text_color(muted),
+        )
+        .on_click(toggle(this, key.clone()));
+    v_flex()
+        .w_full()
+        .pb(px(8.))
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                v_flex()
+                    .mt(px(4.))
+                    .mb(px(4.))
+                    .p(px(4.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(alpha(t.border, 0.6))
+                    .bg(alpha(t.card, 0.3))
+                    .children(cards.iter().map(|card| subagent_card(card, this, t))),
+            )
+        })
+        .into_any_element()
 }
 
 /// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.

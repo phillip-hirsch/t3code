@@ -73,6 +73,12 @@ pub enum Row {
     },
     /// A centered lifecycle label between hairlines (`TimelineSystemDivider`): a stop, a fork.
     System(Rc<SystemDivider>),
+    /// Subagents one provider turn started, folded under "3 subagents" (`V2SubagentGroup`).
+    SubagentGroup {
+        key: SharedString,
+        cards: Vec<Rc<SubagentCard>>,
+        expanded: bool,
+    },
     /// A subagent's card, opening its thread (`SubagentTimelineLink`).
     Subagent(Rc<SubagentCard>),
     /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
@@ -301,6 +307,62 @@ pub struct SubagentCard {
     pub completed_at: Option<SharedString>,
     pub child_thread_id: Option<SharedString>,
     pub driver: SharedString,
+    pub status: SharedString,
+    /// Subagents one provider turn started together group into one row.
+    pub run_id: Option<SharedString>,
+    pub provider_turn_id: Option<SharedString>,
+}
+
+/// `subagentGroupSummary` + `summarizeSubagentStatuses`: "2 working · 1 done", and whether
+/// any still runs or failed.
+pub fn subagent_group_status(cards: &[Rc<SubagentCard>]) -> (String, bool, bool) {
+    let mut counts = [("working", 0), ("done", 0), ("failed", 0), ("stopped", 0), ("idle", 0)];
+    for card in cards {
+        let slot = match card.status.as_ref() {
+            "pending" | "running" | "waiting" => 0,
+            "completed" => 1,
+            "failed" => 2,
+            "idle" => 4,
+            _ => 3,
+        };
+        counts[slot].1 += 1;
+    }
+    let summary = counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(key, count)| format!("{count} {key}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (summary, counts[0].1 > 0, counts[2].1 > 0)
+}
+
+/// `subagentGroupTiming`: the earliest start to the latest end, open while any runs.
+pub fn subagent_group_timing(cards: &[Rc<SubagentCard>]) -> (Option<i64>, Option<i64>, bool) {
+    let ms = |at: &Option<SharedString>| at.as_deref().and_then(work_log::parse_iso_ms);
+    let start = cards.iter().filter_map(|c| ms(&c.started_at)).min();
+    let live = cards.iter().any(|c| c.live);
+    let end_unknown = cards.iter().any(|c| ms(&c.completed_at).is_none());
+    let end = cards.iter().filter_map(|c| ms(&c.completed_at)).max().filter(|_| !live && !end_unknown);
+    (start, end, live)
+}
+
+pub fn subagent_group_key(first_id: &str) -> SharedString {
+    format!("subagent-group:{first_id}").into()
+}
+
+/// Joins `card` to the subagent row before it when both came from the same provider turn.
+fn push_subagent(rows: &mut Vec<Row>, card: Rc<SubagentCard>, expanded: &HashSet<SharedString>) {
+    let same = |other: &SubagentCard| other.run_id == card.run_id && other.provider_turn_id == card.provider_turn_id;
+    match rows.last_mut() {
+        Some(Row::Subagent(previous)) if same(previous) => {
+            let key = subagent_group_key(&previous.id);
+            let cards = vec![previous.clone(), card];
+            *rows.last_mut().expect("a last row") =
+                Row::SubagentGroup { expanded: expanded.contains(&key), key, cards };
+        }
+        Some(Row::SubagentGroup { cards, .. }) if cards.first().is_some_and(|first| same(first)) => cards.push(card),
+        _ => rows.push(Row::Subagent(card)),
+    }
 }
 
 /// `formatSubagentDisplayTitle`: drops "Subagent: " and names a `/root/.../name_x` path "Name X".
@@ -384,6 +446,9 @@ fn subagent_card(item: &TurnItem) -> SubagentCard {
         completed_at: text("completedAt").map(|s| s.to_owned().into()),
         child_thread_id: text("childThreadId").map(|s| s.to_owned().into()),
         driver: text("driver").unwrap_or_default().to_owned().into(),
+        status: item.status.clone().into(),
+        run_id: item.run_id.clone().map(Into::into),
+        provider_turn_id: text("providerTurnId").map(|s| s.to_owned().into()),
     }
 }
 
@@ -1377,7 +1442,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                 continue;
             }
             Kind::Plan { markdown } => rows.push(Row::Plan { id: entry.id.clone(), markdown: markdown.clone() }),
-            Kind::Event { subagent: Some(card), .. } => rows.push(Row::Subagent(card.clone())),
+            Kind::Event { subagent: Some(card), .. } => push_subagent(&mut rows, card.clone(), expanded),
             Kind::Event { system: Some(divider), .. } => rows.push(Row::System(divider.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Request(card) => rows.push(Row::Request(card.clone())),
@@ -1544,6 +1609,7 @@ mod tests {
                 Row::Divider { label, .. } => format!("divider {label}"),
                 Row::Event { label, .. } => format!("event {label}"),
                 Row::Subagent(card) => format!("subagent {}", card.title),
+                Row::SubagentGroup { cards, .. } => format!("subagents {}", cards.len()),
                 Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
                 Row::Embed(embed) => format!("embed {}", embed.title),
                 Row::Queued { message, .. } => format!("queued {}", message.text),
@@ -1591,6 +1657,33 @@ mod tests {
         assert_eq!(label("declined"), "GitHub token · Declined");
         assert_eq!(label("cancelled"), "GitHub token · Request ended");
         assert_eq!(label("pending"), "GitHub token · Waiting for an answer in the original thread");
+    }
+
+    #[test]
+    fn subagents_from_one_provider_turn_group() {
+        let agent = |id: &str, turn: &str, status: &str| {
+            item(
+                id,
+                "subagent",
+                "r1",
+                "2026-01-01T00:00:01Z",
+                json!({"title": id, "status": status, "providerTurnId": turn}),
+            )
+        };
+        let mut items = turn("r1");
+        items.insert(1, agent("a", "p1", "running"));
+        items.insert(2, agent("b", "p1", "completed"));
+        items.insert(3, agent("c", "p2", "failed"));
+        let p = projection(items, json!([{"id": "r1", "status": "running", "ordinal": 1}]));
+        let rows = rows(&p, &HashSet::new(), &mut EntryCache::default());
+        let Some(Row::SubagentGroup { cards, expanded: false, .. }) =
+            rows.iter().find(|r| matches!(r, Row::SubagentGroup { .. }))
+        else {
+            panic!("expected a group: {:?}", describe(&rows))
+        };
+        assert_eq!(cards.len(), 2);
+        assert_eq!(subagent_group_status(cards), ("1 working · 1 done".to_owned(), true, false));
+        assert!(rows.iter().any(|r| matches!(r, Row::Subagent(card) if card.title == "c")));
     }
 
     #[test]
