@@ -79,6 +79,7 @@ impl Workspace {
     pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
         self.save_custom_answer(cx);
         self.sync_composer_empty(cx);
+        self.reveal_branch_banner();
         let state = self.composer.read(cx);
         if self.prompt_history.as_ref().is_some_and(|h| *h.recalled != *state.value()) {
             self.prompt_history = None;
@@ -572,6 +573,7 @@ impl Workspace {
                 .children(self.render_environment_banner(&t, cx))
                 .children(self.render_fallback_banner(&t, cx))
                 .children(self.render_recovery_banner(&t, cx))
+                .children(self.render_branch_banner(&t, cx))
                 .children(self.render_question(&t, cx))
                 .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
                 .children(self.render_context_strip(&t, cx)),

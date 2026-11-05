@@ -42,12 +42,18 @@ pub(super) struct BannerUi {
     /// The reconnect grace has passed; `_grace` flips it.
     reconnect_warning: bool,
     _grace: Option<Task<()>>,
+    /// `sessionDismissedBranchMismatchKeys`.
+    dismissed_branches: HashSet<String>,
+    /// The mismatch the banner showed for; it stays until the mismatch changes.
+    revealed_branch: Option<String>,
+    restoring_branch: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Variant {
     Error,
     Warning,
+    Info,
 }
 
 /// `getThreadErrorBannerMessage`: a provider's JSON error reads as its `error.message`.
@@ -505,7 +511,7 @@ impl Workspace {
                 .into_any_element()
         });
         let variant = if reconnecting { Variant::Warning } else { Variant::Error };
-        Some(composer_banner(variant, Icon::new(IconName::WifiOff), title.into(), reason, actions, t))
+        Some(composer_banner(variant, Icon::new(IconName::WifiOff), SharedString::from(title), reason, actions, t))
     }
 
     /// Starts the connection over after the server stopped.
@@ -513,6 +519,132 @@ impl Workspace {
         self.connection = Connection::Starting;
         self._connection_task = Self::connect(window, cx);
         cx.notify();
+    }
+
+    /// `resolveLocalCheckoutBranchMismatch`: a thread on the project checkout whose branch moved.
+    fn branch_mismatch(&self) -> Option<(String, String, String)> {
+        let thread = self.open_shell_thread()?;
+        if thread.worktree_path.is_some() {
+            return None;
+        }
+        let branch = thread.branch.clone().filter(|b| !b.is_empty())?;
+        let current = self.vcs.status.as_ref()?.local.ref_name.clone().filter(|c| !c.is_empty() && *c != branch)?;
+        Some((format!("{}:{branch}:{current}", thread.id), branch, current))
+    }
+
+    /// `shouldShowBranchMismatchBanner`: shown once the composer holds a draft, then kept.
+    pub(super) fn reveal_branch_banner(&mut self) {
+        let key = self.branch_mismatch().map(|(key, ..)| key);
+        if !self.composer_empty && key.is_some() {
+            self.banners.revealed_branch = key;
+        } else if self.banners.revealed_branch != key {
+            self.banners.revealed_branch = None;
+        }
+    }
+
+    pub(super) fn render_branch_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (key, branch, current) = self.branch_mismatch()?;
+        let shown = !self.banners.dismissed_branches.contains(&key)
+            && (!self.composer_empty || self.banners.revealed_branch.as_ref() == Some(&key));
+        if !shown {
+            return None;
+        }
+        let restoring = self.banners.restoring_branch.as_ref() == Some(&key);
+        let tooltip: SharedString =
+            format!("This thread last ran on {branch}. Sending will continue on {current}.").into();
+        let title = h_flex()
+            .min_w_0()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(t.muted_foreground)
+                    .child("Branch changed from"),
+            )
+            .child(
+                div()
+                    .id("branch-mismatch-name")
+                    .min_w_0()
+                    .truncate()
+                    .font_family(t.fonts.mono)
+                    .text_color(t.foreground)
+                    .child(branch.clone())
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+            );
+        let (restore_key, dismiss_key) = (key.clone(), key);
+        let actions = h_flex()
+            .gap(px(2.))
+            .child(
+                Button::new("branch-restore")
+                    .ghost()
+                    .xsmall()
+                    .label(if restoring { "Restoring..." } else { "Restore branch" })
+                    .disabled(restoring)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restore_thread_branch(restore_key.clone(), branch.clone(), window, cx)
+                    })),
+            )
+            .child(
+                Button::new("branch-dismiss")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::X).size(px(14.)))
+                    .tooltip("Dismiss branch change notice")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.banners.dismissed_branches.insert(dismiss_key.clone());
+                        cx.notify();
+                    })),
+            );
+        Some(composer_banner(
+            Variant::Info,
+            Icon::new(IconName::GitBranch),
+            title,
+            None,
+            Some(actions.into_any_element()),
+            t,
+        ))
+    }
+
+    /// `handleSwitchCheckoutToThread`: checks the branch out again, then points the thread at it.
+    fn restore_thread_branch(&mut self, key: String, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(client), Some(thread)) = (self.client(), self.open_shell_thread()) else { return };
+        let Some(cwd) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
+        if self.banners.restoring_branch.is_some() {
+            return;
+        }
+        let (thread_id, thread_branch) = (thread.id.clone(), thread.branch.clone());
+        self.banners.restoring_branch = Some(key);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let switched = client.request("vcs.switchRef", json!({"cwd": cwd, "refName": branch})).await;
+            let failure = match switched {
+                Err(error) => Some(("Failed to switch checkout", error.to_string())),
+                Ok(result) => {
+                    let next = result["refName"].as_str().map_or(branch, str::to_owned);
+                    if thread_branch.as_deref() == Some(next.as_str()) {
+                        None
+                    } else {
+                        let command = json!({"type": "thread.metadata.update", "commandId": new_id(),
+                            "threadId": thread_id, "branch": next, "worktreePath": null});
+                        client
+                            .request("orchestration.dispatchCommand", command)
+                            .await
+                            .err()
+                            .map(|e| ("Checkout switched, but the thread could not be updated", e.to_string()))
+                    }
+                }
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.banners.restoring_branch = None;
+                match failure {
+                    Some((title, error)) => window.push_notification(Notification::error(error).title(title), cx),
+                    None => this.focus_composer(window, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_recovery_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -593,7 +725,7 @@ impl Workspace {
         Some(composer_banner(
             Variant::Warning,
             icon,
-            title.into(),
+            SharedString::from(title),
             Some(description.into()),
             Some(actions.into_any_element()),
             t,
@@ -655,7 +787,7 @@ fn copy_admin_request(window: &mut Window, cx: &mut gpui_kit::App) {
 fn colors(variant: Variant, t: &Tokens) -> (Hsla, Hsla, Hsla) {
     match variant {
         Variant::Error => (t.error.opacity(0.32), t.error_foreground, t.error),
-        Variant::Warning => (t.warning.opacity(0.32), t.warning_foreground, t.warning),
+        Variant::Warning | Variant::Info => (t.warning.opacity(0.32), t.warning_foreground, t.warning),
     }
 }
 
@@ -705,7 +837,7 @@ fn alert(
 fn composer_banner(
     variant: Variant,
     icon: Icon,
-    title: SharedString,
+    title: impl IntoElement,
     description: Option<SharedString>,
     actions: Option<AnyElement>,
     t: &Tokens,
@@ -713,6 +845,9 @@ fn composer_banner(
     let (outline, tint) = match variant {
         Variant::Error => (t.error.opacity(0.32), t.error.opacity(0.08)),
         Variant::Warning => (t.warning.opacity(0.28), t.warning.opacity(0.08)),
+        // `neutralOutline`: white 5% in dark, the contrast foreground at 8% in light.
+        Variant::Info if t.dark => (gpui_kit::white().opacity(0.05), gpui_kit::transparent_black()),
+        Variant::Info => (t.foreground.opacity(0.08), gpui_kit::transparent_black()),
     };
     div()
         .mx(px(22.))
