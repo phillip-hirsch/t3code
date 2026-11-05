@@ -175,8 +175,11 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
     getrandom::fill(&mut secret).map_err(|error| anyhow!("random bootstrap secret: {error}"))?;
     let secret = hex(&secret);
 
+    // From Finder or a desktop launcher the app has a bare PATH; the server gets the login shell's.
+    let shell = crate::desktop::shell_env::probe().await;
     // Bootstrap goes over stdin (fd 0): Rust cannot hand fd 3 to a child on Windows.
     let mut command = Command::new(&config.node);
+    command.envs(shell.vars.iter().map(|(name, value)| (name, value)));
     command
         .arg(&config.server_entry)
         .args(["--bootstrap-fd", "0"])
@@ -217,6 +220,7 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
         "desktopBootstrapSecret": secret,
         "tailscaleServeEnabled": tailscale_serve_enabled,
         "tailscaleServePort": tailscale_serve_port,
+        "shellEnvironmentPrepared": shell.prepared,
     });
     let mut stdin = child.stdin.take().context("server stdin")?;
     stdin.write_all(format!("{bootstrap}\n").as_bytes()).await?;

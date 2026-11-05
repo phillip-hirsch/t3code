@@ -7,7 +7,10 @@ pub mod badge;
 pub mod cli;
 pub mod exposure;
 pub mod links;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod linux_url_handler;
 pub mod settings;
+pub mod shell_env;
 pub mod snap_shot;
 pub mod window_state;
 

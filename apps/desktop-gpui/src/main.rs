@@ -134,6 +134,8 @@ fn main() {
             .expect("bundled fonts");
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        desktop::linux_url_handler::register();
         cx.set_global(desktop::Desktop::load(launches, cx));
         open_main_window(cx);
     });

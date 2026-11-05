@@ -16,7 +16,7 @@ pub fn set(window: &gpui_kit::Window, count: usize) {
         if let Ok(handle) = HasWindowHandle::window_handle(window)
             && let RawWindowHandle::Win32(handle) = handle.as_raw()
         {
-            static WORKER: OnceLock<Option<Mutex<Sender<(isize, usize)>>>> = OnceLock::new();
+            static WORKER: Worker<(isize, usize)> = OnceLock::new();
             send_latest(&WORKER, "taskbar-badge", (handle.hwnd.get(), count), || {
                 let mut taskbar = windows_overlay::Taskbar::default();
                 move |(hwnd, count)| {
@@ -35,7 +35,7 @@ pub fn set(window: &gpui_kit::Window, count: usize) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = window;
-        static WORKER: OnceLock<Option<Mutex<Sender<usize>>>> = OnceLock::new();
+        static WORKER: Worker<usize> = OnceLock::new();
         send_latest(&WORKER, "launcher-badge", count, || {
             |count| {
                 if let Err(error) = launcher::set(count) {
@@ -46,11 +46,15 @@ pub fn set(window: &gpui_kit::Window, count: usize) {
     }
 }
 
+/// A badge thread's queue, started on first use (`None` when the thread couldn't start).
+#[cfg(not(target_os = "macos"))]
+type Worker<T> = OnceLock<Option<Mutex<Sender<T>>>>;
+
 /// Hands `update` to the badge's own thread, which `start`s its applier there and applies only
 /// the latest of queued updates (COM, fonts and D-Bus stay off the UI thread).
 #[cfg(not(target_os = "macos"))]
 fn send_latest<T: Send + 'static, F: FnMut(T)>(
-    worker: &'static OnceLock<Option<Mutex<Sender<T>>>>,
+    worker: &'static Worker<T>,
     name: &str,
     update: T,
     start: impl FnOnce() -> F + Send + 'static,
@@ -106,15 +110,14 @@ mod dock {
 }
 
 /// `app.setBadgeCount` on Linux: Unity's launcher API, which GNOME's Dash to Dock, KDE Plasma
-/// and others read for the launcher entry named [`DESKTOP_ENTRY`].
+/// and others read for this app's desktop entry.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod launcher {
     use std::collections::HashMap;
 
     use zbus::zvariant::Value;
 
-    /// The desktop entry an installed build ships, after the app id (`set_app_identity`).
-    pub const DESKTOP_ENTRY: &str = "com.t3tools.t3code.gpui.desktop";
+    use crate::desktop::linux_url_handler::DESKTOP_ENTRY;
 
     pub fn set(count: usize) -> zbus::Result<()> {
         let connection = zbus::blocking::Connection::session()?;

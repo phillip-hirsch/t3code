@@ -146,10 +146,10 @@ async fn read_one(stream: impl tokio::io::AsyncRead + Unpin, sender: async_chann
     use tokio::io::AsyncBufReadExt as _;
     let mut line = Vec::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::AsyncReadExt::take(stream, MAX_MESSAGE_BYTES as u64 + 1));
-    if reader.read_until(b'\n', &mut line).await.is_ok() {
-        if let Some(args) = decode(line.trim_ascii_end()) {
-            let _ = sender.send(args).await;
-        }
+    if reader.read_until(b'\n', &mut line).await.is_ok()
+        && let Some(args) = decode(line.trim_ascii_end())
+    {
+        let _ = sender.send(args).await;
     }
 }
 

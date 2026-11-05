@@ -68,13 +68,14 @@ pub fn init(cx: &mut App) {
         with_workspace(cx, |workspace, window, cx| {
             // `handleCheckForUpdatesMenuClick` while updates are disabled.
             let detail = workspace.about_update_description();
-            let _ = window.prompt(
+            // The prompt stays up without its answer receiver; there is nothing to do after OK.
+            drop(window.prompt(
                 PromptLevel::Info,
                 "Automatic updates are not available right now.",
                 Some(&detail),
                 &["OK"],
                 cx,
-            );
+            ));
         })
     });
     cx.set_menus(menus());
