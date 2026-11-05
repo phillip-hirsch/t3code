@@ -291,6 +291,73 @@ impl Workspace {
         .detach();
         cx.notify();
     }
+
+    /// The open thread can pick up where it stopped (`deriveResumableRunId`, held queue).
+    pub(super) fn can_resume(&self) -> bool {
+        matches!(self.target, Some(Target::Thread(_)))
+            && self.open_projection().is_some_and(|p| p.resumable_run_id().is_some() || p.has_held_queued_runs())
+    }
+
+    /// `useComposerResume`: "Continue where you left off." on the resumable run, then the
+    /// held queue; with nothing to continue, only the queue.
+    pub(super) fn resume_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let (Some(client), Some(projection)) = (self.client(), self.open_projection()) else { return };
+        if self.sending || self.target_rewinding() {
+            return;
+        }
+        let run = projection.resumable_run_id().map(str::to_owned);
+        let held = projection.has_held_queued_runs();
+        let queue_resume = || json!({"type": "queue.resume", "commandId": new_id(), "threadId": thread_id});
+        let mut commands = Vec::new();
+        match run {
+            None if !held => return,
+            None => commands.push(queue_resume()),
+            Some(run) => {
+                let (_, mode) = self.interaction_mode();
+                commands.extend(self.interaction_mode_command(&thread_id, mode));
+                let mut message = json!({
+                    "type": "message.dispatch",
+                    "commandId": new_id(),
+                    "createdBy": "user",
+                    "creationSource": "web",
+                    "threadId": thread_id,
+                    "messageId": new_id(),
+                    "manualContinuationOfRunId": run,
+                    "text": "Continue where you left off.",
+                    "attachments": [],
+                    "dispatchMode": {"type": "start_immediately"},
+                });
+                if let Some(model) = &self.model_override {
+                    message["modelSelection"] = model.to_json();
+                }
+                commands.push(message);
+                if held {
+                    commands.push(queue_resume());
+                }
+            }
+        }
+        self.sending = true;
+        self.error = None;
+        cx.spawn_in(window, async move |this, cx| {
+            let mut result = Ok(Value::Null);
+            for command in commands {
+                result = client.request("orchestration.dispatchCommand", command).await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.sending = false;
+                if let Err(error) = result {
+                    this.error = Some(format!("Could not resume thread. {error}").into());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
 }
 
 #[cfg(test)]

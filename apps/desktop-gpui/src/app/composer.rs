@@ -728,12 +728,31 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        if self.plan_follow_up_target().is_some() {
+        let sendable = !self.composer_empty || self.has_attachments();
+        let can_resume = self.can_resume();
+        if self.plan_follow_up_target().is_some() && (!self.composer_empty || !can_resume) {
             return self.render_plan_follow_up_action(t, cx);
         }
-        let sendable = !self.composer_empty || self.has_attachments();
         if running && !sendable {
             return stop().into_any_element();
+        }
+        if can_resume && !sendable {
+            let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
+            let content = if self.sending {
+                Spinner::new().small().color(t.primary_foreground).into_any_element()
+            } else {
+                Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
+            };
+            return round_button("resume", t.primary, t.primary)
+                .child(content)
+                .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
+                .when(enabled, |el| {
+                    el.cursor_pointer()
+                        .hover(|s| s.bg(t.primary_hover))
+                        .on_click(cx.listener(|this, _, window, cx| this.resume_thread(window, cx)))
+                })
+                .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
+                .into_any_element();
         }
         let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
         let can_send = sendable

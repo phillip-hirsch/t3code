@@ -1030,6 +1030,11 @@ pub struct Run {
     pub active_attempt_id: Option<String>,
     #[serde(default)]
     pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub root_node_id: Option<String>,
+    /// A queued run the server holds until the thread is resumed.
+    #[serde(default)]
+    pub queue_held: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1214,6 +1219,46 @@ pub struct ThreadProjection {
 }
 
 impl ThreadProjection {
+    /// `latestExecutedRun`: the run that ran last, unfinished runs counting as latest.
+    pub fn latest_executed_run(&self) -> Option<&Run> {
+        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::inbox::parse_ms).unwrap_or(i64::MAX);
+        self.runs
+            .iter()
+            .filter(|run| run.status != "queued" && !(run.status == "cancelled" && run.started_at.is_none()))
+            .max_by(|a, b| end(a).cmp(&end(b)).then(a.ordinal.cmp(&b.ordinal)))
+    }
+
+    /// `deriveResumableRunId`: an interrupted last run, or one its provider failed for usage limits.
+    pub fn resumable_run_id(&self) -> Option<&str> {
+        let run = self.latest_executed_run()?;
+        if run.status == "interrupted" {
+            return Some(&run.id);
+        }
+        if run.status != "failed" {
+            return None;
+        }
+        let failure = self
+            .turn_items
+            .iter()
+            .filter(|item| {
+                item.item_type == "error"
+                    && item.status == "failed"
+                    && item.run_id.as_deref() == Some(&run.id)
+                    && item.node_id.is_some()
+                    && item.node_id == run.root_node_id
+            })
+            .max_by(|a, b| {
+                let at = |item: &TurnItem| item.str("updatedAt").and_then(crate::inbox::parse_ms).unwrap_or_default();
+                at(a).cmp(&at(b)).then(a.ordinal.cmp(&b.ordinal)).then(a.id.cmp(&b.id))
+            })?;
+        (failure.raw["failure"]["class"] == "usage_limit").then_some(run.id.as_str())
+    }
+
+    /// Queued runs the server holds until the thread resumes.
+    pub fn has_held_queued_runs(&self) -> bool {
+        self.runs.iter().any(|run| run.status == "queued" && run.queue_held)
+    }
+
     /// The newest turn report, else the active provider thread's snapshot, as
     /// `latestProviderTurnTokenUsage` + `deriveLatestContextWindowSnapshot`
     /// in `packages/client-runtime/src/state/contextWindow.ts`.
@@ -1753,6 +1798,36 @@ mod tests {
         let project: ProjectShell =
             serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
         assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+    }
+
+    #[test]
+    fn resumable_runs_are_interrupted_or_out_of_usage() {
+        let projection = |runs: Value, items: Value| {
+            let projection = json!({"thread": {"id": "t", "title": "t"}, "runs": runs, "turnItems": items});
+            let mut state = ThreadState::default();
+            state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})).unwrap();
+            state.projection.unwrap()
+        };
+        let runs = json!([
+            {"id": "r1", "status": "interrupted", "ordinal": 1, "completedAt": "2026-01-01T00:00:02Z"},
+            {"id": "r2", "status": "completed", "ordinal": 2, "completedAt": "2026-01-01T00:00:01Z"},
+            {"id": "r3", "status": "queued", "ordinal": 3, "queueHeld": true},
+        ]);
+        let interrupted = projection(runs, json!([]));
+        assert_eq!(interrupted.resumable_run_id(), Some("r1"), "the run that ended last, not the highest ordinal");
+        assert!(interrupted.has_held_queued_runs());
+        let failed = json!([{"id": "r1", "status": "failed", "ordinal": 1, "rootNodeId": "n", "completedAt": "2026-01-01T00:00:00Z"}]);
+        let error = |class: &str, node: &str| {
+            json!([{"id": "e", "type": "error", "threadId": "t", "runId": "r1", "nodeId": node, "status": "failed",
+                    "updatedAt": "2026-01-01T00:00:00Z", "failure": {"class": class}}])
+        };
+        assert_eq!(projection(failed.clone(), error("usage_limit", "n")).resumable_run_id(), Some("r1"));
+        assert_eq!(projection(failed.clone(), error("provider_error", "n")).resumable_run_id(), None);
+        assert_eq!(
+            projection(failed, error("usage_limit", "child")).resumable_run_id(),
+            None,
+            "a child node's failure"
+        );
     }
 
     #[test]
