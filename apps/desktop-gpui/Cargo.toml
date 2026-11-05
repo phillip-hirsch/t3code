@@ -16,7 +16,7 @@ async-channel = "2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 env_logger = "0.11"
-# Inflates Open VSX theme packages; GPUI already builds this crate.
+# Inflates Open VSX theme packages and gzip archives in file previews; GPUI already builds this crate.
 flate2 = "1"
 futures = "0.3"
 getrandom = "0.3"
@@ -39,9 +39,10 @@ gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-yaml",
 ] }
 hmac = "0.12"
+# The system zone's IANA name, which usage reads send so the server buckets days locally.
+iana-time-zone = "0.1"
 # Agent browser tabs stream JPEG frames and SnapShots encode PNG; GPUI already builds both codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-jiff = "0.2"
 log = "0.4"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
@@ -64,6 +65,10 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 unicode-segmentation = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+# File previews: zip archives and the Office Open XML packages inside them (read only).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# Office documents' XML parts; GPUI's SVG renderer already builds it.
+roxmltree = "0.21"
 wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 
 [build-dependencies]

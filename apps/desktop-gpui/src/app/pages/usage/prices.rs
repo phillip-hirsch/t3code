@@ -335,10 +335,10 @@ impl Workspace {
     /// Opens "Custom model prices", with a new row for `model` when it has no price yet
     /// (the model dialog's "Set price").
     pub(super) fn open_model_prices(&mut self, model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = &self.server_info.settings;
+        let settings = &self.server_info().settings;
         let prices = settings.get("usagePriceOverrides").clone();
         let aliases = settings.get("usageModelAliases").clone();
-        let label = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let label = self.server_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         let workspace = cx.weak_entity();
         let editor = cx.new(|cx| {
             let mut editor = PriceEditor {

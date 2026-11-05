@@ -366,7 +366,7 @@ impl Render for AcpRegistrySearch {
         let t = *tokens(cx);
         let preparing = self.preparing.is_some();
         let instances =
-            self.workspace.upgrade().map(|w| w.read(cx).server_info.provider_instances.clone()).unwrap_or_default();
+            self.workspace.upgrade().map(|w| w.read(cx).settings_info().provider_instances.clone()).unwrap_or_default();
         let search_bar = h_flex()
             .flex_wrap()
             .gap(px(8.))
@@ -1222,7 +1222,7 @@ impl Render for AcpSessions {
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let (provider, projects) = {
             let workspace = workspace.read(cx);
-            let provider = workspace.server_info.provider(&self.instance_id).cloned();
+            let provider = workspace.settings_info().provider(&self.instance_id).cloned();
             let projects: Vec<_> = workspace.shell.projects.iter().map(|p| (p.id.clone(), p.title.clone())).collect();
             (provider, projects)
         };
@@ -1247,7 +1247,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let provider = self.server_info.provider(instance_id)?;
+        let provider = self.settings_info().provider(instance_id)?;
         if provider.driver != super::add::ACP_REGISTRY {
             return None;
         }

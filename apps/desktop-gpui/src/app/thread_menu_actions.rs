@@ -51,7 +51,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(thread_id) else { return };
         let title = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| t.title.clone()).unwrap_or_default();
         let input = json!({"threadId": thread_id});
         cx.spawn_in(window, async move |this, cx| {

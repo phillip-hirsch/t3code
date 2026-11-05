@@ -33,7 +33,7 @@ use serde_json::json;
 use super::{Connection, Target, Workspace, project_name};
 use crate::inbox::{self, Facts, FolderDot, Status};
 use crate::model::{ProjectShell, ShellState, ThreadShell};
-use crate::project_groups::{self, GroupingSettings, ProjectGroup, SortOrder};
+use crate::project_groups::{self, GroupingSettings, ProjectGroup, ScratchRoot, SortOrder};
 use crate::theme::Tokens;
 
 const DEFAULT_WIDTH: f32 = 256.;
@@ -61,7 +61,8 @@ pub(super) struct SidebarState {
     _hover_card_delay: Option<Task<()>>,
     /// A menu opened by a click rather than a right-click (the snooze menu).
     menu: Option<OpenMenu>,
-    favicons: HashMap<String, Favicon>,
+    /// By environment, workspace root, then favicon path, so a lookup needs no key built.
+    favicons: HashMap<SharedString, HashMap<String, HashMap<Option<String>, Favicon>>>,
     renaming: Option<actions::Renaming>,
     /// The row the last single click opened, for double-click rename.
     clicked: Option<String>,
@@ -69,6 +70,7 @@ pub(super) struct SidebarState {
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
     groups: RefCell<GroupsCache>,
+    search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
     collapsed_folders: HashSet<String>,
     /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
@@ -140,6 +142,7 @@ impl SidebarState {
             undo: None,
             scope: Vec::new(),
             groups: RefCell::default(),
+            search_ranking: RefCell::default(),
             collapsed_folders: HashSet::new(),
             inbox_order: Vec::new(),
             thread_order: Vec::new(),
@@ -169,8 +172,7 @@ struct GroupsKey {
     revision: u64,
     order: SortOrder,
     grouping: GroupingSettings,
-    environment: Option<String>,
-    scratch_root: Option<String>,
+    scratch_roots: Vec<ScratchRoot>,
 }
 
 #[derive(Default)]
@@ -389,7 +391,7 @@ impl SidebarState {
         now: i64,
     ) -> Vec<Item<'a>> {
         let route = match target {
-            Some(Target::Thread(id)) => Some(id.as_str()),
+            Some(Target::Thread { id, .. }) => Some(id.as_str()),
             _ => None,
         };
         let scoped = scoped_groups(groups, &self.scope);
@@ -492,7 +494,9 @@ impl SidebarState {
                         }
                     }
                     Status::Waiting => {
-                        if let Some(from) = inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()) {
+                        if let Some(from) =
+                            crate::timestamp::parse_ms(facts.latest_run_completed_at().unwrap_or_default())
+                        {
                             at(inbox::duration_changes_in(now - from));
                         }
                     }
@@ -525,7 +529,7 @@ impl SidebarState {
         }
         // Waking moves a thread between shelves even while its shelf is collapsed.
         for thread in threads {
-            if let Some(delay) = inbox::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
+            if let Some(delay) = crate::timestamp::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
                 .and_then(|until| inbox::wake_changes_in(until - now))
             {
                 at(delay);
@@ -541,22 +545,18 @@ impl Workspace {
     /// They rebuild only when the shell or those settings change.
     pub(super) fn project_groups(&self) -> Rc<Vec<ProjectGroup>> {
         let settings = &self.client_settings.values;
-        let key = GroupsKey {
-            revision: self.shell.revision,
-            order: SortOrder::from_settings(settings),
-            grouping: GroupingSettings::from_settings(settings),
-            environment: self.server_info.environment_id.clone(),
-            scratch_root: self.server_info.scratch_workspace_root.clone(),
-        };
+        let (order, grouping) = (SortOrder::from_settings(settings), GroupingSettings::from_settings(settings));
         let mut cache = self.sidebar.groups.borrow_mut();
-        if cache.key.as_ref() != Some(&key) {
-            let mut groups = project_groups::build_groups(
-                &self.shell.projects,
-                &key.grouping,
-                key.environment.as_deref().unwrap_or_default(),
-                key.scratch_root.as_deref(),
-                true,
-            );
+        let fresh = cache.key.as_ref().is_some_and(|key| {
+            key.revision == self.shell.revision
+                && key.order == order
+                && key.grouping == grouping
+                && self.scratch_roots_match(&key.scratch_roots)
+        });
+        if !fresh {
+            let key = GroupsKey { revision: self.shell.revision, order, grouping, scratch_roots: self.scratch_roots() };
+            let mut groups =
+                project_groups::build_groups(&self.shell.projects, &key.grouping, &key.scratch_roots, true);
             project_groups::sort_groups(&mut groups, &self.shell.threads, key.order);
             *cache = GroupsCache { key: Some(key), groups: Rc::new(groups) };
         }
@@ -588,14 +588,14 @@ impl Workspace {
     /// The stage art the sidebar header and send button show (`environmentIdentificationMode`).
     pub(super) fn stage_art(&self) -> Option<StageArt> {
         let mode = self.client_settings.values.get("environmentIdentificationMode").as_str().unwrap_or("artwork");
-        let version = self.server_info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        let version = self.server_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
         stage_art(mode, version)
     }
 
     /// The "Nightly" pill of `pill` mode, shown only on a Nightly server.
     fn stage_pill(&self) -> Option<&'static str> {
         let mode = self.client_settings.values.get("environmentIdentificationMode").as_str();
-        let version = self.server_info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        let version = self.server_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
         (mode == Some("pill") && version.is_some_and(is_nightly_version)).then_some("Nightly")
     }
 
@@ -611,16 +611,16 @@ impl Workspace {
         self.sidebar.search.read(cx).value().trim().to_lowercase()
     }
 
-    fn route_thread(&self) -> Option<&str> {
+    pub(super) fn route_thread(&self) -> Option<&str> {
         match &self.target {
-            Some(Target::Thread(id)) => Some(id),
+            Some(Target::Thread { id, .. }) => Some(id),
             _ => None,
         }
     }
 
-    /// Wakes the sidebar after `delay` ms, keeping a pending wake that still
-    /// fits. Idle sidebars wake at most once a minute; only a duration in its
-    /// first minute ticks every second.
+    /// Wakes the sidebar after `delay` ms, replacing a pending wake for another time.
+    /// Idle sidebars wake at most once a minute; only a duration in its first
+    /// minute ticks every second.
     fn arm_sidebar_clock(&mut self, delay: Option<i64>, now: i64, cx: &mut Context<Self>) {
         let at = delay.map(|delay| now + delay.max(0) + 5);
         if at == self.sidebar.clock_at {
@@ -807,6 +807,9 @@ impl Workspace {
     /// (`Sidebar.tsx` row tooltip delay).
     fn hover_row(&mut self, thread_id: &str, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
+            if self.sidebar.hovered.as_deref() == Some(thread_id) {
+                return;
+            }
             self.sidebar.hovered = Some(thread_id.to_owned());
             self.sidebar.hover_card = None;
             let thread_id = thread_id.to_owned();
@@ -824,6 +827,8 @@ impl Workspace {
             self.sidebar.hovered = None;
             self.sidebar.hover_card = None;
             self.sidebar._hover_card_delay = None;
+        } else {
+            return;
         }
         self.notify_sidebar(cx);
     }
@@ -840,7 +845,7 @@ impl Workspace {
         else {
             return;
         };
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(&thread.id) else { return };
         cx.spawn(async move |this, cx| {
             let Ok(status) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
             let Some(branch) = status["refName"].as_str().map(str::to_owned) else { return };
@@ -874,7 +879,7 @@ impl Workspace {
             .as_deref()
             .filter(|_| facts.runtime_status().is_some())
             .or(thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
-        let provider = instance.and_then(|id| self.server_info.provider(id));
+        let provider = instance.and_then(|id| self.server_info().provider(id));
         let model = thread.model_selection.as_ref().map(|selection| {
             let found = provider.and_then(|p| p.models.iter().find(|m| m.slug == selection.model).map(|m| (p, m)));
             match found {
@@ -888,7 +893,7 @@ impl Workspace {
                 svg().path(path).size(px(12.)).text_color(tint.unwrap_or(tokens.foreground).grayscale().opacity(0.6));
             Some(line(mark.into_any_element(), model.into()))
         });
-        let machine = match self.server_info.machine_kind() {
+        let machine = match self.server_info().machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => IconName::Monitor,
             "laptop" => IconName::Laptop,
             "cloud" => IconName::Cloud,
@@ -943,7 +948,10 @@ impl Workspace {
                         project.map(|p| line(project_icon(p, tokens, false, 12., self.favicon(p)), project_name(p))),
                     )
                     .children(
-                        self.server_info.environment_label.clone().map(|label| line(muted_icon(machine), label.into())),
+                        self.server_info()
+                            .environment_label
+                            .clone()
+                            .map(|label| line(muted_icon(machine), label.into())),
                     )
                     .children(thread.branch.clone().map(|branch| line(muted_icon(IconName::GitBranch), branch.into())))
                     .children(mismatch)
@@ -1097,8 +1105,10 @@ impl Workspace {
     /// New thread in the open thread's project, else the first project.
     pub(super) fn new_thread_project(&self) -> Option<String> {
         let current = match &self.target {
-            Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| t.project_id.clone()),
-            Some(Target::Draft { project_id }) => Some(project_id.clone()),
+            Some(Target::Thread { id, .. }) => {
+                self.shell.threads.iter().find(|t| &t.id == id).map(|t| t.project_id.clone())
+            }
+            Some(Target::Draft { project_id, .. }) => Some(project_id.clone()),
             None => None,
         };
         current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(|p| p.id.clone()))
@@ -1136,9 +1146,9 @@ impl Workspace {
         let sb = tokens.sidebar;
         let now = now_ms();
         let query = self.search_query(cx);
-        let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
+        let connected = matches!(self.connection, Connection::Connected | Connection::Connecting);
         let working_shelf =
-            connected && self.shell.live && self.client_settings.values.bool("sidebarWorkingShelfEnabled");
+            connected && self.shell.live() && self.client_settings.values.bool("sidebarWorkingShelfEnabled");
         let boring = self.boring_sidebar();
         let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
         let groups = self.project_groups();
@@ -1172,7 +1182,8 @@ impl Workspace {
             list = list.child(self.render_empty_state(&tokens, cx));
         } else {
             for (index, item) in items.into_iter().enumerate() {
-                let key = item.nav_key();
+                // Only a focused list draws the cursor ring, so only it needs the row keys.
+                let ring = cursor.as_ref().is_some_and(|cursor| item.nav_key().as_ref() == Some(cursor));
                 let element = match item {
                     Item::Draft(row) => {
                         self.render_draft(&row, projects.get(row.project_id.as_str()).copied(), &tokens, cx)
@@ -1211,7 +1222,6 @@ impl Workspace {
                     }
                     Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
                 };
-                let ring = key.is_some() && key == cursor;
                 list = list.child(if ring { focus_ring(element, &tokens) } else { element });
             }
         }
@@ -1462,8 +1472,8 @@ impl Workspace {
                 .child(icon(name, 16., sb.icon))
         };
         let status: Option<(SharedString, Hsla)> = match &self.connection {
-            Connection::Connected(_) if self.shell.live => None,
-            Connection::Connected(_) => Some(("Syncing…".into(), tokens.muted_foreground)),
+            Connection::Connected if self.shell.live() => None,
+            Connection::Connected => Some(("Syncing…".into(), tokens.muted_foreground)),
             Connection::Starting => Some(("Starting server…".into(), tokens.muted_foreground)),
             Connection::Connecting => Some(("Connecting…".into(), tokens.muted_foreground)),
             Connection::Disconnected(reason) => {
@@ -1526,7 +1536,7 @@ impl Workspace {
     /// (`SidebarUpdatePill.tsx`, `isProviderUpdateCandidate`).
     fn render_update_button(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let candidates: Vec<(String, String)> = self
-            .server_info
+            .server_info()
             .providers
             .iter()
             .filter(|p| inbox::is_provider_update_candidate(p))
@@ -1658,7 +1668,7 @@ impl Workspace {
             thread.model_selection.as_ref().map(|m| m.instance_id.as_str())
         }
         .or(thread.provider_instance_id.as_deref())?;
-        let driver = &self.server_info.provider(instance)?.driver;
+        let driver = &self.server_info().provider(instance)?.driver;
         let (path, tint) = crate::assets::provider_icon(driver)?;
         let color = tint.unwrap_or(foreground);
         Some(svg().path(path).size(px(14.)).flex_none().text_color(color.opacity(0.6)).into_any_element())
@@ -1687,7 +1697,7 @@ impl Workspace {
         let woke_status = top.is_some_and(|(_, label, _)| label == "Woke");
         let duration_from = match status {
             Status::Working | Status::Preparing => facts.working_started_at(),
-            Status::Waiting => inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()),
+            Status::Waiting => crate::timestamp::parse_ms(facts.latest_run_completed_at().unwrap_or_default()),
             _ => None,
         };
         let status_label: AnyElement = match top {
@@ -1745,7 +1755,7 @@ impl Workspace {
             .child(Icon::new(IconName::Check).size(px(14.)))
             .child("Settle");
         let discard = draft.then(|| {
-            let target = Target::Thread(thread.id.clone());
+            let target = self.thread_target(&thread.id);
             div()
                 .id(SharedString::from(format!("discard-{}", thread.id)))
                 .flex()
@@ -1759,7 +1769,9 @@ impl Workspace {
                 .tooltip(tooltip("Discard draft"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.discard_draft(target.clone(), window, cx);
+                    if let Some(target) = target.clone() {
+                        this.discard_draft(target, window, cx)
+                    };
                 }))
                 .child(Icon::new(IconName::X).size(px(14.)))
         });
@@ -2204,7 +2216,7 @@ impl Workspace {
                 .gap(px(4.))
                 .text_color(tokens.info_foreground)
                 .child(icon(IconName::AlarmClock, 12., tokens.info_foreground))
-                .child(inbox::format_wake(inbox::parse_ms(until).unwrap_or(now) - now))
+                .child(inbox::format_wake(crate::timestamp::parse_ms(until).unwrap_or(now) - now))
                 .into_any_element(),
             _ if woke => {
                 let color = tokens.warning_foreground;
@@ -2375,13 +2387,13 @@ pub(super) enum Favicon {
     Ready(Arc<Image>),
 }
 
-fn favicon_key(project: &ProjectShell) -> String {
-    format!("{}\0{}", project.workspace_root, project.favicon_path.as_deref().unwrap_or_default())
-}
-
 impl Workspace {
+    fn favicon_state(&self, project: &ProjectShell) -> Option<&Favicon> {
+        self.sidebar.favicons.get(&project.environment_id)?.get(&project.workspace_root)?.get(&project.favicon_path)
+    }
+
     pub(super) fn favicon(&self, project: &ProjectShell) -> Option<Arc<Image>> {
-        match self.sidebar.favicons.get(&favicon_key(project)) {
+        match self.favicon_state(project) {
             Some(Favicon::Ready(image)) => Some(image.clone()),
             _ => None,
         }
@@ -2391,18 +2403,29 @@ impl Workspace {
     /// `project-favicon` resource signs a URL, then the image is read over HTTP
     /// (`createProjectFaviconUrlAtomFamily` in `client-runtime/src/state/assets.ts`).
     fn load_favicons(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
         for project in &self.shell.projects {
-            let key = favicon_key(project);
-            if self.sidebar.favicons.contains_key(&key) {
+            if self.favicon_state(project).is_some() {
                 continue;
             }
-            self.sidebar.favicons.insert(key.clone(), Favicon::Loading);
+            let Some(session) = self.session(&project.environment_id) else { continue };
+            let (Some(client), Some(base)) =
+                (session.client.clone(), session.endpoint.as_ref().map(|e| e.http_base.clone()))
+            else {
+                continue;
+            };
+            let (environment, root, path) =
+                (project.environment_id.clone(), project.workspace_root.clone(), project.favicon_path.clone());
+            self.sidebar
+                .favicons
+                .entry(environment.clone())
+                .or_default()
+                .entry(root.clone())
+                .or_default()
+                .insert(path.clone(), Favicon::Loading);
             let mut resource = json!({"_tag": "project-favicon", "cwd": project.workspace_root});
             if let Some(path) = &project.favicon_path {
                 resource["path"] = path.as_str().into();
             }
-            let (client, base) = (client.clone(), base.clone());
             cx.spawn(async move |this, cx| {
                 let image = async {
                     let signed = client.request("assets.createUrl", json!({"resource": resource})).await.ok()?;
@@ -2429,7 +2452,8 @@ impl Workspace {
                 }
                 .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.sidebar.favicons.insert(key, image.map_or(Favicon::Missing, Favicon::Ready));
+                    let state = image.map_or(Favicon::Missing, Favicon::Ready);
+                    this.sidebar.favicons.entry(environment).or_default().entry(root).or_default().insert(path, state);
                     this.notify_sidebar(cx);
                 });
             })

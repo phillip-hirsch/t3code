@@ -338,7 +338,7 @@ impl Workspace {
     /// `gitCwd`: the thread's worktree, else its project root.
     pub(super) fn git_cwd(&self) -> Option<String> {
         let worktree = match self.target.as_ref()? {
-            Target::Thread(id) => self
+            Target::Thread { id, .. } => self
                 .shell
                 .threads
                 .iter()
@@ -413,7 +413,7 @@ impl Workspace {
         if let Some(message) = commit_message {
             input["commitMessage"] = message.into();
         }
-        if let Some(Target::Thread(id)) = &self.target {
+        if let Some(Target::Thread { id, .. }) = &self.target {
             input["threadId"] = id.clone().into();
         }
         if let Some(project) = self.target_project() {

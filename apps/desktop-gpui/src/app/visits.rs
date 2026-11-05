@@ -8,8 +8,8 @@ use std::time::Duration;
 use gpui_kit::{Context, Task};
 use serde_json::json;
 
-use super::{Target, Workspace, new_id};
-use crate::inbox::{self, Facts};
+use super::{Workspace, new_id};
+use crate::inbox::Facts;
 use crate::model::ThreadShell;
 
 const THROTTLE_MS: i64 = 10_000;
@@ -41,8 +41,12 @@ enum Visit {
 /// again at its wake.
 fn decide(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>, now: i64) -> Visit {
     let visit = decide_now(state, shell, woke_at, now);
-    let wake =
-        shell.snoozed_until.as_deref().and_then(inbox::parse_ms).map(|until| until - now).filter(|in_ms| *in_ms > 0);
+    let wake = shell
+        .snoozed_until
+        .as_deref()
+        .and_then(crate::timestamp::parse_ms)
+        .map(|until| until - now)
+        .filter(|in_ms| *in_ms > 0);
     match (visit, wake) {
         (Visit::Skip, Some(wake)) => Visit::Later(wake),
         (Visit::Later(delay), Some(wake)) => Visit::Later(delay.min(wake)),
@@ -55,8 +59,8 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
     if !shell.tracks_visits() {
         return Visit::Skip;
     }
-    let Some(updated) = inbox::parse_ms(&shell.updated_at) else { return Visit::Skip };
-    let woke = woke_at.and_then(inbox::parse_ms).filter(|woke| *woke > updated);
+    let Some(updated) = crate::timestamp::parse_ms(&shell.updated_at) else { return Visit::Skip };
+    let woke = woke_at.and_then(crate::timestamp::parse_ms).filter(|woke| *woke > updated);
     let (visited_at, updated) = match (woke, woke_at) {
         (Some(woke), Some(at)) => (at, woke),
         _ => (shell.updated_at.as_str(), updated),
@@ -70,7 +74,7 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
         state.open_pending = false;
         return send(state, true);
     }
-    let last_visited = shell.last_visited().and_then(inbox::parse_ms);
+    let last_visited = shell.last_visited().and_then(crate::timestamp::parse_ms);
     if last_visited.is_some_and(|visited| visited >= updated) {
         // Already seen, so a later mark-unread stays sticky.
         if state.last_dispatched.is_none_or(|sent| sent < updated) {
@@ -81,7 +85,7 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
     if state.last_dispatched.is_some_and(|sent| sent >= updated) {
         return Visit::Skip;
     }
-    let completed = shell.latest_run_completed_at.clone().flatten().as_deref().and_then(inbox::parse_ms);
+    let completed = shell.latest_run_completed_at.clone().flatten().as_deref().and_then(crate::timestamp::parse_ms);
     let unseen_completion = completed.is_some_and(|completed| last_visited.is_none_or(|visited| completed > visited));
     let elapsed = state.last_dispatch_at.map_or(THROTTLE_MS, |at| now - at);
     if unseen_completion || woke.is_some() || elapsed >= THROTTLE_MS {
@@ -105,7 +109,7 @@ impl Workspace {
     pub(super) fn track_visit(&mut self, cx: &mut Context<Self>) {
         self.visit._timer = None;
         let Some(thread_id) = self.visit.thread_id.clone() else { return };
-        if self.target.as_ref() != Some(&Target::Thread(thread_id.clone())) {
+        if self.open_thread_id() != Some(&*thread_id) {
             return;
         }
         let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
@@ -155,7 +159,7 @@ mod tests {
     #[test]
     fn opening_sends_one_opened_visit_then_skips_until_the_thread_changes() {
         let mut state = VisitState { open_pending: true, ..VisitState::default() };
-        let now = inbox::parse_ms(T2).unwrap();
+        let now = crate::timestamp::parse_ms(T2).unwrap();
         assert_eq!(
             decide(&mut state, &shell(T0, None, None), None, now),
             Visit::Send { visited_at: T0.into(), opened: true }
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn streaming_updates_are_throttled_but_a_completion_goes_out_at_once() {
-        let now = inbox::parse_ms(T2).unwrap();
+        let now = crate::timestamp::parse_ms(T2).unwrap();
         let mut state =
             VisitState { last_dispatched: Some(0), last_dispatch_at: Some(now - 1_000), ..VisitState::default() };
         assert_eq!(decide(&mut state, &shell(T1, Some(T0), None), None, now), Visit::Later(9_000));
@@ -180,9 +184,9 @@ mod tests {
         let mut snoozed = shell(T0, Some(T0), None);
         snoozed.snoozed_until = Some(T2.into());
         let mut state = VisitState::default();
-        let before = inbox::parse_ms(T1).unwrap();
+        let before = crate::timestamp::parse_ms(T1).unwrap();
         assert_eq!(decide(&mut state, &snoozed, None, before), Visit::Later(1_000));
-        let at = inbox::parse_ms(T2).unwrap();
+        let at = crate::timestamp::parse_ms(T2).unwrap();
         let woke_at = Facts::new(&snoozed, &Default::default()).woke_at(at);
         assert_eq!(decide(&mut state, &snoozed, woke_at, at), Visit::Send { visited_at: T2.into(), opened: false });
         assert_eq!(decide(&mut state, &snoozed, woke_at, at), Visit::Skip);
@@ -191,9 +195,9 @@ mod tests {
     #[test]
     fn an_already_seen_update_is_not_resent() {
         let mut state = VisitState::default();
-        let now = inbox::parse_ms(T2).unwrap();
+        let now = crate::timestamp::parse_ms(T2).unwrap();
         assert_eq!(decide(&mut state, &shell(T1, Some(T1), None), None, now), Visit::Skip);
-        assert_eq!(state.last_dispatched, inbox::parse_ms(T1));
+        assert_eq!(state.last_dispatched, crate::timestamp::parse_ms(T1));
     }
 
     #[test]
@@ -201,7 +205,7 @@ mod tests {
         let mut state = VisitState { open_pending: true, ..VisitState::default() };
         let mut thread = shell(T0, None, None);
         thread.last_visited_at = None;
-        let now = inbox::parse_ms(T2).unwrap();
+        let now = crate::timestamp::parse_ms(T2).unwrap();
         assert_eq!(decide(&mut state, &thread, None, now), Visit::Skip);
         assert!(state.open_pending, "the open waits for a server that tracks visits");
     }

@@ -538,7 +538,7 @@ fn format_search_label(data: &Value) -> Option<String> {
     let query = first(&["pattern", "query", "searchTerm", "regex", "grep", "needle"]);
     let glob = first(&["glob", "globPattern", "glob_pattern", "include", "filePattern", "file_pattern"]);
     let target = first(&["path", "target_directory", "targetDirectory", "directory", "cwd", "root"])
-        .and_then(|t| t.split(['\\', '/']).filter(|part| !part.is_empty() && *part != ".").last());
+        .and_then(|t| t.split(['\\', '/']).filter(|part| !part.is_empty() && *part != ".").next_back());
     Some(match (query, glob, target) {
         (Some(query), _, Some(target)) => format!("Searched {query} in {target}"),
         (None, Some(glob), Some(target)) => format!("Searched files {glob} in {target}"),
@@ -708,45 +708,46 @@ fn t3_tool(name: &str) -> Option<&'static T3Tool> {
 
 const T3_SERVERS: [&str; 5] = ["t3-code", "t3_code", "t3code", "t3-code-direct", "t3_code_direct"];
 
-/// `parseT3McpToolName`: the bare tool name behind a provider's label.
-fn t3_tool_name(label: &str) -> Option<&'static str> {
+/// `parseT3McpToolName`: the tool behind a provider's label.
+fn t3_tool_name(label: &str) -> Option<&'static T3Tool> {
     let label = normalize_compact_label(label);
-    let known = |name: &str| t3_tool(name).map(|tool| tool.name);
     if let Some(rest) = strip_prefix_ci(&label, "mcp__") {
         let (server, tool) = rest.split_once("__")?;
-        return T3_SERVERS.contains(&server.to_lowercase().as_str()).then(|| known(tool)).flatten();
+        return T3_SERVERS.contains(&server.to_lowercase().as_str()).then(|| t3_tool(tool)).flatten();
     }
-    let lower = label.to_lowercase();
     for server in ["t3-code-direct", "t3_code_direct", "t3-code", "t3_code", "t3code"] {
-        if let Some(rest) = lower.strip_prefix(server) {
-            let rest = rest.trim_start();
-            if let Some(tool) = rest.strip_prefix(['.', ':', '/']).or_else(|| rest.strip_prefix('·')) {
-                return known(&label[label.len() - tool.trim_start().len()..]);
-            }
+        if let Some(rest) = strip_prefix_ci(&label, server)
+            && let Some(tool) = rest.trim_start().strip_prefix(['.', ':', '/', '·'])
+        {
+            return t3_tool(tool.trim_start());
         }
     }
-    if let Some(tool) = known(&label) {
+    if let Some(tool) = t3_tool(&label) {
         return Some(tool);
     }
     // OpenCode 2 thread prefixes carry underscores: take the longest known suffix.
-    if !lower.starts_with("t3-code-") {
-        return None;
-    }
+    strip_prefix_ci(&label, "t3-code-")?;
     T3_TOOLS
         .iter()
-        .filter(|tool| label.ends_with(&format!("_{}", tool.name)))
+        .filter(|tool| label.strip_suffix(tool.name).is_some_and(|head| head.ends_with('_')))
         .max_by_key(|tool| tool.name.len())
-        .map(|tool| tool.name)
 }
 
+/// ASCII-case-insensitive `strip_prefix` that never slices inside a character.
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let head = text.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
+/// ASCII-case-insensitive `strip_suffix` that never slices inside a character.
+fn strip_suffix_ci<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = text.len().checked_sub(suffix.len())?;
+    text.get(start..)?.eq_ignore_ascii_case(suffix).then(|| &text[..start])
+}
+
 /// `resolveT3McpToolDefinition`: action tools resolve to the tool their action replaced.
-fn t3_definition(name: &str, input: &Value) -> &'static T3Tool {
-    let tool = t3_tool(name).expect("known tool");
+fn t3_definition(tool: &'static T3Tool, input: &Value) -> &'static T3Tool {
+    let name = tool.name;
     let action = str_at(input, "action");
     let replaced = action.and_then(|action| match name {
         "preview_act" => Some(format!("preview_{action}")),
@@ -777,7 +778,8 @@ fn t3_call(entry: &Entry, raw: &Value) -> Option<T3Call> {
         (None, None, Some(name)) => name.to_owned(),
         (None, None, None) => title.unwrap_or(&entry.label).to_owned(),
     };
-    let name = t3_tool_name(&source)?;
+    let parsed = t3_tool_name(&source)?;
+    let name = parsed.name;
     let input_value =
         if dynamic { raw.get("input") } else { raw.get("arguments").or(raw.get("input")).or(raw.get("rawInput")) };
     let output_value = if dynamic {
@@ -785,8 +787,7 @@ fn t3_call(entry: &Entry, raw: &Value) -> Option<T3Call> {
     } else {
         raw.get("output").or(raw.get("result")).or(raw.get("rawOutput")).or(raw.get("content"))
     };
-    let raw_input = input_value.cloned().unwrap_or(Value::Null);
-    let tool = t3_definition(name, &raw_input);
+    let tool = t3_definition(parsed, input_value.unwrap_or(&Value::Null));
     let output = output_value.map(read_result).unwrap_or_default();
     let input = input_value.and_then(|value| {
         let data = read_result(value).data?;
@@ -1105,7 +1106,10 @@ fn summarize_t3_calls(summary: &str, calls: &[&T3Call]) -> (String, usize) {
         "link-pr" | "unlink-pr" => {
             let counts: Option<Vec<i64>> = selected.iter().map(|c| c.pr_count).collect();
             let object = match counts {
-                Some(counts) => quantity(counts.iter().sum::<i64>().max(0) as usize, "pull request"),
+                Some(counts) => {
+                    let total = counts.iter().fold(0i64, |total, count| total.saturating_add(*count));
+                    quantity(usize::try_from(total).unwrap_or(0), "pull request")
+                }
                 None => "pull requests".to_owned(),
             };
             if summary == "link-pr" { phrase("Linked", "link", object) } else { phrase("Unlinked", "unlink", object) }
@@ -1170,10 +1174,9 @@ fn summarize_t3_calls(summary: &str, calls: &[&T3Call]) -> (String, usize) {
 
 fn normalize_compact_label(value: &str) -> String {
     let trimmed = value.trim_end();
-    let lower = trimmed.to_lowercase();
     for suffix in [" completed", " complete"] {
-        if lower.ends_with(suffix) {
-            return trimmed[..trimmed.len() - suffix.len()].trim().to_owned();
+        if let Some(head) = strip_suffix_ci(trimmed, suffix) {
+            return head.trim().to_owned();
         }
     }
     trimmed.trim().to_owned()
@@ -1778,11 +1781,7 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
 
 fn program_basename(token: &str) -> String {
     let name = token.rsplit(['\\', '/']).next().unwrap_or(token);
-    let lower = name.to_lowercase();
-    match lower.strip_suffix(".exe") {
-        Some(stem) => name[..stem.len()].to_owned(),
-        None => name.to_owned(),
-    }
+    strip_suffix_ci(name, ".exe").unwrap_or(name).to_owned()
 }
 
 /// `commandDisplayText`: strips a `bash -lc '…'` wrapper.
@@ -1830,32 +1829,6 @@ pub fn command_program_name(command: &str) -> Option<String> {
 
 // ---------------------------------------------------------------------------
 // Time
-
-/// Milliseconds since the epoch for an ISO-8601 UTC timestamp (`…Z`).
-pub fn parse_iso_ms(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 19 {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    let millis = match text.get(19..20) {
-        Some(".") => {
-            let digits: String = text[20..].chars().take_while(char::is_ascii_digit).collect();
-            format!("{digits:0<3}")[..3].parse::<i64>().ok()?
-        }
-        _ => 0,
-    };
-    // Days from civil, after Howard Hinnant.
-    let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
-}
 
 /// `formatDuration` in `packages/shared/src/orchestrationTiming.ts`.
 pub fn format_duration(ms: i64) -> String {
@@ -2012,11 +1985,27 @@ mod tests {
             "t3_code/preview_click",
             "preview_click",
         ] {
-            assert_eq!(t3_tool_name(label), Some("preview_click"), "{label}");
+            assert_eq!(t3_tool_name(label).map(|tool| tool.name), Some("preview_click"), "{label}");
         }
         for label in ["mcp__github__preview_click", "t3-code.unknown_tool", "Search files"] {
-            assert_eq!(t3_tool_name(label), None, "{label}");
+            assert!(t3_tool_name(label).is_none(), "{label}");
         }
+    }
+
+    #[test]
+    fn labels_and_commands_with_case_changing_characters_do_not_panic() {
+        // `to_lowercase` changes byte lengths for these: Kelvin sign 3→1, Ⱥ 2→3, İ 2→3.
+        let tricky =
+            ["t3code·Ⱥ", "T3CODEȺ.x", "\u{212A}.exe", "İİ complete", "Ⱥ COMPLETE", "t3-code-Ⱥ_preview_click", "é"];
+        for label in tricky {
+            let _ = t3_tool_name(label);
+            let _ = normalize_compact_label(label);
+            let _ = program_basename(label);
+            let _ = command_display_text(label);
+        }
+        assert_eq!(program_basename("C:\\Tools\\\u{212A}.EXE"), "\u{212A}");
+        assert_eq!(program_basename("bash.Exe"), "bash");
+        assert_eq!(normalize_compact_label("Read file COMPLETED"), "Read file");
     }
 
     #[test]
@@ -2066,15 +2055,12 @@ mod tests {
     }
 
     #[test]
-    fn durations_and_timestamps() {
+    fn durations() {
         assert_eq!(format_duration(500), "500ms");
         assert_eq!(format_duration(1_250), "1.3s");
         assert_eq!(format_duration(59_500), "1m");
         assert_eq!(format_duration(65_000), "1m 5s");
         assert_eq!(format_duration(3_723_000), "1h 2m 3s");
-        let start = parse_iso_ms("2026-11-04T10:15:00.000Z").unwrap();
-        assert_eq!(parse_iso_ms("2026-11-04T10:15:06.4Z").unwrap() - start, 6_400);
-        assert_eq!(parse_iso_ms("1970-01-01T00:00:01Z"), Some(1000));
     }
 
     #[test]

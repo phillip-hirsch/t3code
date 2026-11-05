@@ -389,8 +389,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let provider = self.server_info.provider(instance_id)?;
-        let instance = &self.server_info.settings["providerInstances"][instance_id];
+        let provider = self.settings_info().provider(instance_id)?;
+        let instance = &self.settings_info().settings["providerInstances"][instance_id];
         let driver = instance["driver"].as_str().unwrap_or(&provider.driver);
         let codex_managed = driver == "codex" && codex_setup_managed(&instance["config"]);
         let can_authenticate = provider.setup.as_ref().map(|setup| setup.can_authenticate);
@@ -457,15 +457,17 @@ impl Workspace {
 
     /// Shows the ChatGPT plan notice once per connected sharing profile.
     pub(in crate::app) fn check_chatgpt_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
-        let next = self.server_info.providers.iter().filter(|p| uses_chatgpt_sharing(&p.auth)).find_map(|provider| {
-            let profile = provider.auth.profile_id.as_deref().or(provider.auth.email.as_deref()).unwrap_or("default");
-            let key = json!(["local", provider.instance_id, profile]).to_string();
-            let welcome = cx.default_global::<Welcome>();
-            welcome.load();
-            (!welcome.acknowledged.contains(&key) && welcome.showing.is_none())
-                .then(|| (key, provider.display_name.clone().unwrap_or_else(|| "Codex".into())))
-        });
+        let environment = self.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let next =
+            self.settings_info().providers.iter().filter(|p| uses_chatgpt_sharing(&p.auth)).find_map(|provider| {
+                let profile =
+                    provider.auth.profile_id.as_deref().or(provider.auth.email.as_deref()).unwrap_or("default");
+                let key = json!(["local", provider.instance_id, profile]).to_string();
+                let welcome = cx.default_global::<Welcome>();
+                welcome.load();
+                (!welcome.acknowledged.contains(&key) && welcome.showing.is_none())
+                    .then(|| (key, provider.display_name.clone().unwrap_or_else(|| "Codex".into())))
+            });
         let Some((key, provider_name)) = next else { return };
         cx.global_mut::<Welcome>().showing = Some(key.clone());
         let detail: SharedString = format!("{provider_name} on {environment}").into();
@@ -706,10 +708,14 @@ impl AccountSection {
     fn snapshot(&self, cx: &App) -> Option<Snapshot> {
         let workspace = self.workspace.upgrade()?;
         let workspace = workspace.read(cx);
-        let provider = workspace.server_info.provider(&self.instance_id)?.clone();
+        let provider = workspace.settings_info().provider(&self.instance_id)?.clone();
         Some(Snapshot {
-            instance: workspace.server_info.settings["providerInstances"][self.instance_id.as_str()].clone(),
-            environment: workspace.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
+            instance: workspace.settings_info().settings["providerInstances"][self.instance_id.as_str()].clone(),
+            environment: workspace
+                .settings_info()
+                .environment_label
+                .clone()
+                .unwrap_or_else(|| "this environment".into()),
             client: workspace.client(),
             provider,
         })
@@ -1922,7 +1928,7 @@ impl Render for RuntimeFields {
             .upgrade()
             .map(|workspace| {
                 let workspace = workspace.read(cx);
-                let paths = workspace.server_info.provider(&self.instance_id).map(|p| p.runtime_paths.clone());
+                let paths = workspace.settings_info().provider(&self.instance_id).map(|p| p.runtime_paths.clone());
                 (workspace.client(), paths)
             })
             .unwrap_or_default();
@@ -2019,7 +2025,7 @@ impl AddCodexAccount {
         }
         let (client, mut instances) = {
             let workspace = workspace.read(cx);
-            (workspace.client(), workspace.server_info.settings["providerInstances"].clone())
+            (workspace.client(), workspace.settings_info().settings["providerInstances"].clone())
         };
         let Some(client) = client else { return };
         let id = format!("codex_{}", uuid::Uuid::new_v4());
@@ -2079,7 +2085,8 @@ impl AddCodexAccount {
         cx: &mut Context<Self>,
     ) -> gpui_kit::component::dialog::Dialog {
         let t = *theme::tokens(cx);
-        let providers = self.workspace.upgrade().map(|w| w.read(cx).server_info.providers.clone()).unwrap_or_default();
+        let providers =
+            self.workspace.upgrade().map(|w| w.read(cx).settings_info().providers.clone()).unwrap_or_default();
         let created = self.created.clone();
         let provider = created.as_ref().and_then(|(id, _)| providers.iter().find(|p| p.instance_id == *id));
         // Closes itself once the new account connects.

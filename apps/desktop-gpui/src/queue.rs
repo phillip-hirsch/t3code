@@ -2,6 +2,8 @@
 //! `packages/client-runtime/src/state/threadWorkflows.ts`, joined to each run's
 //! `user_message` turn item instead of the projection's message table.
 
+use std::collections::{HashMap, HashSet};
+
 use gpui_kit::SharedString;
 use serde_json::Value;
 
@@ -61,14 +63,19 @@ pub fn active_run(projection: &ThreadProjection) -> Option<&Run> {
 
 pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
     let active = active_run(projection);
-    let message_item = |message_id: &str| -> Option<&TurnItem> {
-        projection
-            .turn_items
-            .iter()
-            .rev()
-            .find(|item| item.item_type == "user_message" && item.str("messageId") == Some(message_id))
-            .map(|item| item.as_ref())
-    };
+    // One pass: the latest user message per message id, and which messages are notifications.
+    let mut user_messages: HashMap<&str, &TurnItem> = HashMap::new();
+    let mut notifications: HashSet<Option<&str>> = HashSet::new();
+    for item in &projection.turn_items {
+        match item.item_type.as_str() {
+            "user_message" => user_messages.extend(item.str("messageId").map(|id| (id, item.as_ref()))),
+            "notification" => {
+                notifications.insert(item.str("messageId"));
+            }
+            _ => {}
+        }
+    }
+    let message_item = |message_id: &str| user_messages.get(message_id).copied();
     let promote_skips_compaction =
         active.and_then(|run| run.user_message_id.as_deref()).and_then(message_item).is_some_and(is_compaction_command);
     let steerable_turn = active.is_some_and(|run| {
@@ -90,10 +97,7 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
         .runs
         .iter()
         .filter(|run| run.status == "queued" && run.delegated_completion.is_none())
-        .filter(|run| {
-            let id = run.user_message_id.as_deref();
-            !projection.turn_items.iter().any(|item| item.item_type == "notification" && item.str("messageId") == id)
-        })
+        .filter(|run| !notifications.contains(&run.user_message_id.as_deref()))
         .collect();
     runs.sort_by_key(|run| (run.queue_position.unwrap_or(run.ordinal), run.ordinal));
     let queued = runs

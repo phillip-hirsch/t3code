@@ -205,6 +205,11 @@ impl Workspace {
         self.pull_requests.panel.as_mut().map(|p| &mut p.write)
     }
 
+    /// The write state of the pull request `key` names, shown or parked.
+    fn pr_write_of(&mut self, key: &str) -> Option<&mut WriteState> {
+        self.pr_panel(key).map(|p| &mut p.write)
+    }
+
     fn pr_review(&mut self) -> Option<&mut ReviewDraft> {
         let key = self.pull_requests.panel.as_ref()?.reference.key();
         Some(self.pull_requests.reviews.entry(key).or_default())
@@ -219,7 +224,8 @@ impl Workspace {
             .unwrap_or_default()
     }
 
-    /// Runs one write RPC; success reads the pull request again, failure toasts `failure`.
+    /// Runs one write RPC for the shown pull request; success reads it again, failure toasts
+    /// `failure`. `done` gets that pull request's key, which stays right if another tab shows meanwhile.
     fn run_pr_write(
         &mut self,
         method: &'static str,
@@ -228,14 +234,14 @@ impl Workspace {
         hint: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        done: impl FnOnce(&mut Workspace, bool, &mut Window, &mut Context<Workspace>) + 'static,
+        done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
-        let Some(client) = self.client() else { return };
+        let (Some(client), Some(key)) = (self.client(), self.shown_pr_key()) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match &result {
-                    Ok(_) => this.read_pr_detail(cx),
+                    Ok(_) => this.read_pr_detail_of(&key, cx),
                     Err(error) => {
                         let message = match hint {
                             Some(hint) => logic::readable_failure(&list_logic::error_message(error), hint),
@@ -244,7 +250,7 @@ impl Workspace {
                         toast_error(window, cx, failure, message);
                     }
                 }
-                done(this, result.is_ok(), window, cx);
+                done(this, &key, result.is_ok(), window, cx);
                 cx.notify();
             });
         })
@@ -343,7 +349,6 @@ impl Workspace {
         if let Some(write) = self.pr_write() {
             write.submitting = Some(action);
         }
-        let key = self.pull_requests.panel.as_ref().map(|p| p.reference.key()).unwrap_or_default();
         self.run_pr_write(
             "pullRequests.comment",
             payload,
@@ -351,8 +356,8 @@ impl Workspace {
             None,
             window,
             cx,
-            move |this, ok, window, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
+            move |this, key, ok, window, cx| {
+                let Some(panel) = this.pr_panel(key) else { return };
                 panel.write.submitting = None;
                 if !ok {
                     return;
@@ -362,7 +367,7 @@ impl Workspace {
                     input.update(cx, |input, cx| input.set_value("", window, cx));
                 }
                 if action != "comment" {
-                    this.perform_pr_action(action, None, window, cx);
+                    this.perform_pr_action_on(key, action, None, None, window, cx);
                 }
             },
         );
@@ -399,7 +404,7 @@ impl Workspace {
             Some("The host refused the review. Your draft is still here to try again."),
             window,
             cx,
-            move |this, ok, window, cx| {
+            move |this, _, ok, window, cx| {
                 if let Some(panel) = this.pr_panel(&key) {
                     panel.write.submitting = None;
                     if ok {
@@ -977,8 +982,8 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, _, _, _| {
-                if let Some(write) = this.pr_write() {
+            |this, key, _, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
                     write.thread_pending = false;
                 }
             },
@@ -1070,8 +1075,8 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, ok, _, _| {
-                if let Some(write) = this.pr_write() {
+            |this, key, ok, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
                     write.thread_pending = false;
                     if ok {
                         write.reply = None;
@@ -1134,8 +1139,8 @@ impl Workspace {
             ("pullRequests.updateComment", "Could not save the comment")
         };
         write.saving = true;
-        self.run_pr_write(method, payload, failure.into(), None, window, cx, |this, ok, _, _| {
-            if let Some(write) = this.pr_write() {
+        self.run_pr_write(method, payload, failure.into(), None, window, cx, |this, key, ok, _, _| {
+            if let Some(write) = this.pr_write_of(key) {
                 write.saving = false;
                 if ok {
                     write.editing = None;
@@ -1278,8 +1283,8 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, _, _, _| {
-                if let Some(write) = this.pr_write() {
+            |this, key, _, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
                     write.saving = false;
                     write.title = None;
                 }
@@ -1451,8 +1456,8 @@ impl Workspace {
             None,
             window,
             cx,
-            move |this, ok, _, _| {
-                if !ok && let Some(write) = this.pr_write() {
+            move |this, pr, ok, _, _| {
+                if !ok && let Some(write) = this.pr_write_of(pr) {
                     write.reactions.remove(&key);
                 }
             },
@@ -1533,11 +1538,12 @@ impl Workspace {
             )
         };
         picker.pending = Some(id);
-        self.run_pr_write(method, payload, failure, Some(hint), window, cx, move |this, ok, window, cx| {
-            if let Some(picker) = this.pr_write().and_then(|w| w.picker.as_mut()) {
+        self.run_pr_write(method, payload, failure, Some(hint), window, cx, move |this, key, ok, window, cx| {
+            if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
                 picker.pending = None;
             }
-            if ok {
+            // `open_pr_picker` reads for the shown pull request; a parked one's ticks read again when reopened.
+            if ok && this.shown_pr_key().as_deref() == Some(key) {
                 // The list reads again so the ticks follow the host.
                 this.open_pr_picker(kind, window, cx);
             }

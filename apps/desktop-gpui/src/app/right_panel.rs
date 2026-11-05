@@ -396,7 +396,7 @@ impl Workspace {
 
     /// `closePreviewPanel`: hiding the panel floats the browser it showed.
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread(thread_id)), Some(Surface::Browser(tab))) =
+        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
             (self.target.clone(), self.active_surface().cloned())
         {
             self.float_browser(thread_id, tab, cx);
@@ -445,7 +445,7 @@ impl Workspace {
         if let Surface::SideChat(thread_id) = &surface {
             self.release_side_chat(thread_id, cx);
         }
-        if let (Surface::Browser(tab), Some(Target::Thread(thread_id))) = (&surface, self.target.clone()) {
+        if let (Surface::Browser(tab), Some(Target::Thread { id: thread_id, .. })) = (&surface, self.target.clone()) {
             self.close_preview_tab(thread_id, tab.clone(), window, cx);
         }
         self.sync_active_browser(window, cx);
@@ -462,7 +462,7 @@ impl Workspace {
     /// `diff.toggle` (`rightPanelStore.toggle(…, "diff")`): hides the panel while it shows the
     /// Diff, else opens the Diff tab.
     pub(super) fn toggle_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.target, Some(Target::Thread(_))) {
+        if !matches!(self.target, Some(Target::Thread { .. })) {
             return;
         }
         if self.active_surface() == Some(&Surface::Diff) {
@@ -579,7 +579,7 @@ impl Workspace {
 
     /// Keeps the thread's focused preview tab on the browser surface the panel shows.
     fn sync_active_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread(thread_id)), Some(Surface::Browser(tab))) =
+        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
             (self.target.clone(), self.active_surface().cloned())
         {
             self.focus_preview_tab(&thread_id, &tab, window, cx);
@@ -588,8 +588,8 @@ impl Workspace {
 
     /// Follows a thread's preview sessions: a panel tab per drawable session.
     pub(super) fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[&str]) {
-        let panel = self.right_panel.panels.entry(Target::Thread(thread_id.to_owned())).or_default();
-        panel.reconcile_browsers(tab_ids);
+        let Some(target) = self.thread_target(thread_id) else { return };
+        self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids);
     }
 
     /// `addDiffSurface`: the details card's Changes row and the launcher's Diff open the branch's changes.
@@ -641,7 +641,7 @@ impl Workspace {
 
     /// `diffAvailable`: a server thread in a git repository.
     fn diff_available(&self) -> bool {
-        matches!(self.target, Some(Target::Thread(_))) && self.vcs.status.as_ref().is_none_or(|s| s.local.is_repo)
+        matches!(self.target, Some(Target::Thread { .. })) && self.vcs.status.as_ref().is_none_or(|s| s.local.is_repo)
     }
 
     /// `diffLayout`, which the layout toggle also writes.
@@ -676,11 +676,12 @@ impl Workspace {
     /// with enough changes opens the branch diff, unless the user chose a panel since it started.
     /// A thread's pull requests take precedence (`observe_proactive_pull_requests`).
     pub(super) fn observe_proactive_panels(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else {
+        let Some(target @ Target::Thread { .. }) = self.target.clone() else {
             self.right_panel.observation = None;
             return;
         };
-        let target = Target::Thread(thread_id.clone());
+        let Target::Thread { id: thread_id, .. } = &target else { return };
+        let thread_id = thread_id.clone();
         let revision = self.right_panel.panels.get(&target).map_or(0, |panel| panel.user_revision);
         let projection = self.open_projection();
         let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
@@ -748,7 +749,8 @@ impl Workspace {
             && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
-        let panel = self.right_panel.panels.entry(Target::Thread(thread_id.to_owned())).or_default();
+        let Some(target) = self.thread_target(thread_id) else { return false };
+        let panel = self.right_panel.panels.entry(target).or_default();
         let mut changed = false;
         if let (true, Some(linked)) = (follow, &linked) {
             changed |= panel.open_proactive(Surface::PullRequest(linked.clone()), revision, true);
@@ -824,7 +826,7 @@ impl Workspace {
         }
         self.right_panel.loaded = Some(key);
         let selection = (target.clone(), scope.clone());
-        let (Some(client), Target::Thread(thread_id)) = (self.client(), target) else { return };
+        let (Some(client), Target::Thread { id: thread_id, .. }) = (self.client(), target) else { return };
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
                 DiffLoad::Empty("Turn diffs are unavailable because this project is not a git repository.");
@@ -1040,7 +1042,7 @@ impl Workspace {
         }
         let content = match (&panel.active, self.target.clone()) {
             (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, cx),
-            (Some(Surface::Browser(tab)), Some(Target::Thread(thread_id))) => {
+            (Some(Surface::Browser(tab)), Some(Target::Thread { id: thread_id, .. })) => {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
@@ -1249,11 +1251,12 @@ impl Workspace {
             Surface::Files => {
                 ("files".into(), "Files".into(), Icon::new(IconName::Files).size(px(12.)).into_any_element())
             }
-            Surface::File(path) => (
-                format!("file:{path}").into(),
-                path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(),
-                Icon::new(IconName::File).size(px(12.)).into_any_element(),
-            ),
+            Surface::File(path) => {
+                (format!("file:{path}").into(), path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(), {
+                    let (asset, color) = crate::file_icons::file_icon(path, self.dark_theme(cx));
+                    Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
+                })
+            }
             Surface::SideChat(thread_id) => {
                 let (title, state) = self.side_chat_tab(thread_id);
                 // Static dots: a side chat tab can stay open for a whole run.

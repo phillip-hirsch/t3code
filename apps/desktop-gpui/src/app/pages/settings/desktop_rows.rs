@@ -35,7 +35,7 @@ impl Workspace {
     }
 
     pub(super) fn about_update_description(&self) -> String {
-        update_disabled_reason(&self.server_info.managed_policy)
+        update_disabled_reason(&self.settings_info().managed_policy)
     }
 
     /// `CliCommandSettingsRow`; hidden until the launcher state is known, or when this app has

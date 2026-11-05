@@ -88,7 +88,7 @@ impl Workspace {
         if write(&stored).is_none() || !ask {
             return;
         }
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         self.settings_ui.star_prompt_shown = true;
         // Input resets the idle clock; only keystrokes are observable app-wide here.
         let last_input = Rc::new(Cell::new(Instant::now()));

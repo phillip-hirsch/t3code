@@ -46,7 +46,7 @@ impl Workspace {
             self.alerts.threads = None;
             return;
         }
-        if !self.shell.live {
+        if !self.shell.live() {
             return;
         }
         for alert in self.alerts.threads.get_or_insert_default().observe(&self.shell.threads) {
@@ -72,7 +72,7 @@ impl Workspace {
         // Settings and pages are routes of their own on the web, so they never count as the open thread.
         let on_screen = self.page.is_none()
             && self.settings.is_none()
-            && self.target.as_ref().is_some_and(|t| matches!(t, Target::Thread(id) if *id == alert.thread_id));
+            && self.target.as_ref().is_some_and(|t| matches!(t, Target::Thread { id, .. } if *id == alert.thread_id));
         if focused && !on_screen && self.client_settings.values.bool("inAppNotificationsEnabled") {
             let t = *crate::theme::tokens(cx);
             let (icon, color) = match (alert.kind, alert.status) {

@@ -811,7 +811,7 @@ impl Workspace {
 
     fn render_pull_requests_empty(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.pull_requests;
-        if self.shell.projects.is_empty() && self.shell.live {
+        if self.shell.projects.is_empty() && self.shell.live() {
             return empty_state(t)
                 .child(branch_mark(t))
                 .child(empty_header(

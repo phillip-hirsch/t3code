@@ -4,7 +4,10 @@
 //! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
 //! values never fail a whole frame; only fields the UI reads are typed.
 
+use std::collections::HashMap;
 use std::rc::Rc;
+
+use gpui_kit::SharedString;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -540,6 +543,9 @@ pub struct RepositoryOrigin {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectShell {
+    /// The environment this project lives on; set by [`ShellState::apply`], not the wire.
+    #[serde(skip)]
+    pub environment_id: SharedString,
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -573,6 +579,7 @@ impl ProjectShell {
     pub fn scope_project(&self) -> crate::settings::scope::Project {
         crate::settings::scope::Project {
             id: self.id.clone(),
+            environment_id: self.environment_id.to_string(),
             name: self.title.clone(),
             legacy_model_selection: self.default_model_selection.as_ref().map(ModelSelection::to_json),
             legacy_thread_env_mode: self.default_thread_env_mode.clone(),
@@ -710,6 +717,9 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(deserializer: 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
+    /// The environment this thread lives on; set by [`ShellState::apply`], not the wire.
+    #[serde(skip)]
+    pub environment_id: SharedString,
     pub id: String,
     pub project_id: String,
     pub title: String,
@@ -845,31 +855,68 @@ struct ShellSnapshot {
     threads: Vec<ThreadShell>,
 }
 
+/// Every environment's projects and threads in one list (the web's merged shell selectors),
+/// each tagged with its environment and fed by that environment's own subscription.
 #[derive(Default)]
 pub struct ShellState {
     pub projects: Vec<ProjectShell>,
     pub threads: Vec<ThreadShell>,
-    pub sequence: u64,
-    pub live: bool,
     /// Counts applied elements, so views can cache what they derive from projects and threads.
     pub revision: u64,
+    cursors: HashMap<SharedString, ShellCursor>,
+}
+
+#[derive(Default)]
+struct ShellCursor {
+    sequence: u64,
+    live: bool,
     /// A full snapshot failed to decode, so deltas wait for the next one.
     needs_snapshot: bool,
 }
 
 impl ShellState {
-    /// Applies one `orchestration.subscribeShell` element.
-    pub fn apply(&mut self, item: &Value) -> Result<(), serde_json::Error> {
+    /// The last applied sequence of one environment's subscription, 0 before its snapshot.
+    pub fn sequence(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.sequence)
+    }
+
+    /// Some environment's subscription caught up with its server.
+    pub fn live(&self) -> bool {
+        self.cursors.values().any(|cursor| cursor.live)
+    }
+
+    /// The environment a thread lives on.
+    pub fn thread_environment(&self, thread_id: &str) -> Option<&SharedString> {
+        self.threads.iter().find(|t| t.id == thread_id).map(|t| &t.environment_id)
+    }
+
+    /// The environment a project lives on.
+    pub fn project_environment(&self, project_id: &str) -> Option<&SharedString> {
+        self.projects.iter().find(|p| p.id == project_id).map(|p| &p.environment_id)
+    }
+
+    /// Drops an environment that was removed or switched off.
+    pub fn remove_environment(&mut self, environment_id: &str) {
+        self.projects.retain(|p| p.environment_id != environment_id);
+        self.threads.retain(|t| t.environment_id != environment_id);
+        self.cursors.remove(environment_id);
+        self.revision += 1;
+    }
+
+    /// Applies one `orchestration.subscribeShell` element of `environment_id`'s subscription.
+    pub fn apply(&mut self, environment_id: &SharedString, item: &Value) -> Result<(), serde_json::Error> {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
         let sequence = item.get("sequence").and_then(Value::as_u64);
+        let cursor = self.cursors.entry(environment_id.clone()).or_default();
         if let Some(sequence) = sequence {
-            if sequence <= self.sequence || self.needs_snapshot {
+            if sequence <= cursor.sequence || cursor.needs_snapshot {
                 return Ok(());
             }
         }
         self.revision += 1;
+        let ours = |id: &SharedString| id == environment_id;
         match kind {
-            "synchronized" => self.live = true,
+            "synchronized" => cursor.live = true,
             "snapshot" => {
                 let roots = item.get("resolvedRepositoryIdentityRoots").and_then(Value::as_array);
                 let snapshot = match ShellSnapshot::deserialize(&item["snapshot"]) {
@@ -881,8 +928,8 @@ impl ShellState {
                     }
                     Err(error) => {
                         // Resume from scratch, so a resubscribe fetches a fresh snapshot.
-                        self.sequence = 0;
-                        self.needs_snapshot = true;
+                        cursor.sequence = 0;
+                        cursor.needs_snapshot = true;
                         return Err(error);
                     }
                 };
@@ -895,7 +942,9 @@ impl ShellState {
                                 .iter()
                                 .find(|p| p.workspace_root == root)
                                 .and_then(|p| p.repository_identity.clone());
-                            for project in self.projects.iter_mut().filter(|p| p.workspace_root == root) {
+                            for project in
+                                self.projects.iter_mut().filter(|p| ours(&p.environment_id) && p.workspace_root == root)
+                            {
                                 project.repository_identity = identity.clone();
                             }
                         }
@@ -903,18 +952,27 @@ impl ShellState {
                     None => {
                         let mut projects = snapshot.projects;
                         for project in &mut projects {
+                            project.environment_id = environment_id.clone();
                             if project.repository_identity.is_none() {
                                 project.repository_identity = self
                                     .projects
                                     .iter()
-                                    .find(|old| old.workspace_root == project.workspace_root)
+                                    .find(|old| {
+                                        ours(&old.environment_id) && old.workspace_root == project.workspace_root
+                                    })
                                     .and_then(|old| old.repository_identity.clone());
                             }
                         }
-                        self.projects = projects;
-                        self.threads = snapshot.threads;
-                        self.sequence = snapshot.snapshot_sequence;
-                        self.needs_snapshot = false;
+                        let mut threads = snapshot.threads;
+                        for thread in &mut threads {
+                            thread.environment_id = environment_id.clone();
+                        }
+                        self.projects.retain(|p| !ours(&p.environment_id));
+                        self.projects.extend(projects);
+                        self.threads.retain(|t| !ours(&t.environment_id));
+                        self.threads.extend(threads);
+                        cursor.sequence = snapshot.snapshot_sequence;
+                        cursor.needs_snapshot = false;
                     }
                 }
             }
@@ -922,25 +980,30 @@ impl ShellState {
             // thread reducer: replaying it after a resubscribe would fail the same way.
             "project.updated" => match ProjectShell::deserialize(&item["project"]) {
                 Err(error) => log::warn!("skipping undecodable project update: {error}"),
-                Ok(mut project) => match self.projects.iter_mut().find(|p| p.id == project.id) {
-                    Some(existing) => {
-                        if project.repository_identity.is_none() {
-                            project.repository_identity = existing.repository_identity.take();
+                Ok(mut project) => {
+                    project.environment_id = environment_id.clone();
+                    match self.projects.iter_mut().find(|p| ours(&p.environment_id) && p.id == project.id) {
+                        Some(existing) => {
+                            if project.repository_identity.is_none() {
+                                project.repository_identity = existing.repository_identity.take();
+                            }
+                            *existing = project;
                         }
-                        *existing = project;
+                        None => self.projects.push(project),
                     }
-                    None => self.projects.push(project),
-                },
+                }
             },
             "project.removed" => {
                 let id = item["projectId"].as_str().unwrap_or_default();
-                self.projects.retain(|p| p.id != id);
+                self.projects.retain(|p| !(ours(&p.environment_id) && p.id == id));
             }
             "thread.updated" => match ThreadShell::deserialize(&item["thread"]) {
                 Err(error) => log::warn!("skipping undecodable thread update: {error}"),
-                Ok(thread) => {
+                Ok(mut thread) => {
+                    thread.environment_id = environment_id.clone();
                     let active = item.get("location").and_then(Value::as_str) == Some("active");
-                    match (self.threads.iter().position(|t| t.id == thread.id), active) {
+                    let index = self.threads.iter().position(|t| ours(&t.environment_id) && t.id == thread.id);
+                    match (index, active) {
                         (Some(index), true) => self.threads[index] = thread,
                         (None, true) => self.threads.push(thread),
                         (Some(index), false) => {
@@ -952,12 +1015,12 @@ impl ShellState {
             },
             "thread.removed" => {
                 let id = item["threadId"].as_str().unwrap_or_default();
-                self.threads.retain(|t| t.id != id);
+                self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
             }
             _ => {}
         }
         if let Some(sequence) = sequence {
-            self.sequence = sequence;
+            cursor.sequence = sequence;
         }
         Ok(())
     }
@@ -1297,7 +1360,7 @@ pub struct ThreadProjection {
 impl ThreadProjection {
     /// `latestExecutedRun`: the run that ran last, unfinished runs counting as latest.
     pub fn latest_executed_run(&self) -> Option<&Run> {
-        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::inbox::parse_ms).unwrap_or(i64::MAX);
+        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::timestamp::parse_ms).unwrap_or(i64::MAX);
         self.runs
             .iter()
             .filter(|run| run.status != "queued" && !(run.status == "cancelled" && run.started_at.is_none()))
@@ -1324,7 +1387,8 @@ impl ThreadProjection {
                     && item.node_id == run.root_node_id
             })
             .max_by(|a, b| {
-                let at = |item: &TurnItem| item.str("updatedAt").and_then(crate::inbox::parse_ms).unwrap_or_default();
+                let at =
+                    |item: &TurnItem| item.str("updatedAt").and_then(crate::timestamp::parse_ms).unwrap_or_default();
                 at(a).cmp(&at(b)).then(a.ordinal.cmp(&b.ordinal)).then(a.id.cmp(&b.id))
             })?;
         (failure.raw["failure"]["class"] == "usage_limit").then_some(run.id.as_str())
@@ -1687,6 +1751,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const ENV: &str = "env-a";
+
     fn thread(id: &str, updated_at: &str) -> Value {
         json!({"id": id, "projectId": "p", "title": id, "status": "idle", "updatedAt": updated_at, "lineage": {"rootThreadId": id}})
     }
@@ -1698,11 +1764,9 @@ mod tests {
     #[test]
     fn shell_enrichment_snapshot_only_patches_identity() {
         let mut shell = ShellState::default();
-        shell
-            .apply(&json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[project("a", None), project("b", None)],"threads":[thread("t", "1")]}}))
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[project("a", None), project("b", None)],"threads":[thread("t", "1")]}}))
             .unwrap();
-        shell
-            .apply(&json!({"kind":"snapshot","resolvedRepositoryIdentityRoots":["a"],"snapshot":{"snapshotSequence":5,"projects":[project("a", Some("repo"))],"threads":[]}}))
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","resolvedRepositoryIdentityRoots":["a"],"snapshot":{"snapshotSequence":5,"projects":[project("a", Some("repo"))],"threads":[]}}))
             .unwrap();
         assert_eq!(shell.threads.len(), 1);
         assert_eq!(shell.projects.len(), 2);
@@ -1712,30 +1776,64 @@ mod tests {
     #[test]
     fn an_undecodable_shell_delta_is_skipped_but_advances_the_cursor() {
         let mut shell = ShellState::default();
-        shell.apply(&json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
         // Not an error: only a failed full snapshot asks for a resubscribe.
-        shell.apply(&json!({"kind":"thread.updated","sequence":6,"location":"active","thread":{"id": 1}})).unwrap();
-        assert_eq!(shell.sequence, 6);
+        shell
+            .apply(&ENV.into(), &json!({"kind":"thread.updated","sequence":6,"location":"active","thread":{"id": 1}}))
+            .unwrap();
+        assert_eq!(shell.sequence(ENV), 6);
         assert_eq!(shell.threads.len(), 1);
     }
 
     #[test]
     fn shell_deltas_respect_sequence_and_location() {
         let mut shell = ShellState::default();
-        shell.apply(&json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
         shell
-            .apply(&json!({"kind":"thread.updated","sequence":4,"location":"active","thread":thread("old", "1")}))
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":4,"location":"active","thread":thread("old", "1")}),
+            )
             .unwrap();
         assert_eq!(shell.threads.len(), 1, "stale delta is skipped");
         shell
-            .apply(&json!({"kind":"thread.updated","sequence":6,"location":"active","thread":thread("u", "2")}))
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":6,"location":"active","thread":thread("u", "2")}),
+            )
             .unwrap();
         shell
-            .apply(&json!({"kind":"thread.updated","sequence":7,"location":"archive","thread":thread("t", "3")}))
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":7,"location":"archive","thread":thread("t", "3")}),
+            )
             .unwrap();
         let ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["u"]);
-        assert_eq!(shell.sequence, 7);
+        assert_eq!(shell.sequence(ENV), 7);
+    }
+
+    #[test]
+    fn each_environment_keeps_its_own_projects_threads_and_cursor() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |sequence: u64, thread_id: &str| json!({"kind":"snapshot","snapshot":{"snapshotSequence":sequence,"projects":[project("/r", None)],"threads":[thread(thread_id, "1")]}});
+        shell.apply(&a, &snapshot(5, "t1")).unwrap();
+        shell.apply(&b, &snapshot(2, "t2")).unwrap();
+        assert_eq!((shell.projects.len(), shell.threads.len()), (2, 2));
+        assert_eq!(shell.thread_environment("t2"), Some(&b));
+        // Sequences are per subscription: b's 3 is new even though a is at 5.
+        shell
+            .apply(&b, &json!({"kind":"thread.updated","sequence":3,"location":"active","thread":thread("t3", "2")}))
+            .unwrap();
+        assert_eq!((shell.sequence("env-a"), shell.sequence("env-b")), (5, 3));
+        // A fresh snapshot of a replaces only a's part.
+        shell.apply(&a, &snapshot(9, "t4")).unwrap();
+        let mut ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["t2", "t3", "t4"]);
+        shell.remove_environment("env-b");
+        assert_eq!((shell.projects.len(), shell.threads.len(), shell.sequence("env-b")), (1, 1, 0));
     }
 
     fn item(id: &str, item_type: &str, run_id: &str, ordinal: i64) -> Value {
@@ -1816,19 +1914,25 @@ mod tests {
     fn shell_snapshots_skip_bad_threads_and_reset_the_cursor_on_failure() {
         let mut shell = ShellState::default();
         let snapshot = |sequence: Value| json!({"kind": "snapshot", "snapshot": {"snapshotSequence": sequence, "projects": [project("a", None), {"id": "x"}], "threads": [thread("t", "1"), {"id": "bad"}]}});
-        shell.apply(&snapshot(json!(5))).unwrap();
+        shell.apply(&ENV.into(), &snapshot(json!(5))).unwrap();
         assert_eq!((shell.projects.len(), shell.threads.len()), (1, 1));
 
-        assert!(shell.apply(&snapshot(json!(null))).is_err());
+        assert!(shell.apply(&ENV.into(), &snapshot(json!(null))).is_err());
         shell
-            .apply(&json!({"kind":"thread.updated","sequence":9,"location":"active","thread":thread("u", "2")}))
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":9,"location":"active","thread":thread("u", "2")}),
+            )
             .unwrap();
-        assert_eq!((shell.sequence, shell.threads.len()), (0, 1), "deltas wait for a fresh snapshot");
-        shell.apply(&snapshot(json!(10))).unwrap();
+        assert_eq!((shell.sequence(ENV), shell.threads.len()), (0, 1), "deltas wait for a fresh snapshot");
+        shell.apply(&ENV.into(), &snapshot(json!(10))).unwrap();
         shell
-            .apply(&json!({"kind":"thread.updated","sequence":11,"location":"active","thread":thread("u", "2")}))
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":11,"location":"active","thread":thread("u", "2")}),
+            )
             .unwrap();
-        assert_eq!((shell.sequence, shell.threads.len()), (11, 2));
+        assert_eq!((shell.sequence(ENV), shell.threads.len()), (11, 2));
     }
 
     #[test]

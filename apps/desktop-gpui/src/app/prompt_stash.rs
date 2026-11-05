@@ -326,7 +326,11 @@ impl Workspace {
             return;
         }
         let attachments: Vec<&Attachment> = self.attachments.iter().collect();
-        let stashed = self.prompt_stash.store.stash(prompt, &attachments, jiff::Timestamp::now().to_string());
+        let stashed = self.prompt_stash.store.stash(
+            prompt,
+            &attachments,
+            crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default(),
+        );
         let evicted = match stashed {
             Ok(evicted) => evicted,
             Err(error) => {
@@ -565,7 +569,7 @@ impl Workspace {
                     .into_any_element(),
             ]
         } else {
-            let now = jiff::Timestamp::now();
+            let now = crate::timestamp::now_ms();
             entries
                 .iter()
                 .map(|entry| self.render_stash_row(entry, highlighted == Some(&entry.id), now, t, cx))
@@ -610,7 +614,7 @@ impl Workspace {
         &self,
         entry: &StashEntry,
         highlighted: bool,
-        now: jiff::Timestamp,
+        now_ms: i64,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -620,11 +624,7 @@ impl Workspace {
         let thumbs: Vec<PathBuf> =
             entry.images().take(3).filter_map(|a| self.prompt_stash.store.thumbnail(entry, a)).collect();
         let files = entry.file_count();
-        let age = entry
-            .created_at
-            .parse::<jiff::Timestamp>()
-            .ok()
-            .map(|at| relative_time(now.as_millisecond() - at.as_millisecond()));
+        let age = crate::timestamp::parse_ms(&entry.created_at).map(|at| relative_time(now_ms - at));
         h_flex()
             .id(ElementId::Name(format!("stash-entry-{id}").into()))
             .min_h(px(20.))
@@ -690,7 +690,7 @@ impl Workspace {
 
     /// The last `composer.stash` rule's shortcut.
     fn stash_shortcut_label(&self) -> Option<String> {
-        let rules = keybindings::merge_with_defaults(&self.server_info.keybindings);
+        let rules = keybindings::merge_with_defaults(&self.server_info().keybindings);
         rules.iter().rev().find(|rule| rule.command == "composer.stash").map(|rule| shortcut_label(&rule.shortcut))
     }
 }

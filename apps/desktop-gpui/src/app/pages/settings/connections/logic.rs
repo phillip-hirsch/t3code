@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::work_log::parse_iso_ms;
+use crate::timestamp::parse_ms;
 
 pub(super) const ORCHESTRATION_READ: &str = "orchestration:read";
 pub(in crate::app::pages::settings) const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
@@ -346,7 +346,7 @@ pub(super) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
 /// `formatAccessTimestamp` (`dateStyle: medium, timeStyle: short`), in UTC: the app
 /// has no time zone database, so it names the zone instead of guessing it.
 pub(super) fn format_timestamp(iso: &str) -> String {
-    let Some(ms) = parse_iso_ms(iso) else { return iso.to_owned() };
+    let Some(ms) = parse_ms(iso) else { return iso.to_owned() };
     let days = ms.div_euclid(86_400_000);
     let minute_of_day = ms.rem_euclid(86_400_000) / 60_000;
     // Civil from days, after Howard Hinnant.
@@ -371,7 +371,7 @@ pub(super) fn format_timestamp(iso: &str) -> String {
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
-    parse_iso_ms(iso).unwrap_or(0)
+    parse_ms(iso).unwrap_or(0)
 }
 
 /// `ENVIRONMENT_MACHINE_KIND_LABELS`, in `ENVIRONMENT_MACHINE_KINDS` order.

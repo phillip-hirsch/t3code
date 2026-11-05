@@ -192,7 +192,7 @@ pub(super) fn grouped(count: usize) -> String {
     let digits = count.to_string();
     let mut out = String::new();
     for (index, c) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -239,6 +239,89 @@ pub(super) fn is_image(path: &str) -> bool {
     [".avif", ".bmp", ".gif", ".ico", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"]
         .iter()
         .any(|ext| lower.ends_with(ext))
+}
+
+/// The extension after the last dot of the file name, lowercased (`""` without one).
+fn extension(path: &str) -> String {
+    file_name(path).rsplit_once('.').map(|(_, ext)| ext.to_lowercase()).unwrap_or_default()
+}
+
+/// `officePreviewKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Office {
+    Docx,
+    Xlsx,
+    Pptx,
+    Odt,
+    Ods,
+    Odp,
+    Rtf,
+    Epub,
+    Ipynb,
+}
+
+/// How the panel shows a workspace file (`FilePreviewPanel`'s `isVideo`, `isAudio`, `isImage`,
+/// `isPdf`, `isDocument` and `isHtml`, in that order of precedence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileKind {
+    Video,
+    Audio,
+    Image,
+    Pdf,
+    /// `binaryPreviewKind`: zip, jar, tar and gzip archives.
+    Archive,
+    Sqlite,
+    Office(Office),
+    Font,
+    Html,
+    /// Read with `projects.readFile`: source, Markdown, Mermaid and tables.
+    Text,
+}
+
+impl FileKind {
+    /// Read through an asset URL, never as text (`isMedia || isPdf || isDocument`).
+    pub(super) fn is_asset(self) -> bool {
+        !matches!(self, Self::Html | Self::Text)
+    }
+}
+
+pub(super) fn file_kind(path: &str) -> FileKind {
+    let ext = extension(path);
+    match ext.as_str() {
+        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "ogv" | "webm" => FileKind::Video,
+        "mp3" | "wav" | "ogg" | "oga" | "flac" | "aac" | "m4a" | "opus" | "aiff" | "webm-audio" | "weba" => {
+            FileKind::Audio
+        }
+        _ if is_image(path) => FileKind::Image,
+        "pdf" => FileKind::Pdf,
+        "zip" | "jar" | "tar" | "gz" | "tgz" => FileKind::Archive,
+        "sqlite" | "sqlite3" | "db" => FileKind::Sqlite,
+        "docx" => FileKind::Office(Office::Docx),
+        "xlsx" => FileKind::Office(Office::Xlsx),
+        "pptx" => FileKind::Office(Office::Pptx),
+        "odt" => FileKind::Office(Office::Odt),
+        "ods" => FileKind::Office(Office::Ods),
+        "odp" => FileKind::Office(Office::Odp),
+        "rtf" => FileKind::Office(Office::Rtf),
+        "epub" => FileKind::Office(Office::Epub),
+        "ipynb" => FileKind::Office(Office::Ipynb),
+        "ttf" | "otf" | "woff" | "woff2" => FileKind::Font,
+        "htm" | "html" => FileKind::Html,
+        _ => FileKind::Text,
+    }
+}
+
+/// `filePreviewDelimiter` by name.
+pub(super) fn table_delimiter(path: &str) -> Option<char> {
+    match extension(path).as_str() {
+        "csv" => Some(','),
+        "tsv" => Some('\t'),
+        _ => None,
+    }
+}
+
+pub(super) fn is_mermaid(path: &str) -> bool {
+    matches!(extension(path).as_str(), "mmd" | "mermaid")
 }
 
 /// The highlighter language for a file, by extension or well-known name.
@@ -304,7 +387,7 @@ pub(super) fn parent_of(path: &str) -> &str {
 }
 
 /// Folders before files, then by name, case-insensitively (the tree's sort).
-fn sort_entries(entries: &mut [&Entry]) {
+pub(super) fn sort_entries(entries: &mut [&Entry]) {
     entries.sort_by(|a, b| {
         (a.kind == EntryKind::File)
             .cmp(&(b.kind == EntryKind::File))
@@ -375,6 +458,12 @@ fn walk(
     }
 }
 
+/// The row holding the folder above `rows[at]`: the nearest earlier row one level up.
+pub(super) fn parent_row(rows: &[TreeRow], at: usize) -> Option<usize> {
+    let depth = rows[at].depth.checked_sub(1)?;
+    rows[..at].iter().rposition(|row| row.depth == depth)
+}
+
 /// The paths a tree search shows: each match and every folder above it.
 pub(super) fn search_paths(matches: &[Entry]) -> HashSet<String> {
     let mut paths = HashSet::new();
@@ -417,10 +506,14 @@ pub(super) fn merge_search_entries(listed: &[Entry], hits: &[Entry]) -> Vec<Entr
     merged
 }
 
+/// `isHostPath`: an absolute path rather than one in the workspace.
+pub(super) fn is_host_path(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':')
+}
+
 /// `resolvePathLinkTarget` for a workspace path: joined onto `cwd` with its separator.
 pub(super) fn absolute_path(cwd: &str, path: &str) -> String {
-    let bytes = path.as_bytes();
-    if path.starts_with('/') || path.starts_with('\\') || (bytes.len() >= 2 && bytes[1] == b':') {
+    if is_host_path(path) {
         return path.to_owned();
     }
     let windows = cwd.as_bytes().get(1) == Some(&b':') || cwd.starts_with("\\\\");
@@ -448,6 +541,58 @@ pub(super) fn ancestors(path: &str) -> Vec<String> {
     }
     out.reverse();
     out
+}
+
+/// One ordered write queue per file (`FileSaveCoordinator`): every edit is a new revision, at
+/// most one write is in flight, and the newest revision is written after it settles, so a
+/// revert made while a write is in flight is still written.
+#[derive(Debug, Default)]
+pub(super) struct SaveQueue {
+    revision: u64,
+    confirmed: u64,
+    writing: bool,
+}
+
+impl SaveQueue {
+    /// An edit; true when a debounced write should be scheduled (none in flight).
+    pub(super) fn change(&mut self) -> bool {
+        self.revision += 1;
+        !self.writing
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Edits not yet confirmed on disk, or a write in flight.
+    pub(super) fn pending(&self) -> bool {
+        self.writing || self.revision != self.confirmed
+    }
+
+    /// Starts a write of the newest revision unless one is in flight or nothing is unwritten.
+    pub(super) fn start(&mut self) -> Option<u64> {
+        if self.writing || self.revision == self.confirmed {
+            return None;
+        }
+        self.writing = true;
+        Some(self.revision)
+    }
+
+    /// Confirms the write of `revision`; true when newer edits arrived meanwhile and need their own write.
+    pub(super) fn written(&mut self, revision: u64) -> bool {
+        self.confirmed = revision;
+        self.settle(revision)
+    }
+
+    /// Settles a failed write of `revision`; its edits stay unsaved, and only newer edits write again.
+    pub(super) fn failed(&mut self, revision: u64) -> bool {
+        self.settle(revision)
+    }
+
+    fn settle(&mut self, revision: u64) -> bool {
+        self.writing = false;
+        self.revision != revision
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +695,27 @@ mod tests {
         let labels: Vec<(&str, bool)> = rows.iter().map(|r| (r.label.as_str(), r.expanded)).collect();
         assert_eq!(labels, [("src/app", true), ("files.rs", false)]);
         assert!(tree_search_matches(&merged, "rail").is_empty());
+        assert_eq!((parent_row(&rows, 1), parent_row(&rows, 0)), (Some(0), None), "left goes to the folder row");
         assert_eq!(ancestors("a/b/c.rs"), ["a", "a/b"]);
+    }
+
+    #[test]
+    fn file_kinds_follow_the_web_precedence() {
+        assert_eq!(file_kind("clip.webm"), FileKind::Video, "webm is video before audio");
+        assert_eq!(file_kind("a/song.MP3"), FileKind::Audio);
+        assert_eq!(file_kind("logo.svg"), FileKind::Image);
+        assert_eq!(file_kind("doc.pdf"), FileKind::Pdf);
+        assert_eq!(file_kind("x.tgz"), FileKind::Archive);
+        assert_eq!(file_kind("app.db"), FileKind::Sqlite);
+        assert_eq!(file_kind("r.docx"), FileKind::Office(Office::Docx));
+        assert_eq!(file_kind("n.ipynb"), FileKind::Office(Office::Ipynb));
+        assert_eq!(file_kind("Inter.woff2"), FileKind::Font);
+        assert_eq!(file_kind("index.HTM"), FileKind::Html);
+        assert_eq!(file_kind("main.rs"), FileKind::Text);
+        assert!(!FileKind::Html.is_asset() && FileKind::Font.is_asset());
+        assert_eq!(table_delimiter("a.TSV"), Some('\t'));
+        assert_eq!((table_delimiter("a.csv"), table_delimiter("a.txt")), (Some(','), None));
+        assert!(is_mermaid("flow.mmd") && is_host_path(r"C:\x") && !is_host_path("src/x"));
     }
 
     #[test]
@@ -573,5 +738,23 @@ mod tests {
         assert_eq!(absolute_path("/home/me/repo", "src/a.rs"), "/home/me/repo/src/a.rs");
         assert_eq!(absolute_path("/repo", "/etc/hosts"), "/etc/hosts");
         assert_eq!(split_path("a/b/c.rs"), ("c.rs", "a/b"));
+    }
+
+    #[test]
+    fn save_queue_writes_a_revert_made_during_a_write() {
+        let mut queue = SaveQueue::default();
+        assert!(queue.change(), "an edit schedules a write");
+        let first = queue.start().unwrap();
+        assert!(!queue.change(), "the revert waits for the write in flight");
+        assert_eq!(queue.start(), None, "writes are serialized");
+        assert!(queue.written(first), "the revert still needs its own write");
+        let revert = queue.start().unwrap();
+        assert!(!queue.written(revert));
+        assert!(!queue.pending());
+
+        queue.change();
+        let failed = queue.start().unwrap();
+        assert!(!queue.failed(failed), "a failed write with no newer edits is not retried");
+        assert!(queue.pending(), "but its edits stay unsaved");
     }
 }

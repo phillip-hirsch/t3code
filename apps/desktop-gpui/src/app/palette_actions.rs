@@ -25,16 +25,6 @@ pub(super) fn github_repository(identity: &RepositoryIdentity) -> Option<(String
 }
 
 /// `URLSearchParams` encoding of one value.
-fn form_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => (byte as char).to_string(),
-            b' ' => "+".into(),
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
 
 /// `buildNewThreadLink` with its context: the repository, and the model once a provider is known.
 pub(super) fn prompt_link_with(
@@ -43,14 +33,18 @@ pub(super) fn prompt_link_with(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<String> {
+    use super::message_actions::form_encode_into;
     let mut link = super::message_actions::prompt_link(prompt)?;
     if let Some((owner, name)) = repository {
-        link.push_str(&format!("&repo={}", form_encode(&format!("{owner}/{name}"))));
+        link.push_str("&repo=");
+        form_encode_into(&mut link, &format!("{owner}/{name}"));
     }
     if let Some(provider) = provider {
-        link.push_str(&format!("&provider={}", form_encode(provider)));
+        link.push_str("&provider=");
+        form_encode_into(&mut link, provider);
         if let Some(model) = model {
-            link.push_str(&format!("&model={}", form_encode(model)));
+            link.push_str("&model=");
+            form_encode_into(&mut link, model);
         }
     }
     Some(link)
@@ -89,7 +83,7 @@ impl Workspace {
     pub(super) fn start_triage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         const CLI: &str = "npx t3 triage";
         let fail = |message: &str| format!("{message} Run {CLI} in a terminal on that machine instead.");
-        if self.server_info.scratch_workspace_root.is_none() {
+        if self.server_info().scratch_workspace_root.is_none() {
             toast_error(
                 "Could not start triage",
                 fail("This machine cannot start threads without a project."),
@@ -128,15 +122,17 @@ impl Workspace {
         let prompt = self.composer.read(cx).value().to_string();
         let link = if with_context {
             let project_id = match &self.target {
-                Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id),
-                Some(Target::Draft { project_id }) => Some(project_id),
+                Some(Target::Thread { id, .. }) => {
+                    self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id)
+                }
+                Some(Target::Draft { project_id, .. }) => Some(project_id),
                 None => None,
             };
             let project = project_id.and_then(|id| self.shell.projects.iter().find(|p| &p.id == id));
             let repository = project.and_then(|p| p.repository_identity.as_ref()).and_then(github_repository);
             let selection = self.composer_model();
             let provider =
-                selection.as_ref().and_then(|s| self.server_info.provider(&s.instance_id)).map(|p| p.driver.clone());
+                selection.as_ref().and_then(|s| self.server_info().provider(&s.instance_id)).map(|p| p.driver.clone());
             let model = selection.map(|s| s.model);
             prompt_link_with(&prompt, repository, provider.as_deref(), model.as_deref())
         } else {
@@ -149,8 +145,8 @@ impl Workspace {
 
     /// `thread.copyReference`: a link that opens the thread from anywhere (`threadChipCopyTarget`).
     pub(super) fn copy_thread_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = &self.target else { return };
-        let Some(environment_id) = self.server_info.environment_id.as_deref() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return };
+        let Some(environment_id) = self.server_info().environment_id.as_deref() else { return };
         let title = self.shell.threads.iter().find(|t| &t.id == thread_id).map(|t| t.title.clone()).unwrap_or_default();
         let link = super::thread_menu::hosted_thread_link(environment_id, thread_id);
         cx.write_to_clipboard(ClipboardItem::new_string(link));
@@ -160,7 +156,7 @@ impl Workspace {
     /// "Restart agent session": detaches the thread's provider sessions, so the next message
     /// starts a fresh one, then refreshes the provider for its checkout.
     pub(super) fn restart_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let Some(client) = self.client() else { return };
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let sessions: Vec<String> =

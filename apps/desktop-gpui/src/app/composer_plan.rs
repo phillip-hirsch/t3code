@@ -87,14 +87,14 @@ impl Workspace {
             return Some(mode);
         }
         match target {
-            Target::Thread(_) => self.open_projection()?.thread.interaction_mode.as_deref(),
+            Target::Thread { .. } => self.open_projection()?.thread.interaction_mode.as_deref(),
             Target::Draft { .. } => None,
         }
     }
 
     /// Whether the Build/Plan toggle shows, and the interaction mode the next send uses.
     pub(super) fn interaction_mode(&self) -> (bool, &'static str) {
-        let provider = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id));
+        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id));
         resolve_interaction_mode(
             self.client_settings.values.bool("planModeEnabled"),
             provider,
@@ -155,7 +155,7 @@ impl Workspace {
     /// `useImplementPlanInNewThread`: a fresh default-mode thread that implements
     /// the plan; it is deleted again when its first message fails.
     fn implement_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some((plan_id, markdown)), Some(client), Some(Target::Thread(source_id))) =
+        let (Some((plan_id, markdown)), Some(client), Some(Target::Thread { id: source_id, .. })) =
             (self.plan_follow_up_target(), self.client(), self.target.clone())
         else {
             return;

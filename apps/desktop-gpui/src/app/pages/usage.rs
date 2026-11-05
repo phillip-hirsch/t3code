@@ -6,6 +6,7 @@ mod prices;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -17,8 +18,6 @@ use gpui_kit::{
     MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
 };
-use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use super::super::Workspace;
@@ -36,7 +35,6 @@ pub(in crate::app) struct UsageState {
     hidden: Vec<String>,
     /// The environment filter: this window reads one environment, so it is on or off.
     environment_selected: bool,
-    tz: TimeZone,
     window: UsageWindow,
     /// The answer on screen and the window it answers; a new window keeps it until it lands.
     summary: Option<(Rc<Summary>, UsageWindow)>,
@@ -55,16 +53,20 @@ pub(in crate::app) struct UsageState {
     redeemed: Vec<(String, String, Option<String>)>,
 }
 
+/// A usage window ending now, in the system time zone.
+fn local_window(days: u32) -> UsageWindow {
+    let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
+    UsageWindow::new(days, crate::timestamp::now_ms(), &Local, zone)
+}
+
 impl Default for UsageState {
     fn default() -> Self {
-        let tz = TimeZone::system();
         Self {
             metric: "limits",
             days: 30,
             hidden: Vec::new(),
             environment_selected: true,
-            window: UsageWindow::new(30, Timestamp::now(), &tz),
-            tz,
+            window: local_window(30),
             summary: None,
             merged: Rc::default(),
             error: None,
@@ -147,7 +149,7 @@ impl Workspace {
 
     fn select_usage_window(&mut self, days: u32, cx: &mut Context<Self>) {
         self.usage.days = days;
-        self.usage.window = UsageWindow::new(days, Timestamp::now(), &self.usage.tz);
+        self.usage.window = local_window(days);
         self.usage.hover = None;
         self.read_usage(false, cx);
     }
@@ -232,7 +234,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 if let Ok(payload) = result {
                     let event = json!({"type": "providerStatuses", "payload": payload});
-                    if let Err(error) = this.server_info.apply(&event) {
+                    if let Err(error) = this.server_info_mut().apply(&event) {
                         log::warn!("refreshed providers did not decode: {error}");
                     }
                 }
@@ -254,7 +256,7 @@ impl Workspace {
             self.refresh_limits(false, cx);
             return;
         }
-        self.usage.window = UsageWindow::new(self.usage.days, Timestamp::now(), &self.usage.tz);
+        self.usage.window = local_window(self.usage.days);
         self.usage.refreshing = true;
         self.read_usage(true, cx);
     }
@@ -365,7 +367,7 @@ impl Workspace {
         let limits = usage.metric == "limits";
         let view = cx.entity();
         let separator = || div().flex_none().text_color(t.muted_foreground).child("/");
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "This environment".into());
+        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "This environment".into());
         let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
         let has_issue = !limits && (usage.error.is_some() || summary.as_ref().is_some_and(|s| !s.compatible()));
         let env_label =
@@ -561,20 +563,20 @@ impl Workspace {
 
     fn render_limits(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
-        let providers = &self.server_info.providers;
+        let providers = &self.server_info().providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let sources = &self.server_info.config["usageLimitSources"];
+        let sources = &self.server_info().config["usageLimitSources"];
         let pools = logic::limit_pools(logic::limit_accounts(providers, sources, &hidden), now);
         let notices = logic::limit_notices(providers, &hidden);
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         let links = logic::external_links(providers, &environment, &hidden);
         let mut body = v_flex().gap(px(32.));
         if pools.is_empty() && notices.is_empty() && links.is_empty() {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
-        let environment_label = self.server_info.environment_label.clone();
+        let environment_label = self.server_info().environment_label.clone();
         for pool in &pools {
             let view = cx.weak_entity();
             let redeemed = &self.usage.redeemed;
@@ -845,7 +847,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tokens = self.usage.tokens();
-        let tz = self.usage.tz.clone();
+        let tz = Local;
         let periods = window.periods();
         let columns: Vec<Vec<f64>> = periods
             .iter()
@@ -1191,7 +1193,7 @@ impl Workspace {
             }
             for period in periods {
                 let label = match period.hour_ms {
-                    Some(ms) => logic::format_hour_short(ms, &usage.tz),
+                    Some(ms) => logic::format_hour_short(ms, &Local),
                     None => logic::format_day_short(&period.day),
                 };
                 table =

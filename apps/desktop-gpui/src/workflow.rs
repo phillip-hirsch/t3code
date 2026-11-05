@@ -9,6 +9,12 @@ pub struct WorkflowRow {
     pub opening: Opening,
     pub phases: Vec<(String, usize, Vec<std::rc::Rc<crate::timeline::SubagentCard>>)>,
     pub unphased: Vec<std::rc::Rc<crate::timeline::SubagentCard>>,
+    /// [`Opening::headline`], built with the row rather than per frame.
+    pub headline: (String, Option<String>, Option<String>),
+    /// [`script_markdown`] of the opening's script.
+    pub script_markdown: gpui_kit::SharedString,
+    /// The script is long enough to fold.
+    pub foldable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,7 +76,7 @@ pub fn is_workflow_script(text: &str, mark: Option<bool>) -> bool {
 /// The members of a coordinator's workflow (`workflowMembersToRuntime`).
 fn members(coordinator: &Value) -> Vec<(Member, Option<i64>, Option<String>, i64)> {
     let coordinator_status = coordinator["status"].as_str().unwrap_or_default();
-    let coordinator_done = coordinator["completedAt"].as_str().and_then(crate::work_log::parse_iso_ms);
+    let coordinator_done = coordinator["completedAt"].as_str().and_then(crate::timestamp::parse_ms);
     let Some(agents) = coordinator.pointer("/workflow/agents").and_then(Value::as_array) else { return Vec::new() };
     agents
         .iter()
@@ -86,7 +92,7 @@ fn members(coordinator: &Value) -> Vec<(Member, Option<i64>, Option<String>, i64
                 .then(|| {
                     agent["completedAt"]
                         .as_i64()
-                        .or_else(|| Some(started? + agent["durationMs"].as_i64()?))
+                        .or_else(|| started?.checked_add(agent["durationMs"].as_i64()?))
                         .or(coordinator_done)
                 })
                 .flatten();
@@ -125,7 +131,7 @@ pub fn opening(thread_id: &str, message_id: &str, script: &str, parent_subagents
         let mut titles: Vec<(i64, String)> = Vec::new();
         for (_, phase, title, _) in &all {
             let Some(phase) = phase else { continue };
-            let title = title.clone().unwrap_or_else(|| format!("Phase {}", phase + 1));
+            let title = title.clone().unwrap_or_else(|| format!("Phase {}", phase.saturating_add(1)));
             match titles.iter_mut().find(|(i, _)| i == phase) {
                 Some(entry) => entry.1 = title,
                 None => titles.push((*phase, title)),
@@ -234,5 +240,18 @@ mod tests {
             ("review".into(), Some("Review the diff".into()), Some("3 agents · 2 working · 1 done".into()))
         );
         assert_eq!(script_markdown("a ``` b"), "````javascript\na ``` b\n````");
+    }
+
+    #[test]
+    fn extreme_server_numbers_do_not_overflow() {
+        let parent = vec![json!({
+            "id": "s1", "childThreadId": "t", "status": "completed",
+            "workflow": {"agents": [
+                {"index": 0, "label": "a", "state": "completed", "phaseIndex": i64::MAX, "startedAt": i64::MAX, "durationMs": 1}
+            ]}
+        })];
+        let opening = opening("t", "m", "export const meta = {}", Some(&parent));
+        assert_eq!(opening.phases[0].title, format!("Phase {}", i64::MAX));
+        assert_eq!(opening.phases[0].members[0].completed_ms, None);
     }
 }

@@ -247,7 +247,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
 impl Workspace {
     pub(super) fn render_access(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = window.use_keyed_state("settings-access", cx, |_, _| AccessState::default());
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |state, cx| state.start(client, endpoint, cx));
         let t = *theme::tokens(cx);
         let local_rows = self.local_backend_rows(window, cx, &t);
@@ -270,7 +270,7 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
-        let config = &self.server_info.config;
+        let config = &self.settings_info().config;
         let has_config = config.is_object();
         let label: SharedString = self.environment_label().unwrap_or("This machine").to_owned().into();
         let mut rows = Vec::new();
@@ -291,9 +291,9 @@ impl Workspace {
                 None => rows.push(network_access_row(s, t)),
             }
         }
-        rows.push(permissions_details(state, s, self.client().is_some(), t));
+        rows.push(permissions_details(state, s, self.settings_client().is_some(), t));
         let more = self.icon_menu(s, window).into_any_element();
-        let icon = ui::glyph(logic::machine_icon(self.server_info.machine_kind()), 16., t.foreground);
+        let icon = ui::glyph(logic::machine_icon(self.settings_info().machine_kind()), 16., t.foreground);
         section_with_action(
             "connections-environment",
             h_flex().gap(px(8.)).child(icon).child(label),
@@ -305,7 +305,7 @@ impl Workspace {
 
     /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`).
     fn icon_menu(&self, s: &AccessState, _: &mut Window) -> impl IntoElement {
-        let config = &self.server_info.config;
+        let config = &self.settings_info().config;
         let lock = if !config.is_object() {
             Some("Connect to this environment to change its icon.")
         } else if !s.grants(SETTINGS_WRITE) {
@@ -314,8 +314,8 @@ impl Workspace {
             None
         };
         let machine = config.pointer("/environment/platform/machine").and_then(Value::as_str).map(str::to_owned);
-        let resolved = self.server_info.machine_kind().to_owned();
-        let client = self.client();
+        let resolved = self.settings_info().machine_kind().to_owned();
+        let client = self.settings_client();
         Button::new("settings-access-more")
             .ghost()
             .xsmall()
@@ -376,7 +376,7 @@ impl Workspace {
             snapshot.sorted_links().into_iter().filter(|l| logic::ms(&l.expires_at) > now).collect();
         let sessions = snapshot.sorted_sessions();
         let open = s.clients_open;
-        let endpoint = self.endpoint.clone();
+        let endpoint = self.settings_endpoint().cloned();
         let link_row = |link: &PairingLink| pairing_link_row(state, s, link, can_write, endpoint.clone(), now, t);
 
         let toggle = {
@@ -467,7 +467,7 @@ impl Workspace {
         can_read: bool,
         t: &Tokens,
     ) -> AnyElement {
-        let endpoint = self.endpoint.clone();
+        let endpoint = self.settings_endpoint().cloned();
         // Unknown sessions keep the button on, as the web does without a snapshot.
         let others =
             !can_read || s.access_error.is_some() || s.access.as_ref().is_none_or(AccessSnapshot::has_other_clients);
@@ -481,7 +481,7 @@ impl Workspace {
             let (state, endpoint) = (state.clone(), endpoint.clone());
             move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
         });
-        let denial = logic::remote_clients_denial(&self.server_info.managed_policy);
+        let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
         let delegatable: Vec<String> = match &s.session {
             SessionLoad::Ready(session) => session.delegatable().to_vec(),
             _ => Vec::new(),

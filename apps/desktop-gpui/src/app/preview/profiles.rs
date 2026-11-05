@@ -54,11 +54,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let server = self.client().filter(|_| self.server_info.capability("serverBrowser"));
+        let server = self.client().filter(|_| self.server_info().capability("serverBrowser"));
         let storage = Storage::of(Some(&profile_id));
         cx.spawn_in(window, async move |_, cx| {
             // Clears through a hidden view in the profile's storage, which works whether or not a tab of it is open.
-            let view = cx.update(|window, _| {
+            let view = cx.update(|window, cx| {
                 let mut context = storage.context();
                 let builder = storage
                     .builder(context.as_mut())
@@ -66,11 +66,11 @@ impl Workspace {
                     // A focused view would take the keyboard focus with it when it is dropped.
                     .with_focused(false)
                     .with_url("about:blank");
-                build(builder, window)
+                super::build_view(builder, window, cx)
             });
             let view = view.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
             let desktop = async {
-                view.clear_all_browsing_data().map_err(|error| error.to_string())?;
+                view.raw().clear_all_browsing_data().map_err(|error| error.to_string())?;
                 // WebView2 clears in the background and reports nothing back; dropping the view
                 // early could cut that short.
                 cx.background_executor().timer(CLEAR_GRACE).await;
@@ -89,7 +89,7 @@ impl Workspace {
     /// Reports this client's profiles, default profile and recording frame rate to the server's
     /// browser once per connection and again on each change. Agents' tabs use them.
     pub(in crate::app) fn report_browser_profiles(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client().filter(|_| self.server_info.capability("serverBrowser")) else { return };
+        let Some(client) = self.client().filter(|_| self.server_info().capability("serverBrowser")) else { return };
         let report = preview::profile_report(&self.client_settings.values);
         if self.preview.reported_profiles.as_ref() == Some(&report) {
             return;
@@ -107,10 +107,3 @@ impl Workspace {
 
 /// How long a hidden view stays alive after it asked WebView2 to clear its profile.
 const CLEAR_GRACE: Duration = Duration::from_secs(2);
-
-/// Builds a native view in `window`. Call it from a task's update: WebView2's constructor runs
-/// the window's message loop, and while a task runs GPUI posts no other task to that loop, so
-/// nothing re-enters the borrowed app (window events in that time are dropped).
-pub(super) fn build(builder: wry::WebViewBuilder, window: &Window) -> wry::Result<wry::WebView> {
-    builder.build_as_child(window)
-}

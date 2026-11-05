@@ -173,7 +173,7 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
 impl Workspace {
     pub(in crate::app) fn preview_thread_id(&self) -> Option<&str> {
         match self.target.as_ref()? {
-            Target::Thread(id) => Some(id),
+            Target::Thread { id, .. } => Some(id),
             Target::Draft { .. } => None,
         }
     }
@@ -241,13 +241,14 @@ impl Workspace {
     }
 
     /// Whether GPUI draws over the browser's area: a native view would cover it on Windows.
-    fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
+    pub(super) fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
         self.page.is_some()
             || self.settings.is_some()
             || self.palette.is_some()
             || self.preview.menu_open
             || self.right_panel.add_menu_open
             || self.tab_menu_open()
+            || self.files.menu_open
             || window.has_active_dialog(cx)
     }
 
@@ -573,7 +574,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Creates the native view for a tab and starts `url` in it, from a task: see [`profiles::build`].
+    /// Creates the native view for a tab and starts `url` in it, from a task: see [`build_view`].
     fn host_tab(&mut self, thread_id: &str, tab_id: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pending) = self.preview.starting.get_mut(tab_id) {
             *pending = url.to_owned();
@@ -593,7 +594,7 @@ impl Workspace {
                 let (sender, events) = async_channel::unbounded();
                 let mut context = partition.context();
                 let builder = page_builder(partition.builder(context.as_mut()), &url, sender.clone());
-                match profiles::build(builder, window) {
+                match build_view(builder, window, cx) {
                     Ok(webview) => this.adopt_view(thread_id, tab_id, url, webview, (sender, events), window, cx),
                     Err(error) => {
                         this.error = Some(format!("Unable to start the browser: {error}").into());
@@ -611,12 +612,11 @@ impl Workspace {
         thread_id: String,
         tab_id: String,
         url: String,
-        webview: wry::WebView,
+        webview: WebView,
         (page_events, events): (async_channel::Sender<PageEvent>, async_channel::Receiver<PageEvent>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let webview = WebView::new(webview, window, cx);
         // Hidden until a frame lays it out, so it never flashes at the window's origin.
         let _ = webview.set_visible(false);
         let view = cx.new(|_| webview);
@@ -1292,6 +1292,14 @@ fn probe_failure(view: &wry::WebView, url: &str, events: &async_channel::Sender<
     if let Err(error) = probed {
         log::warn!("could not check the page for a failed load: {error}");
     }
+}
+
+/// Builds a native view in `window` (gpui-webview's safe constructor). Call it from inside a task's
+/// update, never from an event handler or `defer`: WebView2's constructor runs the window's message
+/// loop, and only while a task runs does GPUI post no other task to that loop, so no task re-enters
+/// the borrowed app. The UI still pauses for the build, and window events in that time are dropped.
+pub(super) fn build_view(builder: wry::WebViewBuilder, window: &mut Window, cx: &mut App) -> wry::Result<WebView> {
+    WebView::build(builder, window, cx)
 }
 
 /// A tab's view: its page events, and the script that reports its history.
