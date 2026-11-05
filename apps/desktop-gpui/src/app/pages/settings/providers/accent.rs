@@ -11,9 +11,9 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
-    SharedString, Styled as _, Subscription, Window, canvas, div, hsla, linear_color_stop, linear_gradient, px, rgb,
+    AnyElement, App, AppContext as _, Bounds, Context, ElementId, Entity, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString,
+    Styled as _, Subscription, Window, canvas, div, hsla, linear_color_stop, linear_gradient, px, rgb,
 };
 
 use crate::theme;
@@ -21,7 +21,7 @@ use crate::theme;
 const FALLBACK_ACCENT_COLOR: &str = "#2563eb";
 
 /// `normalizeProviderAccentColor` in `packages/client-runtime/src/state/providerInstanceDisplay.ts`.
-pub(in crate::app) fn normalize_accent_color(value: Option<&str>) -> Option<String> {
+pub(super) fn normalize_accent_color(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (trimmed.len() == 7 && trimmed.starts_with('#') && trimmed[1..].bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| trimmed.to_owned())
@@ -74,7 +74,7 @@ fn hsv_to_hex(Hsv { h, s, v }: Hsv) -> String {
     format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
 }
 
-fn hex_color(hex: &str) -> Hsla {
+pub(super) fn hex_color(hex: &str) -> Hsla {
     rgb(u32::from_str_radix(&hex[1..], 16).unwrap_or(0)).into()
 }
 
@@ -93,7 +93,7 @@ enum Drag {
 
 type Commit = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
-pub(in crate::app) struct AccentPicker {
+pub(super) struct AccentPicker {
     display_name: SharedString,
     value: String,
     draft: Option<Draft>,
@@ -110,13 +110,11 @@ pub(in crate::app) struct AccentPicker {
     _subscriptions: Vec<Subscription>,
 }
 
-/// The accent swatch button and its popover; `stacked` adds the label and
-/// description above and below it, as the web's default layout.
-pub(in crate::app) fn accent_color_picker(
+/// The accent swatch button and its popover (the web's `layout="inline"`, which every caller uses).
+pub(super) fn accent_color_picker(
     id: impl Into<ElementId>,
     display_name: &str,
     value: Option<&str>,
-    stacked: Option<Option<&str>>,
     on_commit: impl Fn(String, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
@@ -133,16 +131,7 @@ pub(in crate::app) fn accent_color_picker(
         picker.display_name = display_name;
         picker.on_commit = on_commit;
     });
-    let Some(description) = stacked else { return picker.into_any_element() };
-    let t = theme::tokens(cx);
-    v_flex()
-        .gap_2()
-        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child("Accent color"))
-        .child(picker)
-        .when_some(description, |el, description| {
-            el.child(div().text_xs().text_color(t.muted_foreground).child(description.to_owned()))
-        })
-        .into_any_element()
+    picker.into_any_element()
 }
 
 impl AccentPicker {
@@ -265,8 +254,12 @@ impl AccentPicker {
         let picker = cx.entity();
         canvas(
             move |bounds, _, _| bounds,
-            move |_, measured, window, _| {
-                bounds.set(measured);
+            move |_, measured, window, cx| {
+                // The thumbs are placed from these bounds, so a new size renders the picker again.
+                if bounds.replace(measured) != measured {
+                    let picker = picker.clone();
+                    cx.defer(move |cx| picker.update(cx, |_, cx| cx.notify()));
+                }
                 if !dragging {
                     return;
                 }
@@ -315,7 +308,9 @@ impl AccentPicker {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event, window, cx| this.start_drag(Drag::Plane, event, window, cx)),
-            );
+            )
+            // A quick click releases before the window-wide release listener is registered.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.end_drag(window, cx)));
         // Six two-stop segments draw the web's seven-stop hue gradient.
         let stops = [0xff0000, 0xffff00, 0x00ff00, 0x00ffff, 0x0000ff, 0xff00ff, 0xff0000];
         let hue = div()
@@ -340,7 +335,9 @@ impl AccentPicker {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event, window, cx| this.start_drag(Drag::Hue, event, window, cx)),
-            );
+            )
+            // A quick click releases before the window-wide release listener is registered.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.end_drag(window, cx)));
         v_flex()
             .w(px(224.))
             .bg(t.popover)

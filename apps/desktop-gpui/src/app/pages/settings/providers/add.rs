@@ -2,22 +2,18 @@
 //! `AddProviderInstanceWizardSteps.tsx`, `ProviderWizardAuthenticationStep.tsx`,
 //! `MultipleAccountsNote.tsx`) and the driver connection form (`ProviderSettingsForm.tsx`),
 //! which the instance card's Runtime section reuses through [`Workspace::render_provider_runtime_form`].
-//!
-//! The web derives the form from each driver's Effect schema annotations; [`DRIVERS`] is that
-//! derivation captured as data (labels, order and options copied from the schemas).
+//! The form's fields come from [`super::drivers::DRIVERS`].
 
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    Colorize as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _, FontWeight, Hsla,
@@ -26,319 +22,19 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
+use super::accent::{accent_color_picker, normalize_accent_color};
 use super::acp::{AcpRegistrySearch, AcpSearchEvent, RegistryAgent, rpc_message};
+use super::drivers::{self, Control, DRIVERS, Driver, Field, is_local_acp, next_config, visible_fields};
 use crate::app::Workspace;
 use crate::rpc::StreamEvent;
 use crate::theme::{FONT_MONO, Tokens, tokens};
 
 pub(super) const ACP_REGISTRY: &str = "acpRegistry";
 
-// MARK: Driver catalog (`providerClients` + each driver's settings schema)
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Control {
-    Text,
-    Password,
-    Select(&'static [(&'static str, &'static str)]),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct FieldSpec {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub description: &'static str,
-    pub placeholder: &'static str,
-    pub control: Control,
-    /// `clearWhenEmpty: "persist"`: an empty value is saved instead of removing the key.
-    pub persist_empty: bool,
-    /// Kept in the server's secret store; a saved value never comes back.
-    pub secret: bool,
-}
-
-const fn text(
-    key: &'static str,
-    label: &'static str,
-    description: &'static str,
-    placeholder: &'static str,
-) -> FieldSpec {
-    FieldSpec { key, label, description, placeholder, control: Control::Text, persist_empty: false, secret: false }
-}
-
-const fn secret(key: &'static str, label: &'static str, description: &'static str) -> FieldSpec {
-    FieldSpec { control: Control::Password, secret: true, ..text(key, label, description, "Optional") }
-}
-
-const fn select(
-    key: &'static str,
-    label: &'static str,
-    description: &'static str,
-    options: &'static [(&'static str, &'static str)],
-) -> FieldSpec {
-    FieldSpec { control: Control::Select(options), ..text(key, label, description, "") }
-}
-
-pub(super) struct DriverSpec {
-    pub kind: &'static str,
-    pub label: &'static str,
-    /// `featured: false` lists the driver under "Show more".
-    pub featured: bool,
-    pub badge: Option<&'static str>,
-    /// Registry entries for the same agent, left out of the Registry list.
-    pub acp_ids: &'static [&'static str],
-    pub fields: &'static [FieldSpec],
-}
-
-const BINARY: &str = "Binary path";
-
-pub(super) const DRIVERS: &[DriverSpec] = &[
-    DriverSpec {
-        kind: "codex",
-        label: "Codex",
-        featured: true,
-        badge: None,
-        acp_ids: &["codex-acp"],
-        fields: &[
-            text("binaryPath", BINARY, "Path to the Codex binary used by this instance.", "codex"),
-            text("homePath", "CODEX_HOME path", "Custom Codex home and config directory.", "~/.codex"),
-            text(
-                "shadowHomePath",
-                "Shadow home path",
-                "Account-specific Codex home. Keeps auth.json separate while sharing state from CODEX_HOME.",
-                "~/.codex-t3/personal",
-            ),
-            text(
-                "launchArgs",
-                "Launch arguments",
-                "Additional CLI arguments passed to codex app-server on session start.",
-                "",
-            ),
-        ],
-    },
-    DriverSpec {
-        kind: "claudeAgent",
-        label: "Claude",
-        featured: true,
-        badge: None,
-        acp_ids: &["claude-acp"],
-        fields: &[
-            text("binaryPath", BINARY, "Path to the Claude binary used by this instance.", "claude"),
-            text(
-                "homePath",
-                "CLAUDE_CONFIG_DIR path",
-                "Custom Claude home and config directory. Keeps .claude.json and .claude separate.",
-                "~/.claude",
-            ),
-            text(
-                "autoCompactWindow",
-                "Auto-compact after",
-                "Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.",
-                "e.g. 300000",
-            ),
-            select(
-                "idleCompaction",
-                "Compact idle threads",
-                "When to compact an idle thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Overrides the default in Providers > Advanced.",
-                &[
-                    ("default", "Use default"),
-                    ("onReturn", "When you return"),
-                    ("beforeCacheExpires", "Before the cache expires (beta)"),
-                    ("off", "Never"),
-                ],
-            ),
-            text(
-                "launchArgs",
-                "Launch arguments",
-                "Additional CLI arguments passed on session start.",
-                "e.g. --chrome",
-            ),
-        ],
-    },
-    DriverSpec { kind: "cursor", label: "Cursor", featured: true, badge: None, acp_ids: &["cursor"], fields: &[] },
-    DriverSpec {
-        kind: "grok",
-        label: "Grok",
-        featured: true,
-        badge: None,
-        acp_ids: &["grok-build"],
-        fields: &[text("binaryPath", BINARY, "Path to the Grok CLI binary.", "grok")],
-    },
-    DriverSpec {
-        kind: "fx",
-        label: "fx",
-        featured: false,
-        badge: None,
-        acp_ids: &[],
-        fields: &[text(
-            "binaryPath",
-            BINARY,
-            "Path to the fx binary. All fx instances on this machine share its fx login.",
-            "fx",
-        )],
-    },
-    DriverSpec {
-        kind: "opencode",
-        label: "OpenCode",
-        featured: true,
-        badge: None,
-        acp_ids: &["opencode", "opencode-v2"],
-        fields: &[
-            text("binaryPath", BINARY, "Path to the OpenCode binary.", "opencode"),
-            text(
-                "serverUrl",
-                "Server URL",
-                "Leave blank to let T3 Code spawn the server when needed.",
-                "http://127.0.0.1:4096",
-            ),
-            secret("serverPassword", "Server password", "Stored separately on the host."),
-        ],
-    },
-    DriverSpec {
-        kind: "antigravity",
-        label: "Antigravity",
-        featured: true,
-        badge: None,
-        acp_ids: &["antigravity-acp"],
-        fields: &[
-            select(
-                "authMethod",
-                "Sign-in method",
-                "Google accounts use your subscription; API keys and Agent Platform bill usage.",
-                &[
-                    ("oauth-personal", "Google account"),
-                    ("oauth-business", "Gemini Enterprise"),
-                    ("gemini-api-key", "Gemini API key"),
-                    ("agent-platform", "Agent Platform (Vertex AI)"),
-                ],
-            ),
-            secret("apiKey", "API key", "Gemini or Vertex AI express key. Stored separately on the host."),
-            text(
-                "gcpProject",
-                "GCP project",
-                "Required for Gemini Enterprise. Agent Platform uses it when no API key is set.",
-                "my-project-id",
-            ),
-            text("gcpLocation", "GCP location", "Region for Gemini Enterprise or Agent Platform.", "us-central1"),
-            FieldSpec {
-                persist_empty: true,
-                ..text("binaryPath", BINARY, "Custom ACP executable. Leave empty to select automatically.", "Automatic")
-            },
-        ],
-    },
-    DriverSpec {
-        kind: "kiro",
-        label: "Kiro",
-        featured: false,
-        badge: Some("Early Access"),
-        acp_ids: &[],
-        fields: &[text("binaryPath", BINARY, "Path to the Kiro CLI binary.", "kiro-cli")],
-    },
-    DriverSpec {
-        kind: "muse",
-        label: "Muse Code",
-        featured: true,
-        badge: None,
-        acp_ids: &[],
-        fields: &[text(
-            "binaryPath",
-            BINARY,
-            "Path to the Muse Code binary on this environment. Sign in with muse login on that host.",
-            "muse",
-        )],
-    },
-    DriverSpec {
-        kind: "pi",
-        label: "Pi",
-        featured: true,
-        badge: None,
-        acp_ids: &["pi-acp"],
-        fields: &[
-            text("binaryPath", BINARY, "Path to the Pi coding agent binary.", "pi"),
-            text(
-                "launchArgs",
-                "Launch arguments",
-                "Additional CLI arguments passed to pi --mode rpc on session start.",
-                "",
-            ),
-        ],
-    },
-    DriverSpec {
-        kind: ACP_REGISTRY,
-        label: "ACP Registry",
-        featured: true,
-        badge: None,
-        acp_ids: &[],
-        fields: &[
-            select("source", "ACP source", "", &[("registry", "ACP Registry"), ("local", "Local command")]),
-            FieldSpec {
-                persist_empty: true,
-                ..text(
-                    "agentId",
-                    "Registry agent ID",
-                    "Agent identifier from the official ACP Registry, for example 'devin'.",
-                    "devin",
-                )
-            },
-            text(
-                "commandPath",
-                "Executable override",
-                "Executable on this environment. For registry agents, this overrides the distribution executable while keeping its arguments and environment.",
-                "Registry default",
-            ),
-            text(
-                "authMethodId",
-                "Authentication method",
-                "Optional ACP authentication method ID. By default, the first agent-managed method is selected.",
-                "auto",
-            ),
-        ],
-    },
-];
-
-pub(super) fn driver_spec(kind: &str) -> Option<&'static DriverSpec> {
-    DRIVERS.iter().find(|driver| driver.kind == kind)
-}
-
 // MARK: Pure logic
 
 fn config_str<'a>(config: &'a Value, key: &str) -> &'a str {
     config.get(key).and_then(Value::as_str).unwrap_or_default()
-}
-
-fn is_local_acp(driver: &str, config: &Value) -> bool {
-    driver == ACP_REGISTRY && config_str(config, "source") == "local"
-}
-
-/// `deriveProviderSettingsFields`: a local ACP command shows only its source and executable.
-pub(super) fn visible_fields(driver: &DriverSpec, config: &Value) -> Vec<FieldSpec> {
-    if !is_local_acp(driver.kind, config) {
-        return driver.fields.to_vec();
-    }
-    driver
-        .fields
-        .iter()
-        .filter(|field| field.key == "source" || field.key == "commandPath")
-        .map(|field| match field.key {
-            "commandPath" => FieldSpec {
-                label: "Executable",
-                description: "Executable name or path on this environment.",
-                placeholder: "e.g. dsh",
-                ..*field
-            },
-            _ => *field,
-        })
-        .collect()
-}
-
-/// `nextProviderConfigWithFieldValue` for string values: an empty value removes the key unless
-/// the field persists empties; an empty config is `None`.
-pub(super) fn next_config(config: &Value, field: &FieldSpec, value: &str) -> Option<Value> {
-    let mut base = config.as_object().cloned().unwrap_or_default();
-    if !field.persist_empty && value.trim().is_empty() {
-        base.remove(field.key);
-    } else {
-        base.insert(field.key.into(), value.into());
-    }
-    (!base.is_empty()).then_some(Value::Object(base))
 }
 
 fn with_command_args(config: &Value, args: Vec<String>) -> Value {
@@ -450,13 +146,6 @@ pub(super) fn is_configured_acp_agent(instances: &Value, agent_id: &str) -> bool
     })
 }
 
-/// `normalizeProviderAccentColor`: a `#rrggbb` color or nothing.
-fn normalize_accent(value: &str) -> Option<String> {
-    let value = value.trim();
-    (value.len() == 7 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit()))
-        .then(|| value.to_owned())
-}
-
 /// `isManagedDriverAllowed`.
 fn driver_allowed(policy: &Value, driver: &str) -> bool {
     match policy.pointer("/limits/providers/allowedDrivers").and_then(Value::as_array) {
@@ -524,7 +213,7 @@ fn input_value(input: &Entity<InputState>, cx: &App) -> String {
 pub(super) struct ConfigChanged(pub Option<Value>);
 
 pub(super) struct ConfigForm {
-    driver: &'static DriverSpec,
+    driver: &'static Driver,
     config: Value,
     /// The last config set from outside; an unchanged one (e.g. our own save in flight) is ignored.
     seen: Value,
@@ -534,6 +223,8 @@ pub(super) struct ConfigForm {
     args: Vec<(u64, Entity<InputState>)>,
     next_arg: u64,
     locks: Option<(HashSet<String>, SharedString)>,
+    /// Hairlines between rows, as in a grouped settings card; the wizard's plain group spaces them.
+    divided: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -541,10 +232,11 @@ impl EventEmitter<ConfigChanged> for ConfigForm {}
 
 impl ConfigForm {
     pub(super) fn new(
-        driver: &'static DriverSpec,
+        driver: &'static Driver,
         config: Value,
         id_prefix: impl Into<SharedString>,
         locks: Option<(HashSet<String>, SharedString)>,
+        divided: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -557,6 +249,7 @@ impl ConfigForm {
             args: Vec::new(),
             next_arg: 0,
             locks,
+            divided,
             _subscriptions: Vec::new(),
         };
         for field in driver.fields.iter().filter(|f| !matches!(f.control, Control::Select(_))) {
@@ -599,7 +292,7 @@ impl ConfigForm {
                         if saved.is_empty() { "Not set" } else { "Stored secret, enter a new value to replace" };
                     input.set_placeholder(placeholder, window, cx);
                 } else {
-                    input.set_placeholder(field.placeholder, window, cx);
+                    input.set_placeholder(field.placeholder.unwrap_or_default(), window, cx);
                     if !focused && input.value().as_ref() != saved {
                         input.set_value(saved, window, cx);
                     }
@@ -665,19 +358,19 @@ impl ConfigForm {
         self.publish(next, window, cx);
     }
 
-    fn select_option(&mut self, field: FieldSpec, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_option(&mut self, field: Field, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Control::Select(options) = field.control else { return };
         let fallback = options.first().map(|(v, _)| *v).unwrap_or_default();
         let next = next_config(&self.config, &field, if value == fallback { "" } else { value });
         self.publish(next, window, cx);
     }
 
-    fn clear_secret(&mut self, field: FieldSpec, window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_secret(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
         let next = next_config(&self.config, &field, "");
         self.publish(next, window, cx);
     }
 
-    fn render_control(&self, field: FieldSpec, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_control(&self, field: Field, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let locked = self.locks.as_ref().filter(|(keys, _)| keys.contains(field.key)).map(|(_, reason)| reason.clone());
         let id = |part: &str| ElementId::Name(format!("{}-{}{part}", self.id_prefix, field.key).into());
         let control = match field.control {
@@ -787,100 +480,67 @@ impl Render for ConfigForm {
         let t = *tokens(cx);
         let fields = visible_fields(self.driver, &self.config);
         let local = is_local_acp(self.driver.kind, &self.config);
-        v_flex()
-            .gap(px(4.))
-            .children(fields.into_iter().map(|field| {
+        let rows = fields
+            .into_iter()
+            .map(|field| {
                 let control = self.render_control(field, &t, cx);
                 settings_row(
                     SharedString::from(format!("{}-{}", self.id_prefix, field.key)),
                     field.label,
-                    (!field.description.is_empty()).then(|| field.description.into()),
+                    field.description.map(Into::into),
                     None,
                     Some(control),
                     &t,
                 )
-            }))
-            .when(local, |form| form.child(self.render_args(&t, cx)))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(local.then(|| self.render_args(&t, cx)));
+        let divided = self.divided;
+        v_flex().when(!divided, |form| form.gap(px(4.))).children(rows.enumerate().map(|(index, row)| {
+            div().when(divided && index > 0, |el| el.border_t_1().border_color(t.border.opacity(0.5))).child(row)
+        }))
     }
 }
 
 // MARK: The instance card's Runtime fields
 
 impl Workspace {
-    /// `ProviderSettingsForm` for a saved instance: each committed change upserts the instance.
-    /// `None` when the instance or its driver is unknown (the card then shows its "Driver" note).
-    pub(in crate::app) fn render_provider_runtime_form(
+    /// `ProviderSettingsForm` in the instance card: each committed change replaces the instance's
+    /// `config` and upserts it (`updateConfig`).
+    pub(super) fn render_provider_runtime_form(
         &mut self,
         instance_id: &str,
+        driver: &'static Driver,
+        config: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let instance = self.server_info.provider_instances.get(instance_id)?.clone();
-        let driver = driver_spec(instance.get("driver")?.as_str()?)?;
-        if driver.fields.is_empty() {
-            return None;
-        }
-        let config = instance.get("config").cloned().unwrap_or_default();
+    ) -> AnyElement {
         let locks = config_locks(&self.server_info.managed_policy, driver.kind);
         let workspace = cx.weak_entity();
         let owned_id = instance_id.to_owned();
+        let initial = config.clone();
         let form = window.use_keyed_state(
             SharedString::from(format!("provider-runtime-{instance_id}-{}", driver.kind)),
             cx,
             |window, cx| {
-                let form =
-                    ConfigForm::new(driver, config.clone(), format!("provider-instance-{owned_id}"), locks, window, cx);
-                cx.subscribe(&cx.entity(), move |_, _, ConfigChanged(next), cx| {
-                    let next = next.clone();
-                    let id = owned_id.clone();
-                    let _ = workspace.update(cx, |workspace, cx| workspace.update_instance_config(id, next, cx));
+                let prefix = format!("provider-instance-{owned_id}");
+                let form = ConfigForm::new(driver, initial, prefix, locks, true, window, cx);
+                cx.subscribe_in(&cx.entity(), window, move |_, _, ConfigChanged(next), window, cx| {
+                    let (next, id) = (next.clone(), owned_id.clone());
+                    let _ = workspace.update(cx, |this, cx| {
+                        let Some(row) = this.instance_row(&id) else { return };
+                        let instance = super::instances::with_key(&row.instance(), "config", next);
+                        this.persist_provider_instance(&id, instance, window, cx);
+                    });
                 })
                 .detach();
                 form
             },
         );
         form.update(cx, |form, cx| form.set_config(config, window, cx));
-        Some(form.into_any_element())
-    }
-
-    /// `updateConfig` in `ProviderInstanceCard`: replaces the instance's `config` and upserts it.
-    fn update_instance_config(&mut self, instance_id: String, config: Option<Value>, cx: &mut Context<Self>) {
-        let Some(mut instance) = self.server_info.provider_instances.get(&instance_id).cloned() else { return };
-        let Some(fields) = instance.as_object_mut() else { return };
-        match config {
-            Some(config) => fields.insert("config".into(), config),
-            None => fields.remove("config"),
-        };
-        self.mutate_provider_instance(
-            json!({"operation": "upsert", "instanceId": instance_id, "instance": instance}),
-            cx,
-        );
-    }
-
-    /// `usePersistEnvironmentProviderInstanceMutation`: `server.updateSettings` with an empty patch
-    /// and a `ProviderInstanceMutation` (`create`, `upsert` or `remove`).
-    pub(in crate::app) fn mutate_provider_instance(&mut self, mutation: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        cx.spawn(async move |this, cx| {
-            let payload = json!({"patch": {}, "providerInstanceMutation": mutation});
-            if let Err(error) = client.request("server.updateSettings", payload).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(format!("Could not save provider instance: {}", rpc_message(&error)).into());
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-}
-
-impl Workspace {
-    /// `onCreated`: the page selects the new instance.
-    fn provider_instance_created(&mut self, instance_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let page = window.use_keyed_state("settings-providers", cx, |_, _| super::ProvidersPage::default());
-        let id = instance_id.to_owned();
-        page.update(cx, |page, _| page.selected = Some(id));
-        cx.notify();
+        form.into_any_element()
     }
 }
 
@@ -902,12 +562,13 @@ struct Identity {
 
 pub(super) struct AddProviderWizard {
     workspace: WeakEntity<Workspace>,
+    /// The Providers page, which selects the new instance (`onCreated`).
+    page: Entity<super::ProvidersPage>,
     step: usize,
-    driver: &'static DriverSpec,
+    driver: &'static Driver,
     identity: HashMap<&'static str, Identity>,
     label_input: Entity<InputState>,
     id_input: Entity<InputState>,
-    accent: Entity<ColorPickerState>,
     /// `configByDriver`: one draft form per driver.
     forms: HashMap<&'static str, Entity<ConfigForm>>,
     configs: HashMap<&'static str, Value>,
@@ -926,17 +587,21 @@ pub(super) struct AddProviderWizard {
 }
 
 impl AddProviderWizard {
-    fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: Entity<Workspace>,
+        page: Entity<super::ProvidersPage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let policy = workspace.read(cx).server_info.managed_policy.clone();
         let first = DRIVERS
             .iter()
             .filter(|d| d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
             .min_by_key(|d| !d.featured)
-            .or_else(|| driver_allowed(&policy, ACP_REGISTRY).then(|| driver_spec(ACP_REGISTRY)).flatten())
+            .or_else(|| driver_allowed(&policy, ACP_REGISTRY).then(|| drivers::driver(ACP_REGISTRY)).flatten())
             .unwrap_or(&DRIVERS[0]);
         let label_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Work"));
         let id_input = cx.new(|cx| InputState::new(window, cx));
-        let accent = cx.new(|cx| ColorPickerState::new(window, cx));
         let registry = cx.new(|cx| AcpRegistrySearch::new(workspace.downgrade(), window, cx));
         let subscriptions = vec![
             cx.observe(&workspace, |_, _, cx| cx.notify()),
@@ -953,10 +618,6 @@ impl AddProviderWizard {
                     cx.notify();
                 }
             }),
-            cx.subscribe(&accent, |this, _, ColorPickerEvent::Change(color), cx| {
-                this.identity_mut().accent = color.map(|c| c.to_hex()).unwrap_or_default();
-                cx.notify();
-            }),
             cx.subscribe_in(&registry, window, |this, _, event: &AcpSearchEvent, window, cx| match event {
                 AcpSearchEvent::Prepared(agent) => this.acp_prepared(agent.clone(), window, cx),
                 AcpSearchEvent::Manual => this.manual_acp_configuration(window, cx),
@@ -965,12 +626,12 @@ impl AddProviderWizard {
         ];
         let mut wizard = Self {
             workspace: workspace.downgrade(),
+            page,
             step: 0,
             driver: first,
             identity: HashMap::new(),
             label_input,
             id_input,
-            accent,
             forms: HashMap::new(),
             configs: HashMap::new(),
             selected_acp: None,
@@ -1086,11 +747,6 @@ impl AddProviderWizard {
         let identity = self.identity();
         if label {
             self.label_input.update(cx, |input, cx| input.set_value(identity.label.clone(), window, cx));
-            let accent = normalize_accent(&identity.accent).and_then(|hex| Hsla::parse_hex(&hex).ok());
-            self.accent.update(cx, |picker, cx| match accent {
-                Some(color) => picker.set_value(color, window, cx),
-                None => picker.clear_value(window, cx),
-            });
         }
         let id = self.instance_id(cx);
         let placeholder = format!("{}_work", self.driver.kind);
@@ -1111,8 +767,9 @@ impl AddProviderWizard {
         let config = self.config().clone();
         let locks =
             self.workspace.upgrade().and_then(|w| config_locks(&w.read(cx).server_info.managed_policy, driver.kind));
-        let form =
-            cx.new(|cx| ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, window, cx));
+        let form = cx.new(|cx| {
+            ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx)
+        });
         self._subscriptions.push(cx.subscribe(&form, move |this, _, ConfigChanged(next), cx| {
             match next {
                 Some(config) => this.configs.insert(driver.kind, config.clone()),
@@ -1133,7 +790,7 @@ impl AddProviderWizard {
         };
     }
 
-    fn select_driver(&mut self, driver: &'static DriverSpec, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_driver(&mut self, driver: &'static Driver, window: &mut Window, cx: &mut Context<Self>) {
         self.driver = driver;
         self.manual_acp = false;
         self.attempted = false;
@@ -1141,7 +798,7 @@ impl AddProviderWizard {
     }
 
     fn acp_prepared(&mut self, agent: RegistryAgent, window: &mut Window, cx: &mut Context<Self>) {
-        let acp = driver_spec(ACP_REGISTRY).expect("acpRegistry driver");
+        let acp = drivers::driver(ACP_REGISTRY).expect("acpRegistry driver");
         self.driver = acp;
         let id = derive_available_instance_id(
             |label| derive_instance_id(ACP_REGISTRY, label),
@@ -1164,7 +821,7 @@ impl AddProviderWizard {
     }
 
     fn manual_acp_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.driver = driver_spec(ACP_REGISTRY).expect("acpRegistry driver");
+        self.driver = drivers::driver(ACP_REGISTRY).expect("acpRegistry driver");
         self.selected_acp = None;
         self.manual_acp = true;
         self.reset_config(ACP_REGISTRY, None);
@@ -1174,7 +831,7 @@ impl AddProviderWizard {
     }
 
     fn local_acp_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.driver = driver_spec(ACP_REGISTRY).expect("acpRegistry driver");
+        self.driver = drivers::driver(ACP_REGISTRY).expect("acpRegistry driver");
         self.selected_acp = None;
         self.manual_acp = true;
         self.reset_config(ACP_REGISTRY, Some(json!({"source": "local", "commandArgs": []})));
@@ -1227,7 +884,7 @@ impl AddProviderWizard {
         if !identity.label.trim().is_empty() {
             instance.insert("displayName".into(), identity.label.trim().into());
         }
-        if let Some(accent) = normalize_accent(&identity.accent) {
+        if let Some(accent) = normalize_accent_color(Some(&identity.accent)) {
             instance.insert("accentColor".into(), accent.into());
         }
         if !config.is_empty() {
@@ -1250,9 +907,11 @@ impl AddProviderWizard {
                 if let Err(error) = result {
                     return notify_error(window, cx, "Could not add provider instance", rpc_message(&error));
                 }
-                if let Some(workspace) = this.workspace.upgrade() {
-                    workspace.update(cx, |w, cx| w.provider_instance_created(&instance_id, window, cx));
-                }
+                let selected = instance_id.clone();
+                this.page.update(cx, |page, cx| {
+                    page.selected = Some(selected);
+                    cx.notify();
+                });
                 if then_sign_in {
                     this.step = 2;
                     this.watch_auth(instance_id.clone(), window, cx);
@@ -1376,7 +1035,7 @@ impl AddProviderWizard {
     fn render_option_grid(
         &self,
         id: &'static str,
-        options: Vec<&'static DriverSpec>,
+        options: Vec<&'static Driver>,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1429,7 +1088,7 @@ impl AddProviderWizard {
                             .child(Icon::new(IconName::Check).size(px(14.)).text_color(t.primary_foreground)),
                     )
                 })
-                .children(option.badge.map(|badge| {
+                .children(option.badge_label.map(|badge| {
                     div()
                         .px(px(6.))
                         .rounded(px(4.))
@@ -1637,26 +1296,23 @@ impl AddProviderWizard {
         )
     }
 
-    fn render_identity(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_identity(&self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.instance_id_error(cx).filter(|_| self.attempted);
-        let accent_set = normalize_accent(&self.identity().accent).is_some();
-        let accent = h_flex()
-            .gap(px(4.))
-            .child(ColorPicker::new(&self.accent).accessibility_label("Accent color"))
-            .when(accent_set, |row| {
-                row.child(
-                    Button::new("add-provider-clear-accent")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Clear color")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.identity_mut().accent.clear();
-                            this.accent.update(cx, |picker, cx| picker.clear_value(window, cx));
-                            cx.notify();
-                        })),
-                )
-            });
+        let identity = self.identity();
+        let wizard = cx.entity().downgrade();
+        let accent = accent_color_picker(
+            "add-provider-accent-picker",
+            if identity.label.is_empty() { self.driver.label } else { &identity.label },
+            Some(&identity.accent),
+            move |color, _, cx| {
+                let _ = wizard.update(cx, |this, cx| {
+                    this.identity_mut().accent = color;
+                    cx.notify();
+                });
+            },
+            window,
+            cx,
+        );
         v_flex()
             .gap(px(4.))
             .child(settings_row(
@@ -1699,7 +1355,7 @@ impl AddProviderWizard {
         let section = (provider.is_some() && (can_authenticate || signed_in))
             .then(|| workspace.as_ref())
             .flatten()
-            .map(|w| w.update(cx, |w, cx| w.render_provider_account(&instance_id, window, cx)));
+            .and_then(|w| w.update(cx, |w, cx| w.render_provider_account(&instance_id, window, cx)));
         let body = section.unwrap_or_else(|| {
             let message = self.auth.as_ref().and_then(|a| a.get("message")).and_then(Value::as_str);
             let description: SharedString = if discovering {
@@ -1756,8 +1412,7 @@ impl AddProviderWizard {
             let workspace = self.workspace.upgrade();
             let locked = workspace.as_ref().is_none_or(|w| {
                 let w = w.read(cx);
-                config_locks(&w.server_info.managed_policy, "codex")
-                        .is_some_and(|(keys, _)| keys.contains("setupMode"))
+                config_locks(&w.server_info.managed_policy, "codex").is_some_and(|(keys, _)| keys.contains("setupMode"))
             });
             h_flex()
                 .gap(px(8.))
@@ -1867,7 +1522,7 @@ impl Render for AddProviderWizard {
                 body = body
                     .when(self.is_acp(), |b| b.min_h(px(288.)))
                     .children(self.render_selected_acp(&t))
-                    .child(self.render_identity(&t, cx));
+                    .child(self.render_identity(window, &t, cx));
             }
             _ if !self.is_acp() => {
                 body = if self.driver.fields.is_empty() {
@@ -1922,12 +1577,19 @@ fn black(alpha: f32) -> Hsla {
 
 impl Workspace {
     /// Opens the Add provider wizard over the Settings modal.
-    pub(in crate::app) fn open_add_provider_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_add_provider_dialog(
+        &mut self,
+        page: Entity<super::ProvidersPage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace = cx.entity();
         // The wizard reads the workspace, which this call is still updating.
         window.defer(cx, move |window, cx| {
-            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, window, cx));
-            window.open_dialog(cx, move |dialog, _, _| dialog.p_0().w(px(768.)).centered().child(wizard.clone()));
+            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, page, window, cx));
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog.entrance(DialogEntrance::None).p_0().w(px(768.)).centered().child(wizard.clone())
+            });
         });
     }
 }
@@ -1988,25 +1650,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_values_clear_keys_unless_the_field_persists_them() {
-        let codex = driver_spec("codex").unwrap();
-        let binary = codex.fields[0];
-        assert_eq!(next_config(&Value::Null, &binary, "/bin/codex"), Some(json!({"binaryPath": "/bin/codex"})));
-        assert_eq!(next_config(&json!({"binaryPath": "x"}), &binary, "  "), None);
-        let agent_id = driver_spec(ACP_REGISTRY).unwrap().fields[1];
-        assert_eq!(next_config(&Value::Null, &agent_id, ""), Some(json!({"agentId": ""})));
-    }
-
-    #[test]
-    fn local_acp_shows_only_its_source_and_executable() {
-        let acp = driver_spec(ACP_REGISTRY).unwrap();
-        let local = visible_fields(acp, &json!({"source": "local"}));
-        assert_eq!(local.iter().map(|f| f.key).collect::<Vec<_>>(), ["source", "commandPath"]);
-        assert_eq!(local[1].label, "Executable");
-        assert_eq!(visible_fields(acp, &Value::Null).len(), 4);
-    }
-
-    #[test]
     fn registry_agents_count_as_added_only_for_registry_instances() {
         let instances = json!({
             "a": {"driver": "acpRegistry", "config": {"agentId": "gemini"}},
@@ -2030,12 +1673,5 @@ mod tests {
         assert!(keys.contains("setupMode") && keys.len() == 1);
         assert_eq!(reason.as_ref(), "Managed by Acme.");
         assert!(config_locks(&policy, "claudeAgent").is_none());
-    }
-
-    #[test]
-    fn accent_colors_must_be_six_digit_hex() {
-        assert_eq!(normalize_accent(" #2563eb ").as_deref(), Some("#2563eb"));
-        assert_eq!(normalize_accent("#fff"), None);
-        assert_eq!(normalize_accent("2563eb0"), None);
     }
 }

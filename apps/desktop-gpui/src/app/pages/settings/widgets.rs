@@ -95,6 +95,8 @@ pub(in crate::app) struct SettingRow {
     description: Option<SharedString>,
     keys: Vec<&'static str>,
     control: Control,
+    /// A reset the row works out itself, replacing the bound keys' default.
+    reset: Option<Option<Value>>,
 }
 
 enum Control {
@@ -114,7 +116,14 @@ impl SettingRow {
 
     /// A row with no search item.
     pub(in crate::app) fn titled(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Self {
-        Self { id: id.into(), title: title.into(), description: None, keys: Vec::new(), control: Control::None }
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            keys: Vec::new(),
+            control: Control::None,
+            reset: None,
+        }
     }
 
     pub(in crate::app) fn description(mut self, description: impl Into<SharedString>) -> Self {
@@ -148,6 +157,13 @@ impl SettingRow {
     /// A control the section builds itself.
     pub(in crate::app) fn control(mut self, control: impl IntoElement) -> Self {
         self.control = Control::Element(control.into_any_element());
+        self
+    }
+
+    /// A reset button that writes `patch`, shown only when there is one; for values whose default
+    /// is not a plain per-key default (`SettingResetButton` passed as `resetAction`).
+    pub(in crate::app) fn reset(mut self, patch: Option<Value>) -> Self {
+        self.reset = Some(patch);
         self
     }
 }
@@ -445,6 +461,17 @@ impl Workspace {
         disconnected: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if let Some(custom) = &row.reset {
+            let patch = custom.clone().filter(|_| !disconnected)?;
+            return Some(
+                reset_button(&row.id, "Reset to default", cx)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.update_settings(patch.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
         if row.keys.is_empty() || disconnected {
             return None;
         }

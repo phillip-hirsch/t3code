@@ -2,23 +2,23 @@
 //! provider instances listed beside the selected one's editor, then Advanced.
 //!
 //! The native client talks to one environment, which is the web's single-primary-device case, so
-//! there are no device tabs. Rows the web scopes (global/project/checkout) live in [`ADVANCED_ROWS`]
-//! for the shared settings rows to take over; everything else here is environment-wide.
+//! there are no device tabs. Advanced uses the shared settings rows; everything else here is
+//! environment-wide.
 
 mod accent;
-mod acp;
 mod accounts;
-mod codex_callback;
-mod usage_sources;
+mod acp;
 mod add;
+mod codex_callback;
 mod drivers;
 mod instances;
 mod models;
+mod usage_sources;
 
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
@@ -31,7 +31,11 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::system::NumberField;
+use super::system::background;
+use super::widgets::{SettingRow, select_trigger};
 use crate::app::Workspace;
+use crate::settings::contract;
 use crate::theme::{self, Tokens};
 
 /// What the page keeps between frames, like the panel's React state.
@@ -45,6 +49,9 @@ pub(super) struct ProvidersPage {
     inputs: HashMap<SharedString, PageInput>,
     models: models::ModelsUi,
     environment: instances::EnvironmentDraft,
+    health: Option<NumberField>,
+    /// Managed Codex instances whose folded Runtime section is open.
+    runtime_open: HashSet<String>,
 }
 
 /// A text field the page owns; `synced` is the saved value it last showed.
@@ -57,51 +64,24 @@ struct PageInput {
 
 type InputHandler = Box<dyn Fn(&mut Workspace, &Entity<InputState>, &InputEvent, &mut Window, &mut Context<Workspace>)>;
 
-/// A setting row the shared settings widgets will render once they land (see the module docs).
-#[allow(dead_code)]
-struct SettingRowSpec {
-    id: &'static str,
-    label: &'static str,
-    description: &'static str,
-    path: &'static str,
-    control: RowControl,
-    scopes: &'static [&'static str],
-}
+/// `IDLE_COMPACTION_MODES`.
+const IDLE_COMPACTION_MODES: &[(&str, &str)] =
+    &[("onReturn", "When you return"), ("beforeCacheExpires", "Before the cache expires (beta)"), ("off", "Never")];
 
-#[allow(dead_code)]
-enum RowControl {
-    /// Whole seconds, in a field that stores milliseconds.
-    Seconds {
-        step: u32,
-    },
-    Select(&'static [(&'static str, &'static str)]),
-}
+/// `PROVIDER_HEALTH_INTERVAL_STEP_SECONDS`.
+const HEALTH_STEP_SECONDS: f64 = 30.;
+const HEALTH_KEY: &str = "providerHealthRefreshInterval";
+/// Its index in [`background::DURATION_KEYS`].
+const HEALTH: usize = 1;
 
-/// Providers › Advanced. The web scopes "Compact idle threads"; the health interval is a
-/// Background activity override (`backgroundActivityOverrideSettings`), so it is shown here and
-/// edited where that profile logic lives.
-const ADVANCED_ROWS: &[SettingRowSpec] = &[
-    SettingRowSpec {
-        id: "provider-health-check-interval",
-        label: "Provider health check interval",
-        description: "Refresh provider status, versions, and models in the background. Set to 0 to disable.",
-        path: "backgroundActivity.overrides.providerHealthRefreshInterval",
-        control: RowControl::Seconds { step: 30 },
-        scopes: &["global"],
-    },
-    SettingRowSpec {
-        id: "compact-idle-threads",
-        label: "Compact idle threads",
-        description: "When to compact an idle Claude thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Each Claude provider can override this.",
-        path: "idleCompaction",
-        control: RowControl::Select(&[
-            ("onReturn", "When you return"),
-            ("beforeCacheExpires", "Before the cache expires (beta)"),
-            ("off", "Never"),
-        ]),
-        scopes: &["global", "environment", "project", "checkout"],
-    },
-];
+/// `globalIdleCompaction`: the mode, or the legacy switch from before modes.
+fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
+    mode.as_str().unwrap_or(match legacy {
+        Value::String(mode) => mode,
+        Value::Bool(true) => "beforeCacheExpires",
+        _ => "onReturn",
+    })
+}
 
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
 fn card_height(window: &Window) -> f32 {
@@ -145,7 +125,10 @@ impl Workspace {
             .hover(|s| s.bg(t.muted.opacity(0.25)).text_color(t.foreground))
             .child(Icon::new(gpui_kit::assets::IconName::Plus).size(px(16.)))
             .child("Add provider")
-            .on_click(cx.listener(|this, _, window, cx| this.open_add_provider_dialog(window, cx)));
+            .on_click(cx.listener({
+                let page = page.clone();
+                move |this, _, window, cx| this.open_add_provider_dialog(page.clone(), window, cx)
+            }));
 
         let card = div()
             .flex()
@@ -180,35 +163,34 @@ impl Workspace {
                 }),
             );
 
-        v_flex()
-            .w_full()
-            .gap_8()
+        let providers = v_flex()
+            .gap(px(10.))
             .child(
-                v_flex()
-                    .gap(px(10.))
+                h_flex()
+                    .min_h(px(28.))
+                    .px_4()
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        h_flex()
-                            .min_h(px(28.))
-                            .px_4()
-                            .justify_between()
-                            .gap_4()
-                            .child(
-                                h_flex().gap_1().child(section_title("Providers", &t)).child(
-                                    ghost_icon_button("providers-add", gpui_kit::assets::IconName::Plus, &t)
-                                        .tooltip("Add provider")
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.open_add_provider_dialog(window, cx)
-                                            }),
-                                        ),
-                                ),
-                            )
-                            .child(self.render_providers_header_actions(&page, &t, cx)),
+                        h_flex().gap_1().child(section_title("Providers", &t)).child(
+                            ghost_icon_button("providers-add", gpui_kit::assets::IconName::Plus, &t)
+                                .tooltip("Add provider")
+                                .on_click(cx.listener({
+                                    let page = page.clone();
+                                    move |this, _, window, cx| this.open_add_provider_dialog(page.clone(), window, cx)
+                                })),
+                        ),
                     )
-                    .child(card),
+                    .child(self.render_providers_header_actions(&page, &t, cx)),
             )
-            .child(self.render_providers_advanced(&t, cx))
-            .into_any_element()
+            .child(card);
+        let content = [
+            providers.into_any_element(),
+            self.render_usage_limit_sources(window, cx),
+            self.render_providers_advanced(&page, window, cx).into_any_element(),
+        ];
+        let view = self.settings_view();
+        self.settings_page("providers", &view, content, cx)
     }
 
     /// "Update all" and the refresh button with when providers were last checked.
@@ -254,55 +236,90 @@ impl Workspace {
             )
     }
 
-    /// Providers › Advanced, from [`ADVANCED_ROWS`].
-    fn render_providers_advanced(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = &self.server_info.settings;
-        let rows = ADVANCED_ROWS.iter().map(|spec| {
-            let control = match &spec.control {
-                RowControl::Seconds { .. } => {
-                    let seconds = lookup(settings, spec.path).and_then(Value::as_f64).map(|ms| (ms / 1000.).round());
-                    div()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child(match seconds {
-                            Some(seconds) => format!("{seconds} seconds"),
-                            None => "Background activity default".into(),
-                        })
-                        .into_any_element()
-                }
-                RowControl::Select(choices) => {
-                    let current = lookup(settings, spec.path).and_then(Value::as_str).unwrap_or("onReturn").to_owned();
-                    let path = spec.path;
-                    select_button(
-                        SharedString::from(format!("providers-advanced-{}", spec.id)),
-                        options(choices),
-                        &current,
-                        224.,
-                        t,
-                        {
-                            let view = cx.entity().downgrade();
-                            move |value, window, cx| {
-                                let patch = patch_at(path, json!(value.as_ref()));
-                                let _ = view.update(cx, |this, cx| {
-                                    this.save_settings(
-                                        json!({ "patch": patch }),
-                                        "Could not update settings",
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            }
-                        },
-                    )
-                    .into_any_element()
-                }
-            };
-            settings_row(spec.label, Some(spec.description), Some(control), t).into_any_element()
+    /// Providers › Advanced: the health check interval, a Background activity override
+    /// (`backgroundActivityOverrideSettings`), then `CompactIdleThreadsRow`.
+    fn render_providers_advanced(
+        &mut self,
+        page: &Entity<ProvidersPage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = *theme::tokens(cx);
+        let view = self.settings_view();
+
+        let resolved = background::resolve_server(&self.server_info.settings);
+        let seconds = resolved.seconds(HEALTH);
+        let reset_health = (seconds != background::preset(resolved.profile).seconds(HEALTH)).then(|| {
+            let mut patch = background::override_patch(&self.server_info.settings, HEALTH_KEY, Value::Null);
+            if let Some(overrides) = patch["backgroundActivity"]["overrides"].as_object_mut() {
+                overrides.remove(HEALTH_KEY);
+            }
+            patch
         });
-        v_flex().gap(px(10.)).child(h_flex().min_h(px(28.)).px_4().child(section_title("Advanced", t))).child(group(
-            divided(rows, t),
+        if page.read(cx).health.is_none() {
+            let field = NumberField::new(HEALTH_STEP_SECONDS, 0., f64::MAX, window, cx, |this, seconds, window, cx| {
+                let patch = background::override_patch(&this.server_info.settings, HEALTH_KEY, json!(seconds * 1000.));
+                this.update_settings(patch, window, cx);
+            });
+            page.update(cx, |page, _| page.health = Some(field));
+        }
+        let input = page.update(cx, |page, cx| {
+            let field = page.health.as_mut().expect("created above");
+            field.sync(seconds as f64, window, cx);
+            field.input.clone()
+        });
+        let health = SettingRow::new("provider-health-check-interval")
+            .description("Refresh provider status, versions, and models in the background. Set to 0 to disable.")
+            .reset(reset_health)
+            .control(
+                h_flex()
+                    .gap_2()
+                    .child(NumberInput::new(&input).small().w(px(128.)))
+                    .child(div().text_xs().text_color(t.muted_foreground).child("seconds")),
+            );
+
+        let mode_of = |settings: &crate::settings::Settings| {
+            idle_compaction(settings.get("idleCompaction"), settings.get("compactIdleThreads")).to_owned()
+        };
+        let modes: Vec<String> = view.targets.iter().map(|target| mode_of(&target.settings)).collect();
+        let mixed = modes.iter().any(|mode| Some(mode) != modes.first());
+        let current = idle_compaction(view.value("idleCompaction"), view.value("compactIdleThreads")).to_owned();
+        let never_available = view.targets.iter().all(|target| {
+            !target.settings.get("idleCompaction").is_null() || target.settings.get("compactIdleThreads").is_string()
+        });
+        let default_mode = idle_compaction(&Value::Null, contract().default_value("compactIdleThreads"));
+        let label = if mixed {
+            "Mixed"
+        } else {
+            IDLE_COMPACTION_MODES.iter().find(|(value, _)| *value == current).map_or(current.as_str(), |(_, l)| l)
+        };
+        let workspace = cx.entity();
+        let select = select_trigger(&"compact-idle-threads".into(), label.to_owned(), 224., &t)
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
+                for (value, label) in IDLE_COMPACTION_MODES {
+                    menu = menu.item(
+                        PopupMenuItem::new(*label)
+                            .checked(!mixed && current == *value)
+                            .disabled(*value == "off" && !never_available)
+                            .on_click(window.listener_for(&workspace, move |this, _, window, cx| {
+                                this.update_settings(json!({ "idleCompaction": value }), window, cx)
+                            })),
+                    );
+                }
+                menu
+            });
+        let compact = SettingRow::new("compact-idle-threads")
+            .description("When to compact an idle Claude thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Each Claude provider can override this.")
+            .setting("idleCompaction")
+            .setting("compactIdleThreads")
+            .reset((mode_of(&self.server_info.settings) != default_mode).then(|| json!({ "idleCompaction": default_mode })))
+            .control(select);
+
+        let rows = [self.setting_row(&view, health, window, cx), self.setting_row(&view, compact, window, cx)];
+        v_flex().gap(px(10.)).child(h_flex().min_h(px(28.)).px_4().child(section_title("Advanced", &t))).child(group(
+            divided(rows, &t),
             true,
-            t,
+            &t,
         ))
     }
 
@@ -616,11 +633,6 @@ fn now_ms() -> i64 {
 /// `a.b.c` in a JSON value.
 fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(value, |value, key| value.get(key))
-}
-
-/// `{a: {b: value}}` for `a.b`.
-fn patch_at(path: &str, value: Value) -> Value {
-    path.rsplit('.').fold(value, |value, key| json!({ key: value }))
 }
 
 // Stand-ins for the settings layout (`settingsLayout.tsx`) until the shared settings widgets land.
