@@ -138,7 +138,7 @@ impl Workspace {
         };
         self.prompt_history = None;
         self.menu = Default::default();
-        self.picker.open = false;
+        self.picker.dismiss();
         if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
             self.composer_drafts.remove(&target);
         } else {
@@ -200,7 +200,7 @@ impl Workspace {
     /// Every keystroke, before key bindings run (the editor binds arrows, Tab and
     /// Enter itself); `true` consumes it.
     pub(super) fn intercept_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.picker.open {
+        if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
         if self.draft_workspace_key(keystroke, window, cx) || self.composer_shortcut(keystroke, window, cx) {
@@ -279,7 +279,7 @@ impl Workspace {
         if (m.control || m.platform) && m.shift && !m.alt && self.page.is_none() && self.settings.is_none() {
             match keystroke.key.as_str() {
                 "m" | "e" => {
-                    if self.picker.open {
+                    if self.composer_picker_open() {
                         self.close_model_picker(window, cx);
                     } else {
                         self.open_model_picker(window, cx);
@@ -548,7 +548,7 @@ impl Workspace {
                     )
                 }),
             ))
-            .child(self.render_footer(&t, window, cx));
+            .child(self.render_footer(&t, cx));
         div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
@@ -559,7 +559,7 @@ impl Workspace {
         )
     }
 
-    fn render_footer(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_footer(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.runtime_mode();
         // Drafts name their permissions in the row under the composer instead.
         let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
@@ -618,7 +618,7 @@ impl Workspace {
                                     cx,
                                 ))
                             })
-                            .child(self.render_model_picker(t, window, cx)),
+                            .child(self.render_model_picker(t, cx)),
                     )
                     .child(self.render_primary_action(t, cx)),
             )

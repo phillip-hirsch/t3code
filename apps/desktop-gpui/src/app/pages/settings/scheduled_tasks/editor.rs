@@ -9,7 +9,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::time_field::{TimeField, TimeFieldEvent, TimeFieldState, TimePrecision};
-use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -24,8 +24,9 @@ use super::logic::{
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
 use super::worktree_mode::{self, NewWorktreeMode};
-use super::{ScheduledTasksView, chevron, error_message, notify_error, pick_model_control, select_trigger};
+use super::{ScheduledTasksView, chevron, error_message, notify_error, select_trigger};
 use crate::app::Workspace;
+use crate::app::model_picker::{OnPick, PickHost};
 use crate::model::{ModelSelection, ProjectShell};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
@@ -131,7 +132,7 @@ impl TaskEditor {
                 }
             }
         };
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&title, window, on_text(|d| &mut d.title)),
             cx.subscribe_in(&interval, window, on_text(|d| &mut d.interval_minutes)),
             cx.subscribe_in(&checkout, window, on_text(|d| &mut d.existing_worktree_path)),
@@ -149,6 +150,10 @@ impl TaskEditor {
                 cx.notify();
             }),
         ];
+        // The form shows the workspace's connection and projects, and its model picker's state.
+        if let Some(workspace) = workspace.upgrade() {
+            subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
+        }
         Self {
             workspace,
             list,
@@ -502,23 +507,24 @@ impl Render for TaskEditor {
                 }
             });
 
-        let model = {
-            let workspace = workspace.read(cx);
+        let model = workspace.update(cx, |workspace, cx| {
+            let id = SharedString::from("scheduled-task-model");
             let editor = editor.clone();
-            pick_model_control(
-                "scheduled-task-model",
-                &workspace.server_info,
-                selection.as_ref(),
-                disabled || !connected,
-                Rc::new(move |picked: ModelSelection, _, cx: &mut App| {
-                    editor.update(cx, |this, cx| {
-                        this.draft.model_key = format!("{}:{}", picked.instance_id, picked.model);
-                        cx.notify();
-                    });
-                }),
-                &t,
+            let disabled = disabled || !connected || workspace.server_info.model_choices().is_empty();
+            let trigger = workspace.model_picker_trigger(id.clone(), selection.as_ref(), None, cx).disabled(disabled);
+            let on_pick: OnPick = Rc::new(move |_, picked, _, cx| {
+                editor.update(cx, |this, cx| {
+                    this.draft.model_key = format!("{}:{}", picked.instance_id, picked.model);
+                    cx.notify();
+                });
+            });
+            workspace.undocked_model_picker(
+                id,
+                trigger,
+                PickHost { current: selection.clone(), include: |_| true, on_pick },
+                cx,
             )
-        };
+        });
 
         let mode = draft.schedule_mode;
         let modes: Vec<(ScheduleMode, &str)> = [
@@ -680,7 +686,7 @@ impl Render for TaskEditor {
                         this.child(field("Checkout path", None, Input::new(&self.checkout).disabled(disabled), &t))
                     })
                     .child(field("Prompt", None, Textarea::new(&self.prompt).disabled(disabled), &t))
-                    .child(field("Model", None, model, &t))
+                    .child(field("Model", None, h_flex().child(model), &t))
                     .child(
                         div()
                             .flex()

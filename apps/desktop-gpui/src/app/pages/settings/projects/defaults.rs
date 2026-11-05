@@ -9,18 +9,19 @@ use std::rc::Rc;
 
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::component::h_flex;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::{
-    AnyElement, Context, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px, svg,
+    AnyElement, Context, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, px,
 };
 use serde_json::{Value, json};
 
 use super::scripts::rpc_message;
 use crate::app::Workspace;
+use crate::app::pages::settings::model_select::muted;
 use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
 use crate::model::ModelSelection;
-use crate::model_label;
 use crate::theme;
 
 enum Control {
@@ -178,13 +179,8 @@ fn setting_patch(settings: &Value, project_id: Option<&str>, key: &str, value: V
 
 impl Workspace {
     /// The "New threads" section of a project's settings page.
-    pub(super) fn render_project_defaults(
-        &mut self,
-        project_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.render_defaults_section("project", Some(project_id), window, cx)
+    pub(super) fn render_project_defaults(&mut self, project_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        self.render_defaults_section("project", Some(project_id), cx)
     }
 
     /// `ProjectDefaultsSettings` for one category, at project scope or (with `None`) the environment's.
@@ -192,7 +188,6 @@ impl Workspace {
         &mut self,
         category: &str,
         project_id: Option<&str>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
@@ -202,7 +197,7 @@ impl Workspace {
             .filter(|spec| spec.categories.contains(&category) && spec.scopes.contains(&scope))
             .map(|spec| {
                 let value = effective(&self.server_info.settings, project_id, spec.path).clone();
-                let control = self.render_row_control(spec, &value, project_id, window, cx);
+                let control = self.render_row_control(spec, &value, project_id, cx);
                 let reset = spec
                     .reset
                     .filter(|(_, scopes)| scopes.contains(&scope))
@@ -234,7 +229,6 @@ impl Workspace {
         spec: &'static SettingRowSpec,
         value: &Value,
         project_id: Option<&str>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = SharedString::from(format!("setting-{}", spec.id));
@@ -267,6 +261,9 @@ impl Workspace {
                     .into_any_element()
             }
             Control::Model => {
+                if self.server_info.model_choices().is_empty() {
+                    return muted("No providers available", &theme::tokens(cx)).into_any_element();
+                }
                 let stored: Option<ModelSelection> = serde_json::from_value(value.clone()).ok();
                 let fallback = spec.path == "fallbackModelSelection";
                 // An unset default is picked automatically; an unset fallback shows the default as "None".
@@ -277,77 +274,36 @@ impl Workspace {
                         .filter(|_| fallback)
                         .or_else(|| self.server_info.new_thread_model(None))
                 });
-                let label = (fallback && stored.is_none()).then(|| SharedString::from("None"));
+                let label = (fallback && stored.is_none()).then_some("None");
                 let path = spec.path;
-                let on_pick = Rc::new(
-                    move |this: &mut Workspace,
-                          picked: ModelSelection,
-                          window: &mut Window,
-                          cx: &mut Context<Workspace>| {
-                        let picked = json!({"instanceId": picked.instance_id, "model": picked.model});
-                        this.write_setting(project.as_deref(), path, picked, window, cx)
+                let write = Rc::new(
+                    move |this: &mut Workspace, value: Value, window: &mut Window, cx: &mut Context<Workspace>| {
+                        this.write_setting(project.as_deref(), path, value, window, cx)
                     },
                 );
-                self.pick_model_control(id, selection.as_ref(), label, on_pick, window, cx)
+                let pick = write.clone();
+                let traits = if fallback { stored.as_ref() } else { selection.as_ref() };
+                h_flex()
+                    .gap(px(6.))
+                    .child(self.model_picker(
+                        id,
+                        selection.as_ref(),
+                        label,
+                        |_| true,
+                        cx,
+                        move |this, picked, window, cx| {
+                            pick(this, json!({"instanceId": picked.instance_id, "model": picked.model}), window, cx)
+                        },
+                    ))
+                    .children(traits.and_then(|traits| {
+                        let traits_id = SharedString::from(format!("setting-{}-traits", spec.id));
+                        self.traits_picker(traits_id, traits, cx, move |this, picked, window, cx| {
+                            write(this, picked.to_json(), window, cx)
+                        })
+                    }))
+                    .into_any_element()
             }
         }
-    }
-
-    /// A simple provider/model dropdown. At merge the composer's `ProviderModelPicker` (with the
-    /// effort `TraitsPicker` beside it) replaces this one function.
-    pub(super) fn pick_model_control(
-        &self,
-        id: impl Into<ElementId>,
-        selection: Option<&ModelSelection>,
-        trigger_label: Option<SharedString>,
-        on_pick: Rc<dyn Fn(&mut Workspace, ModelSelection, &mut Window, &mut Context<Workspace>)>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let t = *theme::tokens(cx);
-        let choices = Rc::new(self.server_info.model_choices());
-        if choices.is_empty() {
-            return div().text_sm().text_color(t.muted_foreground).child("No providers available").into_any_element();
-        }
-        let provider = selection.and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = selection.and_then(|s| self.server_info.model(s));
-        let name: SharedString = trigger_label.unwrap_or_else(|| match (model, provider) {
-            (Some(model), Some(provider)) => model_label::trigger_model_name(model, &provider.driver).into(),
-            _ => selection.map(|s| s.model.clone()).unwrap_or_default().into(),
-        });
-        let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
-        let current = selection.cloned();
-        let view = cx.entity();
-        select_trigger(id, "")
-            .children(icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.foreground))
-            }))
-            .child(div().max_w(px(224.)).truncate().child(name))
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
-                let mut group: Option<&str> = None;
-                for (label, picked) in choices.iter() {
-                    let (provider_name, model) = label.split_once(" · ").unwrap_or(("", label.as_ref()));
-                    if group != Some(provider_name) {
-                        if group.is_some() {
-                            menu = menu.separator();
-                        }
-                        menu = menu.label(provider_name.to_owned());
-                        group = Some(provider_name);
-                    }
-                    let checked = current
-                        .as_ref()
-                        .is_some_and(|c| c.instance_id == picked.instance_id && c.model == picked.model);
-                    let (picked, on_pick) = (picked.clone(), on_pick.clone());
-                    menu =
-                        menu.item(PopupMenuItem::new(model.to_owned()).checked(checked).on_click(
-                            window.listener_for(&view, move |this, _, window, cx| {
-                                on_pick(this, picked.clone(), window, cx)
-                            }),
-                        ));
-                }
-                menu.max_h(px(420.)).scrollable(true)
-            })
-            .into_any_element()
     }
 
     /// Writes one setting at the row's scope; failures show as a toast.

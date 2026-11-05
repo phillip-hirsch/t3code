@@ -1794,9 +1794,16 @@ impl Workspace {
             .gap(px(8.))
             .children(note)
             .when_some(selection, |el, selection| {
-                el.child(self.model_picker(id, &selection, None, generates_text, cx, move |this, pick, window, cx| {
-                    set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx)
-                }))
+                el.child(self.model_picker(
+                    id,
+                    Some(&selection),
+                    None,
+                    generates_text,
+                    cx,
+                    move |this, pick, window, cx| {
+                        set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx)
+                    },
+                ))
                 .children(self.traits_picker(
                     traits_id,
                     &selection,

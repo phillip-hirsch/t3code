@@ -25,14 +25,13 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div, px, svg,
+    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
 };
 use serde_json::json;
 
 use self::logic::{ScheduledTask, decode_tasks, relative_label, schedule_label};
 use super::super::widgets::{RowFrame, section_with_action};
 use crate::app::Workspace;
-use crate::model::{ModelSelection, ServerInfo};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
@@ -333,59 +332,6 @@ fn error_message(error: &RpcError) -> String {
 /// `toastManager.add({type: "error", title, description})`.
 fn notify_error(window: &mut Window, cx: &mut App, title: &str, description: impl Into<SharedString>) {
     window.push_notification(Notification::error(description).title(title.to_owned()), cx);
-}
-
-/// The editor's model picker: a provider-grouped menu of every usable model. Stands in for
-/// the composer's `ProviderModelPicker`, which the parent swaps in here at merge.
-fn pick_model_control(
-    id: impl Into<SharedString>,
-    info: &ServerInfo,
-    current: Option<&ModelSelection>,
-    disabled: bool,
-    on_pick: Rc<dyn Fn(ModelSelection, &mut Window, &mut App)>,
-    t: &Tokens,
-) -> AnyElement {
-    let provider = current.and_then(|c| info.provider(&c.instance_id));
-    let name: SharedString = current
-        .map(|c| info.model(c).and_then(|m| m.name.clone()).unwrap_or_else(|| c.model.clone()))
-        .unwrap_or_else(|| "Select a model".into())
-        .into();
-    let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
-    let choices = Rc::new(info.model_choices());
-    let current = current.cloned();
-    select_trigger(id, t)
-        .disabled(disabled || choices.is_empty())
-        .children(
-            icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.foreground))
-            }),
-        )
-        .child(div().flex_1().min_w_0().truncate().child(name))
-        .child(chevron(t))
-        .dropdown_menu(move |mut menu, _, _| {
-            let mut group: Option<&str> = None;
-            for (label, selection) in choices.iter() {
-                let (provider, model) = label.split_once(" · ").unwrap_or(("", label.as_ref()));
-                if group != Some(provider) {
-                    if group.is_some() {
-                        menu = menu.separator();
-                    }
-                    menu = menu.label(provider.to_owned());
-                    group = Some(provider);
-                }
-                let checked = current
-                    .as_ref()
-                    .is_some_and(|c| c.instance_id == selection.instance_id && c.model == selection.model);
-                let (picked, on_pick) = (selection.clone(), on_pick.clone());
-                menu = menu.item(
-                    PopupMenuItem::new(model.to_owned())
-                        .checked(checked)
-                        .on_click(move |_, window, cx| on_pick(picked.clone(), window, cx)),
-                );
-            }
-            menu.max_h(px(420.)).scrollable(true)
-        })
-        .into_any_element()
 }
 
 /// A bordered select trigger (`SelectTrigger size="sm"`); callers add the label and a menu.

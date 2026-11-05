@@ -8,17 +8,16 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{Icon, Sizable as _, h_flex};
 use gpui_kit::{
-    AnyElement, Context, Div, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
-    svg,
+    AnyElement, App, Context, Div, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div,
+    px, svg,
 };
 use serde_json::Value;
 
 use crate::app::Workspace;
+use crate::app::model_picker::{OnPick, PickHost};
 use crate::model::{ModelSelection, Provider};
 use crate::model_label;
 use crate::theme::{Tokens, tokens};
-
-type OnPick = Rc<dyn Fn(&mut Workspace, ModelSelection, &mut Window, &mut Context<Workspace>)>;
 
 /// The bordered trigger shared by selects and pickers (`SETTINGS_PICKER_TRIGGER_CLASSNAME`).
 pub(in crate::app) fn trigger(id: impl Into<ElementId>, t: &Tokens) -> Button {
@@ -53,75 +52,54 @@ pub(in crate::app) fn generates_text(provider: &Provider) -> bool {
 }
 
 impl Workspace {
-    /// `ProviderModelPicker` in a settings row: provider icon, short model name and a menu of
-    /// every model of every usable provider that `include` keeps.
+    /// `ProviderModelPicker` in a settings row, opening the shared picker over the providers
+    /// `include` keeps.
     pub(in crate::app) fn model_picker(
         &self,
-        id: &'static str,
-        selection: &ModelSelection,
+        id: impl Into<SharedString>,
+        selection: Option<&ModelSelection>,
         label: Option<&str>,
         include: fn(&Provider) -> bool,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        let id = id.into();
+        let trigger = self.model_picker_trigger(id.clone(), selection, label, cx);
+        let on_pick: OnPick = Rc::new(on_pick);
+        self.undocked_model_picker(id, trigger, PickHost { current: selection.cloned(), include, on_pick }, cx)
+    }
+
+    /// The picker's settings trigger: provider icon and short model name, or `label` (`triggerLabel`).
+    pub(in crate::app) fn model_picker_trigger(
+        &self,
+        id: SharedString,
+        selection: Option<&ModelSelection>,
+        label: Option<&str>,
+        cx: &App,
+    ) -> Button {
         let t = *tokens(cx);
-        let provider = self.server_info.provider(&selection.instance_id);
-        let model = self.server_info.model(selection);
-        let name: SharedString = match (label, provider.zip(model)) {
-            (Some(label), _) => label.to_owned().into(),
-            (None, Some((provider, model))) => model_label::trigger_model_name(model, &provider.driver).into(),
-            (None, None) => selection.model.clone().into(),
+        let provider = selection.and_then(|s| self.server_info.provider(&s.instance_id));
+        let model = selection.and_then(|s| self.server_info.model(s));
+        let name: SharedString = match (label, provider.zip(model), selection) {
+            (Some(label), ..) => label.to_owned().into(),
+            (None, Some((provider, model)), _) => model_label::trigger_model_name(model, &provider.driver).into(),
+            (None, None, Some(selection)) => selection.model.clone().into(),
+            (None, None, None) => "Select a model".into(),
         };
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
-        let groups: Vec<(SharedString, Vec<(SharedString, ModelSelection)>)> = self
-            .server_info
-            .providers
-            .iter()
-            .filter(|p| p.is_selectable() && include(p))
-            .map(|p| {
-                let models = p.models.iter().map(|m| {
-                    let pick =
-                        ModelSelection { instance_id: p.instance_id.clone(), model: m.slug.clone(), options: None };
-                    (SharedString::from(m.name.clone().unwrap_or_else(|| m.slug.clone())), pick)
-                });
-                (p.display_name.clone().unwrap_or_else(|| p.instance_id.clone()).into(), models.collect())
-            })
-            .collect();
-        let current = selection.clone();
-        let view = cx.entity();
-        let on_pick: OnPick = Rc::new(on_pick);
         trigger(id, &t)
             .min_w(px(0.))
             .children(icon.map(|(path, tint)| {
                 svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.foreground))
             }))
             .child(trigger_label(name))
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu: PopupMenu, window, _| {
-                for (index, (group, models)) in groups.iter().enumerate() {
-                    if index > 0 {
-                        menu = menu.separator();
-                    }
-                    menu = menu.label(group.clone());
-                    for (name, pick) in models {
-                        let checked = pick.instance_id == current.instance_id && pick.model == current.model;
-                        let (pick, on_pick) = (pick.clone(), on_pick.clone());
-                        menu = menu.item(PopupMenuItem::new(name.clone()).checked(checked).on_click(
-                            window.listener_for(&view, move |this, _, window, cx| {
-                                on_pick(this, pick.clone(), window, cx)
-                            }),
-                        ));
-                    }
-                }
-                menu.max_h(px(420.)).scrollable(true)
-            })
-            .into_any_element()
     }
 
     /// `TraitsPicker` with prompt-injected effort left out: the model's effort levels and its
     /// on/off options. `None` when the model has neither.
     pub(in crate::app) fn traits_picker(
         &self,
-        id: &'static str,
+        id: impl Into<ElementId>,
         selection: &ModelSelection,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,

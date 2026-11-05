@@ -204,7 +204,14 @@ impl Workspace {
         let model: AnyElement = match &selection {
             Some(selection) if self.server_info.provider(&selection.instance_id).is_some() => h_flex()
                 .gap(px(6.))
-                .child(self.model_picker("default-model", selection, None, |_| true, cx, pick("defaultModelSelection")))
+                .child(self.model_picker(
+                    "default-model",
+                    Some(selection),
+                    None,
+                    |_| true,
+                    cx,
+                    pick("defaultModelSelection"),
+                ))
                 .children(self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection")))
                 .into_any_element(),
             _ => muted("No providers available", &t).into_any_element(),
@@ -216,7 +223,7 @@ impl Workspace {
                 .gap(px(6.))
                 .child(self.model_picker(
                     "fallback-model",
-                    shown,
+                    Some(shown),
                     fallback_stored.is_none().then_some("None"),
                     |_| true,
                     cx,
@@ -367,7 +374,7 @@ impl Workspace {
             (None, true) => muted("No text generation providers available.", &t).into_any_element(),
             (Some(selection), true) => h_flex()
                 .gap(px(6.))
-                .child(self.model_picker("text-generation-model", selection, None, generates_text, cx, save))
+                .child(self.model_picker("text-generation-model", Some(selection), None, generates_text, cx, save))
                 .children(self.traits_picker("text-generation-traits", selection, cx, save))
                 .into_any_element(),
         };

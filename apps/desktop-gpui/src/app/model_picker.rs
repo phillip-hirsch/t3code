@@ -1,9 +1,11 @@
-//! The composer's model picker in its docked form (`ProviderModelPicker.tsx`,
-//! `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`, `ModelListRow.tsx`,
-//! `ComposerModelEffort.tsx`): a provider rail, the model list and the effort
-//! column, over a footer with the speed and permissions controls.
+//! The model picker (`ProviderModelPicker.tsx`, `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`,
+//! `ModelListRow.tsx`): a provider rail, search and the model list. The composer's is docked
+//! (`ComposerModelEffort.tsx`): it adds the effort column and a footer with the speed and
+//! permissions controls, and stays open while picking. Settings rows and the scheduled task
+//! editor open the plain one with their own selection and setter.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,9 +15,9 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
+    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
@@ -23,12 +25,24 @@ use super::Workspace;
 use super::composer::{control_button, runtime_modes};
 use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel};
 use crate::model_label;
-use crate::theme::Tokens;
+use crate::theme::{self, Tokens};
 
 const RAIL: f32 = 44.;
 const LIST: f32 = 316.;
 const EFFORT: f32 = 192.;
 const BODY_HEIGHT: f32 = 346.;
+const COMPOSER: &str = "model-picker";
+
+/// `onInstanceModelChange` for a picker outside the composer.
+pub(in crate::app) type OnPick = Rc<dyn Fn(&mut Workspace, ModelSelection, &mut Window, &mut Context<Workspace>)>;
+
+/// What an undocked picker picks for: its row's selection, the providers it offers, and the setter.
+#[derive(Clone)]
+pub(in crate::app) struct PickHost {
+    pub current: Option<ModelSelection>,
+    pub include: fn(&Provider) -> bool,
+    pub on_pick: OnPick,
+}
 
 #[derive(Clone, PartialEq)]
 enum Tab {
@@ -38,7 +52,10 @@ enum Tab {
 
 #[derive(Default)]
 pub(super) struct PickerState {
-    pub(super) open: bool,
+    /// The open picker's trigger id; only one is open at a time.
+    open: Option<SharedString>,
+    /// `None` while the composer's picker is open: it reads the composer's live selection.
+    host: Option<PickHost>,
     tab: Option<Tab>,
     search: Option<Entity<InputState>>,
     query: String,
@@ -61,11 +78,31 @@ struct Row {
     legacy: bool,
 }
 
+impl PickerState {
+    /// Closes the picker without moving focus, as a target change does.
+    pub(super) fn dismiss(&mut self) {
+        self.open = None;
+        self.host = None;
+    }
+}
+
 impl Workspace {
+    pub(super) fn model_picker_open(&self) -> bool {
+        self.picker.open.is_some()
+    }
+
+    pub(super) fn composer_picker_open(&self) -> bool {
+        self.picker.open.as_deref() == Some(COMPOSER)
+    }
+
     pub(super) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.target.is_none() || self.server_info.model_choices().is_empty() {
             return;
         }
+        self.open_picker(COMPOSER.into(), None, window, cx);
+    }
+
+    fn open_picker(&mut self, id: SharedString, host: Option<PickHost>, window: &mut Window, cx: &mut Context<Self>) {
         let search = match self.picker.search.clone() {
             Some(search) => search,
             None => {
@@ -88,14 +125,41 @@ impl Workspace {
         self.picker.query.clear();
         self.picker.highlighted = 0;
         self.picker.tab = None;
-        self.picker.open = true;
+        self.picker.open = Some(id);
+        self.picker.host = host;
         cx.notify();
     }
 
     pub(super) fn close_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.picker.open) {
+        let Some(id) = self.picker.open.take() else { return };
+        self.picker.host = None;
+        if id.as_ref() == COMPOSER {
             self.focus_composer(window, cx);
-            cx.notify();
+        }
+        cx.notify();
+    }
+
+    /// The selection the open picker marks: its host's, else the composer's.
+    fn picker_current(&self) -> Option<ModelSelection> {
+        match &self.picker.host {
+            Some(host) => host.current.clone(),
+            None => self.composer_model(),
+        }
+    }
+
+    /// The providers the open picker offers.
+    fn picker_includes(&self, provider: &Provider) -> bool {
+        self.picker.host.as_ref().is_none_or(|host| (host.include)(provider))
+    }
+
+    /// The docked picker keeps its popup open; any other closes and hands the model to its host.
+    fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
+        match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
+            None => self.pick_model(selection, cx),
+            Some(on_pick) => {
+                self.close_model_picker(window, cx);
+                on_pick(self, selection, window, cx);
+            }
         }
     }
 
@@ -171,7 +235,7 @@ impl Workspace {
                 .map(move |m| (p.clone(), m.clone()))
                 .collect::<Vec<_>>()
         };
-        let providers = self.server_info.providers.iter().filter(ready);
+        let providers = self.server_info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -220,7 +284,7 @@ impl Workspace {
 
     /// Up/Down/Enter/Escape and Ctrl+1-9 while the picker is open.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let current = self.composer_model();
+        let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
         let modifiers = keystroke.modifiers;
         let digit = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d));
@@ -233,12 +297,12 @@ impl Workspace {
             }
             "enter" => {
                 if let Some(row) = rows.into_iter().nth(self.picker.highlighted) {
-                    self.pick_model(row.selection, cx);
+                    self.pick_row(row.selection, window, cx);
                 }
             }
-            _ if digit.is_some() && (modifiers.control || modifiers.platform) => {
+            _ if digit.is_some() && (modifiers.control || modifiers.platform) && self.picker.host.is_none() => {
                 if let Some(row) = rows.into_iter().nth(digit.unwrap_or(1) - 1) {
-                    self.pick_model(row.selection, cx);
+                    self.pick_row(row.selection, window, cx);
                 }
             }
             _ => return false,
@@ -247,7 +311,7 @@ impl Workspace {
     }
 
     /// The trigger and, while open, the popover.
-    pub(super) fn render_model_picker(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info.provider(&s.instance_id));
         let model = current.as_ref().and_then(|s| self.server_info.model(s));
@@ -265,7 +329,7 @@ impl Workspace {
                 == Some(Value::Bool(true))
         });
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
-        let open = self.picker.open;
+        let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info.model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
         let trigger = control_button("model-picker", t)
@@ -292,13 +356,45 @@ impl Workspace {
                         .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.)))),
                 )
             });
+        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
+        self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
+    }
+
+    /// A picker without the effort column (`ProviderModelPicker` with no `effortColumn`) on `trigger`.
+    pub(in crate::app) fn undocked_model_picker(
+        &self,
+        id: SharedString,
+        trigger: Button,
+        host: PickHost,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.picker.open.as_ref() == Some(&id);
+        let body = open.then(|| {
+            let t = *theme::tokens(cx);
+            let current = self.picker_current();
+            self.render_picker_body(current.as_ref(), &SharedString::default(), None, &t, cx)
+        });
+        self.picker_popover(id, trigger.selected(open), Anchor::TopLeft, Some(host), body, cx)
+    }
+
+    fn picker_popover(
+        &self,
+        id: SharedString,
+        trigger: Button,
+        anchor: Anchor,
+        host: Option<PickHost>,
+        body: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let view = cx.entity();
-        let mut popover = Popover::new("model-picker-popover")
-            .anchor(gpui_kit::Anchor::BottomRight)
+        let open = self.picker.open.as_ref() == Some(&id);
+        let mut popover = Popover::new(ElementId::Name(format!("{id}-popover").into()))
+            .anchor(anchor)
             .open(open)
             .on_open_change(move |open, window, cx| {
+                let (id, host) = (id.clone(), host.clone());
                 view.update(cx, |this, cx| {
-                    if *open { this.open_model_picker(window, cx) } else { this.close_model_picker(window, cx) }
+                    if *open { this.open_picker(id, host, window, cx) } else { this.close_model_picker(window, cx) }
                 })
             })
             .trigger(trigger)
@@ -309,19 +405,16 @@ impl Workspace {
         if let Some(search) = &self.picker.search {
             popover = popover.track_focus(&search.focus_handle(cx));
         }
-        if open {
-            popover = popover.child(self.render_picker_body(current.as_ref(), &name, descriptors, t, window, cx));
-        }
-        popover.into_any_element()
+        popover.children(body).into_any_element()
     }
 
+    /// The rail, search and list; `docked` carries the model's option descriptors for the effort column.
     fn render_picker_body(
         &self,
         current: Option<&ModelSelection>,
         model_name: &SharedString,
-        descriptors: &[OptionDescriptor],
+        docked: Option<&[OptionDescriptor]>,
         t: &Tokens,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
@@ -342,11 +435,9 @@ impl Workspace {
                 let text = if tab == Tab::Favorites && !searching { "No favorites yet" } else { "No models found" };
                 el.child(div().p(px(8.)).flex().justify_center().text_sm().text_color(t.muted_foreground).child(text))
             })
-            .children(
-                rows.iter()
-                    .enumerate()
-                    .map(|(index, row)| self.render_picker_model_row(row, index, tab == Tab::Favorites, t, cx)),
-            )
+            .children(rows.iter().enumerate().map(|(index, row)| {
+                self.render_picker_model_row(row, index, tab == Tab::Favorites, docked.is_some(), t, cx)
+            }))
             .when(has_legacy && !searching, |el| {
                 let label = if self.picker.show_legacy { "Show less" } else { "Show more" };
                 el.child(
@@ -395,29 +486,24 @@ impl Workspace {
             .child(list);
         v_flex()
             .id("model-picker-body")
-            .w(px(RAIL + LIST + EFFORT))
+            .w(px(RAIL + LIST + if docked.is_some() { EFFORT } else { 0. }))
             .bg(t.popover)
             .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 h_flex()
                     .h(px(BODY_HEIGHT))
                     .items_start()
-                    .when(!searching, |el| el.child(self.render_rail(&tab, current, t, cx)))
+                    .when(!searching, |el| el.child(self.render_rail(&tab, t, cx)))
                     .child(column)
-                    .child(self.render_effort_column(current, model_name, descriptors, t, cx)),
+                    .children(
+                        docked.map(|descriptors| self.render_effort_column(current, model_name, descriptors, t, cx)),
+                    ),
             )
-            .child(self.render_picker_footer(current, descriptors, t, cx))
+            .children(docked.map(|descriptors| self.render_picker_footer(current, descriptors, t, cx)))
             .into_any_element()
     }
 
-    fn render_rail(
-        &self,
-        tab: &Tab,
-        current: Option<&ModelSelection>,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let _ = current;
+    fn render_rail(&self, tab: &Tab, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let button = |id: ElementId, selected: bool, enabled: bool| {
             div()
                 .id(id)
@@ -443,7 +529,7 @@ impl Workspace {
                 this.picker.highlighted = 0;
                 cx.notify();
             }));
-        let providers = self.server_info.providers.iter().filter(|p| p.enabled).map(|p| {
+        let providers = self.server_info.providers.iter().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             let name = p.display_name.clone().unwrap_or_else(|| p.instance_id.clone());
             let tooltip: SharedString = match (ready, p.availability.as_deref(), &p.message) {
@@ -493,6 +579,7 @@ impl Workspace {
         row: &Row,
         index: usize,
         favorites_tab: bool,
+        docked: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -519,7 +606,7 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _, _, cx| this.pick_model(selection.clone(), cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.pick_row(selection.clone(), window, cx)))
             .child(
                 div().size(px(16.)).flex_none().flex().items_center().justify_center().children(
                     row.icon.map(|(path, tint)| {
@@ -588,7 +675,7 @@ impl Workspace {
                                 this.toggle_favorite(&star_selection, cx);
                             })),
                     )
-                    .when(index < 9, |el| el.child(kbd(&format!("Ctrl+{}", index + 1), t))),
+                    .when(docked && index < 9, |el| el.child(kbd(&format!("Ctrl+{}", index + 1), t))),
             )
             .into_any_element()
     }

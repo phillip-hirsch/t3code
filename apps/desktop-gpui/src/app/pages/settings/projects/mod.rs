@@ -717,7 +717,7 @@ impl Workspace {
             .gap_6()
             .child(alert)
             .child(card(overview, &tokens))
-            .child(self.render_project_defaults(&project_id, window, cx))
+            .child(self.render_project_defaults(&project_id, cx))
             .child(self.render_project_actions(&project_id, window, cx))
             .child(checkouts)
             .child(danger)
