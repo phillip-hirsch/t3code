@@ -35,7 +35,9 @@ impl Workspace {
         }
         let keymap = self.keymap.clone();
         let command = keymap::resolve(&keymap, keystroke, &context);
-        log::trace!("keystroke {keystroke:?} resolves to {command:?}");
+        if let Some(command) = command {
+            log::trace!("shortcut resolves to {command}");
+        }
         // A confirmation keeps the app's shortcuts from acting behind it (`isInsideConfirmation`).
         if command.is_some() && keymap::focus_in(&event.context_stack, "Dialog") {
             return true;
