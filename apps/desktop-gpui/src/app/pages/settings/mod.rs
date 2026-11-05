@@ -75,6 +75,21 @@ pub(in crate::app) const SETTINGS: &[(Option<&str>, &[(&str, &str)])] = &[
     (None, &[("maintenance", "Maintenance"), ("labs", "Labs"), ("about", "About"), ("archived", "Archive")]),
 ];
 
+/// `isSecretsFeatureEnabled`: the web's build flag `T3CODE_FEATURE_SECRETS`, read here from
+/// the environment. Off, the Secrets section and its search items do not exist.
+pub(in crate::app) fn secrets_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let flag = std::env::var("T3CODE_FEATURE_SECRETS").unwrap_or_default();
+        matches!(flag.trim().to_lowercase().as_str(), "1" | "true")
+    })
+}
+
+/// Whether a section exists in this build (`SETTINGS_NAV_GROUPS` drops Secrets without the flag).
+pub(in crate::app) fn section_enabled(id: &str) -> bool {
+    id != "secrets" || secrets_enabled()
+}
+
 /// Pages without a nav entry: id, breadcrumb label, and the section highlighted for them
 /// (`SETTINGS_DETAIL_PAGE_PARENTS`).
 const DETAIL_PAGES: &[(&str, &str, &str)] =
@@ -550,7 +565,7 @@ impl Workspace {
                                 .text_color(sb.muted_foreground.opacity(0.8))
                                 .child(heading)
                         }))
-                        .children(items.iter().map(|(id, label)| {
+                        .children(items.iter().filter(|(id, _)| section_enabled(id)).map(|(id, label)| {
                             let id: &'static str = id;
                             let active = nav_section(section) == id;
                             h_flex()
@@ -720,7 +735,8 @@ impl Workspace {
             "worktrees" => self.render_settings_worktrees(window, cx),
             "connections" => self.render_settings_connections(window, cx),
             "access" => self.render_settings_access(window, cx),
-            "secrets" => self.render_settings_secrets(window, cx),
+            // The web redirects the route to General without the feature flag.
+            "secrets" if secrets_enabled() => self.render_settings_secrets(window, cx),
             "maintenance" => self.render_settings_maintenance(window, cx),
             "diagnostics" => self.render_settings_diagnostics(window, cx),
             "labs" => self.render_settings_labs(window, cx),

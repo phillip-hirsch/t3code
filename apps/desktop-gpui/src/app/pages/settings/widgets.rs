@@ -99,6 +99,8 @@ pub(in crate::app) struct SettingRow {
     title: SharedString,
     description: Option<AnyElement>,
     status: Option<SharedString>,
+    /// `PolicyTooltip`: an info icon after the title explaining the setting.
+    tip: Option<SharedString>,
     body: Option<AnyElement>,
     keys: Vec<&'static str>,
     control: Control,
@@ -146,12 +148,18 @@ impl SettingRow {
             title: title.into(),
             description: None,
             status: None,
+            tip: None,
             body: None,
             keys: Vec::new(),
             control: Control::None,
             unavailable: false,
             reset: None,
         }
+    }
+
+    pub(in crate::app) fn tip(mut self, tip: impl Into<SharedString>) -> Self {
+        self.tip = Some(tip.into());
+        self
     }
 
     pub(in crate::app) fn description(mut self, description: impl IntoElement) -> Self {
@@ -720,7 +728,7 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
-        let SettingRow { id, title, description, status, body, control, unavailable, .. } = row;
+        let SettingRow { id, title, description, status, tip, body, control, unavailable, .. } = row;
         let (state, summary) = scope::row_inheritance(&view.scope, &view.targets, &view.environment(), &keys);
         let inheritance = (server_scoped && !keys.is_empty() && !view.targets.is_empty())
             .then(|| self.render_inheritance(view, &id, &keys, state, summary, overriding, &t, cx));
@@ -743,6 +751,14 @@ impl Workspace {
         let inert = if unavailable { Some("") } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
+        let title = h_flex().gap(px(6.)).child(title).when_some(tip, |el, tip| {
+            el.child(
+                div()
+                    .id(SharedString::from(format!("{id}-tip")))
+                    .child(Icon::new(IconName::Info).size(px(14.)).text_color(t.muted_foreground))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+            )
+        });
         let mut frame = RowFrame::new(title).dimmed(unavailable).status(status);
         frame.marker = inheritance.map(|marker| {
             div()

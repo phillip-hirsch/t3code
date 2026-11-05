@@ -22,7 +22,7 @@ pub(super) fn available(item: &SearchItem) -> bool {
         && (!item.windows_only || cfg!(target_os = "windows"))
         // Features the web gates on a hosted config, a local backend it manages, WSL, tunnels,
         // peer links or a Mac environment are not offered by this client yet.
-        && !item.secrets_feature_only
+        && (!item.secrets_feature_only || super::secrets_enabled())
         && !item.cloud_only
         && !item.local_backend_management_only
         && !item.wsl_available_only
