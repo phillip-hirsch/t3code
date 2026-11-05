@@ -173,6 +173,11 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    pub environment_id: Option<String>,
+    /// `capabilities.projectOrganization`: the server keeps project pin and archive.
+    pub project_organization: bool,
+    /// The "No project" workspace; a project rooted there is the scratch project.
+    pub scratch_workspace_root: Option<String>,
 }
 
 impl ServerInfo {
@@ -188,6 +193,11 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.environment_id = text("/environment/environmentId");
+                self.project_organization =
+                    config.pointer("/environment/capabilities/projectOrganization").and_then(Value::as_bool)
+                        == Some(true);
+                self.scratch_workspace_root = text("/scratchWorkspaceRoot");
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -270,6 +280,23 @@ impl ServerInfo {
 pub struct RepositoryIdentity {
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub canonical_key: Option<String>,
+    /// Work tree root, or the git dir for a bare repository.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub origin: Option<RepositoryOrigin>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryOrigin {
+    pub canonical_key: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -294,6 +321,10 @@ pub struct ProjectShell {
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,
+    #[serde(default)]
+    pub favicon_path: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

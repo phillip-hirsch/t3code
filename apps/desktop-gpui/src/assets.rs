@@ -82,11 +82,12 @@ impl AssetSource for Assets {
         if let Some((_, bytes)) = APP_ICONS.iter().chain(LUCIDE_ICONS).find(|(name, _)| *name == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        gpui_kit::assets::Assets.load(path)
+        // The full catalog: a project icon can be any Lucide icon (`ProjectIconPickerDialog`).
+        gpui_kit::assets::AllAssets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut names = gpui_kit::assets::Assets.list(path)?;
+        let mut names = gpui_kit::assets::AllAssets.list(path)?;
         names.extend(
             APP_ICONS
                 .iter()

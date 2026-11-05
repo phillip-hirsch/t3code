@@ -67,6 +67,8 @@ struct OpenThread {
 
 pub struct Workspace {
     connection: Connection,
+    /// The connected server's HTTP side, for asset URLs such as project favicons.
+    endpoint: Option<backend::Endpoint>,
     server: Option<ServerHandle>,
     server_info: ServerInfo,
     shell: ShellState,
@@ -141,6 +143,7 @@ impl Workspace {
         ];
         Self {
             connection: Connection::Starting,
+            endpoint: None,
             server: None,
             server_info: ServerInfo::default(),
             shell: ShellState::default(),
@@ -247,8 +250,11 @@ impl Workspace {
                     Ok(client) => {
                         renewed = false;
                         log::info!("connected");
-                        if this.update_in(cx, |this, window, cx| this.on_connected(client.clone(), window, cx)).is_err()
-                        {
+                        let connected = this.update_in(cx, |this, window, cx| {
+                            this.endpoint = Some(endpoint.clone());
+                            this.on_connected(client.clone(), window, cx)
+                        });
+                        if connected.is_err() {
                             return;
                         }
                         let reason = client.closed().await;
