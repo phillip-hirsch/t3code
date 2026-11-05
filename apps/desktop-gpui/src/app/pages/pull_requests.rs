@@ -3,6 +3,8 @@
 //! `pullRequests.list` (plus `pullRequests.listStats` for diff sizes the listing leaves out),
 //! and Refresh asks the host again through `pullRequests.invalidate`.
 
+mod facets;
+use facets::FacetKind;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -100,6 +102,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) panel: Option<super::pull_request_detail::Panel>,
     /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
     pub(super) last_merge_method: &'static str,
+    /// The searchable Author or Labels picker, while open.
+    facet_search: Option<facets::FacetSearch>,
 }
 
 impl PullRequestsState {
@@ -139,6 +143,7 @@ impl PullRequestsState {
             _search_subscription: subscription,
             panel: None,
             last_merge_method: "merge",
+            facet_search: None,
         }
     }
 
@@ -543,7 +548,7 @@ impl Workspace {
             .gap(px(8.))
             .child(search)
             .child(sort_menu)
-            .child(filters)
+            .child(div().relative().child(filters).children(self.render_facet_search(t, cx)))
             .child(provider)
             .child(refresh)
     }
@@ -610,6 +615,13 @@ impl Workspace {
                 window,
                 cx,
                 move |mut menu, window, _| {
+                    menu = menu
+                        .item(PopupMenuItem::new("Search authors…").icon(Lucide::Search).on_click(
+                            window.listener_for(&author_view, |this, _, window, cx| {
+                                this.open_facet_search(FacetKind::Authors, window, cx)
+                            }),
+                        ))
+                        .separator();
                     menu = menu.item(PopupMenuItem::new("Anyone").checked(picked_author.is_none()).on_click(
                         window.listener_for(&author_view, |this, _, _, cx| {
                             this.set_pull_request_scope(cx, |state| state.menu.author = None)
@@ -635,6 +647,13 @@ impl Workspace {
             let label_summary =
                 if selected.is_empty() { "Any".to_owned() } else { format!("{} selected", selected.len()) };
             root = root.submenu(format!("Labels  {label_summary}"), window, cx, move |mut menu, window, _| {
+                menu = menu
+                    .item(PopupMenuItem::new("Search labels…").icon(Lucide::Search).on_click(
+                        window.listener_for(&label_view, |this, _, window, cx| {
+                            this.open_facet_search(FacetKind::Labels, window, cx)
+                        }),
+                    ))
+                    .separator();
                 if label_choices.is_empty() && selected.is_empty() {
                     return menu.label("No labels found");
                 }

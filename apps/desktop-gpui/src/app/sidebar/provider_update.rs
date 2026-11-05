@@ -48,23 +48,7 @@ pub(super) struct PillState {
     _timer: Option<Task<()>>,
 }
 
-/// `PROVIDER_DISPLAY_NAMES`.
-fn display_name(driver: &str) -> &str {
-    match driver {
-        "antigravity" => "Antigravity",
-        "codex" => "Codex",
-        "claudeAgent" => "Claude",
-        "cursor" => "Cursor",
-        "grok" => "Grok",
-        "fx" => "fx",
-        "kiro" => "Kiro",
-        "muse" => "Muse Code",
-        "acpRegistry" => "ACP Registry",
-        "pi" => "Pi",
-        "opencode" => "OpenCode",
-        other => other,
-    }
-}
+use crate::usage::provider_display_name as display_name;
 
 fn update_field<'a>(provider: &'a Provider, key: &str) -> Option<&'a str> {
     provider.update_state.as_ref().and_then(|state| state[key].as_str())

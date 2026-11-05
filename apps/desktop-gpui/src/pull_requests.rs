@@ -662,14 +662,69 @@ pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Grou
     groups
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct AuthorFacet {
     pub login: String,
     pub count: usize,
+    /// How many of the loaded rows it merged.
+    pub merged: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct LabelFacet {
     pub name: String,
+    pub color: Option<String>,
     pub count: usize,
+}
+
+/// How many loaded matches lead the picker before the host's answers (`HOSTED_CHOICE_ROOM`).
+const HOSTED_CHOICE_ROOM: usize = 15;
+
+/// `pullRequestAuthorChoices`: loaded authors matching the search, then the host's answers.
+pub fn author_choices(facets: &[AuthorFacet], hosted: &[String], query: &str) -> Vec<AuthorFacet> {
+    let needle = normalize(query);
+    let loaded: Vec<AuthorFacet> = facets
+        .iter()
+        .filter(|f| needle.as_ref().is_none_or(|n| f.login.to_lowercase().contains(n.as_str())))
+        .cloned()
+        .collect();
+    let mut seen: Vec<String> = loaded.iter().filter_map(|f| normalize(&f.login)).collect();
+    let mut added = Vec::new();
+    for login in hosted {
+        let Some(key) = normalize(login) else { continue };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let known = facets.iter().find(|f| normalize(&f.login).as_ref() == Some(&key)).cloned();
+        added.push(known.unwrap_or(AuthorFacet { login: login.clone(), count: 0, merged: 0 }));
+    }
+    let room = loaded.len().min(HOSTED_CHOICE_ROOM);
+    let mut choices: Vec<AuthorFacet> = loaded[..room].to_vec();
+    choices.extend(added);
+    choices.extend(loaded[room..].iter().cloned());
+    choices
+}
+
+/// `pullRequestLabelChoices`: loaded labels matching the search, then the host's answers.
+pub fn label_choices(facets: &[LabelFacet], hosted: &[(String, Option<String>)], query: &str) -> Vec<LabelFacet> {
+    let needle = normalize(query);
+    let mut choices: Vec<LabelFacet> = facets
+        .iter()
+        .filter(|f| needle.as_ref().is_none_or(|n| f.name.to_lowercase().contains(n.as_str())))
+        .cloned()
+        .collect();
+    let mut seen: Vec<String> = choices.iter().filter_map(|f| normalize(&f.name)).collect();
+    for (name, color) in hosted {
+        let Some(key) = normalize(name) else { continue };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let known = facets.iter().find(|f| normalize(&f.name).as_ref() == Some(&key)).cloned();
+        choices.push(known.unwrap_or(LabelFacet { name: name.clone(), color: color.clone(), count: 0 }));
+    }
+    choices
 }
 
 /// `collectPullRequestListFacets`: who wrote the loaded rows and which labels they carry.
@@ -688,7 +743,7 @@ pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<Labe
                 }
                 None => authors.push((
                     key,
-                    AuthorFacet { login: author.login.clone(), count: usize::from(in_state) },
+                    AuthorFacet { login: author.login.clone(), count: usize::from(in_state), merged: 0 },
                     usize::from(entry.state == "merged"),
                 )),
             }
@@ -700,7 +755,9 @@ pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<Labe
             let Some(key) = normalize(&label.name) else { continue };
             match labels.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, facet)) => facet.count += 1,
-                None => labels.push((key, LabelFacet { name: label.name.clone(), count: 1 })),
+                None => {
+                    labels.push((key, LabelFacet { name: label.name.clone(), color: label.color.clone(), count: 1 }))
+                }
             }
         }
     }
@@ -708,7 +765,8 @@ pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<Labe
     authors
         .sort_by(|(_, l, lm), (_, r, rm)| rm.cmp(lm).then(r.count.cmp(&l.count)).then_with(|| l.login.cmp(&r.login)));
     labels.sort_by(|(_, l), (_, r)| r.count.cmp(&l.count).then_with(|| l.name.cmp(&r.name)));
-    (authors.into_iter().map(|(_, f, _)| f).collect(), labels.into_iter().map(|(_, f)| f).collect())
+    let authors = authors.into_iter().map(|(_, facet, merged)| AuthorFacet { merged, ..facet }).collect();
+    (authors, labels.into_iter().map(|(_, f)| f).collect())
 }
 
 /// `pullRequestLabelColor`: a six-digit hex color, else none.
@@ -780,6 +838,20 @@ pub fn provider_name(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_answers_join_the_loaded_facets_after_their_room() {
+        let author = |login: &str| AuthorFacet { login: login.into(), count: 1, merged: 0 };
+        let facets = vec![author("alice"), author("bob")];
+        let hosted = vec!["Alice".to_owned(), "carol".to_owned()];
+        let logins = |c: Vec<AuthorFacet>| c.into_iter().map(|f| f.login).collect::<Vec<_>>();
+        assert_eq!(logins(author_choices(&facets, &hosted, "")), ["alice", "bob", "carol"]);
+        assert_eq!(logins(author_choices(&facets, &["carol".to_owned()], "car")), ["carol"]);
+        let label = |name: &str| LabelFacet { name: name.into(), color: None, count: 2 };
+        let hosted = vec![("bug".to_owned(), Some("d73a4a".to_owned())), ("docs".to_owned(), None)];
+        let names: Vec<String> = label_choices(&[label("Bug")], &hosted, "").into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["Bug", "docs"]);
+    }
 
     fn entry(number: u64, patch: Value) -> Rc<Entry> {
         let mut value = json!({

@@ -786,11 +786,33 @@ pub struct Account {
     pub plan: Option<String>,
     pub accent_color: Option<String>,
     pub limits: UsageLimits,
+    /// The usage-limit source that reports it, when no provider here is signed in to it.
+    pub source_label: Option<String>,
+    /// The `provider.consumeResetCredit` input that spends its next reset credit.
+    pub redeem: Option<Value>,
 }
 
 impl Account {
     pub fn name(&self) -> String {
         self.display_name.clone().or_else(|| self.email.clone()).unwrap_or_else(|| self.driver.clone())
+    }
+}
+
+/// `PROVIDER_DISPLAY_NAMES`.
+pub fn provider_display_name(driver: &str) -> &str {
+    match driver {
+        "antigravity" => "Antigravity",
+        "codex" => "Codex",
+        "claudeAgent" => "Claude",
+        "cursor" => "Cursor",
+        "grok" => "Grok",
+        "fx" => "fx",
+        "kiro" => "Kiro",
+        "muse" => "Muse Code",
+        "acpRegistry" => "ACP Registry",
+        "pi" => "Pi",
+        "opencode" => "OpenCode",
+        other => other,
     }
 }
 
@@ -801,11 +823,40 @@ fn reports_limits(provider: &Provider) -> bool {
         && provider.usage_limits.is_some()
 }
 
-/// `accountKey` + `accountKeyResolver`: the same login on two instances is one account.
-fn account_key(provider: &Provider, workspaces: &HashMap<String, Vec<String>>) -> Option<String> {
-    let base = account_base_key(provider)?;
-    let auth = Some(&provider.auth);
-    if let Some(workspace) = auth.and_then(|a| a.workspace_id.as_ref()) {
+/// One account a usage-limit source (a hub) reports (`UsageLimitSourceAccount`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubAccount {
+    id: String,
+    driver: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    usage_limits: UsageLimits,
+}
+
+/// `accountKey`: the login, else the credential, per driver.
+fn base_key(driver: &str, email: Option<&str>, limits: Option<&UsageLimits>) -> Option<String> {
+    match email.map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()) {
+        Some(email) => Some(format!("{driver}:{email}")),
+        None => limits
+            .and_then(|l| l.credential_fingerprint.as_ref())
+            .map(|fingerprint| format!("{driver}:credential:{fingerprint}")),
+    }
+}
+
+/// `accountKeyResolver`: the same login on two instances or a hub is one account; a login with
+/// several workspaces is one account per workspace.
+fn resolve_key(
+    base: Option<String>,
+    workspace: Option<&str>,
+    workspaces: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let base = base?;
+    if let Some(workspace) = workspace {
         return Some(format!("{base}:{workspace}"));
     }
     match workspaces.get(&base).map(Vec::as_slice) {
@@ -815,70 +866,195 @@ fn account_key(provider: &Provider, workspaces: &HashMap<String, Vec<String>>) -
     }
 }
 
-fn account_base_key(provider: &Provider) -> Option<String> {
-    let email = Some(&provider.auth).and_then(|a| a.email.as_deref()).map(|e| e.trim().to_lowercase());
-    match email.filter(|e| !e.is_empty()) {
-        Some(email) => Some(format!("{}:{email}", provider.driver)),
-        None => provider
-            .usage_limits
-            .as_ref()
-            .and_then(|l| l.credential_fingerprint.as_ref())
-            .map(|fingerprint| format!("{}:credential:{fingerprint}", provider.driver)),
-    }
+/// An account and what a merge keeps from its sources (`collectLimitAccounts`' `merge`).
+struct Merging {
+    key: String,
+    account: Account,
+    /// Some provider here is signed in to it, so it names no source.
+    signed_in: bool,
+    credits: Option<(i64, Option<crate::model::ResetCredits>, Option<Value>)>,
+    hub_redeem: Option<(i64, Value)>,
+    plan: Option<(i64, String)>,
 }
 
-/// `collectLimitAccounts` for one environment's providers.
-pub fn limit_accounts(providers: &[Provider], hidden_drivers: &[&str]) -> Vec<Account> {
-    let providers: Vec<&Provider> = providers.iter().filter(|p| !hidden_drivers.contains(&p.driver.as_str())).collect();
+fn checked_ms(account: &Account) -> i64 {
+    account.limits.checked_at.as_deref().and_then(parse_ms).unwrap_or(0)
+}
+
+/// `collectLimitAccounts` for this environment: its providers, then the hub accounts its
+/// usage-limit sources (`config.usageLimitSources`) report.
+pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &[&str]) -> Vec<Account> {
+    let visible = |driver: &str| !hidden_drivers.contains(&driver);
+    let providers: Vec<&Provider> = providers.iter().filter(|p| visible(&p.driver)).collect();
+    let hubs: Vec<(String, String, HubAccount)> = sources
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|source| {
+            let id = source["id"].as_str().unwrap_or_default().to_owned();
+            let label = source["label"].as_str().unwrap_or_default().to_owned();
+            let accounts: Vec<HubAccount> = source["accounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|account| serde_json::from_value(account.clone()).ok())
+                .collect();
+            accounts.into_iter().map(move |account| (id.clone(), label.clone(), account))
+        })
+        .filter(|(_, _, account)| visible(&account.driver))
+        .collect();
     let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
-    for provider in providers.iter().filter(|p| p.enabled) {
-        if let (Some(base), Some(workspace)) =
-            (account_base_key(provider), Some(&provider.auth).and_then(|a| a.workspace_id.clone()))
-        {
+    let reports = providers
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| {
+            (base_key(&p.driver, p.auth.email.as_deref(), p.usage_limits.as_ref()), p.auth.workspace_id.as_deref())
+        })
+        .chain(hubs.iter().map(|(_, _, a)| {
+            (base_key(&a.driver, a.email.as_deref(), Some(&a.usage_limits)), a.workspace_id.as_deref())
+        }));
+    for (base, workspace) in reports {
+        if let (Some(base), Some(workspace)) = (base, workspace) {
             let known = workspaces.entry(base).or_default();
-            if !known.contains(&workspace) {
-                known.push(workspace);
+            if !known.iter().any(|w| w == workspace) {
+                known.push(workspace.to_owned());
             }
         }
     }
-    let mut accounts: Vec<Account> = Vec::new();
+    let mut candidates: Vec<(String, Account, bool)> = Vec::new();
     for provider in providers.into_iter().filter(|p| reports_limits(p)) {
         let Some(limits) = provider.usage_limits.clone() else { continue };
         if limits_notice(&limits).is_some() {
             continue;
         }
-        let key = account_key(provider, &workspaces).unwrap_or_else(|| provider.instance_id.clone());
-        let auth = Some(&provider.auth);
-        let next = Account {
+        let auth = &provider.auth;
+        let base = base_key(&provider.driver, auth.email.as_deref(), Some(&limits));
+        let key = resolve_key(base, auth.workspace_id.as_deref(), &workspaces)
+            .unwrap_or_else(|| provider.instance_id.clone());
+        let account = Account {
             key: provider.instance_id.clone(),
             driver: provider.driver.clone(),
             display_name: provider.display_name.as_ref().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()),
-            email: auth.and_then(|a| a.email.clone()),
-            plan: auth.and_then(|a| a.label.clone()),
+            email: auth.email.clone(),
+            plan: auth.label.clone(),
             accent_color: provider.accent_color.clone(),
             limits,
+            source_label: None,
+            redeem: Some(json!({"instanceId": provider.instance_id})),
         };
-        let checked = |account: &Account| account.limits.checked_at.as_deref().and_then(parse_ms).unwrap_or(0);
-        match accounts.iter_mut().find(|a| account_key_of(a, &key)) {
-            None => accounts.push(Account { key: format!("{key}\u{0}{}", next.key), ..next }),
-            Some(previous) => {
-                let fresher = checked(&next) > checked(previous);
-                if fresher {
-                    previous.plan = next.plan.or(previous.plan.take());
-                    previous.limits = next.limits;
-                } else if previous.plan.is_none() {
-                    previous.plan = next.plan;
-                }
-                previous.display_name = previous.display_name.take().or(next.display_name);
-                previous.accent_color = previous.accent_color.take().or(next.accent_color);
-            }
-        }
+        candidates.push((key, account, true));
     }
-    accounts
+    for (source_id, source_label, hub) in hubs {
+        if limits_notice(&hub.usage_limits).is_some() {
+            continue;
+        }
+        let own_key = match &hub.workspace_id {
+            Some(workspace) => format!("{source_id}:{}:{workspace}", hub.id),
+            None => format!("{source_id}:{}", hub.id),
+        };
+        let base = base_key(&hub.driver, hub.email.as_deref(), Some(&hub.usage_limits));
+        let key = resolve_key(base, hub.workspace_id.as_deref(), &workspaces).unwrap_or_else(|| own_key.clone());
+        let redeem = hub
+            .usage_limits
+            .reset_credits
+            .as_ref()
+            .and_then(|c| c.next_credit_id.clone())
+            .map(|credit| json!({"sourceId": source_id, "accountId": hub.id, "creditId": credit}));
+        let name = hub.id.strip_suffix(".json").or_else(|| hub.id.strip_suffix(".JSON")).unwrap_or(&hub.id).to_owned();
+        let account = Account {
+            key: own_key,
+            driver: hub.driver,
+            display_name: hub.email.is_none().then_some(name),
+            email: hub.email,
+            plan: hub.plan,
+            accent_color: None,
+            limits: hub.usage_limits,
+            source_label: Some(source_label),
+            redeem,
+        };
+        candidates.push((key, account, false));
+    }
+    let mut merged: Vec<Merging> = Vec::new();
+    for (key, next, signed_in) in candidates {
+        let at = checked_ms(&next);
+        let hub_redeem = next.redeem.clone().filter(|r| r.get("sourceId").is_some()).map(|r| (at, r));
+        let credits =
+            next.limits.reset_credits.is_some().then(|| (at, next.limits.reset_credits.clone(), next.redeem.clone()));
+        let plan = next.plan.clone().map(|plan| (at, plan));
+        let Some(group) = merged.iter_mut().find(|m| m.key == key) else {
+            let account = Account { key: format!("{key}\u{0}{}", next.key), ..next };
+            merged.push(Merging { key, account, signed_in, credits, hub_redeem, plan });
+            continue;
+        };
+        // Each part comes from the freshest account that has it.
+        if hub_redeem.is_some() && group.hub_redeem.as_ref().is_none_or(|(seen, _)| at > *seen) {
+            group.hub_redeem = hub_redeem;
+        }
+        if credits.is_some() && group.credits.as_ref().is_none_or(|(seen, ..)| at > *seen) {
+            group.credits = credits;
+        }
+        if plan.is_some() && group.plan.as_ref().is_none_or(|(seen, _)| at > *seen) {
+            group.plan = plan;
+        }
+        let previous = &mut group.account;
+        let winner_is_next = at > checked_ms(previous);
+        // A hub e-mail names the account better than the driver's default instance name.
+        let hub_email = [&*previous, &next].iter().any(|a| a.source_label.is_some() && a.email.is_some());
+        let display_name = previous.display_name.take().or(next.display_name.clone());
+        previous.display_name = display_name.filter(|name| {
+            !(hub_email && name.to_lowercase() == provider_display_name(&previous.driver).to_lowercase())
+        });
+        previous.plan =
+            group.plan.as_ref().map(|(_, plan)| plan.clone()).or(previous.plan.take()).or(next.plan.clone());
+        previous.accent_color = previous.accent_color.take().or(next.accent_color.clone());
+        group.signed_in |= signed_in;
+        previous.source_label =
+            if group.signed_in { None } else { previous.source_label.take().or(next.source_label.clone()) };
+        let winner_redeem = if winner_is_next { next.redeem.clone() } else { previous.redeem.clone() };
+        previous.redeem = match (&group.hub_redeem, &group.credits) {
+            (Some((_, redeem)), _) => Some(redeem.clone()),
+            (None, Some((_, _, redeem))) => redeem.clone(),
+            (None, None) => winner_redeem.or(previous.redeem.take()).or(next.redeem.clone()),
+        };
+        if winner_is_next {
+            previous.limits = next.limits;
+        }
+        previous.limits.reset_credits = group.credits.as_ref().and_then(|(_, credits, _)| credits.clone());
+    }
+    merged.into_iter().map(|m| m.account).collect()
 }
 
-fn account_key_of(account: &Account, key: &str) -> bool {
-    account.key.split('\u{0}').next() == Some(key)
+/// `resetCreditsSummary`: "2 reset credits banked · next expires in 3d", or compact "2 banked · expires in 3d".
+pub fn reset_credits_summary(credits: &crate::model::ResetCredits, now: i64, compact: bool) -> String {
+    let expires = credits.next_expires_at.as_deref().and_then(parse_ms).map(|at| format_duration(at - now));
+    if credits.available_count == 0 {
+        return "No reset credits banked".into();
+    }
+    let n = credits.available_count;
+    match (compact, expires) {
+        (true, Some(expires)) => format!("{n} banked · expires in {expires}"),
+        (true, None) => format!("{n} banked"),
+        (false, expires) => format!(
+            "{n} {} banked{}",
+            if n == 1 { "reset credit" } else { "reset credits" },
+            expires.map(|e| format!(" · next expires in {e}")).unwrap_or_default()
+        ),
+    }
+}
+
+/// The status line a redeemed reset credit leaves (`OUTCOME_TEXT`, or the server's warning).
+pub fn reset_outcome_text(result: &Value) -> String {
+    if let Some(warning) = result["warning"].as_str() {
+        return warning.to_owned();
+    }
+    match result["outcome"].as_str() {
+        Some("reset") => "Reset applied. Your windows have cleared.",
+        Some("nothingToReset") => "Nothing to reset right now.",
+        Some("noCredit") => "No reset credit left.",
+        Some("alreadyRedeemed") => "That credit was already redeemed.",
+        _ => "Could not use the reset credit.",
+    }
+    .into()
 }
 
 /// `WINDOW_KIND_ORDER`.
@@ -1233,6 +1409,37 @@ mod tests {
     }
 
     #[test]
+    fn a_hub_account_merges_with_the_same_login_and_redeems_through_the_hub() {
+        let window = json!([{"id": "w", "kind": "session", "label": "5-hour", "usedPercent": 40}]);
+        let providers = vec![provider("codex", "codex", "me@x.dev", window.clone())];
+        let sources = json!([{
+            "id": "hub", "kind": "cliproxy", "label": "Team hub", "checkedAt": "2026-11-05T01:00:00Z",
+            "accounts": [
+                {"id": "me.json", "driver": "codex", "email": "ME@x.dev", "plan": "Pro",
+                 "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window,
+                                 "resetCredits": {"availableCount": 2, "nextCreditId": "c1"}}},
+                {"id": "other.json", "driver": "codex", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window}},
+            ],
+        }]);
+        let accounts = limit_accounts(&providers, &sources, &[]);
+        assert_eq!(accounts.len(), 2);
+        let me = &accounts[0];
+        assert_eq!(
+            (me.plan.as_deref(), me.source_label.as_deref()),
+            (Some("Pro"), None),
+            "signed in here, so no source"
+        );
+        assert_eq!(me.limits.reset_credits.as_ref().map(|c| c.available_count), Some(2));
+        assert_eq!(me.redeem, Some(json!({"sourceId": "hub", "accountId": "me.json", "creditId": "c1"})));
+        let other = &accounts[1];
+        assert_eq!((other.display_name.as_deref(), other.source_label.as_deref()), (Some("other"), Some("Team hub")));
+        assert_eq!(other.redeem, None);
+        let credits = me.limits.reset_credits.clone().unwrap();
+        assert_eq!(reset_credits_summary(&credits, 0, false), "2 reset credits banked");
+        assert_eq!(reset_outcome_text(&json!({"outcome": "nothingToReset"})), "Nothing to reset right now.");
+    }
+
+    #[test]
     fn pools_accounts_and_blocks_sessions_behind_a_spent_week() {
         let now = parse_ms("2026-11-05T12:00:00Z").unwrap();
         let session = |used: f64, resets: &str| json!({"id": "five_hour", "kind": "session", "label": "5-hour", "usedPercent": used, "resetsAt": resets, "windowDurationMins": 300});
@@ -1250,7 +1457,7 @@ mod tests {
                 ]),
             ),
         ];
-        let pools = limit_pools(limit_accounts(&providers, &[]), now);
+        let pools = limit_pools(limit_accounts(&providers, &Value::Null, &[]), now);
         assert_eq!(pools.len(), 1);
         let pool = &pools[0];
         assert_eq!(pool.accounts.len(), 2);
@@ -1265,7 +1472,7 @@ mod tests {
         assert_eq!(session.remaining_percent, 40);
         assert_eq!(session.next_refill, Some(10), "me@'s 20% back, as a share of two accounts");
         assert!(pool.windows[1].columns[0].is_none(), "me@ has no weekly window");
-        assert!(limit_accounts(&providers, &["claudeAgent"]).is_empty());
+        assert!(limit_accounts(&providers, &Value::Null, &["claudeAgent"]).is_empty());
     }
 
     #[test]
