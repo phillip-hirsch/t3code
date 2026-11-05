@@ -275,7 +275,7 @@ impl Workspace {
 
     /// `foldPastedText`: a large paste, or one past the input limit, attaches as a text
     /// file; one that can neither fit nor attach is refused.
-    fn fold_pasted_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn fold_pasted_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let state = self.composer.read(cx);
         let selected = state.selected_range();
         let value = state.value();

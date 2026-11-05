@@ -218,6 +218,7 @@ impl Workspace {
         if self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || self.composer_shortcut(keystroke, window, cx)
+            || self.redirect_to_composer(keystroke, window, cx)
         {
             return true;
         }
@@ -227,6 +228,49 @@ impl Workspace {
                 || self.menu_key(keystroke, window, cx)
                 || self.history_key(keystroke, window, cx)
                 || self.send_key(keystroke, window, cx))
+    }
+
+    /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
+    /// click on the timeline blurs the editor), typing and pasting land at the composer's end.
+    fn redirect_to_composer(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.focus.is_focused(window)
+            || self.target.is_none()
+            || self.palette.is_some()
+            || self.page.is_some()
+            || self.settings.is_some()
+        {
+            return false;
+        }
+        let m = keystroke.modifiers;
+        let paste = keystroke.key == "v" && (m.control || m.platform) && !m.alt;
+        let text = if paste {
+            let item = cx.read_from_clipboard();
+            let only_text = item
+                .as_ref()
+                .is_some_and(|item| item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_))));
+            match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
+                Some(text) => text,
+                None => return false,
+            }
+        } else if !m.control && !m.alt && !m.platform && !m.function {
+            match keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control)) {
+                Some(c) => c.clone(),
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        self.composer.update(cx, |state, cx| {
+            let end = state.value().len();
+            state.set_selected_range(end..end, cx);
+        });
+        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        // Ctrl+Shift+V pastes as text even when it is long (`isPasteAsTextShortcut`).
+        if paste && !m.shift && self.fold_pasted_text(&text, window, cx) {
+            return true;
+        }
+        self.composer.update(cx, |state, cx| state.insert(text, window, cx));
+        true
     }
 
     /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
