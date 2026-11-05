@@ -1340,10 +1340,15 @@ impl AddProviderWizard {
         let section = (provider.is_some() && (can_authenticate || signed_in))
             .then(|| self.workspace.upgrade())
             .flatten()
-            .and_then(|w| w.update(cx, |w, cx| w.render_provider_account(&instance_id, window, cx)));
+            .and_then(|w| {
+                let scope = self.scope.clone();
+                w.update(cx, |w, cx| w.render_provider_account_on(scope, &instance_id, window, cx))
+            });
         let body = section.unwrap_or_else(|| {
             let message = self.auth.as_ref().and_then(|a| a.get("message")).and_then(Value::as_str);
-            let description: SharedString = if discovering {
+            let description: SharedString = if self.client(cx).is_none() {
+                format!("Reconnect {} to finish signing in.", self.environment_label(cx)).into()
+            } else if discovering {
                 "Discovering sign-in methods…".into()
             } else {
                 self.auth_error.clone().or_else(|| message.map(|m| m.to_owned().into())).unwrap_or_else(|| {
@@ -1422,10 +1427,12 @@ impl AddProviderWizard {
                                     )
                                     .child("Continue with ChatGPT"),
                             )
+                            .disabled(self.client(cx).is_none())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let Some(workspace) = this.workspace.upgrade() else { return };
+                                let scope = this.scope.clone();
                                 Self::close(window, cx);
-                                workspace.update(cx, |w, cx| w.open_add_codex_account_dialog(None, window, cx));
+                                workspace.update(cx, |w, cx| w.open_add_codex_account_dialog(scope, None, window, cx));
                             })),
                     )
                 })

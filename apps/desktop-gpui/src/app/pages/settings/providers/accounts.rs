@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 use super::codex_callback;
 
 mod antigravity;
+use super::super::scoped_client;
 use crate::app::Workspace;
 use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
@@ -389,8 +390,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let provider = self.settings_info().provider(instance_id)?;
-        let instance = &self.settings_info().settings["providerInstances"][instance_id];
+        self.render_provider_account_on(self.settings_environment(), instance_id, window, cx)
+    }
+
+    /// [`Self::render_provider_account`] for the instance on `scope`, a dialog's own environment;
+    /// nothing while that environment is gone.
+    pub(in crate::app) fn render_provider_account_on(
+        &mut self,
+        scope: Option<SharedString>,
+        instance_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let info = self.env_info(scope.as_ref()?)?;
+        let provider = info.provider(instance_id)?;
+        let instance = &info.settings["providerInstances"][instance_id];
         let driver = instance["driver"].as_str().unwrap_or(&provider.driver);
         let codex_managed = driver == "codex" && codex_setup_managed(&instance["config"]);
         let can_authenticate = provider.setup.as_ref().map(|setup| setup.can_authenticate);
@@ -412,7 +426,7 @@ impl Workspace {
             }
             return None;
         }
-        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
+        let workspace = cx.weak_entity();
         let id = instance_id.to_owned();
         let key = format!("provider-account-{}-{instance_id}", scope.as_deref().unwrap_or_default());
         Some(
@@ -444,15 +458,16 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `AddManagedCodexAccountDialog`: names a new managed Codex instance, then
+    /// `AddManagedCodexAccountDialog`: names a new managed Codex instance on `scope`, then
     /// installs and signs it in. `on_created` takes over after creation instead.
     pub(in crate::app) fn open_add_codex_account_dialog(
         &mut self,
+        scope: Option<SharedString>,
         on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
+        let workspace = cx.weak_entity();
         let dialog = cx.new(|cx| AddCodexAccount::new(workspace, scope, on_created, window, cx));
         window.open_dialog(cx, move |modal, window, cx| {
             let modal = modal.entrance(DialogEntrance::None);
@@ -2122,11 +2137,17 @@ impl AddCodexAccount {
             cx.defer_in(window, |_, window, cx| window.close_dialog(cx));
         }
         let name_empty = self.name.read(cx).value().trim().is_empty();
+        // The environment the dialog opened on; while it is gone the account cannot be made.
+        let connected = scoped_client(&self.workspace, self.scope.as_ref(), cx).is_some();
         let title = if created.is_some() { self.display_name(cx) } else { "Add ChatGPT account".into() };
         let body: AnyElement = match (&created, provider) {
             (Some((_, section)), Some(p)) if p.setup.is_some() => section.clone().into_any_element(),
             (Some(_), _) => {
                 settings_row(&t, "Codex runtime", Some(text("Preparing managed setup.")), None).into_any_element()
+            }
+            (None, _) if !connected => {
+                settings_row(&t, "Environment disconnected", Some(text("Reconnect it to add the account.")), None)
+                    .into_any_element()
             }
             (None, _) => v_flex()
                 .gap_3()
@@ -2159,7 +2180,7 @@ impl AddCodexAccount {
                 .child(
                     button("add-codex-continue", if self.pending { "Adding account…" } else { "Continue" })
                         .primary()
-                        .disabled(self.pending || name_empty)
+                        .disabled(self.pending || name_empty || !connected)
                         .on_click(cx.listener(|this, _, window, cx| this.create(window, cx))),
                 ),
         };
