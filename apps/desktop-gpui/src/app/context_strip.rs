@@ -94,7 +94,7 @@ pub(super) struct DraftWorkspaceState {
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { project_id }) = self.target.clone() else { return };
+        let Some(Target::Draft { project_id, .. }) = self.target.clone() else { return };
         if self.draft_workspace.project_id.as_ref() == Some(&project_id) {
             return;
         }
@@ -104,7 +104,7 @@ impl Workspace {
         };
         self.draft_workspace = DraftWorkspaceState { project_id: Some(project_id.clone()), ..Default::default() };
         let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
-        let workspace = DraftWorkspace::new(&self.server_info, project, has_threads);
+        let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
         let cwd = project.workspace_root.clone();
         self.draft_workspace._load = Some(cx.spawn(async move |this, cx| {
@@ -147,7 +147,7 @@ impl Workspace {
 
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
-        let thread = matches!(self.target, Some(Target::Thread(_)));
+        let thread = matches!(self.target, Some(Target::Thread { .. }));
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
@@ -166,7 +166,7 @@ impl Workspace {
     /// The refs the branch picker lists: the thread checkout's, or the draft project's.
     fn refs(&self) -> Option<&Value> {
         match &self.target {
-            Some(Target::Thread(_)) => {
+            Some(Target::Thread { .. }) => {
                 let (cwd, refs) = self.draft_workspace.thread_refs.as_ref()?;
                 (Some(cwd) == self.composer_cwd().as_ref()).then_some(refs)
             }
@@ -209,7 +209,7 @@ impl Workspace {
 
     /// The newest other thread of this project that ran in a worktree (`resolvePreviousWorktreeSeed`).
     fn previous_worktree(&self) -> Option<(String, Option<String>)> {
-        let Some(Target::Draft { project_id }) = &self.target else { return None };
+        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
         self.shell
             .threads
             .iter()
@@ -240,7 +240,7 @@ impl Workspace {
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
-        if let Some(Target::Thread(thread_id)) = self.target.clone() {
+        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
             self.select_thread_branch(thread_id, name, cx);
             self.focus_composer(window, cx);
             return;
@@ -271,7 +271,7 @@ impl Workspace {
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
-        if let Some(Target::Thread(thread_id)) = self.target.clone() {
+        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
             let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
             let input = json!({"cwd": cwd, "refName": name, "switchRef": true});
             self.run_thread_ref_command(thread_id, "vcs.createRef", input, name, worktree, cx);
@@ -432,7 +432,7 @@ impl Workspace {
     /// only with `persistComposerContextStrip`, and then without permissions.
     pub(super) fn render_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.target_project()?;
-        if matches!(self.target, Some(Target::Thread(_))) {
+        if matches!(self.target, Some(Target::Thread { .. })) {
             return self.render_thread_context_strip(t, cx);
         }
         let git = self.is_git_repo();
@@ -524,8 +524,9 @@ impl Workspace {
 
     /// The machine the draft runs on; a locked label while this is the only environment.
     fn render_environment_chip(&self, t: &Tokens) -> AnyElement {
-        let label: SharedString = self.server_info.environment_label.clone().unwrap_or_else(|| "Run on".into()).into();
-        let icon = match self.server_info.machine_kind() {
+        let label: SharedString =
+            self.server_info().environment_label.clone().unwrap_or_else(|| "Run on".into()).into();
+        let icon = match self.server_info().machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
             "laptop" => Lucide::Laptop,
             "cloud" => Lucide::Cloud,
@@ -603,7 +604,7 @@ impl Workspace {
 
     fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.draft_workspace;
-        let thread = matches!(self.target, Some(Target::Thread(_)));
+        let thread = matches!(self.target, Some(Target::Thread { .. }));
         let worktree_base =
             !thread && self.draft_env_mode() == EnvMode::Worktree && state.choice.existing_worktree.is_none();
         let current =
@@ -833,7 +834,7 @@ impl Workspace {
         let current = self.runtime_mode();
         let supported = self
             .composer_model()
-            .and_then(|s| self.server_info.provider(&s.instance_id))
+            .and_then(|s| self.server_info().provider(&s.instance_id))
             .map(|p| p.supported_runtime_modes.clone())
             .unwrap_or_default();
         let shown = self.draft_workspace.permissions_preview.map(str::to_owned).unwrap_or_else(|| current.clone());

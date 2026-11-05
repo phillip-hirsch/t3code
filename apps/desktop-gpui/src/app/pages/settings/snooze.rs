@@ -7,7 +7,7 @@ use chrono::{DateTime, Datelike as _, Duration, NaiveTime, TimeZone, Timelike as
 use serde::{Deserialize, Serialize};
 
 pub(super) const MAX_PRESETS: usize = 8;
-pub(super) const MAX_MINUTES: i64 = 30 * 24 * 60;
+pub(super) const MAX_MINUTES: i64 = crate::inbox::MAX_SNOOZE_PRESET_MINUTES;
 
 /// `SnoozePresetSetting`: a duration, or a local time on a day.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +15,16 @@ pub(super) const MAX_MINUTES: i64 = 30 * 24 * 60;
 pub(super) enum Preset {
     After { minutes: i64 },
     At { day: String, time: String },
+}
+
+impl Preset {
+    /// Whether the contract accepts it: a duration is 1 minute to [`MAX_MINUTES`].
+    pub(super) fn in_range(&self) -> bool {
+        match self {
+            Preset::After { minutes } => (1..=MAX_MINUTES).contains(minutes),
+            Preset::At { .. } => true,
+        }
+    }
 }
 
 pub(super) fn defaults() -> Vec<Preset> {
@@ -199,7 +209,7 @@ fn label(preset: &Preset, days_ahead: i64) -> String {
 /// `resolveSnoozePreset`: when an option wakes from `now`, or `None` for a passed "Today".
 pub(super) fn resolve<Tz: TimeZone>(preset: &Preset, now: &DateTime<Tz>) -> Option<Resolved<Tz>> {
     let (wake, ahead) = match preset {
-        Preset::After { minutes } => (now.clone() + Duration::minutes(*minutes), 0),
+        Preset::After { minutes } => (now.clone().checked_add_signed(Duration::try_minutes(*minutes)?)?, 0),
         Preset::At { day, time } => {
             let ahead = days_ahead(day, now);
             // Calendar days, so a DST day of 23 or 25 hours still lands on the right date.
@@ -329,6 +339,10 @@ mod tests {
         assert_eq!(resolve(&at("wednesday", "09:00"), &now).unwrap().label, "Next Wednesday");
         assert_eq!(resolve(&at("friday", "09:00"), &now).unwrap().label, "Friday");
         assert_eq!(resolve(&at("thursday", "13:00"), &now).unwrap().label, "Tomorrow");
+        for minutes in [i64::MAX, i64::MIN, i64::MAX / 60_000, 200_000_000_000] {
+            assert!(resolve(&after(minutes), &now).is_none(), "{minutes} minutes has no wake");
+        }
+        assert!(!after(MAX_MINUTES + 1).in_range() && !after(0).in_range() && after(MAX_MINUTES).in_range());
     }
 
     #[test]

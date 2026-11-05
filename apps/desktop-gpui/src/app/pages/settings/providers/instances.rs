@@ -390,7 +390,7 @@ pub(super) fn one_click_update_candidates(providers: &[Value]) -> Vec<(String, S
 /// "Checked 5m ago" from the newest `checkedAt` (`ProviderLastChecked`).
 pub(super) fn last_checked_label(providers: &[Value], now_ms: i64) -> Option<String> {
     let latest = providers.iter().filter_map(|p| p["checkedAt"].as_str()).max()?;
-    let Some(checked) = crate::inbox::parse_ms(latest) else { return Some("Checked unavailable".into()) };
+    let Some(checked) = crate::timestamp::parse_ms(latest) else { return Some("Checked unavailable".into()) };
     let minutes = (now_ms - checked).max(0) / 60_000;
     Some(match minutes {
         0 => "Checked just now".into(),
@@ -695,7 +695,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let advisory = facts.advisory.clone()?;
-        let live = super::instances::live_provider(&self.server_info.providers_json, &row.id).cloned();
+        let live = super::instances::live_provider(&self.settings_info().providers_json, &row.id).cloned();
         let can_install = live.as_ref().is_some_and(|p| {
             text(p, "/compatibilityAdvisory/message").is_some()
                 && text(p, "/compatibilityAdvisory/recommendedVersion").is_some()
@@ -844,9 +844,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let live = live_provider(&self.server_info.providers_json, &row.id);
+        let live = live_provider(&self.settings_info().providers_json, &row.id);
         let dispatching = page.read(cx).updating.contains(&row.id);
-        let project_override = project_override(&self.server_info.settings, override_projects, &row.id);
+        let project_override = project_override(&self.settings_info().settings, override_projects, &row.id);
         let enabled = project_override.map_or_else(|| resolve_enabled(&row.instance()), |o| o.effective);
         let facts = card_facts(row, live, dispatching, enabled);
         let status_text = match &facts.update_progress {
@@ -1028,7 +1028,7 @@ impl Workspace {
         value: Option<bool>,
         cx: &mut Context<Self>,
     ) {
-        let patch = scope::provider_override_patch(&self.server_info.settings, projects, instance_id, value);
+        let patch = scope::provider_override_patch(&self.settings_info().settings, projects, instance_id, value);
         self.update_environment_settings(Value::Object(patch), cx, |_, _, _| {});
     }
 
@@ -1043,9 +1043,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
-        let live = live_provider(&self.server_info.providers_json, &row.id).cloned();
+        let live = live_provider(&self.settings_info().providers_json, &row.id).cloned();
         let dispatching = page.read(cx).updating.contains(&row.id);
-        let enabled = project_override(&self.server_info.settings, override_projects, &row.id)
+        let enabled = project_override(&self.settings_info().settings, override_projects, &row.id)
             .map_or_else(|| resolve_enabled(&row.instance()), |o| o.effective);
         let facts = card_facts(row, live.as_ref(), dispatching, enabled);
         let instance = row.instance();
@@ -1438,7 +1438,7 @@ impl Workspace {
 
     /// The saved instance behind a list row, looked up again when a deferred edit commits.
     pub(super) fn instance_row(&self, instance_id: &str) -> Option<InstanceRow> {
-        instance_rows(&self.server_info.settings, &self.server_info.providers_json)
+        instance_rows(&self.settings_info().settings, &self.settings_info().providers_json)
             .into_iter()
             .find(|row| row.id == instance_id)
     }
@@ -1793,7 +1793,7 @@ impl Workspace {
                             cx,
                             move |this, reply, window, cx| {
                                 let _ = this
-                                    .server_info
+                                    .settings_info_mut()
                                     .apply(&json!({"type": "settingsUpdated", "payload": {"settings": reply}}));
                                 let Some(agent_id) = uninstall_agent else { return };
                                 this.providers_request_then(

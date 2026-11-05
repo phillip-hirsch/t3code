@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
 use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
-use crate::app::{Target, Workspace, new_id};
+use crate::app::{Workspace, new_id};
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
@@ -103,8 +103,7 @@ impl Workspace {
         groups::build_groups(
             &self.shell.projects,
             &GroupingSettings::from_settings(&self.client_settings.values),
-            self.server_info.environment_id.as_deref().unwrap_or_default(),
-            self.server_info.scratch_workspace_root.as_deref(),
+            &self.scratch_roots(),
         )
     }
 
@@ -169,7 +168,7 @@ impl Workspace {
                     .archived
                     .then(|| "Archived".to_owned())
                     .into_iter()
-                    .chain(shared.then(|| view.environment().label.to_owned()))
+                    .chain(shared.then(|| view.label_of(&project.environment_id).to_owned()))
                     .chain([project.workspace_root.clone()])
                     .collect::<Vec<_>>()
                     .join(" · ");
@@ -273,14 +272,14 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.client() else {
+        let Some(client) = self.settings_client() else {
             toast_error(window, cx, failure_title, "Connect the selected environment and try again.");
             done(self, cx);
             return;
         };
         let several = members.len() > 1;
         let environment =
-            self.server_info.environment_label.clone().unwrap_or_else(|| "the current environment".into());
+            self.settings_info().environment_label.clone().unwrap_or_else(|| "the current environment".into());
         cx.spawn_in(window, async move |this, cx| {
             let mut failure = None;
             for (id, _) in &members {
@@ -367,7 +366,7 @@ impl Workspace {
             group.members.len(),
             false,
             &group.display_name,
-            self.server_info.environment_label.as_deref(),
+            self.settings_info().environment_label.as_deref(),
             &self.shell.threads,
         );
         let (title, description) = message.split_once('\n').unwrap_or((&message, ""));
@@ -398,7 +397,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         cx.spawn_in(window, async move |this, cx| {
             for (id, title) in &members {
                 let command = json!({"type": "project.delete", "commandId": new_id(), "projectId": id, "force": true});
@@ -409,10 +408,11 @@ impl Workspace {
                         return true;
                     }
                     // The project's draft goes with it.
-                    let draft = Target::Draft { project_id: id.clone() };
-                    this.composer_drafts.remove(&draft);
-                    if this.target.as_ref() == Some(&draft) {
-                        this.target = None;
+                    if let Some(draft) = this.draft_target(id) {
+                        this.composer_drafts.remove(&draft);
+                        if this.target.as_ref() == Some(&draft) {
+                            this.target = None;
+                        }
                     }
                     false
                 });
@@ -454,14 +454,14 @@ impl Workspace {
             return None;
         }
         let resource = icon::favicon_resource(&member.project.workspace_root, member.project.favicon_path.as_deref());
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 
     /// The file picker's "Open in Explorer" needs the server on this machine.
     fn can_pick_external_favicon(&self, members: &[Member]) -> bool {
         let local = self.server.is_some()
-            || self.endpoint.as_ref().is_some_and(|endpoint| {
+            || self.settings_endpoint().is_some_and(|endpoint| {
                 let host = endpoint.http_base.split("://").nth(1).unwrap_or_default();
                 ["127.0.0.1", "localhost", "[::1]"].iter().any(|local| host.starts_with(local))
             });
@@ -556,7 +556,7 @@ impl Workspace {
                         let _ = workspace
                             .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
                     });
-                    let (client, endpoint) = (this.client(), this.endpoint.clone());
+                    let (client, endpoint) = (this.settings_client(), this.settings_endpoint().cloned());
                     let (cwd, project_name, images) = (cwd.clone(), project_name.clone(), images.clone());
                     let picker = cx.new(|cx| {
                         favicon_picker::FaviconPicker::new(
@@ -618,7 +618,7 @@ impl Workspace {
                 .render(&tokens)
                 .into_any_element(),
         ];
-        if self.server_info.capability("projectOrganization") {
+        if self.settings_info().capability("projectOrganization") {
             let pin = {
                 let (panel, all_ids) = (panel.clone(), ids.clone());
                 Switch::new("pin-project").checked(group.pinned).disabled(organizing).on_click(cx.listener(
@@ -697,7 +697,7 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         let several = group.members.len() > 1;
         let grouping = GroupingSettings::from_settings(&self.client_settings.values);
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "Environment".into());
+        let environment = self.settings_info().environment_label.clone().unwrap_or_else(|| "Environment".into());
         let mut rows = vec![
             div()
                 .px_4()

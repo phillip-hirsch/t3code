@@ -77,7 +77,7 @@ impl Workspace {
             };
             strip = strip.child(
                 div()
-                    .id(ElementId::Name(format!("minimap:{row}").into()))
+                    .id(ElementId::NamedInteger("minimap".into(), row as u64))
                     .absolute()
                     .left_0()
                     .top(px(y - PITCH / 2.))

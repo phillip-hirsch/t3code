@@ -32,7 +32,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         t: &Tokens,
     ) -> Option<Vec<AnyElement>> {
-        if self.environment_remote || self.endpoint.is_none() {
+        if self.environment_remote || self.settings_endpoint().is_none() {
             return None;
         }
         if self.desktop.exposure.is_none() && !self.desktop.exposure_pending {
@@ -42,7 +42,7 @@ impl Workspace {
         let settings = &cx.global::<Desktop>().settings;
         let (mode, serve_enabled, serve_port) =
             (settings.server_exposure_mode, settings.tailscale_serve_enabled, settings.tailscale_serve_port);
-        let denial = remote_clients_denial(&self.server_info.managed_policy);
+        let denial = remote_clients_denial(&self.settings_info().managed_policy);
         let accessible = view.as_ref().is_some_and(|v| v.exposure.mode == ExposureMode::NetworkAccessible);
 
         let description: SharedString = match &view {
@@ -102,7 +102,7 @@ impl Workspace {
     fn load_exposure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = cx.global::<Desktop>().settings.clone();
         let port = self
-            .endpoint
+            .settings_endpoint()
             .as_ref()
             .and_then(|e| e.http_base.rsplit(':').next()?.parse::<u16>().ok())
             .unwrap_or_default();

@@ -96,7 +96,7 @@ impl Workspace {
     }
 
     pub(super) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.target.is_none() || self.server_info.model_choices().is_empty() {
+        if self.target.is_none() || self.server_info().model_choices().is_empty() {
             return;
         }
         self.open_picker(COMPOSER.into(), None, window, cx);
@@ -182,11 +182,11 @@ impl Workspace {
 
     fn toggle_favorite(&mut self, selection: &ModelSelection, cx: &mut Context<Self>) {
         let key = (selection.instance_id.clone(), selection.model.clone());
-        let favorite = !self.server_info.favorites.contains(&key);
+        let favorite = !self.server_info().favorites.contains(&key);
         if favorite {
-            self.server_info.favorites.push(key);
+            self.server_info_mut().favorites.push(key);
         } else {
-            self.server_info.favorites.retain(|f| f != &key);
+            self.server_info_mut().favorites.retain(|f| f != &key);
         }
         cx.notify();
         let Some(client) = self.client() else { return };
@@ -207,7 +207,7 @@ impl Workspace {
     /// `providerModelPreferences[id].hiddenModels`, never hiding custom models.
     fn model_hidden(&self, provider: &Provider, model: &ProviderModel) -> bool {
         !model.is_custom
-            && self.server_info.settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
+            && self.server_info().settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
                 .as_array()
                 .is_some_and(|hidden| hidden.iter().any(|h| h.as_str() == Some(&model.slug)))
     }
@@ -215,7 +215,7 @@ impl Workspace {
     fn picker_rows<'a>(&'a self, current: Option<&ModelSelection>) -> (Vec<Row>, bool) {
         let ready =
             |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
-        let favorites = &self.server_info.favorites;
+        let favorites = &self.server_info().favorites;
         let is_favorite =
             |p: &Provider, m: &ProviderModel| favorites.contains(&(p.instance_id.clone(), m.slug.clone()));
         let row = |p: &Provider, m: &ProviderModel| Row {
@@ -229,7 +229,7 @@ impl Workspace {
             legacy: m.is_legacy,
         };
         let models = |p: &'a Provider| p.models.iter().filter(move |m| !self.model_hidden(p, m)).map(move |m| (p, m));
-        let providers = self.server_info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
+        let providers = self.server_info().providers.iter().filter(ready).filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -267,7 +267,7 @@ impl Workspace {
         if let Some(tab) = &self.picker.tab {
             return tab.clone();
         }
-        if !self.server_info.favorites.is_empty() {
+        if !self.server_info().favorites.is_empty() {
             return Tab::Favorites;
         }
         match current {
@@ -314,7 +314,7 @@ impl Workspace {
         let tab = self.picker_tab(current.as_ref());
         let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
             .chain(
-                self.server_info
+                self.server_info()
                     .providers
                     .iter()
                     .filter(|p| p.enabled && self.picker_includes(p))
@@ -347,8 +347,8 @@ impl Workspace {
     /// The trigger and, while open, the popover.
     pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let current = self.composer_model();
-        let provider = current.as_ref().and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = current.as_ref().and_then(|s| self.server_info.model(s));
+        let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
+        let model = current.as_ref().and_then(|s| self.server_info().model(s));
         let driver = provider.map(|p| p.driver.as_str()).unwrap_or_default();
         let name: SharedString = match (&current, model) {
             (_, Some(model)) => model_label::trigger_model_name(model, driver).into(),
@@ -364,7 +364,7 @@ impl Workspace {
         });
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
-        let disabled = self.target.is_none() || self.server_info.model_choices().is_empty();
+        let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
         let trigger = control_button("model-picker", t)
             .min_w(px(52.))
@@ -563,7 +563,7 @@ impl Workspace {
                 this.picker.highlighted = 0;
                 cx.notify();
             }));
-        let providers = self.server_info.providers.iter().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
+        let providers = self.server_info().providers.iter().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             let name = p.display_name.clone().unwrap_or_else(|| p.instance_id.clone());
             let tooltip: SharedString = match (ready, p.availability.as_deref(), &p.message) {

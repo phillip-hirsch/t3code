@@ -224,8 +224,8 @@ impl Workspace {
 
     fn target_exists(&self, target: &Target) -> bool {
         match target {
-            Target::Thread(id) => self.shell.threads.iter().any(|thread| &thread.id == id),
-            Target::Draft { project_id } => self.shell.projects.iter().any(|project| &project.id == project_id),
+            Target::Thread { id, .. } => self.shell.threads.iter().any(|thread| &thread.id == id),
+            Target::Draft { project_id, .. } => self.shell.projects.iter().any(|project| &project.id == project_id),
         }
     }
 

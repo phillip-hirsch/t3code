@@ -12,7 +12,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString,
@@ -162,7 +162,7 @@ impl Workspace {
 
     /// The user-invocable skills of the composer's provider, by name.
     fn skill_names(&self) -> Vec<String> {
-        let Some(provider) = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id)) else {
+        let Some(provider) = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id)) else {
             return Vec::new();
         };
         let cwd = self.composer_cwd();
@@ -391,14 +391,17 @@ impl Workspace {
         true
     }
 
-    /// 1-9 pick an option on an open question card while the editor is not focused.
+    /// 1-9 pick an option on an open question card while no text field, terminal or preview has focus.
     fn question_option_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let m = keystroke.modifiers;
         if m.control || m.platform || m.alt || self.page.is_some() || self.settings.is_some() {
             return false;
         }
         let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
-        if self.composer.focus_handle(cx).is_focused(window) {
+        // The web skips keys aimed at any text field; here that is any focus but the workspace's own
+        // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
+        let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
+        if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
         let Some(draft) = &self.question else { return false };
@@ -422,18 +425,16 @@ impl Workspace {
         if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
             return;
         }
-        let next = first
-            .map(|(request, item)| (request.id.clone(), requests::questions(item)))
-            .filter(|(_, questions)| !questions.is_empty());
+        let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
         match (self.question.take(), next) {
             (None, None) => {}
             (Some(previous), None) => self.set_composer_text(previous.prompt, window, cx),
-            (previous, Some((request_id, questions))) => {
+            (previous, Some(draft)) => {
                 let prompt = match previous {
                     Some(previous) => previous.prompt,
                     None => self.composer.read(cx).value().to_string(),
                 };
-                self.question = Some(QuestionDraft { prompt, ..QuestionDraft::new(request_id, questions) });
+                self.question = Some(QuestionDraft { prompt, ..draft });
                 self.load_custom_answer(window, cx);
             }
         }
@@ -544,13 +545,13 @@ impl Workspace {
 
     /// `defaultRuntimeMode` for the open thread's or draft's project (`ChatView.tsx`).
     pub(super) fn default_runtime_mode(&self) -> String {
-        let mode = self.server_info.project_setting(self.target_project(), "defaultRuntimeMode");
+        let mode = self.server_info().project_setting(self.target_project(), "defaultRuntimeMode");
         mode.as_str().unwrap_or(DEFAULT_RUNTIME_MODE).to_owned()
     }
 
     pub(super) fn runtime_mode(&self) -> String {
         let mode = match &self.target {
-            Some(Target::Thread(_)) => self
+            Some(Target::Thread { .. }) => self
                 .thread
                 .as_ref()
                 .and_then(|t| t.state.projection.as_ref())
@@ -562,7 +563,7 @@ impl Workspace {
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
-            Some(Target::Thread(thread_id)) => {
+            Some(Target::Thread { id: thread_id, .. }) => {
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
                 self.dispatch(command, cx);
             }
@@ -590,7 +591,7 @@ impl Workspace {
         if self.target.is_none() {
             return "Choose a project above to start a thread";
         }
-        if self.server_info.model_choices().is_empty() {
+        if self.server_info().model_choices().is_empty() {
             return "Enable a provider in Settings to send a message";
         }
         DEFAULT_PLACEHOLDER
@@ -1094,11 +1095,11 @@ impl Workspace {
     /// A draft's model moved to `fallbackModelSelection` while the default's provider
     /// is out of usage (`resolveNewThreadModelSelection`); an explicit pick wins.
     pub(super) fn draft_usage_fallback(&self, default: &ModelSelection) -> Option<UsageFallback> {
-        let Some(Target::Draft { project_id }) = &self.target else { return None };
-        if self.model_override.is_some() || self.server_info.settings.get("fallbackModelSelection").is_null() {
+        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
+        if self.model_override.is_some() || self.server_info().settings.get("fallbackModelSelection").is_null() {
             return None;
         }
-        crate::new_thread::usage_fallback(&self.server_info, default, Some(project_id), jiff::Timestamp::now())
+        crate::new_thread::usage_fallback(self.server_info(), default, Some(project_id), crate::timestamp::now_ms())
     }
 
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
@@ -1128,29 +1129,29 @@ impl Workspace {
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Draft { project_id }) = &self.target else { return None };
+        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
         let project = self.shell.projects.iter().find(|p| &p.id == project_id);
-        let default = self.server_info.new_thread_model(project)?;
+        let default = self.server_info().new_thread_model(project)?;
         let fallback = self.draft_usage_fallback(&default)?;
         let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
         if self.composer_ui.dismissed_fallback.as_ref() == Some(&window) {
             return None;
         }
         let model_name = |selection: &ModelSelection| {
-            self.server_info
+            self.server_info()
                 .provider(&selection.instance_id)
                 .and_then(|p| p.models.iter().find(|m| m.slug == selection.model))
                 .and_then(|m| m.name.clone())
                 .unwrap_or_else(|| selection.model.clone())
         };
-        let exhausted = self.server_info.provider(&fallback.exhausted_instance)?;
+        let exhausted = self.server_info().provider(&fallback.exhausted_instance)?;
         let provider_name = exhausted.display_name.clone().unwrap_or_else(|| exhausted.driver.clone());
         let hour12 =
             crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));
         let resets = fallback
             .resets_at
             .as_deref()
-            .and_then(|at| crate::timestamp::upcoming(at, &jiff::Zoned::now(), hour12))
+            .and_then(|at| crate::timestamp::upcoming_local(at, hour12))
             .map(|at| format!(" · resets {at}"))
             .unwrap_or_default();
         let outline = if t.dark { white(0.05) } else { black(0.08) };

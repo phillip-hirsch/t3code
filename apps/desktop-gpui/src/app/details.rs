@@ -154,6 +154,23 @@ fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
     }
 }
 
+/// How long a card stream that ended while still wanted waits before it subscribes again.
+const RESUBSCRIBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clears an ended stream's task after [`RESUBSCRIBE_AFTER`], so the next render subscribes
+/// again without looping on a server that keeps failing.
+async fn resubscribe_after_backoff(
+    this: &WeakEntity<Workspace>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+    clear: impl FnOnce(&mut Workspace),
+) {
+    cx.background_executor().timer(RESUBSCRIBE_AFTER).await;
+    let _ = this.update(cx, |this, cx| {
+        clear(this);
+        cx.notify();
+    });
+}
+
 impl Workspace {
     /// Whether the card is on screen, inline or as the popover.
     pub(super) fn details_shown(&self, window: &Window) -> bool {
@@ -191,7 +208,9 @@ impl Workspace {
         } else {
             f32::from(viewport.height) - 104.
         };
-        let sections: Vec<Section> = [
+        // Built once at full density; when the card must shrink, only the two sections
+        // whose rows depend on density are built again.
+        let mut sections: [Option<Section>; 7] = [
             self.workspace_section(&tokens, &colors, cx),
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
@@ -199,41 +218,32 @@ impl Workspace {
             self.lineage_section(&tokens, &colors, cx).filter(|_| self.lineage_shown()),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        ];
         let height_at = |density: Density| {
-            let heights = sections.iter().filter(|s| s.min_density <= density).map(|s| s.height + SECTION_PADDING);
-            heights.sum::<f32>() + 2.
+            let shown = sections.iter().flatten().filter(|s| s.min_density <= density);
+            shown.map(|s| s.height + SECTION_PADDING).sum::<f32>() + 2.
         };
         let density = resolve_density(available, height_at(Density::Full), height_at(Density::Compact));
-        // Re-rendered at the chosen density, so hidden rows never build.
-        let sections: Vec<AnyElement> = [
-            self.workspace_section_at(density, &tokens, &colors, cx),
-            self.version_control_section_at(density, &tokens, &colors, cx),
-            (density == Density::Full).then(|| self.servers_section(&tokens, &colors, cx)).flatten(),
-            (density == Density::Full).then(|| self.automations_section(&tokens, &colors, cx)).flatten(),
-            (density == Density::Full && self.lineage_shown())
-                .then(|| self.lineage_section(&tokens, &colors, cx))
-                .flatten(),
-            self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
-            self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|section| section.element)
-        .enumerate()
-        .map(|(index, section)| {
-            v_flex()
-                .px_2()
-                .pt_2()
-                .pb(px(10.))
-                .when(index > 0, |el| el.border_t_1().border_color(colors.divider))
-                .child(section)
-                .into_any_element()
-        })
-        .collect();
+        if density != Density::Full {
+            sections[0] = self.workspace_section_at(density, &tokens, &colors, cx);
+            sections[1] = self.version_control_section_at(density, &tokens, &colors, cx);
+        }
+        let sections: Vec<AnyElement> = sections
+            .into_iter()
+            .flatten()
+            .filter(|section| section.min_density <= density)
+            .map(|section| section.element)
+            .enumerate()
+            .map(|(index, section)| {
+                v_flex()
+                    .px_2()
+                    .pt_2()
+                    .pb(px(10.))
+                    .when(index > 0, |el| el.border_t_1().border_color(colors.divider))
+                    .child(section)
+                    .into_any_element()
+            })
+            .collect();
         // Shown only when no section has content, so an emptied card can be refilled.
         let choose = sections.is_empty().then(|| {
             div().p_2().child(
@@ -340,8 +350,8 @@ impl Workspace {
 
     /// The environment row: machine icon, environment label, workspace kind at the far right.
     fn environment_row(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
-        let label = self.server_info.environment_label.clone()?;
-        let machine = match self.server_info.machine_kind() {
+        let label = self.server_info().environment_label.clone()?;
+        let machine = match self.server_info().machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => "icons/monitor.svg",
             "laptop" => "icons/laptop.svg",
             "cloud" => "icons/cloud.svg",
@@ -375,7 +385,7 @@ impl Workspace {
 
     /// The editor the Open in row launches: the last one picked, else the first available (`usePreferredEditor`).
     pub(super) fn preferred_editor(&self) -> Option<&str> {
-        let available = &self.server_info.available_editors;
+        let available = &self.server_info().available_editors;
         self.preferred_editor
             .as_deref()
             .filter(|editor| available.iter().any(|id| id == editor))
@@ -401,7 +411,7 @@ impl Workspace {
                 .into_any_element(),
         };
         let view = cx.entity();
-        let editors = self.server_info.available_editors.clone();
+        let editors = self.server_info().available_editors.clone();
         let current = preferred.clone();
         let menu_tokens = *tokens;
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
@@ -483,7 +493,7 @@ impl Workspace {
         let project_id = project.id.clone();
         let scripts: Vec<(SharedString, SharedString)> =
             super::pages::settings::code::projects::scripts::resolve_project_scripts(
-                &self.server_info.settings,
+                &self.server_info().settings,
                 project,
             )
             .into_iter()
@@ -900,7 +910,7 @@ impl Workspace {
     /// `ThreadRelationshipsPanel` from the shell: the parent thread, running
     /// subagents, and settled ones folded under "Previous agents".
     fn lineage_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
-        let Some(Target::Thread(id)) = &self.target else { return None };
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
         let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
         let parent = thread.lineage.parent_thread_id.as_ref().and_then(|parent| self.thread_shell(parent));
         let (previous, active): (Vec<&ThreadShell>, Vec<&ThreadShell>) = self
@@ -1057,7 +1067,7 @@ impl Workspace {
     /// The selected provider's limit windows; each bar reads as room left.
     fn usage_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<Section> {
         let selection = self.composer_model()?;
-        let limits = self.server_info.provider(&selection.instance_id)?.usage_limits.as_ref()?;
+        let limits = self.server_info().provider(&selection.instance_id)?.usage_limits.as_ref()?;
         let meters = limit_meters(limits, tokens);
         Some(Section {
             height: meters.len() as f32 * METER_ROW_HEIGHT,
@@ -1077,21 +1087,20 @@ impl Workspace {
 
     pub(super) fn open_projection(&self) -> Option<&crate::model::ThreadProjection> {
         match &self.target {
-            Some(Target::Thread(_)) => self.thread.as_ref()?.state.projection.as_ref(),
+            Some(Target::Thread { .. }) => self.thread.as_ref()?.state.projection.as_ref(),
             _ => None,
         }
     }
 
     pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
         let project_id = match self.target.as_ref()? {
-            Target::Thread(id) => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
-            Target::Draft { project_id } => project_id,
+            Target::Thread { id, .. } => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
+            Target::Draft { project_id, .. } => project_id,
         };
         self.shell.projects.iter().find(|project| &project.id == project_id)
     }
 }
 
-/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 /// `ThreadDetailsItemsMenuItems`: the card's context menu, its empty state and Settings share it.
 pub(in crate::app) fn thread_details_items_menu(
     workspace: WeakEntity<Workspace>,
@@ -1115,6 +1124,7 @@ pub(in crate::app) fn thread_details_items_menu(
     }
 }
 
+/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
     discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
         let auth = &provider["auth"];

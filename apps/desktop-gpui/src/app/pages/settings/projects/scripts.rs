@@ -504,14 +504,20 @@ impl Workspace {
         keybinding: Option<Option<&str>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let Some(client) = self.client() else { return Task::ready(Err("Not connected.".into())) };
+        let Some(client) = self.settings_client() else { return Task::ready(Err("Not connected.".into())) };
         let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
-        let next = next(&self.server_info.settings, project);
-        let write =
-            match plan_scripts_write(&self.server_info, &self.shell.projects, project, next, script_id, keybinding) {
-                Ok(write) => write,
-                Err(error) => return Task::ready(Err(error)),
-            };
+        let next = next(&self.settings_info().settings, project);
+        let write = match plan_scripts_write(
+            self.settings_info(),
+            &self.shell.projects,
+            project,
+            next,
+            script_id,
+            keybinding,
+        ) {
+            Ok(write) => write,
+            Err(error) => return Task::ready(Err(error)),
+        };
         cx.spawn(async move |this, cx| {
             let settings = client
                 .request("server.updateSettings", json!({"patch": write.patch}))
@@ -519,7 +525,7 @@ impl Workspace {
                 .map_err(|e| e.message())?;
             let _ = this.update(cx, |this, cx| {
                 let event = json!({"type": "settingsUpdated", "payload": {"settings": settings}});
-                if let Err(error) = this.server_info.apply(&event) {
+                if let Err(error) = this.settings_info_mut().apply(&event) {
                     log::warn!("saved settings did not decode: {error}");
                 }
                 cx.notify();
@@ -530,7 +536,7 @@ impl Workspace {
                 let Some(keybindings) = result.get("keybindings").filter(|rules| rules.is_array()) else { continue };
                 let _ = this.update(cx, |this, cx| {
                     let event = json!({"type": "keybindingsUpdated", "payload": {"keybindings": keybindings}});
-                    if let Err(error) = this.server_info.apply(&event) {
+                    if let Err(error) = this.settings_info_mut().apply(&event) {
                         log::warn!("saved keybindings did not decode: {error}");
                     }
                     cx.notify();
@@ -579,7 +585,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
-        let (id, _) = scripts_after_save(&self.server_info.settings, &self.shell.projects, project, script_id, input);
+        let (id, _) =
+            scripts_after_save(&self.settings_info().settings, &self.shell.projects, project, script_id, input);
         let input = input.clone();
         self.write_targets(
             project_id,
@@ -659,7 +666,7 @@ impl Workspace {
         static LOADING: T3ProjectFile = T3ProjectFile::Loading;
         if !self.t3_project_files.contains_key(workspace_root) {
             // Without a client nothing is cached, so the read starts once one connects.
-            let Some(client) = self.client() else { return &LOADING };
+            let Some(client) = self.settings_client() else { return &LOADING };
             self.t3_project_files.insert(workspace_root.to_owned(), T3ProjectFile::Loading);
             let root = workspace_root.to_owned();
             let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});

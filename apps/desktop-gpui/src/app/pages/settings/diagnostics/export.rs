@@ -124,14 +124,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        if view.scope.kind != ScopeKind::Environment || self.client().is_none() {
+        if view.scope.kind != ScopeKind::Environment || self.settings_client().is_none() {
             return self.export_scope_notice(view, &t, cx);
         }
-        let client = self.client().expect("checked above");
-        let saved_values = &self.server_info.settings.get("observability").clone();
+        let client = self.settings_client().expect("checked above");
+        let saved_values = &self.settings_info().settings.get("observability").clone();
         let saved: [String; 3] =
             SIGNALS.map(|(key, ..)| saved_values[key].as_str().unwrap_or_default().trim().to_owned());
-        let running = self.server_info.config.get("observability").cloned().unwrap_or_default();
+        let running = self.settings_info().config.get("observability").cloned().unwrap_or_default();
         let workspace = cx.weak_entity();
         let inputs = window.use_keyed_state("otlp-inputs", cx, |window, cx| {
             let inputs = std::array::from_fn(|index| {
@@ -173,7 +173,7 @@ impl Workspace {
 
         let s = state.read(cx);
         let can_edit = s.grants(SETTINGS_WRITE);
-        let can_check = can_edit && self.server_info.capability("otlpEndpointCheck");
+        let can_check = can_edit && self.settings_info().capability("otlpEndpointCheck");
         if can_check && !s.export.checks_started {
             let initial: Vec<(usize, String)> = (0..3)
                 .filter_map(|i| {
@@ -194,7 +194,7 @@ impl Workspace {
         let invalid = changed.iter().any(|&i| !values[i].is_empty() && !is_http_url(&values[i]));
         let saving = s.export.saving;
 
-        let label = self.server_info.environment_label.clone().unwrap_or_else(|| "the selected environment".into());
+        let label = self.settings_info().environment_label.clone().unwrap_or_else(|| "the selected environment".into());
         let mut body = vec![
             div()
                 .text_xs()
@@ -372,7 +372,7 @@ impl Workspace {
 
     /// `SettingsScopeNotice target="environment"` inside the section.
     fn export_scope_notice(&mut self, view: &SettingsView, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let environment = view.environment();
+        let Some(environment) = view.environment() else { return div().into_any_element() };
         let (id, label) = (environment.id.to_owned(), SharedString::from(environment.label.to_owned()));
         let choice = h_flex()
             .id("telemetry-export-environment")

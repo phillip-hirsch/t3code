@@ -510,7 +510,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let locks = config_locks(&self.server_info.managed_policy, driver.kind);
+        let locks = config_locks(&self.settings_info().managed_policy, driver.kind);
         let workspace = cx.weak_entity();
         let owned_id = instance_id.to_owned();
         let initial = config.clone();
@@ -586,7 +586,7 @@ impl AddProviderWizard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let policy = workspace.read(cx).server_info.managed_policy.clone();
+        let policy = workspace.read(cx).settings_info().managed_policy.clone();
         let first = DRIVERS
             .iter()
             .filter(|d| d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
@@ -678,7 +678,7 @@ impl AddProviderWizard {
     fn existing_ids(&self, cx: &App) -> HashSet<String> {
         let mut ids: HashSet<String> = ["codex".into(), "claudeAgent".into()].into();
         if let Some(workspace) = self.workspace.upgrade() {
-            if let Some(instances) = workspace.read(cx).server_info.provider_instances.as_object() {
+            if let Some(instances) = workspace.read(cx).settings_info().provider_instances.as_object() {
                 ids.extend(instances.keys().cloned());
             }
         }
@@ -758,8 +758,10 @@ impl AddProviderWizard {
             return form.clone();
         }
         let config = self.config().clone();
-        let locks =
-            self.workspace.upgrade().and_then(|w| config_locks(&w.read(cx).server_info.managed_policy, driver.kind));
+        let locks = self
+            .workspace
+            .upgrade()
+            .and_then(|w| config_locks(&w.read(cx).settings_info().managed_policy, driver.kind));
         let form = cx.new(|cx| {
             ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx)
         });
@@ -1104,7 +1106,7 @@ impl AddProviderWizard {
         let workspace = self.workspace.upgrade()?;
         let signed_in = workspace
             .read(cx)
-            .server_info
+            .settings_info()
             .providers
             .iter()
             .any(|p| p.driver == self.driver.kind && p.auth.status == "authenticated");
@@ -1134,7 +1136,7 @@ impl AddProviderWizard {
 
     fn render_more(&mut self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let policy =
-            self.workspace.upgrade().map(|w| w.read(cx).server_info.managed_policy.clone()).unwrap_or_default();
+            self.workspace.upgrade().map(|w| w.read(cx).settings_info().managed_policy.clone()).unwrap_or_default();
         let more: Vec<_> = DRIVERS
             .iter()
             .filter(|d| !d.featured && d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
@@ -1231,7 +1233,7 @@ impl AddProviderWizard {
     fn environment_label(&self, cx: &App) -> String {
         self.workspace
             .upgrade()
-            .and_then(|w| w.read(cx).server_info.environment_label.clone())
+            .and_then(|w| w.read(cx).settings_info().environment_label.clone())
             .unwrap_or_else(|| "this environment".to_owned())
     }
 
@@ -1328,7 +1330,7 @@ impl AddProviderWizard {
     fn render_auth_step(&mut self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let instance_id = self.created.clone().unwrap_or_default();
         let workspace = self.workspace.upgrade();
-        let provider = workspace.as_ref().and_then(|w| w.read(cx).server_info.provider(&instance_id).cloned());
+        let provider = workspace.as_ref().and_then(|w| w.read(cx).settings_info().provider(&instance_id).cloned());
         let phase = self.auth.as_ref().and_then(|a| a.get("phase")).and_then(Value::as_str).unwrap_or_default();
         let active = matches!(phase, "starting" | "waiting" | "verifying");
         let status = provider.as_ref().map(|p| p.auth.status.as_str()).unwrap_or_default();
@@ -1396,7 +1398,8 @@ impl AddProviderWizard {
             let workspace = self.workspace.upgrade();
             let locked = workspace.as_ref().is_none_or(|w| {
                 let w = w.read(cx);
-                config_locks(&w.server_info.managed_policy, "codex").is_some_and(|(keys, _)| keys.contains("setupMode"))
+                config_locks(&w.settings_info().managed_policy, "codex")
+                    .is_some_and(|(keys, _)| keys.contains("setupMode"))
             });
             h_flex()
                 .gap(px(8.))
@@ -1482,7 +1485,7 @@ impl Render for AddProviderWizard {
             return root.child(self.render_auth_step(window, &t, cx));
         }
         let policy =
-            self.workspace.upgrade().map(|w| w.read(cx).server_info.managed_policy.clone()).unwrap_or_default();
+            self.workspace.upgrade().map(|w| w.read(cx).settings_info().managed_policy.clone()).unwrap_or_default();
         let featured: Vec<_> = DRIVERS
             .iter()
             .filter(|d| d.featured && d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))

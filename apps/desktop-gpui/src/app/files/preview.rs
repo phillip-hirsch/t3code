@@ -3,7 +3,7 @@
 //! (`projects.writeFile`, 500 ms after the last edit), Markdown can render, images show, and a
 //! folder path shows the tree with that folder selected.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
@@ -55,12 +55,10 @@ enum Load {
 pub(super) struct PreviewState {
     load: Load,
     editor: Option<Entity<EditorState>>,
-    /// The contents as last read or written; edits that match it don't save.
+    /// The contents as last read or written.
     saved: String,
-    /// The editor holds edits not yet written.
-    dirty: bool,
-    /// A write is waiting or in flight.
-    saving: bool,
+    save: logic::SaveQueue,
+    last_change: Instant,
     markdown: Option<Entity<TextViewState>>,
     full: Option<FullFile>,
     /// The word wrap toggle; unset, it follows `wordWrap`.
@@ -80,8 +78,8 @@ impl PreviewState {
             load: Load::Loading,
             editor: None,
             saved: String::new(),
-            dirty: false,
-            saving: false,
+            save: logic::SaveQueue::default(),
+            last_change: Instant::now(),
             markdown: None,
             full: None,
             wrap: None,
@@ -146,14 +144,14 @@ impl Workspace {
         let state = self.files.previews.entry(key.clone()).or_insert_with(PreviewState::new);
         let fresh = state.mutation.is_none();
         let changed = state.mutation.as_ref().is_some_and(|m| *m != mutation);
-        let dirty = state.saving || state.dirty;
+        let dirty = state.save.pending();
         state.mutation = Some(mutation);
         if logic::is_image(&key.1) {
             state.load = Load::Image;
         } else if fresh || (changed && !dirty) {
             self.read_file(key.clone(), window, cx);
         }
-        let draft = !matches!(self.target, Some(Target::Thread(_)));
+        let draft = !matches!(self.target, Some(Target::Thread { .. }));
         let Some(state) = self.files.previews.get_mut(key) else { return };
         if matches!(state.load, Load::Text { truncated: true, .. })
             && state.full.is_none()
@@ -178,20 +176,30 @@ impl Workspace {
 
     fn read_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
+        let Some(state) = self.files.previews.get_mut(&key) else { return };
+        let revision = state.save.revision();
         let payload = json!({"cwd": key.0, "relativePath": key.1});
         let request_key = key.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
+        state._read = Some(cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.readFile", payload).await;
-            let _ = this.update_in(cx, |this, window, cx| this.apply_read(&request_key, result, window, cx));
-        });
-        if let Some(state) = self.files.previews.get_mut(&key) {
-            state._read = Some(task);
-        }
+            let _ = this.update_in(cx, |this, window, cx| this.apply_read(&request_key, revision, result, window, cx));
+        }));
     }
 
-    fn apply_read(&mut self, key: &Key, result: Result<Value, RpcError>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Applies a read requested at edit `revision`; edits made since win, like the web's unsaved draft.
+    fn apply_read(
+        &mut self,
+        key: &Key,
+        revision: u64,
+        result: Result<Value, RpcError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(state) = self.files.previews.get_mut(key) else { return };
         state._read = None;
+        if state.save.revision() != revision {
+            return;
+        }
         match result {
             Ok(value) if value["exists"] == false => {
                 state.load =
@@ -220,7 +228,7 @@ impl Workspace {
                         state._subscription =
                             Some(cx.subscribe_in(&editor, window, move |this, _, event: &InputEvent, _, cx| {
                                 if matches!(event, InputEvent::Change) {
-                                    this.schedule_save(&save_key, cx);
+                                    this.change_file(&save_key, cx);
                                 }
                             }));
                         state.editor = Some(editor);
@@ -252,14 +260,14 @@ impl Workspace {
 
     /// The `media-file` resource for a workspace file of the open thread.
     fn media_resource(&self, key: &Key) -> Option<Value> {
-        let Some(Target::Thread(thread_id)) = &self.target else { return None };
+        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return None };
         let path = logic::absolute_path(&key.0, &key.1);
         Some(json!({"_tag": "media-file", "threadId": thread_id, "path": path, "disposition": "attachment"}))
     }
 
     fn load_full_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint.clone(), self.media_resource(&key))
+            (self.client(), self.endpoint().cloned(), self.media_resource(&key))
         else {
             return;
         };
@@ -289,7 +297,7 @@ impl Workspace {
     /// Save file: fetches the file again and writes it where the user picks.
     fn save_full_file(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint.clone(), self.media_resource(key))
+            (self.client(), self.endpoint().cloned(), self.media_resource(key))
         else {
             return;
         };
@@ -310,43 +318,62 @@ impl Workspace {
         .detach();
     }
 
-    /// Saves the editor's text 500 ms after the last edit (`FileSaveCoordinator`).
-    fn schedule_save(&mut self, key: &Key, cx: &mut Context<Self>) {
-        let client = self.client();
+    /// An edit: writes the editor's text 500 ms after the last edit, one write at a time
+    /// (`FileSaveCoordinator`). While a write is in flight the loop running it picks the edit up.
+    fn change_file(&mut self, key: &Key, cx: &mut Context<Self>) {
         let Some(state) = self.files.previews.get_mut(key) else { return };
-        let Some(editor) = &state.editor else { return };
         if matches!(state.load, Load::Text { truncated: true, .. }) {
             return;
         }
-        let contents = editor.read(cx).value().to_string();
-        state.dirty = contents != state.saved;
-        if !state.dirty {
-            state._save = None;
-            state.saving = false;
+        state.last_change = Instant::now();
+        if !state.save.change() {
             return;
         }
-        let Some(client) = client else { return };
-        state.saving = true;
         let key = key.clone();
-        let payload = json!({"cwd": key.0, "relativePath": key.1, "contents": contents});
         state._save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            let result = client.request("projects.writeFile", payload).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(state) = this.files.previews.get_mut(&key) else { return };
-                state.saving = false;
-                match result {
-                    Ok(_) => {
-                        state.dirty = state.editor.as_ref().is_some_and(|e| *e.read(cx).value() != *contents);
-                        state.saved = contents;
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("Could not save {}: {}", key.1, logic::error_message(&error)).into())
-                    }
-                }
-                cx.notify();
-            });
+            let mut delay = SAVE_DEBOUNCE;
+            loop {
+                cx.background_executor().timer(delay).await;
+                let Ok(Some((client, revision, contents))) = this.update(cx, |this, cx| this.start_write(&key, cx))
+                else {
+                    return;
+                };
+                let payload = json!({"cwd": key.0, "relativePath": key.1, "contents": contents});
+                let result = client.request("projects.writeFile", payload).await;
+                let finished = this.update(cx, |this, cx| this.finish_write(&key, revision, contents, result, cx));
+                let Ok(Some(next)) = finished else { return };
+                delay = next;
+            }
         }));
+    }
+
+    fn start_write(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<(crate::rpc::RpcClient, u64, String)> {
+        let client = self.client()?;
+        let state = self.files.previews.get_mut(key)?;
+        let contents = state.editor.as_ref()?.read(cx).value().to_string();
+        Some((client, state.save.start()?, contents))
+    }
+
+    /// Settles a write; the delay before the next one when edits arrived meanwhile.
+    fn finish_write(
+        &mut self,
+        key: &Key,
+        revision: u64,
+        contents: String,
+        result: Result<Value, RpcError>,
+        cx: &mut Context<Self>,
+    ) -> Option<Duration> {
+        let state = self.files.previews.get_mut(key)?;
+        let again = if result.is_ok() { state.save.written(revision) } else { state.save.failed(revision) };
+        let next = again.then(|| SAVE_DEBOUNCE.saturating_sub(state.last_change.elapsed()));
+        match result {
+            Ok(_) => state.saved = contents,
+            Err(error) => {
+                self.error = Some(format!("Could not save {}: {}", key.1, logic::error_message(&error)).into())
+            }
+        }
+        cx.notify();
+        next
     }
 
     /// The Files tab (`path` = None) or a file or folder tab.
@@ -376,7 +403,7 @@ impl Workspace {
         let reveal = self.files.reveals.get(&key).map_or(0, |(_, request)| *request);
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
         let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
-        let draft = !matches!(self.target, Some(Target::Thread(_)));
+        let draft = !matches!(self.target, Some(Target::Thread { .. }));
         let notice = self.files.previews.get(&key).and_then(|state| match state.load {
             Load::Text { truncated: true, byte_length } if !logic::loads_full_file(&path, draft) => Some(
                 div()
@@ -751,17 +778,19 @@ impl Workspace {
     fn workspace_image(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
         let absolute = logic::absolute_path(&key.0, &key.1);
         let resource = match &self.target {
-            Some(Target::Thread(thread_id)) => json!({"_tag": "media-file", "threadId": thread_id, "path": absolute}),
+            Some(Target::Thread { id: thread_id, .. }) => {
+                json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
+            }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.0, "path": absolute}),
         };
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.client(), self.endpoint().cloned());
         let images = self.files.images.get_or_insert_with(|| cx.new(|_| Default::default())).clone();
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 
     /// The editor the details card's Open in launches.
     pub(in crate::app) fn preferred_editor_id(&self) -> Option<String> {
-        let available = &self.server_info.available_editors;
+        let available = &self.server_info().available_editors;
         self.preferred_editor.clone().filter(|editor| available.contains(editor)).or_else(|| available.first().cloned())
     }
 }

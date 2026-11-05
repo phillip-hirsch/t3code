@@ -17,6 +17,7 @@ mod model_select;
 
 mod providers;
 pub(in crate::app) use providers::chatgpt_usage_button;
+pub(in crate::app) use widgets::device_only;
 mod search;
 mod snap_shot;
 mod star_prompt;
@@ -145,7 +146,7 @@ fn section_icon(id: &str) -> IconName {
 /// The modal's own state, kept while it is closed so the scope and folds persist.
 pub(in crate::app) struct SettingsUi {
     /// The scope the sentence picked, kept across sections (`retainSettingsScope`).
-    scope: ScopeSearch,
+    pub(in crate::app) scope: ScopeSearch,
     search: Entity<InputState>,
     active_result: usize,
     /// The row a search result jumped to; highlighted until the next navigation.
@@ -734,7 +735,7 @@ impl Workspace {
             let message = match &view.scope.kind {
                 ScopeKind::Unavailable { message } => Some((*message).to_owned()),
                 ScopeKind::Environment if view.targets.is_empty() => {
-                    Some(format!("Reconnect {} to change its settings.", view.environment().label))
+                    Some(format!("Reconnect {} to change its settings.", view.scope.label))
                 }
                 _ => None,
             };

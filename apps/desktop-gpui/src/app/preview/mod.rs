@@ -184,7 +184,7 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
 impl Workspace {
     pub(in crate::app) fn preview_thread_id(&self) -> Option<&str> {
         match self.target.as_ref()? {
-            Target::Thread(id) => Some(id),
+            Target::Thread { id, .. } => Some(id),
             Target::Draft { .. } => None,
         }
     }

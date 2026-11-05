@@ -43,7 +43,7 @@ pub(super) struct WebhookContext {
 
 impl WebhookContext {
     pub(super) fn new(client: RpcClient, workspace: &Entity<Workspace>, cx: &App) -> Self {
-        Self { client, endpoint: workspace.read(cx).endpoint.clone(), workspace: workspace.downgrade() }
+        Self { client, endpoint: workspace.read(cx).endpoint().cloned(), workspace: workspace.downgrade() }
     }
 }
 

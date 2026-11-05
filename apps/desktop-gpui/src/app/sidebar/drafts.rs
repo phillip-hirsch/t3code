@@ -39,8 +39,10 @@ fn has_content(draft: &ComposerDraft) -> bool {
 /// The row's text: the prompt's first line with context links as their labels, else
 /// "N attachments" (`SidebarDraftRow`).
 fn preview(prompt: &str, attachments: usize) -> String {
-    let mut text = prompt.to_owned();
-    for (range, chip) in crate::composer_text::chips(prompt, |_| false).into_iter().rev() {
+    // Only the first line shows, so chips past it are never looked at.
+    let first = prompt.trim_start().split('\n').next().unwrap_or_default();
+    let mut text = first.to_owned();
+    for (range, chip) in crate::composer_text::chips(first, |_| false).into_iter().rev() {
         if let crate::composer_text::Chip::Context { label, .. } = chip {
             text.replace_range(range, &label);
         }
@@ -73,7 +75,7 @@ impl Workspace {
     /// The draft rows in sidebar order: the open draft, and the other drafts with content.
     pub(super) fn draft_rows(&mut self) -> Vec<DraftRow> {
         let route = match &self.target {
-            Some(Target::Draft { project_id }) => Some(project_id.clone()),
+            Some(Target::Draft { project_id, .. }) => Some(project_id.clone()),
             _ => None,
         };
         let mut previews: Vec<(String, SharedString)> = self
@@ -81,11 +83,11 @@ impl Workspace {
             .iter()
             .filter(|(_, draft)| has_content(draft))
             .filter_map(|(target, draft)| match target {
-                Target::Draft { project_id } => {
+                Target::Draft { project_id, .. } => {
                     let (prompt, attachments) = content(draft);
                     Some((project_id.clone(), preview(prompt, attachments).into()))
                 }
-                Target::Thread(_) => None,
+                Target::Thread { .. } => None,
             })
             .collect();
         let live: Vec<String> = route.iter().cloned().chain(previews.iter().map(|(id, _)| id.clone())).collect();
@@ -102,7 +104,10 @@ impl Workspace {
 
     /// `useThreadHasUnsentDraft`, for a thread that is not on screen.
     pub(super) fn has_unsent_draft(&self, thread_id: &str) -> bool {
-        self.composer_drafts.get(&Target::Thread(thread_id.to_owned())).is_some_and(has_content)
+        // Drafts are few; scanning them saves building a key per sidebar row.
+        self.composer_drafts
+            .iter()
+            .any(|(target, draft)| matches!(target, Target::Thread { id, .. } if id == thread_id) && has_content(draft))
     }
 
     /// `discardComposerDraft`: clears the draft and offers to undo it.
@@ -168,7 +173,7 @@ impl Workspace {
         let view = cx.weak_entity();
         let path = project.map(|p| p.workspace_root.clone());
         let has_project = project.is_some();
-        let project_id = project_id.to_owned();
+        let draft = self.draft_target(project_id);
         move |menu, window, cx| {
             let path = path.clone();
             let mut menu =
@@ -195,11 +200,14 @@ impl Workspace {
                     },
                 ));
             }
-            let (view, project_id) = (view.clone(), project_id.clone());
+            let (view, target) = (view.clone(), draft.clone());
             menu.separator().item(PopupMenuItem::new("Discard draft").icon(Icon::new(IconName::Trash)).on_click(
                 move |_, window, cx| {
-                    let target = Target::Draft { project_id: project_id.clone() };
-                    let _ = view.update(cx, |this, cx| this.discard_draft(target, window, cx));
+                    let _ = view.update(cx, |this, cx| {
+                        if let Some(target) = target.clone() {
+                            this.discard_draft(target, window, cx)
+                        }
+                    });
                 },
             ))
         }
@@ -216,7 +224,7 @@ impl Workspace {
         let sb = tokens.sidebar;
         let active = row.preview.is_none();
         let project_id = row.project_id.clone();
-        let target = Target::Draft { project_id: project_id.clone() };
+        let target = self.draft_target(&project_id);
         let discard = div()
             .id(SharedString::from(format!("draft-discard-{project_id}")))
             .flex()
@@ -231,7 +239,9 @@ impl Workspace {
             .tooltip(tooltip("Discard draft"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.discard_draft(target.clone(), window, cx);
+                if let Some(target) = target.clone() {
+                    this.discard_draft(target, window, cx)
+                };
             }))
             .child(Icon::new(IconName::X).size(px(12.)));
         let open_id = project_id.clone();

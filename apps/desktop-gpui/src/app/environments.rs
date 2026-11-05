@@ -1,6 +1,6 @@
 //! Saved remote environments and one background connection per enabled one
 //! (`connection/supervisor.ts`): connecting, connected, backing off, or blocked until a retry.
-//! The workspace's own thread and shell state stays on its one environment.
+//! The workspace runs each connected environment's streams on that socket (`super::sessions`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,17 +19,22 @@ pub(crate) struct Session {
     pub machine: Option<String>,
     /// The open socket while connected.
     pub client: Option<RpcClient>,
+    /// Counts connections, so the workspace notices a new socket and resubscribes on it.
+    pub generation: u64,
     _task: Option<Task<()>>,
 }
 
 pub(crate) struct SavedEnvironments {
     catalog: Catalog,
     sessions: HashMap<String, Session>,
+    /// The workspace's primary environment. Saved under the same id, it is that session
+    /// (`EnvironmentRegistry.register` ignores platform environments), so it gets no socket here.
+    primary: Option<String>,
 }
 
 impl SavedEnvironments {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut this = Self { catalog: Catalog::load(), sessions: HashMap::new() };
+        let mut this = Self { catalog: Catalog::load(), sessions: HashMap::new(), primary: None };
         let ids: Vec<String> = this.catalog.environments.iter().map(|e| e.environment_id.clone()).collect();
         for id in ids {
             this.restart(&id, cx);
@@ -43,6 +48,22 @@ impl SavedEnvironments {
 
     pub fn session(&self, environment_id: &str) -> Option<&Session> {
         self.sessions.get(environment_id)
+    }
+
+    /// The saved environment is the primary one, connected through the workspace's own socket.
+    pub fn is_primary(&self, environment_id: &str) -> bool {
+        self.primary.as_deref() == Some(environment_id)
+    }
+
+    /// Learns the primary environment's id and stops a duplicate connection to it.
+    pub fn set_primary(&mut self, environment_id: &str, cx: &mut Context<Self>) {
+        if self.is_primary(environment_id) {
+            return;
+        }
+        let previous = self.primary.replace(environment_id.to_owned());
+        for id in previous.into_iter().chain([environment_id.to_owned()]) {
+            self.restart(&id, cx);
+        }
     }
 
     pub fn local_environment_enabled(&self) -> bool {
@@ -101,13 +122,17 @@ impl SavedEnvironments {
         let session = self.sessions.entry(environment_id.to_owned()).or_default();
         session.state = ConnectionState::default();
         session.client = None;
-        session._task = environment.enabled.then(|| Self::supervise(environment, 0, cx));
+        let own = environment.enabled && !self.primary.as_deref().is_some_and(|id| id == environment_id);
+        session._task = own.then(|| Self::supervise(environment, 0, cx));
         cx.notify();
     }
 
     /// `retryNow`: attempts at once, keeping the failure and attempt count on screen meanwhile.
     pub fn retry(&mut self, environment_id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.catalog.get(environment_id).cloned().filter(|e| e.enabled) else { return };
+        if self.is_primary(environment_id) {
+            return;
+        }
         let Some(session) = self.sessions.get_mut(environment_id) else { return };
         let failures = session.state.attempt;
         session._task = Some(Self::supervise(environment, failures, cx));
@@ -146,6 +171,7 @@ impl SavedEnvironments {
                                 s.server_version = descriptor.server_version.clone();
                                 s.machine = descriptor.machine();
                                 s.client = Some(client.clone());
+                                s.generation += 1;
                             })
                         });
                         if connected.is_err() {

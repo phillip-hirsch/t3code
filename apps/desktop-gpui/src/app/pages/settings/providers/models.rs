@@ -570,11 +570,11 @@ fn models_view(settings: &Value, row: &InstanceRow, live: Option<&Value>, instan
 
 /// The current instance's models, read again at the time of an action.
 fn current_models_view(this: &Workspace, instance_id: &str) -> Option<(InstanceRow, ModelsView)> {
-    let row = super::instances::instance_rows(&this.server_info.settings, &this.server_info.providers_json)
+    let row = super::instances::instance_rows(&this.settings_info().settings, &this.settings_info().providers_json)
         .into_iter()
         .find(|r| r.id == instance_id)?;
-    let live = super::instances::live_provider(&this.server_info.providers_json, instance_id);
-    let view = models_view(&this.server_info.settings, &row, live, &row.instance());
+    let live = super::instances::live_provider(&this.settings_info().providers_json, instance_id);
+    let view = models_view(&this.settings_info().settings, &row, live, &row.instance());
     Some((row, view))
 }
 
@@ -661,7 +661,7 @@ impl Workspace {
                 page.models = ModelsUi { instance: Some(id), revealed_email, ..Default::default() };
             });
         }
-        let view = models_view(&self.server_info.settings, row, live, instance);
+        let view = models_view(&self.settings_info().settings, row, live, instance);
         let (hidden, favorites): (HashSet<String>, HashSet<String>) =
             (view.hidden.iter().cloned().collect(), view.favorites.iter().cloned().collect());
         let prefs = Preferences { hidden: &hidden, favorites: &favorites, order: &view.order };

@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, FontWeight, IntoElement as _, ParentElement as _, SharedString, Styled as _, Subscription,
@@ -19,6 +19,7 @@ use crate::desktop::links::{self, AppLink, LinkedPrompt, NewThreadLink, Reposito
 use crate::desktop::settings::WindowRect;
 use crate::desktop::window_state::{self, BoundsPersistence};
 use crate::desktop::{self, Desktop};
+use crate::pull_request_detail::{CheckoutMode, CheckoutRequest, terminology};
 
 /// `MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS`.
 const BOUNDS_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -27,10 +28,25 @@ const BOUNDS_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 #[derive(Clone)]
 pub(super) enum LinkPage {
     Opening,
-    Opened { link: NewThreadLink },
-    Failed { title: SharedString, message: SharedString },
-    MissingRepository { link: NewThreadLink, repository: Repository },
-    PullRequestCheckout { owner: String, name: String, number: u64 },
+    Opened {
+        link: NewThreadLink,
+    },
+    Failed {
+        title: SharedString,
+        message: SharedString,
+    },
+    MissingRepository {
+        link: NewThreadLink,
+        repository: Repository,
+    },
+    /// The pull request has no thread yet; checking it out runs setup from its code, so it waits
+    /// for the user (`PullRequestLinkCheckout`).
+    PullRequestCheckout {
+        pull_request: links::PullRequest,
+        project_id: String,
+        prompt: Option<String>,
+        checking: bool,
+    },
 }
 
 pub(super) struct DesktopShell {
@@ -145,12 +161,12 @@ impl Workspace {
             // Saved remote environments are not part of this single-environment client.
             AppLink::Pair { .. } => toast_error(window, cx, "Could not add backend", "Failed to add backend."),
             AppLink::Thread { environment_id, thread_id, query } => {
-                let ours = self.server_info.environment_id.as_deref() == Some(environment_id.as_str());
-                if !ours || !self.shell.threads.iter().any(|t| t.id == thread_id) {
+                let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);
+                if !listed {
                     toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");
                     return;
                 }
-                self.select_thread(thread_id, window, cx);
+                self.select_thread_in(environment_id.into(), thread_id, window, cx);
                 match links::parse_thread_link_prompt(&query) {
                     Err(error) => toast_error(window, cx, "Could not open the linked prompt", error),
                     Ok(Some(prompt)) => self.place_linked_prompt(prompt, Vec::new(), window, cx),
@@ -180,7 +196,7 @@ impl Workspace {
     fn launch_new_thread_link(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
         let recent: Vec<_> = crate::inbox::projects_by_recency(&self.shell.projects, &self.shell.threads)
             .into_iter()
-            .filter(|p| Some(p.workspace_root.as_str()) != self.server_info.scratch_workspace_root.as_deref())
+            .filter(|p| Some(p.workspace_root.as_str()) != self.server_info().scratch_workspace_root.as_deref())
             .collect();
         match &link {
             NewThreadLink::New { repository: None, .. } => self.open_scratch_draft(link, window, cx),
@@ -202,6 +218,7 @@ impl Workspace {
                     return;
                 }
                 let Some(client) = self.client() else { return };
+                let project_id = projects[0].clone();
                 self.show_link_page(LinkPage::Opening, cx);
                 let repository = format!("{}/{}", pull_request.repository.owner, pull_request.repository.name);
                 let number = pull_request.number;
@@ -233,12 +250,15 @@ impl Workspace {
                                 }
                             }
                             None => {
-                                let repository = &pull_request.repository;
+                                if let Some(prompt) = prompt {
+                                    warn_hidden_characters(prompt.hidden_characters, window, cx);
+                                }
                                 this.show_link_page(
                                     LinkPage::PullRequestCheckout {
-                                        owner: repository.owner.clone(),
-                                        name: repository.name.clone(),
-                                        number: pull_request.number,
+                                        pull_request: pull_request.clone(),
+                                        project_id,
+                                        prompt: prompt.as_ref().map(|p| p.text.clone()),
+                                        checking: false,
                                     },
                                     cx,
                                 );
@@ -253,7 +273,7 @@ impl Workspace {
     /// `openScratchDraft`: the "No project" workspace, with the pull request's URL when the
     /// link names one.
     fn open_scratch_draft(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client().filter(|_| self.server_info.scratch_workspace_root.is_some()) else {
+        let Some(client) = self.client().filter(|_| self.server_info().scratch_workspace_root.is_some()) else {
             let message = "None of your machines can start a thread without a project right now.";
             self.show_link_page(
                 LinkPage::Failed { title: "Could not open the link".into(), message: message.into() },
@@ -300,7 +320,7 @@ impl Workspace {
         self.start_draft(project_id, window, cx);
         let mut notes = Vec::new();
         if let NewThreadLink::New { provider: Some(provider), model, .. } = link {
-            let resolved = links::resolve_model(&self.server_info.providers, provider, model.as_deref());
+            let resolved = links::resolve_model(&self.server_info().providers, provider, model.as_deref());
             if let Some((selection, _)) = &resolved {
                 self.model_override = Some(selection.clone());
             }
@@ -335,17 +355,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if prompt.hidden_characters > 0 {
-            let count = prompt.hidden_characters;
-            let message = format!(
-                "T3 Code removed {count} hidden character{}. Read the prompt before you send it.",
-                if count == 1 { "" } else { "s" }
-            );
-            let warning = Notification::warning(message)
-                .title("This prompt had hidden characters, it may be malicious")
-                .autohide(false);
-            window.push_notification(warning, cx);
-        }
+        warn_hidden_characters(prompt.hidden_characters, window, cx);
         let description: SharedString =
             std::iter::once("Read it before you send.".to_owned()).chain(notes).collect::<Vec<_>>().join(" ").into();
         let existing = self.composer.read(cx).value().to_string();
@@ -383,6 +393,34 @@ impl Workspace {
         window.push_notification(toast, cx);
     }
 
+    /// `PullRequestLinkCheckout`'s Check out: a worktree of the pull request with a draft on it,
+    /// the link's prompt in its composer.
+    fn check_out_linked_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(LinkPage::PullRequestCheckout { pull_request, project_id, prompt, checking }) =
+            &mut self.desktop.link_page
+        else {
+            return;
+        };
+        if *checking {
+            return;
+        }
+        *checking = true;
+        let request = CheckoutRequest {
+            project_id: project_id.clone(),
+            url: pull_request.url(),
+            term: terminology("github").0,
+            task: prompt.clone(),
+            mode: CheckoutMode::Worktree,
+        };
+        let settled = |this: &mut Workspace| {
+            if let Some(LinkPage::PullRequestCheckout { checking, .. }) = &mut this.desktop.link_page {
+                *checking = false;
+            }
+        };
+        self.prepare_pr_checkout(request, settled, window, cx);
+        cx.notify();
+    }
+
     /// `LinkPage`: the open link's state, centered in the main column.
     pub(super) fn render_link_page(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *crate::theme::tokens(cx);
@@ -412,14 +450,23 @@ impl Workspace {
                     vec![without.into_any_element()],
                 )
             }
-            LinkPage::PullRequestCheckout { owner, name, number } => (
-                format!("Check out {owner}/{name}#{number}?").into(),
-                Some(
-                    "This puts the pull request's code in a new worktree and runs your project's setup script on it."
-                        .into(),
-                ),
-                Vec::new(),
-            ),
+            LinkPage::PullRequestCheckout { pull_request, checking, .. } => {
+                let check_out = Button::new("link-check-out")
+                    .primary()
+                    .small()
+                    .disabled(checking)
+                    .label(if checking { "Checking out..." } else { "Check out" })
+                    .on_click(cx.listener(|this, _, window, cx| this.check_out_linked_pull_request(window, cx)));
+                let Repository { owner, name } = &pull_request.repository;
+                (
+                    format!("Check out {owner}/{name}#{}?", pull_request.number).into(),
+                    Some(
+                        "This puts the pull request's code in a new worktree and runs your project's setup script on it."
+                            .into(),
+                    ),
+                    vec![check_out.into_any_element()],
+                )
+            }
         };
         v_flex()
             .size_full()
@@ -442,4 +489,18 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// `warnAboutHiddenCharacters`: a linked prompt lost characters that would not show.
+fn warn_hidden_characters(count: usize, window: &mut Window, cx: &mut gpui_kit::App) {
+    if count == 0 {
+        return;
+    }
+    let message = format!(
+        "T3 Code removed {count} hidden character{}. Read the prompt before you send it.",
+        if count == 1 { "" } else { "s" }
+    );
+    let warning =
+        Notification::warning(message).title("This prompt had hidden characters, it may be malicious").autohide(false);
+    window.push_notification(warning, cx);
 }

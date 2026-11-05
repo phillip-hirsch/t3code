@@ -606,9 +606,10 @@ impl KeybindingsPanel {
             cx.observe(&workspace, |this, workspace, cx| {
                 let workspace = workspace.read(cx);
                 let connected = workspace.client().is_some();
-                if !Rc::ptr_eq(&this.catalog.source, &workspace.server_info.keybindings) || connected != this.connected
+                if !Rc::ptr_eq(&this.catalog.source, &workspace.settings_info().keybindings)
+                    || connected != this.connected
                 {
-                    let source = workspace.server_info.keybindings.clone();
+                    let source = workspace.settings_info().keybindings.clone();
                     this.connected = connected;
                     this.set_catalog(source);
                     cx.notify();
@@ -830,7 +831,7 @@ impl KeybindingsPanel {
                         }
                         if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.server_info.keybindings = Rc::new(keybindings::decode_rules(rules));
+                                workspace.settings_info_mut().keybindings = Rc::new(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });
@@ -892,7 +893,7 @@ impl KeybindingsPanel {
     fn open_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else { return };
         let workspace = workspace.read(cx);
-        let info = &workspace.server_info;
+        let info = &workspace.settings_info();
         let (client, path, editors) =
             (workspace.client(), info.keybindings_config_path.clone(), info.available_editors.clone());
         open_keybindings_file(client, path, &editors, window, cx);
@@ -986,7 +987,7 @@ impl Render for KeybindingsPanel {
 impl KeybindingsPanel {
     fn render_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let can_open = self.connected
-            && self.workspace.upgrade().is_some_and(|w| w.read(cx).server_info.keybindings_config_path.is_some());
+            && self.workspace.upgrade().is_some_and(|w| w.read(cx).settings_info().keybindings_config_path.is_some());
         h_flex()
             .flex_wrap()
             .gap(px(8.))
@@ -1715,7 +1716,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (workspace, source, connected) =
-            (cx.entity(), self.server_info.keybindings.clone(), self.client().is_some());
+            (cx.entity(), self.settings_info().keybindings.clone(), self.settings_client().is_some());
         let panel = self
             .keybindings_panel
             .get_or_insert_with(|| cx.new(|cx| KeybindingsPanel::new(workspace, source, connected, window, cx)).into())

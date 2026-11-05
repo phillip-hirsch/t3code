@@ -40,15 +40,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = window.use_keyed_state("settings-secrets", cx, |_, _| SecretsState::default());
-        if let Some(endpoint) = self.endpoint.clone().filter(|_| self.client().is_some() && !state.read(cx).started) {
+        let started = state.read(cx).started;
+        if let (Some(endpoint), Some(_), false) = (self.settings_endpoint().cloned(), self.settings_client(), started) {
             state.update(cx, |state, cx| {
                 state.started = true;
                 state._session_task = Some(check_session(endpoint, cx, |this, session, _| this.session = session));
             });
         }
         let t = *theme::tokens(cx);
-        let config = &self.server_info.config;
-        let connected = self.client().is_some() && config.is_object();
+        let config = &self.settings_info().config;
+        let connected = self.settings_client().is_some() && config.is_object();
         let label = self.environment_label().unwrap_or("this environment").to_owned();
         let section = if connected && config["secretProviderSettings"] != true {
             message_section(format!("Update T3 Code on {label} to manage its secret providers."), &t)
@@ -69,7 +70,7 @@ impl Workspace {
         let read_only = !s.session.grants(PROVIDERS_MANAGE);
         let providers = self.server_settings()["secretProviders"].as_object().cloned().unwrap_or_default();
         let ids: Vec<String> = providers.keys().cloned().collect();
-        let client = self.client();
+        let client = self.settings_client();
         let add = (!read_only).then(|| {
             let (client, environment, ids) = (client.clone(), environment.clone(), ids.clone());
             WebButton::new("add-secret-provider", "Add provider")

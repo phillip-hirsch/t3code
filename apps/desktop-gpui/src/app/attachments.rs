@@ -190,7 +190,7 @@ fn image_format(mime: &str) -> Option<ImageFormat> {
 impl Workspace {
     /// The paperclip shows while the server takes file uploads.
     pub(super) fn can_attach(&self) -> bool {
-        self.server_info.file_upload_limit().is_some() && self.question.is_none()
+        self.server_info().file_upload_limit().is_some() && self.question.is_none()
     }
 
     pub(super) fn attachments_busy(&self) -> bool {
@@ -287,7 +287,7 @@ impl Workspace {
         if !composer_text::paste_folds(text, would_exceed) {
             return false;
         }
-        let limit = self.server_info.file_upload_limit().map(|l| l.min(MAX_FILE_BYTES));
+        let limit = self.server_info().file_upload_limit().map(|l| l.min(MAX_FILE_BYTES));
         let can_stage = self.target.is_some() && self.can_attach() && self.attachments.len() < MAX_ATTACHMENTS;
         let refuse = |title: &'static str, description: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             let toast = gpui_kit::component::notification::Notification::error(description).title(title);
@@ -360,7 +360,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let size = bytes.len() as u64;
-        let file_limit = self.server_info.file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
+        let file_limit = self.server_info().file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
         let error = if self.attachments.len() >= MAX_ATTACHMENTS {
             Some(format!("You can attach up to {MAX_ATTACHMENTS} files per message."))
         } else if kind == Kind::Image && size > MAX_IMAGE_BYTES {
@@ -835,11 +835,14 @@ mod tests {
         };
         let mut active = vec![attachment("on-screen")];
         let mut drafts = HashMap::from([(
-            Target::Thread("t1".into()),
+            Target::Thread { env: "e".into(), id: "t1".into() },
             ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]),
         )]);
         find_attachment(&mut active, &mut drafts, "stashed").unwrap().upload = Upload::Ready("srv".into());
-        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&Target::Thread("t1".into())) else { panic!() };
+        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&Target::Thread { env: "e".into(), id: "t1".into() })
+        else {
+            panic!()
+        };
         assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
         assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some());
         assert!(find_attachment(&mut active, &mut drafts, "removed").is_none());

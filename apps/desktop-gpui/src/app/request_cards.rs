@@ -56,6 +56,21 @@ const SECRET_TAGS: [&str; 2] = ["SecretRequestError", "EnvironmentAuthorizationE
 const LINK_TAGS: [&str; 3] = ["PeerLinkRequestError", "EnvironmentAuthorizationError", "PeerPairingCodeError"];
 
 impl Workspace {
+    /// Drops typed secrets and errors of requests no longer shown: answered elsewhere,
+    /// declined or deleted, the typed value must not outlive its card.
+    pub(super) fn prune_requests(&mut self) {
+        let side = self.side_chat.view.as_ref().map(|view| view.rows.clone());
+        let shown = |id: &SharedString| {
+            self.rows
+                .iter()
+                .chain(side.iter().flat_map(|rows| rows.iter()))
+                .any(|row| matches!(row, crate::timeline::Row::Request(card) if card.item_id == *id))
+        };
+        let (secrets, errors) = (&mut self.requests.secrets, &mut self.requests.errors);
+        secrets.retain(|id, _| shown(id));
+        errors.retain(|id, _| shown(id));
+    }
+
     fn secret_input(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some((input, _)) = self.requests.secrets.get(&card.item_id) {
             return input.clone();

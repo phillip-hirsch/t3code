@@ -3,6 +3,7 @@
 //! The tab shows the side chat's timeline, its pending approvals and a plain-text composer;
 //! Bring back hands its last reply to the main thread's next message.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -14,7 +15,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, PromptLevel, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
     Subscription, Task, Window, div, px,
 };
@@ -47,6 +48,28 @@ pub(super) struct SideChats {
     starting: bool,
     bringing_back: bool,
     deleting: bool,
+    /// Unsent composer text of side chats not on screen, by thread id.
+    drafts: HashMap<String, String>,
+}
+
+impl SideChats {
+    /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
+    pub(super) fn disconnect(&mut self) {
+        if let Some(view) = &mut self.view {
+            view._subscription = None;
+        }
+    }
+
+    /// Releases the view on screen, keeping its unsent text for when it shows again.
+    fn release_view(&mut self, cx: &App) {
+        let Some(view) = self.view.take() else { return };
+        let text = view.composer.read(cx).value().to_string();
+        if text.is_empty() {
+            self.drafts.remove(&view.thread_id);
+        } else {
+            self.drafts.insert(view.thread_id, text);
+        }
+    }
 }
 
 /// What kind of thread would start the side chat.
@@ -130,7 +153,7 @@ impl Workspace {
     fn side_chat_origin(&self) -> Option<Origin> {
         Some(match self.target.as_ref()? {
             Target::Draft { .. } => Origin::Draft,
-            Target::Thread(id) => match self.shell_thread(id) {
+            Target::Thread { id, .. } => match self.shell_thread(id) {
                 Some(shell) if shell.lineage.side_chat == Some(true) => Origin::SideChat,
                 Some(shell) if shell.lineage.relationship_to_parent.as_deref() == Some("subagent") => Origin::Subagent,
                 _ => Origin::Thread,
@@ -142,14 +165,14 @@ impl Workspace {
     /// [`Self::side_chat_disabled_reason`].
     pub(super) fn side_chats_offered(&self) -> bool {
         matches!(self.side_chat_origin(), Some(Origin::Thread | Origin::Draft))
-            && self.server_info.capability("sideChats")
+            && self.server_info().capability("sideChats")
     }
 
     pub(super) fn side_chat_disabled_reason(&self) -> Option<&'static str> {
         let origin = self.side_chat_origin()?;
-        let capability = self.client().map(|_| self.server_info.capability("sideChats"));
+        let capability = self.client().map(|_| self.server_info().capability("sideChats"));
         let pending = match &self.target {
-            Some(Target::Thread(id)) => worktree_pending(
+            Some(Target::Thread { id, .. }) => worktree_pending(
                 self.shell_thread(id).and_then(|t| t.worktree_path.as_deref()),
                 self.open_projection().map_or(&[], |p| p.runs.as_slice()),
             ),
@@ -170,7 +193,9 @@ impl Workspace {
         if self.side_chat_disabled_reason().is_some() || self.side_chat.starting {
             return;
         }
-        let (Some(client), Some(Target::Thread(source))) = (self.client(), self.target.clone()) else { return };
+        let (Some(client), Some(Target::Thread { id: source, .. })) = (self.client(), self.target.clone()) else {
+            return;
+        };
         self.side_chat.starting = true;
         let target = new_id();
         let fork = json!({
@@ -270,13 +295,23 @@ impl Workspace {
 
     /// Subscribes the side chat on screen and drops the one that left it.
     pub(super) fn sync_side_chat(&mut self, shown: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.side_chat.view.as_ref().map(|view| view.thread_id.as_str()) == shown {
+        let client = self.client();
+        // While the socket is down the view keeps what it last showed.
+        if let Some(view) = &self.side_chat.view
+            && Some(view.thread_id.as_str()) == shown
+            && (view._subscription.is_some() || client.is_none())
+        {
             return;
         }
-        self.side_chat.view = None;
-        let (Some(thread_id), Some(client)) = (shown, self.client()) else { return };
+        self.side_chat.release_view(cx);
+        let (Some(thread_id), Some(client)) = (shown, client) else { return };
+        let draft = self.side_chat.drafts.remove(thread_id).unwrap_or_default();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx).auto_grow(1, 8).submit_on_enter(true).placeholder("Ask a side question")
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("Ask a side question")
+                .default_value(draft)
         });
         let events = vec![cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { secondary: false, .. } = event {
@@ -391,7 +426,7 @@ impl Workspace {
     fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
         let Some(projection) = self.side_chat_projection() else { return };
         let thread_id = projection.thread.id.clone();
-        let command = if self.server_info.capability("threadStop") {
+        let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
@@ -511,7 +546,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let Some(Target::Thread(parent_id)) = self.target.clone() else { return div().into_any_element() };
+        let Some(Target::Thread { id: parent_id, .. }) = self.target.clone() else { return div().into_any_element() };
         let shell = self.shell_thread(thread_id);
         let title: SharedString = shell.map_or_else(|| "Side chat".into(), |s| s.title.clone().into());
         let blocked = self.bring_back_blocked(&parent_id);
@@ -567,7 +602,7 @@ impl Workspace {
                         ),
                 );
         let body = match (shell, self.side_chat.view.as_ref()) {
-            (None, _) if self.shell.sequence > 0 => div()
+            (None, _) if self.active_environment().is_some_and(|id| self.shell.sequence(id) > 0) => div()
                 .p_3()
                 .text_xs()
                 .text_color(t.muted_foreground)

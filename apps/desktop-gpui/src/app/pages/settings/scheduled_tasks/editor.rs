@@ -244,7 +244,7 @@ impl TaskEditor {
     /// The picked model while its provider is usable, else the default (`activeSelection`).
     fn active_selection(&self, project: Option<&ProjectShell>, cx: &App) -> Option<ModelSelection> {
         let workspace = self.workspace.upgrade()?;
-        let info = &workspace.read(cx).server_info;
+        let info = &workspace.read(cx).settings_info();
         logic::split_model_key(&self.draft.model_key)
             .filter(|s| info.providers.iter().any(|p| p.instance_id == s.instance_id && p.enabled))
             .or_else(|| logic::default_model(info, project))
@@ -329,7 +329,7 @@ impl TaskEditor {
             return fail(DraftError::new("Invalid interval", "Enter an interval of at least one minute."), window, cx);
         }
         let (offers_once, policy) = {
-            let info = &workspace.read(cx).server_info;
+            let info = &workspace.read(cx).settings_info();
             (self.offers_once(info.capability("oneTimeSchedules")), info.managed_policy.clone())
         };
         if schedule["type"] == "once" && !offers_once {
@@ -422,7 +422,7 @@ impl Render for TaskEditor {
         let selection = self.active_selection(project, cx);
         let (offers_once, denial, env_label, machine, destination) = {
             let workspace = workspace.read(cx);
-            let info = &workspace.server_info;
+            let info = &workspace.settings_info();
             let destination = (!self.draft.thread_id.is_empty()).then(|| {
                 workspace
                     .shell
@@ -514,7 +514,7 @@ impl Render for TaskEditor {
         let model = workspace.update(cx, |workspace, cx| {
             let id = SharedString::from("scheduled-task-model");
             let editor = editor.clone();
-            let disabled = disabled || !connected || workspace.server_info.model_choices().is_empty();
+            let disabled = disabled || !connected || workspace.settings_info().model_choices().is_empty();
             let trigger = workspace.model_picker_trigger(id.clone(), selection.as_ref(), None, cx).disabled(disabled);
             let on_pick: OnPick = Rc::new(move |_, picked, _, cx| {
                 editor.update(cx, |this, cx| {

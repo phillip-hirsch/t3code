@@ -76,14 +76,14 @@ impl Workspace {
     pub(in crate::app) fn render_device_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let sources = window.use_keyed_state("device-sources", cx, |_, _| DeviceSources::default());
         let t = *tokens(cx);
-        let settings = &self.server_info.settings;
+        let settings = &self.settings_info().settings;
         let enabled = settings.bool("enableDeviceSupport");
         let simlock_enabled = settings.bool("simlockDeviceHostsEnabled");
         let model = sources.read(cx);
         let state = self.devices.state.as_ref();
         let supports_eas = state.is_some_and(|state| state.supports_eas_hosts);
         let supports_simlock = state.is_some_and(|state| state.supports_simlock_hosts) && simlock_enabled;
-        let disabled = model.busy || self.client().is_none();
+        let disabled = model.busy || self.settings_client().is_none();
         let rows = source_rows(settings, state, enabled, &model.testing, supports_eas, supports_simlock);
         let view = cx.entity();
 
@@ -273,7 +273,7 @@ impl Workspace {
 
     /// `device.list`: a refresh, or a retry of one host.
     fn list_device_hosts(&mut self, input: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         cx.spawn(async move |_, _| {
             if let Err(error) = client.request("device.list", input).await {
                 log::warn!("device.list failed: {error}");
@@ -289,7 +289,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let settings = &self.server_info.settings;
+        let settings = &self.settings_info().settings;
         let planned = match &host {
             RowHost::Ssh(host) => hosts::host_list(settings, "deviceHosts").and_then(|saved| {
                 hosts::update_device_hosts(&saved, host, true, host)
@@ -314,7 +314,7 @@ impl Workspace {
             Ok(planned) => planned,
             Err(error) => return notify_error(window, cx, "Device host not saved", error),
         };
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         let label = self.environment_name();
         sources.update(cx, |sources, cx| {
             sources.busy = true;
@@ -344,7 +344,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         let label = self.environment_name();
         let host_id = host.id.clone();
         let started = sources.update(cx, |sources, cx| {
@@ -378,7 +378,7 @@ impl Workspace {
 
     /// The environment's name, as the web labels its rows and toasts.
     fn environment_name(&self) -> String {
-        self.server_info.environment_label.clone().unwrap_or_else(|| "This environment".into())
+        self.settings_info().environment_label.clone().unwrap_or_else(|| "This environment".into())
     }
 }
 

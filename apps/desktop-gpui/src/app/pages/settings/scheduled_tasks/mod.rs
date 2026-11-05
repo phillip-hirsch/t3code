@@ -298,7 +298,8 @@ impl Render for ScheduledTasksView {
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let (client, label) = {
             let workspace = workspace.read(cx);
-            let label = workspace.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+            let label =
+                workspace.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
             (workspace.client(), label)
         };
         if let Some(client) = &client

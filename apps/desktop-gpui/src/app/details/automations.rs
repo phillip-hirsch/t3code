@@ -52,7 +52,7 @@ fn schedule_line(task: &ScheduledTask, now_ms: i64) -> String {
 
 impl Workspace {
     fn automations_wanted(&self, window: &Window) -> bool {
-        matches!(self.target, Some(Target::Thread(_)))
+        matches!(self.target, Some(Target::Thread { .. }))
             && self.details_shown(window)
             && self.details_item_shown("automations")
             && self.client().is_some()
@@ -84,10 +84,14 @@ impl Workspace {
                     }
                     cx.notify();
                 });
-                if ended || applied.is_err() {
+                if applied.is_err() {
                     return;
                 }
+                if ended {
+                    break;
+                }
             }
+            super::resubscribe_after_backoff(&this, cx, |this| this.automations.task = None).await;
         }));
     }
 
@@ -124,7 +128,7 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
-        let Some(Target::Thread(thread_id)) = &self.target else { return None };
+        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return None };
         let tasks: Vec<&ScheduledTask> =
             self.automations.tasks.iter().filter(|t| t.thread_id.as_ref() == Some(thread_id)).collect();
         let error = self.automations.error.clone();

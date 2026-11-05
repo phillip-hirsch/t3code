@@ -376,7 +376,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let endpoint = self.endpoint.clone();
+        let endpoint = self.settings_endpoint().cloned();
         let state =
             window.use_keyed_state("settings-licenses", cx, |window, cx| LicensesState::new(endpoint, window, cx));
         let t = *theme::tokens(cx);
@@ -449,7 +449,7 @@ impl Workspace {
                     .into_any_element(),
             ),
             ServerNotices::Failed(message) => {
-                let (retry, endpoint) = (state.clone(), self.endpoint.clone());
+                let (retry, endpoint) = (state.clone(), self.settings_endpoint().cloned());
                 Some(
                     v_flex()
                         .items_start()

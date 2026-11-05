@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::inbox::parse_ms;
+use crate::timestamp::parse_ms;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1111,6 +1111,38 @@ pub fn terminology(provider: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Where `startHandoff` puts the pull request's code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutMode {
+    /// A new worktree beside the project.
+    Worktree,
+    /// The project's own checkout.
+    Local,
+}
+
+/// A checkout `startHandoff` prepares: the pull request, the project it goes in, and the task
+/// the thread opened on it gets in its composer.
+#[derive(Clone, Debug)]
+pub struct CheckoutRequest {
+    pub project_id: String,
+    pub url: String,
+    /// The host's word for it, from [`terminology`].
+    pub term: &'static str,
+    pub task: Option<String>,
+    pub mode: CheckoutMode,
+}
+
+impl CheckoutRequest {
+    /// The `git.preparePullRequestThread` input, run from the project checkout `root` for `thread_id`.
+    pub fn input(&self, root: &str, thread_id: &str) -> Value {
+        let mode = match self.mode {
+            CheckoutMode::Worktree => "worktree",
+            CheckoutMode::Local => "local",
+        };
+        json!({"cwd": root, "reference": self.url, "mode": mode, "threadId": thread_id})
+    }
+}
+
 /// `checkoutCommand` for the hosts whose command needs only the number.
 pub fn checkout_command(provider: &str, number: u64) -> Option<String> {
     match provider {
@@ -2008,5 +2040,22 @@ mod tests {
         let projects = [("p1", Some("github.com/acme/web")), ("p2", Some("github.com/acme/app")), ("p3", None)];
         assert_eq!(project_for_link(projects, "github.com", "Acme/App"), Some("p2"));
         assert_eq!(project_for_link(projects, "gitlab.com", "acme/app"), None);
+    }
+
+    #[test]
+    fn a_checkout_asks_for_the_pull_request_in_the_chosen_place() {
+        let request = CheckoutRequest {
+            project_id: "p1".into(),
+            url: "https://github.com/acme/app/pull/7".into(),
+            term: "pull request",
+            task: None,
+            mode: CheckoutMode::Worktree,
+        };
+        assert_eq!(
+            request.input("/repo", "t1"),
+            json!({"cwd": "/repo", "reference": "https://github.com/acme/app/pull/7", "mode": "worktree", "threadId": "t1"})
+        );
+        let local = CheckoutRequest { mode: CheckoutMode::Local, ..request };
+        assert_eq!(local.input("/repo", "t1")["mode"], "local");
     }
 }

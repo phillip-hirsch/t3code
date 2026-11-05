@@ -167,8 +167,8 @@ impl Workspace {
         self.settings = None;
         self.page = None;
         match location {
-            Location::Chat(Some(Target::Thread(thread_id))) => self.select_thread(thread_id, window, cx),
-            Location::Chat(Some(Target::Draft { project_id })) => self.start_draft(project_id, window, cx),
+            Location::Chat(Some(Target::Thread { id: thread_id, .. })) => self.select_thread(thread_id, window, cx),
+            Location::Chat(Some(Target::Draft { project_id, .. })) => self.start_draft(project_id, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {
                 self.page = Some(page);
@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     fn draft(id: &str) -> Location {
-        Location::Chat(Some(Target::Draft { project_id: id.into() }))
+        Location::Chat(Some(Target::Draft { env: "e".into(), project_id: id.into() }))
     }
 
     #[test]

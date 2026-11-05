@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use gpui_kit::SharedString;
 use serde_json::{Map, Value};
 
 use crate::model::{ProjectShell, RepositoryIdentity, ThreadShell};
@@ -120,18 +121,39 @@ impl SortOrder {
     }
 }
 
-/// `normalizeProjectPathForComparison`: no trailing separators; Windows paths compare
-/// case-insensitively with backslashes.
+/// `normalizeProjectPathForComparison` (`packages/shared/src/path.ts`): no trailing
+/// separators except on a root; drive and UNC paths compare case-insensitively with
+/// backslashes.
 pub fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim();
-    let mut normalized = trimmed.trim_end_matches(['/', '\\']);
-    if normalized.is_empty() && !trimmed.is_empty() {
-        normalized = &trimmed[..1];
+    let normalized = trim_trailing_separators(path.trim());
+    if is_drive_path(&normalized) || normalized.starts_with("\\\\") {
+        normalized.replace('/', "\\").to_lowercase()
+    } else {
+        normalized
     }
-    let bytes = normalized.as_bytes();
-    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    let unc = normalized.starts_with("\\\\") || normalized.starts_with("//");
-    if drive || unc { normalized.replace('/', "\\").to_lowercase() } else { normalized.to_owned() }
+}
+
+/// `isWindowsDrivePath`: `C:` followed by a separator or nothing.
+fn is_drive_path(path: &str) -> bool {
+    match path.as_bytes() {
+        [drive, b':', rest @ ..] => drive.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/' | b'\\')),
+        _ => false,
+    }
+}
+
+/// `trimTrailingPathSeparators`: roots (`/`, `\`, `C:\`) stay, a bare drive gains its
+/// separator, and a POSIX path only sheds forward slashes.
+fn trim_trailing_separators(path: &str) -> String {
+    let is_root = |p: &str| matches!(p, "/" | "\\") || (p.len() == 3 && is_drive_path(p));
+    if path.is_empty() || is_root(path) {
+        return path.to_owned();
+    }
+    let trimmed = if path.starts_with('/') { path.trim_end_matches('/') } else { path.trim_end_matches(['/', '\\']) };
+    match trimmed {
+        "" => path.to_owned(),
+        _ if trimmed.len() == 2 && is_drive_path(trimmed) => format!("{trimmed}\\"),
+        _ => trimmed.to_owned(),
+    }
 }
 
 /// `derivePhysicalProjectKey`.
@@ -248,20 +270,28 @@ impl ProjectGroup {
     }
 }
 
-/// `buildProjectGroups`, in first-seen order. `group_scratch` folds every scratch project into
-/// one "No project" group, as the sidebar does.
+/// An environment's "No project" workspace (`scratchWorkspaceRoot`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScratchRoot {
+    pub environment_id: SharedString,
+    pub root: String,
+}
+
+/// `buildProjectGroups` over every environment's projects, in first-seen order. A folder is
+/// one checkout per environment; checkouts on different environments group by repository.
+/// `group_scratch` folds every scratch project into one "No project" group, as the sidebar does.
 pub fn build_groups(
     projects: &[ProjectShell],
     settings: &GroupingSettings,
-    environment_id: &str,
-    scratch_root: Option<&str>,
+    scratch_roots: &[ScratchRoot],
     group_scratch: bool,
 ) -> Vec<ProjectGroup> {
-    let scratch_root = scratch_root.map(normalize_path);
+    let scratch_roots: Vec<(&SharedString, String)> =
+        scratch_roots.iter().map(|scratch| (&scratch.environment_id, normalize_path(&scratch.root))).collect();
     // Several entries can share a folder; the freshest one stands for it.
     let mut physical: Vec<(String, Vec<&ProjectShell>)> = Vec::new();
     for project in projects {
-        let key = physical_key(environment_id, &project.workspace_root);
+        let key = physical_key(&project.environment_id, &project.workspace_root);
         match physical.iter_mut().find(|(existing, _)| *existing == key) {
             Some((_, entries)) => entries.push(project),
             None => physical.push((key, vec![project])),
@@ -270,7 +300,9 @@ pub fn build_groups(
     let mut groups: Vec<ProjectGroup> = Vec::new();
     let mut index_by_key: HashMap<String, usize> = HashMap::new();
     for (physical_key, entries) in physical {
-        let winner = entries.iter().copied().reduce(|best, p| if fresher(p, best) { p } else { best }).unwrap();
+        let Some(winner) = entries.iter().copied().reduce(|best, p| if fresher(p, best) { p } else { best }) else {
+            continue;
+        };
         let identity_source = if winner.repository_identity.is_some() {
             winner
         } else {
@@ -281,7 +313,10 @@ pub fn build_groups(
                 .reduce(|best, p| if fresher(p, best) { p } else { best })
                 .unwrap_or(winner)
         };
-        let is_scratch = scratch_root.as_deref() == Some(normalize_path(&winner.workspace_root).as_str());
+        let root = normalize_path(&winner.workspace_root);
+        let is_scratch = scratch_roots
+            .iter()
+            .any(|(environment, scratch)| **environment == winner.environment_id && *scratch == root);
         let mode = settings.mode_for(&physical_key);
         let key = logical_key(identity_source, mode, &physical_key, group_scratch && is_scratch);
         let project_ids = entries.iter().map(|p| p.id.clone());
@@ -319,7 +354,7 @@ pub fn build_groups(
 }
 
 fn parse_ms(value: Option<&str>) -> Option<i64> {
-    value.and_then(crate::inbox::parse_ms)
+    value.and_then(crate::timestamp::parse_ms)
 }
 
 /// `sortLogicalProjectsForSidebar` over the sidebar's listed threads: newest activity first
@@ -361,13 +396,9 @@ pub fn sort_groups(groups: &mut Vec<ProjectGroup>, threads: &[ThreadShell], orde
         })
         .collect();
     let mut keyed: Vec<(i64, ProjectGroup)> = times.into_iter().zip(std::mem::take(groups)).collect();
-    keyed.sort_by(|(a_time, a), (b_time, b)| {
-        let (a_title, b_title) = (&a.representative().title, &b.representative().title);
-        b_time
-            .cmp(a_time)
-            .then_with(|| a_title.to_lowercase().cmp(&b_title.to_lowercase()))
-            .then_with(|| a_title.cmp(b_title))
-            .then_with(|| a.key.cmp(&b.key))
+    keyed.sort_by_cached_key(|(time, group)| {
+        let title = &group.representative().title;
+        (std::cmp::Reverse(*time), title.to_lowercase(), title.clone(), group.key.clone())
     });
     *groups = keyed.into_iter().map(|(_, group)| group).collect();
 }
@@ -409,14 +440,32 @@ mod tests {
     use super::*;
 
     fn project(id: &str, root: &str, identity: Value) -> ProjectShell {
-        serde_json::from_value(json!({
+        let mut project: ProjectShell = serde_json::from_value(json!({
             "id": id,
             "title": id,
             "workspaceRoot": root,
             "repositoryIdentity": identity,
             "updatedAt": "2026-11-01T00:00:00.000Z",
         }))
-        .unwrap()
+        .unwrap();
+        project.environment_id = "env".into();
+        project
+    }
+
+    fn scratch(root: &str) -> [ScratchRoot; 1] {
+        [ScratchRoot { environment_id: "env".into(), root: root.into() }]
+    }
+
+    #[test]
+    fn the_same_folder_on_two_environments_is_two_checkouts_of_one_repository() {
+        let local = project("a", "/src/app", repo("k", "/src/app"));
+        let mut remote = project("b", "/src/app", repo("k", "/src/app"));
+        remote.environment_id = "remote".into();
+        let groups = build_groups(&[local, remote], &GroupingSettings::default(), &scratch("/src/app"), false);
+        assert_eq!(groups.len(), 1);
+        let members: Vec<(&str, bool)> =
+            groups[0].members.iter().map(|m| (m.physical_key.as_str(), m.is_scratch)).collect();
+        assert_eq!(members, [("env:/src/app", true), ("remote:/src/app", false)], "scratch roots are per environment");
     }
 
     fn repo(key: &str, root: &str) -> Value {
@@ -440,6 +489,24 @@ mod tests {
         assert_eq!(normalize_path("C:/Dev/T3/"), "c:\\dev\\t3");
         assert_eq!(normalize_path("/home/me/app//"), "/home/me/app");
         assert_eq!(normalize_path("/"), "/");
+        // Roots keep their separator; only backslash pairs are UNC (`isUncPath`).
+        for (path, want) in [
+            ("  C:\\  ", "c:\\"),
+            ("C:/", "c:\\"),
+            ("C:", "c:\\"),
+            ("c:\\\\", "c:\\"),
+            ("\\", "\\"),
+            ("///", "///"),
+            ("\\\\Server\\Share\\", "\\\\server\\share"),
+            ("//Server/Share/", "//Server/Share"),
+            ("/home/Me\\", "/home/Me\\"),
+            ("C:foo", "C:foo"),
+            ("", ""),
+            ("é:\\Ä/", "é:\\Ä"),
+            ("Ä", "Ä"),
+        ] {
+            assert_eq!(normalize_path(path), want, "{path:?}");
+        }
         assert_eq!(physical_key("env", "H:\\Dev\\App"), "env:h:\\dev\\app");
     }
 
@@ -451,7 +518,7 @@ mod tests {
             project("solo", "/src/solo", Value::Null),
         ];
         let mut settings = GroupingSettings::default();
-        let groups = build_groups(&projects, &settings, "env", None, false);
+        let groups = build_groups(&projects, &settings, &[], false);
         let counts: Vec<_> = groups.iter().map(|g| (g.key.as_str(), g.members.len())).collect();
         assert_eq!(counts, [("github.com/pingdotgg/t3code", 2), ("env:/src/solo", 1)]);
         assert_eq!(groups[0].project_ids, ["main", "web"]);
@@ -459,7 +526,7 @@ mod tests {
         assert_eq!(groups[0].display_name, "pingdotgg/t3code");
 
         settings.mode = GroupingMode::RepositoryPath;
-        let groups = build_groups(&projects, &settings, "env", None, false);
+        let groups = build_groups(&projects, &settings, &[], false);
         assert_eq!(
             keys(&groups),
             ["github.com/pingdotgg/t3code", "github.com/pingdotgg/t3code::apps/web", "env:/src/solo"]
@@ -467,7 +534,7 @@ mod tests {
 
         settings.mode = GroupingMode::Repository;
         settings.set_override("env:/src/t3code/apps/web", Some(GroupingMode::Separate));
-        let groups = build_groups(&projects, &settings, "env", None, false);
+        let groups = build_groups(&projects, &settings, &[], false);
         assert!(groups.iter().any(|g| g.key == "env:/src/t3code/apps/web"));
         assert_eq!(
             settings.overrides_patch()["sidebarProjectGroupingOverrides"],
@@ -484,7 +551,7 @@ mod tests {
         let mut newer = project("b", "/src/app/", Value::Null);
         newer.pinned_at = Some("2026-11-02T00:00:00.000Z".into());
         newer.archived_at = Some("2026-11-02T00:00:00.000Z".into());
-        let groups = build_groups(&[older, newer], &GroupingSettings::default(), "env", Some("/src/app"), false);
+        let groups = build_groups(&[older, newer], &GroupingSettings::default(), &scratch("/src/app"), false);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members.len(), 1);
         assert_eq!(groups[0].project_ids, ["a", "b"], "both entries' threads belong to the group");
@@ -496,11 +563,10 @@ mod tests {
     fn the_sidebar_folds_scratch_projects_into_no_project() {
         let projects =
             [project("scratch", "/home/me/.t3/scratch", Value::Null), project("app", "/src/app", Value::Null)];
-        let groups = build_groups(&projects, &GroupingSettings::default(), "env", Some("/home/me/.t3/scratch"), true);
+        let groups = build_groups(&projects, &GroupingSettings::default(), &scratch("/home/me/.t3/scratch"), true);
         assert_eq!(keys(&groups), [SCRATCH_PROJECT_SCOPE_KEY, "env:/src/app"]);
         assert_eq!(groups[0].display_name, SCRATCH_PROJECT_TITLE);
-        let unfolded =
-            build_groups(&projects, &GroupingSettings::default(), "env", Some("/home/me/.t3/scratch"), false);
+        let unfolded = build_groups(&projects, &GroupingSettings::default(), &scratch("/home/me/.t3/scratch"), false);
         assert_eq!(unfolded[0].display_name, "scratch");
     }
 
@@ -510,7 +576,7 @@ mod tests {
         let mut b = project("b", "/y/two", repo("k", "/y/two"));
         a.title = "Rex".into();
         b.title = "Rex".into();
-        let groups = build_groups(&[a, b], &GroupingSettings::default(), "env", None, false);
+        let groups = build_groups(&[a, b], &GroupingSettings::default(), &[], false);
         assert_eq!(groups[0].display_name, "Rex");
     }
 
@@ -540,7 +606,7 @@ mod tests {
             thread("t1", "early", "2026-02-01T00:00:00.000Z", Some("2026-11-04T00:00:00.000Z")),
             thread("t2", "busy", "2026-10-25T00:00:00.000Z", None),
         ];
-        let base = build_groups(&projects, &GroupingSettings::default(), "env", None, true);
+        let base = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let sorted = |order| {
             let mut groups = base.clone();
             sort_groups(&mut groups, &threads, order);
@@ -555,7 +621,7 @@ mod tests {
     fn folders_follow_group_order_and_keep_empty_ones_on_request() {
         let projects =
             [project("a", "/a", Value::Null), project("b", "/b", Value::Null), project("c", "/c", Value::Null)];
-        let groups = build_groups(&projects, &GroupingSettings::default(), "env", None, true);
+        let groups = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let order: Vec<&ProjectGroup> = vec![&groups[2], &groups[0], &groups[1]];
         let threads = vec![("t1", "a"), ("t2", "x"), ("t3", "c"), ("t4", "a")];
         let folders = folders(&order, threads, |t| t.1, |g| g.key == "env:/b");
@@ -570,13 +636,8 @@ mod tests {
         pinned.pinned_at = Some("2026-11-01T00:00:00.000Z".into());
         let mut archived = project("x", "/x", Value::Null);
         archived.archived_at = Some("2026-11-01T00:00:00.000Z".into());
-        let groups = build_groups(
-            &[project("a", "/a", Value::Null), archived, pinned],
-            &GroupingSettings::default(),
-            "env",
-            None,
-            true,
-        );
+        let groups =
+            build_groups(&[project("a", "/a", Value::Null), archived, pinned], &GroupingSettings::default(), &[], true);
         let picked: Vec<&str> = pickable(&groups).iter().map(|g| g.key.as_str()).collect();
         assert_eq!(picked, ["env:/p", "env:/a"]);
     }

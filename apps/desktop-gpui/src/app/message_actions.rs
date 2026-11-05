@@ -50,21 +50,35 @@ impl CopyFeedback {
     }
 }
 
+/// Whether `prompt` makes a prompt link: not blank and at most [`PROMPT_LINK_MAX`] UTF-16 units.
+fn prompt_link_fits(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    // UTF-16 never takes more units than UTF-8 takes bytes, so short text skips the count.
+    !prompt.is_empty() && (prompt.len() <= PROMPT_LINK_MAX || prompt.encode_utf16().count() <= PROMPT_LINK_MAX)
+}
+
 /// `promptLinkFor`: a link that starts a new thread with this prompt.
 pub(super) fn prompt_link(prompt: &str) -> Option<String> {
-    let prompt = prompt.trim();
-    if prompt.is_empty() || prompt.encode_utf16().count() > PROMPT_LINK_MAX {
+    if !prompt_link_fits(prompt) {
         return None;
     }
     let mut url = String::from("https://app.t3.codes/new?prompt=");
-    for byte in prompt.bytes() {
+    form_encode_into(&mut url, prompt.trim());
+    Some(url)
+}
+
+/// `URLSearchParams` encoding of `value`, appended to `out`.
+pub(super) fn form_encode_into(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    for byte in value.bytes() {
         match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => url.push(byte as char),
-            b' ' => url.push('+'),
-            _ => url.push_str(&format!("%{byte:02X}")),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => out.push(byte as char),
+            b' ' => out.push('+'),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
-    Some(url)
 }
 
 impl Workspace {
@@ -105,8 +119,8 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(_) => this.select_thread(target, window, cx),
-                Err(_) => {
-                    this.error = Some("Failed to fork this response.".into());
+                Err(error) => {
+                    this.error = Some(format!("Failed to fork this response: {error}").into());
                     cx.notify();
                 }
             });
@@ -179,7 +193,11 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rewinding.remove(&thread_id);
                 match result {
-                    Ok(files) => this.restore_rewound(Target::Thread(thread_id), text, files, window, cx),
+                    Ok(files) => {
+                        if let Some(target) = this.thread_target(&thread_id) {
+                            this.restore_rewound(target, text, files, window, cx);
+                        }
+                    }
                     Err(error) => this.error = Some(error.into()),
                 }
                 cx.notify();
@@ -231,7 +249,7 @@ impl Workspace {
     pub(super) fn supports_rollback(&self) -> bool {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return false };
         let instance = projection.thread.model_selection.as_ref().map(|m| m.instance_id.as_str());
-        self.server_info
+        self.server_info()
             .providers
             .iter()
             .find(|provider| Some(provider.instance_id.as_str()) == instance)
@@ -285,7 +303,10 @@ async fn download_attachments(
         };
         let resource = json!({"_tag": "attachment", "attachmentId": id, "fileName": name, "mimeType": mime});
         let failed = || format!("Could not restore attachment: {name}");
-        let signed = client.request("assets.createUrl", json!({"resource": resource})).await.map_err(|_| failed())?;
+        let signed = client.request("assets.createUrl", json!({"resource": resource})).await.map_err(|error| {
+            log::warn!("assets.createUrl for attachment {name}: {error}");
+            failed()
+        })?;
         let url = format!("{http_base}{}", signed["relativeUrl"].as_str().ok_or_else(failed)?);
         let bytes = crate::runtime()
             .spawn(async move {
@@ -293,7 +314,17 @@ async fn download_attachments(
                 response.error_for_status()?.bytes().await
             })
             .await;
-        let Ok(Ok(bytes)) = bytes else { return Err(failed()) };
+        let bytes = match bytes {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                log::warn!("downloading attachment {name}: {error}");
+                return Err(failed());
+            }
+            Err(error) => {
+                log::warn!("downloading attachment {name}: {error}");
+                return Err(failed());
+            }
+        };
         restored.push(Attachment::restored(kind, name.to_owned(), mime.to_owned(), bytes.to_vec()));
     }
     Ok(restored)
@@ -332,11 +363,25 @@ pub(super) fn copy_button(
     t: &Tokens,
     cx: &App,
 ) -> impl IntoElement {
+    copy_button_with(this, id, label, icon, t, cx, move || Some(text.to_string()))
+}
+
+/// [`copy_button`] for text that is derived only when clicked.
+fn copy_button_with(
+    this: &WeakEntity<Workspace>,
+    id: SharedString,
+    label: &'static str,
+    icon: IconName,
+    t: &Tokens,
+    cx: &App,
+    text: impl Fn() -> Option<String> + 'static,
+) -> impl IntoElement {
     let copied = this.upgrade().is_some_and(|w| w.read(cx).copy_feedback.id.as_ref() == Some(&id));
     let glyph = if copied { Icon::new(IconName::Check).text_color(t.primary) } else { Icon::new(icon) };
     let this = this.clone();
     icon_button(id.clone(), glyph, if copied { "Copied!" } else { label }, true, t).on_click(move |_, _, cx| {
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        let Some(text) = text() else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
         let _ = this.update(cx, |workspace, cx| workspace.copied(id.clone(), COPIED_FOR, cx));
     })
 }
@@ -360,26 +405,24 @@ pub(super) fn code_copy_button(
         })
 }
 
-/// `TimelineRowTimestamp` text: "3:04 PM", with the full date as its tooltip.
+/// `TimelineRowTimestamp` text: "3:04 PM", with the full date as its tooltip (built on hover).
 pub(super) fn timestamp(
     this: &WeakEntity<Workspace>,
     id: SharedString,
-    iso: &str,
+    iso: &SharedString,
     t: &Tokens,
     cx: &App,
 ) -> Option<impl IntoElement> {
-    let format = this.upgrade().map(|w| w.read(cx).client_settings.values.get("timestampFormat").clone());
-    let hour12 = crate::timestamp::hour12(format.as_ref().and_then(Value::as_str).unwrap_or_default());
-    let (text, tooltip) = crate::timestamp::now_local(iso, hour12)?;
-    let tooltip: SharedString = tooltip.into();
-    Some(
-        div()
-            .id(ElementId::Name(id))
-            .text_xs()
-            .text_color(t.muted_foreground)
-            .child(text)
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
-    )
+    let format = this.upgrade().and_then(|w| w.read(cx).client_settings.values.get("timestampFormat").as_str());
+    let hour12 = crate::timestamp::hour12(format.unwrap_or_default());
+    let text = crate::timestamp::day_aware(iso, &chrono::Local::now(), hour12)?;
+    let iso = iso.clone();
+    Some(div().id(ElementId::Name(id)).text_xs().text_color(t.muted_foreground).child(text).tooltip(
+        move |window, cx| {
+            let tooltip = crate::timestamp::tooltip(&iso, &chrono::Local, hour12).unwrap_or_default();
+            Tooltip::new(tooltip).build(window, cx)
+        },
+    ))
 }
 
 /// The row under a user message: time, then edit, copy and prompt link.
@@ -387,7 +430,7 @@ pub(super) fn user_actions(
     this: &WeakEntity<Workspace>,
     id: &SharedString,
     text: &SharedString,
-    created_at: &str,
+    created_at: &SharedString,
     revert: Option<&Checkpoint>,
     t: &Tokens,
     cx: &App,
@@ -409,8 +452,11 @@ pub(super) fn user_actions(
                 }
             })
     });
-    let link = prompt_link(text).map(|link| {
-        copy_button(this, format!("link:{id}").into(), link.into(), "Copy prompt link", IconName::Link, t, cx)
+    let link = prompt_link_fits(text).then(|| {
+        let text = text.clone();
+        copy_button_with(this, format!("link:{id}").into(), "Copy prompt link", IconName::Link, t, cx, move || {
+            prompt_link(&text)
+        })
     });
     gpui_kit::component::h_flex()
         .gap(px(8.))
@@ -438,7 +484,7 @@ pub(super) fn assistant_meta(
     id: &SharedString,
     text: &SharedString,
     streaming: bool,
-    updated_at: &str,
+    updated_at: &SharedString,
     status: &str,
     fork: Option<&(SharedString, SharedString)>,
     t: &Tokens,

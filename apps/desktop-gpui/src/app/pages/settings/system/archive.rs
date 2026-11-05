@@ -93,7 +93,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let client = self.client();
+        let client = self.settings_client();
         let state = window.use_keyed_state("settings-archive", cx, |_, cx| {
             let mut state = ArchiveState { groups: None, _load: None };
             state.load(client, cx);

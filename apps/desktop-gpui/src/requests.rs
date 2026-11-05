@@ -78,7 +78,7 @@ pub struct Draft {
 /// The open question card: which request, which question, and every draft.
 pub struct QuestionDraft {
     pub request_id: String,
-    /// Never empty.
+    /// Never empty: [`QuestionDraft::new`] refuses an empty list.
     pub questions: Vec<Question>,
     pub index: usize,
     pub drafts: HashMap<String, Draft>,
@@ -88,8 +88,11 @@ pub struct QuestionDraft {
 }
 
 impl QuestionDraft {
-    /// A fresh draft, seeded with each question's initial answer.
-    pub fn new(request_id: String, questions: Vec<Question>) -> Self {
+    /// A fresh draft, seeded with each question's initial answer; `None` without questions.
+    pub fn new(request_id: String, questions: Vec<Question>) -> Option<Self> {
+        if questions.is_empty() {
+            return None;
+        }
         let drafts = questions
             .iter()
             .filter(|q| q.allows_custom())
@@ -97,12 +100,17 @@ impl QuestionDraft {
                 Some((q.id.clone(), Draft { selected: Vec::new(), custom: Some(q.initial_answer.clone()?) }))
             })
             .collect();
-        Self { request_id, questions, index: 0, drafts, collapsed: false, prompt: String::new() }
+        Some(Self { request_id, questions, index: 0, drafts, collapsed: false, prompt: String::new() })
     }
 }
 
+/// The item's questions; an unreadable payload is logged and reads as none.
 pub fn questions(item: &TurnItem) -> Vec<Question> {
-    item.raw.get("questions").and_then(|q| Vec::deserialize(q).ok()).unwrap_or_default()
+    let Some(raw) = item.raw.get("questions") else { return Vec::new() };
+    Vec::deserialize(raw).unwrap_or_else(|error| {
+        log::warn!("unreadable questions on {}: {error}", item.id);
+        Vec::new()
+    })
 }
 
 /// The answer to submit for one question, or `None` while it is unanswered.
@@ -218,7 +226,7 @@ mod tests {
             json!({"id": "b", "header": "H", "question": "?", "options": options(), "allowCustomAnswer": false}),
         );
         let questions = vec![initial.clone(), choice.clone()];
-        let mut state = QuestionDraft::new("r".into(), questions.clone());
+        let mut state = QuestionDraft::new("r".into(), questions.clone()).unwrap();
         assert_eq!(answers(&questions, &state.drafts), None);
         let typed = set_custom(&choice, None, "free text".into());
         assert_eq!(answer(&choice, Some(&typed)), None, "choice-only ignores typing");
@@ -230,7 +238,7 @@ mod tests {
     fn a_pick_replaces_the_seeded_answer_until_the_user_types() {
         let q =
             question(json!({"id": "q", "header": "H", "question": "?", "options": options(), "initialAnswer": "seed"}));
-        let state = QuestionDraft::new("r".into(), vec![q.clone()]);
+        let state = QuestionDraft::new("r".into(), vec![q.clone()]).unwrap();
         let seeded = state.drafts.get("q");
         assert_eq!(answer(&q, seeded), Some(json!("seed")));
         let picked = toggle(&q, seeded, "Red");

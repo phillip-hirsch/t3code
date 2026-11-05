@@ -19,32 +19,45 @@ use crate::worktree_setup::{self, Snapshot, Stage};
 #[derive(Default)]
 pub(super) struct SetupWatch {
     thread_id: Option<String>,
-    pub(super) snapshot: Option<Snapshot>,
+    /// Shared with the timeline row, so a refresh never copies the stage logs.
+    pub(super) snapshot: Option<Rc<Snapshot>>,
     details_open: bool,
     _task: Option<Task<()>>,
+}
+
+impl SetupWatch {
+    /// Drops the stream with its socket, keeping the card, so the next sync resubscribes.
+    pub(super) fn disconnect(&mut self) {
+        self.thread_id = None;
+        self._task = None;
+    }
 }
 
 impl Workspace {
     /// Keeps one `subscribeWorktreeSetup` stream on an open thread that has or is preparing a worktree.
     pub(super) fn sync_worktree_setup(&mut self, cx: &mut Context<Self>) {
         let wanted = match (&self.target, self.open_projection()) {
-            (Some(Target::Thread(id)), Some(projection)) => {
+            (Some(Target::Thread { id, .. }), Some(projection)) => {
                 let preparing = projection.runs.last().is_some_and(|run| run.status == "preparing");
                 (preparing || projection.thread.worktree_path.is_some()).then(|| id.clone())
             }
             _ => None,
         };
+        // Without a socket the watch waits, so it subscribes once one connects.
+        let Some(client) = self.client() else { return };
         if wanted == self.setup.thread_id {
             return;
         }
-        self.setup = SetupWatch { thread_id: wanted.clone(), ..Default::default() };
-        let (Some(thread_id), Some(client)) = (wanted, self.client()) else { return };
+        // A resubscribe after a reconnect keeps the card up until the stream resends it.
+        let snapshot = self.setup.snapshot.take().filter(|s| wanted.as_ref() == Some(&s.thread_id));
+        self.setup = SetupWatch { thread_id: wanted.clone(), snapshot, ..Default::default() };
+        let Some(thread_id) = wanted else { return };
         let stream = client.stream("subscribeWorktreeSetup", json!({"threadId": thread_id}));
         self.setup._task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {
                 let ended = this.update(cx, |this, cx| match event {
                     StreamEvent::Item(value) if this.setup.thread_id.as_deref() == Some(thread_id.as_str()) => {
-                        let next = serde_json::from_value::<Option<Snapshot>>(value).ok().flatten();
+                        let next = serde_json::from_value::<Option<Rc<Snapshot>>>(value).ok().flatten();
                         // Keep the newer of the two: a late event never rolls the card back.
                         let newer = match (&this.setup.snapshot, &next) {
                             (Some(held), Some(next)) => {
@@ -98,9 +111,9 @@ impl Workspace {
 }
 
 fn elapsed(start: Option<&str>, end: Option<&str>, live: bool) -> Option<String> {
-    let start = crate::work_log::parse_iso_ms(start?)?;
+    let start = crate::timestamp::parse_ms(start?)?;
     let end = match end {
-        Some(end) => crate::work_log::parse_iso_ms(end)?,
+        Some(end) => crate::timestamp::parse_ms(end)?,
         None if live => super::sidebar::now_ms(),
         None => return None,
     };

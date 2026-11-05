@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::work_log::parse_iso_ms;
+use crate::timestamp::parse_ms;
 
 pub(super) const ORCHESTRATION_READ: &str = "orchestration:read";
 pub(in crate::app::pages::settings) const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
@@ -358,7 +358,7 @@ where
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
-    parse_iso_ms(iso).unwrap_or(0)
+    parse_ms(iso).unwrap_or(0)
 }
 
 /// `ENVIRONMENT_MACHINE_KIND_LABELS`, in `ENVIRONMENT_MACHINE_KINDS` order.

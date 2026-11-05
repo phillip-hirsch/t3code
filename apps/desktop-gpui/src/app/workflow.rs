@@ -29,7 +29,7 @@ pub(super) struct WorkflowUi {
 }
 
 fn iso(ms: Option<i64>) -> Option<SharedString> {
-    jiff::Timestamp::from_millisecond(ms?).ok().map(|at| at.to_string().into())
+    crate::timestamp::iso(ms?).map(Into::into)
 }
 
 fn card(member: &Member, driver: &str) -> Rc<SubagentCard> {
@@ -84,7 +84,14 @@ impl Workspace {
         let unphased = opening.unphased.iter().map(|m| card(m, &driver)).collect();
         let key = timeline::entry_key(&format!("workflow-script:{id}"));
         rows[index] = Row::Workflow {
-            row: Rc::new(WorkflowRow { opening, phases, unphased }),
+            row: Rc::new(WorkflowRow {
+                headline: opening.headline(),
+                script_markdown: workflow::script_markdown(&opening.script).into(),
+                foldable: super::chat::should_collapse(&opening.script),
+                opening,
+                phases,
+                unphased,
+            }),
             expanded: self.expanded.contains(&key),
         };
     }
@@ -102,9 +109,12 @@ impl Workspace {
         }
         self.workflow.parent = Some((parent.clone(), Instant::now()));
         self.workflow._fetch = Some(cx.spawn(async move |this, cx| {
-            let Ok(value) = client.request("orchestration.getThreadProjection", json!({"threadId": parent})).await
-            else {
-                return;
+            let value = match client.request("orchestration.getThreadProjection", json!({"threadId": parent})).await {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!("workflow parent {parent}: {error}");
+                    return;
+                }
             };
             let subagents = value["subagents"].as_array().cloned().unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
@@ -125,7 +135,7 @@ pub(super) fn workflow_row(
     cx: &mut App,
 ) -> AnyElement {
     let opening = &row.opening;
-    let (title, description, agents) = opening.headline();
+    let (title, description, agents) = row.headline.clone();
     let muted = t.muted_foreground;
     let header = h_flex()
         .min_w_0()
@@ -167,9 +177,8 @@ pub(super) fn workflow_row(
     });
     let key = timeline::entry_key(&format!("workflow-script:{}", opening.message_id));
     let markdown_key: SharedString = format!("workflow-script:{}", opening.message_id).into();
-    let source: SharedString = workflow::script_markdown(&opening.script).into();
-    let script = super::chat::markdown(this, markdown_key, &source, false, t, cx);
-    let foldable = super::chat::should_collapse(&opening.script);
+    let script = super::chat::markdown(this, markdown_key, &row.script_markdown, false, t, cx);
+    let foldable = row.foldable;
     let folded = foldable && !expanded;
     let toggle_this = this.clone();
     v_flex()

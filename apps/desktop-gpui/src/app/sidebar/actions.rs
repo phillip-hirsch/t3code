@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::{Shelf, now_ms};
 use crate::app::thread_menu::hosted_thread_link;
-use crate::app::{Target, Workspace, new_id};
+use crate::app::{Workspace, new_id};
 use crate::inbox::{self, Facts};
 
 /// The undoable actions (`showThreadUndoNotice`).
@@ -136,17 +136,18 @@ impl Workspace {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
-    /// Dispatches `{type, commandId, threadId, ..fields}`.
+    /// Dispatches `{type, commandId, threadId, ..fields}`; `false` when there is no
+    /// connection to send it on, so callers skip their optimistic undo and navigation.
     pub(in crate::app) fn thread_command(
         &mut self,
         kind: &str,
         thread_id: &str,
         fields: Value,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let title = failure_title(kind, &fields);
         let command = Self::thread_command_value(kind, thread_id, fields);
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(thread_id) else { return false };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
                 let _ = this.update(cx, |this, cx| {
@@ -156,6 +157,7 @@ impl Workspace {
             }
         })
         .detach();
+        true
     }
 
     /// `{type, commandId, threadId, ..fields}`.
@@ -176,10 +178,12 @@ impl Workspace {
         title: fn(usize, usize) -> String,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        // Each command goes to the environment its thread or project lives on.
+        let routed: Vec<_> = commands.into_iter().map(|command| (self.command_client(&command), command)).collect();
         cx.spawn(async move |this, cx| {
             let (mut failed, mut succeeded, mut first_error) = (0, 0, None);
-            for command in commands {
+            for (client, command) in routed {
+                let Some(client) = client else { continue };
                 match client.request("orchestration.dispatchCommand", command).await {
                     Ok(_) => succeeded += 1,
                     Err(error) => {
@@ -260,24 +264,17 @@ impl Workspace {
             self.restore_discarded(draft, window, cx);
             return;
         }
-        let Some(client) = self.client() else { return };
         let now = now_ms();
         let action = notice.action;
-        let mut plans: Vec<Vec<Value>> = Vec::new();
+        let mut plans = Vec::new();
         for entry in notice.entries {
-            let command = |kind: &str, fields: Value| {
-                let mut command = json!({"type": kind, "commandId": new_id(), "threadId": entry.thread_id});
-                if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), fields) {
-                    command.extend(fields);
-                }
-                command
-            };
+            let command = |kind: &str, fields| Self::thread_command_value(kind, &entry.thread_id, fields);
             let repin =
                 || command("thread.pin", entry.pin_key.as_ref().map_or(json!({}), |key| json!({"orderKey": key})));
             let resnooze = entry
                 .snoozed_until
                 .as_ref()
-                .filter(|until| inbox::parse_ms(until).is_some_and(|until| until > now))
+                .filter(|until| crate::timestamp::parse_ms(until).is_some_and(|until| until > now))
                 .map(|until| command("thread.snooze", json!({"snoozedUntil": until})));
             let mut steps = Vec::new();
             match action {
@@ -296,10 +293,11 @@ impl Workspace {
                 UndoAction::Archived => steps.push(command("thread.unarchive", json!({}))),
                 UndoAction::Discarded => {}
             }
-            plans.push(steps);
+            plans.push((self.thread_client(&entry.thread_id), steps));
         }
         cx.spawn(async move |this, cx| {
-            for steps in plans {
+            for (client, steps) in plans {
+                let Some(client) = client else { continue };
                 for step in steps {
                     if let Err(error) = client.request("orchestration.dispatchCommand", step).await {
                         let _ = this.update(cx, |this, cx| {
@@ -330,7 +328,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.target.as_ref() != Some(&Target::Thread(thread_id.to_owned())) {
+        if self.open_thread_id() != Some(thread_id) {
             return;
         }
         let order = &self.sidebar.inbox_order;
@@ -356,7 +354,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.settle", thread_id, json!({}), cx);
+        if !self.thread_command("thread.settle", thread_id, json!({}), cx) {
+            return;
+        }
         self.push_undo(UndoAction::Settled, entry, cx);
         if advance {
             self.leave_thread(thread_id, window, cx);
@@ -382,7 +382,10 @@ impl Workspace {
             return;
         }
         let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.snooze", thread_id, json!({"snoozedUntil": inbox::iso(wake_ms)}), cx);
+        let wake = json!({"snoozedUntil": crate::timestamp::iso(wake_ms).unwrap_or_default()});
+        if !self.thread_command("thread.snooze", thread_id, wake, cx) {
+            return;
+        }
         self.push_undo(UndoAction::Snoozed, entry, cx);
         if advance {
             self.leave_thread(thread_id, window, cx);
@@ -421,8 +424,33 @@ impl Workspace {
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             let entry = this.undo_entry(&thread_id);
-            this.thread_command("thread.unpin", &thread_id, json!({}), cx);
-            this.push_undo(UndoAction::Unpinned, entry, cx);
+            if this.thread_command("thread.unpin", &thread_id, json!({}), cx) {
+                this.push_undo(UndoAction::Unpinned, entry, cx);
+            }
+        });
+    }
+
+    /// The selection's Unpin: one question for all of them, unlike the web's one per thread.
+    pub(super) fn unpin_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        if let [id] = ids {
+            self.unpin_thread(id, window, cx);
+            return;
+        }
+        let ids = ids.to_vec();
+        let question = Confirm {
+            setting: "confirmThreadUnpin",
+            message: format!("Unpin {} threads?", ids.len()),
+            detail: Some("This will move the threads out of your pinned section."),
+            ok: "Unpin",
+            level: PromptLevel::Info,
+        };
+        self.confirm_then(question, window, cx, move |this, _, cx| {
+            for id in &ids {
+                let entry = this.undo_entry(id);
+                if this.thread_command("thread.unpin", id, json!({}), cx) {
+                    this.push_undo(UndoAction::Unpinned, entry, cx);
+                }
+            }
         });
     }
 
@@ -441,9 +469,11 @@ impl Workspace {
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
-            this.thread_command("thread.archive", &thread_id, json!({}), cx);
+            if !this.thread_command("thread.archive", &thread_id, json!({}), cx) {
+                return;
+            }
             this.push_undo(UndoAction::Archived, entry, cx);
-            if this.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
+            if this.open_thread_id() == Some(&*thread_id) {
                 this.start_draft(project_id, window, cx);
             }
         });
@@ -461,8 +491,10 @@ impl Workspace {
             level: PromptLevel::Critical,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
-            this.expire_undo(&thread_id);
-            this.thread_command("thread.delete", &thread_id, json!({}), cx);
+            if this.client().is_some() {
+                this.expire_undo(&thread_id);
+                this.thread_command("thread.delete", &thread_id, json!({}), cx);
+            }
         });
     }
 
@@ -535,7 +567,7 @@ impl Workspace {
         let title = renaming.input.read(cx).value().trim().to_owned();
         if title.is_empty() {
             window.push_notification(Notification::warning("").title("Thread title cannot be empty"), cx);
-        } else if let (true, Some(client)) = (title != renaming.original, self.client()) {
+        } else if let (true, Some(client)) = (title != renaming.original, self.thread_client(&renaming.thread_id)) {
             let command = json!({
                 "type": "thread.metadata.update",
                 "commandId": new_id(),
@@ -584,7 +616,7 @@ impl Workspace {
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let facts = Facts::new(thread, &requests);
-        let info = &self.server_info;
+        let info = &self.server_info();
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let sidebar = origin == MenuOrigin::Sidebar;
         let groups = self.project_groups();
@@ -694,7 +726,7 @@ pub(super) struct SnoozeItems {
 
 impl SnoozeItems {
     fn new(workspace: &Workspace, thread_id: &str, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
-        let settings = inbox::snooze_settings(workspace.server_info.settings.get("snoozePresets"));
+        let settings = inbox::snooze_settings(workspace.server_info().settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
         let advance = origin == MenuOrigin::Sidebar;

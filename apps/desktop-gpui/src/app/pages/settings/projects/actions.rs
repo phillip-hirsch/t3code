@@ -36,7 +36,7 @@ impl Workspace {
         let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else {
             return div().into_any_element();
         };
-        let scripts = resolve_project_scripts(&self.server_info.settings, project);
+        let scripts = resolve_project_scripts(&self.settings_info().settings, project);
         // Every checkout of the group is a target; differing lists are edited one environment at a time.
         let targets = self.script_targets(project_id);
         let mixed = targets.iter().any(|id| {
@@ -44,9 +44,9 @@ impl Workspace {
                 .projects
                 .iter()
                 .find(|p| &p.id == id)
-                .is_some_and(|p| resolve_project_scripts(&self.server_info.settings, p) != scripts)
+                .is_some_and(|p| resolve_project_scripts(&self.settings_info().settings, p) != scripts)
         });
-        let overridden = targets.iter().any(|id| has_project_scripts_override(&self.server_info.settings, id));
+        let overridden = targets.iter().any(|id| has_project_scripts_override(&self.settings_info().settings, id));
         let root = project.workspace_root.clone();
         let file = self.t3_project_file(&root, cx).clone();
         let importable: Vec<ScriptInput> =
@@ -170,7 +170,7 @@ impl Workspace {
             .children(script.preview_url.is_some().then(|| badge("preview · desktop only")));
         let command = div().max_w_full().truncate().font_family(t.fonts.mono).child(script.command.clone());
         let shortcut = shortcut_label_for_command(
-            self.server_info.keybindings_json(),
+            self.settings_info().keybindings_json(),
             command_for_project_script(&script.id).as_deref(),
         );
         let (pid, sid) = (project_id.to_owned(), script.id.clone());

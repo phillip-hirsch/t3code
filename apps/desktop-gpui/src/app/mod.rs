@@ -16,7 +16,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::backend::{self, ServerHandle};
-use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
+use crate::model::{ModelSelection, ProjectShell, ShellState, ThreadState};
 use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
@@ -60,6 +60,7 @@ mod quit;
 mod request_cards;
 mod right_panel;
 mod send;
+mod sessions;
 mod side_chat;
 mod sidebar;
 mod snap_shot;
@@ -93,17 +94,21 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 enum Connection {
     Starting,
     Connecting,
-    Connected(RpcClient),
+    Connected,
     Disconnected(SharedString),
     Failed(SharedString),
 }
 
-/// Where the composer sends.
+/// Where the composer sends, on the environment the thread or project lives on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Target {
-    Thread(String),
+    Thread {
+        env: SharedString,
+        id: String,
+    },
     /// A new thread in this project, created by the first message.
     Draft {
+        env: SharedString,
         project_id: String,
     },
 }
@@ -119,11 +124,12 @@ struct OpenThread {
 }
 
 pub struct Workspace {
+    /// The primary environment's socket; see [`sessions`] for every environment's.
     connection: Connection,
-    /// The server the socket talks to, for its HTTP routes (`/api/auth/*`).
-    endpoint: Option<backend::Endpoint>,
     server: Option<ServerHandle>,
-    server_info: ServerInfo,
+    /// One per connected environment, the primary first.
+    sessions: Vec<sessions::EnvironmentSession>,
+    /// Every environment's projects and threads.
     shell: ShellState,
     target: Option<Target>,
     thread: Option<OpenThread>,
@@ -201,11 +207,8 @@ pub struct Workspace {
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
     _connection_task: Task<()>,
+    /// The primary environment's streams besides its config and shell.
     _stream_tasks: Vec<Task<()>>,
-    _shell_task: Option<Task<()>>,
-    /// Shell twin of [`OpenThread::snapshot_failed`] / [`OpenThread::retried`].
-    shell_snapshot_failed: bool,
-    shell_retried: bool,
     /// The launch landing ran (once, after the first shell snapshot).
     landed: bool,
     /// A page covering the chat in the main column.
@@ -283,7 +286,7 @@ impl Workspace {
         let weak = cx.weak_entity();
         let saved_environments = cx.new(environments::SavedEnvironments::new);
         let subscriptions = vec![
-            cx.observe(&saved_environments, |_, _, cx| cx.notify()),
+            cx.observe_in(&saved_environments, window, |this, _, window, cx| this.sync_saved_sessions(window, cx)),
             cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::Change = event {
                     this.on_composer_change(cx);
@@ -320,9 +323,8 @@ impl Workspace {
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
         let mut workspace = Self {
             connection: Connection::Starting,
-            endpoint: None,
             server: None,
-            server_info: ServerInfo::default(),
+            sessions: vec![sessions::EnvironmentSession::default()],
             shell: ShellState::default(),
             target: None,
             thread: None,
@@ -375,9 +377,6 @@ impl Workspace {
             title: thread_menu::TitleState::default(),
             _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
-            _shell_task: None,
-            shell_snapshot_failed: false,
-            shell_retried: false,
             landed: false,
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
@@ -421,6 +420,7 @@ impl Workspace {
             _subscriptions: subscriptions,
         };
         workspace.sync_snap_shot(window, cx);
+        workspace.sync_saved_sessions(window, cx);
         workspace
     }
 
@@ -459,6 +459,32 @@ impl Workspace {
                 if this.update(cx, |this, cx| this.set_connection(Connection::Connecting, cx)).is_err() {
                     return;
                 }
+                // The environment's id keys its threads, so it is read before the socket opens.
+                let known = this.update(cx, |this, _| this.primary_environment().is_some()).unwrap_or(true);
+                if !known {
+                    let http_base = endpoint.http_base.clone();
+                    let descriptor =
+                        runtime().spawn(async move { crate::environments::fetch_descriptor(&http_base).await }).await;
+                    let failure: Option<SharedString> = match descriptor {
+                        Ok(Ok(descriptor)) => {
+                            let id = SharedString::from(descriptor.environment_id);
+                            if this.update(cx, |this, cx| this.set_primary_environment(id, cx)).is_err() {
+                                return;
+                            }
+                            None
+                        }
+                        Ok(Err(failure)) => Some(failure.detail.into()),
+                        Err(error) => Some(error.to_string().into()),
+                    };
+                    if let Some(failure) = failure {
+                        let disconnected = Connection::Disconnected(failure);
+                        if this.update(cx, |this, cx| this.set_connection(disconnected, cx)).is_err() {
+                            return;
+                        }
+                        cx.background_executor().timer(RECONNECT_DELAY).await;
+                        continue;
+                    }
+                }
                 let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
                 match RpcClient::connect(runtime().handle(), options).await {
                     Err(error) if rpc::is_unauthorized(&error) && !endpoint.renewable() => {
@@ -493,8 +519,7 @@ impl Workspace {
                         if this
                             .update_in(cx, |this, window, cx| {
                                 this.environment_remote = remote;
-                                this.endpoint = Some(current);
-                                this.on_connected(client.clone(), window, cx)
+                                this.on_connected(client.clone(), current, window, cx)
                             })
                             .is_err()
                         {
@@ -538,16 +563,24 @@ impl Workspace {
 
     fn set_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {
         // A stopped server is final; a late socket close must not hide why.
-        if matches!(self.connection, Connection::Failed(_)) && !matches!(connection, Connection::Connected(_)) {
+        if matches!(self.connection, Connection::Failed(_)) && !matches!(connection, Connection::Connected) {
             return;
         }
-        if !matches!(connection, Connection::Connected(_)) {
+        if !matches!(connection, Connection::Connected) {
             self._stream_tasks.clear();
-            self._shell_task = None;
+            self.set_primary_connection(None, None);
             self.preview.disconnect();
-            if let Some(thread) = &mut self.thread {
+            if self.target_on_primary() {
+                self.setup.disconnect();
+                self.details = inspector::Details::default();
+            }
+            if self.target_on_primary()
+                && let Some(thread) = &mut self.thread
+            {
                 thread._subscription = None;
             }
+            self.side_chat.disconnect();
+            self.unfollow_pull_requests();
         }
         self.connection = connection;
         self.sync_connection_banner(cx);
@@ -555,97 +588,29 @@ impl Workspace {
         cx.notify();
     }
 
-    fn client(&self) -> Option<RpcClient> {
-        match &self.connection {
-            Connection::Connected(client) => Some(client.clone()),
-            _ => None,
-        }
-    }
-
-    /// The connected server's HTTP origin, for its routes and signed asset URLs.
-    fn http_base(&self) -> Option<&str> {
-        self.endpoint.as_ref().map(|e| e.http_base.as_str())
-    }
-
-    fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
-        self.connection = Connection::Connected(client.clone());
+    fn on_connected(
+        &mut self,
+        client: RpcClient,
+        endpoint: backend::Endpoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connection = Connection::Connected;
+        self.set_primary_connection(Some(client.clone()), Some(endpoint));
         // Read per connection: the files may have changed, or never loaded while down.
         self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
         self.page_opened(cx);
-        let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
-        self._stream_tasks = vec![Self::pump(
-            config,
-            window,
-            cx,
-            |this, value| {
-                if let Err(error) = this.server_info.apply(value) {
-                    log::warn!("bad server config event: {error}");
-                }
-                if let Some(reload) = this.reload_toasts.handle(value, std::time::Instant::now()) {
-                    this.pending_reload = Some(reload);
-                }
-            },
-            |this, window, cx| {
-                this.sync_keymap(cx);
-                this.show_reload_toast(window, cx);
-                this.notify_sidebar(cx);
-                this.check_chatgpt_welcome(window, cx);
-                // Skills arrive with provider updates.
-                this.refresh_menu_items(cx);
-                this.report_browser_profiles(cx);
-            },
-        )];
-        let devices = self.subscribe_device_state(window, cx);
-        self._stream_tasks.push(devices);
-        self.shell_retried = false;
-        self.subscribe_terminal_metadata(&client, window, cx);
-        self.subscribe_shell(window, cx);
-        self.subscribe_thread(window, cx);
-        self.subscribe_previews(window, cx);
-        cx.notify();
-    }
-
-    fn subscribe_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        let mut input = json!({"requestCompletionMarker": true});
-        if self.shell.sequence > 0 {
-            input["afterSequence"] = self.shell.sequence.into();
+        if let Some(primary) = self.primary_environment().cloned() {
+            self.start_session(primary, window, cx);
         }
-        let stream = client.stream("orchestration.subscribeShell", input);
-        self._shell_task = Some(Self::pump(
-            stream,
-            window,
-            cx,
-            |this, value| {
-                if let Err(error) = this.shell.apply(value) {
-                    log::warn!("bad shell event: {error}");
-                    this.shell_snapshot_failed = true;
-                }
-            },
-            |this, window, cx| {
-                // The reducer reset its cursor, so one resubscribe fetches a fresh snapshot.
-                if std::mem::take(&mut this.shell_snapshot_failed) {
-                    if !std::mem::replace(&mut this.shell_retried, true) {
-                        this.subscribe_shell(window, cx);
-                        return;
-                    }
-                    this.error =
-                        Some("Couldn't read the thread list from the server. Restart T3 Code to retry.".into());
-                } else if this.shell.sequence > 0 {
-                    this.shell_retried = false;
-                }
-                this.land(window, cx);
-                this.open_pending_links(window, cx);
-                this.keep_running_threads(cx);
-                this.observe_alerts(window, cx);
-                this.observe_inbox_while_hidden();
-                this.notify_sidebar(cx);
-                this.track_visit(cx);
-                this.sync_now(cx);
-                this.sync_child_approvals(cx);
-            },
-        ));
+        self._stream_tasks = vec![self.subscribe_device_state(window, cx)];
+        self.subscribe_terminal_metadata(&client, window, cx);
+        self.subscribe_previews(window, cx);
+        // Rows that come back unchanged would not resync these.
+        self.sync_worktree_setup(cx);
+        self.sync_details(cx);
+        cx.notify();
     }
 
     /// Applies every event already queued on `stream`, then runs `after_batch`
@@ -745,7 +710,8 @@ impl Workspace {
     /// Electron always opens the index route, which starts a draft in the most
     /// recently active project (`IndexDraftLanding`); this is that landing.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.landed || self.shell.sequence == 0 {
+        let primary_sequence = self.primary_environment().map_or(0, |id| self.shell.sequence(id));
+        if self.landed || primary_sequence == 0 {
             return;
         }
         self.landed = true;
@@ -793,6 +759,7 @@ impl Workspace {
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);
         self.sync_details(cx);
+        self.prune_requests();
         self.scroller.update(cx, |scroller, cx| {
             if was_empty {
                 scroller.reset(total, cx);
@@ -802,8 +769,15 @@ impl Workspace {
         });
     }
 
+    /// Opens a listed thread on the environment it lives on.
     fn select_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
+        let Some(env) = self.thread_environment(&thread_id) else { return };
+        self.select_thread_in(env, thread_id, window, cx);
+    }
+
+    fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = Target::Thread { env, id: thread_id.clone() };
+        if self.target.as_ref() == Some(&target) {
             if self.page.take().is_some() {
                 self.record_location();
                 cx.notify();
@@ -812,7 +786,7 @@ impl Workspace {
         }
         self.page = None;
         self.stash_composer(cx);
-        self.target = Some(Target::Thread(thread_id.clone()));
+        self.target = Some(target);
         if let Some(old) = self.thread.take() {
             self.retire_thread(old.id, old.state, cx);
         }
@@ -841,9 +815,10 @@ impl Workspace {
     }
 
     fn start_draft(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(env) = self.project_environment(&project_id) else { return };
         self.page = None;
         self.stash_composer(cx);
-        self.target = Some(Target::Draft { project_id });
+        self.target = Some(Target::Draft { env, project_id });
         if let Some(old) = self.thread.take() {
             self.retire_thread(old.id, old.state, cx);
         }
@@ -863,6 +838,7 @@ impl Workspace {
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
+        self.markdown_images = markdown_images::ImageCache::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
@@ -878,10 +854,12 @@ impl Workspace {
             return Some(selection.clone());
         }
         match &self.target {
-            Some(Target::Thread(_)) => self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.clone(),
-            Some(Target::Draft { project_id }) => {
+            Some(Target::Thread { .. }) => {
+                self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.clone()
+            }
+            Some(Target::Draft { project_id, .. }) => {
                 let default =
-                    self.server_info.new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))?;
+                    self.server_info().new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))?;
                 Some(self.draft_usage_fallback(&default).map_or(default, |fallback| fallback.selection))
             }
             None => None,
@@ -891,7 +869,7 @@ impl Workspace {
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let thread_id = projection.thread.id.clone();
-        let command = if self.server_info.capability("threadStop") {
+        let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
@@ -938,7 +916,7 @@ impl Workspace {
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.command_client(&command) else { return };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
                 let _ = this.update(cx, |this, cx| {
@@ -1071,7 +1049,7 @@ impl Render for Workspace {
                                             return el.child(page);
                                         }
                                         match self.target.clone() {
-                                            Some(Target::Draft { project_id }) => el
+                                            Some(Target::Draft { project_id, .. }) => el
                                                 .child(self.render_draft_stage(&project_id, window, cx))
                                                 .children(self.render_details_card(window, cx)),
                                             _ => el

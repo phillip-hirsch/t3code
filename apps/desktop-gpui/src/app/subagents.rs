@@ -52,7 +52,7 @@ impl Workspace {
     /// Reads the pending approvals of each child that asks for one; the shell only says that it does.
     pub(super) fn sync_child_approvals(&mut self, cx: &mut Context<Self>) {
         let parent = match &self.target {
-            Some(Target::Thread(id)) => id.clone(),
+            Some(Target::Thread { id, .. }) => id.clone(),
             _ => {
                 self.subagents.approvals.clear();
                 return;
@@ -82,16 +82,25 @@ impl Workspace {
             }
             let Some(client) = self.client() else { return };
             let input = json!({"threadId": thread_id});
+            let parent = parent.clone();
             self.subagents._fetches.push(cx.spawn(async move |this, cx| {
                 let result = client.request("orchestration.getThreadProjection", input).await;
                 let _ = this.update(cx, |this, cx| {
                     this.subagents.fetching.remove(&key);
-                    let Ok(projection) = result
+                    let projection = match result
                         .map_err(|e| e.to_string())
                         .and_then(|value| serde_json::from_value::<ThreadProjection>(value).map_err(|e| e.to_string()))
-                    else {
-                        return;
+                    {
+                        Ok(projection) => projection,
+                        Err(error) => {
+                            log::warn!("child approvals for {thread_id}: {error}");
+                            return;
+                        }
                     };
+                    // The user moved to another thread while this read ran.
+                    if this.open_thread_id() != Some(parent.as_str()) {
+                        return;
+                    }
                     let requests: Vec<(RuntimeRequest, Option<TurnItem>)> = projection
                         .pending_approvals()
                         .into_iter()
@@ -314,8 +323,8 @@ impl Workspace {
     pub(super) fn render_provider_subagent_bar(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let projection = self.open_provider_subagent()?;
         let selection = projection.thread.model_selection.as_ref();
-        let provider = selection.and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = selection.and_then(|s| self.server_info.model(s));
+        let provider = selection.and_then(|s| self.server_info().provider(&s.instance_id));
+        let model = selection.and_then(|s| self.server_info().model(s));
         let driver = provider.map(|p| p.driver.as_str()).unwrap_or_default();
         let name = match (selection, model) {
             (_, Some(model)) => model_label::trigger_model_name(model, driver),
@@ -437,7 +446,7 @@ impl gpui_kit::Render for NativeWork {
             None => note("Loading…".into(), t.muted_foreground).into_any_element(),
             Some(Err(error)) => note(error.to_string(), t.error_foreground).into_any_element(),
             Some(Ok(value)) => {
-                let children = value["children"].as_array().cloned().unwrap_or_default();
+                let children = value["children"].as_array().map(Vec::as_slice).unwrap_or_default();
                 if children.is_empty() {
                     note("The provider has no record of which subagents this call started.".into(), t.muted_foreground)
                         .into_any_element()
@@ -607,7 +616,7 @@ fn format_status(status: Option<(String, Option<String>, Option<String>)>, now_m
     if !live && status != "completed" {
         return label.into();
     }
-    let parse = |at: Option<&str>| at.and_then(crate::work_log::parse_iso_ms);
+    let parse = |at: Option<&str>| at.and_then(crate::timestamp::parse_ms);
     let (Some(start), Some(end)) =
         (parse(started.as_deref()), if live { Some(now_ms) } else { parse(completed.as_deref()) })
     else {
@@ -627,7 +636,7 @@ mod tests {
 
     #[test]
     fn subagent_status_reads_like_the_web() {
-        let start = crate::work_log::parse_iso_ms("2026-01-01T00:00:00Z").unwrap();
+        let start = crate::timestamp::parse_ms("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(format_status(None, 0), "Starting");
         assert_eq!(format_status(status("running", None), start + 12_400), "Working 12s");
         assert_eq!(format_status(status("completed", Some("2026-01-01T00:03:02Z")), 0), "Completed in 3m 2s");

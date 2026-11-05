@@ -22,12 +22,44 @@ use crate::work_log::Entry;
 
 /// Output of the open entries, by entry id.
 #[derive(Default)]
-pub(super) struct Details(HashMap<SharedString, Detail>);
+pub(super) struct Details {
+    loads: HashMap<SharedString, Detail>,
+    /// Open tools' input and output as text, formatted once per item change, not per frame.
+    tools: HashMap<SharedString, ToolText>,
+}
+
+/// What a tool entry shows, formatted from `item` (the streamed or the fetched one).
+struct ToolText {
+    item: Rc<TurnItem>,
+    input: Option<ToolInput>,
+    output: Option<SharedString>,
+}
+
+enum ToolInput {
+    /// `key value` lines, with the key's length for its muted highlight.
+    Lines(Vec<(usize, SharedString)>),
+    Text(SharedString),
+}
+
+impl ToolText {
+    fn new(item: Rc<TurnItem>) -> Self {
+        let input = item.raw.get("input").and_then(|input| match arg_lines(input) {
+            Some(lines) => Some(ToolInput::Lines(
+                lines.into_iter().map(|(key, value)| (key.len(), format!("{key} {value}").into())).collect(),
+            )),
+            None => format_value(input.get("summary").unwrap_or(input)).map(|text| ToolInput::Text(text.into())),
+        });
+        let output = item.raw.get("output").and_then(format_value).map(Into::into);
+        Self { item, input, output }
+    }
+}
 
 enum Detail {
     /// `orchestration.subscribeCommandOutput`, folded as a terminal shows it.
     Output {
         output: TerminalText,
+        /// `output` as one string, rebuilt when frames land.
+        text: SharedString,
         loaded: bool,
         running: bool,
         error: Option<SharedString>,
@@ -92,7 +124,7 @@ fn open_entries(rows: &[Row]) -> impl Iterator<Item = &Rc<Entry>> {
         match row {
             Row::Work(WorkRow { kind: WorkRowKind::Single { entry, expanded: true, .. }, .. }) => vec![entry],
             Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
-                entries.iter().filter(|(_, open)| *open).map(|(entry, _)| entry).collect()
+                entries.iter().filter(|detail| detail.expanded).map(|detail| &detail.entry).collect()
             }
             _ => Vec::new(),
         }
@@ -102,13 +134,17 @@ fn open_entries(rows: &[Row]) -> impl Iterator<Item = &Rc<Entry>> {
 impl Workspace {
     /// Starts loading the output of entries that just opened and drops it for closed ones.
     pub(super) fn sync_details(&mut self, cx: &mut Context<Self>) {
-        let streams_output = self.server_info.capability("commandOutputStreaming");
+        let streams_output = self.server_info().capability("commandOutputStreaming");
         let open: Vec<Rc<Entry>> = open_entries(&self.rows).filter(|entry| has_inspector(entry)).cloned().collect();
-        self.details.0.retain(|id, _| open.iter().any(|entry| entry.id == *id));
+        self.details.loads.retain(|id, _| open.iter().any(|entry| entry.id == *id));
+        self.details.tools.retain(|id, _| open.iter().any(|entry| entry.id == *id));
+        for entry in &open {
+            self.details.format_tool(entry);
+        }
         for entry in open {
             let item = entry.item.0.clone();
             let streams = item.item_type == "command_execution" && streams_output;
-            match self.details.0.get(&entry.id) {
+            match self.details.loads.get(&entry.id) {
                 Some(Detail::Output { .. }) => continue,
                 Some(Detail::Item { revision: current, .. }) if *current == revision(&item) => continue,
                 _ => {}
@@ -124,8 +160,8 @@ impl Workspace {
                         let mut events = vec![first];
                         events.extend(std::iter::from_fn(|| stream.try_next()));
                         let alive = this.update(cx, |this, cx| {
-                            if let Some(Detail::Output { output, loaded, running, error, scroll, .. }) =
-                                this.details.0.get_mut(&id)
+                            if let Some(Detail::Output { output, text, loaded, running, error, scroll, .. }) =
+                                this.details.loads.get_mut(&id)
                             {
                                 let following = scroll.offset().y.abs() + px(8.) >= scroll.max_offset().y;
                                 for event in events {
@@ -135,6 +171,7 @@ impl Workspace {
                                         StreamEvent::End(Ok(())) => *running = false,
                                     }
                                 }
+                                *text = output.text_content().into();
                                 *loaded = true;
                                 if following {
                                     scroll.scroll_to_bottom();
@@ -149,6 +186,7 @@ impl Workspace {
                 });
                 Detail::Output {
                     output: TerminalText::default(),
+                    text: SharedString::default(),
                     loaded: false,
                     running: true,
                     error: None,
@@ -168,8 +206,12 @@ impl Workspace {
                         Err(error) => Fetch::Failed(error.to_string().into()),
                     };
                     let _ = this.update(cx, |this, cx| {
-                        if let Some(Detail::Item { fetched: slot, .. }) = this.details.0.get_mut(&id) {
+                        if let Some(Detail::Item { fetched: slot, .. }) = this.details.loads.get_mut(&id) {
                             *slot = fetched;
+                            let entry = open_entries(&this.rows).find(|entry| entry.id == id).cloned();
+                            if let Some(entry) = entry {
+                                this.details.format_tool(&entry);
+                            }
                             cx.notify();
                         }
                     });
@@ -178,7 +220,7 @@ impl Workspace {
             } else {
                 continue;
             };
-            self.details.0.insert(entry.id.clone(), detail);
+            self.details.loads.insert(entry.id.clone(), detail);
         }
     }
 
@@ -187,6 +229,28 @@ impl Workspace {
         let projection = self.thread.as_ref()?.state.projection.as_ref()?;
         let row = projection.visible_turn_items.iter().find(|row| row.item.id == item_id)?;
         Some((row.source_thread_id.clone(), row.source_item_id.clone()))
+    }
+}
+
+impl Details {
+    /// The item an entry shows: the fetched one once it loads, else the streamed one.
+    fn shown_item(&self, entry: &Entry) -> Rc<TurnItem> {
+        match self.loads.get(&entry.id) {
+            Some(Detail::Item { fetched: Fetch::Loaded(Some(item)), .. })
+                if item.item_type == entry.item.0.item_type =>
+            {
+                item.clone()
+            }
+            _ => entry.item.0.clone(),
+        }
+    }
+
+    /// Formats a tool entry's text unless it is current for the item it shows.
+    fn format_tool(&mut self, entry: &Entry) {
+        let item = self.shown_item(entry);
+        if !self.tools.get(&entry.id).is_some_and(|text| Rc::ptr_eq(&text.item, &item)) {
+            self.tools.insert(entry.id.clone(), ToolText::new(item));
+        }
     }
 }
 
@@ -254,35 +318,41 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
     }
     let workspace = this.upgrade()?;
     let workspace = workspace.read(cx);
-    let detail = workspace.details.0.get(&entry.id);
-    let fetched = match detail {
-        Some(Detail::Item { fetched: Fetch::Loaded(Some(item)), .. }) if item.item_type == entry.item.0.item_type => {
-            Some(item.clone())
+    let detail = workspace.details.loads.get(&entry.id);
+    let item = workspace.details.shown_item(entry);
+    // Filled by `sync_details`; formatting here covers a frame that runs before it.
+    let formatted;
+    let tool = match workspace.details.tools.get(&entry.id).filter(|text| Rc::ptr_eq(&text.item, &item)) {
+        Some(tool) => tool,
+        None => {
+            formatted = ToolText::new(item.clone());
+            &formatted
         }
-        _ => None,
     };
-    let item = fetched.unwrap_or_else(|| entry.item.0.clone());
     let foreground = gpui_kit::Hsla { a: t.foreground.a * 0.85, ..t.foreground };
     let mut body = v_flex().gap(px(6.));
     if item.item_type == "command_execution" {
         if let Some(command) = item.str("input").map(str::trim).filter(|c| !c.is_empty()) {
             body = body.child(mono().text_color(foreground).child(control_pictures(command)));
         }
-    } else if let Some(input) = item.raw.get("input") {
-        if let Some(lines) = arg_lines(input) {
-            body = body.child(mono().text_color(foreground).children(lines.into_iter().map(|(key, value)| {
-                div().child(gpui_kit::StyledText::new(format!("{key} {value}")).with_highlights([(
-                    0..key.len(),
-                    gpui_kit::HighlightStyle { color: Some(t.muted_foreground), ..Default::default() },
-                )]))
-            })));
-        } else if let Some(text) = format_value(input.get("summary").unwrap_or(input)) {
-            body = body.child(structured(&format!("args:{}", entry.id), text, t));
+    } else {
+        match &tool.input {
+            Some(ToolInput::Lines(lines)) => {
+                body = body.child(mono().text_color(foreground).children(lines.iter().map(|(key_len, line)| {
+                    div().child(gpui_kit::StyledText::new(line.clone()).with_highlights([(
+                        0..*key_len,
+                        gpui_kit::HighlightStyle { color: Some(t.muted_foreground), ..Default::default() },
+                    )]))
+                })));
+            }
+            Some(ToolInput::Text(text)) => {
+                body = body.child(structured(&format!("args:{}", entry.id), text.clone(), t));
+            }
+            None => {}
         }
     }
     let output_slot: Option<AnyElement> = match detail {
-        Some(Detail::Output { output, loaded, running, error, scroll, .. }) => {
-            let text = output.text_content();
+        Some(Detail::Output { output, text, loaded, running, error, scroll, .. }) => {
             if text.is_empty() {
                 match (error, loaded, running) {
                     (Some(error), _, _) => {
@@ -304,7 +374,7 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
                                 .overflow_y_scroll()
                                 .track_scroll(scroll)
                                 .text_color(t.muted_foreground)
-                                .child(text),
+                                .child(text.clone()),
                         )
                         .into_any_element(),
                 )
@@ -319,8 +389,8 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
         Some(Detail::Item { fetched: Fetch::Loaded(None), .. }) => {
             Some(note("Output is no longer available.", t.muted_foreground).into_any_element())
         }
-        _ => match item.raw.get("output").and_then(format_value) {
-            Some(text) => Some(structured(&format!("result:{}", entry.id), text, t).into_any_element()),
+        _ => match &tool.output {
+            Some(text) => Some(structured(&format!("result:{}", entry.id), text.clone(), t).into_any_element()),
             None if matches!(detail, Some(Detail::Item { .. })) => {
                 Some(note("No output.", t.muted_foreground).into_any_element())
             }
@@ -335,7 +405,7 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
 }
 
 /// `StructuredValue`: a scrolling block of muted mono text.
-fn structured(id: &str, text: String, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+fn structured(id: &str, text: SharedString, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     mono()
         .id(ElementId::Name(id.to_owned().into()))
         .max_h(px(320.))
@@ -378,13 +448,13 @@ mod tests {
             &mut running,
             &json!({"kind": "append", "text": "b", "truncated": false, "running": true}),
         );
-        assert_eq!((output.text_content().as_str(), output.truncated, running), ("a\nb", true, true));
+        assert_eq!((&*output.text_content(), output.truncated, running), ("a\nb", true, true));
         apply_frame(
             &mut output,
             &mut running,
             &json!({"kind": "replace", "text": "done", "truncated": false, "running": false}),
         );
-        assert_eq!((output.text_content().as_str(), output.truncated, running), ("done", true, false));
+        assert_eq!((&*output.text_content(), output.truncated, running), ("done", true, false));
     }
 
     #[test]
