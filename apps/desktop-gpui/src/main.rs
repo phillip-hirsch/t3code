@@ -7,6 +7,7 @@ mod model_label;
 mod new_thread;
 mod requests;
 mod rpc;
+mod settings;
 mod theme;
 mod timeline;
 mod work_log;

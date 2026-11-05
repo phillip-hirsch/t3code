@@ -2,7 +2,7 @@
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
 mod pull_requests;
-mod settings;
+pub(super) mod settings;
 mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
@@ -105,6 +105,7 @@ impl Workspace {
     }
 
     pub(super) fn open_settings(&mut self, section: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.focus_settings_on_open();
         self.settings = Some(section.into());
         self.record_location();
         cx.notify();

@@ -173,6 +173,9 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The full `ServerSettings`; see `crate::settings`.
+    pub settings: crate::settings::Settings,
+    pub environment_id: Option<String>,
 }
 
 impl ServerInfo {
@@ -186,6 +189,7 @@ impl ServerInfo {
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
+                self.environment_id = text("/environment/environmentId");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
             }
@@ -196,7 +200,8 @@ impl ServerInfo {
         Ok(())
     }
 
-    fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+    pub fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.settings = crate::settings::Settings::layered(&crate::settings::contract().server_defaults, settings);
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
         self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
