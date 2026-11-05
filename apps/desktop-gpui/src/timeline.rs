@@ -436,7 +436,14 @@ fn is_resource_card(item_type: &str) -> bool {
 /// Entries from the previous refresh, reused while their item's revision is
 /// unchanged, so a streamed delta rebuilds only its own item.
 #[derive(Default)]
-pub struct EntryCache(HashMap<String, (u64, Rc<TimelineEntry>)>);
+pub struct EntryCache(HashMap<String, (u64, Rc<TimelineEntry>)>, HashMap<SharedString, Vec<SharedString>>);
+
+impl EntryCache {
+    /// The closed folds ([`fold_key`], [`attempt_key`]) hiding item `item_id` in the last rows built.
+    pub fn folds_hiding(&self, item_id: &str) -> &[SharedString] {
+        self.1.get(item_id).map_or(&[], Vec::as_slice)
+    }
+}
 
 fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Vec<Rc<TimelineEntry>> {
     let mut next = HashMap::with_capacity(cache.0.len());
@@ -979,6 +986,14 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         .flat_map(|fold| fold.hidden.iter().copied())
         .collect();
     collapsed.retain(|index| !entries[*index].work().is_some_and(|e| is_pending(e)));
+    let closed_folds = folds.values().map(|fold| (fold_key(&fold.key), &fold.hidden));
+    let closed_attempts = attempt_folds.values().map(|fold| (fold.key.clone(), &fold.hidden));
+    cache.1.clear();
+    for (key, hidden) in closed_folds.chain(closed_attempts).filter(|(key, _)| !expanded.contains(key)) {
+        for index in hidden {
+            cache.1.entry(entries[*index].id.clone()).or_default().push(key.clone());
+        }
+    }
 
     let is_active_response = |run: Option<&SharedString>| run.is_some_and(|run| active_responses.contains(run));
     let in_active_run = |entry: &Entry| {

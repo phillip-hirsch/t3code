@@ -258,7 +258,7 @@ fn shortcut_key_label(key: &str) -> String {
 }
 
 /// `shortcutLabelForCommand` / `formatShortcutLabel` for this platform.
-pub(super) fn shortcut_label_for_command(keybindings: &Value, command: Option<&str>) -> Option<String> {
+pub(in crate::app) fn shortcut_label_for_command(keybindings: &Value, command: Option<&str>) -> Option<String> {
     let shortcut = shortcuts_for(keybindings, command?).next_back()?;
     let key = shortcut_key_label(shortcut.get("key").and_then(Value::as_str)?);
     let mac = cfg!(target_os = "macos");

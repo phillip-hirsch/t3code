@@ -38,6 +38,7 @@ pub(super) struct MessageMatch {
     pub(super) thread_id: String,
     pub(super) user: bool,
     pub(super) snippet: String,
+    pub(super) message_id: Option<String>,
     pub(super) at: Option<String>,
 }
 
@@ -68,6 +69,14 @@ enum Run {
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
+    /// Find in the open thread (`chat.find`).
+    Find,
+    /// A message hit: opens its thread with find on the query, at the message.
+    FindIn {
+        thread_id: String,
+        query: String,
+        message_id: Option<String>,
+    },
 }
 
 enum RowIcon {
@@ -92,6 +101,8 @@ struct Row {
     shortcut: Option<SharedString>,
     chevron: bool,
     run: Run,
+    /// Keywords that match besides the title (`searchTerms`).
+    terms: &'static [&'static str],
     /// Ranking, while a query is typed.
     quality: f32,
 }
@@ -108,6 +119,7 @@ impl Row {
             shortcut: None,
             chevron: false,
             run,
+            terms: &[],
             quality: 0.,
         }
     }
@@ -370,6 +382,7 @@ impl Workspace {
                             thread_id: m["threadId"].as_str()?.to_owned(),
                             user: m["source"] == "user",
                             snippet: m["snippet"].as_str()?.to_owned(),
+                            message_id: m["messageId"].as_str().map(str::to_owned),
                             at: m["messageCreatedAt"].as_str().map(str::to_owned),
                         })
                     })
@@ -408,6 +421,13 @@ impl Workspace {
             .collect()
     }
 
+    /// The live shortcut label of `command` (`shortcutCommand`).
+    fn shortcut(&self, command: &str) -> Option<SharedString> {
+        let keybindings = self.server_info.keybindings_json();
+        super::pages::settings::code::projects::scripts::shortcut_label_for_command(keybindings, Some(command))
+            .map(Into::into)
+    }
+
     fn action_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         let current =
@@ -420,7 +440,8 @@ impl Workspace {
                 Run::NewThread(project.id.clone()),
             );
             row.strong = Some(project_name(project));
-            row.shortcut = Some("Ctrl+Shift+N".into());
+            row.terms = &["new thread", "chat", "create", "draft"];
+            row.shortcut = self.shortcut("chat.newLocal");
             rows.push(row);
         }
         if !self.shell.projects.is_empty() {
@@ -431,6 +452,18 @@ impl Workspace {
                 Run::Open(View::NewThreadIn),
             );
             row.chevron = true;
+            row.terms = &["new thread", "project", "pick", "choose", "select"];
+            rows.push(row);
+        }
+        if matches!(self.target, Some(Target::Thread(_))) && self.thread_find_available() {
+            let mut row = Row::new(
+                "find-current-thread",
+                RowIcon::Lucide(IconName::TextSearch),
+                "Find in current thread",
+                Run::Find,
+            );
+            row.terms = &["find", "search", "messages", "plans"];
+            row.shortcut = self.shortcut("chat.find");
             rows.push(row);
         }
         rows.push(Row::new(
@@ -447,7 +480,7 @@ impl Workspace {
         ));
         let mut usage =
             Row::new("usage", RowIcon::Lucide(IconName::ChartNoAxesColumn), "Open usage", Run::Page(Page::Usage));
-        usage.shortcut = Some("Ctrl+U".into());
+        usage.shortcut = self.shortcut("usage.open");
         rows.push(usage);
         rows.push(Row::new("settings", RowIcon::Lucide(IconName::Settings), "Open settings", Run::Settings("general")));
         if let Some(project) = current {
@@ -623,6 +656,11 @@ impl Workspace {
                 let thread = self.palette_threads().find(|t| t.id == m.thread_id)?;
                 let mut row = self.thread_row(thread, now);
                 row.key = format!("message-{}-{}", m.thread_id, m.at.as_deref().unwrap_or_default()).into();
+                row.run = Run::FindIn {
+                    thread_id: m.thread_id.clone(),
+                    query: super::find::query_for_message(&m.snippet, query),
+                    message_id: m.message_id.clone(),
+                };
                 let ranges = search::token_ranges(&m.snippet, query);
                 row.description = Some(Description::Snippet(m.user, search::split_ranges(&m.snippet, &ranges)));
                 row.time = m.at.as_deref().and_then(inbox::parse_ms).map(|at| ago(now - at));
@@ -737,6 +775,11 @@ impl Workspace {
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Page(page) => self.open_page(page, cx),
+            Run::Find => self.open_thread_find_or_explain(window, cx),
+            Run::FindIn { thread_id, query, message_id } => {
+                self.select_thread(thread_id, window, cx);
+                self.open_thread_find_on(&query, message_id, window, cx);
+            }
             Run::Open(_) | Run::BrowseTo(_) => {}
         }
     }
@@ -1270,6 +1313,7 @@ fn row_clone(row: &Row) -> Row {
         shortcut: row.shortcut.clone(),
         chevron: row.chevron,
         run: row.run.clone(),
+        terms: row.terms,
         quality: row.quality,
     }
 }
@@ -1283,8 +1327,11 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
                 Some(strong) => format!("{} {strong}", row.title),
                 None => row.title.to_string(),
             };
-            let field = Field::new(&title);
-            let found = search::match_fields(tokens, &[Weighted::new(&field, 1.)], typos)?;
+            // The title names the item; its terms are keywords, the best one counts.
+            let found = std::iter::once(title.as_str())
+                .chain(row.terms.iter().copied())
+                .filter_map(|text| search::match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos))
+                .max_by(|a, b| a.quality.total_cmp(&b.quality))?;
             row.quality = found.quality;
             Some((row, found.strong))
         })

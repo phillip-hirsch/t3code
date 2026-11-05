@@ -184,7 +184,7 @@ impl Workspace {
         let inline = self.details_inline(window);
         let viewport = window.viewport_size();
         let available = if inline {
-            f32::from(viewport.height - TITLEBAR_HEIGHT) - CARD_INSET * 2.
+            f32::from(viewport.height - TITLEBAR_HEIGHT) - CARD_INSET * 2. - self.find_bar_inset()
         } else {
             f32::from(viewport.height) - 104.
         };
@@ -255,7 +255,7 @@ impl Workspace {
             return Some(
                 div()
                     .absolute()
-                    .top(px(CARD_INSET))
+                    .top(px(CARD_INSET + self.find_bar_inset()))
                     .bottom(px(CARD_INSET))
                     .right(px(CARD_INSET))
                     .w(px(CARD_WIDTH))
