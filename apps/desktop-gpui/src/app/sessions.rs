@@ -190,6 +190,11 @@ impl Workspace {
         self.env_client(&self.project_environment(project_id)?)
     }
 
+    /// The address of the environment a listed project lives on, for its HTTP routes.
+    pub(super) fn project_endpoint(&self, project_id: &str) -> Option<&Endpoint> {
+        self.session(&self.project_environment(project_id)?)?.endpoint.as_ref()
+    }
+
     /// The socket for an orchestration command: its thread's environment, else its project's.
     pub(super) fn command_client(&self, command: &Value) -> Option<RpcClient> {
         if let Some(thread_id) = command.get("threadId").and_then(Value::as_str) {
@@ -259,6 +264,7 @@ impl Workspace {
             self.subscribe_thread(window, cx);
         }
         self.subscribe_shell(environment_id, window, cx);
+        self.sync_pull_request_refreshes(cx);
     }
 
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {

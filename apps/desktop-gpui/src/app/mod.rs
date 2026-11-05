@@ -580,7 +580,6 @@ impl Workspace {
                 thread._subscription = None;
             }
             self.side_chat.disconnect();
-            self.unfollow_pull_requests();
         }
         self.connection = connection;
         self.sync_connection_banner(cx);

@@ -338,12 +338,9 @@ impl Workspace {
         self.project_client(&panel.reference.project_id)
     }
 
-    /// The socket of the shown pull request's machine.
+    /// The socket of the shown pull request's machine; none while no pull request is shown.
     pub(in crate::app) fn pull_request_client(&self) -> Option<RpcClient> {
-        match &self.pull_requests.panel {
-            Some(panel) => self.project_client(&panel.reference.project_id),
-            None => self.client(),
-        }
+        self.project_client(&self.pull_requests.panel.as_ref()?.reference.project_id)
     }
 
     fn shown_pr_key(&self) -> Option<String> {
@@ -498,7 +495,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.pull_request_client() else { return };
+        let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
