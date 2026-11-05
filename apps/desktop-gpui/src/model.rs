@@ -120,6 +120,8 @@ pub struct Provider {
     pub installed: bool,
     #[serde(default)]
     pub runtime_paths: Option<RuntimePaths>,
+    #[serde(default)]
+    pub supports_text_generation: Option<bool>,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
@@ -183,12 +185,12 @@ impl UsageWindow {
 }
 
 impl Provider {
-    fn is_selectable(&self) -> bool {
+    pub fn is_selectable(&self) -> bool {
         self.enabled && self.availability.as_deref() != Some("unavailable")
     }
 
     /// `getDefaultProviderInstanceModel` in `apps/web/src/providerInstances.ts`.
-    fn default_model(&self) -> Option<&str> {
+    pub fn default_model(&self) -> Option<&str> {
         self.models
             .iter()
             .find(|m| m.is_default == Some(true) && !m.is_custom)
@@ -224,6 +226,8 @@ pub struct ServerInfo {
     /// The raw `ServerProvider` records, for settings pages that edit them.
     pub providers_json: Vec<Value>,
     pub platform_os: Option<String>,
+    /// `environment.capabilities` from the config snapshot.
+    pub capabilities: Value,
 }
 
 impl ServerInfo {
@@ -243,6 +247,7 @@ impl ServerInfo {
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
                 self.platform_os = text("/environment/platform/os");
+                self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
             }
             "providerStatuses" => {
                 self.providers = lossy(&event["payload"]["providers"])?;

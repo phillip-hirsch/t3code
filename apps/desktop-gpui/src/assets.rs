@@ -21,6 +21,14 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/mac-mini.svg", include_bytes!("../assets/icons/mac-mini.svg")),
     ("icons/app/mac-studio.svg", include_bytes!("../assets/icons/mac-studio.svg")),
     ("icons/app/onepassword.svg", include_bytes!("../assets/icons/onepassword.svg")),
+    ("icons/app/source-control/azure-devops.svg", include_bytes!("../assets/icons/source-control/azure-devops.svg")),
+    ("icons/app/source-control/bitbucket.svg", include_bytes!("../assets/icons/source-control/bitbucket.svg")),
+    ("icons/app/source-control/forgejo.svg", include_bytes!("../assets/icons/source-control/forgejo.svg")),
+    ("icons/app/source-control/git.svg", include_bytes!("../assets/icons/source-control/git.svg")),
+    ("icons/app/source-control/gitcafe.svg", include_bytes!("../assets/icons/source-control/gitcafe.svg")),
+    ("icons/app/source-control/github.svg", include_bytes!("../assets/icons/source-control/github.svg")),
+    ("icons/app/source-control/gitlab.svg", include_bytes!("../assets/icons/source-control/gitlab.svg")),
+    ("icons/app/source-control/jj.svg", include_bytes!("../assets/icons/source-control/jj.svg")),
 ];
 
 /// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
@@ -59,6 +67,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "folder-plus",
     "folder-tree",
     "git-branch",
+    "git-pull-request",
     "git-pull-request-arrow",
     "hammer",
     "key-round",
