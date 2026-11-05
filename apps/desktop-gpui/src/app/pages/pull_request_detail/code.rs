@@ -88,6 +88,19 @@ impl CodeTab {
         }
     }
 
+    /// The first page of the diff has been read.
+    pub(super) fn loaded(&self) -> bool {
+        !self.slices.is_empty()
+    }
+
+    /// Unfolds a file and scrolls the viewer to it.
+    pub(super) fn reveal(&self, path: &str, cx: &mut App) {
+        self.diff.update(cx, |state, cx| {
+            state.set_file_collapsed(path, false, cx);
+            state.scroll_to_file(path, cx);
+        });
+    }
+
     pub(super) fn commit_selected(&self) -> bool {
         self.commit.is_some()
     }

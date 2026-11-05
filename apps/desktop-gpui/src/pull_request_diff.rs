@@ -31,11 +31,12 @@ enum Change {
     Context,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Line {
     change: Change,
     old: u64,
     new: u64,
+    text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -90,7 +91,7 @@ pub fn index_patch(patch: &str) -> Vec<FilePatch> {
                 Some(b'\\') => continue,
                 _ => Change::Context,
             };
-            hunk.lines.push(Line { change, old: at.0, new: at.1 });
+            hunk.lines.push(Line { change, old: at.0, new: at.1, text: line.get(1..).unwrap_or_default().to_owned() });
             if change != Change::Added {
                 at.0 += 1;
                 remaining.0 = remaining.0.saturating_sub(1);
@@ -174,7 +175,7 @@ fn find_line(file: &FilePatch, side: Side, line: u64) -> Option<(usize, usize, L
                 Side::Right => entry.change != Change::Deleted && entry.new == line,
             };
             if hit {
-                return Some((index, hunk_index, *entry));
+                return Some((index, hunk_index, entry.clone()));
             }
             index += 1;
         }
@@ -209,6 +210,58 @@ pub fn review_anchor(
         return Some((last, None));
     }
     Some(if start_index < end_index { (last, Some(first)) } else { (first, Some(last)) })
+}
+
+/// One line of a file's diff (`DiffRow`), for showing a few lines of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    /// `+`, `-` or a space.
+    pub mark: char,
+    pub old: Option<u64>,
+    pub new: Option<u64>,
+    pub text: String,
+    pub hunk: usize,
+}
+
+/// `fileDiffRows`.
+pub fn file_rows(file: &FilePatch) -> Vec<Row> {
+    file.hunks
+        .iter()
+        .enumerate()
+        .flat_map(|(hunk, h)| {
+            h.lines.iter().map(move |line| Row {
+                mark: match line.change {
+                    Change::Added => '+',
+                    Change::Deleted => '-',
+                    Change::Context => ' ',
+                },
+                old: (line.change != Change::Added).then_some(line.old),
+                new: (line.change != Change::Deleted).then_some(line.new),
+                text: line.text.clone(),
+                hunk,
+            })
+        })
+        .collect()
+}
+
+/// `excerptRows`: the lines a guide excerpt names, with the removed lines an added run replaced
+/// (or the added lines a removed run became) kept beside them.
+pub fn excerpt_rows(rows: &[Row], new_side: bool, start: u64, end: u64) -> Vec<Row> {
+    let line_of = |row: &Row| if new_side { row.new } else { row.old };
+    let in_range = |row: &Row| line_of(row).is_some_and(|line| line >= start && line <= end);
+    let Some(mut first) = rows.iter().position(in_range) else { return Vec::new() };
+    let mut last = rows.iter().rposition(in_range).unwrap_or(first);
+    if new_side && rows[first].mark == '+' {
+        while first > 0 && rows[first - 1].mark == '-' && rows[first - 1].hunk == rows[first].hunk {
+            first -= 1;
+        }
+    }
+    if !new_side && rows[last].mark == '-' {
+        while last + 1 < rows.len() && rows[last + 1].mark == '+' && rows[last + 1].hunk == rows[last].hunk {
+            last += 1;
+        }
+    }
+    rows[first..=last].to_vec()
 }
 
 /// `hideWhitespaceChanges`: within each run of removed and added lines, the pairs that differ
@@ -530,6 +583,20 @@ deleted file mode 100644
         );
         assert_eq!(Position::Added { new: 12 }.to_json(), json!({"kind": "added", "newLine": 12}));
         assert_eq!(Position::Context { old: 3, new: 4, side: Side::Left }.anchor(), (Side::Left, 3));
+    }
+
+    #[test]
+    fn an_excerpt_keeps_the_lines_its_change_replaced() {
+        let rows = file_rows(&index_patch(PATCH)[0]);
+        let shape = |rows: &[Row]| rows.iter().map(|r| format!("{}{}", r.mark, r.text)).collect::<Vec<_>>();
+        assert_eq!(
+            shape(&excerpt_rows(&rows, true, 11, 12)),
+            ["-old", "+new", "+more"],
+            "the removed line it replaced comes too"
+        );
+        assert_eq!(shape(&excerpt_rows(&rows, false, 11, 11)), ["-old", "+new", "+more"]);
+        assert_eq!(shape(&excerpt_rows(&rows, true, 41, 42)), [" x", "-y", "+y2"], "a removed line between them stays");
+        assert!(excerpt_rows(&rows, true, 90, 99).is_empty());
     }
 
     #[test]

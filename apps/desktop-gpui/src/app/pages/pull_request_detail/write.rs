@@ -276,6 +276,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// "Finish review": the composer opens on its review.
+    pub(super) fn open_pr_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_pr_composer(true, window, cx);
+        if let Some(write) = self.pr_write() {
+            write.review_mode = true;
+        }
+        cx.notify();
+    }
+
     fn ensure_pr_composer_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pr_write().is_some_and(|w| w.comment.is_none()) {
             let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("Leave a comment"));

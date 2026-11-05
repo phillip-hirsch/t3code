@@ -35,7 +35,9 @@ use crate::pull_requests::{self as list_logic, Entry};
 use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
 
+mod avatars;
 mod code;
+mod guide;
 mod handoff;
 mod header;
 mod live;
@@ -107,6 +109,11 @@ pub(in crate::app) struct Panel {
     handoff: Option<String>,
     /// The header's fold scrolled away.
     condensed: bool,
+    guide_head: Option<String>,
+    guide_position: usize,
+    guide_seen: HashSet<usize>,
+    guide_rail_open: bool,
+    guide_files_open: HashSet<String>,
 }
 
 impl Panel {
@@ -155,6 +162,11 @@ impl Panel {
             _picker_search: None,
             handoff: None,
             condensed: false,
+            guide_head: None,
+            guide_position: 0,
+            guide_seen: HashSet::new(),
+            guide_rail_open: false,
+            guide_files_open: HashSet::new(),
         }
     }
 
@@ -296,6 +308,7 @@ impl Workspace {
                         if first {
                             this.read_pr_extras(cx);
                         }
+                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => {
                         panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false))
@@ -319,6 +332,7 @@ impl Workspace {
                         panel.activity = Some(Rc::new(activity));
                         panel.activity_error = None;
                         panel.write.reactions.clear();
+                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => panel.activity_error = Some(format!("Unreadable activity: {error}").into()),
                     Err(error) => panel.activity_error = Some(list_logic::error_message(&error).into()),
@@ -665,7 +679,10 @@ impl Workspace {
         let body = match tab {
             Tab::Summary => self.render_pr_summary(&detail, &t, window, cx),
             Tab::Timeline => self.render_pr_timeline(&detail, &t, cx),
-            Tab::Guide => self.render_pr_guide(&t, cx),
+            Tab::Guide => {
+                let width = self.pr_panel_width(window);
+                self.render_pr_guide(&t, width, cx)
+            }
             Tab::Code => self.render_pr_code(&detail, &t, window, cx),
         };
         let composer = self.render_pr_composer(&detail, &t, cx);
@@ -969,7 +986,8 @@ impl Workspace {
             if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
                 this.read_pr_guide(cx);
             }
-            if tab == Tab::Code {
+            // The guide's excerpts come from the change's diff.
+            if matches!(tab, Tab::Code | Tab::Guide) {
                 this.open_pr_code(cx);
             }
             cx.notify();
@@ -2018,7 +2036,7 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn render_pr_guide(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pr_guide(&mut self, t: &Tokens, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let result = panel.guide.clone().unwrap_or(Value::Null);
         let running = panel.guide_starting || result["run"]["_tag"] == "Running";
@@ -2097,19 +2115,15 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().child(text))
                 .when(!running, |el| el.child(write_button("Rewrite", cx)))
         });
-        let stops: Vec<Value> = guide["stops"].as_array().cloned().unwrap_or_default();
-        let mut cards = Vec::with_capacity(stops.len());
-        for (index, stop) in stops.iter().enumerate() {
-            let summary = stop["summary"].as_str().unwrap_or_default();
-            let markdown = self.pr_markdown(&format!("guide:{index}"), summary, cx);
-            cards.push(guide_stop(index, stop, markdown, t, cx));
+        match serde_json::from_value::<logic::Guide>(guide.clone()) {
+            Ok(guide) => self.render_pr_guide_tour(&guide, banner.map(IntoElement::into_any_element), width, t, cx),
+            Err(error) => div()
+                .p(px(16.))
+                .text_xs()
+                .text_color(t.error)
+                .child(format!("Unreadable review guide: {error}"))
+                .into_any_element(),
         }
-        v_flex()
-            .id("pr-guide")
-            .size_full()
-            .overflow_y_scroll()
-            .child(v_flex().w_full().max_w(px(768.)).mx_auto().p(px(16.)).gap(px(16.)).children(banner).children(cards))
-            .into_any_element()
     }
 }
 
@@ -2230,10 +2244,10 @@ fn meta_line<const N: usize>(segments: [Option<AnyElement>; N], t: &Tokens) -> g
     line
 }
 
-/// `PullRequestActorAvatar` as its fallback: the login's initial. Avatars are not fetched.
+/// `PullRequestActorAvatar`: the picture once read, else the login's initial.
 fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
     let login = actor.map_or("ghost", |a| a.login.as_str());
-    div()
+    let initial = div()
         .size(px(size))
         .flex_none()
         .flex()
@@ -2244,7 +2258,8 @@ fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
         .text_size(px((size * 0.6).min(11.)))
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.muted_foreground)
-        .child(login.chars().next().unwrap_or('?').to_uppercase().to_string())
+        .child(login.chars().next().unwrap_or('?').to_uppercase().to_string());
+    avatars::avatar_or(actor, size, initial)
 }
 
 /// `PullRequestActorLabel`: avatar and login, with the display name on hover.
@@ -2658,91 +2673,6 @@ fn failure_details(detail: String, t: &Tokens) -> impl IntoElement {
                 .font_family(FONT_MONO)
                 .child(detail),
         )
-}
-
-/// One stop of a review guide: its title, why it matters, what to read and what to ask.
-fn guide_stop(
-    index: usize,
-    stop: &Value,
-    summary: Option<Entity<TextViewState>>,
-    t: &Tokens,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-    let attention = stop["attention"].as_object().map(|a| {
-        let kind = a.get("kind").and_then(Value::as_str).unwrap_or_default();
-        let note = a.get("note").and_then(Value::as_str).unwrap_or_default();
-        h_flex()
-            .gap(px(8.))
-            .items_start()
-            .rounded(px(6.))
-            .bg(Hsla { a: 0.08, ..t.warning })
-            .px(px(8.))
-            .py(px(6.))
-            .text_xs()
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.warning_foreground)
-                    .child(logic::capitalize(kind)),
-            )
-            .child(div().flex_1().min_w_0().text_color(t.foreground).child(note.to_owned()))
-    });
-    let files: Vec<(String, String)> = stop["files"]
-        .as_array()
-        .map(|f| f.iter().map(|f| (text(&f["path"]), text(&f["note"]))).collect())
-        .unwrap_or_default();
-    let questions: Vec<String> = stop["questions"].as_array().map(|q| q.iter().map(text).collect()).unwrap_or_default();
-    v_flex()
-        .gap(px(10.))
-        .p(px(16.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .font_family(FONT_MONO)
-                        .text_color(t.muted_foreground)
-                        .child(format!("{}", index + 1)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.foreground)
-                        .child(text(&stop["title"])),
-                ),
-        )
-        .children(summary.map(|state| pr_markdown_view(&state, t, cx.entity())))
-        .children(attention)
-        .when(!files.is_empty(), |el| {
-            el.child(v_flex().gap(px(4.)).children(files.into_iter().map(|(path, note)| {
-                h_flex()
-                    .min_w_0()
-                    .gap(px(8.))
-                    .text_xs()
-                    .child(Icon::new(Lucide::FileCode).with_size(px(12.)).text_color(t.muted_foreground))
-                    .child(div().flex_none().font_family(FONT_MONO).text_color(t.foreground).child(path))
-                    .child(div().min_w_0().truncate().text_color(t.muted_foreground).child(note))
-            })))
-        })
-        .when(!questions.is_empty(), |el| {
-            el.child(
-                v_flex()
-                    .gap(px(4.))
-                    .text_xs()
-                    .text_color(t.muted_foreground)
-                    .children(questions.into_iter().map(|q| div().child(format!("? {q}")))),
-            )
-        })
-        .into_any_element()
 }
 
 // Timeline rows (`PullRequestTimelineTab`). Each sits 48px right of the connector line.
