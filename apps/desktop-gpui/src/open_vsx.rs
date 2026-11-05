@@ -26,6 +26,9 @@ const MAX_INCLUDE_DEPTH: usize = 8;
 const MAX_PACKAGE_PATH_LENGTH: usize = 1_024;
 const MAX_COLOR_VALUE_LENGTH: usize = 128;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Import bounds each wait, not the whole download, so a slow but live 20 MB package still finishes.
+const IMPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IMPORT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPPORTED_LICENSES: &[&str] =
     &["0BSD", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "CC0-1.0", "ISC", "MIT", "MPL-2.0", "Unlicense"];
 const USED_WORKBENCH_COLORS: &[&str] = &[
@@ -174,19 +177,44 @@ fn extension_from_detail(value: &Value) -> Result<Option<Extension>, String> {
     }))
 }
 
-async fn get_capped(client: &reqwest::Client, url: &str, limit: usize, too_large: &str) -> Result<Vec<u8>, String> {
-    let mut response = client.get(url).send().await.map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("status {}", response.status().as_u16()));
+/// Why a capped download failed, kept typed until the caller picks what the user reads.
+#[derive(Debug)]
+enum Fetch {
+    TooLarge,
+    Status(reqwest::StatusCode),
+    Http(reqwest::Error),
+}
+
+impl Fetch {
+    /// `too_large` for an oversized body, else `failed`; the cause goes to the log.
+    fn message(self, too_large: &str, failed: &str) -> String {
+        match self {
+            Fetch::TooLarge => too_large.to_owned(),
+            Fetch::Status(status) => {
+                log::warn!("open vsx: HTTP {status}");
+                failed.to_owned()
+            }
+            Fetch::Http(error) => {
+                log::warn!("open vsx: {error:?}");
+                failed.to_owned()
+            }
+        }
     }
-    if response.content_length().is_some_and(|length| length as usize > limit) {
-        return Err(too_large.to_owned());
+}
+
+async fn get_capped(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>, Fetch> {
+    let mut response = client.get(url).send().await.map_err(Fetch::Http)?;
+    if !response.status().is_success() {
+        return Err(Fetch::Status(response.status()));
+    }
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        return Err(Fetch::TooLarge);
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await.map_err(Fetch::Http)? {
         bytes.extend_from_slice(&chunk);
         if bytes.len() > limit {
-            return Err(too_large.to_owned());
+            return Err(Fetch::TooLarge);
         }
     }
     Ok(bytes)
@@ -205,16 +233,17 @@ fn jsonc_object(bytes: &[u8], description: &str) -> Result<Value, String> {
 async fn detail(client: &reqwest::Client, namespace: &str, name: &str) -> Result<Option<Extension>, String> {
     let encode = |part: &str| url::form_urlencoded::byte_serialize(part.as_bytes()).collect::<String>();
     let url = format!("https://open-vsx.org/api/{}/{}", encode(namespace), encode(name));
-    let bytes = get_capped(client, &url, MAX_DETAIL_BYTES, "large").await?;
+    let unavailable = |error: Fetch| error.message("Theme details are too large.", "Theme details are unavailable.");
+    let bytes = get_capped(client, &url, MAX_DETAIL_BYTES).await.map_err(unavailable)?;
     let unreadable = |_| "Open VSX returned unreadable theme details.".to_owned();
     let Some(extension) = extension_from_detail(&serde_json::from_slice(&bytes).map_err(unreadable)?)? else {
         return Ok(None);
     };
     let (manifest, package) = futures::join!(
-        get_capped(client, &extension.manifest_url, MAX_MANIFEST_BYTES, "large"),
+        get_capped(client, &extension.manifest_url, MAX_MANIFEST_BYTES),
         client.head(&extension.vsix_url).send()
     );
-    let manifest = jsonc_object(&manifest?, "Extension manifest")?;
+    let manifest = jsonc_object(&manifest.map_err(unavailable)?, "Extension manifest")?;
     let Ok(package) = package else { return Ok(None) };
     let length =
         package.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
@@ -240,18 +269,13 @@ pub async fn search(query: String, sort: &'static str) -> Result<Vec<Extension>,
             .append_pair("sortBy", sort)
             .append_pair("sortOrder", "desc")
             .append_pair("size", "16");
-        let bytes =
-            get_capped(&client, url.as_str(), MAX_SEARCH_BYTES, "Open VSX returned an unexpectedly large response.")
-                .await
-                .map_err(|error| {
-                    if error.contains("timed out") || error.contains("operation timed out") {
-                        "Open VSX took too long to respond.".to_owned()
-                    } else if error.starts_with("Open VSX") {
-                        error
-                    } else {
-                        "Open VSX search is unavailable right now.".to_owned()
-                    }
-                })?;
+        let bytes = get_capped(&client, url.as_str(), MAX_SEARCH_BYTES).await.map_err(|error| match error {
+            Fetch::Http(error) if error.is_timeout() => "Open VSX took too long to respond.".to_owned(),
+            error => error.message(
+                "Open VSX returned an unexpectedly large response.",
+                "Open VSX search is unavailable right now.",
+            ),
+        })?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| "Open VSX returned an unreadable response.".to_owned())?;
         let Some(hits) = value["extensions"].as_array() else {
@@ -399,7 +423,10 @@ impl<'a> Zip<'a> {
         match entry.method {
             0 => out.extend_from_slice(raw),
             8 => {
-                flate2::read::DeflateDecoder::new(raw).take(limit).read_to_end(&mut out).map_err(|_| unreadable())?;
+                flate2::read::DeflateDecoder::new(raw).take(limit).read_to_end(&mut out).map_err(|error| {
+                    log::warn!("open vsx: inflating {path}: {error}");
+                    unreadable()
+                })?;
             }
             _ => return Err(unreadable()),
         }
@@ -525,7 +552,10 @@ fn themes_from_package(extension: &Extension, package: &[u8]) -> Result<Vec<Them
             }
             Ok((parse_vscode_theme(&value)?, path))
         })();
-        parsed.push(theme.map_err(|_| "One or more color themes in that extension could not be imported safely.")?);
+        parsed.push(theme.map_err(|error| {
+            log::warn!("open vsx: {} theme {path}: {error}", extension.id);
+            "One or more color themes in that extension could not be imported safely."
+        })?);
     }
     let extension_id = extension.id.to_lowercase();
     let mut seen: HashMap<&str, usize> = HashMap::new();
@@ -566,16 +596,16 @@ fn themes_from_package(extension: &Extension, package: &[u8]) -> Result<Vec<Them
 /// `importOpenVsxThemeExtension`: downloads, verifies and reads an extension's themes.
 pub async fn import(extension: Extension) -> Result<Vec<ThemeDefinition>, String> {
     let request = async move {
-        let client = reqwest::Client::new();
-        let manifest = get_capped(
-            &client,
-            &extension.manifest_url,
-            MAX_MANIFEST_BYTES,
-            "That Open VSX extension manifest is too large.",
-        )
-        .await
-        .map_err(|error| {
-            if error.starts_with("That") { error } else { "That Open VSX extension has no readable manifest.".into() }
+        let client = reqwest::Client::builder()
+            .connect_timeout(IMPORT_CONNECT_TIMEOUT)
+            .read_timeout(IMPORT_READ_TIMEOUT)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let manifest = get_capped(&client, &extension.manifest_url, MAX_MANIFEST_BYTES).await.map_err(|error| {
+            error.message(
+                "That Open VSX extension manifest is too large.",
+                "That Open VSX extension has no readable manifest.",
+            )
         })?;
         let advertised = theme_contributions(&jsonc_object(&manifest, "Extension manifest")?).len();
         if advertised == 0 {
@@ -584,21 +614,16 @@ pub async fn import(extension: Extension) -> Result<Vec<ThemeDefinition>, String
         if advertised > MAX_THEMES_PER_EXTENSION {
             return Err("That extension contains too many color themes to import safely.".to_owned());
         }
-        let package = get_capped(
-            &client,
-            &extension.vsix_url,
-            MAX_VSIX_BYTES,
-            "That theme extension is too large to import safely.",
-        )
-        .await
-        .map_err(|error| {
-            if error.starts_with("That") { error } else { "That Open VSX theme could not be downloaded.".into() }
+        let package = get_capped(&client, &extension.vsix_url, MAX_VSIX_BYTES).await.map_err(|error| {
+            error.message(
+                "That theme extension is too large to import safely.",
+                "That Open VSX theme could not be downloaded.",
+            )
         })?;
-        let checksum = get_capped(&client, &extension.sha256_url, 256, "That Open VSX checksum response is invalid.")
-            .await
-            .map_err(|error| {
-                if error.starts_with("That") { error } else { "That Open VSX theme has no readable checksum.".into() }
-            })?;
+        let checksum = get_capped(&client, &extension.sha256_url, 256).await.map_err(|error| {
+            error
+                .message("That Open VSX checksum response is invalid.", "That Open VSX theme has no readable checksum.")
+        })?;
         let expected = String::from_utf8_lossy(&checksum).split_whitespace().next().unwrap_or_default().to_owned();
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("That Open VSX theme has an invalid checksum.".to_owned());
