@@ -8239,6 +8239,7 @@ dependencies = [
  "image",
  "lb-wry",
  "log",
+ "markdown",
  "raw-window-handle",
  "reqwest",
  "resvg 0.46.0",

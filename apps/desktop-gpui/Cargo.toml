@@ -46,6 +46,8 @@ iana-time-zone = "0.1"
 # Agent browser tabs stream JPEG frames and SnapShots encode PNG; GPUI already builds both codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log = "0.4"
+# Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
+markdown = "1"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
