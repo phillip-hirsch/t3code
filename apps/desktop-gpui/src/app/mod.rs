@@ -281,7 +281,6 @@ impl Workspace {
                     }
                 },
                 |this, _, cx| {
-                    this.schedule_sidebar_clock(cx);
                     this.notify_sidebar(cx);
                     this.track_visit(cx);
                 },

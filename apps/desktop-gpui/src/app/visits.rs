@@ -36,8 +36,21 @@ enum Visit {
     Skip,
 }
 
-/// The tracker's `onShell` decision for one shell update.
+/// The tracker's `onShell` decision for one shell update. A snooze wake marks
+/// the thread with no shell event to follow, so a snoozed thread also checks
+/// again at its wake.
 fn decide(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>, now: i64) -> Visit {
+    let visit = decide_now(state, shell, woke_at, now);
+    let wake =
+        shell.snoozed_until.as_deref().and_then(inbox::parse_ms).map(|until| until - now).filter(|in_ms| *in_ms > 0);
+    match (visit, wake) {
+        (Visit::Skip, Some(wake)) => Visit::Later(wake),
+        (Visit::Later(delay), Some(wake)) => Visit::Later(delay.min(wake)),
+        (visit, _) => visit,
+    }
+}
+
+fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>, now: i64) -> Visit {
     let Some(updated) = inbox::parse_ms(&shell.updated_at) else { return Visit::Skip };
     let woke = woke_at.and_then(inbox::parse_ms).filter(|woke| *woke > updated);
     let (visited_at, updated) = match (woke, woke_at) {
@@ -156,6 +169,19 @@ mod tests {
             decide(&mut state, &shell(T1, Some(T0), Some(T1)), None, now),
             Visit::Send { visited_at: T1.into(), opened: false }
         );
+    }
+
+    #[test]
+    fn a_snoozed_open_thread_is_marked_read_when_it_wakes() {
+        let mut snoozed = shell(T0, Some(T0), None);
+        snoozed.snoozed_until = Some(T2.into());
+        let mut state = VisitState::default();
+        let before = inbox::parse_ms(T1).unwrap();
+        assert_eq!(decide(&mut state, &snoozed, None, before), Visit::Later(1_000));
+        let at = inbox::parse_ms(T2).unwrap();
+        let woke_at = Facts::new(&snoozed, &Default::default()).woke_at(at);
+        assert_eq!(decide(&mut state, &snoozed, woke_at, at), Visit::Send { visited_at: T2.into(), opened: false });
+        assert_eq!(decide(&mut state, &snoozed, woke_at, at), Visit::Skip);
     }
 
     #[test]

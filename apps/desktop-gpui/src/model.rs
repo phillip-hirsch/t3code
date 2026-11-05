@@ -318,14 +318,19 @@ pub struct ThreadShell {
     pub project_id: String,
     pub title: String,
     pub status: String,
+    /// Absent from older servers, which fall back to `status`; `null` means no activity run.
+    #[serde(default, deserialize_with = "present")]
+    pub activity_run_status: Option<Option<String>>,
     #[serde(default)]
-    pub activity_run_status: Option<String>,
+    pub creation_source: Option<String>,
     #[serde(default)]
     pub blocked_on_thread_wait: Option<bool>,
     #[serde(default)]
     pub pending_runtime_request: Option<PendingRequestSummary>,
     #[serde(default)]
     pub lineage: Lineage,
+    #[serde(default)]
+    pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_class: Option<String>,
     #[serde(default)]
@@ -387,6 +392,8 @@ pub struct ThreadShell {
     pub snoozed_at: Option<String>,
     #[serde(default)]
     pub pin_order_key: Option<String>,
+    #[serde(default)]
+    pub active_order_key: Option<String>,
     #[serde(default)]
     pub last_visited_at: Option<String>,
 }
