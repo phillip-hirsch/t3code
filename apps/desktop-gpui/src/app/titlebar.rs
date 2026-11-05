@@ -122,10 +122,22 @@ impl Workspace {
                         }),
                     ),
             )
-            .child(
-                toggle("toggle-terminal", "icons/panel-bottom.svg", false, false)
-                    .tooltip(tooltip("Terminal drawer is unavailable")),
-            )
+            .child({
+                let available = self.terminal_available();
+                toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available)
+                    .tooltip(tooltip(if available {
+                        "Toggle terminal drawer (Ctrl+J)"
+                    } else {
+                        "Terminal drawer is unavailable"
+                    }))
+                    // On press, like the details toggle beside it.
+                    .when(available, |el| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
+                        )
+                    })
+            })
             .child(
                 toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
                     .tooltip(tooltip("Toggle right panel (Ctrl+Alt+B)"))

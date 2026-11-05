@@ -43,6 +43,7 @@ mod send;
 mod right_panel;
 mod sidebar;
 mod thread_menu;
+mod terminal;
 mod titlebar;
 mod visits;
 
@@ -59,6 +60,7 @@ pub struct RunInTerminal {
     pub cwd: String,
     pub command: String,
 }
+pub use terminal::key_bindings as terminal_key_bindings;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -196,6 +198,7 @@ pub struct Workspace {
     preview: preview::PreviewState,
     /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
     t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
+    terminals: terminal::Terminals,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -305,6 +308,7 @@ impl Workspace {
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),
+            terminals: terminal::Terminals::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -472,6 +476,7 @@ impl Workspace {
         let devices = self.subscribe_device_state(window, cx);
         self._stream_tasks.push(devices);
         self.shell_retried = false;
+        self.subscribe_terminal_metadata(&client, window, cx);
         self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);
         self.subscribe_previews(window, cx);
@@ -830,6 +835,7 @@ impl Render for Workspace {
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_vcs(window, cx);
         let right_panel = self.render_right_panel(window, cx);
+        let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()
             .size_full()
@@ -854,6 +860,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
+            .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -925,7 +932,8 @@ impl Render for Workspace {
                                     .when(self.dragging_files && cx.has_active_drag(), |el| {
                                         el.child(self.render_drop_overlay(crate::theme::tokens(cx)))
                                     }),
-                            ),
+                            )
+                            .children(terminal_drawer),
                     )
                     .children(
                         right_panel

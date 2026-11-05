@@ -103,7 +103,7 @@ impl Workspace {
                     let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
                     Some((DraftWorkspace::new(&self.server_info, project, has_threads), project.workspace_root.clone()))
                 });
-                let thread_id = new_id();
+                let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
                 let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
                 if let Some(context) = context.clone() {
                     initial["context"] = context;

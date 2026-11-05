@@ -1380,13 +1380,14 @@ impl Workspace {
                 },
             );
         let provider = self.provider_mark(&facts, sb.foreground);
-        let meta = thread.branch.as_ref().map(|branch| {
+        let terminals = self.render_running_terminals(&thread.id, cx);
+        let meta = (thread.branch.is_some() || terminals.is_some()).then(|| {
             text_xs(h_flex())
                 .mt(px(2.))
                 .gap(px(6.))
                 .min_w_0()
                 .text_color(sb.secondary_label)
-                .when(thread.worktree_path.is_some(), |el| {
+                .when(thread.worktree_path.is_some() && thread.branch.is_some(), |el| {
                     el.child(icon(IconName::FolderGit2, 14., sb.muted_foreground))
                 })
                 .child(
@@ -1396,8 +1397,9 @@ impl Workspace {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis_middle()
-                        .child(branch.clone()),
+                        .children(thread.branch.clone()),
                 )
+                .children(terminals)
                 .children(provider)
         });
         let title_icons = if meta.is_none() { self.provider_mark(&facts, sb.foreground) } else { None };
@@ -1598,6 +1600,7 @@ impl Workspace {
                     .child(thread.title.clone()),
             )
             .map(|el| self.with_rename(el, &thread.id, 36., tokens, cx))
+            .children(self.render_running_terminals(&thread.id, cx))
             .child(
                 text_xs(h_flex())
                     .relative()
