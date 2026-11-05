@@ -28,6 +28,26 @@ pub struct Desktop {
 
 impl Global for Desktop {}
 
+/// This process's top-level window whose handle is `hwnd`, as winsafe's handle type.
+#[cfg(windows)]
+pub fn top_level_window(hwnd: isize) -> Option<winsafe::HWND> {
+    let mut found = None;
+    // Returning false stops the walk, which EnumWindows reports as a failure.
+    let _ = winsafe::EnumWindows(|window: winsafe::HWND| {
+        if window.ptr() as isize != hwnd {
+            return true;
+        }
+        found = Some(window);
+        false
+    });
+    found
+}
+
+/// This launch's arguments; one that isn't valid Unicode (an unpaired surrogate) is read lossily.
+pub fn launch_args() -> Vec<String> {
+    std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect()
+}
+
 impl Desktop {
     pub fn load(launches: Option<async_channel::Receiver<Vec<String>>>, cx: &App) -> Self {
         let settings = DesktopSettings::load();
@@ -36,7 +56,7 @@ impl Desktop {
         if settings.main_window_bounds.is_some() && matches!(initial, InitialBounds::Default { .. }) {
             log::warn!("saved main window bounds could not be restored; using defaults");
         }
-        Self { settings, initial, launch_args: std::env::args().skip(1).collect(), launches }
+        Self { settings, initial, launch_args: launch_args(), launches }
     }
 
     pub fn window_bounds(&self, cx: &App) -> WindowBounds {

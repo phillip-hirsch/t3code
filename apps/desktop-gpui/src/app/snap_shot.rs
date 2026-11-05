@@ -140,13 +140,28 @@ impl Workspace {
         // `requested`: the capture belongs to the draft on screen now, wherever the user goes next.
         let pinned = self.target.clone();
         self.snap_shot.capturing = true;
+        platform::retire_flash(cx);
         let (done, result) = futures::channel::oneshot::channel();
+        let (grabbed, flashes) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new().name("snap-shot-capture".into()).spawn(move || {
-            let _ = done.send(platform::capture(flash, text));
+            let captured = platform::capture(text, |grab| {
+                if flash.is_some() {
+                    let _ = grabbed.send(platform::Flash::new(&grab));
+                }
+            });
+            let _ = done.send(captured);
         });
         if spawned.is_err() {
             self.snap_shot.capturing = false;
             return self.snap_shot_failed(snap_shot::CAPTURE_FAILED.into(), window, cx);
+        }
+        if let Some(animated) = flash {
+            cx.spawn(async move |_, cx| {
+                if let Ok(flash) = flashes.await {
+                    let _ = cx.update(|cx| platform::show_flash(flash, animated, cx));
+                }
+            })
+            .detach();
         }
         cx.spawn_in(window, async move |this, cx| {
             let result = result.await.unwrap_or(Err(snap_shot::CAPTURE_FAILED));

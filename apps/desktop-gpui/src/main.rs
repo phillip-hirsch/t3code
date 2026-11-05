@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod app;
 mod assets;
 mod backend;
@@ -62,18 +64,45 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn main() {
-    // WebView2 is a child window; GPUI's DirectComposition swap chain would cover it.
-    #[cfg(windows)]
-    // SAFETY: set before any other thread starts.
-    unsafe {
-        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+/// Set for the whole process: WebView2 is a child window, and GPUI's DirectComposition swap chain would cover it.
+#[cfg(windows)]
+const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
+
+/// GPUI reads [`DISABLE_DIRECT_COMPOSITION`] only from the environment it starts with, so a launch
+/// without it starts this executable again with it set, hands that process the foreground, and exits.
+#[cfg(windows)]
+fn relaunched_with_composition_disabled() -> bool {
+    if std::env::var_os(DISABLE_DIRECT_COMPOSITION).is_some() {
+        return false;
     }
+    let child = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(DISABLE_DIRECT_COMPOSITION, "true")
+            .spawn()
+    });
+    match child {
+        Ok(child) => {
+            let _ = winsafe::AllowSetForegroundWindow(Some(child.id()));
+            true
+        }
+        Err(error) => {
+            log::warn!("could not restart with {DISABLE_DIRECT_COMPOSITION} set: {error}");
+            false
+        }
+    }
+}
+
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(windows)]
+    if relaunched_with_composition_disabled() {
+        return;
+    }
     // A second launch hands its command line to the running app and exits.
     let launches = match settings::t3_home() {
         Some(home) => {
-            let args: Vec<String> = std::env::args().skip(1).collect();
+            let args = desktop::launch_args();
             match desktop::activation::claim(&home, &args, runtime().handle()) {
                 desktop::activation::Instance::Forwarded => return,
                 desktop::activation::Instance::Primary(launches) => Some(launches),

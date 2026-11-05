@@ -54,16 +54,6 @@ impl Modifier {
             Self::Alt => "Alt",
         }
     }
-
-    /// `WINDOWS_MODIFIER_PAIR_VIRTUAL_KEYS`: the left and right keys.
-    pub fn virtual_keys(self) -> (i32, i32) {
-        match self {
-            Self::Shift => (0xa0, 0xa1),
-            Self::Control => (0xa2, 0xa3),
-            Self::Alt => (0xa4, 0xa5),
-            Self::Meta => (0x5b, 0x5c),
-        }
-    }
 }
 
 /// `SnapShotShortcut`: both keys of one modifier, or a chord with at least one modifier.
