@@ -21,6 +21,24 @@ const MAX_COLUMNS: usize = 1024;
 const MAX_CELL: usize = 16 * 1024;
 const MAX_ROWS: usize = 250_000;
 
+/// A delimited file's cells, parseable off the UI thread.
+pub(super) struct Cells {
+    header: Vec<SharedString>,
+    rows: Vec<Vec<SharedString>>,
+    columns: usize,
+}
+
+impl Cells {
+    /// The first row heads the columns.
+    pub(super) fn parse(text: &str, delimiter: char) -> Self {
+        let (mut rows, _) = parse_delimited(text, delimiter, MAX_ROWS + 1, MAX_COLUMNS, MAX_CELL);
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let header = if rows.is_empty() { Vec::new() } else { rows.remove(0) };
+        let shared = |row: Vec<String>| row.into_iter().map(SharedString::from).collect::<Vec<_>>();
+        Self { header: shared(header), rows: rows.into_iter().map(shared).collect(), columns }
+    }
+}
+
 pub(super) struct Table {
     header: Vec<SharedString>,
     rows: Vec<Vec<SharedString>>,
@@ -46,15 +64,16 @@ pub(super) fn parse_delimited(
     max_columns: usize,
     max_cell: usize,
 ) -> (Vec<Vec<String>>, bool) {
-    let chars: Vec<char> = text.strip_prefix('\u{feff}').unwrap_or(text).chars().collect();
+    // Streamed: a full file can be hundreds of megabytes.
+    let mut chars = text.strip_prefix('\u{feff}').unwrap_or(text).chars().peekable();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut cell = String::new();
     let mut cell_len = 0usize;
     let mut quoted = false;
     let mut truncated = false;
-    let mut row_start = 0usize;
-    let mut index = 0usize;
+    // Characters were read since the last row ended.
+    let mut in_row = false;
     let end_cell = |row: &mut Vec<String>, cell: &mut String, cell_len: &mut usize, truncated: &mut bool| {
         if *cell_len > max_cell {
             *cell = cell.chars().take(max_cell).collect();
@@ -68,22 +87,21 @@ pub(super) fn parse_delimited(
         }
         *cell_len = 0;
     };
-    while index < chars.len() {
-        let char = chars[index];
+    while let Some(char) = chars.next() {
+        in_row = true;
         if char == '"' {
-            if quoted && chars.get(index + 1) == Some(&'"') {
+            if quoted && chars.peek() == Some(&'"') {
+                chars.next();
                 if cell_len <= max_cell {
                     cell.push('"');
                     cell_len += 1;
                 } else {
                     truncated = true;
                 }
-                index += 2;
                 continue;
             }
             if quoted || cell.is_empty() {
                 quoted = !quoted;
-                index += 1;
                 continue;
             }
         }
@@ -91,12 +109,12 @@ pub(super) fn parse_delimited(
             end_cell(&mut row, &mut cell, &mut cell_len, &mut truncated);
             if char != delimiter {
                 rows.push(std::mem::take(&mut row));
-                if char == '\r' && chars.get(index + 1) == Some(&'\n') {
-                    index += 1;
+                if char == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
-                row_start = index + 1;
+                in_row = false;
                 if rows.len() == max_rows {
-                    return (rows, truncated || index < chars.len().saturating_sub(1));
+                    return (rows, truncated || chars.peek().is_some());
                 }
             }
         } else if cell_len <= max_cell {
@@ -105,9 +123,8 @@ pub(super) fn parse_delimited(
         } else {
             truncated = true;
         }
-        index += 1;
     }
-    if row_start < chars.len() {
+    if in_row {
         end_cell(&mut row, &mut cell, &mut cell_len, &mut truncated);
         rows.push(row);
     }
@@ -134,17 +151,12 @@ impl Table {
         Self { header: Vec::new(), rows, columns, scroll: ScrollHandle::new() }
     }
 
+    pub(super) fn new(Cells { header, rows, columns }: Cells) -> Self {
+        Self { header, rows, columns, scroll: ScrollHandle::new() }
+    }
+
     pub(super) fn parse(text: &str, delimiter: char) -> Self {
-        let (mut rows, _) = parse_delimited(text, delimiter, MAX_ROWS + 1, MAX_COLUMNS, MAX_CELL);
-        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let header = if rows.is_empty() { Vec::new() } else { rows.remove(0) };
-        let shared = |row: Vec<String>| row.into_iter().map(SharedString::from).collect::<Vec<_>>();
-        Self {
-            header: shared(header),
-            rows: rows.into_iter().map(shared).collect(),
-            columns,
-            scroll: ScrollHandle::new(),
-        }
+        Self::new(Cells::parse(text, delimiter))
     }
 }
 
@@ -264,6 +276,11 @@ mod tests {
         let (rows, truncated) = parse_delimited("1\n2\n3\n", ',', 2, 30, 2000);
         assert_eq!(rows.len(), 2);
         assert!(truncated);
+        assert!(!parse_delimited("1\n2\r\n", ',', 2, 30, 2000).1, "the bound met at the end cuts nothing");
+        assert_eq!(
+            parse_delimited("a\n\nb", ',', 10, 10, 10).0,
+            [vec!["a".to_owned()], vec!["".into()], vec!["b".into()]]
+        );
         assert!(parse_delimited("\"open", ',', 10, 10, 10).1, "an unclosed quote is truncation");
         assert_eq!(parse_delimited("abcdef", ',', 10, 10, 3).0, [vec!["abc".to_owned()]]);
     }

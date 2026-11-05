@@ -77,7 +77,7 @@ impl Workspace {
     /// `addTerminalSurface`: a new terminal in a tab of its own.
     pub(in crate::app) fn add_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(launch)) = (self.terminal_thread(true), self.terminal_launch()) else { return };
-        if self.client().is_none() {
+        if self.thread_client(&thread_id).is_none() {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);

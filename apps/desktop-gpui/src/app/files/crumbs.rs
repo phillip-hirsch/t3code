@@ -7,6 +7,7 @@ use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::{AnyElement, App, Context, Entity, IntoElement, Styled as _, Window, px};
 
+use super::Checkout;
 use super::logic::{self, Entry, EntryKind};
 use crate::app::Workspace;
 use crate::theme::Tokens;
@@ -23,7 +24,7 @@ enum Level {
 #[derive(Clone)]
 struct FolderMenu {
     view: Entity<Workspace>,
-    cwd: String,
+    root: Checkout,
     /// The file the panel shows, checked in its folder's list.
     current: String,
 }
@@ -39,17 +40,17 @@ impl FolderMenu {
     /// Lists `folder` and the folders in it, so their submenus fill on the next open.
     fn load(&self, folder: &str, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |this, cx| {
-            this.ensure_tree(&self.cwd, window, cx);
-            this.load_folder(&self.cwd, folder.to_owned(), false, cx);
+            this.ensure_tree(&self.root, window, cx);
+            this.load_folder(&self.root, folder.to_owned(), false, cx);
             let children: Vec<String> = this
-                .tree_state(&self.cwd)
+                .tree_state(&self.root)
                 .and_then(|tree| tree.folder(folder).ok().flatten())
                 .map(|entries| {
                     entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.clone()).collect()
                 })
                 .unwrap_or_default();
             for child in children {
-                this.load_folder(&self.cwd, child, false, cx);
+                this.load_folder(&self.root, child, false, cx);
             }
         });
     }
@@ -65,14 +66,14 @@ impl FolderMenu {
     ) -> PopupMenu {
         let view = &self.view;
         let dark = view.read(cx).dark_theme(cx);
-        let listing = view.read(cx).tree_state(&self.cwd).map(|tree| tree.folder(folder).map(|e| e.map(sorted)));
+        let listing = view.read(cx).tree_state(&self.root).map(|tree| tree.folder(folder).map(|e| e.map(sorted)));
         let entries = match listing {
             Some(Ok(Some(entries))) => entries,
             Some(Err(_)) => {
-                let (cwd, folder) = (self.cwd.clone(), folder.to_owned());
+                let (root, folder) = (self.root.clone(), folder.to_owned());
                 return menu.item(PopupMenuItem::new("Retry loading folder").icon(IconName::RefreshCw).on_click(
                     window.listener_for(view, move |this: &mut Workspace, _, _, cx| {
-                        this.load_folder(&cwd, folder.clone(), true, cx)
+                        this.load_folder(&root, folder.clone(), true, cx)
                     }),
                 ));
             }
@@ -124,14 +125,14 @@ impl Workspace {
     /// The chevron after the crumb for `folder` (`""` is the workspace root).
     pub(super) fn crumb_menu(
         &self,
-        cwd: &str,
+        root: &Checkout,
         folder: &str,
         current: &str,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = cx.entity();
-        let menu = FolderMenu { view: view.clone(), cwd: cwd.to_owned(), current: current.to_owned() };
+        let menu = FolderMenu { view: view.clone(), root: root.clone(), current: current.to_owned() };
         let loader = menu.clone();
         let folder = folder.to_owned();
         let label = if folder.is_empty() { "the project" } else { logic::file_name(&folder) };

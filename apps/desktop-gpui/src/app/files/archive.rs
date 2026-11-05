@@ -361,20 +361,14 @@ pub(super) fn preview_text(bytes: &[u8]) -> Option<(String, bool)> {
 }
 
 impl Workspace {
-    fn archive_mut(&mut self, key: &(String, String)) -> Option<&mut Archive> {
+    fn archive_mut(&mut self, key: &super::FileKey) -> Option<&mut Archive> {
         match self.files.assets.viewer_mut(key)? {
             super::asset::Viewer::Archive(archive) => Some(archive),
             _ => None,
         }
     }
 
-    fn open_archive_entry(
-        &mut self,
-        key: &(String, String),
-        path: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_archive_entry(&mut self, key: &super::FileKey, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(archive) = self.archive_mut(key) else { return };
         let bytes = archive.listing.files.get(&path).cloned();
         let opened = match bytes {
@@ -406,7 +400,7 @@ impl Workspace {
 
     pub(super) fn render_archive_listing(
         &mut self,
-        key: &(String, String),
+        key: &super::FileKey,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -492,7 +486,7 @@ impl Workspace {
                     .child(column_header)
                     .child(
                         uniform_list(
-                            ElementId::Name(format!("archive:{}", key.1).into()),
+                            ElementId::Name(format!("archive:{}", key.path).into()),
                             children.len(),
                             cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                                 let tokens = *crate::theme::tokens(cx);
@@ -511,7 +505,7 @@ impl Workspace {
 }
 
 fn archive_row(
-    key: &(String, String),
+    key: &super::FileKey,
     child: &Child,
     folder: &str,
     tokens: &Tokens,

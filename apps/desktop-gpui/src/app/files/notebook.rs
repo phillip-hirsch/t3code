@@ -141,26 +141,82 @@ pub(super) fn open_notebook(bytes: &[u8]) -> Result<NotebookData, String> {
     Ok(NotebookData { language, cells })
 }
 
-/// `inertNotebookMarkdown`: images become their alt text and links their label, so a saved
-/// notebook loads no URLs.
-pub(super) fn inert_markdown(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(open) = rest.find('[') {
-        let image = open > 0 && rest.as_bytes()[open - 1] == b'!';
-        let Some(close) = rest[open..].find("](").map(|at| open + at) else { break };
-        let Some(end) = rest[close..].find(')').map(|at| close + at) else { break };
-        if rest[open + 1..close].contains(['\n', ']']) {
-            out.push_str(&rest[..=open]);
-            rest = &rest[open + 1..];
-            continue;
+/// Re-parses after each pass: dropping a link's brackets can join text into new syntax.
+const INERT_PASSES: usize = 4;
+
+/// The renderer's own syntax (`MarkdownParseContext::parse_options`): GFM with math.
+fn markdown_options() -> markdown::ParseOptions {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    options
+}
+
+/// Backslash-escapes every ASCII punctuation mark, so the text parses as nothing but text.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
         }
-        out.push_str(&rest[..if image { open - 1 } else { open }]);
-        out.push_str(&rest[open + 1..close]);
-        rest = &rest[end + 1..];
+        out.push(c);
     }
-    out.push_str(rest);
     out
+}
+
+/// The source edits that make `node` inert, in document order.
+fn inert_edits(node: &markdown::mdast::Node, edits: &mut Vec<(std::ops::Range<usize>, String)>) {
+    use markdown::mdast::Node;
+    let range = node.position().map(|p| p.start.offset..p.end.offset);
+    let children = node.children().map(Vec::as_slice).unwrap_or_default();
+    match (node, range) {
+        (Node::Html(_) | Node::Definition(_), Some(range)) => edits.push((range, String::new())),
+        (Node::Image(image), Some(range)) => edits.push((range, escape_markdown(&image.alt))),
+        (Node::ImageReference(image), Some(range)) => edits.push((range, escape_markdown(&image.alt))),
+        (Node::Link(_) | Node::LinkReference(_), Some(range)) => {
+            let inner = children
+                .first()
+                .zip(children.last())
+                .and_then(|(first, last)| Some(first.position()?.start.offset..last.position()?.end.offset));
+            match inner.filter(|_| !children.iter().all(|child| matches!(child, Node::Text(_)))) {
+                // Formatted labels keep their markup; only the brackets and destination go.
+                Some(inner) => {
+                    edits.push((range.start..inner.start, String::new()));
+                    children.iter().for_each(|child| inert_edits(child, edits));
+                    edits.push((inner.end..range.end, String::new()));
+                }
+                // Plain labels, autolinks and bare URLs become escaped text, which no longer links.
+                None => edits.push((range, escape_markdown(&node.to_string()))),
+            }
+        }
+        _ => children.iter().for_each(|child| inert_edits(child, edits)),
+    }
+}
+
+/// `inertNotebookMarkdown`: HTML and link definitions go, images become their alt text and
+/// links their label, so a saved notebook loads and links no URLs. Text that still parses
+/// as any of them after a few passes shows escaped.
+pub(super) fn inert_markdown(source: &str) -> String {
+    let options = markdown_options();
+    let mut text = source.to_owned();
+    for _ in 0..INERT_PASSES {
+        let Ok(root) = markdown::to_mdast(&text, &options) else { break };
+        let mut edits = Vec::new();
+        inert_edits(&root, &mut edits);
+        if edits.is_empty() {
+            return text;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for (range, replacement) in edits {
+            out.push_str(&text[at..range.start]);
+            out.push_str(&replacement);
+            at = range.end;
+        }
+        out.push_str(&text[at..]);
+        text = out;
+    }
+    escape_markdown(source)
 }
 
 /// `{ python: "py", javascript: "js", typescript: "ts", julia: "jl" }`, as the highlighter's language.
@@ -199,7 +255,7 @@ impl Notebook {
 impl Workspace {
     pub(super) fn render_notebook(
         &mut self,
-        key: &(String, String),
+        key: &super::FileKey,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -319,7 +375,7 @@ impl Workspace {
             .child(chrome::notice("Saved outputs only. Code is never executed.", tokens))
             .child(
                 div()
-                    .id(ElementId::Name(format!("notebook:{}", key.1).into()))
+                    .id(ElementId::Name(format!("notebook:{}", key.path).into()))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -398,10 +454,46 @@ mod tests {
         );
     }
 
+    /// Every node that loads or links a URL, in `text` as the renderer parses it.
+    fn loaders(text: &str) -> Vec<String> {
+        fn walk(node: &markdown::mdast::Node, found: &mut Vec<String>) {
+            use markdown::mdast::Node;
+            if matches!(
+                node,
+                Node::Html(_)
+                    | Node::Definition(_)
+                    | Node::Image(_)
+                    | Node::ImageReference(_)
+                    | Node::Link(_)
+                    | Node::LinkReference(_)
+            ) {
+                found.push(format!("{node:?}"));
+            }
+            node.children().into_iter().flatten().for_each(|child| walk(child, found));
+        }
+        let mut found = Vec::new();
+        walk(&markdown::to_mdast(text, &markdown_options()).expect("markdown parses"), &mut found);
+        found
+    }
+
     #[test]
     fn notebook_markdown_loads_no_urls() {
         assert_eq!(inert_markdown("a ![plot](http://x/p.png) [docs](https://d) b"), "a plot docs b");
         assert_eq!(inert_markdown("[x] task\n[y](z)"), "[x] task\ny");
         assert_eq!(inert_markdown("[x] done [y](z)"), "[x] done y");
+        assert_eq!(inert_markdown("é ![α](u) **[b *c*](u)**"), "é α **b *c***", "offsets are bytes");
+        assert_eq!(inert_markdown("x\n\n[r]: http://x/a.png\n\n![alt][r] [see][r]"), "x\n\n\n\nalt see");
+        assert_eq!(inert_markdown("a <img src=\"http://x/a.png\"> <b>b</b>"), "a  b");
+        for source in [
+            "<http://x/a> and https://x/b and www.x.com and me@x.com",
+            "![a [b](http://x)](http://x/i.png)",
+            "[<](x)img src=http://x/i.png>",
+            "| a | ![t](http://x/i.png) |\n|---|---|\n| <img src=x> | [l](u) |",
+            "> [r]: http://x/a.png\n> ![r]",
+            "<div>\n<img src=\"http://x/a.png\">\n</div>",
+        ] {
+            let inert = inert_markdown(source);
+            assert_eq!(loaders(&inert), Vec::<String>::new(), "{source:?} became {inert:?}");
+        }
     }
 }

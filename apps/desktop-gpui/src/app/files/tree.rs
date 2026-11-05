@@ -19,6 +19,7 @@ use gpui_kit::{
 };
 use serde_json::json;
 
+use super::Checkout;
 use super::logic::{self, Entry, EntryKind, TreeRow};
 use crate::app::Workspace;
 use crate::composer_text::{self, Chip};
@@ -142,21 +143,21 @@ impl TreeState {
 }
 
 impl Workspace {
-    pub(super) fn tree_state(&self, cwd: &str) -> Option<&TreeState> {
-        self.files.trees.get(cwd)
+    pub(super) fn tree_state(&self, root: &Checkout) -> Option<&TreeState> {
+        self.files.trees.get(root)
     }
 
-    fn tree(&mut self, cwd: &str) -> Option<&mut TreeState> {
-        self.files.trees.get_mut(cwd)
+    fn tree(&mut self, root: &Checkout) -> Option<&mut TreeState> {
+        self.files.trees.get_mut(root)
     }
 
-    /// The tree for `cwd`, created (and its root listed) on first use.
-    pub(super) fn ensure_tree(&mut self, cwd: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.files.trees.contains_key(cwd) {
+    /// The tree for `root`, created (and its root folder listed) on first use.
+    pub(super) fn ensure_tree(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.trees.contains_key(root) {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search files"));
-        let key = cwd.to_owned();
+        let key = root.clone();
         let subscription = cx.subscribe_in(&query, window, move |this, input, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 let value = input.read(cx).value().to_string();
@@ -164,7 +165,7 @@ impl Workspace {
             }
         });
         self.files.trees.insert(
-            cwd.to_owned(),
+            root.clone(),
             TreeState {
                 listed: HashMap::new(),
                 requested: HashSet::new(),
@@ -189,24 +190,24 @@ impl Workspace {
                 _subscription: subscription,
             },
         );
-        self.load_folder(cwd, String::new(), false, cx);
+        self.load_folder(root, String::new(), false, cx);
     }
 
     /// Lists `folder` once (or again with `refresh`), at most four at a time.
-    pub(super) fn load_folder(&mut self, cwd: &str, folder: String, refresh: bool, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    pub(super) fn load_folder(&mut self, root: &Checkout, folder: String, refresh: bool, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         if tree.loading.contains(&folder) || (!refresh && tree.listed.contains_key(&folder)) {
             return;
         }
         tree.requested.insert(folder.clone());
         Rc::make_mut(&mut tree.loading).insert(folder.clone());
         tree.queue.push_back(folder);
-        self.pump_folder_loads(cwd, cx);
+        self.pump_folder_loads(root, cx);
     }
 
-    fn pump_folder_loads(&mut self, cwd: &str, cx: &mut Context<Self>) {
-        let client = self.client();
-        let Some(tree) = self.tree(cwd) else { return };
+    fn pump_folder_loads(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let client = self.env_client(&root.env);
+        let Some(tree) = self.tree(root) else { return };
         while tree.in_flight < MAX_LOADS {
             let Some(folder) = tree.queue.pop_front() else { break };
             let Some(client) = client.clone() else {
@@ -215,15 +216,15 @@ impl Workspace {
                 continue;
             };
             tree.in_flight += 1;
-            let cwd = cwd.to_owned();
-            let mut input = json!({"cwd": cwd});
+            let root = root.clone();
+            let mut input = json!({"cwd": root.cwd});
             if !folder.is_empty() {
                 input["directoryPath"] = folder.clone().into();
             }
             cx.spawn(async move |this, cx| {
                 let result = client.request("projects.listEntries", input).await;
                 let _ = this.update(cx, |this, cx| {
-                    let Some(tree) = this.tree(&cwd) else { return };
+                    let Some(tree) = this.tree(&root) else { return };
                     tree.in_flight -= 1;
                     Rc::make_mut(&mut tree.loading).remove(&folder);
                     match result {
@@ -250,8 +251,8 @@ impl Workspace {
                         }
                     }
                     tree.rows_dirty = true;
-                    this.pump_folder_loads(&cwd, cx);
-                    this.load_open_folders(&cwd, cx);
+                    this.pump_folder_loads(&root, cx);
+                    this.load_open_folders(&root, cx);
                     cx.notify();
                 });
             })
@@ -260,8 +261,8 @@ impl Workspace {
     }
 
     /// Lists every open folder not listed yet (a chain grows as its folders list).
-    fn load_open_folders(&mut self, cwd: &str, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    fn load_open_folders(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         if tree.rows_dirty {
             tree.rebuild_rows();
         }
@@ -272,12 +273,12 @@ impl Workspace {
             .map(|row| row.path.clone())
             .collect();
         for folder in missing {
-            self.load_folder(cwd, folder, false, cx);
+            self.load_folder(root, folder, false, cx);
         }
     }
 
-    fn toggle_tree_folder(&mut self, cwd: &str, row: &TreeRow, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    fn toggle_tree_folder(&mut self, root: &Checkout, row: &TreeRow, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         if row.expanded {
             let (top, path) = (row.top.clone(), row.path.clone());
             tree.expanded.retain(|p| !(p == &path || (p.starts_with(&top) && path.starts_with(&format!("{p}/")))));
@@ -286,12 +287,12 @@ impl Workspace {
             tree.expanded.insert(row.path.clone());
         }
         tree.rows_dirty = true;
-        self.load_open_folders(cwd, cx);
+        self.load_open_folders(root, cx);
         cx.notify();
     }
 
-    fn toggle_all_folders(&mut self, cwd: &str, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    fn toggle_all_folders(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         let expandable = tree.expandable_in(&tree.reachable());
         let all_open = tree.expand_all || expandable.iter().all(|p| tree.expanded.contains(p));
         if all_open {
@@ -302,28 +303,28 @@ impl Workspace {
             tree.expanded.extend(expandable);
         }
         tree.rows_dirty = true;
-        self.load_open_folders(cwd, cx);
+        self.load_open_folders(root, cx);
         cx.notify();
     }
 
     /// Refresh: lists every requested folder still in the tree again, and the search.
-    fn refresh_tree(&mut self, cwd: &str, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    fn refresh_tree(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         let reachable: HashSet<String> = std::iter::once(String::new())
             .chain(tree.reachable().into_iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path))
             .collect();
         let folders: Vec<String> = tree.requested.iter().filter(|p| reachable.contains(*p)).cloned().collect();
         let query = std::mem::take(&mut tree.search.query);
         for folder in folders {
-            self.load_folder(cwd, folder, true, cx);
+            self.load_folder(root, folder, true, cx);
         }
-        self.search_tree(cwd, query, cx);
+        self.search_tree(root, query, cx);
     }
 
     /// `useProjectPathSearch` for the tree's search box.
-    fn search_tree(&mut self, cwd: &str, value: String, cx: &mut Context<Self>) {
-        let client = self.client();
-        let Some(tree) = self.tree(cwd) else { return };
+    fn search_tree(&mut self, root: &Checkout, value: String, cx: &mut Context<Self>) {
+        let client = self.env_client(&root.env);
+        let Some(tree) = self.tree(root) else { return };
         let query: String = value.chars().take(256).collect::<String>().trim().to_owned();
         tree.search.typed = value.to_lowercase();
         tree.rows_dirty = true;
@@ -345,13 +346,13 @@ impl Workspace {
         }
         tree.search.pending = true;
         let Some(client) = client else { return };
-        let cwd = cwd.to_owned();
-        let payload = json!({"cwd": cwd, "query": query, "limit": SEARCH_LIMIT});
+        let root = root.clone();
+        let payload = json!({"cwd": root.cwd, "query": query, "limit": SEARCH_LIMIT});
         tree.search._task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             let result = client.request("projects.searchEntries", payload).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(tree) = this.tree(&cwd).filter(|t| t.search.generation == generation) else { return };
+                let Some(tree) = this.tree(&root).filter(|t| t.search.generation == generation) else { return };
                 tree.search.pending = false;
                 match result {
                     Ok(value) => {
@@ -367,11 +368,11 @@ impl Workspace {
         cx.notify();
     }
 
-    fn clear_tree_search(&mut self, cwd: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree(cwd) else { return };
+    fn clear_tree_search(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
         let input = tree.query.clone();
         input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.search_tree(cwd, String::new(), cx);
+        self.search_tree(root, String::new(), cx);
         window.blur(cx);
     }
 
@@ -379,20 +380,20 @@ impl Workspace {
     /// selection opens the folders above it and scrolls to it.
     fn sync_tree(
         &mut self,
-        cwd: &str,
+        root: &Checkout,
         selected: Option<&str>,
         reveal: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mutation = self.files.mutation.clone();
-        let Some(tree) = self.tree(cwd) else { return };
+        let Some(tree) = self.tree(root) else { return };
         let previous = tree.mutation.replace(mutation.clone());
         if previous.is_some_and(|p| p != mutation) {
-            self.refresh_tree(cwd, cx);
+            self.refresh_tree(root, cx);
         }
         let Some(selected) = selected.filter(|s| !s.is_empty()) else { return };
-        let Some(tree) = self.tree(cwd) else { return };
+        let Some(tree) = self.tree(root) else { return };
         let request = (selected.to_owned(), reveal);
         if tree.revealed.as_ref() == Some(&request) {
             return;
@@ -402,9 +403,9 @@ impl Workspace {
         if !tree.search.query.is_empty() {
             let input = tree.query.clone();
             input.update(cx, |input, cx| input.set_value("", window, cx));
-            self.search_tree(cwd, String::new(), cx);
+            self.search_tree(root, String::new(), cx);
         }
-        let Some(tree) = self.tree(cwd) else { return };
+        let Some(tree) = self.tree(root) else { return };
         tree.expanded.extend(ancestors.iter().cloned());
         tree.rows_dirty = true;
         let known = ancestors.iter().all(|a| tree.listed.contains_key(a)) && tree.listed.contains_key("");
@@ -417,22 +418,22 @@ impl Workspace {
         } else if known {
             tree.revealed = Some(request);
         }
-        self.load_open_folders(cwd, cx);
+        self.load_open_folders(root, cx);
     }
 
     /// The tree pane: the search bar, status lines and the rows.
     pub(super) fn render_tree(
         &mut self,
-        cwd: &str,
+        root: &Checkout,
         selected: Option<&str>,
         reveal: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.ensure_tree(cwd, window, cx);
-        self.sync_tree(cwd, selected, reveal, window, cx);
+        self.ensure_tree(root, window, cx);
+        self.sync_tree(root, selected, reveal, window, cx);
         let tokens = *crate::theme::tokens(cx);
-        let Some(tree) = self.tree(cwd) else { return div().into_any_element() };
+        let Some(tree) = self.tree(root) else { return div().into_any_element() };
         if tree.rows_dirty {
             tree.rebuild_rows();
         }
@@ -449,7 +450,7 @@ impl Workspace {
         let loading_folders = tree.loading.clone();
         let scroll = tree.scroll.clone();
         let muted = tokens.muted_foreground;
-        let key = cwd.to_owned();
+        let key = root.clone();
         let icon_button = |id: &'static str, icon: IconName, label: SharedString| {
             div()
                 .id(id)
@@ -517,7 +518,7 @@ impl Workspace {
             let focused = tree.focused.clone().filter(|_| tree.focus.is_focused(window));
             let list_key = key.clone();
             uniform_list(
-                ElementId::Name(format!("files-tree:{cwd}").into()),
+                ElementId::Name(format!("files-tree:{}", root.cwd).into()),
                 rows.len(),
                 cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                     let tokens = *crate::theme::tokens(cx);
@@ -574,7 +575,7 @@ impl Workspace {
             })
             .child(
                 div()
-                    .id(ElementId::Name(format!("files-tree-keys:{cwd}").into()))
+                    .id(ElementId::Name(format!("files-tree-keys:{}", root.cwd).into()))
                     .track_focus(&focus)
                     .flex_1()
                     .min_h_0()
@@ -596,8 +597,8 @@ impl Workspace {
 
     /// The web tree's keys: arrows move or open and close folders, Home and End jump,
     /// Enter and Space open the row.
-    fn tree_key(&mut self, cwd: &str, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(tree) = self.tree(cwd) else { return false };
+    fn tree_key(&mut self, root: &Checkout, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(tree) = self.tree(root) else { return false };
         let rows = tree.rows.clone();
         if rows.is_empty() {
             return false;
@@ -612,14 +613,14 @@ impl Workspace {
             ("up", Some(at)) => Some(at.saturating_sub(1)),
             ("right", Some(at)) => match folder {
                 Some(row) if !row.expanded => {
-                    self.toggle_tree_folder(cwd, &row, cx);
+                    self.toggle_tree_folder(root, &row, cx);
                     None
                 }
                 _ => Some((at + 1).min(rows.len() - 1)),
             },
             ("left", Some(at)) => match folder {
                 Some(row) if row.expanded => {
-                    self.toggle_tree_folder(cwd, &row, cx);
+                    self.toggle_tree_folder(root, &row, cx);
                     None
                 }
                 _ => logic::parent_row(&rows, at),
@@ -627,7 +628,7 @@ impl Workspace {
             ("enter" | "space", Some(_)) => {
                 if let Some(row) = row {
                     if row.kind == EntryKind::Directory {
-                        self.toggle_tree_folder(cwd, &row, cx);
+                        self.toggle_tree_folder(root, &row, cx);
                     } else {
                         self.open_file(&row.path, None, window, cx);
                     }
@@ -636,7 +637,7 @@ impl Workspace {
             }
             _ => return false,
         };
-        if let (Some(next), Some(tree)) = (next, self.tree(cwd)) {
+        if let (Some(next), Some(tree)) = (next, self.tree(root)) {
             tree.focused = Some(rows[next].path.clone());
             tree.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         }
@@ -646,7 +647,7 @@ impl Workspace {
 
     fn tree_row(
         &mut self,
-        cwd: &str,
+        root: &Checkout,
         row: &TreeRow,
         look: RowLook,
         tokens: &Tokens,
@@ -664,8 +665,8 @@ impl Workspace {
             }
         };
         let fg = tokens.foreground;
-        let (click_key, click_row) = (cwd.to_owned(), row.clone());
-        let menu = self.tree_context_menu(cwd, &row.path, cx);
+        let (click_key, click_row) = (root.clone(), row.clone());
+        let menu = self.tree_context_menu(&root.cwd, &row.path, cx);
         h_flex()
             .id(ElementId::Name(format!("files-row:{}", row.path).into()))
             .h(px(ROW_HEIGHT))

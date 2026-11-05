@@ -248,8 +248,9 @@ impl Workspace {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
-                    this.report_browser_profiles(cx);
                 }
+                // Each environment's browser gets this client's profiles.
+                this.report_browser_profiles(cx);
                 this.notify_sidebar(cx);
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);

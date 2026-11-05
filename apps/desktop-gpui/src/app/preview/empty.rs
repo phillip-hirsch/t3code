@@ -77,11 +77,22 @@ fn local_servers(list: &Value, configured: &[String]) -> Vec<LocalServer> {
     servers
 }
 
+/// What a discovery stream was opened for: the environment probed and its configured URLs.
+type DiscoveryKey = (SharedString, Vec<String>);
+
 #[derive(Default)]
 pub(super) struct Discovery {
     servers: Vec<LocalServer>,
-    /// The configured URLs subscribed with, and the stream.
-    subscribed: Option<(Vec<String>, Task<()>)>,
+    subscribed: Option<(DiscoveryKey, Task<()>)>,
+}
+
+impl Discovery {
+    /// `environment` reconnected: a stream it served ended, so the next frame opens a new one.
+    pub(super) fn reconnected(&mut self, environment: &str) {
+        if self.subscribed.as_ref().is_some_and(|((env, _), _)| env == environment) {
+            *self = Self::default();
+        }
+    }
 }
 
 impl Workspace {
@@ -107,8 +118,9 @@ impl Workspace {
         }
     }
 
-    /// The panel's blank tab, if one shows: its thread and the project's script preview URLs.
-    fn blank_browser(&self) -> Option<(String, Vec<String>)> {
+    /// The panel's blank tab, if one shows: its thread's environment and the project's script
+    /// preview URLs.
+    fn blank_browser(&self) -> Option<DiscoveryKey> {
         let Some(Surface::Browser(tab)) = self.active_surface() else { return None };
         let thread_id = self.preview_thread_id()?;
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab));
@@ -124,20 +136,20 @@ impl Workspace {
                 p.scripts.iter().filter_map(|s| s.preview_url.clone()).filter(|u| u.len() <= 2048).take(20).collect()
             })
             .unwrap_or_default();
-        Some((thread_id.to_owned(), urls))
+        Some((self.thread_environment(thread_id)?, urls))
     }
 
     /// `subscribeDiscoveredLocalServers` while a blank tab shows, so the server only probes then.
     pub(in crate::app) fn sync_discovered_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = self.blank_browser().map(|(_, urls)| urls);
-        let current = self.preview.discovery.subscribed.as_ref().map(|(urls, _)| urls.clone());
-        if wanted == current {
+        let wanted = self.blank_browser();
+        let current = self.preview.discovery.subscribed.as_ref().map(|(key, _)| key);
+        if wanted.as_ref() == current {
             return;
         }
-        let (Some(urls), Some(client)) = (wanted, self.client()) else {
-            self.preview.discovery = Discovery::default();
-            return;
-        };
+        // Another environment's servers never show on this one's blank tab.
+        self.preview.discovery = Discovery::default();
+        let Some((environment, urls)) = wanted else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         let input = if urls.is_empty() { json!({}) } else { json!({"configuredUrls": urls}) };
         let stream = client.stream("subscribeDiscoveredLocalServers", input);
         let configured = urls.clone();
@@ -148,7 +160,7 @@ impl Workspace {
             move |this, value| this.preview.discovery.servers = local_servers(value, &configured),
             |_, _, cx| cx.notify(),
         );
-        self.preview.discovery.subscribed = Some((urls, task));
+        self.preview.discovery.subscribed = Some(((environment, urls), task));
     }
 
     /// Opens a card's URL in the blank tab (`handleOpenServerUrl`).

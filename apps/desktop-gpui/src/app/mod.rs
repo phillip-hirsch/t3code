@@ -569,7 +569,6 @@ impl Workspace {
         }
         if !matches!(connection, Connection::Connected) {
             self.set_primary_connection(None, None);
-            self.preview.disconnect();
             if self.target_on_primary() {
                 self.end_target_streams();
             }
