@@ -61,3 +61,11 @@ type parameter (default `EditorMode`, so editor code is unaffected), and its met
 - `src/input/editor/decorations.rs`: the generic handle; its methods move into a macro (`git diff -w` shows the real change).
 - `src/input/mod.rs`: exports `TextareaExtras`.
 - `src/input/base/state.rs`: one test, `test_textarea_decorations_follow_edits_beside_tokens`.
+
+**Toasts above dialogs.** Dialogs paint in a deferred pass (priority `10 + layer`), but 0.9.0's
+`ToastStack` paints in the normal pass, so a toast raised while a dialog is open (an error from
+the dialog itself) is hidden under it; the web app's toasts draw above dialogs. The patch paints
+the stack deferred at `TOAST_PRIORITY` (50): above dialogs, below popups (100) and tooltips (200).
+Files:
+
+- `src/toast.rs`: `TOAST_PRIORITY` and the deferred stack in `ToastStack::render`.

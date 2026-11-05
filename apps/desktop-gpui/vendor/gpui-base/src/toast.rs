@@ -8,7 +8,7 @@ use web_time::Instant;
 use gpui::{
     Anchor, AnyElement, App, Div, ElementId, FocusHandle, InteractiveElement, Interactivity,
     IntoElement, MouseMoveEvent, ParentElement, Pixels, RenderOnce, Role, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, div,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, canvas, deferred, div,
     prelude::FluentBuilder as _, px,
 };
 
@@ -16,6 +16,9 @@ use crate::{
     ElementExt as _, StyledExt as _,
     motion::{Spring, spring},
 };
+
+/// Toast stacks paint above dialogs (`10 + layer`) and below popups and tooltips.
+pub const TOAST_PRIORITY: usize = 50;
 
 /// Motion tokens used by an unstyled toast stack.
 #[derive(Clone, Copy, Debug)]
@@ -547,7 +550,8 @@ impl RenderOnce for ToastStack {
 
         let hovered_state = self.state.hovered.clone();
         let measured_width = self.state.width.clone();
-        self.base
+        let stack = self
+            .base
             .relative()
             .h(stack_height)
             .when_some(self.focus_handle, |this, handle| this.track_focus(&handle))
@@ -577,7 +581,8 @@ impl RenderOnce for ToastStack {
                 .size_full(),
             )
             .children(items)
-            .refine_style(&self.style)
+            .refine_style(&self.style);
+        deferred(stack).with_priority(TOAST_PRIORITY)
     }
 }
 
