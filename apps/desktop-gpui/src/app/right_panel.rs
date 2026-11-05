@@ -1,8 +1,8 @@
 //! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
 //! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
 //! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
-//! The Files and file surfaces render in `files/`. The web's other surfaces (terminal, pull
-//! requests, devices, side chats) are not native yet, so the launcher offers Browser, Files and Diff.
+//! Other surfaces render in their own modules (files, terminal, pull requests, side chats); the
+//! device surface is not native, so the launcher leaves it out.
 
 mod diff_base;
 
@@ -138,11 +138,23 @@ impl PanelState {
             return false;
         }
         self.proactive_diff_run = Some(run.to_owned());
-        if self.user_revision != revision || (self.open && self.active == Some(Surface::Diff)) {
+        let shown = self.active.as_ref().filter(|_| self.open);
+        let pull_request = matches!(shown, Some(Surface::PullRequest(_) | Surface::PullRequests));
+        if self.user_revision != revision || shown == Some(&Surface::Diff) || pull_request {
             return false;
         }
         self.upsert(Surface::Diff);
         self.scope = DiffScope::Branch;
+        true
+    }
+
+    /// `openProactive` for a pull request surface: refused after a panel choice made since
+    /// `revision`, and an existing tab stays where the user left it unless `activate_existing`.
+    fn open_proactive(&mut self, surface: Surface, revision: u64, activate_existing: bool) -> bool {
+        if self.user_revision != revision || (!activate_existing && self.surfaces.contains(&surface)) {
+            return false;
+        }
+        self.upsert(surface);
         true
     }
 
@@ -276,6 +288,8 @@ pub(super) struct RightPanel {
     tabs_scroll: ScrollHandle,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
+    /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
+    observed_pull_requests: HashMap<String, Option<crate::pull_request_detail::Reference>>,
     /// The branch diff's picked comparison target per thread; none is Automatic.
     base_refs: HashMap<Target, String>,
     base_picker: diff_base::BasePicker,
@@ -309,6 +323,7 @@ impl RightPanel {
             tabs_scroll: ScrollHandle::new(),
             revealed_tab: None,
             observation: None,
+            observed_pull_requests: HashMap::new(),
             base_refs: HashMap::new(),
             base_picker: Default::default(),
             _diff_events: diff_events,
@@ -626,7 +641,7 @@ impl Workspace {
 
     /// `useProactivePanels` for turn diffs: with proactive panels on, a turn that just completed
     /// with enough changes opens the branch diff, unless the user chose a panel since it started.
-    /// Change-request panels are not native, so their half of the hook is not ported.
+    /// A thread's pull requests take precedence (`observe_proactive_pull_requests`).
     pub(super) fn observe_proactive_panels(&mut self, cx: &mut Context<Self>) {
         let Some(Target::Thread(thread_id)) = self.target.clone() else {
             self.right_panel.observation = None;
@@ -637,6 +652,8 @@ impl Workspace {
         let projection = self.open_projection();
         let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
         let mut observation = observe(self.right_panel.observation.as_ref(), &thread_id, running.as_deref(), revision);
+        let pull_requests = self.observe_proactive_pull_requests(&thread_id, &mut observation, cx);
+        let projection = self.open_projection();
         let Some(projection) = projection else {
             self.right_panel.observation = Some(observation);
             return;
@@ -653,7 +670,8 @@ impl Workspace {
             turn_just_completed(observation.running.as_ref().map(Option::as_deref), running.as_deref(), run, completed)
         });
         let offer = match &newly {
-            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") => {
+            // A thread with pull requests offers those instead of its turn diffs.
+            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") && !pull_requests => {
                 let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
                 turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
             }
@@ -668,6 +686,51 @@ impl Workspace {
         if self.right_panel.panels.entry(target).or_default().open_proactive_diff(&run, revision) {
             cx.notify();
         }
+    }
+
+    /// The pull request half of `useProactivePanels`: a Pull request tab follows the thread's
+    /// pull request when it changes, and with proactive panels on, newly linked pull requests
+    /// open (the list when there are several). `true` while the thread has any.
+    fn observe_proactive_pull_requests(
+        &mut self,
+        thread_id: &str,
+        observation: &mut Observation,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let linked = self.thread_pull_request_target();
+        let previous = self.right_panel.observed_pull_requests.insert(thread_id.to_owned(), linked.clone()).flatten();
+        let shown = self.active_surface().cloned();
+        // `shouldRetargetThreadPullRequestPanel`.
+        let follow = match (&previous, &linked, &shown) {
+            (Some(previous), Some(linked), Some(Surface::PullRequest(open))) => previous != linked && open == previous,
+            _ => false,
+        };
+        let visible = self.thread_pull_request_keys();
+        let key = match visible.len() {
+            0 => linked.as_ref().map(|r| format!("{}:{}#{}", r.project_id, r.repository.to_lowercase(), r.number)),
+            _ => Some(visible.join("\n")),
+        };
+        let eligible = self.client_settings.values.bool("proactivePanelsEnabled")
+            && key.is_some()
+            && observation.target_key.as_ref() != Some(&key);
+        observation.target_key = Some(key.clone());
+        let revision = observation.revision;
+        let panel = self.right_panel.panels.entry(Target::Thread(thread_id.to_owned())).or_default();
+        let mut changed = false;
+        if let (true, Some(linked)) = (follow, &linked) {
+            changed |= panel.open_proactive(Surface::PullRequest(linked.clone()), revision, true);
+        }
+        if eligible && !follow {
+            if !visible.is_empty() && (visible.len() > 1 || linked.is_none()) {
+                changed |= panel.open_proactive(Surface::PullRequests, revision, false);
+            } else if let Some(linked) = linked {
+                changed |= panel.open_proactive(Surface::PullRequest(linked), revision, false);
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        key.is_some()
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -1798,6 +1861,8 @@ struct Observation {
     user_turn: Option<String>,
     /// The panel revision a proactive open must still find.
     revision: u64,
+    /// The pull requests the thread linked at the last read; `None` before the first.
+    target_key: Option<Option<String>>,
 }
 
 /// `observeProactivePanelUserChoice`: a panel choice made since the thread opened or its
@@ -1809,6 +1874,7 @@ fn observe(previous: Option<&Observation>, thread_id: &str, running: Option<&str
         thread_id: thread_id.to_owned(),
         running: same.and_then(|previous| previous.running.clone()),
         user_turn: running.map(str::to_owned).or_else(|| same.and_then(|previous| previous.user_turn.clone())),
+        target_key: same.and_then(|previous| previous.target_key.clone()),
         revision: match same {
             Some(previous) if !new_turn => previous.revision,
             _ => revision,
@@ -2128,6 +2194,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(workspace_mutation_id(&projection, Some("12:00")), (Some("edit".into()), Some("12:00".into())));
+    }
+
+    #[test]
+    fn proactive_pull_requests_defer_to_user_choices_and_keep_existing_tabs() {
+        let mut panel = PanelState::default();
+        assert!(panel.open_proactive(Surface::PullRequests, 0, false));
+        // Already open: left where it is, unless following the thread's pull request.
+        panel.active = Some(Surface::Diff);
+        assert!(!panel.open_proactive(Surface::PullRequests, 0, false));
+        assert!(panel.open_proactive(Surface::PullRequests, 0, true));
+        assert_eq!(panel.active, Some(Surface::PullRequests));
+        panel.user_revision = 1;
+        assert!(!panel.open_proactive(Surface::Files, 0, false));
+        // A pull request on screen keeps a turn diff from replacing it.
+        assert!(!panel.open_proactive_diff("run-1", 1));
     }
 
     #[test]

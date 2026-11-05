@@ -39,6 +39,17 @@ impl Workspace {
         self.open_thread_shell().is_some_and(|shell| links::visible(&shell.pull_requests).next().is_some())
     }
 
+    /// The visible linked pull requests as sorted `[host, repository, number]` keys
+    /// (`proactivePullRequestsKey`).
+    pub(in crate::app) fn thread_pull_request_keys(&self) -> Vec<String> {
+        let Some(shell) = self.open_thread_shell() else { return Vec::new() };
+        let mut keys: Vec<String> = links::visible(&shell.pull_requests)
+            .map(|link| serde_json::json!([link.host, link.repository, link.number]).to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The Pull request surface: the detail panel, retargeted to this tab's pull request.
     pub(in crate::app) fn render_pull_request_surface(
         &mut self,
