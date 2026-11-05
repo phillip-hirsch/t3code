@@ -6,11 +6,12 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, hsla, px, relative, rgb,
+    Anchor, AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, anchored, deferred, div,
+    hsla, point, px, relative, rgb,
 };
 
-use super::titlebar::icon;
+use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
 use crate::model::{ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
@@ -67,8 +68,31 @@ struct Meter {
 }
 
 impl Workspace {
-    pub(super) fn render_details_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.details_open || self.target.is_none() {
+    /// Whether the card is on screen, inline or as the popover.
+    pub(super) fn details_shown(&self, window: &Window) -> bool {
+        self.target.is_some() && if self.details_inline(window) { self.details_open } else { self.details_popover }
+    }
+
+    /// The toggle drives whichever presentation the canvas allows.
+    pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.details_inline(window) {
+            self.details_open = !self.details_open;
+        } else {
+            self.details_popover = !self.details_popover;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn escape_details_popover(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.details_popover && event.keystroke.key == "escape" {
+            self.details_popover = false;
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn render_details_card(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.details_shown(window) {
             return None;
         }
         let tokens = *theme::tokens(cx);
@@ -93,20 +117,47 @@ impl Workspace {
                 .into_any_element()
         })
         .collect();
+        let card = v_flex()
+            .id("thread-details")
+            .w_full()
+            .overflow_y_scroll()
+            .occlude()
+            .rounded(px(16.))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.background)
+            .children(sections);
+        if self.details_inline(window) {
+            return Some(
+                div()
+                    .absolute()
+                    .top(px(CARD_INSET))
+                    .bottom(px(CARD_INSET))
+                    .right(px(CARD_INSET))
+                    .w(px(CARD_WIDTH))
+                    .child(card.max_h_full())
+                    .into_any_element(),
+            );
+        }
+        // `PopoverPopup variant="panel"` under the header, `align="end"`: 4px align
+        // offset plus its 8px padding put the card where the inline one sits, 8px
+        // below the header, capped at `100dvh - 6.5rem`.
+        let viewport = window.viewport_size();
+        let corner = point(viewport.width - RIGHT_RESIZE_INSET - px(CARD_INSET), TITLEBAR_HEIGHT + px(8.));
         Some(
-            div().absolute().top(px(CARD_INSET)).bottom(px(CARD_INSET)).right(px(CARD_INSET)).w(px(CARD_WIDTH)).child(
-                v_flex()
-                    .id("thread-details")
-                    .w_full()
-                    .max_h_full()
-                    .overflow_y_scroll()
-                    .occlude()
-                    .rounded(px(16.))
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.background)
-                    .children(sections),
-            ),
+            deferred(
+                anchored().anchor(Anchor::TopRight).position(corner).child(
+                    div()
+                        .w(px(CARD_WIDTH))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.details_popover = false;
+                            cx.notify();
+                        }))
+                        .child(card.max_h(viewport.height - px(104.))),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
         )
     }
 

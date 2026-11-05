@@ -10,12 +10,12 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClickEvent, Context, Div, FontFallbacks, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    App, Context, Div, FontFallbacks, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     Pixels, Stateful, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, font, hsla, px,
     rgb, svg,
 };
 
-use super::{ToggleSidebar, ToggleThreadDetails, Workspace};
+use super::{ToggleSidebar, Workspace};
 use crate::theme;
 
 /// `--workspace-topbar-height` with Electron's 40px titlebar overlay on Windows.
@@ -64,7 +64,7 @@ impl Workspace {
             .right_0()
             .h(TITLEBAR_HEIGHT)
             .child(self.render_sidebar_toggle(cx))
-            .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(cx)))
+            .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
             .when(cfg!(target_os = "windows"), |el| el.child(render_caption_buttons(window, cx)))
     }
 
@@ -90,8 +90,9 @@ impl Workspace {
     }
 
     /// `WorkspaceTitlebarControls` + `PanelLayoutControls`: thread details, terminal, right panel.
-    fn render_panel_toggles(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_panel_toggles(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
+        let details = self.details_shown(window);
         let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool| {
             let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
             control(id)
@@ -108,9 +109,18 @@ impl Workspace {
             .items_center()
             .gap_1()
             .child(
-                toggle("toggle-thread-details", "icons/square-menu.svg", self.details_open, true)
+                toggle("toggle-thread-details", "icons/square-menu.svg", details, true)
                     .tooltip(tooltip("Toggle thread details (Ctrl+Shift+B)"))
-                    .on_click(|_: &ClickEvent, window, cx| window.dispatch_action(Box::new(ToggleThreadDetails), cx)),
+                    // Acts on press, like a popover trigger: the popover's outside-press
+                    // dismissal runs first, so a press that already closed it must not reopen it.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if this.details_shown(window) == details {
+                                this.toggle_details(window, cx);
+                            }
+                        }),
+                    ),
             )
             .child(
                 toggle("toggle-terminal", "icons/panel-bottom.svg", false, false)

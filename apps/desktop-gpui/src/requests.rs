@@ -83,6 +83,8 @@ pub struct QuestionDraft {
     pub index: usize,
     pub drafts: HashMap<String, Draft>,
     pub collapsed: bool,
+    /// The thread's prompt, set aside while the card holds the editor.
+    pub prompt: String,
 }
 
 impl QuestionDraft {
@@ -95,7 +97,7 @@ impl QuestionDraft {
                 Some((q.id.clone(), Draft { selected: Vec::new(), custom: Some(q.initial_answer.clone()?) }))
             })
             .collect();
-        Self { request_id, questions, index: 0, drafts, collapsed: false }
+        Self { request_id, questions, index: 0, drafts, collapsed: false, prompt: String::new() }
     }
 }
 
@@ -222,5 +224,22 @@ mod tests {
         assert_eq!(answer(&choice, Some(&typed)), None, "choice-only ignores typing");
         state.drafts.insert("b".into(), toggle(&choice, None, "Red"));
         assert_eq!(answers(&questions, &state.drafts), Some(json!({"a": "draft", "b": "Red"})));
+    }
+
+    #[test]
+    fn a_pick_replaces_the_seeded_answer_until_the_user_types() {
+        let q =
+            question(json!({"id": "q", "header": "H", "question": "?", "options": options(), "initialAnswer": "seed"}));
+        let state = QuestionDraft::new("r".into(), vec![q.clone()]);
+        let seeded = state.drafts.get("q");
+        assert_eq!(answer(&q, seeded), Some(json!("seed")));
+        let picked = toggle(&q, seeded, "Red");
+        assert_eq!(answer(&q, Some(&picked)), Some(json!("Red")));
+        assert!(is_selected(&q, Some(&picked), "Red"));
+        let typed = set_custom(&q, Some(&picked), "mine".into());
+        assert_eq!(answer(&q, Some(&typed)), Some(json!("mine")));
+        assert!(!is_selected(&q, Some(&typed), "Red"));
+        // Emptying a seeded answer submits it empty, as the web does.
+        assert_eq!(answer(&q, Some(&set_custom(&q, Some(&typed), String::new()))), Some(json!("")));
     }
 }

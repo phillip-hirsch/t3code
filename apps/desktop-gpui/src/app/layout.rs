@@ -32,7 +32,7 @@ pub(super) fn resolve_lane(canvas: f32, card_left: Option<f32>) -> Lane {
 }
 
 /// The card's left edge when it fits inline next to a lane of at least 640px.
-/// Narrower canvases get no inline card (the web shows a popover there).
+/// Narrower canvases show it as a popover under the header instead.
 pub(super) fn inline_card_left(canvas: f32) -> Option<f32> {
     let left = canvas - CARD_WIDTH - CARD_INSET;
     (left - CARD_CLEARANCE - GUTTER >= MIN_LANE).then_some(left)
@@ -42,6 +42,11 @@ impl Workspace {
     fn canvas_width(&self, window: &Window) -> f32 {
         let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
         f32::from(window.viewport_size().width) - sidebar - f32::from(RIGHT_RESIZE_INSET)
+    }
+
+    /// Whether the details card fits inline; otherwise it is a popover.
+    pub(super) fn details_inline(&self, window: &Window) -> bool {
+        inline_card_left(self.canvas_width(window)).is_some()
     }
 
     /// The lane, and the details card's left edge when the card is shown inline.
