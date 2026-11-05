@@ -26,7 +26,7 @@ impl Workspace {
             .pr(controls_inset)
             .bg(tokens.background)
             .window_control_area(WindowControlArea::Drag);
-        if let Some(page) = self.page {
+        if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
         let (project, title, parent) = match &self.target {
