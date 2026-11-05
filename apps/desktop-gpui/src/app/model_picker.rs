@@ -212,7 +212,7 @@ impl Workspace {
                 .is_some_and(|hidden| hidden.iter().any(|h| h.as_str() == Some(&model.slug)))
     }
 
-    fn picker_rows(&self, current: Option<&ModelSelection>) -> (Vec<Row>, bool) {
+    fn picker_rows<'a>(&'a self, current: Option<&ModelSelection>) -> (Vec<Row>, bool) {
         let ready =
             |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
         let favorites = &self.server_info.favorites;
@@ -228,13 +228,7 @@ impl Workspace {
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
         };
-        let models = |p: &'_ Provider| {
-            p.models
-                .iter()
-                .filter(|m| !self.model_hidden(p, m))
-                .map(move |m| (p.clone(), m.clone()))
-                .collect::<Vec<_>>()
-        };
+        let models = |p: &'a Provider| p.models.iter().filter(move |m| !self.model_hidden(p, m)).map(move |m| (p, m));
         let providers = self.server_info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
@@ -242,9 +236,9 @@ impl Workspace {
                 .enumerate()
                 .filter_map(|(order, (p, m))| {
                     let name = p.display_name.as_deref().unwrap_or(&p.instance_id);
-                    let favorite = is_favorite(&p, &m);
-                    let score = model_label::search_score(&m, &p.driver, name, favorite, &self.picker.query)?;
-                    Some((score, !favorite, order, row(&p, &m)))
+                    let favorite = is_favorite(p, m);
+                    let score = model_label::search_score(m, &p.driver, name, favorite, &self.picker.query)?;
+                    Some((score, !favorite, order, row(p, m)))
                 })
                 .collect();
             scored.sort_by_key(|(score, not_favorite, order, _)| (*score, *not_favorite, *order));
@@ -253,10 +247,10 @@ impl Workspace {
         let tab = self.picker_tab(current);
         let mut rows: Vec<Row> = match &tab {
             Tab::Favorites => {
-                providers.flat_map(models).filter(|(p, m)| is_favorite(p, m)).map(|(p, m)| row(&p, &m)).collect()
+                providers.flat_map(models).filter(|(p, m)| is_favorite(p, m)).map(|(p, m)| row(p, m)).collect()
             }
             Tab::Provider(id) => {
-                providers.filter(|p| &p.instance_id == id).flat_map(models).map(|(p, m)| row(&p, &m)).collect()
+                providers.filter(|p| &p.instance_id == id).flat_map(models).map(|(p, m)| row(p, m)).collect()
             }
         };
         rows.sort_by_key(|r| !r.favorite);

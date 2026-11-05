@@ -124,7 +124,12 @@ pub(in crate::app) struct NumberField {
 
 impl NumberField {
     fn new(value: i64, workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx));
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            // Steps come back as events, so a step commits like Enter does.
+            state.set_step(None, window, cx);
+            state
+        });
         input.update(cx, |input, cx| input.set_value(value.to_string(), window, cx));
         let subscriptions = [
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {

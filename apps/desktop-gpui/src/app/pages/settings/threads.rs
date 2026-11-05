@@ -195,7 +195,11 @@ impl Workspace {
     /// Workspace controls.
     fn new_thread_controls(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> [AnyElement; 4] {
         let t = *tokens(cx);
-        let selection = self.server_info.new_thread_model(None);
+        // The scope's own default when its provider is usable, else what a new thread would get.
+        let selection = serde_json::from_value::<ModelSelection>(view.value("defaultModelSelection").clone())
+            .ok()
+            .filter(|s| self.server_info.provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
+            .or_else(|| self.server_info.new_thread_model(None));
         let pick = |key: &'static str| {
             move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
                 this.update_settings(json!({ key: pick.to_json() }), window, cx)
