@@ -25,6 +25,7 @@ mod requests;
 mod rpc;
 mod search;
 mod settings;
+mod snap_shot;
 mod terminal_text;
 mod theme;
 mod themes;

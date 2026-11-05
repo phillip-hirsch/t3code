@@ -621,6 +621,7 @@ impl Workspace {
             // The sidebar is a cached view and reads several device settings.
             self.notify_sidebar(cx);
             self.report_browser_profiles(cx);
+            self.sync_snap_shot(window, cx);
         }
         let Some(patch) = plan.server_patch else { return done(self, true, cx) };
         let Some(client) = self.client() else { return done(self, false, cx) };

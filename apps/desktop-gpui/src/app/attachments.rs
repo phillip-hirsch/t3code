@@ -19,6 +19,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::composer::ComposerDraft;
+use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
 use crate::composer_text;
 use crate::theme::Tokens;
@@ -58,6 +59,8 @@ pub(super) struct Attachment {
     bytes: Arc<Vec<u8>>,
     image: Option<Arc<Image>>,
     upload: Upload,
+    /// A SnapShot's source, sent with the image.
+    source: Option<SnapShotSource>,
 }
 
 impl Attachment {
@@ -72,7 +75,7 @@ impl Attachment {
         let image = image_format(&mime)
             .filter(|_| kind == Kind::Image)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        Self { local_id, kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
+        Self { local_id, kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading, source: None }
     }
 
     pub(super) fn local_id(&self) -> &str {
@@ -383,6 +386,7 @@ impl Workspace {
             bytes: Arc::new(bytes),
             image,
             upload: Upload::Uploading,
+            source: None,
         };
         // Files always get an inline chip; images only once the prompt has text.
         if kind == Kind::File || !self.composer_empty {
@@ -410,6 +414,48 @@ impl Workspace {
         self.attachments.push(attachment);
         self.upload(local_id, cx);
         cx.notify();
+    }
+
+    /// A SnapShot capture into the composer on screen, with its source.
+    pub(super) fn attach_snap_shot(
+        &mut self,
+        name: String,
+        mime: &str,
+        bytes: Vec<u8>,
+        source: SnapShotSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.attachments.len();
+        self.add_attachment(name, Kind::Image, mime, bytes, window, cx);
+        if let Some(attachment) = self.attachments.get_mut(at) {
+            attachment.source = Some(source);
+        }
+    }
+
+    /// A SnapShot capture into `target`'s set-aside draft, which the user left while it was
+    /// taken; `false` when that draft has no room for it.
+    pub(super) fn stash_snap_shot(
+        &mut self,
+        target: Target,
+        name: String,
+        mime: &str,
+        bytes: Vec<u8>,
+        source: SnapShotSource,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let draft =
+            self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
+        let ComposerDraft::Prompt(_, kept) = draft else { return false };
+        if kept.len() >= MAX_ATTACHMENTS {
+            return false;
+        }
+        let mut attachment = Attachment::restored(Kind::Image.as_str(), name, mime.to_owned(), bytes);
+        attachment.source = Some(source);
+        let local_id = attachment.local_id.clone();
+        kept.push(attachment);
+        self.upload(local_id, cx);
+        true
     }
 
     /// Mints a signed upload URL, then POSTs the bytes to it.
@@ -528,10 +574,14 @@ impl Workspace {
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let size = attachment.bytes.len();
-            attachments.push(json!({
+            let mut sent = json!({
                 "type": attachment.kind.as_str(), "id": id, "name": attachment.name,
                 "mimeType": attachment.mime, "sizeBytes": size,
-            }));
+            });
+            if let Some(source) = &attachment.source {
+                sent["source"] = source.value.clone();
+            }
+            attachments.push(sent);
             if text.contains(&format!("/{}/{})", attachment.kind.as_str(), attachment.context_id())) {
                 records.push(json!({
                     "version": 1, "kind": attachment.kind.as_str(), "contextId": attachment.context_id(),
@@ -590,7 +640,8 @@ impl Workspace {
         div()
             .id(ElementId::Name(format!("attachment-{id}").into()))
             .relative()
-            .size(px(64.))
+            // `SNAP_SHOT_ATTACHMENT_FRAME_CLASS`.
+            .map(|el| if attachment.source.is_some() { el.w(px(208.)).h(px(112.)) } else { el.size(px(64.)) })
             .flex_none()
             .overflow_hidden()
             .rounded(px(8.))
@@ -611,6 +662,7 @@ impl Workspace {
                         .child(attachment.name.clone()),
                 ),
             })
+            .children(attachment.source.as_ref().map(|source| source.render_details(&id, t)))
             .when(attachment.upload == Upload::Uploading, |el| {
                 el.child(
                     div()
@@ -779,6 +831,7 @@ mod tests {
             bytes: Arc::default(),
             image: None,
             upload: Upload::Uploading,
+            source: None,
         };
         let mut active = vec![attachment("on-screen")];
         let mut drafts = HashMap::from([(
