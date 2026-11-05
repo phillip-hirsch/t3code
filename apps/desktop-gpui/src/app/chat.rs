@@ -21,7 +21,7 @@ use gpui_kit::{
 use gpui_kit::assets::IconName;
 
 use super::{Target, Workspace, message_actions, project_name};
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
 
@@ -272,7 +272,7 @@ fn no_thread(t: &Tokens) -> AnyElement {
                 .items_center()
                 .child(
                     div()
-                        .text_size(px(20.))
+                        .text_xl()
                         .line_height(px(28.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(t.foreground)
@@ -301,7 +301,7 @@ fn draft_headline(project: Option<SharedString>, t: &Tokens) -> gpui_kit::Div {
             .child("?"),
         None => h_flex().justify_center().child("What should we work on?"),
     };
-    div().w_full().text_size(px(30.)).line_height(px(36.)).text_color(t.foreground).child(headline)
+    div().w_full().text_3xl().line_height(px(36.)).text_color(t.foreground).child(headline)
 }
 
 impl Workspace {
@@ -896,7 +896,7 @@ fn code_block_header(
         .gap(px(8.))
         .child(
             div()
-                .font_family(FONT_MONO)
+                .font_family(t.fonts.mono)
                 .text_size(px(11.))
                 .text_color(label_color)
                 .children(block.lang().filter(|lang| !lang.is_empty())),
@@ -927,7 +927,7 @@ pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyl
         .rounded(px(8.))
         .bg(code_background)
         .border_color(code_border)
-        .text_size(px(13.))
+        .text_size(px(t.fonts.code_size))
         .line_height(relative(1.375));
     if !wrap {
         code_block = code_block.whitespace_nowrap();
@@ -1365,7 +1365,7 @@ fn entry_details(
             .pb(px(8.))
             .max_h(px(256.))
             .overflow_y_scroll()
-            .font_family(FONT_MONO)
+            .font_family(t.fonts.mono)
             .text_size(px(13.))
             .line_height(relative(1.625))
             .text_color(alpha(t.foreground, 0.85))

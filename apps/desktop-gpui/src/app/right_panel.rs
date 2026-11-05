@@ -1130,7 +1130,7 @@ impl Workspace {
                         h_flex()
                             .mr_1()
                             .gap_1()
-                            .font_family(theme::FONT_MONO)
+                            .font_family(tokens.fonts.mono)
                             .text_size(px(11.))
                             .child(div().text_color(git::addition_color(tokens, scheme)).child(format!("+{additions}")))
                             .child(div().text_color(git::deletion_color(tokens, scheme)).child(format!("-{deletions}")))
@@ -1233,8 +1233,8 @@ impl Workspace {
                     )
                 })
                 .child({
-                    // Pierre's default size for headers and code.
-                    let diff = Diff::new(&self.right_panel.diff).soft_wrap(wrap).flex_1().min_h_0().text_size(px(13.));
+                    // `--diffs-font-size`, the Code font size.
+                    let diff = Diff::new(&self.right_panel.diff).soft_wrap(wrap).flex_1().min_h_0().text_size(px(tokens.fonts.code_size));
                     match scheme {
                         DiffColorScheme::RedGreen => diff.into_any_element(),
                         DiffColorScheme::BlueOrange => DiffTint {

@@ -357,7 +357,7 @@ fn redacted_email(id: &str, email: &str, revealed: bool, t: &Tokens) -> gpui_kit
     div()
         .id(SharedString::from(format!("redacted-{id}")))
         .cursor_pointer()
-        .font_family(theme::FONT_MONO)
+        .font_family(t.fonts.mono)
         .text_size(px(10.))
         .text_color(if revealed { t.muted_foreground } else { t.muted_foreground.opacity(0.6) })
         .hover(|el| el.text_color(t.foreground))
@@ -1792,7 +1792,7 @@ impl AccountSection {
                     .text_sm()
                     .text_color(t.muted_foreground)
                     .child("Enter code")
-                    .child(div().font_family(theme::FONT_MONO).text_color(t.foreground).child(user_code.clone()))
+                    .child(div().font_family(t.fonts.mono).text_color(t.foreground).child(user_code.clone()))
                     .child("in your browser."),
             );
         }
@@ -1810,7 +1810,7 @@ impl AccountSection {
                         .border_color(if focus.is_focused(window) { t.ring } else { t.border })
                         .bg(t.background)
                         .p_2()
-                        .font_family(theme::FONT_MONO)
+                        .font_family(t.fonts.mono)
                         .text_size(px(13.))
                         .text_color(t.foreground)
                         .child(strip_ansi(output))

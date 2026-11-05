@@ -353,7 +353,7 @@ impl Workspace {
                 .py(px(4.))
                 .gap(px(8.))
                 .rounded(px(4.))
-                .text_size(px(14.))
+                .text_sm()
                 .line_height(px(20.))
                 .cursor_pointer()
                 .when(highlighted, |el| el.bg(fg.opacity(0.09)))
@@ -377,52 +377,54 @@ impl Workspace {
                 )
                 .children(controls)
         }));
-        let popup =
-            v_flex()
-                .id("sidebar-filter-popup")
-                .occlude()
-                .w(px(288.))
-                .max_h(px(368.))
-                .overflow_hidden()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(fg.opacity(0.1))
-                .bg(tokens.popover)
-                .shadow_xl()
-                .cursor_default()
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_filter(cx)))
-                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.filter_key(event, cx)))
-                .child(
-                    div().px(px(12.)).pt(px(10.)).child(
-                        h_flex()
-                            .relative()
-                            .pb(px(6.))
-                            .border_b_1()
-                            .border_color(tokens.ring)
-                            .child(div().absolute().left_0().top(px(5.)).child(icon(
-                                IconName::Search,
-                                16.,
-                                tokens.muted_foreground.opacity(0.55),
-                            )))
-                            .child(div().flex_1().pl(px(20.)).child(
-                                Input::new(&filter.query).appearance(false).h(px(26.)).px_0().text_size(px(14.)),
-                            )),
-                    ),
-                )
-                .child(div().id("sidebar-filter-list").flex_1().min_h_0().overflow_y_scroll().child(list).when(
-                    rows.is_empty(),
-                    |el| {
-                        el.child(
+        let popup = v_flex()
+            .id("sidebar-filter-popup")
+            .occlude()
+            .w(px(288.))
+            .max_h(px(368.))
+            .overflow_hidden()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(fg.opacity(0.1))
+            .bg(tokens.popover)
+            .shadow_xl()
+            .cursor_default()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_filter(cx)))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.filter_key(event, cx)))
+            .child(
+                div().px(px(12.)).pt(px(10.)).child(
+                    h_flex()
+                        .relative()
+                        .pb(px(6.))
+                        .border_b_1()
+                        .border_color(tokens.ring)
+                        .child(div().absolute().left_0().top(px(5.)).child(icon(
+                            IconName::Search,
+                            16.,
+                            tokens.muted_foreground.opacity(0.55),
+                        )))
+                        .child(
                             div()
-                                .p(px(8.))
-                                .text_center()
-                                .text_size(px(14.))
-                                .text_color(tokens.muted_foreground)
-                                .child("No matching projects."),
-                        )
-                    },
-                ));
+                                .flex_1()
+                                .pl(px(20.))
+                                .child(Input::new(&filter.query).appearance(false).h(px(26.)).px_0().text_sm()),
+                        ),
+                ),
+            )
+            .child(div().id("sidebar-filter-list").flex_1().min_h_0().overflow_y_scroll().child(list).when(
+                rows.is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .p(px(8.))
+                            .text_center()
+                            .text_sm()
+                            .text_color(tokens.muted_foreground)
+                            .child("No matching projects."),
+                    )
+                },
+            ));
         let _ = FontWeight::NORMAL;
         Some(
             div()

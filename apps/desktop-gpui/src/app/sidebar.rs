@@ -31,7 +31,7 @@ use super::{Connection, Target, Workspace, project_name};
 use crate::inbox::{self, Facts, FolderDot, Status};
 use crate::model::{ProjectShell, ShellState, ThreadShell};
 use crate::project_groups::{self, GroupingSettings, ProjectGroup, SortOrder};
-use crate::theme::{FONT_MONO, Tokens};
+use crate::theme::Tokens;
 
 const DEFAULT_WIDTH: f32 = 256.;
 const MIN_WIDTH: f32 = 208.;
@@ -333,11 +333,11 @@ pub(super) fn now_ms() -> i64 {
 }
 
 fn text_xs<E: gpui_kit::Styled>(el: E) -> E {
-    el.text_size(px(12.)).line_height(px(16.))
+    el.text_xs().line_height(px(16.))
 }
 
 fn text_sm<E: gpui_kit::Styled>(el: E) -> E {
-    el.text_size(px(14.)).line_height(px(20.))
+    el.text_sm().line_height(px(20.))
 }
 
 fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
@@ -750,7 +750,7 @@ impl Workspace {
                 .child(
                     Input::new(&renaming.input)
                         .w_full()
-                        .text_size(px(14.))
+                        .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .h(px(22.))
                         .px(px(4.))
@@ -1318,9 +1318,11 @@ impl Workspace {
                         el.bg(sb.row_hover).border_1().border_color(tokens.ring.opacity(0.7)).px(px(7.))
                     })
                     .child(icon(IconName::Search, 16., sb.icon))
-                    .child(div().flex_1().min_w_0().child(
-                        Input::new(&self.sidebar.search).appearance(false).px_0().py_0().h(px(20.)).text_size(px(14.)),
-                    ))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.sidebar.search).appearance(false).px_0().py_0().h(px(20.)).text_sm(),
+                        ),
+                    )
                     .when(searching, |el| {
                         el.child(
                             div()
@@ -2338,7 +2340,7 @@ pub(in crate::app) fn project_icon(
         .bg(shown.opacity(0.14))
         .text_color(shown)
         .when(grayscale, |el| el.group_hover(ROW_GROUP, |s| s.bg(color.opacity(0.14)).text_color(color)))
-        .font_family(FONT_MONO)
+        .font_family(tokens.fonts.mono)
         .text_size(px(9. * scale))
         .line_height(px(size))
         .font_weight(FontWeight::BOLD)

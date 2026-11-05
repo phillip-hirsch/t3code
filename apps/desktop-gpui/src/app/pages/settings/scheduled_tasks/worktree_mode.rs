@@ -317,9 +317,7 @@ impl NewWorktreeMode {
                 ),
             )
             .when(count == 0, |popup| {
-                popup.child(
-                    div().p_2().text_center().text_size(px(14.)).text_color(t.muted_foreground).child("No refs found."),
-                )
+                popup.child(div().p_2().text_center().text_sm().text_color(t.muted_foreground).child("No refs found."))
             })
             .when(count > 0, |popup| popup.child(div().py_2().child(list)))
             .child(self.render_origin_control(t, cx))
@@ -327,7 +325,7 @@ impl NewWorktreeMode {
                 div()
                     .px_3()
                     .py_2()
-                    .text_size(px(12.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.muted_foreground)
                     .child(status)
@@ -361,7 +359,7 @@ impl NewWorktreeMode {
             .gap_2()
             .rounded(px(4.))
             .cursor_pointer()
-            .text_size(px(14.))
+            .text_sm()
             .when(highlighted, |row| row.bg(t.foreground.opacity(0.09)))
             .hover(|row| row.bg(t.foreground.opacity(0.09)))
             .child(div().flex_1().min_w_0().truncate().child(name.clone()))
@@ -381,7 +379,7 @@ impl NewWorktreeMode {
             .py_2()
             .border_t_1()
             .border_color(t.border.opacity(0.6))
-            .text_size(px(12.))
+            .text_xs()
             .cursor_pointer()
             .tooltip(|window, cx| {
                 gpui_kit::component::tooltip::Tooltip::new(
@@ -449,7 +447,7 @@ impl Render for NewWorktreeMode {
             .gap(px(6.))
             .child(
                 div()
-                    .text_size(px(14.))
+                    .text_sm()
                     .line_height(px(16.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.foreground)

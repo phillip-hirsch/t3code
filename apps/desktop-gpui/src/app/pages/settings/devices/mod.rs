@@ -27,7 +27,7 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::{RowFrame, settings_section};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcError;
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 impl Workspace {
     /// Streams `subscribeDeviceState` for this connection; the task ends with the socket.
@@ -407,5 +407,5 @@ fn version_row(label: &'static str, value: String, t: &Tokens) -> Div {
         .justify_between()
         .gap(px(24.))
         .child(div().text_color(t.muted_foreground).child(label))
-        .child(div().font_family(FONT_MONO).text_right().child(SharedString::from(value)))
+        .child(div().font_family(t.fonts.mono).text_right().child(SharedString::from(value)))
 }

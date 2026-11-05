@@ -16,6 +16,8 @@ mod providers;
 mod search;
 mod snap_shot;
 mod system;
+mod theme_library;
+mod typography;
 mod widgets;
 
 use std::cell::Cell;
@@ -39,6 +41,7 @@ use crate::app::Workspace;
 use crate::settings::scope::{ScopeKind, ScopeSearch};
 use crate::settings::{SearchItem, ThemePreference, contract};
 use crate::theme::{self, Tokens};
+use crate::themes::ThemeChoice;
 
 /// The sections in sidebar order (`SETTINGS_NAV_GROUPS`, `SETTINGS_SECTION_LABELS` in
 /// `apps/web/src/components/settings/settingsSearch.ts`). A `None` heading is set apart by space alone.
@@ -133,6 +136,8 @@ pub(in crate::app) struct SettingsUi {
     open_marker: Option<SharedString>,
     /// Open "Advanced" folds, by section id.
     advanced_open: HashSet<&'static str>,
+    /// The Typography rows' family pickers, by setting key.
+    font_pickers: HashMap<&'static str, typography::FontPicker>,
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
@@ -166,6 +171,7 @@ impl SettingsUi {
             sliders: HashMap::new(),
             open_marker: None,
             advanced_open: HashSet::new(),
+            font_pickers: HashMap::new(),
             last_grouping_mode: "repository",
             focus: cx.focus_handle(),
             focus_on_render: false,
@@ -249,10 +255,16 @@ const RESTORE: &[(&str, &[&str])] = &[
 
 /// The restore labels whose settings differ from their defaults, and the patch that resets
 /// every restorable key the contract knows.
-fn restore_plan(value: impl Fn(&str) -> Value, theme: ThemePreference) -> (Vec<&'static str>, Map<String, Value>) {
+fn restore_plan(value: impl Fn(&str) -> Value, theme: &ThemeChoice) -> (Vec<&'static str>, Map<String, Value>) {
     let contract = contract();
     let known = |key: &str| contract.server_defaults.contains_key(key) || contract.client_defaults.contains_key(key);
-    let changed = (theme != ThemePreference::System).then_some("Theme").into_iter().chain(
+    let halves = &theme.halves;
+    let theme_labels = [
+        (theme.base.is_some(), "Theme"),
+        (theme.mode != ThemePreference::System, "Follow system"),
+        (halves.light.is_some() || halves.dark.is_some(), "Theme mix"),
+    ];
+    let changed = theme_labels.into_iter().filter(|(changed, _)| *changed).map(|(_, label)| label).chain(
         RESTORE
             .iter()
             .filter(|(_, keys)| {
@@ -417,15 +429,18 @@ impl Workspace {
             .px(px(8.))
             .gap(px(8.))
             .rounded(px(6.))
-            .text_size(px(14.))
+            .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .text_color(sb.muted_foreground)
             .hover(|s| s.bg(sb.row_hover))
             .when(search_focused, |el| el.bg(sb.row_hover))
             .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.muted_foreground.opacity(0.8)))
-            .child(div().flex_1().min_w_0().child(
-                Input::new(&self.settings_ui.search).appearance(false).px_0().py_0().h(px(20.)).text_size(px(14.)),
-            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.settings_ui.search).appearance(false).px_0().py_0().h(px(20.)).text_sm()),
+            )
             .map(|el| {
                 if searching {
                     el.child(
@@ -458,7 +473,7 @@ impl Workspace {
                     .px(px(8.))
                     .py(px(24.))
                     .text_center()
-                    .text_size(px(12.))
+                    .text_xs()
                     .text_color(sb.muted_foreground)
                     .child("No settings found")
                     .into_any_element()
@@ -496,7 +511,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(14.))
+                                            .text_sm()
                                             .line_height(px(20.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(sb.foreground)
@@ -524,7 +539,7 @@ impl Workspace {
                         .children(heading.map(|heading| {
                             div()
                                 .px(px(8.))
-                                .text_size(px(12.))
+                                .text_xs()
                                 .line_height(px(16.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(sb.muted_foreground.opacity(0.8))
@@ -540,7 +555,7 @@ impl Workspace {
                                 .gap(px(8.))
                                 .rounded(px(8.))
                                 .cursor_pointer()
-                                .text_size(px(14.))
+                                .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(if active { sb.foreground } else { sb.muted_foreground.opacity(0.8) })
                                 .when(active, |el| el.bg(sb.row_active))
@@ -583,7 +598,7 @@ impl Workspace {
                 .px(px(7.))
                 .gap(px(4.))
                 .rounded(px(8.))
-                .text_size(px(12.))
+                .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .disabled(changed.is_empty())
                 .child(Icon::new(IconName::RotateCcw).size(px(14.)).mx(px(4.)))
@@ -602,7 +617,7 @@ impl Workspace {
                 h_flex()
                     .min_w_0()
                     .gap(px(12.))
-                    .text_size(px(14.))
+                    .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .child(div().flex_none().text_color(t.muted_foreground).child("Settings"))
                     .child(div().flex_none().text_color(t.muted_foreground.opacity(0.6)).child("/"))
@@ -613,6 +628,7 @@ impl Workspace {
                     Button::new("settings-close")
                         .ghost()
                         .size(px(28.))
+                        .p_0()
                         .rounded(px(8.))
                         .child(Icon::new(IconName::X).size(px(16.)))
                         .tooltip("Close (Esc)")
@@ -624,7 +640,7 @@ impl Workspace {
 
     fn restore_defaults_plan(&self) -> (Vec<&'static str>, Map<String, Value>) {
         let view = self.settings_view();
-        restore_plan(|key| view.value(key).clone(), self.client_settings.theme)
+        restore_plan(|key| view.value(key).clone(), &self.client_settings.theme_choice())
     }
 
     /// `RestoreDeviceDefaultsButton`: confirms, then resets the theme and every listed setting.
@@ -645,7 +661,7 @@ impl Workspace {
                 .show_cancel(true)
                 .on_ok(move |_, window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.set_theme_preference(ThemePreference::System, window, cx);
+                        this.set_theme_choice(ThemeChoice::default(), window, cx);
                         this.update_settings(Value::Object(patch.clone()), window, cx);
                     });
                     true
@@ -653,14 +669,15 @@ impl Workspace {
         });
     }
 
-    pub(in crate::app) fn set_theme_preference(
+    /// Stores and paints a theme library pick (`setTheme`, `setAppearanceMode`, `setThemeHalf`).
+    pub(in crate::app) fn set_theme_choice(
         &mut self,
-        preference: ThemePreference,
+        choice: ThemeChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.client_settings.set_theme(preference);
-        theme::set_preference(preference, window, cx);
+        self.client_settings.set_theme_choice(choice.clone());
+        theme::set_preference(choice, window, cx);
         cx.notify();
     }
 
@@ -677,7 +694,7 @@ impl Workspace {
             };
             if let Some(message) = message {
                 let t = *theme::tokens(cx);
-                let note = div().px(px(16.)).text_size(px(14.)).text_color(t.muted_foreground).child(message);
+                let note = div().px(px(16.)).text_sm().text_color(t.muted_foreground).child(message);
                 return self.settings_page(section, &view, [note.into_any_element()], cx);
             }
         }
@@ -725,7 +742,7 @@ impl Workspace {
                     .px(px(16.))
                     .gap(px(6.))
                     .cursor_pointer()
-                    .text_size(px(12.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.muted_foreground)
                     .hover(|s| s.text_color(t.foreground))
@@ -761,7 +778,7 @@ fn kbd(key: &'static str, t: &Tokens) -> impl IntoElement {
         .justify_center()
         .rounded(px(4.))
         .bg(t.foreground.opacity(0.07))
-        .text_size(px(12.))
+        .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.muted_foreground)
         .child(key)
@@ -774,7 +791,7 @@ mod tests {
     #[test]
     fn restore_lists_changed_settings_and_resets_known_keys() {
         let defaults = |key: &str| contract().default_value(key).clone();
-        let (changed, patch) = restore_plan(defaults, ThemePreference::System);
+        let (changed, patch) = restore_plan(defaults, &ThemeChoice::default());
         assert!(changed.is_empty());
         assert_eq!(patch.get("confirmThreadDelete"), Some(contract().default_value("confirmThreadDelete")));
         assert!(patch.keys().all(|k| contract().is_server_key(k) || contract().is_client_key(k)));
@@ -783,8 +800,9 @@ mod tests {
             "fontSizeCode" => Value::from(20),
             _ => contract().default_value(key).clone(),
         };
-        let (changed, _) = restore_plan(edited, ThemePreference::Dark);
-        assert_eq!(changed, ["Theme", "Code font"]);
+        let theme = ThemeChoice { mode: ThemePreference::Dark, base: Some("grove".into()), ..Default::default() };
+        let (changed, _) = restore_plan(edited, &theme);
+        assert_eq!(changed, ["Theme", "Follow system", "Code font"]);
     }
 
     #[test]

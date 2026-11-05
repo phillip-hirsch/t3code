@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::backend::Endpoint;
 use crate::inbox;
 use crate::rpc::RpcClient;
-use crate::theme::{FONT_MONO, Tokens};
+use crate::theme::Tokens;
 
 /// `PROJECT_ICON_COLORS` swatches (Tailwind 500), in `inbox::PROJECT_COLORS` order.
 const SWATCHES: [u32; 18] = [
@@ -215,7 +215,7 @@ pub(super) fn monogram(text: &str, color: &str, size: f32, tokens: &Tokens) -> A
         .rounded(px(size / 4.))
         .bg(color.opacity(0.14))
         .text_color(color)
-        .font_family(FONT_MONO)
+        .font_family(tokens.fonts.mono)
         .font_weight(FontWeight::BOLD)
         .text_size(px(size * 8.25 / 16.))
         .line_height(px(size))

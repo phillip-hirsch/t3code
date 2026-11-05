@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::themes::{ThemeChoice, ThemeHalves};
+
 /// Data generated from the TypeScript contracts by `tools/settings_data.test.ts`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,13 +175,21 @@ impl ThemePreference {
     }
 }
 
-/// Key in `client-settings.json` holding the theme, which this client has no local storage for.
+/// Keys in `client-settings.json` for what the web keeps in local storage: the appearance
+/// mode (`t3code:theme-appearance-mode`), the theme in use (`t3code:theme`) and the
+/// per-appearance mix (`t3code:theme-halves:v1`).
 const THEME_KEY: &str = "theme";
+const THEME_ID_KEY: &str = "themeId";
+const THEME_HALVES_KEY: &str = "themeHalves";
+/// `t3code:typography-advanced`: prompt, code and terminal fonts set separately.
+pub const TYPOGRAPHY_ADVANCED_KEY: &str = "typographyAdvanced";
 
 /// This device's settings, persisted like the desktop app's `client-settings.json`.
 pub struct ClientSettings {
     pub values: Settings,
     pub theme: ThemePreference,
+    pub theme_id: Option<String>,
+    pub theme_halves: ThemeHalves,
     path: Option<PathBuf>,
 }
 
@@ -200,8 +210,26 @@ impl ClientSettings {
     }
 
     fn from_stored(stored: &Value, path: Option<PathBuf>) -> Self {
+        let text = |value: &Value| value.as_str().map(str::to_owned);
         let theme = ThemePreference::parse(stored.get(THEME_KEY).and_then(Value::as_str).unwrap_or_default());
-        Self { values: Settings::layered(&contract().client_defaults, stored), theme, path }
+        let halves = &stored[THEME_HALVES_KEY];
+        Self {
+            values: Settings::layered(&contract().client_defaults, stored),
+            theme,
+            theme_id: text(&stored[THEME_ID_KEY]),
+            theme_halves: ThemeHalves { light: text(&halves["light"]), dark: text(&halves["dark"]) },
+            path,
+        }
+    }
+
+    pub fn theme_choice(&self) -> ThemeChoice {
+        ThemeChoice { mode: self.theme, base: self.theme_id.clone(), halves: self.theme_halves.clone() }
+    }
+
+    /// Stores a theme library pick (mode, theme and mix together).
+    pub fn set_theme_choice(&mut self, choice: ThemeChoice) {
+        (self.theme, self.theme_id, self.theme_halves) = (choice.mode, choice.base, choice.halves);
+        self.save();
     }
 
     pub fn apply(&mut self, patch: &Map<String, Value>) {
@@ -209,14 +237,12 @@ impl ClientSettings {
         self.save();
     }
 
-    pub fn set_theme(&mut self, theme: ThemePreference) {
-        self.theme = theme;
-        self.save();
-    }
-
     fn document(&self) -> Value {
         let mut document = self.values.as_map().clone();
         document.insert(THEME_KEY.into(), self.theme.id().into());
+        document.insert(THEME_ID_KEY.into(), self.theme_id.clone().into());
+        let halves = &self.theme_halves;
+        document.insert(THEME_HALVES_KEY.into(), serde_json::json!({ "light": halves.light, "dark": halves.dark }));
         Value::Object(document)
     }
 
@@ -277,11 +303,15 @@ mod tests {
         let path = dir.join("client-settings.json");
         let mut settings = ClientSettings::from_stored(&json!({}), Some(path.clone()));
         settings.apply(json!({"timestampFormat": "24-hour"}).as_object().unwrap());
-        settings.set_theme(ThemePreference::Dark);
+        let mut choice = settings.theme_choice();
+        choice.mode = ThemePreference::Dark;
+        choice.assign_half(false, Some("grove".into()));
+        settings.set_theme_choice(choice.clone());
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let reloaded = ClientSettings::from_stored(&raw, None);
         assert_eq!(reloaded.values.get("timestampFormat"), "24-hour");
         assert_eq!(reloaded.theme, ThemePreference::Dark);
+        assert_eq!(reloaded.theme_choice(), choice);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

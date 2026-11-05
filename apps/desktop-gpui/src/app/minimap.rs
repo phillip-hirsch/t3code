@@ -99,32 +99,33 @@ impl Workspace {
                     })),
             );
         }
-        let card = hovered.map(|index| {
-            let (user, reply) = preview(&self.rows, ticks[index]);
-            div()
-                .absolute()
-                .left(px(20.))
-                .top(px(index as f32 / last * height - 12.))
-                .w(px(320.))
-                .p(px(12.))
-                .rounded(px(12.))
-                .border_1()
-                .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-                .bg(t.popover)
-                .shadow_xl()
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(14.))
-                        .line_height(px(20.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(t.foreground)
-                        .child(user),
-                )
-                .children(reply.map(|reply| {
-                    div().mt(px(4.)).line_clamp(3).text_size(px(14.)).text_color(t.muted_foreground).child(reply)
-                }))
-        });
+        let card =
+            hovered.map(|index| {
+                let (user, reply) = preview(&self.rows, ticks[index]);
+                div()
+                    .absolute()
+                    .left(px(20.))
+                    .top(px(index as f32 / last * height - 12.))
+                    .w(px(320.))
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
+                    .bg(t.popover)
+                    .shadow_xl()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.foreground)
+                            .child(user),
+                    )
+                    .children(reply.map(|reply| {
+                        div().mt(px(4.)).line_clamp(3).text_sm().text_color(t.muted_foreground).child(reply)
+                    }))
+            });
         Some(
             div()
                 .absolute()

@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use self::background::Profile;
 use super::widgets::{Part, RowFrame, SettingRow, rich_text, settings_section};
 use crate::app::Workspace;
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 const GUEST_LINKS: &[Part] = &[
     Part::Text(
@@ -540,7 +540,7 @@ fn version_title(t: &Tokens) -> AnyElement {
         .child(
             div()
                 .id("about-version")
-                .font_family(FONT_MONO)
+                .font_family(t.fonts.mono)
                 .text_size(px(11.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(t.muted_foreground)

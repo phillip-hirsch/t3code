@@ -4,14 +4,14 @@
 //! and context, at the density the card's height allows.
 
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, anchored, deferred, div,
-    hsla, img, point, px, relative, rgb, svg,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, anchored,
+    deferred, div, hsla, img, point, px, relative, rgb, svg,
 };
 use serde_json::{Value, json};
 
@@ -20,6 +20,7 @@ use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
 use crate::model::{ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
+use crate::thread_details;
 
 const CARD_WIDTH: f32 = 280.;
 const CARD_INSET: f32 = 12.;
@@ -190,9 +191,9 @@ impl Workspace {
         let sections: Vec<Section> = [
             self.workspace_section(&tokens, &colors, cx),
             self.version_control_section(&tokens, &colors, cx),
-            self.lineage_section(&tokens, &colors, cx),
-            self.usage_section(&tokens, &colors),
-            self.context_section(&tokens, &colors),
+            self.lineage_section(&tokens, &colors, cx).filter(|_| self.lineage_shown()),
+            self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
+            self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
         ]
         .into_iter()
         .flatten()
@@ -206,9 +207,11 @@ impl Workspace {
         let sections: Vec<AnyElement> = [
             self.workspace_section_at(density, &tokens, &colors, cx),
             self.version_control_section_at(density, &tokens, &colors, cx),
-            (density == Density::Full).then(|| self.lineage_section(&tokens, &colors, cx)).flatten(),
-            self.usage_section(&tokens, &colors),
-            self.context_section(&tokens, &colors),
+            (density == Density::Full && self.lineage_shown())
+                .then(|| self.lineage_section(&tokens, &colors, cx))
+                .flatten(),
+            self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
+            self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
         ]
         .into_iter()
         .flatten()
@@ -224,6 +227,18 @@ impl Workspace {
                 .into_any_element()
         })
         .collect();
+        // Shown only when no section has content, so an emptied card can be refilled.
+        let choose = sections.is_empty().then(|| {
+            div().p_2().child(
+                Button::new("thread-details-choose")
+                    .ghost()
+                    .xsmall()
+                    .icon(gpui_kit::assets::IconName::SlidersHorizontal)
+                    .label("Choose what to show")
+                    .text_color(tokens.muted_foreground)
+                    .dropdown_menu(thread_details_items_menu(cx.weak_entity())),
+            )
+        });
         let card = v_flex()
             .id("thread-details")
             .w_full()
@@ -233,7 +248,9 @@ impl Workspace {
             .border_1()
             .border_color(colors.border)
             .bg(colors.background)
-            .children(sections);
+            .children(sections)
+            .children(choose)
+            .context_menu(thread_details_items_menu(cx.weak_entity()));
         if inline {
             return Some(
                 div()
@@ -268,6 +285,16 @@ impl Workspace {
         )
     }
 
+    /// Whether the thread details card shows an item (`threadDetailsItems` client setting).
+    fn details_item_shown(&self, id: &str) -> bool {
+        thread_details::visible(&self.client_settings.values, id)
+    }
+
+    /// The lineage section holds both the lineage and the side chats items.
+    fn lineage_shown(&self) -> bool {
+        self.details_item_shown("lineage") || self.details_item_shown("sideChats")
+    }
+
     fn workspace_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
         self.workspace_section_at(Density::Full, tokens, colors, cx).map(|mut section| {
             // Compact keeps Open in and the scripts row; essential keeps only scripts.
@@ -286,9 +313,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Section> {
         let rows: Vec<AnyElement> = [
-            (density == Density::Full).then(|| self.environment_row(tokens, colors)).flatten(),
-            (density != Density::Essential).then(|| self.open_in_row(tokens, colors, cx)).flatten(),
-            self.scripts_row(tokens, colors, cx),
+            (density == Density::Full && self.details_item_shown("environment"))
+                .then(|| self.environment_row(tokens, colors))
+                .flatten(),
+            (density != Density::Essential && self.details_item_shown("openIn"))
+                .then(|| self.open_in_row(tokens, colors, cx))
+                .flatten(),
+            self.details_item_shown("scripts").then(|| self.scripts_row(tokens, colors, cx)).flatten(),
         ]
         .into_iter()
         .flatten()
@@ -522,7 +553,7 @@ impl Workspace {
             .and_then(|status| status.local.ref_name.clone())
             .or_else(|| self.open_projection().and_then(|p| p.thread.branch.clone()));
         let mut rows: Vec<AnyElement> = Vec::new();
-        if is_repo {
+        if is_repo && self.details_item_shown("branch") {
             if let Some(branch) = branch {
                 rows.push(
                     row(colors)
@@ -539,7 +570,16 @@ impl Workspace {
                 min_density: Density::Essential,
             });
         };
+        let (actions_shown, changes_shown) =
+            (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
         if !status.local.is_repo {
+            if !actions_shown {
+                return (!rows.is_empty()).then(|| Section {
+                    height: rows.len() as f32 * ROW_HEIGHT,
+                    element: v_flex().children(rows).into_any_element(),
+                    min_density: Density::Essential,
+                });
+            }
             let running = self.vcs.running.is_some();
             rows.push(
                 action_row("details-init-git", colors, cx)
@@ -561,10 +601,10 @@ impl Workspace {
                 && quick.disabled()
                 && insertions == 0
                 && deletions == 0;
-            if !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
+            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
                 rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
             }
-            if !quiet_empty_draft {
+            if changes_shown && !quiet_empty_draft {
                 rows.push(self.changes_row(status, tokens, colors, cx));
             }
         }
@@ -830,7 +870,7 @@ impl Workspace {
                     .ml_auto()
                     .flex_none()
                     .gap(px(6.))
-                    .font_family(theme::FONT_MONO)
+                    .font_family(tokens.fonts.mono)
                     .text_xs()
                     .child(div().text_color(addition).child(format!("+{}", git::group_thousands(insertions))))
                     .child(div().text_color(deletion).child(format!("-{}", git::group_thousands(deletions)))),
@@ -1034,6 +1074,29 @@ impl Workspace {
 }
 
 /// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
+/// `ThreadDetailsItemsMenuItems`: the card's context menu, its empty state and Settings share it.
+pub(in crate::app) fn thread_details_items_menu(
+    workspace: WeakEntity<Workspace>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, window, cx| {
+        let Some(entity) = workspace.upgrade() else { return menu };
+        let settings = entity.read(cx).client_settings.values.clone();
+        let mut menu = menu.min_w(px(220.)).label("Show in thread details");
+        for (id, label, _) in thread_details::ITEMS {
+            let shown = thread_details::visible(&settings, id);
+            let patch = thread_details::set_item(&settings, id, !shown);
+            let toggle = window
+                .listener_for(&entity, move |this, _, window, cx| this.update_settings(patch.clone(), window, cx));
+            menu = menu.item(PopupMenuItem::new(label).checked(shown).on_click(toggle));
+        }
+        let reset = window
+            .listener_for(&entity, |this, _, window, cx| this.update_settings(thread_details::reset(), window, cx));
+        menu.separator().item(
+            PopupMenuItem::new("Reset to default").disabled(thread_details::is_default(&settings)).on_click(reset),
+        )
+    }
+}
+
 fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
     discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
         let auth = &provider["auth"];

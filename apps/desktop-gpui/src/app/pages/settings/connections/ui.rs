@@ -12,11 +12,11 @@ use gpui_kit::{
 };
 
 pub(super) fn text_xs<E: Styled>(el: E) -> E {
-    el.text_size(px(12.)).line_height(px(16.))
+    el.text_xs().line_height(px(16.))
 }
 
 pub(super) fn text_sm<E: Styled>(el: E) -> E {
-    el.text_size(px(14.)).line_height(px(20.))
+    el.text_sm().line_height(px(20.))
 }
 
 pub(super) fn text_2xs<E: Styled>(el: E) -> E {

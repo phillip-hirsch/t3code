@@ -27,7 +27,7 @@ use crate::pull_requests::{
     self as logic, CHECKS, DRAFTS, Entry, Filters, ListResult, MAX_PAGE_SIZE, PAGE_SIZE, REVIEWS, SORTS, STATES, Stats,
     View,
 };
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 /// `PullRequestRef` for a listed row.
 fn reference_of(entry: &Entry) -> Reference {
@@ -450,7 +450,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(&state.search).appearance(false).px_0().py_0().h(px(20.)).text_size(px(14.))),
+                    .child(Input::new(&state.search).appearance(false).px_0().py_0().h(px(20.)).text_sm()),
             );
 
         let sort = state.sort;
@@ -1138,7 +1138,7 @@ fn pull_request_row(
     let number = div()
         .id(ElementId::Name(id("number").into()))
         .flex_none()
-        .font_family(FONT_MONO)
+        .font_family(t.fonts.mono)
         .text_xs()
         .text_color(t.muted_foreground)
         .child(format!("#{}", entry.number))
@@ -1167,7 +1167,7 @@ fn pull_request_row(
             .ml_auto()
             .flex_none()
             .gap(px(4.))
-            .font_family(FONT_MONO)
+            .font_family(t.fonts.mono)
             .text_size(px(11.))
             .child(div().text_color(addition).child(format!("+{additions}")))
             .child(div().text_color(t.error).child(format!("-{deletions}")))

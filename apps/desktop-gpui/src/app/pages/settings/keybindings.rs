@@ -31,7 +31,7 @@ use crate::app::Workspace;
 use crate::keybindings::{
     self, Rule, STATIC_COMMANDS, Shortcut, When, defaults, parse_shortcut, parse_when, shortcut_input, when_expression,
 };
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 const MAC: bool = cfg!(target_os = "macos");
 /// The draft row of "Add keybinding".
@@ -1184,7 +1184,7 @@ impl KeybindingsPanel {
             .text_color(if expression.is_empty() { t.muted_foreground } else { t.foreground })
             .hover(|style| style.bg(t.accent))
             .when(open, |el| el.bg(t.accent))
-            .child(div().truncate().font_family(FONT_MONO).child(if expression.is_empty() {
+            .child(div().truncate().font_family(t.fonts.mono).child(if expression.is_empty() {
                 SharedString::new_static("Always")
             } else {
                 SharedString::from(expression.to_owned())
@@ -1286,7 +1286,7 @@ impl KeybindingsPanel {
                     .child(
                         Input::new(&self.when_input)
                             .small()
-                            .font_family(FONT_MONO)
+                            .font_family(t.fonts.mono)
                             .when(!unknown.is_empty(), |input| input.suffix(unknown_warning(id, t))),
                     )
                     .children(parsed.as_ref().err().map(|message| {
@@ -1619,7 +1619,7 @@ fn capture_field(id: &str, value: &str, recording: bool, t: &Tokens) -> gpui_kit
         .border_color(if recording { t.ring } else { t.input })
         .bg(if t.dark { t.input.opacity(0.32) } else { t.background })
         .cursor_text()
-        .font_family(FONT_MONO)
+        .font_family(t.fonts.mono)
         .text_sm()
         .map(|el| {
             if value.is_empty() {

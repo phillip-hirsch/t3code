@@ -18,7 +18,7 @@ use super::super::widgets::{RowFrame, card, loose_section, note, settings_sectio
 use super::{format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
 use crate::rpc::{RpcClient, StreamEvent};
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 /// `DATABASE_COMPACTION_RECOMMENDED_BYTES`.
 const COMPACTION_RECOMMENDED_BYTES: f64 = 1024. * 1024. * 1024.;
@@ -386,7 +386,7 @@ impl Workspace {
                 .render(t)
                 .into_any_element(),
             RowFrame::new(format!("{:.1} GiB on {label}", reclaimable / COMPACTION_RECOMMENDED_BYTES))
-                .description(div().font_family(FONT_MONO).child(command))
+                .description(div().font_family(t.fonts.mono).child(command))
                 .control(controls)
                 .render(t)
                 .into_any_element(),
@@ -449,7 +449,7 @@ fn cleanup_results(report: &Value, machine: &str, t: &Tokens) -> Vec<AnyElement>
                     div()
                         .min_w_0()
                         .text_color(t.foreground.opacity(0.8))
-                        .when(mono, |el| el.font_family(FONT_MONO))
+                        .when(mono, |el| el.font_family(t.fonts.mono))
                         .child(value.to_owned()),
                 )
             };

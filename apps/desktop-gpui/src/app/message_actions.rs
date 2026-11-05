@@ -445,7 +445,7 @@ pub(super) fn assistant_meta(
             .rounded_full()
             .border_1()
             .border_color(gpui_kit::Hsla { a: t.border.a * 0.7, ..t.border })
-            .font_family(crate::theme::FONT_MONO)
+            .font_family(t.fonts.mono)
             .text_size(px(10.))
             .text_color(t.muted_foreground)
             .child(status.to_owned())

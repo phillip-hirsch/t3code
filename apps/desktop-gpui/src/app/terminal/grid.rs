@@ -16,10 +16,8 @@ use gpui_kit::{
 };
 
 use super::session::TerminalSession;
-use crate::theme::{FONT_MONO, Tokens};
+use crate::theme::{self, Fonts, Tokens};
 
-/// `DEFAULT_CODE_FONT_SIZE`; the terminal follows the code font.
-pub(super) const FONT_SIZE: Pixels = px(13.);
 /// `CONTENT_PADDING` in `apps/web/src/terminal/ghostty/surface.ts`.
 pub(super) const PADDING: Pixels = px(4.);
 
@@ -258,17 +256,19 @@ impl Geometry {
     }
 }
 
-fn terminal_font() -> Font {
-    font(FONT_MONO)
+/// The Terminal font setting, which follows the code font unless set separately.
+fn terminal_font(fonts: &Fonts) -> (Font, Pixels) {
+    (font(fonts.terminal), px(fonts.terminal_size))
 }
 
 /// `measureGhosttyCell`: the advance of "M", and 1.35× the font size or the glyph height.
-pub(super) fn cell_size(window: &Window) -> (Pixels, Pixels) {
+pub(super) fn cell_size(window: &Window, fonts: &Fonts) -> (Pixels, Pixels) {
     let text_system = window.text_system();
-    let font_id = text_system.resolve_font(&terminal_font());
-    let width = text_system.advance(font_id, FONT_SIZE, 'M').map(|size| size.width).unwrap_or(px(7.));
-    let glyph = text_system.ascent(font_id, FONT_SIZE) + text_system.descent(font_id, FONT_SIZE).abs();
-    let height = (f32::from(FONT_SIZE) * 1.35).round().max(f32::from(glyph).ceil());
+    let (font, font_size) = terminal_font(fonts);
+    let font_id = text_system.resolve_font(&font);
+    let width = text_system.advance(font_id, font_size, 'M').map(|size| size.width).unwrap_or(px(7.));
+    let glyph = text_system.ascent(font_id, font_size) + text_system.descent(font_id, font_size).abs();
+    let height = (f32::from(font_size) * 1.35).round().max(f32::from(glyph).ceil());
     (width, px(height))
 }
 
@@ -336,7 +336,8 @@ impl Element for TerminalGrid {
         cx: &mut App,
     ) -> GridPrepaint {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let (cell_width, line_height) = cell_size(window);
+        let fonts = theme::tokens(cx).fonts;
+        let (cell_width, line_height) = cell_size(window, &fonts);
         // `terminalGridSize`.
         let columns = (((bounds.size.width - PADDING * 2.) / cell_width).floor() as usize).max(1);
         let rows = (((bounds.size.height - PADDING * 2.) / line_height).floor() as usize).max(1);
@@ -364,7 +365,7 @@ impl Element for TerminalGrid {
             background_colors.push(span.color);
         }
         let text_system = window.text_system().clone();
-        let base_font = terminal_font();
+        let (base_font, font_size) = terminal_font(&fonts);
         let shape = |text: String, style: &RunStyle| {
             let font = Font {
                 weight: if style.bold { FontWeight::BOLD } else { FontWeight::NORMAL },
@@ -379,7 +380,7 @@ impl Element for TerminalGrid {
                 underline: style.underline.then_some(UnderlineStyle { thickness: px(1.), color: None, wavy: false }),
                 strikethrough: style.strikethrough.then_some(StrikethroughStyle { thickness: px(1.), color: None }),
             };
-            text_system.shape_line(text.into(), FONT_SIZE, &[run], Some(cell_width))
+            text_system.shape_line(text.into(), font_size, &[run], Some(cell_width))
         };
         let mut lines = Vec::with_capacity(batched.runs.len());
         let mut cursor_glyph = None;
