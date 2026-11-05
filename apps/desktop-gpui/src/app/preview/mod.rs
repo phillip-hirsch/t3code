@@ -99,8 +99,7 @@ pub(super) struct PreviewState {
     pub(super) menu_open: bool,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
-    /// What this connection last sent with `preview.reportProfiles`.
-    reported_profiles: Option<Value>,
+    reported_profiles: profiles::ReportedProfiles,
     /// Agent tabs' streams.
     server: server::ServerStreams,
     /// Pages opened per project, for a blank tab's "Recently used".
@@ -109,13 +108,6 @@ pub(super) struct PreviewState {
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<String>,
     _subscription: Subscription,
-}
-
-impl PreviewState {
-    /// The primary's socket closed: its profiles are reported again on reconnect.
-    pub(super) fn disconnect(&mut self) {
-        self.reported_profiles = None;
-    }
 }
 
 impl PreviewState {
@@ -138,7 +130,7 @@ impl PreviewState {
             address_tab: None,
             menu_open: false,
             stale: HashSet::new(),
-            reported_profiles: None,
+            reported_profiles: profiles::ReportedProfiles::default(),
             server: Default::default(),
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
@@ -269,6 +261,19 @@ impl Workspace {
                 previews.list_loaded = false;
             }
             self.preview.stale.insert(thread_id);
+        }
+        self.preview.discovery.reconnected(environment);
+        self.preview.reported_profiles.forget(environment);
+        // Tabs whose report failed or waited for this connection send it now.
+        let unreported: Vec<String> = self
+            .preview
+            .tabs
+            .iter()
+            .filter(|(_, tab)| tab.reported.is_none() && on_environment(self, &tab.thread_id))
+            .map(|(tab_id, _)| tab_id.clone())
+            .collect();
+        for tab_id in unreported {
+            self.report_status(&tab_id, cx);
         }
         let stream = client.stream("subscribePreviewEvents", json!({}));
         let task = Self::pump(
@@ -466,7 +471,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(&thread_id) else { return };
         let profile = profile.unwrap_or_else(|| preview::default_profile_id(&self.client_settings.values));
         let mut input = json!({"threadId": thread_id, "profileId": profile});
         if let Some(url) = &url {
@@ -537,7 +542,7 @@ impl Workspace {
             previews.remove(&tab_id);
         }
         self.preview.tabs.remove(&tab_id);
-        if let Some(client) = self.client() {
+        if let Some(client) = self.thread_client(&thread_id) {
             cx.spawn(async move |this, cx| {
                 if let Err(error) =
                     client.request("preview.close", json!({"threadId": thread_id, "tabId": tab_id})).await
@@ -706,8 +711,11 @@ impl Workspace {
     }
 
     /// `preview.reportStatus`, once per change, so the server and agents see this tab's page.
+    /// It goes to the tab's own thread's environment: a hidden tab's need not be the open one's.
+    /// A failed report is sent again with the tab's next change or its environment's reconnect.
     fn report_status(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(tab) = self.preview.tabs.get(tab_id) else { return };
+        let Some(client) = self.thread_client(&tab.thread_id) else { return };
         let Some(tab) = self.preview.tabs.get_mut(tab_id) else { return };
         let state = (tab.status.clone(), tab.can_go_back, tab.can_go_forward);
         if tab.reported.as_ref() == Some(&state) {
@@ -720,11 +728,16 @@ impl Workspace {
             "canGoBack": state.1,
             "canGoForward": state.2,
         });
-        tab.reported = Some(state);
-        cx.spawn(async move |_, _| {
-            if let Err(error) = client.request("preview.reportStatus", input).await {
-                log::warn!("preview.reportStatus failed: {error}");
-            }
+        tab.reported = Some(state.clone());
+        let tab_id = tab_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            let Err(error) = client.request("preview.reportStatus", input).await else { return };
+            log::warn!("preview.reportStatus failed: {error}");
+            let _ = this.update(cx, |this, _| {
+                if let Some(tab) = this.preview.tabs.get_mut(&tab_id).filter(|tab| tab.reported == Some(state)) {
+                    tab.reported = None;
+                }
+            });
         })
         .detach();
     }

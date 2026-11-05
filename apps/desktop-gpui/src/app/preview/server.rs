@@ -178,7 +178,10 @@ impl Workspace {
         if self.preview.server.streams.contains_key(tab_id) {
             return;
         }
-        let Some(endpoint) = self.endpoint() else { return };
+        // The tab streams from its thread's environment.
+        let Some(endpoint) = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned()) else {
+            return;
+        };
         let scale = window.scale_factor();
         let size = window.viewport_size();
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
@@ -642,20 +645,23 @@ impl Workspace {
     /// `alternatePreviewRuntime`'s label: a remote environment's tab can move between this
     /// computer and the environment's own browser. `None` for this app's own server.
     pub(super) fn move_tab_label(&self, session: &Session) -> Option<SharedString> {
-        if !self.environment_remote {
+        let environment = self.thread_environment(&session.thread_id)?;
+        let remote = self.environment_remote || self.primary_environment() != Some(&environment);
+        let info = &self.session(&environment)?.server_info;
+        if !remote || !info.capability("serverBrowser") {
             return None;
         }
         Some(if session.server_hosted() {
             "Open on this computer".into()
         } else {
-            let label = self.server_info().environment_label.as_deref().unwrap_or("the environment");
+            let label = info.environment_label.as_deref().unwrap_or("the environment");
             format!("Open in {label}'s browser").into()
         })
     }
 
     /// `handleMoveTab`: opens the page in the other runtime, then closes this tab.
     pub(super) fn move_preview_tab(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(&session.thread_id) else { return };
         let mut input = json!({"threadId": session.thread_id, "viewport": viewport_json(&session.viewport)});
         if let Some(url) = session.nav_status.url() {
             input["url"] = url.into();
