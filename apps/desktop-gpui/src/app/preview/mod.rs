@@ -354,6 +354,28 @@ impl Workspace {
 
     /// `togglePreviewPanel` (`preview.toggle`): hides a panel showing the browser, else shows the
     /// thread's focused tab, else opens a new one.
+    /// `preview.refresh` / `focusUrl` / `zoomIn` / `zoomOut` / `resetZoom` on the panel's browser tab.
+    pub(super) fn preview_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.preview_thread_id().and_then(|thread_id| self.active_session(thread_id)) else {
+            return;
+        };
+        let (zoom, _) = self.tab_look(session);
+        let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
+        match command {
+            "preview.refresh" => self.with_active_view(cx, |view| {
+                let _ = view.reload();
+            }),
+            "preview.focusUrl" => self.preview.address.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            }),
+            "preview.zoomIn" => self.adjust_preview("preview.adjust", zoom_to(1), cx),
+            "preview.zoomOut" => self.adjust_preview("preview.adjust", zoom_to(-1), cx),
+            "preview.resetZoom" => self.adjust_preview("preview.adjust", zoom_to(0), cx),
+            _ => {}
+        }
+    }
+
     pub(super) fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
         if matches!(self.active_surface(), Some(Surface::Browser(_))) {
@@ -787,6 +809,7 @@ impl Workspace {
         let available =
             (width - 1., f32::from(window.viewport_size().height) - f32::from(TITLEBAR_HEIGHT) - CHROME_ROW);
         v_flex()
+            .key_context(super::keymap::PREVIEW_CONTEXT)
             .flex_1()
             .min_h_0()
             .child(self.render_preview_chrome(thread_id, &tokens, window, cx))

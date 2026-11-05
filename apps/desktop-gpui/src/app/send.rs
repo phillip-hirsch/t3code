@@ -28,28 +28,12 @@ pub(super) fn requires_modifier(send_shortcut: &str, prompt: &str) -> bool {
     send_shortcut == "mod-enter" || (send_shortcut == "mod-enter-multiline" && prompt.contains(['\r', '\n']))
 }
 
-/// `composerSubmissionIntentForKey` over the default composer bindings. When Enter needs a
-/// modifier, the running turn's alternate moves to Ctrl+Shift+Enter (`keybindings.ts`).
-pub(super) fn key_intent(
-    keystroke: &Keystroke,
-    send_shortcut: &str,
-    prompt: &str,
-    running: bool,
-    draft: bool,
-) -> Option<Intent> {
+/// `composerSubmissionIntentForKey` once no keybinding command took the key: Enter (or
+/// Ctrl+Enter) sends, unless Enter needs a modifier and none is held.
+pub(super) fn sends_on(keystroke: &Keystroke, requires_modifier: bool) -> bool {
     let m = keystroke.modifiers;
-    if keystroke.key != "enter" {
-        return None;
-    }
-    let requires = requires_modifier(send_shortcut, prompt);
-    match (m.control || m.platform, m.alt, m.shift) {
-        (true, true, false) => Some(Intent::AndNewThread),
-        (true, false, shift) if running && shift == requires => Some(Intent::Alternate),
-        (true, false, false) if draft => Some(Intent::Alternate),
-        (true, false, false) => Some(Intent::Foreground),
-        (false, false, false) if !requires => Some(Intent::Foreground),
-        _ => None,
-    }
+    let modifier = m.control || m.platform;
+    keystroke.key == "enter" && !m.shift && !m.alt && (modifier || !requires_modifier)
 }
 
 /// `resolveComposerDispatchMode`: a running turn takes `followUpBehavior`, and the
@@ -310,18 +294,13 @@ mod tests {
     #[test]
     fn send_shortcut_decides_whether_enter_needs_a_modifier() {
         let key = |text: &'static str| Keystroke::parse(text).unwrap();
-        let idle = |k: &'static str, shortcut: &str, prompt: &str| key_intent(&key(k), shortcut, prompt, false, false);
-        assert_eq!(idle("enter", "enter", "a\nb"), Some(Intent::Foreground));
-        assert_eq!(idle("enter", "mod-enter-multiline", "one line"), Some(Intent::Foreground));
-        assert_eq!(idle("enter", "mod-enter-multiline", "a\nb"), None);
-        assert_eq!(idle("ctrl-enter", "mod-enter-multiline", "a\nb"), Some(Intent::Foreground));
-        assert_eq!(idle("enter", "mod-enter", "one line"), None);
-        assert_eq!(idle("ctrl-enter", "mod-enter", "one line"), Some(Intent::Foreground));
-        assert_eq!(idle("shift-enter", "enter", ""), None);
-        let running = |k: &'static str, shortcut: &str| key_intent(&key(k), shortcut, "x", true, false);
-        assert_eq!(running("ctrl-enter", "enter"), Some(Intent::Alternate));
-        assert_eq!(running("ctrl-enter", "mod-enter"), Some(Intent::Foreground));
-        assert_eq!(running("ctrl-shift-enter", "mod-enter"), Some(Intent::Alternate));
-        assert_eq!(key_intent(&key("ctrl-enter"), "mod-enter", "x", false, true), Some(Intent::Alternate));
+        assert!(sends_on(&key("enter"), requires_modifier("enter", "a\nb")));
+        assert!(sends_on(&key("enter"), requires_modifier("mod-enter-multiline", "one line")));
+        assert!(!sends_on(&key("enter"), requires_modifier("mod-enter-multiline", "a\nb")));
+        assert!(sends_on(&key("ctrl-enter"), requires_modifier("mod-enter-multiline", "a\nb")));
+        assert!(!sends_on(&key("enter"), requires_modifier("mod-enter", "one line")));
+        assert!(sends_on(&key("ctrl-enter"), requires_modifier("mod-enter", "one line")));
+        assert!(!sends_on(&key("shift-enter"), false));
+        assert!(!sends_on(&key("ctrl-shift-enter"), true));
     }
 }

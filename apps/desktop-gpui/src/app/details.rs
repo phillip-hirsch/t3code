@@ -443,6 +443,17 @@ impl Workspace {
         )
     }
 
+    /// `editor.openFavorite` (`OpenInPickerShortcut.ts`): opens the preferred editor while the
+    /// Open in row can show.
+    pub(super) fn open_favorite_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.target_project().is_none_or(|project| project.workspace_root.is_empty()) {
+            return false;
+        }
+        let Some(editor) = self.preferred_editor().map(str::to_owned) else { return false };
+        self.open_in_editor(editor, cx);
+        true
+    }
+
     /// `shell.openInEditor` on the thread's workspace.
     fn open_in_editor(&mut self, editor: String, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };

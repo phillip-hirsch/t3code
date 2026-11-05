@@ -8,7 +8,8 @@ use std::time::Duration;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::{Icon, h_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{Icon, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
@@ -243,7 +244,7 @@ impl Workspace {
         }
     }
 
-    pub(super) fn unsettle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+    pub(in crate::app) fn unsettle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.expire_undo(thread_id);
         self.thread_command("thread.unsettle", thread_id, json!({"reason": "user"}), cx);
     }
@@ -370,10 +371,11 @@ impl Workspace {
     ) {
         let Some(title) = self.thread(thread_id).map(|t| t.title.clone()) else { return };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title.clone()));
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(origin, cx),
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(origin, window, cx),
+                _ => {}
+            });
         input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
@@ -399,14 +401,29 @@ impl Workspace {
         }
     }
 
-    /// `resolveRenameCommit`: an empty title is refused, an unchanged one is a no-op.
-    fn commit_rename(&mut self, origin: MenuOrigin, cx: &mut Context<Self>) {
+    /// `resolveRenameCommit`: an empty title is refused, an unchanged one is a no-op; both
+    /// refusals and failures toast, as `ChatHeader` and the sidebar do.
+    fn commit_rename(&mut self, origin: MenuOrigin, window: &mut Window, cx: &mut Context<Self>) {
         let Some(renaming) = self.renaming_slot(origin).take() else { return };
         let title = renaming.input.read(cx).value().trim().to_owned();
         if title.is_empty() {
-            self.error = Some("Thread title cannot be empty".into());
-        } else if title != renaming.original {
-            self.thread_command("thread.metadata.update", &renaming.thread_id, json!({"title": title}), cx);
+            window.push_notification(Notification::warning("").title("Thread title cannot be empty"), cx);
+        } else if let (true, Some(client)) = (title != renaming.original, self.client()) {
+            let command = json!({
+                "type": "thread.metadata.update",
+                "commandId": new_id(),
+                "threadId": renaming.thread_id,
+                "title": title,
+            });
+            cx.spawn_in(window, async move |_, cx| {
+                if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                    let _ = cx.update(|window, cx| {
+                        let toast = Notification::error(error.to_string()).title("Failed to rename thread");
+                        window.push_notification(toast, cx);
+                    });
+                }
+            })
+            .detach();
         }
         self.notify_sidebar(cx);
         cx.notify();
@@ -484,6 +501,10 @@ impl Workspace {
         let tokens = crate::theme::tokens(cx);
         // The web wraps the "Ctrl+Z to undo" text away when it doesn't fit and shows the icon.
         let fits = self.sidebar_width() >= px(300.);
+        // `threadUndoLabel`.
+        let undo_text =
+            self.shortcut_label("thread.undo").map_or_else(|| "Undo".to_owned(), |s| format!("{s} to undo"));
+        let undo_tooltip: gpui_kit::SharedString = self.with_shortcut("Undo", "thread.undo").into();
         let label = match notice.count() {
             1 => format!("{},", notice.action.label()),
             n => format!("{} {n},", notice.action.label()),
@@ -508,16 +529,18 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|s| s.underline())
                         .on_click(cx.listener(|this, _, _, cx| this.undo_thread_action(cx)))
-                        .tooltip(|window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new("Undo (Ctrl+Z)").build(window, cx)
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(undo_tooltip.clone()).build(window, cx)
                         })
-                        .map(|el| {
-                            if fits {
-                                el.child("Ctrl+Z to undo")
-                            } else {
-                                el.child(Icon::new(Lucide::Undo2).size(px(16.)))
-                            }
-                        }),
+                        .map(
+                            |el| {
+                                if fits {
+                                    el.child(undo_text)
+                                } else {
+                                    el.child(Icon::new(Lucide::Undo2).size(px(16.)))
+                                }
+                            },
+                        ),
                 ),
         )
     }

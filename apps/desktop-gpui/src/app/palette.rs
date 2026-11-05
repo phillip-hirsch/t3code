@@ -420,7 +420,7 @@ impl Workspace {
                 Run::NewThread(project.id.clone()),
             );
             row.strong = Some(project_name(project));
-            row.shortcut = Some("Ctrl+Shift+N".into());
+            row.shortcut = self.shortcut_label("chat.newLocal").map(Into::into);
             rows.push(row);
         }
         if !self.shell.projects.is_empty() {
@@ -447,7 +447,7 @@ impl Workspace {
         ));
         let mut usage =
             Row::new("usage", RowIcon::Lucide(IconName::ChartNoAxesColumn), "Open usage", Run::Page(Page::Usage));
-        usage.shortcut = Some("Ctrl+U".into());
+        usage.shortcut = self.shortcut_label("usage.open").map(Into::into);
         rows.push(usage);
         rows.push(Row::new("settings", RowIcon::Lucide(IconName::Settings), "Open settings", Run::Settings("general")));
         if let Some(project) = current {

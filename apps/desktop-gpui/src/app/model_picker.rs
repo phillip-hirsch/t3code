@@ -44,7 +44,7 @@ pub(in crate::app) struct PickHost {
     pub on_pick: OnPick,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Tab {
     Favorites,
     Provider(String),
@@ -276,12 +276,13 @@ impl Workspace {
         }
     }
 
-    /// Up/Down/Enter/Escape and Ctrl+1-9 while the picker is open.
+    /// Up/Down/Enter/Escape while the picker is open; Ctrl+1-9 are `modelPicker.jump.N`.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if keystroke.modifiers.modified() {
+            return false;
+        }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
-        let modifiers = keystroke.modifiers;
-        let digit = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d));
         match keystroke.key.as_str() {
             "escape" => self.close_model_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
@@ -294,12 +295,51 @@ impl Workspace {
                     self.pick_row(row.selection, window, cx);
                 }
             }
-            _ if digit.is_some() && (modifiers.control || modifiers.platform) && self.picker.host.is_none() => {
-                if let Some(row) = rows.into_iter().nth(digit.unwrap_or(1) - 1) {
-                    self.pick_row(row.selection, window, cx);
-                }
-            }
             _ => return false,
+        }
+        true
+    }
+
+    /// `modelPicker.previousProvider` / `nextProvider`: steps the rail through favorites and the ready providers.
+    pub(super) fn model_picker_step_provider(
+        &mut self,
+        step: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.model_picker_open() {
+            return false;
+        }
+        let current = self.picker_current();
+        let tab = self.picker_tab(current.as_ref());
+        let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
+            .chain(
+                self.server_info
+                    .providers
+                    .iter()
+                    .filter(|p| p.enabled && self.picker_includes(p))
+                    .filter(|p| p.availability.as_deref() != Some("unavailable") && p.status == "ready")
+                    .map(|p| Tab::Provider(p.instance_id.clone())),
+            )
+            .collect();
+        self.picker.tab = Some(step_tab(&tabs, &tab, step));
+        self.picker.highlighted = 0;
+        if let Some(search) = self.picker.search.clone() {
+            search.update(cx, |search, cx| search.set_value("", window, cx));
+        }
+        cx.notify();
+        true
+    }
+
+    /// `modelPicker.jump.N`: picks the Nth row of the open picker.
+    pub(super) fn model_picker_jump(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.model_picker_open() || self.picker.host.is_some() {
+            return false;
+        }
+        let current = self.picker_current();
+        let (rows, _) = self.picker_rows(current.as_ref());
+        if let Some(row) = rows.into_iter().nth(index) {
+            self.pick_row(row.selection, window, cx);
         }
         true
     }
@@ -961,6 +1001,35 @@ pub(super) fn kbd(text: &str, t: &Tokens) -> impl IntoElement {
         .child(text.to_owned())
 }
 
+/// `adjacentModelPickerProvider`: wraps; from a tab not in the list, the first (or last).
+fn step_tab(tabs: &[Tab], current: &Tab, step: isize) -> Tab {
+    let len = tabs.len() as isize;
+    let index = match tabs.iter().position(|tab| tab == current) {
+        Some(at) => (at as isize + step).rem_euclid(len),
+        None if step > 0 => 0,
+        None => len - 1,
+    };
+    tabs[index as usize].clone()
+}
+
 fn initials(name: &str) -> String {
     name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_steps_wrap_through_favorites() {
+        let codex = Tab::Provider("codex".into());
+        let claude = Tab::Provider("claude".into());
+        let tabs = [Tab::Favorites, codex.clone(), claude.clone()];
+        assert_eq!(step_tab(&tabs, &Tab::Favorites, 1), codex);
+        assert_eq!(step_tab(&tabs, &claude, 1), Tab::Favorites);
+        assert_eq!(step_tab(&tabs, &Tab::Favorites, -1), claude);
+        let gone = Tab::Provider("gone".into());
+        assert_eq!(step_tab(&tabs, &gone, 1), Tab::Favorites);
+        assert_eq!(step_tab(&tabs, &gone, -1), claude);
+    }
 }

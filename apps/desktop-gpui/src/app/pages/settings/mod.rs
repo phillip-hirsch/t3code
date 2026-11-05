@@ -9,7 +9,7 @@ mod connections;
 mod diffs;
 mod fields;
 mod general;
-mod keybindings;
+pub(in crate::app) mod keybindings;
 mod model_select;
 
 mod providers;

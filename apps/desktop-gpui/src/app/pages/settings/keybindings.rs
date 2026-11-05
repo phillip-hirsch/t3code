@@ -1,6 +1,6 @@
 //! Settings → Keybindings (`KeybindingsSettings.tsx`, `KeybindingsSettings.logic.ts`).
 //! Edits go through `server.upsertKeybinding` / `server.removeKeybinding`; the server's
-//! `keybindingsUpdated` event (and each RPC's result) then reinstalls GPUI's keymap
+//! `keybindingsUpdated` event (and each RPC's result) then updates the app's keymap
 //! (`app::keymap`). Keybindings are environment-wide in the web, never project-scoped.
 
 use std::cmp::Ordering;
@@ -884,32 +884,13 @@ impl KeybindingsPanel {
         self.send(command, payload, true, window, cx);
     }
 
-    /// `shell.openInEditor` with the first available editor, in `EDITORS` order.
     fn open_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else { return };
         let workspace = workspace.read(cx);
-        let (Some(client), Some(path)) = (workspace.client(), workspace.server_info.keybindings_config_path.clone())
-        else {
-            return;
-        };
-        let available = &workspace.server_info.available_editors;
-        let Some(editor) = EDITORS.iter().find(|id| available.iter().any(|a| a == *id)) else {
-            let message = format!("No available editor can open {path}.");
-            window.push_notification(Notification::error(message).title("Unable to open keybindings file"), cx);
-            return;
-        };
-        let payload = json!({"cwd": path, "editor": editor});
-        cx.spawn_in(window, async move |_, cx| {
-            if let Err(error) = client.request("shell.openInEditor", payload).await {
-                let _ = cx.update(|window, cx| {
-                    window.push_notification(
-                        Notification::error(error.to_string()).title("Unable to open keybindings file"),
-                        cx,
-                    )
-                });
-            }
-        })
-        .detach();
+        let info = &workspace.server_info;
+        let (client, path, editors) =
+            (workspace.client(), info.keybindings_config_path.clone(), info.available_editors.clone());
+        open_keybindings_file(client, path, &editors, window, cx);
     }
 }
 
@@ -1686,7 +1667,42 @@ fn unknown_warning(id: &str, t: &Tokens) -> AnyElement {
     warning_icon(SharedString::from(format!("kb-unknown-{id}")).into(), tooltip.to_owned(), t).into_any_element()
 }
 
+/// `shell.openInEditor` on `keybindings.json` with the first available editor, in `EDITORS` order.
+pub(in crate::app) fn open_keybindings_file(
+    client: Option<crate::rpc::RpcClient>,
+    path: Option<String>,
+    available: &[String],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (Some(client), Some(path)) = (client, path) else { return };
+    let Some(editor) = EDITORS.iter().find(|id| available.iter().any(|a| a == *id)) else {
+        let message = format!("No available editor can open {path}.");
+        window.push_notification(Notification::error(message).title("Unable to open keybindings file"), cx);
+        return;
+    };
+    let payload = json!({"cwd": path, "editor": editor});
+    window
+        .spawn(cx, async move |cx| {
+            if let Err(error) = client.request("shell.openInEditor", payload).await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(
+                        Notification::error(error.to_string()).title("Unable to open keybindings file"),
+                        cx,
+                    )
+                });
+            }
+        })
+        .detach();
+}
+
 impl Workspace {
+    /// Settings → Keybindings is recording a shortcut, so app shortcuts leave keys to it.
+    pub(in crate::app) fn recording_shortcut(&self, cx: &gpui_kit::App) -> bool {
+        let panel = self.keybindings_panel.clone().and_then(|view| view.downcast::<KeybindingsPanel>().ok());
+        panel.is_some_and(|panel| panel.read(cx).recording.is_some())
+    }
+
     pub(super) fn render_keybindings_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let (workspace, source, connected) =
             (cx.entity(), self.server_info.keybindings.clone(), self.client().is_some());
