@@ -46,6 +46,8 @@ pub struct Provider {
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub availability: Option<String>,

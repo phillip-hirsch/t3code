@@ -1,7 +1,9 @@
 mod app;
+mod assets;
 mod backend;
 mod model;
 mod rpc;
+mod theme;
 mod timeline;
 
 use std::sync::OnceLock;
@@ -23,15 +25,20 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
+    gpui_kit::application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
-        gpui_kit::component::theme::Theme::sync_system_appearance(None, cx);
+        cx.text_system()
+            .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
+            .expect("bundled fonts");
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions { title: Some("T3 Code".into()), ..Default::default() }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| app::Workspace::new(window, cx)))
-            .expect("failed to open window");
+        gpui_kit::open_window(options, cx, |window, cx| {
+            theme::sync(window, cx);
+            cx.new(|cx| app::Workspace::new(window, cx))
+        })
+        .expect("failed to open window");
     });
 }
