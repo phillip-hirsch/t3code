@@ -906,6 +906,7 @@ impl Workspace {
             _ => None,
         };
         self.sync_side_chat(side_chat.as_deref(), window, cx);
+        self.sync_discovered_servers(window, cx);
         let width = self.right_panel_width(window)?;
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
@@ -1002,6 +1003,7 @@ impl Workspace {
         let (diff, browser, files) = (self.diff_available(), self.browser_available(), self.project_target().is_some());
         let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
         let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
+        let profiles = self.browser_profiles();
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -1039,17 +1041,22 @@ impl Workspace {
                     .flex_none()
                     .size(px(24.))
                     .rounded(px(8.))
-                    .dropdown_menu(move |menu: PopupMenu, window, _| {
-                        let menu = menu
-                            .min_w(px(200.))
-                            .item(
-                                PopupMenuItem::new("Browser")
-                                    .icon(Icon::new(IconName::Globe))
-                                    .disabled(!browser)
-                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_browser_surface(window, cx)
-                                    })),
+                    .dropdown_menu(move |menu: PopupMenu, window, cx| {
+                        let menu = menu.min_w(px(200.));
+                        // An available Browser lists the profiles to open it in (`MenuSub`).
+                        let menu = if browser {
+                            let (view, profiles) = (view.clone(), profiles.clone());
+                            menu.submenu_with_icon(
+                                Some(Icon::new(IconName::Globe)),
+                                "Browser",
+                                window,
+                                cx,
+                                move |menu, window, _| profile_items(menu.max_w(px(224.)), &profiles, &view, window),
                             )
+                        } else {
+                            menu.item(PopupMenuItem::new("Browser").icon(Icon::new(IconName::Globe)).disabled(true))
+                        };
+                        let menu = menu
                             .item(
                                 PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
                                     window.listener_for(&view, |this, _, window, cx| {
@@ -1259,6 +1266,37 @@ impl Workspace {
         .when(browser_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
         });
+        // "Open browser in a profile", beside the shortcut while there is more than one.
+        let profiles = self.browser_profiles();
+        let browser = match browser_available && profiles.len() > 1 {
+            true => {
+                let view = cx.entity();
+                div().relative().child(browser).child(
+                    div().absolute().top(px(4.)).right(px(32.)).child(
+                        Button::new("right-panel-browser-profiles")
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(tokens.muted_foreground)
+                                    .hover(tokens.accent)
+                                    .active(tokens.accent),
+                            )
+                            .xsmall()
+                            .size(px(24.))
+                            .rounded(px(6.))
+                            .icon(icon("icons/chevron-down.svg"))
+                            .tooltip("Open browser in a profile")
+                            .dropdown_menu(move |menu: PopupMenu, window, _| {
+                                profile_items(menu.max_w(px(224.)), &profiles, &view, window)
+                            })
+                            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                                this.right_panel.add_menu_open = *open;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            }
+            false => div().child(browser),
+        };
         let files_available = self.project_target().is_some();
         let files = row(
             "right-panel-open-files",
@@ -1663,6 +1701,24 @@ impl Workspace {
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
     }
+}
+
+/// One item per browser profile, each opening a new tab in it.
+fn profile_items(
+    mut menu: PopupMenu,
+    profiles: &[crate::preview::Profile],
+    view: &Entity<Workspace>,
+    window: &mut Window,
+) -> PopupMenu {
+    for profile in profiles {
+        let id = profile.id.clone();
+        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+            window.listener_for(view, move |this, _, window, cx| {
+                this.add_browser_surface_in(Some(id.clone()), window, cx)
+            }),
+        ));
+    }
+    menu
 }
 
 /// The files a selection shows folded: the user's folds once they changed any, else every

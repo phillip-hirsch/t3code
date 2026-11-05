@@ -27,6 +27,7 @@ use super::{Target, Workspace};
 use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPreviews};
 use crate::theme::{self, Tokens};
 
+mod empty;
 #[cfg(windows)]
 mod native;
 mod profiles;
@@ -102,6 +103,11 @@ pub(super) struct PreviewState {
     reported_profiles: Option<Value>,
     /// Agent tabs' streams.
     server: server::ServerStreams,
+    /// Pages opened per project, for a blank tab's "Recently used".
+    history: crate::browser_history::BrowserHistory,
+    discovery: empty::Discovery,
+    /// Failed tabs showing the unreachable page's details.
+    unreachable_details: HashSet<String>,
     _events: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -146,6 +152,9 @@ impl PreviewState {
             stale: HashSet::new(),
             reported_profiles: None,
             server: Default::default(),
+            history: crate::browser_history::BrowserHistory::load(),
+            discovery: Default::default(),
+            unreachable_details: HashSet::new(),
             _events: None,
             _subscription: subscription,
         }
@@ -375,9 +384,24 @@ impl Workspace {
 
     /// `createBrowserSurface`: the launcher's and the "+" menu's Browser.
     pub(super) fn add_browser_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_browser_surface_in(None, window, cx);
+    }
+
+    /// `onAddBrowserInProfile`: a new tab in `profile`, else the default profile.
+    pub(super) fn add_browser_surface_in(
+        &mut self,
+        profile: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(thread_id) = self.preview_thread_id().map(str::to_owned) {
-            self.open_preview_tab(thread_id, None, window, cx);
+            self.open_browser_tab(thread_id, None, false, profile, window, cx);
         }
+    }
+
+    /// The profiles a new tab can open in (`useBrowserDefaults().profiles`).
+    pub(super) fn browser_profiles(&self) -> Vec<preview::Profile> {
+        preview::resolve_profiles(&preview::user_profiles(&self.client_settings.values))
     }
 
     /// Hiding the panel floats the tab it showed over the chat.
@@ -408,8 +432,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_browser_tab(thread_id, url, external_fallback, None, window, cx);
+    }
+
+    fn open_browser_tab(
+        &mut self,
+        thread_id: String,
+        url: Option<String>,
+        external_fallback: bool,
+        profile: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.client() else { return };
-        let profile = preview::default_profile_id(&self.client_settings.values);
+        let profile = profile.unwrap_or_else(|| preview::default_profile_id(&self.client_settings.values));
         let mut input = json!({"threadId": thread_id, "profileId": profile});
         if let Some(url) = &url {
             input["url"] = url.clone().into();
@@ -426,6 +462,9 @@ impl Workspace {
                 }) {
                     Ok(session) => {
                         let tab = session.tab_id.clone();
+                        if let Some(url) = &url {
+                            this.record_visit(&thread_id, url);
+                        }
                         this.preview.threads.entry(thread_id.clone()).or_default().apply_snapshot(session, true);
                         if this.preview_thread_id() == Some(thread_id.as_str()) {
                             this.open_surface(Surface::Browser(tab), window, cx);
@@ -505,6 +544,7 @@ impl Workspace {
                 return;
             }
         };
+        self.record_visit(&thread_id, &url);
         let Some((tab_id, server)) = self.active_session(&thread_id).map(|s| (s.tab_id.clone(), s.server_hosted()))
         else {
             return self.open_preview_tab(thread_id, Some(url), window, cx);
@@ -684,6 +724,8 @@ impl Workspace {
             // WKWebView and WebKitGTK history isn't reachable through wry; keep both usable.
             (tab.can_go_back, tab.can_go_forward) = (true, true);
         }
+        let (thread_id, status) = (tab.thread_id.clone(), tab.status.clone());
+        self.record_title(&thread_id, &status);
         self.report_status(tab_id, cx);
         self.sync_address(window, cx);
         cx.notify();
@@ -827,6 +869,14 @@ impl Workspace {
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id)).cloned();
+        // A failed load shows `PreviewUnreachable` in place of the page (and its native view).
+        let status = match self.preview.tabs.get(tab_id) {
+            Some(tab) => Some(tab.status.clone()),
+            None => session.as_ref().filter(|s| s.server_hosted()).map(|s| s.nav_status.clone()),
+        };
+        if let Some(page) = status.and_then(|status| self.render_unreachable(tab_id, &status, &tokens, cx)) {
+            return div().flex_1().min_h_0().child(page).into_any_element();
+        }
         if let Some(session) = session.as_ref().filter(|s| s.server_hosted()) {
             let follow_size = session.viewport.size().is_none();
             return self.render_server_page(thread_id, tab_id, follow_size, &tokens, window, cx);
@@ -836,7 +886,11 @@ impl Workspace {
         let view = self.preview.tabs.get(tab_id).map(|tab| tab.view.clone());
         let Some(view) = view.filter(|_| !self.preview.menu_open) else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
-            return div().flex_1().min_h_0().when(blank, |el| el.child(render_empty_state(&tokens))).into_any_element();
+            return div()
+                .flex_1()
+                .min_h_0()
+                .when(blank, |el| el.child(self.render_preview_empty_state(thread_id, &tokens, cx)))
+                .into_any_element();
         };
         match fixed {
             Some(((width, height), _)) => div()
@@ -1251,32 +1305,6 @@ impl Workspace {
                 .into_any_element(),
         )
     }
-}
-
-/// `PreviewEmptyState` without recents or local servers.
-fn render_empty_state(tokens: &Tokens) -> impl IntoElement {
-    v_flex()
-        .size_full()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .p_6()
-        .text_center()
-        .child(
-            div()
-                .size(px(36.))
-                .mb_2()
-                .rounded(px(8.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(tokens.muted)
-                .child(Icon::new(IconName::Globe).size(px(18.)).text_color(tokens.muted_foreground)),
-        )
-        .child(div().text_base().font_weight(FontWeight::MEDIUM).text_color(tokens.foreground).child("No preview yet"))
-        .child(div().max_w(px(320.)).text_sm().text_color(tokens.muted_foreground).child(
-            "Type a URL above, or run a dev script. Local servers this thread starts will show up here automatically.",
-        ))
 }
 
 /// A tab's fallback title: the page's host.
