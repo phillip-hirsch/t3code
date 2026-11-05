@@ -30,7 +30,8 @@ const SECTION_PADDING: f32 = 18.;
 /// A section heading: 32px plus its 4px bottom margin.
 const HEADING_HEIGHT: f32 = 36.;
 
-/// The card's opaque stand-ins for `dropdown-glass`; GPUI has no backdrop blur.
+/// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
+/// over the canvas); GPUI has no backdrop blur.
 #[derive(Clone, Copy)]
 struct CardColors {
     background: Hsla,
@@ -45,11 +46,12 @@ struct CardColors {
 
 impl CardColors {
     fn new(tokens: &Tokens) -> Self {
-        let (background, border, divider, hover) = if tokens.dark {
-            (rgb(0x0f0f0f).into(), rgb(0x252525).into(), hsla(0., 0., 1., 0.052), hsla(0., 0., 1., 0.08))
+        let (border, divider, hover) = if tokens.dark {
+            (rgb(0x252525).into(), hsla(0., 0., 1., 0.052), hsla(0., 0., 1., 0.08))
         } else {
-            (rgb(0xfefefe).into(), rgb(0xe8e8e8).into(), rgb(0xeeeef0).into(), hsla(0., 0., 0., 0.035))
+            (rgb(0xe8e8e8).into(), rgb(0xeeeef0).into(), hsla(0., 0., 0., 0.035))
         };
+        let background = tokens.background.blend(tokens.popover.opacity(tokens.glass));
         Self {
             background,
             border,

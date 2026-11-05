@@ -3,6 +3,7 @@
 //! uploaded as soon as they are added (`attachments.createUploadUrl`, then a
 //! POST of the raw bytes to the signed URL) and sent by their server ids.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,14 +18,15 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::{Workspace, new_id};
+use super::composer::ComposerDraft;
+use super::{Target, Workspace, new_id};
 use crate::composer_text;
 use crate::theme::Tokens;
 
-const MAX_ATTACHMENTS: usize = 100;
+pub(super) const MAX_ATTACHMENTS: usize = 100;
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
-pub(super) const ATTACHMENT_ONLY_PROMPT: &str = "[User attached one or more files without additional text. Respond using the conversation context and the attached files.]";
+pub(super) use crate::composer_text::ATTACHMENT_ONLY_PROMPT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -59,9 +61,35 @@ pub(super) struct Attachment {
 }
 
 impl Attachment {
+    /// A sent message's attachment, back in the composer as a new upload.
+    pub(super) fn restored(kind: &str, name: String, mime: String, bytes: Vec<u8>) -> Self {
+        let kind = if kind == "image" { Kind::Image } else { Kind::File };
+        let image = image_format(&mime)
+            .filter(|_| kind == Kind::Image)
+            .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
+        Self { local_id: new_id(), kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
+    }
+
+    pub(super) fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
     fn context_id(&self) -> String {
         format!("{}_{}", self.kind.as_str(), self.local_id)
     }
+}
+
+/// An attachment in the composer on screen or in the draft it was stashed with.
+fn find_attachment<'a>(
+    active: &'a mut [Attachment],
+    drafts: &'a mut HashMap<Target, ComposerDraft>,
+    local_id: &str,
+) -> Option<&'a mut Attachment> {
+    let stashed = drafts.values_mut().filter_map(|draft| match draft {
+        ComposerDraft::Prompt(_, kept) => Some(kept.as_mut_slice()),
+        ComposerDraft::Question(_) => None,
+    });
+    std::iter::once(active).chain(stashed).flatten().find(|a| a.local_id == local_id)
 }
 
 /// `classifyComposerAttachmentFile` by extension: GIF, JPEG, PNG and WebP are
@@ -308,9 +336,11 @@ impl Workspace {
     }
 
     /// Mints a signed upload URL, then POSTs the bytes to it.
-    fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
+    pub(super) fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
         let (client, http_base) = (self.client(), self.http_base().map(str::to_owned));
-        let Some(attachment) = self.attachments.iter_mut().find(|a| a.local_id == local_id) else { return };
+        let Some(attachment) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
+            return;
+        };
         let (Some(client), Some(http_base)) = (client, http_base) else {
             attachment.upload = Upload::Failed("Not connected".into());
             return;
@@ -349,13 +379,13 @@ impl Workspace {
             }
             .await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(attachment) = this.attachments.iter_mut().find(|a| a.local_id == local_id) {
+                if let Some(attachment) = find_attachment(&mut this.attachments, &mut this.composer_drafts, &local_id) {
                     attachment.upload = match result {
                         Ok(id) => Upload::Ready(id),
                         Err(reason) => Upload::Failed(reason),
                     };
                 } else if let (Ok(id), Some(client)) = (result, this.client()) {
-                    // Removed while uploading: let the server drop the pending file.
+                    // Removed from every composer while uploading: let the server drop the pending file.
                     cx.spawn(async move |_, _| client.request("attachments.delete", json!({"attachmentId": id})).await)
                         .detach();
                 }
@@ -646,6 +676,29 @@ mod tests {
         assert_eq!(classify("logo.svg"), Ok((Kind::File, "image/svg+xml")), "svg is a file");
         assert_eq!(classify("notes"), Ok((Kind::File, "application/octet-stream")));
         assert!(classify("photo.bmp").is_err());
+    }
+
+    #[test]
+    fn an_upload_finds_its_attachment_in_the_draft_it_was_stashed_with() {
+        let attachment = |id: &str| Attachment {
+            local_id: id.into(),
+            kind: Kind::File,
+            name: "a.txt".into(),
+            mime: "text/plain".into(),
+            bytes: Arc::default(),
+            image: None,
+            upload: Upload::Uploading,
+        };
+        let mut active = vec![attachment("on-screen")];
+        let mut drafts = HashMap::from([(
+            Target::Thread("t1".into()),
+            ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]),
+        )]);
+        find_attachment(&mut active, &mut drafts, "stashed").unwrap().upload = Upload::Ready("srv".into());
+        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&Target::Thread("t1".into())) else { panic!() };
+        assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
+        assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some());
+        assert!(find_attachment(&mut active, &mut drafts, "removed").is_none());
     }
 
     #[test]

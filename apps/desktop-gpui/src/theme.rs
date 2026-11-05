@@ -48,6 +48,8 @@ pub struct Tokens {
     pub scrollbar_thumb: Hsla,
     pub scrollbar_thumb_hover: Hsla,
     pub sidebar: SidebarTokens,
+    /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
+    pub glass: f32,
 }
 
 /// The `[data-app-sidebar]` palette override (`index.css:1234-1278`).
@@ -118,6 +120,7 @@ impl Tokens {
                 row_active: with_alpha(sidebar_foreground, 0.11),
                 icon: hex(0x8b8b8b),
             },
+            glass: 0.8,
         }
     }
 
@@ -160,8 +163,125 @@ impl Tokens {
                 row_active: hex(0xffffff),
                 icon: hex(0x86858e),
             },
+            glass: 0.8,
         }
     }
+}
+
+/// The client settings that recolor the tokens (`startClientAppearance` in `appInit.tsx`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Appearance {
+    /// `appearanceContrast`, 50-200 percent.
+    pub contrast: f32,
+    /// `glassOpacity`, 40-100 percent.
+    pub glass: f32,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self { contrast: 100., glass: 80. }
+    }
+}
+
+impl Global for Appearance {}
+
+impl Appearance {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let percent = |key, default| settings.get(key).as_f64().map_or(default, |value| value as f32);
+        Self { contrast: percent("appearanceContrast", 100.), glass: percent("glassOpacity", 80.) }
+    }
+}
+
+impl Tokens {
+    /// The `--contrast-*` tokens (`index.css`): below 100% text fades toward its surface and
+    /// borders toward transparent; above it text moves toward black (light) or white
+    /// (dark) and borders toward the text color.
+    fn with_appearance(mut self, appearance: Appearance) -> Self {
+        let base = appearance.contrast.min(100.) / 100.;
+        let boost = (appearance.contrast - 100.).max(0.) / 100.;
+        let target = if self.dark { white(1.) } else { hsla(0., 0., 0., 1.) };
+        let text = |color: Hsla, surface: Hsla| mix_oklab(mix_oklab(surface, color, base), target, boost);
+        let line = |color: Hsla, ink: Hsla| mix_srgb(color.opacity(base), ink, boost / 4.);
+        let (foreground, sidebar_foreground) = (self.foreground, self.sidebar.foreground);
+        self.foreground = text(foreground, self.background);
+        self.muted_foreground = text(self.muted_foreground, self.background);
+        self.border = line(self.border, foreground);
+        self.input = line(self.input, foreground);
+        let sidebar = &mut self.sidebar;
+        sidebar.foreground = text(sidebar_foreground, sidebar.background);
+        sidebar.muted_foreground = text(sidebar.muted_foreground, sidebar.background);
+        sidebar.secondary_label = text(sidebar.secondary_label, self.background);
+        sidebar.icon = text(sidebar.icon, self.background);
+        sidebar.border = line(sidebar.border, sidebar_foreground);
+        if self.dark {
+            sidebar.row_hover = with_alpha(sidebar.foreground, 0.08);
+            sidebar.row_active = with_alpha(sidebar.foreground, 0.11);
+        }
+        self.glass = appearance.glass / 100.;
+        self
+    }
+}
+
+/// CSS `color-mix(in srgb, from, to t)`, with premultiplied alpha.
+fn mix_srgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let (a, b) = (from.to_rgb(), to.to_rgb());
+    let alpha = a.a * (1. - t) + b.a * t;
+    if alpha <= 0. {
+        return gpui_kit::transparent_black();
+    }
+    let channel = |x: f32, y: f32| (x * a.a * (1. - t) + y * b.a * t) / alpha;
+    gpui_kit::Rgba { r: channel(a.r, b.r), g: channel(a.g, b.g), b: channel(a.b, b.b), a: alpha }.into()
+}
+
+/// CSS `color-mix(in oklab, from, to t)` for opaque colors.
+fn mix_oklab(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0. {
+        return from;
+    }
+    let (a, b) = (oklab(from.to_rgb()), oklab(to.to_rgb()));
+    let lab = [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t);
+    let mut rgb = srgb_from_oklab(lab);
+    rgb.a = from.a + (to.a - from.a) * t;
+    rgb.into()
+}
+
+fn oklab(color: gpui_kit::Rgba) -> [f32; 3] {
+    let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let (r, g, b) = (linear(color.r), linear(color.g), linear(color.b));
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+fn srgb_from_oklab([l, a, b]: [f32; 3]) -> gpui_kit::Rgba {
+    let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    let gamma = |c: f32| {
+        let c = c.clamp(0., 1.);
+        if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1. / 2.4) - 0.055 }
+    };
+    gpui_kit::Rgba {
+        r: gamma(4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_94 * s_),
+        g: gamma(-1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_38 * s_),
+        b: gamma(-0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_),
+        a: 1.,
+    }
+}
+
+/// Applies the contrast and glass settings now and on every later `sync`.
+pub fn set_appearance(appearance: Appearance, window: &mut Window, cx: &mut App) {
+    if cx.try_global::<Appearance>() == Some(&appearance) {
+        return;
+    }
+    cx.set_global(appearance);
+    sync(window, cx);
+    window.refresh();
 }
 
 pub fn tokens(cx: &App) -> &Tokens {
@@ -191,7 +311,8 @@ pub fn sync(window: &mut Window, cx: &mut App) {
             matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
         }
     };
-    let tokens = if dark { Tokens::dark() } else { Tokens::light() };
+    let appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
+    let tokens = if dark { Tokens::dark() } else { Tokens::light() }.with_appearance(appearance);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |theme| {
         theme.font_family = FONT_SANS.into();
@@ -241,4 +362,35 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.sidebar_accent_foreground = tokens.sidebar.foreground;
     });
     cx.set_global(tokens);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_of(color: Hsla) -> (u32, f32) {
+        let rgb = color.to_rgb();
+        let byte = |c: f32| (c * 255.).round() as u32;
+        ((byte(rgb.r) << 16) | (byte(rgb.g) << 8) | byte(rgb.b), (rgb.a * 1000.).round() / 1000.)
+    }
+
+    #[test]
+    fn contrast_and_glass_follow_the_web_tokens() {
+        let at = |contrast, dark| {
+            let base = if dark { Tokens::dark() } else { Tokens::light() };
+            base.with_appearance(Appearance { contrast, glass: 64. })
+        };
+        let default = at(100., true);
+        assert_eq!(hex_of(default.foreground), hex_of(Tokens::dark().foreground), "100% changes nothing");
+        assert_eq!(hex_of(default.border), hex_of(Tokens::dark().border));
+        assert_eq!(default.glass, 0.64);
+        // 50%: text halfway to its surface (oklab), borders at half alpha.
+        let low = at(50., true);
+        assert_eq!(hex_of(low.border).1, 0.04);
+        let low_text = hex_of(low.foreground).0 & 0xff;
+        assert_eq!(low_text, 0x5f, "oklab midpoint of #f5f5f5 and black");
+        // 200%: dark text all the way to white, light text to black.
+        assert_eq!(hex_of(at(200., true).muted_foreground).0, 0xffffff);
+        assert_eq!(hex_of(at(200., false).foreground).0, 0x000000);
+    }
 }

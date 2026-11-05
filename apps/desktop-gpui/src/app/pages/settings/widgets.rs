@@ -594,6 +594,7 @@ impl Workspace {
         }
         if !plan.client_patch.is_empty() {
             self.client_settings.apply(&plan.client_patch);
+            theme::set_appearance(theme::Appearance::from_settings(&self.client_settings.values), window, cx);
             cx.notify();
         }
         let Some(patch) = plan.server_patch else { return done(self, true, cx) };

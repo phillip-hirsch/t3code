@@ -2,7 +2,7 @@
 //! `packages/client-runtime/src/operations/commands.ts`): `message.dispatch`
 //! for a thread, `orchestration.launchThread` for a draft.
 
-use gpui_kit::{Context, Window};
+use gpui_kit::{Context, Keystroke, Window};
 use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
@@ -15,30 +15,79 @@ use crate::new_thread::{self, DraftWorkspace};
 pub(super) enum Intent {
     /// Enter or a plain click.
     Foreground,
-    /// Ctrl+Enter or Ctrl-click: queue instead of steer while a turn runs;
+    /// Ctrl+Enter or Ctrl-click: the other of steer and queue while a turn runs;
     /// in a draft, launch in the background and stay on a fresh draft.
     Alternate,
     /// Ctrl+Alt+Enter: send, then open a new draft (background in a draft).
     AndNewThread,
 }
 
-/// `message.dispatch`'s delivery fields (`resolveComposerDispatchMode`, steer by default).
-fn dispatch_fields(running: bool, intent: Intent) -> (Value, Option<&'static str>) {
-    match (running, intent) {
+/// `composerRequiresModifier`: plain Enter adds a line instead of sending.
+pub(super) fn requires_modifier(send_shortcut: &str, prompt: &str) -> bool {
+    send_shortcut == "mod-enter" || (send_shortcut == "mod-enter-multiline" && prompt.contains(['\r', '\n']))
+}
+
+/// `composerSubmissionIntentForKey` over the default composer bindings. When Enter needs a
+/// modifier, the running turn's alternate moves to Ctrl+Shift+Enter (`keybindings.ts`).
+pub(super) fn key_intent(
+    keystroke: &Keystroke,
+    send_shortcut: &str,
+    prompt: &str,
+    running: bool,
+    draft: bool,
+) -> Option<Intent> {
+    let m = keystroke.modifiers;
+    if keystroke.key != "enter" {
+        return None;
+    }
+    let requires = requires_modifier(send_shortcut, prompt);
+    match (m.control || m.platform, m.alt, m.shift) {
+        (true, true, false) => Some(Intent::AndNewThread),
+        (true, false, shift) if running && shift == requires => Some(Intent::Alternate),
+        (true, false, false) if draft => Some(Intent::Alternate),
+        (true, false, false) => Some(Intent::Foreground),
+        (false, false, false) if !requires => Some(Intent::Foreground),
+        _ => None,
+    }
+}
+
+/// `resolveComposerDispatchMode`: a running turn takes `followUpBehavior`, and the
+/// alternate path the other of steer and queue.
+pub(super) fn queues(follow_up: &str, intent: Intent) -> bool {
+    (follow_up == "queue") != (intent == Intent::Alternate)
+}
+
+/// `message.dispatch`'s delivery fields.
+fn dispatch_fields(running: bool, follow_up: &str, intent: Intent) -> (Value, Option<&'static str>) {
+    match (running, queues(follow_up, intent)) {
         (false, _) => (json!({"type": "start_immediately"}), Some("auto")),
-        (true, Intent::Alternate) => (json!({"type": "queue_after_active"}), None),
-        (true, _) => (json!({"type": "start_immediately"}), Some("steer")),
+        (true, true) => (json!({"type": "queue_after_active"}), None),
+        (true, false) => (json!({"type": "start_immediately"}), Some("steer")),
     }
 }
 
 impl Workspace {
+    /// `followUpBehavior`, except that a send declines a waiting approval, so it steers.
+    pub(super) fn follow_up_behavior(&self) -> &str {
+        let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
+        if projection.is_some_and(|p| !p.pending_approvals().is_empty()) {
+            return "steer";
+        }
+        self.client_settings.values.get("followUpBehavior").as_str().unwrap_or("steer")
+    }
+
+    /// The open thread is still rolling back, so a send would race the rewind.
+    pub(super) fn target_rewinding(&self) -> bool {
+        matches!(&self.target, Some(Target::Thread(id)) if self.rewinding.contains(id))
+    }
+
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
         if self.question.is_some() {
             self.advance_question(window, cx);
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
-        if (text.is_empty() && !self.has_attachments()) || self.sending {
+        if (text.is_empty() && !self.has_attachments()) || self.sending || self.target_rewinding() {
             return;
         }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
@@ -58,7 +107,7 @@ impl Workspace {
             Target::Thread(thread_id) => {
                 let running =
                     self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
-                let (dispatch_mode, delivery) = dispatch_fields(running, intent);
+                let (dispatch_mode, delivery) = dispatch_fields(running, self.follow_up_behavior(), intent);
                 let mut command = json!({
                     "type": "message.dispatch",
                     "commandId": new_id(),
@@ -204,10 +253,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn running_turns_steer_unless_ctrl_queues() {
-        assert_eq!(dispatch_fields(false, Intent::Alternate), (json!({"type": "start_immediately"}), Some("auto")));
-        assert_eq!(dispatch_fields(true, Intent::Foreground), (json!({"type": "start_immediately"}), Some("steer")));
-        assert_eq!(dispatch_fields(true, Intent::Alternate), (json!({"type": "queue_after_active"}), None));
-        assert_eq!(dispatch_fields(true, Intent::AndNewThread), (json!({"type": "start_immediately"}), Some("steer")));
+    fn follow_up_behavior_picks_the_default_and_the_alternate_inverts_it() {
+        let (steer, queue) =
+            ((json!({"type": "start_immediately"}), Some("steer")), (json!({"type": "queue_after_active"}), None));
+        assert_eq!(
+            dispatch_fields(false, "queue", Intent::Alternate),
+            (json!({"type": "start_immediately"}), Some("auto"))
+        );
+        assert_eq!(dispatch_fields(true, "steer", Intent::Foreground), steer);
+        assert_eq!(dispatch_fields(true, "steer", Intent::Alternate), queue);
+        assert_eq!(dispatch_fields(true, "steer", Intent::AndNewThread), steer);
+        assert_eq!(dispatch_fields(true, "queue", Intent::Foreground), queue);
+        assert_eq!(dispatch_fields(true, "queue", Intent::Alternate), steer);
+    }
+
+    #[test]
+    fn send_shortcut_decides_whether_enter_needs_a_modifier() {
+        let key = |text: &'static str| Keystroke::parse(text).unwrap();
+        let idle = |k: &'static str, shortcut: &str, prompt: &str| key_intent(&key(k), shortcut, prompt, false, false);
+        assert_eq!(idle("enter", "enter", "a\nb"), Some(Intent::Foreground));
+        assert_eq!(idle("enter", "mod-enter-multiline", "one line"), Some(Intent::Foreground));
+        assert_eq!(idle("enter", "mod-enter-multiline", "a\nb"), None);
+        assert_eq!(idle("ctrl-enter", "mod-enter-multiline", "a\nb"), Some(Intent::Foreground));
+        assert_eq!(idle("enter", "mod-enter", "one line"), None);
+        assert_eq!(idle("ctrl-enter", "mod-enter", "one line"), Some(Intent::Foreground));
+        assert_eq!(idle("shift-enter", "enter", ""), None);
+        let running = |k: &'static str, shortcut: &str| key_intent(&key(k), shortcut, "x", true, false);
+        assert_eq!(running("ctrl-enter", "enter"), Some(Intent::Alternate));
+        assert_eq!(running("ctrl-enter", "mod-enter"), Some(Intent::Foreground));
+        assert_eq!(running("ctrl-shift-enter", "mod-enter"), Some(Intent::Alternate));
+        assert_eq!(key_intent(&key("ctrl-enter"), "mod-enter", "x", false, true), Some(Intent::Alternate));
     }
 }
