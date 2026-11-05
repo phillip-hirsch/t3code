@@ -563,6 +563,8 @@ impl Catalog {
 
 pub(super) struct KeybindingsPanel {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment the rows, drafts and saves belong to.
+    environment: Option<SharedString>,
     search: Entity<InputState>,
     query: String,
     catalog: Catalog,
@@ -582,6 +584,7 @@ pub(super) struct KeybindingsPanel {
 impl KeybindingsPanel {
     fn new(
         workspace: Entity<Workspace>,
+        environment: Option<SharedString>,
         source: Rc<Vec<Rule>>,
         connected: bool,
         window: &mut Window,
@@ -606,6 +609,12 @@ impl KeybindingsPanel {
             cx.observe(&workspace, |this, workspace, cx| {
                 let workspace = workspace.read(cx);
                 let connected = workspace.settings_client().is_some();
+                let environment = workspace.settings_environment();
+                // Another environment's rows: unsaved edits stay behind rather than saving there.
+                if environment != this.environment {
+                    this.environment = environment;
+                    this.clear_editing();
+                }
                 if !Rc::ptr_eq(&this.catalog.source, &workspace.settings_info().keybindings)
                     || connected != this.connected
                 {
@@ -626,6 +635,7 @@ impl KeybindingsPanel {
         ];
         Self {
             workspace: workspace.downgrade(),
+            environment,
             search,
             query: String::new(),
             catalog: Catalog::new(source),
@@ -638,6 +648,14 @@ impl KeybindingsPanel {
             when_input,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn clear_editing(&mut self) {
+        self.drafts.clear();
+        self.adding = None;
+        self.recording = None;
+        self.saving = None;
+        self.when_open = None;
     }
 
     fn set_catalog(&mut self, source: Rc<Vec<Rule>>) {
@@ -805,12 +823,10 @@ impl KeybindingsPanel {
         cx.notify();
     }
 
-    /// The settings environment and its socket, taken before a request so the reply lands there.
-    fn target_environment(&self, cx: &App) -> Option<(gpui_kit::SharedString, crate::rpc::RpcClient)> {
-        let workspace = self.workspace.upgrade()?;
-        let workspace = workspace.read(cx);
-        let environment = workspace.settings_environment()?;
-        let client = workspace.env_client(&environment)?;
+    /// The panel's environment and its socket, taken before a request so the reply lands there.
+    fn target_environment(&self, cx: &App) -> Option<(SharedString, crate::rpc::RpcClient)> {
+        let environment = self.environment.clone()?;
+        let client = self.workspace.upgrade()?.read(cx).env_client(&environment)?;
         Some((environment, client))
     }
 
@@ -823,10 +839,14 @@ impl KeybindingsPanel {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.saving = None;
+                // The panel moved to another environment meanwhile: its editing state is not this one's.
+                let current = this.environment.as_ref() == Some(&environment);
+                if current {
+                    this.saving = None;
+                }
                 match result {
                     Ok(value) => {
-                        if !remove {
+                        if !remove && current {
                             this.adding = None;
                         }
                         // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
@@ -1723,9 +1743,12 @@ impl Workspace {
     ) -> AnyElement {
         let (workspace, source, connected) =
             (cx.entity(), self.settings_info().keybindings.clone(), self.settings_client().is_some());
+        let environment = self.settings_environment();
         let panel = self
             .keybindings_panel
-            .get_or_insert_with(|| cx.new(|cx| KeybindingsPanel::new(workspace, source, connected, window, cx)).into())
+            .get_or_insert_with(|| {
+                cx.new(|cx| KeybindingsPanel::new(workspace, environment, source, connected, window, cx)).into()
+            })
             .clone();
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.
