@@ -423,6 +423,9 @@ struct AddForm {
     saved: WeakEntity<SavedEnvironments>,
     /// The workspace's own environment, which is never saved again.
     primary_id: Option<String>,
+    /// A pairing that could not be saved, with the host and code it used. The code is spent,
+    /// so submitting the same fields again retries only the save.
+    unsaved: Option<(String, String, SavedEnvironment)>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -437,36 +440,55 @@ impl AddForm {
             Ok(fields) => fields,
             Err(message) => return self.fail(message.to_owned(), window, cx),
         };
+        if let Some((_, _, paired)) = self.unsaved.take().filter(|(h, c, _)| (h, c) == (&host, &code)) {
+            return self.save(host, code, paired, window, cx);
+        }
         let Some(catalog) = self.saved.read_with(cx, |saved, _| saved.environments().to_vec()).ok() else { return };
         self.busy = true;
         self.error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = crate::runtime().spawn(environments::pair(host, code, catalog)).await;
+            let result = crate::runtime().spawn(environments::pair(host.clone(), code.clone(), catalog)).await;
             let result = result.unwrap_or_else(|error| Err(error.to_string()));
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
-                let saved = match result {
-                    // The workspace's own environment is already here (`register` skips platform entries).
-                    Ok(paired) if this.primary_id.as_deref() == Some(&paired.environment_id) => Ok(()),
-                    Ok(paired) => this.saved.update(cx, |saved, cx| saved.add(paired, cx)).unwrap_or_else(gone),
-                    Err(error) => Err(error),
-                };
-                match saved {
-                    Ok(()) => {
-                        window.close_dialog(cx);
-                        success_toast(
-                            window,
-                            cx,
-                            "Backend added",
-                            "The environment is saved and will reconnect on app startup.",
-                        );
-                    }
-                    Err(error) => this.fail(error, window, cx),
-                }
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(paired) => this.save(host, code, paired, window, cx),
+                Err(error) => this.fail(error, window, cx),
             });
         })
         .detach();
+    }
+
+    /// Saves a redeemed pairing; on failure the form stays open with the error, ready to retry.
+    fn save(
+        &mut self,
+        host: String,
+        code: String,
+        paired: SavedEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = if self.primary_id.as_deref() == Some(&paired.environment_id) {
+            // The workspace's own environment is already here (`register` skips platform entries).
+            Ok(())
+        } else {
+            self.saved.update(cx, |saved, cx| saved.add(paired.clone(), cx)).unwrap_or_else(gone)
+        };
+        match saved {
+            Ok(()) => {
+                self.busy = false;
+                window.close_dialog(cx);
+                success_toast(
+                    window,
+                    cx,
+                    "Backend added",
+                    "The environment is saved and will reconnect on app startup.",
+                );
+            }
+            Err(error) => {
+                self.unsaved = Some((host, code, paired));
+                self.fail(error, window, cx);
+            }
+        }
     }
 
     fn fail(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -587,6 +609,7 @@ fn open_add_dialog(
             error: None,
             saved,
             primary_id,
+            unsaved: None,
         }
     });
     window.open_dialog(cx, move |dialog, _, cx| {
