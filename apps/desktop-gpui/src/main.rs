@@ -27,14 +27,18 @@ mod search;
 mod settings;
 mod snap_shot;
 mod terminal_text;
+mod tex;
 mod theme;
 mod themes;
 mod thread_details;
+mod thread_now;
 mod thread_pull_requests;
 mod timeline;
 mod timestamp;
 mod usage;
 mod work_log;
+mod workflow;
+mod worktree_setup;
 
 use std::sync::OnceLock;
 

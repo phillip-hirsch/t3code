@@ -44,6 +44,8 @@ mod inspector;
 mod keep_alive;
 mod keymap;
 mod layout;
+mod markdown_images;
+mod markdown_ui;
 mod message_actions;
 mod minimap;
 mod model_picker;
@@ -55,16 +57,21 @@ mod preview;
 mod prompt_stash;
 mod queue;
 mod quit;
+mod request_cards;
 mod right_panel;
 mod send;
 mod side_chat;
 mod sidebar;
 mod snap_shot;
+mod subagents;
 mod terminal;
 mod thread_menu;
 mod thread_menu_actions;
+mod thread_now;
 mod titlebar;
 mod visits;
+mod workflow;
+mod worktree_setup;
 
 gpui_kit::actions!(
     workspace,
@@ -243,6 +250,13 @@ pub struct Workspace {
     snap_shot: snap_shot::SnapShotUi,
     quit: quit::QuitState,
     queue: queue::QueueUi,
+    now: thread_now::NowUi,
+    markdown_images: markdown_images::ImageCache,
+    workflow: workflow::WorkflowUi,
+    setup: worktree_setup::SetupWatch,
+    chat_menu: Option<markdown_ui::ChatMenu>,
+    requests: request_cards::RequestUi,
+    subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
@@ -389,6 +403,13 @@ impl Workspace {
             snap_shot: Default::default(),
             quit: Default::default(),
             queue: Default::default(),
+            now: Default::default(),
+            markdown_images: Default::default(),
+            workflow: Default::default(),
+            setup: Default::default(),
+            chat_menu: None,
+            requests: Default::default(),
+            subagents: Default::default(),
             banners: Default::default(),
             desktop,
             keep_alive: Default::default(),
@@ -615,6 +636,8 @@ impl Workspace {
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
+                this.sync_now(cx);
+                this.sync_child_approvals(cx);
             },
         ));
     }
@@ -751,9 +774,15 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
+        self.apply_workflow_opening(&mut new_rows, cx);
+        self.sync_worktree_setup(cx);
+        self.insert_worktree_setup(&mut new_rows);
+        new_rows.extend(self.now_rows(cx));
         new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
+        self.sync_subagent_tick(cx);
+        self.sync_child_approvals(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);

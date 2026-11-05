@@ -32,6 +32,11 @@ const LINE: f32 = 22.75;
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
 
+/// `shouldCollapseUserMessage`.
+pub(super) fn should_collapse(text: &str) -> bool {
+    text.chars().count() > COLLAPSE_CHARS || text.lines().count() > COLLAPSE_LINES
+}
+
 impl Workspace {
     pub(super) fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
@@ -74,6 +79,7 @@ impl Workspace {
                         .with_bottom_fade(background),
                     )
                     .children(minimap)
+                    .children(self.render_chat_menu())
                     .into_any_element()
             }
         }
@@ -87,15 +93,17 @@ impl Workspace {
         breaks: bool,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        let source = |text: &SharedString| if breaks { hard_breaks(text) } else { text.to_string() };
-        if let Some(state) = self.markdown.0.get_mut(&key) {
-            if state.text != *text {
-                state.text = text.clone();
-                state.view.update(cx, |view, cx| view.set_text(&source(text), cx));
-            }
+        if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
             return state.view.clone();
         }
-        let view = cx.new(|cx| TextViewState::markdown(&source(text), cx));
+        let source = self.with_skill_links(&if breaks { hard_breaks(text) } else { text.to_string() });
+        self.load_markdown_images(&key, &source, cx);
+        if let Some(state) = self.markdown.0.get_mut(&key) {
+            state.text = text.clone();
+            state.view.update(cx, |view, cx| view.set_text(&source, cx));
+            return state.view.clone();
+        }
+        let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let row_key = key.clone();
         let _changed = cx.observe(&view, move |this, _, cx| {
             if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
@@ -134,7 +142,7 @@ impl Workspace {
     }
 
     /// Opens or closes a work group, turn fold or entry.
-    fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
+    pub(super) fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
@@ -145,7 +153,14 @@ impl Workspace {
 
     /// Keeps a once-a-second repaint alive while a "Working for …" row shows.
     pub(super) fn sync_working_tick(&mut self, rows: &[Row], cx: &mut Context<Self>) {
-        let working = rows.iter().any(|row| matches!(row, Row::Working { started_at: Some(_) }));
+        let working = rows.iter().any(|row| match row {
+            Row::Working { started_at: Some(_) } => true,
+            Row::Now(line) => line.ticks(),
+            Row::Workflow { row, .. } => row.phases.iter().flat_map(|p| &p.2).chain(&row.unphased).any(|c| c.live),
+            Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
+            Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
+            _ => false,
+        });
         if !working {
             self._working_tick = None;
         } else if self._working_tick.is_none() {
@@ -183,9 +198,10 @@ fn thought_key(entry_id: &str) -> SharedString {
     format!("thought:{entry_id}").into()
 }
 
-fn shows_markdown(row: &Row, key: &str) -> bool {
+pub(super) fn shows_markdown(row: &Row, key: &str) -> bool {
     match row {
         Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
+        Row::Workflow { row, .. } => key.strip_prefix("workflow-script:") == Some(row.opening.message_id.as_str()),
         Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought_key(&entry.id) == key,
         Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
             entries.iter().any(|(entry, _)| thought_key(&entry.id) == key)
@@ -204,7 +220,7 @@ enum MarkdownKind {
 }
 
 /// `ChatMarkdown` for `text`, parsed once per `key` for as long as the thread is open.
-fn markdown(
+pub(super) fn markdown(
     this: &WeakEntity<Workspace>,
     key: SharedString,
     text: &SharedString,
@@ -228,9 +244,13 @@ fn markdown_with(
     let key_for_view = key.clone();
     match this.update(cx, |workspace, cx| {
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
-        (workspace.markdown_state(key, text, user, cx), wrap)
+        let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
+        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone(), math)
     }) {
-        Ok((state, wrap)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t).into_any_element(),
+        Ok((state, wrap, images, math)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t)
+            .image_source(images.resolver())
+            .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
+            .into_any_element(),
         Err(_) => div().into_any_element(),
     }
 }
@@ -374,7 +394,7 @@ fn centered_note(text: &'static str, t: &Tokens) -> AnyElement {
 }
 
 /// A row in the lane (the scroller insets rows to it); owns its bottom space.
-fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
+pub(super) fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
     div().w_full().pb(px(bottom)).child(child)
 }
 
@@ -393,7 +413,7 @@ pub(super) fn render_row(
     row: &Row,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
-    _: &mut Window,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let t = *theme::tokens(cx);
@@ -427,7 +447,14 @@ pub(super) fn render_row(
                 &t,
             )
         }
-        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork } => {
+        Row::AssistantMeta { id, text, updated_at, status, fork } => {
+            let meta =
+                message_actions::assistant_meta(this, id, text, false, updated_at, status, fork.as_ref(), &t, cx)
+                    .opacity(0.)
+                    .group_hover("timeline-meta", |style| style.opacity(1.));
+            lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
+        }
+        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, .. } => {
             let body = div()
                 .px(px(4.))
                 .py(px(2.))
@@ -510,6 +537,9 @@ pub(super) fn render_row(
         }
         // Subagent rows carry no bottom space of their own.
         Row::Subagent(card) => lane(0., subagent_card(card, this, &t)).into_any_element(),
+        Row::SubagentGroup { key, cards, expanded } => {
+            lane(0., subagent_group(key, cards, *expanded, this, &t)).into_any_element()
+        }
         Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
         Row::AttemptFold { key, expanded } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
@@ -539,12 +569,107 @@ pub(super) fn render_row(
         }
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
+        Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::Workflow { row, expanded } => {
+            lane(16., super::workflow::workflow_row(row, *expanded, this, lane_width, &t, cx)).into_any_element()
+        }
+        Row::WorktreeSetup { snapshot, embedded } => {
+            super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
+        }
+        Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
+        Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
     }
+}
+
+/// `TimelineSystemDivider`: icon, label and detail between hairlines; a pill when it opens a thread.
+fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+    let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
+    let icon = if divider.fork { IconName::GitFork } else { IconName::CircleStop };
+    let content = |el: gpui_kit::Stateful<gpui_kit::Div>| {
+        el.flex()
+            .min_w_0()
+            .items_center()
+            .gap(px(6.))
+            .child(Icon::new(icon).size(px(12.)).flex_none())
+            .child(div().font_weight(FontWeight::MEDIUM).child(divider.label.clone()))
+            .children(
+                divider
+                    .detail
+                    .clone()
+                    .map(|d| div().min_w_0().max_w(px(320.)).opacity(0.7).child(format!("·\u{a0}{d}"))),
+            )
+    };
+    let center = match &divider.action {
+        Some((label, thread_id)) => {
+            let (this, thread_id, label) = (this.clone(), thread_id.clone(), label.clone());
+            content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded_full()
+                .border_1()
+                .border_color(alpha(t.border, 0.7))
+                .bg(t.background)
+                .cursor_pointer()
+                .hover(|style| style.bg(t.accent).text_color(t.foreground))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .on_click(move |_, window, cx| {
+                    let thread_id = thread_id.to_string();
+                    let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+                })
+                .into_any_element()
+        }
+        None => content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+            .flex_wrap()
+            .justify_center()
+            .px(px(8.))
+            .py(px(4.))
+            .into_any_element(),
+    };
+    h_flex()
+        .min_w_0()
+        .gap(px(8.))
+        .py(px(8.))
+        .text_size(px(11.))
+        .text_color(t.muted_foreground)
+        .child(line())
+        .child(center)
+        .child(line())
+        .into_any_element()
+}
+
+/// "Open chat" on a created thread, "Open subagent" on a subagent's notification (`WorkEntryLogRow`).
+fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> Option<AnyElement> {
+    let raw = &entry.item.0.raw;
+    let text = |pointer: &str| raw.pointer(pointer).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty());
+    let (label, thread_id, color) = match entry.item_type.as_ref() {
+        "thread_created" => ("Open chat", text("/targetThreadId")?, t.primary),
+        "notification" if matches!(text("/source/kind"), Some("subagent" | "delegated_task")) => {
+            ("Open subagent", text("/source/childThreadId")?, t.foreground)
+        }
+        _ => return None,
+    };
+    let (this, thread_id) = (this.clone(), thread_id.to_owned());
+    Some(
+        div()
+            .id(ElementId::Name(format!("open-thread:{}", entry.id).into()))
+            .flex_none()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|style| style.underline())
+            .child(label)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                let thread_id = thread_id.clone();
+                let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+            })
+            .into_any_element(),
+    )
 }
 
 /// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
 /// chevron when the subagent's thread can open.
-fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let muted = t.muted_foreground;
     let detail_color = if card.failed { t.error } else { muted };
     let dot = match card.dot {
@@ -633,6 +758,121 @@ fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t:
         }
         None => row.into_any_element(),
     }
+}
+
+/// `V2SubagentGroup`: stacked avatars, "3 subagents" with their statuses, the batch's time,
+/// and the members' cards when open.
+fn subagent_group(
+    key: &SharedString,
+    cards: &[Rc<timeline::SubagentCard>],
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let (summary, active, failed) = timeline::subagent_group_status(cards);
+    let (start, end, live) = timeline::subagent_group_timing(cards);
+    let elapsed = start.and_then(|start| {
+        let end = end.or(live.then(now_ms))?;
+        Some(timeline::agent_elapsed(end - start))
+    });
+    let avatar = |card: &timeline::SubagentCard| {
+        div()
+            .size(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.secondary)
+            .border_2()
+            .border_color(t.background)
+            .child(match crate::assets::provider_icon(&card.driver) {
+                Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+                None => Icon::new(IconName::Bot).size(px(14.)).text_color(muted),
+            })
+    };
+    let more = cards.len().saturating_sub(3);
+    let header = h_flex()
+        .id(ElementId::Name(key.clone()))
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .py(px(8.))
+        .pr(px(13.))
+        .cursor_pointer()
+        .text_color(if expanded || active { t.foreground } else { muted })
+        .when(!expanded && !active, |el| el.opacity(0.55))
+        .hover(|style| style.opacity(1.))
+        .child(
+            h_flex()
+                .flex_none()
+                .children(
+                    cards.iter().take(3).enumerate().map(|(i, card)| avatar(card).when(i > 0, |el| el.ml(px(-6.)))),
+                )
+                .when(more > 0, |el| {
+                    el.child(
+                        div()
+                            .ml(px(-6.))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(t.muted)
+                            .border_2()
+                            .border_color(t.background)
+                            .text_size(px(9.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(format!("+{more}")),
+                    )
+                }),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{} subagents", cards.len())))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(if active {
+                            t.info
+                        } else if failed {
+                            t.error
+                        } else {
+                            muted
+                        })
+                        .child(summary),
+                ),
+        )
+        .children(elapsed.map(|e| div().flex_none().text_xs().text_color(muted).child(e)))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .text_color(muted),
+        )
+        .on_click(toggle(this, key.clone()));
+    v_flex()
+        .w_full()
+        .pb(px(8.))
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                v_flex()
+                    .mt(px(4.))
+                    .mb(px(4.))
+                    .p(px(4.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(alpha(t.border, 0.6))
+                    .bg(alpha(t.card, 0.3))
+                    .children(cards.iter().map(|card| subagent_card(card, this, t))),
+            )
+        })
+        .into_any_element()
 }
 
 /// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.
@@ -852,7 +1092,8 @@ fn markdown_view(
         .py(px(1.4))
         .text_size(px(11.9));
     let t = *t;
-    let (header_this, link_this) = (this.clone(), this.clone());
+    let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
+    let table_key = key.clone();
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -861,7 +1102,29 @@ fn markdown_view(
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
+        .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .on_link_click(move |url, event, window, cx| {
+            // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
+            let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
+            // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).
+            if thread_link(url).is_none() {
+                let target = link_this
+                    .upgrade()
+                    .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
+                if let Some(target) = target {
+                    let _ = link_this.update(cx, |workspace, cx| match right {
+                        true => workspace.open_file_menu(target, event.position(), window, cx),
+                        false => workspace.open_file_link(&target, window, cx),
+                    });
+                    return;
+                }
+            }
+            if right {
+                let _ =
+                    link_this.update(cx, |workspace, cx| workspace.open_link_menu(url, event.position(), window, cx));
+                return;
+            }
             let _ = link_this.update(cx, |workspace, cx| match thread_link(url) {
                 Some(thread_id) => workspace.select_thread(thread_id, window, cx),
                 // A project's pull request opens in its panel (`pullRequestLinksOpenInApp`); Ctrl-click and
@@ -1507,7 +1770,9 @@ fn single_entry(
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     let expandable = expandable(entry, label);
-    let line = work_line(entry.icon(), color, label_text, label_color, Some(chevron(expandable, expanded, t)));
+    let trailing =
+        h_flex().gap(px(6.)).children(entry_open_link(entry, this, t)).child(chevron(expandable, expanded, t));
+    let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
         row.cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
@@ -1538,7 +1803,19 @@ fn detail_entry(
         .px(px(2.))
         .rounded(px(6.))
         .when(expandable, |this| this.cursor_pointer())
-        .child(work_line(entry.icon(), color, shown, label_color, Some(chevron(expandable, expanded, t))))
+        .child(work_line(
+            entry.icon(),
+            color,
+            shown,
+            label_color,
+            Some(
+                h_flex()
+                    .gap(px(6.))
+                    .children(entry_open_link(entry, this, t))
+                    .child(chevron(expandable, expanded, t))
+                    .into_any_element(),
+            ),
+        ))
         .children(details)
         .when(expandable, |row| row.on_click(toggle(this, timeline::entry_key(&entry.id))))
         .into_any_element()

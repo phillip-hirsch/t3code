@@ -40,7 +40,7 @@ const PROMPT_LINK_MAX: usize = 8000;
 /// The copy button that just copied, shown as a check until the timer clears it.
 #[derive(Default)]
 pub(super) struct CopyFeedback {
-    id: Option<SharedString>,
+    pub(super) id: Option<SharedString>,
     _reset: Option<Task<()>>,
 }
 

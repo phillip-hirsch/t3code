@@ -887,7 +887,7 @@ impl Workspace {
     }
 
     /// `revealThreadTerminal`: open the thread with that terminal shown.
-    fn reveal_thread_terminal(
+    pub(super) fn reveal_thread_terminal(
         &mut self,
         thread_id: String,
         terminal_id: String,
