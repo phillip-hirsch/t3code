@@ -506,7 +506,7 @@ impl Workspace {
                 let step = |delta: isize, id: &'static str, icon: IconName, label: &'static str, enabled: bool| {
                     let step_key = key.clone();
                     let scroll = scroll.clone();
-                    chrome::action(id, icon, label, false, tokens)
+                    chrome::action(id, icon, label, tokens)
                         .when(!enabled, |el| el.opacity(0.5).cursor_default())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let Some(doc) = this.office_mut(&step_key) else { return };

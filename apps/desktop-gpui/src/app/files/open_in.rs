@@ -16,12 +16,19 @@ use crate::app::Workspace;
 use crate::app::details::{editor_icon, editor_label};
 use crate::theme::Tokens;
 
+/// What the file manager does with a file (`revealFileManager`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileManager {
+    Open,
+    /// Selects the file in its folder.
+    Reveal,
+}
+
 impl Workspace {
-    /// `reveal`: the file manager reveals the file instead of opening it (`revealFileManager`).
     pub(super) fn render_file_open_in(
         &self,
         absolute: String,
-        reveal: bool,
+        file_manager: FileManager,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -29,6 +36,7 @@ impl Workspace {
         let preferred = self.preferred_editor_id();
         let shortcut = self.shortcut_label("editor.openFavorite");
         let view = cx.entity();
+        let view_for_menu = view.clone();
         let menu_tokens = *tokens;
         let current = preferred.clone();
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
@@ -81,7 +89,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 let Some(editor) = this.preferred_editor_id() else { return };
                 let title = format!("Could not open in {}", editor_label(&editor));
-                let reveal = reveal && editor == "file-manager";
+                let reveal = file_manager == FileManager::Reveal && editor == "file-manager";
                 this.preferred_editor = Some(editor.clone());
                 this.open_path_in_editor(absolute.clone(), editor, reveal, title, window, cx);
             }));
@@ -108,7 +116,8 @@ impl Workspace {
                     .rounded(px(0.))
                     .icon(Icon::new(IconName::ChevronDown).size(px(16.)))
                     .tooltip("Choose editor")
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| build(menu, window, cx)),
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| build(menu, window, cx))
+                    .on_open_change(super::menu_open_change(view_for_menu)),
             )
             .into_any_element()
     }

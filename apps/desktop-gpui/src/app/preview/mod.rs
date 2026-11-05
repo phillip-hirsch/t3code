@@ -115,7 +115,7 @@ impl PreviewState {
 }
 
 /// The GPUI window's native handle, owned so a view can be built after the borrow ends.
-pub(super) struct ParentWindow(pub(super) RawWindowHandle);
+struct ParentWindow(RawWindowHandle);
 
 impl HasWindowHandle for ParentWindow {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
@@ -249,6 +249,7 @@ impl Workspace {
             || self.palette.is_some()
             || self.preview.menu_open
             || self.right_panel.add_menu_open
+            || self.files.menu_open
             || window.has_active_dialog(cx)
     }
 

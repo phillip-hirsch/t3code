@@ -4,7 +4,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Div, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
@@ -17,7 +16,6 @@ pub(super) fn action(
     id: impl Into<ElementId>,
     icon: IconName,
     label: impl Into<SharedString>,
-    pressed: bool,
     tokens: &Tokens,
 ) -> Stateful<Div> {
     let label = label.into();
@@ -30,8 +28,7 @@ pub(super) fn action(
         .justify_center()
         .rounded(px(6.))
         .cursor_pointer()
-        .text_color(if pressed { tokens.foreground } else { tokens.muted_foreground })
-        .when(pressed, |el| el.bg(tokens.accent))
+        .text_color(tokens.muted_foreground)
         .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
         .child(Icon::new(icon).size(px(14.)))
         .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))

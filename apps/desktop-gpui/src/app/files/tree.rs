@@ -121,6 +121,14 @@ impl TreeState {
     }
 }
 
+/// How a tree row draws: the open file, the keyboard focus, and a folder still listing.
+#[derive(Clone, Copy)]
+struct RowLook {
+    selected: bool,
+    focused: bool,
+    loading: bool,
+}
+
 impl TreeState {
     /// A folder's listed entries, or its load error.
     pub(super) fn folder(&self, folder: &str) -> Result<Option<&[Entry]>, &str> {
@@ -516,15 +524,12 @@ impl Workspace {
                         .map(|index| {
                             let row = &rows[index];
                             let loading = row.expanded && loading_folders.contains(&row.path);
-                            this.tree_row(
-                                &list_key,
-                                row,
-                                selected.as_deref() == Some(row.path.as_str()),
-                                focused.as_deref() == Some(row.path.as_str()),
+                            let look = RowLook {
+                                selected: selected.as_deref() == Some(row.path.as_str()),
+                                focused: focused.as_deref() == Some(row.path.as_str()),
                                 loading,
-                                &tokens,
-                                cx,
-                            )
+                            };
+                            this.tree_row(&list_key, row, look, &tokens, cx)
                         })
                         .collect::<Vec<_>>()
                 }),
@@ -642,12 +647,11 @@ impl Workspace {
         &mut self,
         cwd: &str,
         row: &TreeRow,
-        selected: bool,
-        focused: bool,
-        loading: bool,
+        look: RowLook,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let RowLook { selected, focused, loading } = look;
         let folder = row.kind == EntryKind::Directory;
         let glyph = match (folder, row.expanded, loading) {
             (true, true, true) => Icon::new(IconName::LoaderCircle),
@@ -721,6 +725,7 @@ impl Workspace {
         let absolute = logic::absolute_path(cwd, path);
         let path = path.to_owned();
         move |mut menu, window, cx| {
+            super::track_menu(&view, cx);
             let open_in = |editor: String, reveal: bool, title: String| {
                 let absolute = absolute.clone();
                 window.listener_for(&view, move |this: &mut Workspace, _, window, cx| {

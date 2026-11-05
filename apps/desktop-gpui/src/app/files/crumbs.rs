@@ -5,11 +5,28 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::{AnyElement, Context, Entity, IntoElement, Styled as _, Window, px};
+use gpui_kit::{AnyElement, App, Context, Entity, IntoElement, Styled as _, Window, px};
 
 use super::logic::{self, Entry, EntryKind};
 use crate::app::Workspace;
 use crate::theme::Tokens;
+
+/// Which menu lists a folder: the crumb's own menu, whose folders open submenus, or one of
+/// those submenus, whose folders open in the panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Crumb,
+    Submenu,
+}
+
+/// What every row of a crumb's menu acts on.
+#[derive(Clone)]
+struct FolderMenu {
+    view: Entity<Workspace>,
+    cwd: String,
+    /// The file the panel shows, checked in its folder's list.
+    current: String,
+}
 
 /// The rows of a folder's menu: folders first, then by name.
 fn sorted(entries: &[Entry]) -> Vec<Entry> {
@@ -18,67 +35,89 @@ fn sorted(entries: &[Entry]) -> Vec<Entry> {
     refs.into_iter().cloned().collect()
 }
 
-/// A folder's entries as menu items; `nested` folders open in the panel instead of a submenu.
-fn folder_items(
-    view: &Entity<Workspace>,
-    cwd: &str,
-    folder: &str,
-    current: &str,
-    nested: bool,
-    mut menu: PopupMenu,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    let dark = view.read(cx).dark_theme(cx);
-    let listing = view.read(cx).tree_state(cwd).map(|tree| tree.folder(folder).map(|e| e.map(sorted)));
-    let entries = match listing {
-        Some(Ok(Some(entries))) => entries,
-        Some(Err(_)) => {
-            let (cwd, folder) = (cwd.to_owned(), folder.to_owned());
-            return menu.item(PopupMenuItem::new("Retry loading folder").icon(IconName::RefreshCw).on_click(
-                window.listener_for(view, move |this: &mut Workspace, _, _, cx| {
-                    this.load_folder(&cwd, folder.clone(), true, cx)
-                }),
-            ));
-        }
-        _ => return menu.item(PopupMenuItem::new("Loading folder…").disabled(true)),
-    };
-    if entries.is_empty() {
-        return menu.item(PopupMenuItem::new("This folder is empty.").disabled(true));
+impl FolderMenu {
+    /// Lists `folder` and the folders in it, so their submenus fill on the next open.
+    fn load(&self, folder: &str, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |this, cx| {
+            this.ensure_tree(&self.cwd, window, cx);
+            this.load_folder(&self.cwd, folder.to_owned(), false, cx);
+            let children: Vec<String> = this
+                .tree_state(&self.cwd)
+                .and_then(|tree| tree.folder(folder).ok().flatten())
+                .map(|entries| {
+                    entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.clone()).collect()
+                })
+                .unwrap_or_default();
+            for child in children {
+                this.load_folder(&self.cwd, child, false, cx);
+            }
+        });
     }
-    for entry in entries {
-        let label = logic::file_name(&entry.path).to_owned();
-        let path = entry.path.clone();
-        if entry.kind == EntryKind::Directory {
-            if nested {
-                menu = menu.item(PopupMenuItem::new(label).icon(IconName::Folder).on_click(
-                    window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
-                        this.open_file(&path, None, window, cx)
+
+    /// `folder`'s entries as menu items.
+    fn items(
+        &self,
+        folder: &str,
+        level: Level,
+        mut menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let view = &self.view;
+        let dark = view.read(cx).dark_theme(cx);
+        let listing = view.read(cx).tree_state(&self.cwd).map(|tree| tree.folder(folder).map(|e| e.map(sorted)));
+        let entries = match listing {
+            Some(Ok(Some(entries))) => entries,
+            Some(Err(_)) => {
+                let (cwd, folder) = (self.cwd.clone(), folder.to_owned());
+                return menu.item(PopupMenuItem::new("Retry loading folder").icon(IconName::RefreshCw).on_click(
+                    window.listener_for(view, move |this: &mut Workspace, _, _, cx| {
+                        this.load_folder(&cwd, folder.clone(), true, cx)
                     }),
                 ));
-            } else {
-                let (view, cwd, current) = (view.clone(), cwd.to_owned(), current.to_owned());
-                menu = menu.submenu_with_icon(
-                    Some(Icon::new(IconName::Folder)),
-                    label,
-                    window,
-                    cx,
-                    move |sub, window, cx| folder_items(&view, &cwd, &path, &current, true, sub, window, cx),
-                );
             }
-            continue;
+            _ => return menu.item(PopupMenuItem::new("Loading folder…").disabled(true)),
+        };
+        if entries.is_empty() {
+            return menu.item(PopupMenuItem::new("This folder is empty.").disabled(true));
         }
-        let (asset, color) = crate::file_icons::file_icon(&entry.path, dark);
-        menu = menu.item(
-            PopupMenuItem::new(label)
-                .icon(Icon::empty().path(asset).text_color(color))
-                .checked(entry.path == current)
-                .on_click(window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
-                    this.open_file(&path, None, window, cx)
-                })),
-        );
+        for entry in entries {
+            let label = logic::file_name(&entry.path).to_owned();
+            let path = entry.path;
+            match (entry.kind, level) {
+                (EntryKind::Directory, Level::Crumb) => {
+                    let submenu = self.clone();
+                    menu = menu.submenu_with_icon(
+                        Some(Icon::new(IconName::Folder)),
+                        label,
+                        window,
+                        cx,
+                        move |sub, window, cx| submenu.items(&path, Level::Submenu, sub, window, cx),
+                    );
+                }
+                (EntryKind::Directory, Level::Submenu) => {
+                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Folder).on_click(
+                        window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
+                            this.open_file(&path, None, window, cx)
+                        }),
+                    ));
+                }
+                (EntryKind::File, _) => {
+                    let (asset, color) = crate::file_icons::file_icon(&path, dark);
+                    let current = path == self.current;
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .icon(Icon::empty().path(asset).text_color(color))
+                            .checked(current)
+                            .on_click(window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
+                                this.open_file(&path, None, window, cx)
+                            })),
+                    );
+                }
+            }
+        }
+        menu
     }
-    menu
 }
 
 impl Workspace {
@@ -92,9 +131,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = cx.entity();
-        let (cwd, folder, current) = (cwd.to_owned(), folder.to_owned(), current.to_owned());
-        let label = if folder.is_empty() { "the project".to_owned() } else { logic::file_name(&folder).to_owned() };
-        Button::new(gpui_kit::ElementId::Name(format!("crumb-menu:{folder}").into()))
+        let menu = FolderMenu { view: view.clone(), cwd: cwd.to_owned(), current: current.to_owned() };
+        let loader = menu.clone();
+        let folder = folder.to_owned();
+        let label = if folder.is_empty() { "the project" } else { logic::file_name(&folder) };
+        let tooltip = format!("Browse {label}");
+        let id = gpui_kit::ElementId::Name(format!("crumb-menu:{folder}").into());
+        let open_change = super::menu_open_change(view);
+        let load_folder = folder.clone();
+        Button::new(id)
             .custom(
                 ButtonCustomVariant::new(cx)
                     .foreground(tokens.muted_foreground.opacity(0.6))
@@ -106,24 +151,15 @@ impl Workspace {
             .mx(px(2.))
             .rounded(px(4.))
             .icon(Icon::new(IconName::ChevronRight).size(px(14.)))
-            .tooltip(format!("Browse {label}"))
-            .dropdown_menu(move |menu, window, cx| {
-                // Lists the folder and the folders in it, so their submenus fill on the next open.
-                view.update(cx, |this, cx| {
-                    this.ensure_tree(&cwd, window, cx);
-                    this.load_folder(&cwd, folder.clone(), false, cx);
-                    let children: Vec<String> = this
-                        .tree_state(&cwd)
-                        .and_then(|tree| tree.folder(&folder).ok().flatten())
-                        .map(|entries| {
-                            entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.clone()).collect()
-                        })
-                        .unwrap_or_default();
-                    for child in children {
-                        this.load_folder(&cwd, child, false, cx);
-                    }
-                });
-                folder_items(&view, &cwd, &folder, &current, false, menu.max_h(px(384.)), window, cx)
+            .tooltip(tooltip)
+            .dropdown_menu(move |popup, window, cx| {
+                menu.items(&folder, Level::Crumb, popup.max_h(px(384.)), window, cx)
+            })
+            .on_open_change(move |open, window, cx| {
+                if *open {
+                    loader.load(&load_folder, window, cx);
+                }
+                open_change(open, window, cx);
             })
             .into_any_element()
     }

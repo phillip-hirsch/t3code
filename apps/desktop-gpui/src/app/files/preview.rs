@@ -620,10 +620,15 @@ impl Workspace {
         let wrap = state.and_then(|s| s.wrap).unwrap_or_else(|| self.client_settings.values.bool("wordWrap"));
         let absolute = logic::absolute_path(&key.0, &path);
         // `revealsInFileManager`: a read file (not a folder) reveals in the file manager.
-        let reveal = !folder
+        let file_manager = if !folder
             && state.is_some_and(|s| !matches!(s.load, Load::Loading))
-            && self.server_info.config["shellRevealInFileManager"] == true;
-        let open_in = self.render_file_open_in(absolute, reveal, tokens, cx);
+            && self.server_info.config["shellRevealInFileManager"] == true
+        {
+            super::open_in::FileManager::Reveal
+        } else {
+            super::open_in::FileManager::Open
+        };
+        let open_in = self.render_file_open_in(absolute, file_manager, tokens, cx);
         h_flex()
             .flex_none()
             .h(px(28.))

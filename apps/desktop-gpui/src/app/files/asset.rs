@@ -235,10 +235,10 @@ impl Workspace {
                     ),
             )
             .child(
-                chrome::action("asset-save", IconName::Download, "Save file", false, &tokens)
+                chrome::action("asset-save", IconName::Download, "Save file", &tokens)
                     .on_click(cx.listener(move |this, _, window, cx| this.save_asset_file(&save_key, window, cx))),
             );
-        let body = self.render_asset_body(key, kind, &name, width, &tokens, window, cx);
+        let body = self.render_asset_body(key, kind, width, &tokens, window, cx);
         v_flex().flex_1().min_h_0().overflow_hidden().child(header).child(body).into_any_element()
     }
 
@@ -246,7 +246,6 @@ impl Workspace {
         &mut self,
         key: &Key,
         kind: FileKind,
-        name: &str,
         width: f32,
         tokens: &Tokens,
         window: &mut Window,
@@ -256,7 +255,11 @@ impl Workspace {
             return self.render_document(key, kind, window, cx);
         }
         if read_limit(kind).is_none() {
-            let extension = name.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.is_empty()).unwrap_or("this format");
+            let extension = logic::file_name(&key.1)
+                .rsplit_once('.')
+                .map(|(_, e)| e)
+                .filter(|e| !e.is_empty())
+                .unwrap_or("this format");
             return chrome::no_preview(format!("Save it to open in an app that supports {extension} files."), tokens);
         }
         match self.files.assets.states.get(key).map(|s| &s.load) {

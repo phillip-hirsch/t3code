@@ -12,11 +12,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use gpui_webview::WebView;
-use raw_window_handle::HasWindowHandle as _;
 use serde_json::{Value, json};
 
 use super::logic::{self, FileKind};
-use crate::app::preview::ParentWindow;
 use crate::app::{Target, Workspace};
 
 type Key = (String, String);
@@ -322,10 +320,6 @@ impl Workspace {
 
     fn start_document(&mut self, key: Key, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint)) = (self.client(), self.endpoint.clone()) else { return };
-        let parent = match window.window_handle() {
-            Ok(handle) => ParentWindow(handle.as_raw()),
-            Err(_) => return,
-        };
         let resource = self.document_resource(&key, kind);
         let tokens = *crate::theme::tokens(cx);
         let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
@@ -336,7 +330,7 @@ impl Workspace {
         let links_task = cx.spawn(async move |_, cx| {
             while let Ok(url) = opened.recv().await {
                 if url.starts_with("http:") || url.starts_with("https:") {
-                    let _ = cx.update(|cx| cx.open_url(&url));
+                    cx.update(|cx| cx.open_url(&url));
                 }
             }
         });
@@ -353,7 +347,7 @@ impl Workspace {
                 ),
                 _ => None,
             };
-            let built = match (minted, font) {
+            let prepared = match (minted, font) {
                 (Ok(_), Some(Err(error))) | (Err(error), _) => Err(error),
                 (Ok((url, revision)), font) => {
                     let builder =
@@ -381,15 +375,39 @@ impl Workspace {
                         (_, Page::Url(url)) => builder.with_url(url),
                         (_, Page::Html(html)) => builder.with_html(html),
                     };
-                    builder.build_as_child_async(&parent).await.map(|view| (view, revision)).map_err(|e| e.to_string())
+                    Ok((builder, revision))
                 }
             };
-            let _ = this.update_in(cx, |this, window, cx| {
-                let Some(state) = this.files.documents.views.get_mut(&request_key) else { return };
+            let _ = this.update_in(cx, |this, window, cx| match prepared {
+                Ok((builder, revision)) => this.build_view(request_key, builder, revision, window, cx),
+                Err(error) => this.fail_view(&request_key, error, cx),
+            });
+        });
+        if let Some(state) = self.files.documents.views.get_mut(&key) {
+            state._task = Some(task);
+            state._links = Some(links_task);
+        }
+    }
+
+    /// Builds `key`'s native view with gpui-webview's safe constructor. It runs after the
+    /// current update, outside every entity, because WebView2's constructor pumps the
+    /// window's messages.
+    fn build_view(
+        &mut self,
+        key: Key,
+        builder: wry::WebViewBuilder<'static>,
+        revision: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let built = WebView::build(builder, window, cx);
+            let _ = this.update(cx, |this, cx| {
+                let Some(state) = this.files.documents.views.get_mut(&key) else { return };
                 state._task = None;
                 match built {
-                    Ok((webview, revision)) => {
-                        let webview = WebView::new(webview, window, cx);
+                    Ok(webview) => {
                         // Hidden until a frame lays it out, so it never flashes at the window's origin.
                         let _ = webview.set_visible(false);
                         state.view = Some(cx.new(|_| webview));
@@ -398,16 +416,20 @@ impl Workspace {
                     }
                     Err(error) => {
                         log::warn!("file preview: {error}");
-                        state.failed = Some(error);
+                        state.failed = Some(error.to_string());
                     }
                 }
                 cx.notify();
             });
         });
-        if let Some(state) = self.files.documents.views.get_mut(&key) {
-            state._task = Some(task);
-            state._links = Some(links_task);
-        }
+    }
+
+    fn fail_view(&mut self, key: &Key, error: String, cx: &mut Context<Self>) {
+        let Some(state) = self.files.documents.views.get_mut(key) else { return };
+        log::warn!("file preview: {error}");
+        state._task = None;
+        state.failed = Some(error);
+        cx.notify();
     }
 
     /// A Mermaid file's diagram (`MermaidViewer`), rebuilt when its source changes.
@@ -437,40 +459,19 @@ impl Workspace {
                 dark,
             };
             let page = mermaid_page(&source, &colors);
-            let Ok(handle) = window.window_handle() else { return div().into_any_element() };
-            let parent = ParentWindow(handle.as_raw());
-            let request_key = key.clone();
-            let task = cx.spawn_in(window, async move |this, cx| {
-                let built = wry::WebViewBuilder::new()
-                    .with_custom_protocol(MERMAID_SCHEME.into(), move |_, request| {
-                        let (body, content_type): (Vec<u8>, &str) = if request.uri().path() == "/pele.js" {
-                            (pele_script().to_vec(), "text/javascript")
-                        } else {
-                            (page.clone().into_bytes(), "text/html")
-                        };
-                        wry::http::Response::builder()
-                            .header("content-type", content_type)
-                            .body(std::borrow::Cow::Owned(body))
-                            .unwrap_or_default()
-                    })
-                    .with_url(MERMAID_PAGE_URL)
-                    .build_as_child_async(&parent)
-                    .await;
-                let _ = this.update_in(cx, |this, window, cx| {
-                    let Some(state) = this.files.documents.views.get_mut(&request_key) else { return };
-                    state._task = None;
-                    match built {
-                        Ok(webview) => {
-                            let webview = WebView::new(webview, window, cx);
-                            let _ = webview.set_visible(false);
-                            state.view = Some(cx.new(|_| webview));
-                            state.shown = false;
-                        }
-                        Err(error) => state.failed = Some(error.to_string()),
-                    }
-                    cx.notify();
-                });
-            });
+            let builder = wry::WebViewBuilder::new()
+                .with_custom_protocol(MERMAID_SCHEME.into(), move |_, request| {
+                    let (body, content_type): (Vec<u8>, &str) = if request.uri().path() == "/pele.js" {
+                        (pele_script().to_vec(), "text/javascript")
+                    } else {
+                        (page.clone().into_bytes(), "text/html")
+                    };
+                    wry::http::Response::builder()
+                        .header("content-type", content_type)
+                        .body(std::borrow::Cow::Owned(body))
+                        .unwrap_or_default()
+                })
+                .with_url(MERMAID_PAGE_URL);
             documents.views.insert(
                 key.clone(),
                 DocView {
@@ -481,10 +482,11 @@ impl Workspace {
                     content: revision,
                     shown: false,
                     used: 0,
-                    _task: Some(task),
+                    _task: None,
                     _links: None,
                 },
             );
+            self.build_view(key.clone(), builder, None, window, cx);
         }
         match self.files.documents.views.get(key).map(|doc| (&doc.view, &doc.failed)) {
             Some((Some(view), _)) => div().flex_1().min_h_0().size_full().child(view.clone()).into_any_element(),

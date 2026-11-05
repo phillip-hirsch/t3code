@@ -55,9 +55,42 @@ pub(super) struct FilesState {
     documents: document::Documents,
     /// Parsed documents and archives.
     assets: asset::Assets,
+    /// A menu of the file surfaces is open; native document views hide so it shows.
+    pub(super) menu_open: bool,
+    _menu: Option<gpui_kit::Subscription>,
     images: Option<Entity<super::pages::settings::code::projects::icon::Images>>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.
     mutation: (Option<String>, Option<String>),
+}
+
+/// A dropdown's `on_open_change`: its popover closes on outside clicks without the menu's
+/// `DismissEvent`, so dropdowns report their state here.
+pub(super) fn menu_open_change(view: Entity<Workspace>) -> impl Fn(&bool, &mut gpui_kit::Window, &mut gpui_kit::App) {
+    move |open, _, cx| {
+        view.update(cx, |this, cx| {
+            this.files.menu_open = *open;
+            cx.notify();
+        })
+    }
+}
+
+/// Marks a file surface (context) menu open until it is dismissed. Called from the menu's builder, which
+/// runs while the window draws, so the change lands after the frame.
+pub(super) fn track_menu(view: &Entity<Workspace>, cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>) {
+    let menu = cx.entity().downgrade();
+    let view = view.clone();
+    cx.defer(move |cx| {
+        let Some(menu) = menu.upgrade() else { return };
+        view.update(cx, |this, cx| {
+            this.files.menu_open = true;
+            this.files._menu = Some(cx.subscribe(&menu, |this, _, _: &gpui_kit::DismissEvent, cx| {
+                this.files.menu_open = false;
+                this.files._menu = None;
+                cx.notify();
+            }));
+            cx.notify();
+        });
+    });
 }
 
 impl Workspace {

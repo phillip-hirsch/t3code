@@ -432,7 +432,6 @@ impl Workspace {
                     "archive-back",
                     IconName::ChevronLeft,
                     if selected.is_some() { "Back to archive" } else { "Parent folder" },
-                    false,
                     tokens,
                 )
                 .when(!can_go_back, |el| el.opacity(0.5).cursor_default())
