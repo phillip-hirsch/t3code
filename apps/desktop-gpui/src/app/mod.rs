@@ -10,8 +10,8 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, Window, div,
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Task, Window, div,
 };
 use serde_json::{Value, json};
 
@@ -28,6 +28,7 @@ mod composer;
 mod details;
 mod header;
 mod layout;
+mod pages;
 mod sidebar;
 mod titlebar;
 mod visits;
@@ -45,7 +46,7 @@ enum Connection {
 }
 
 /// Where the composer sends.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Target {
     Thread(String),
     /// A new thread in this project, created by the first message.
@@ -111,6 +112,11 @@ pub struct Workspace {
     shell_retried: bool,
     /// The launch landing ran (once, after the first shell snapshot).
     landed: bool,
+    /// A page covering the chat in the main column.
+    page: Option<pages::Page>,
+    /// The Settings modal's open section.
+    settings: Option<SharedString>,
+    history: pages::History,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -170,6 +176,9 @@ impl Workspace {
             shell_snapshot_failed: false,
             shell_retried: false,
             landed: false,
+            page: None,
+            settings: None,
+            history: pages::History::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -503,8 +512,13 @@ impl Workspace {
 
     fn select_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
+            if self.page.take().is_some() {
+                self.record_location();
+                cx.notify();
+            }
             return;
         }
+        self.page = None;
         self.stash_composer(cx);
         self.target = Some(Target::Thread(thread_id.clone()));
         self.thread = Some(OpenThread {
@@ -522,9 +536,11 @@ impl Workspace {
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
+        self.record_location();
     }
 
     fn start_draft(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = None;
         self.stash_composer(cx);
         self.target = Some(Target::Draft { project_id });
         self.thread = None;
@@ -535,6 +551,7 @@ impl Workspace {
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
+        self.record_location();
     }
 
     fn reset_timeline(&mut self, cx: &mut Context<Self>) {
@@ -767,7 +784,15 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
-            .capture_key_down(cx.listener(Self::escape_details_popover))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Escape closes the topmost layer: Settings, then the details popover.
+                if this.settings.is_some() && event.keystroke.key == "escape" {
+                    this.close_settings(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                this.escape_details_popover(event, window, cx);
+            }))
             .child(
                 h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_cached_sidebar())).child(
                     v_flex()
@@ -777,21 +802,22 @@ impl Render for Workspace {
                         .pr(titlebar::RIGHT_RESIZE_INSET)
                         .child(self.render_header(cx))
                         .children(self.render_error(cx))
-                        .child(
-                            div()
-                                .relative()
-                                .flex_1()
-                                .min_h_0()
-                                .child(
-                                    v_flex()
-                                        .size_full()
-                                        .child(self.render_body(window, cx))
-                                        .child(self.render_composer(window, cx)),
-                                )
-                                .children(self.render_details_card(window, cx)),
-                        ),
+                        .child(div().relative().flex_1().min_h_0().map(|el| {
+                            match self.page {
+                                Some(page) => el.child(self.render_page(page, window, cx)),
+                                None => el
+                                    .child(
+                                        v_flex()
+                                            .size_full()
+                                            .child(self.render_body(window, cx))
+                                            .child(self.render_composer(window, cx)),
+                                    )
+                                    .children(self.render_details_card(window, cx)),
+                            }
+                        })),
                 ),
             )
             .child(self.render_titlebar_overlay(window, cx))
+            .children(self.render_settings(window, cx))
     }
 }

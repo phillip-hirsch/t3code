@@ -26,6 +26,9 @@ impl Workspace {
             .pr(controls_inset)
             .bg(tokens.background)
             .window_control_area(WindowControlArea::Drag);
+        if let Some(page) = self.page {
+            return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
+        }
         let (project, title, parent) = match &self.target {
             Some(Target::Thread(id)) => {
                 let shell = self.shell.threads.iter().find(|thread| &thread.id == id);

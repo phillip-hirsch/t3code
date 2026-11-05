@@ -448,16 +448,16 @@ impl Workspace {
                 this.sidebar.width = (event.event.position.x - event.bounds.left()).clamp(px(MIN_WIDTH), max);
                 cx.notify();
             }))
-            .child(self.render_chrome_row(&tokens))
+            .child(self.render_chrome_row(&tokens, cx))
             .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(list))
-            .child(self.render_sidebar_footer(&tokens))
+            .child(self.render_sidebar_footer(&tokens, cx))
             .child(deferred(rail).with_priority(1))
     }
 
-    fn render_chrome_row(&self, tokens: &Tokens) -> impl IntoElement {
+    fn render_chrome_row(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
-        let arrow = |id: &'static str, name: IconName, label: &'static str| {
+        let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool| {
             div()
                 .id(id)
                 .size(px(28.))
@@ -465,12 +465,14 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .rounded(px(8.))
-                .opacity(0.64)
+                .when(!enabled, |el| el.opacity(0.64))
+                .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(sb.row_hover)))
                 // Inside the drag region a button must occlude, or Windows takes the press as a drag.
                 .occlude()
                 .tooltip(tooltip(label))
                 .child(icon(name, 14., sb.muted_foreground))
         };
+        let (back, forward) = (self.history.can_go_back(), self.history.can_go_forward());
         h_flex()
             .id("sidebar-chrome")
             .h(px(40.))
@@ -494,11 +496,18 @@ impl Workspace {
                         text_sm(div()).font_weight(FontWeight::MEDIUM).text_color(sb.muted_foreground).child("Code"),
                     ),
             )
-            .child(h_flex().ml(px(4.)).child(arrow("sidebar-back", IconName::ArrowLeft, "Go back")).child(arrow(
-                "sidebar-forward",
-                IconName::ArrowRight,
-                "Go forward",
-            )))
+            .child(
+                h_flex()
+                    .ml(px(4.))
+                    .child(
+                        arrow("sidebar-back", IconName::ArrowLeft, "Go back", back)
+                            .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
+                    )
+                    .child(
+                        arrow("sidebar-forward", IconName::ArrowRight, "Go forward", forward)
+                            .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
+                    ),
+            )
     }
 
     fn render_search_row(
@@ -584,7 +593,7 @@ impl Workspace {
             )
     }
 
-    fn render_sidebar_footer(&self, tokens: &Tokens) -> impl IntoElement {
+    fn render_sidebar_footer(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
         let button = |id: &'static str, name: IconName, label: &'static str| {
             div()
@@ -594,6 +603,8 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .rounded(px(8.))
+                .cursor_pointer()
+                .hover(|s| s.bg(sb.row_hover))
                 .tooltip(tooltip(label))
                 .child(icon(name, 16., sb.icon))
         };
@@ -613,9 +624,38 @@ impl Workspace {
             .pt(px(4.))
             .pb(px(8.))
             .gap(px(4.))
-            .child(button("sidebar-settings", IconName::Settings, "Settings"))
-            .child(button("sidebar-pull-requests", IconName::GitPullRequestArrow, "Pull requests"))
-            .child(button("sidebar-usage", IconName::ChartNoAxesColumn, "Usage"))
+            // On a utility page the three shortcuts become one "Back" (`SidebarChrome.tsx`).
+            .map(|el| match self.page {
+                Some(_) => el.child(
+                    text_sm(h_flex())
+                        .id("sidebar-back-to-chat")
+                        .flex_1()
+                        .h(px(32.))
+                        .px(px(8.))
+                        .gap(px(8.))
+                        .rounded(px(8.))
+                        .cursor_pointer()
+                        .text_color(sb.foreground)
+                        .hover(|s| s.bg(sb.row_hover))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_page(cx)))
+                        .child(icon(IconName::ArrowLeft, 16., sb.icon))
+                        .child("Back"),
+                ),
+                None => el
+                    .child(
+                        button("sidebar-settings", IconName::Settings, "Settings")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_settings("general", cx))),
+                    )
+                    .child(
+                        button("sidebar-pull-requests", IconName::GitPullRequestArrow, "Pull requests").on_click(
+                            cx.listener(|this, _, _, cx| this.open_page(super::pages::Page::PullRequests, cx)),
+                        ),
+                    )
+                    .child(
+                        button("sidebar-usage", IconName::ChartNoAxesColumn, "Usage")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_page(super::pages::Page::Usage, cx))),
+                    ),
+            })
             .children(status.map(|(label, color)| {
                 text_xs(h_flex())
                     .ml_auto()
