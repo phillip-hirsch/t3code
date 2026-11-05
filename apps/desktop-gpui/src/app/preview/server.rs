@@ -396,10 +396,10 @@ impl Workspace {
                 let tab = tab.clone();
                 cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
             })
-            .on_mouse_up(MouseButton::Middle, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
-            })
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx)),
+            )
             .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e)))
             .on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
                 if this.server_wheel(&wheel_tab, e) {

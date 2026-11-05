@@ -268,7 +268,7 @@ impl Workspace {
                             .p_1()
                             .rounded(px(4.))
                             .invisible()
-                            .group_hover(group.clone(), |s| s.visible())
+                            .group_hover(group, |s| s.visible())
                             .text_color(tokens.muted_foreground)
                             .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
                             .tooltip(move |window, cx| {

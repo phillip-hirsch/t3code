@@ -242,7 +242,7 @@ impl Workspace {
                             .px(px(2.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(tokens.foreground)
-                            .child(name.clone()),
+                            .child(name),
                     ),
             )
             .child(

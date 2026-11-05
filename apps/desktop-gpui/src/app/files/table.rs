@@ -179,7 +179,7 @@ impl Workspace {
             .font_weight(FontWeight::MEDIUM)
             .child(div().w(px(ROW_HEADER)).h_full().flex_none().border_r_1().border_color(border).bg(tokens.background))
             .child(spacer(visible.start))
-            .children(visible.clone().map(|column| {
+            .children(visible.map(|column| {
                 let label = table.header.get(column).cloned().unwrap_or_else(|| column_label(column).into());
                 div()
                     .w(px(column_width))

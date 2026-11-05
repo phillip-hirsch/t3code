@@ -1345,7 +1345,7 @@ impl Workspace {
                         div()
                             .absolute()
                             .invisible()
-                            .group_hover(group.clone(), |style| style.visible())
+                            .group_hover(group, |style| style.visible())
                             .child(icon("icons/x.svg").with_size(px(12.))),
                     )
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -1579,8 +1579,8 @@ impl Workspace {
         };
         let view = cx.entity();
         let menu_scope = scope.clone();
-        let menu_turns = turns.clone();
-        let menu_latest = latest.clone();
+        let menu_turns = turns;
+        let menu_latest = latest;
         let scope_menu = Button::new("diff-scope")
             .custom(
                 ButtonCustomVariant::new(cx)

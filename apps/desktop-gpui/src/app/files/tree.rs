@@ -542,7 +542,7 @@ impl Workspace {
             .into_any_element()
         };
         let focus = tree.focus.clone();
-        let keys_key = key.clone();
+        let keys_key = key;
         v_flex()
             .size_full()
             .min_h_0()
