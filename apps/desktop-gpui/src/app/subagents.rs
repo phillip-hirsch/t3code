@@ -368,6 +368,20 @@ impl Workspace {
                         .child(div().min_w_0().truncate().text_color(t.muted_foreground).child(status)),
                 )
                 .child(div().flex_none().text_color(t.muted_foreground).child("Runs on its own"))
+                // Antigravity's subagents keep their children's work in the provider (`NativeChildWorkDialog`).
+                .when(driver == "antigravity", |bar| {
+                    let (client, thread_id) = (self.client(), projection.thread.id.clone());
+                    bar.child(
+                        Button::new("subagent-work")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::ListTree).size(px(16.)))
+                            .label("Subagent work")
+                            .on_click(move |_, window, cx| {
+                                open_native_work(client.clone(), thread_id.clone(), window, cx)
+                            }),
+                    )
+                })
                 .children(parent.map(|parent| {
                     Button::new("open-parent")
                         .ghost()
@@ -381,6 +395,194 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+/// `NativeChildWorkDialog`: what a provider-native subagent's own children did, read only.
+struct NativeWork {
+    client: Option<crate::rpc::RpcClient>,
+    thread_id: String,
+    /// `None` while loading.
+    result: Option<Result<Value, SharedString>>,
+    _load: Option<Task<()>>,
+}
+
+impl NativeWork {
+    fn load(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        self.result = None;
+        let input = json!({"threadId": self.thread_id});
+        self._load = Some(cx.spawn(async move |this, cx| {
+            let result = client.request("orchestration.getNativeChildWork", input).await;
+            let _ = this.update(cx, |this, cx| {
+                this.result = Some(result.map_err(|e| e.to_string().into()));
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+}
+
+/// `stepLabel`: "TOOL_CALL" reads "Tool call".
+fn step_label(kind: &str) -> String {
+    let words = kind.to_lowercase().replace('_', " ");
+    let mut chars = words.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+impl gpui_kit::Render for NativeWork {
+    fn render(&mut self, _: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+        let t = *crate::theme::tokens(cx);
+        let note = |text: String, color| div().text_sm().text_color(color).child(text);
+        let body: AnyElement = match &self.result {
+            None => note("Loading…".into(), t.muted_foreground).into_any_element(),
+            Some(Err(error)) => note(error.to_string(), t.error_foreground).into_any_element(),
+            Some(Ok(value)) => {
+                let children = value["children"].as_array().cloned().unwrap_or_default();
+                if children.is_empty() {
+                    note("The provider has no record of which subagents this call started.".into(), t.muted_foreground)
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .gap(px(16.))
+                        .children(children.iter().map(|child| {
+                            let text = |key: &str| child[key].as_str().unwrap_or_default().to_owned();
+                            let role =
+                                Some(text("role")).filter(|r| !r.is_empty()).unwrap_or_else(|| "Subagent".into());
+                            let steps = child["steps"].as_array();
+                            v_flex()
+                                .min_w_0()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(t.foreground)
+                                        .child(role),
+                                )
+                                .child(div().text_sm().text_color(t.muted_foreground).child(text("prompt")))
+                                .when(child["truncated"] == true, |el| {
+                                    el.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.muted_foreground)
+                                            .child("Earlier steps are not shown."),
+                                    )
+                                })
+                                .child(match steps {
+                                    None => div()
+                                        .text_xs()
+                                        .text_color(t.muted_foreground)
+                                        .child("No transcript yet.")
+                                        .into_any_element(),
+                                    Some(steps) => v_flex()
+                                        .gap(px(8.))
+                                        .pl(px(12.))
+                                        .border_l_1()
+                                        .border_color(t.border)
+                                        .children(steps.iter().map(|step| {
+                                            let status = step["status"].as_str().filter(|s| *s != "DONE");
+                                            let calls: Vec<String> = step["toolCalls"]
+                                                .as_array()
+                                                .map(|calls| {
+                                                    calls
+                                                        .iter()
+                                                        .map(|c| {
+                                                            format!(
+                                                                "{} {}",
+                                                                c["name"].as_str().unwrap_or_default(),
+                                                                c["input"].as_str().unwrap_or_default()
+                                                            )
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            v_flex()
+                                                .min_w_0()
+                                                .gap(px(4.))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(t.muted_foreground)
+                                                        .child(match status {
+                                                            Some(status) => format!(
+                                                                "{} · {}",
+                                                                step_label(step["type"].as_str().unwrap_or_default()),
+                                                                step_label(status)
+                                                            ),
+                                                            None => {
+                                                                step_label(step["type"].as_str().unwrap_or_default())
+                                                            }
+                                                        }),
+                                                )
+                                                .when(!calls.is_empty(), |el| {
+                                                    el.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_family(t.fonts.mono)
+                                                            .text_color(t.foreground)
+                                                            .child(calls.join("\n")),
+                                                    )
+                                                })
+                                                .children(step["text"].as_str().map(|text| {
+                                                    div()
+                                                        .max_h(px(192.))
+                                                        .overflow_hidden()
+                                                        .text_xs()
+                                                        .font_family(t.fonts.mono)
+                                                        .text_color(t.foreground)
+                                                        .child(text.to_owned())
+                                                }))
+                                        }))
+                                        .into_any_element(),
+                                })
+                        }))
+                        .into_any_element()
+                }
+            }
+        };
+        let loading = self.result.is_none();
+        v_flex().gap(px(16.)).child(div().id("native-work-body").max_h(px(480.)).overflow_y_scroll().child(body)).child(
+            h_flex().justify_end().child(
+                Button::new("native-work-refresh")
+                    .outline()
+                    .small()
+                    .label("Refresh")
+                    .disabled(loading)
+                    .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+            ),
+        )
+    }
+}
+
+fn open_native_work(
+    client: Option<crate::rpc::RpcClient>,
+    thread_id: String,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::AppContext as _;
+    use gpui_kit::component::WindowExt as _;
+    let view = cx.new(|cx| {
+        let mut work = NativeWork { client, thread_id, result: None, _load: None };
+        work.load(cx);
+        work
+    });
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let t = crate::theme::tokens(cx);
+        dialog
+            .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+            .title("Subagent work")
+            .w(px(672.))
+            .child(
+                div()
+                    .mb(px(12.))
+                    .text_sm()
+                    .text_color(t.muted_foreground)
+                    .child("Read only. These subagents cannot take messages."),
+            )
+            .child(view.clone())
+    });
 }
 
 /// `deriveProviderSubagentStatus`: the last runless root turn's status and times.
