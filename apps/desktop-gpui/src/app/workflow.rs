@@ -109,9 +109,12 @@ impl Workspace {
         }
         self.workflow.parent = Some((parent.clone(), Instant::now()));
         self.workflow._fetch = Some(cx.spawn(async move |this, cx| {
-            let Ok(value) = client.request("orchestration.getThreadProjection", json!({"threadId": parent})).await
-            else {
-                return;
+            let value = match client.request("orchestration.getThreadProjection", json!({"threadId": parent})).await {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!("workflow parent {parent}: {error}");
+                    return;
+                }
             };
             let subagents = value["subagents"].as_array().cloned().unwrap_or_default();
             let _ = this.update(cx, |this, cx| {

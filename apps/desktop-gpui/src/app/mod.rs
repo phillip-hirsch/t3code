@@ -796,6 +796,7 @@ impl Workspace {
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);
         self.sync_details(cx);
+        self.prune_requests();
         self.scroller.update(cx, |scroller, cx| {
             if was_empty {
                 scroller.reset(total, cx);

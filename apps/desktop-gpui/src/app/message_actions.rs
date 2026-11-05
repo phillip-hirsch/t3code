@@ -114,8 +114,8 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(_) => this.select_thread(target, window, cx),
-                Err(_) => {
-                    this.error = Some("Failed to fork this response.".into());
+                Err(error) => {
+                    this.error = Some(format!("Failed to fork this response: {error}").into());
                     cx.notify();
                 }
             });
@@ -294,7 +294,10 @@ async fn download_attachments(
         };
         let resource = json!({"_tag": "attachment", "attachmentId": id, "fileName": name, "mimeType": mime});
         let failed = || format!("Could not restore attachment: {name}");
-        let signed = client.request("assets.createUrl", json!({"resource": resource})).await.map_err(|_| failed())?;
+        let signed = client.request("assets.createUrl", json!({"resource": resource})).await.map_err(|error| {
+            log::warn!("assets.createUrl for attachment {name}: {error}");
+            failed()
+        })?;
         let url = format!("{http_base}{}", signed["relativeUrl"].as_str().ok_or_else(failed)?);
         let bytes = crate::runtime()
             .spawn(async move {
@@ -302,7 +305,17 @@ async fn download_attachments(
                 response.error_for_status()?.bytes().await
             })
             .await;
-        let Ok(Ok(bytes)) = bytes else { return Err(failed()) };
+        let bytes = match bytes {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                log::warn!("downloading attachment {name}: {error}");
+                return Err(failed());
+            }
+            Err(error) => {
+                log::warn!("downloading attachment {name}: {error}");
+                return Err(failed());
+            }
+        };
         restored.push(Attachment::restored(kind, name.to_owned(), mime.to_owned(), bytes.to_vec()));
     }
     Ok(restored)

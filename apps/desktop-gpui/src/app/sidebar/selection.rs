@@ -214,6 +214,9 @@ impl Workspace {
 
     /// `settleThreads`: settles each, moving on past all of them from the open one.
     fn settle_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        if self.client().is_none() {
+            return;
+        }
         for id in ids {
             let entry = self.undo_entry(id);
             self.thread_command("thread.settle", id, json!({}), cx);
@@ -232,6 +235,9 @@ impl Workspace {
         if wake_ms <= now_ms() {
             self.error = Some("That snooze time has passed. Choose another time.".into());
             cx.notify();
+            return;
+        }
+        if self.client().is_none() {
             return;
         }
         self.clear_selection(cx);

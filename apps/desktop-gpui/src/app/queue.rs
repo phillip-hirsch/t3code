@@ -243,7 +243,8 @@ impl Workspace {
                 let current = this.queue.edit.as_mut().filter(|edit| edit.run_id == run_id);
                 match (result, current) {
                     (Ok(_), Some(_)) => this.cancel_queue_edit(window, cx),
-                    (Err(_), current) => {
+                    (Err(error), current) => {
+                        log::warn!("saving the edited queued message: {error}");
                         if let Some(edit) = current {
                             edit.saving = false;
                         }

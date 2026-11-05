@@ -136,17 +136,18 @@ impl Workspace {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
-    /// Dispatches `{type, commandId, threadId, ..fields}`.
+    /// Dispatches `{type, commandId, threadId, ..fields}`; `false` when there is no
+    /// connection to send it on, so callers skip their optimistic undo and navigation.
     pub(in crate::app) fn thread_command(
         &mut self,
         kind: &str,
         thread_id: &str,
         fields: Value,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let title = failure_title(kind, &fields);
         let command = Self::thread_command_value(kind, thread_id, fields);
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.client() else { return false };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
                 let _ = this.update(cx, |this, cx| {
@@ -156,6 +157,7 @@ impl Workspace {
             }
         })
         .detach();
+        true
     }
 
     /// `{type, commandId, threadId, ..fields}`.
@@ -356,7 +358,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.settle", thread_id, json!({}), cx);
+        if !self.thread_command("thread.settle", thread_id, json!({}), cx) {
+            return;
+        }
         self.push_undo(UndoAction::Settled, entry, cx);
         if advance {
             self.leave_thread(thread_id, window, cx);
@@ -382,7 +386,9 @@ impl Workspace {
             return;
         }
         let entry = self.undo_entry(thread_id);
-        self.thread_command("thread.snooze", thread_id, json!({"snoozedUntil": inbox::iso(wake_ms)}), cx);
+        if !self.thread_command("thread.snooze", thread_id, json!({"snoozedUntil": inbox::iso(wake_ms)}), cx) {
+            return;
+        }
         self.push_undo(UndoAction::Snoozed, entry, cx);
         if advance {
             self.leave_thread(thread_id, window, cx);
@@ -421,8 +427,9 @@ impl Workspace {
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             let entry = this.undo_entry(&thread_id);
-            this.thread_command("thread.unpin", &thread_id, json!({}), cx);
-            this.push_undo(UndoAction::Unpinned, entry, cx);
+            if this.thread_command("thread.unpin", &thread_id, json!({}), cx) {
+                this.push_undo(UndoAction::Unpinned, entry, cx);
+            }
         });
     }
 
@@ -443,8 +450,9 @@ impl Workspace {
         self.confirm_then(question, window, cx, move |this, _, cx| {
             for id in &ids {
                 let entry = this.undo_entry(id);
-                this.thread_command("thread.unpin", id, json!({}), cx);
-                this.push_undo(UndoAction::Unpinned, entry, cx);
+                if this.thread_command("thread.unpin", id, json!({}), cx) {
+                    this.push_undo(UndoAction::Unpinned, entry, cx);
+                }
             }
         });
     }
@@ -464,7 +472,9 @@ impl Workspace {
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
-            this.thread_command("thread.archive", &thread_id, json!({}), cx);
+            if !this.thread_command("thread.archive", &thread_id, json!({}), cx) {
+                return;
+            }
             this.push_undo(UndoAction::Archived, entry, cx);
             if this.target.as_ref() == Some(&Target::Thread(thread_id.clone())) {
                 this.start_draft(project_id, window, cx);
@@ -484,8 +494,10 @@ impl Workspace {
             level: PromptLevel::Critical,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
-            this.expire_undo(&thread_id);
-            this.thread_command("thread.delete", &thread_id, json!({}), cx);
+            if this.client().is_some() {
+                this.expire_undo(&thread_id);
+                this.thread_command("thread.delete", &thread_id, json!({}), cx);
+            }
         });
     }
 
