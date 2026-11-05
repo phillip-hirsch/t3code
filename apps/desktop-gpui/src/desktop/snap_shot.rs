@@ -849,11 +849,12 @@ function run() {
             mac_window::parse(&String::from_utf8_lossy(&lookup)).ok_or(snap_shot::WINDOW_UNAVAILABLE)?;
         let image = screencapture(window.id)?;
         let bounds = window.bounds;
-        grabbed(Grab {
-            origin: (bounds.x.round() as i32, bounds.y.round() as i32),
-            size: (bounds.width.round() as u32, bounds.height.round() as u32),
-            image: &image,
-        });
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "rounded window bounds in points")]
+        let (origin, size) = (
+            (bounds.x.round() as i32, bounds.y.round() as i32),
+            (bounds.width.round() as u32, bounds.height.round() as u32),
+        );
+        grabbed(Grab { origin, size, image: &image });
         let (bytes, mime) = media::fit_and_encode(image)?;
         Ok(Capture {
             bytes,
