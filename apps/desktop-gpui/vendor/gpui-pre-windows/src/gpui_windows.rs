@@ -38,6 +38,6 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
-pub use platform::WindowsPlatform;
+pub use platform::{WindowsPlatform, disable_direct_composition};
 
 pub(crate) use windows::Win32::Foundation::HWND;

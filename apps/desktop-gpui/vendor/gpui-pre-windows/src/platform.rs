@@ -50,6 +50,15 @@ impl TrackedWindow {
     }
 }
 
+/// Set by [`disable_direct_composition`], as an alternative to [`DISABLE_DIRECT_COMPOSITION`].
+static DIRECT_COMPOSITION_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Makes a platform created after this call render without DirectComposition, as
+/// `GPUI_DISABLE_DIRECT_COMPOSITION=true` does, without changing the process environment.
+pub fn disable_direct_composition() {
+    DIRECT_COMPOSITION_DISABLED.store(true, Ordering::Relaxed);
+}
+
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[TrackedWindow; 4]>>>,
@@ -258,8 +267,9 @@ impl WindowsPlatform {
             .context("CreateWindowExW did not run correctly")?;
         let handle = result?;
 
-        let disable_direct_composition = std::env::var(DISABLE_DIRECT_COMPOSITION)
-            .is_ok_and(|value| value == "true" || value == "1");
+        let disable_direct_composition = DIRECT_COMPOSITION_DISABLED.load(Ordering::Relaxed)
+            || std::env::var(DISABLE_DIRECT_COMPOSITION)
+                .is_ok_and(|value| value == "true" || value == "1");
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher);
 

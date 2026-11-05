@@ -8230,6 +8230,7 @@ dependencies = [
  "getrandom 0.3.4",
  "global-hotkey",
  "gpui-kit",
+ "gpui-pre-windows",
  "gpui-webview",
  "hmac",
  "iana-time-zone",
