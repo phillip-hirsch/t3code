@@ -112,6 +112,46 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub auth: ProviderAuth,
+    #[serde(default)]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub native_sessions: Option<NativeSessions>,
+    #[serde(default)]
+    pub configurable_providers: bool,
+}
+
+/// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub can_logout: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSetup {
+    #[serde(default)]
+    pub can_authenticate: bool,
+    #[serde(default)]
+    pub documentation_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessions {
+    #[serde(default)]
+    pub can_list: bool,
+    #[serde(default)]
+    pub can_load: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub can_delete: bool,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -173,6 +213,10 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// `settings.providerInstances`, keyed by instance id.
+    pub provider_instances: Value,
+    /// `config.managedPolicy` (`ManagedPolicySummary`), `Null` when unmanaged.
+    pub managed_policy: Value,
 }
 
 impl ServerInfo {
@@ -188,6 +232,7 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.managed_policy = config.get("managedPolicy").cloned().unwrap_or_default();
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -205,6 +250,7 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.provider_instances = settings.get("providerInstances").cloned().unwrap_or_default();
         Ok(())
     }
 
