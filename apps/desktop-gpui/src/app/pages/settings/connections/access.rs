@@ -21,6 +21,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
     Session,
@@ -254,7 +255,8 @@ impl Workspace {
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
-        ui::page("settings-access-page", sections)
+        let view = self.settings_view();
+        self.settings_page("access", &view, sections, cx)
     }
 
     /// The `connections-environment` section: name, icon menu, policy, version, network access, permissions.
@@ -273,15 +275,20 @@ impl Workspace {
             let url = self.http_base();
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
             let description = if version.is_none() { "Loading\u{2026}".to_owned() } else { parts.join(" · ") };
-            let status = has_config
-                .then(|| text_xs(div().text_color(t.muted_foreground)).child("Up to date").into_any_element());
-            rows.push(ui::row("Version", Some(description.into_any_element()), None, status, t).into_any_element());
+            let row = RowFrame::new("Version").description(description).status(has_config.then_some("Up to date"));
+            rows.push(row.render(t).into_any_element());
             rows.push(network_access_row(s, t));
         }
         rows.push(permissions_details(state, s, self.client().is_some(), t));
         let more = self.icon_menu(s, window).into_any_element();
         let icon = ui::glyph(logic::machine_icon(self.server_info.machine_kind()), 16., t.foreground);
-        ui::section(label, Some(icon), Some(more), rows, t)
+        section_with_action(
+            "connections-environment",
+            h_flex().gap(px(8.)).child(icon).child(label),
+            Some(more),
+            rows,
+            t,
+        )
     }
 
     /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`).
@@ -425,22 +432,19 @@ impl Workspace {
                 s.newest_link.as_ref().and_then(|id| links.iter().find(|l| &l.id == id)).map(|link| link_row(link))
             })
             .flatten();
-        let hairline = t.border.opacity(0.5);
-        ui::group(t)
-            .child(header)
-            .when_some(collapsed, |el, row| el.child(div().border_t_1().border_color(hairline).child(row)))
-            .when(open, |el| {
-                el.child(
-                    div()
-                        .id("authorized-clients-scroll")
-                        .border_t_1()
-                        .border_color(hairline)
-                        .max_h(px(360.))
-                        .overflow_y_scroll()
-                        .children(ui::divided(body, t)),
-                )
-            })
-            .into_any_element()
+        let mut rows = vec![header.into_any_element()];
+        rows.extend(collapsed.map(IntoElement::into_any_element));
+        if open {
+            rows.push(
+                div()
+                    .id("authorized-clients-scroll")
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .child(hairlines(body, t))
+                    .into_any_element(),
+            );
+        }
+        card(rows, t)
     }
 
     /// `AuthorizedClientsHeaderAction`: "Revoke others" and "Create link".
@@ -547,7 +551,11 @@ fn network_access_row(s: &AccessState, t: &Tokens) -> AnyElement {
             .child(Switch::new("network-access").checked(policy == Some("remote-reachable")).disabled(true))
             .into_any_element()
     });
-    ui::row("Network access", Some(description.into_any_element()), None, control, t).into_any_element()
+    RowFrame::new("Network access")
+        .description(description)
+        .control(div().children(control))
+        .render(t)
+        .into_any_element()
 }
 
 /// The "Permissions" disclosure (`SessionPermissions`).

@@ -228,6 +228,24 @@ pub(in crate::app) fn section_with_action(
     rows: impl IntoIterator<Item = AnyElement>,
     t: &Tokens,
 ) -> AnyElement {
+    section_frame(id, title, action, card(rows, t))
+}
+
+/// A section of loose blocks (cards, notes) instead of one card (`SettingsSection` ungrouped).
+pub(in crate::app) fn loose_section(
+    id: impl Into<ElementId>,
+    title: impl IntoElement,
+    blocks: impl IntoIterator<Item = AnyElement>,
+) -> AnyElement {
+    section_frame(id, title, None, v_flex().gap(px(4.)).children(blocks).into_any_element())
+}
+
+fn section_frame(
+    id: impl Into<ElementId>,
+    title: impl IntoElement,
+    action: Option<AnyElement>,
+    body: AnyElement,
+) -> AnyElement {
     v_flex()
         .id(id)
         .gap(px(10.))
@@ -248,7 +266,51 @@ pub(in crate::app) fn section_with_action(
                 )
                 .children(action),
         )
-        .child(card(rows, t))
+        .child(body)
+        .into_any_element()
+}
+
+/// A piece of a description: plain text, a link to another settings section, or a URL.
+#[derive(Clone, Copy)]
+pub(in crate::app) enum Part {
+    Text(&'static str),
+    Section(&'static str, &'static str),
+    Url(&'static str, &'static str),
+}
+
+/// Description text with its links underlined and clickable; section links open that section.
+pub(in crate::app) fn rich_text(
+    id: impl Into<ElementId>,
+    parts: &'static [Part],
+    workspace: gpui_kit::WeakEntity<Workspace>,
+) -> AnyElement {
+    let mut text = String::new();
+    let mut links = Vec::new();
+    for part in parts {
+        let label = match *part {
+            Part::Text(label) | Part::Section(label, _) | Part::Url(label, _) => label,
+        };
+        let start = text.len();
+        text.push_str(label);
+        if !matches!(part, Part::Text(_)) {
+            links.push((start..text.len(), *part));
+        }
+    }
+    let underline = gpui_kit::HighlightStyle {
+        underline: Some(gpui_kit::UnderlineStyle { thickness: px(1.), color: None, wavy: false }),
+        ..Default::default()
+    };
+    let styled =
+        gpui_kit::StyledText::new(text).with_highlights(links.iter().map(|(range, _)| (range.clone(), underline)));
+    let ranges = links.iter().map(|(range, _)| range.clone()).collect();
+    gpui_kit::InteractiveText::new(id, styled)
+        .on_click(ranges, move |index, _, cx| match links[index].1 {
+            Part::Section(_, section) => {
+                let _ = workspace.update(cx, |this, cx| this.open_settings(section, cx));
+            }
+            Part::Url(_, url) => cx.open_url(url),
+            Part::Text(_) => {}
+        })
         .into_any_element()
 }
 
@@ -296,11 +358,6 @@ impl RowFrame {
 
     pub(in crate::app) fn control(mut self, control: impl IntoElement) -> Self {
         self.control = Some(control.into_any_element());
-        self
-    }
-
-    pub(in crate::app) fn body(mut self, body: impl IntoElement) -> Self {
-        self.body = Some(body.into_any_element());
         self
     }
 
@@ -376,15 +433,21 @@ pub(in crate::app) fn note(text: impl Into<SharedString>, t: &Tokens) -> AnyElem
 
 /// `SettingsGroup` grouped: a bordered card whose rows are divided by hairlines.
 pub(in crate::app) fn card(rows: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> AnyElement {
-    v_flex()
+    hairlines(rows, t)
         .rounded(px(12.))
         .border_1()
         .border_color(t.border.opacity(0.6))
         .bg(t.card.opacity(0.4))
-        .children(rows.into_iter().enumerate().map(|(index, row)| {
-            div().when(index > 0, |el| el.border_t_1().border_color(t.border.opacity(0.5))).child(row)
-        }))
         .into_any_element()
+}
+
+/// Rows divided like a card's, without the card around them.
+pub(in crate::app) fn hairlines(rows: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> gpui_kit::Div {
+    v_flex().children(
+        rows.into_iter().enumerate().map(|(index, row)| {
+            div().when(index > 0, |el| el.border_t_1().border_color(t.border.opacity(0.5))).child(row)
+        }),
+    )
 }
 
 /// The 16px heading of a section without a card, such as "Color scheme".
@@ -1296,7 +1359,11 @@ fn scope_trigger(id: &'static str, label: String, t: &Tokens) -> Button {
 }
 
 /// `SettingResetButton`: a 20px ghost button with the undo arrow.
-fn reset_button(id: &SharedString, tooltip: &'static str, cx: &Context<Workspace>) -> Button {
+pub(in crate::app) fn reset_button(
+    id: &SharedString,
+    tooltip: impl Into<SharedString>,
+    cx: &Context<Workspace>,
+) -> Button {
     let t = theme::tokens(cx);
     Button::new(SharedString::from(format!("{id}-reset")))
         .ghost()
@@ -1304,5 +1371,5 @@ fn reset_button(id: &SharedString, tooltip: &'static str, cx: &Context<Workspace
         .p_0()
         .rounded(px(4.))
         .child(Icon::new(IconName::Undo2).size(px(12.)).text_color(t.muted_foreground))
-        .tooltip(tooltip)
+        .tooltip(tooltip.into())
 }

@@ -13,7 +13,6 @@ mod favicon_picker;
 mod groups;
 mod icon;
 mod icon_picker;
-mod rows;
 mod script_editor;
 pub(in crate::app) mod scripts;
 

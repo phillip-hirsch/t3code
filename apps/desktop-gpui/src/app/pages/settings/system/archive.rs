@@ -13,7 +13,7 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::layout::{row, section};
+use super::super::widgets::{RowFrame, settings_section};
 use super::{notify_error, now_ms, relative_label, text};
 use crate::app::{Workspace, new_id, sidebar};
 use crate::model::ProjectShell;
@@ -104,26 +104,28 @@ impl Workspace {
                 ),
             };
             let title = h_flex().gap_2().child(icon).child(title);
-            return section(
-                "Archived threads",
-                None,
-                vec![row(title, Some(text(description)), None, None, &t).into_any_element()],
-                true,
-                &t,
+            let row = RowFrame::new(title).description(text(description)).render(&t).into_any_element();
+            let view = self.settings_view();
+            return self.settings_page(
+                "archived",
+                &view,
+                [settings_section("archived", "Archived threads", [row], &t)],
+                cx,
             );
         }
         let now = now_ms();
-        let sections = groups.into_iter().map(|(project, threads)| {
-            let rows = threads.iter().map(|thread| self.archived_row(thread, &state, now, &t, cx)).collect();
-            section(
-                project.title.clone(),
-                Some(sidebar::project_icon(&project, &t, false, 16., self.favicon(&project))),
-                rows,
-                true,
-                &t,
-            )
-        });
-        gpui_kit::component::v_flex().gap_8().children(sections).into_any_element()
+        let sections: Vec<AnyElement> = groups
+            .into_iter()
+            .map(|(project, threads)| {
+                let rows: Vec<AnyElement> =
+                    threads.iter().map(|thread| self.archived_row(thread, &state, now, &t, cx)).collect();
+                let icon = sidebar::project_icon(&project, &t, false, 16., self.favicon(&project));
+                let title = h_flex().gap_2().child(icon).child(project.title.clone());
+                settings_section(SharedString::from(format!("archived-{}", project.id)), title, rows, &t)
+            })
+            .collect();
+        let view = self.settings_view();
+        self.settings_page("archived", &view, sections, cx)
     }
 
     fn archived_row(
@@ -153,7 +155,7 @@ impl Workspace {
         let state = state.clone();
         div()
             .id(SharedString::from(format!("archived-{id}")))
-            .child(row(title.clone(), Some(text(description)), None, Some(unarchive_button.into_any_element()), t))
+            .child(RowFrame::new(title.clone()).description(text(description)).control(unarchive_button).render(t))
             .context_menu(move |menu, _, _| {
                 let unarchive_item = {
                     let (view, state, id) = (view.clone(), state.clone(), id.clone());

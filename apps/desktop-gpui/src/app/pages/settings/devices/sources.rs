@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use self::hosts::{EasHost, SimlockHost, SourceStatus, SshHost, Tone};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::section_with_action;
 use crate::device::{DeviceState, PlatformAvailability};
 use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{Tokens, tokens};
@@ -114,43 +115,14 @@ impl Workspace {
                 }
             });
 
-        v_flex()
-            .gap(px(10.))
-            .child(
-                h_flex()
-                    .min_h(px(28.))
-                    .px(px(16.))
-                    .justify_between()
-                    .gap(px(16.))
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.foreground)
-                            .child("Device sources"),
-                    )
-                    .child(add),
-            )
-            .child(
-                // Stand-in for the shared settings group card.
-                v_flex()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(t.border.opacity(0.6))
-                    .bg(t.card.opacity(0.4))
-                    .children(
-                        rows.into_iter()
-                            .enumerate()
-                            .map(|(ix, row)| self.render_source_row(row, ix == 0, &sources, disabled, &t, cx)),
-                    ),
-            )
-            .into_any_element()
+        let rows: Vec<AnyElement> =
+            rows.into_iter().map(|row| self.render_source_row(row, &sources, disabled, &t, cx)).collect();
+        section_with_action("device-sources", "Device sources", Some(add.into_any_element()), rows, &t)
     }
 
     fn render_source_row(
         &self,
         row: SourceRow,
-        first: bool,
         sources: &Entity<DeviceSources>,
         disabled: bool,
         t: &Tokens,
@@ -236,7 +208,6 @@ impl Workspace {
             .gap(px(12.))
             .px(px(16.))
             .py(px(12.))
-            .when(!first, |this| this.border_t_1().border_color(t.border.opacity(0.5)))
             .child(text)
             .child(side)
             .when_some(self.row_actions(&row, sources, disabled, t, cx), |this, actions| this.child(actions))

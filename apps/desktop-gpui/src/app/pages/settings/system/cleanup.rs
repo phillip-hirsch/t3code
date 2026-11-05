@@ -1,17 +1,20 @@
 //! `StorageCleanupSections` (`StorageSettings.tsx`) and `DatabaseStorageNotice` for the one
 //! environment this client talks to.
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::NumberInput;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, Task,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
-use super::layout::{fold_header, group, note, row, section};
+use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
 use super::{NumberField, format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
 use crate::rpc::{RpcClient, StreamEvent};
@@ -53,7 +56,7 @@ impl StorageState {
             let workspace = workspace.clone();
             NumberField::new(1., 1., RETENTION_MAX_DAYS, window, cx, move |_, days, window, cx| {
                 let _ = workspace.update(cx, |this, cx| {
-                    this.update_server_settings(json!({ "storageCleanup": { key: days as u64 } }), window, cx)
+                    this.update_settings(json!({ "storageCleanup": { key: days as u64 } }), window, cx)
                 });
             })
         };
@@ -222,7 +225,7 @@ impl Workspace {
                 "Update the selected environments to use storage cleanup, or choose a machine that supports it.",
                 &t,
             );
-            sections.push(section("Artifacts and logs", None, vec![notice], false, &t));
+            sections.push(loose_section("artifacts-and-logs", "Artifacts and logs", [notice]));
             return sections;
         }
         let storage = &self.settings_json()["storageCleanup"];
@@ -248,9 +251,9 @@ impl Workspace {
                 field.input.clone()
             });
             let control = self.retention_control(key, title, days, &field, &t, cx);
-            row(title, Some(text(description)), None, Some(control), &t).into_any_element()
+            RowFrame::new(title).description(text(description)).control(control).render(&t).into_any_element()
         });
-        sections.push(section("Artifacts and logs", None, rows.into(), true, &t));
+        sections.push(settings_section("artifacts-and-logs", "Artifacts and logs", rows, &t));
         if cleanup_run {
             sections.push(self.render_cleanup(&state, &t, cx));
         }
@@ -288,7 +291,7 @@ impl Workspace {
                     .on_click(move |enabled, window, cx| {
                         let days = if *enabled { json!(RETENTION_ON_DAYS) } else { Value::Null };
                         view.update(cx, |this, cx| {
-                            this.update_server_settings(json!({ "storageCleanup": { key: days } }), window, cx)
+                            this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx)
                         })
                     }),
             )
@@ -329,11 +332,12 @@ impl Workspace {
                 let Some(client) = client.clone() else { return };
                 run_storage_cleanup(client, run_state.clone(), run_label.clone(), window, cx);
             });
-        let mut blocks = vec![group(
-            vec![
-                row("Delete now", Some(text(description)), None, Some(delete_now.into_any_element()), t)
-                    .into_any_element(),
-            ],
+        let mut blocks = vec![card(
+            [RowFrame::new("Delete now")
+                .description(text(description))
+                .control(delete_now)
+                .render(t)
+                .into_any_element()],
             t,
         )];
         if let Some(report) = report {
@@ -354,9 +358,9 @@ impl Workspace {
             if last_run_open {
                 rows.extend(cleanup_results(&report, &label, t));
             }
-            blocks.push(group(rows, t));
+            blocks.push(card(rows, t));
         }
-        section("Cleanup", None, blocks, false, t)
+        loose_section("cleanup", "Cleanup", blocks)
     }
 
     /// `DatabaseStorageNotice`: suggests `t3 doctor` while the database holds a GiB or more of freed pages.
@@ -392,27 +396,20 @@ impl Workspace {
                     cx.notify();
                 });
             }));
-        let rows = vec![
-            row(
-                "Reclaim freed database space",
-                Some(text(
+        let rows = [
+            RowFrame::new("Reclaim freed database space")
+                .description(text(
                     "Old history is cleaned up automatically, but these databases still hold the freed space. Run the command on each machine to return it to disk; it pauses and restarts the background service. Quit the desktop app first if it hosts the environment.",
-                )),
-                None,
-                None,
-                t,
-            )
-            .into_any_element(),
-            row(
-                format!("{:.1} GiB on {label}", reclaimable / COMPACTION_RECOMMENDED_BYTES),
-                Some(div().font_family(FONT_MONO).child(command).into_any_element()),
-                None,
-                Some(controls.into_any_element()),
-                t,
-            )
-            .into_any_element(),
+                ))
+                .render(t)
+                .into_any_element(),
+            RowFrame::new(format!("{:.1} GiB on {label}", reclaimable / COMPACTION_RECOMMENDED_BYTES))
+                .description(div().font_family(FONT_MONO).child(command))
+                .control(controls)
+                .render(t)
+                .into_any_element(),
         ];
-        Some(section("Database", None, rows, true, t))
+        Some(settings_section("database", "Database", rows, t))
     }
 }
 
@@ -493,7 +490,11 @@ fn cleanup_results(report: &Value, machine: &str, t: &Tokens) -> Vec<AnyElement>
                 .child(details);
             let size = entry_size(entry)
                 .map(|size| div().text_xs().text_color(t.muted_foreground).child(size).into_any_element());
-            row(entry_name(entry), Some(description.into_any_element()), None, size, t).into_any_element()
+            RowFrame::new(entry_name(entry))
+                .description(description)
+                .control(div().children(size))
+                .render(t)
+                .into_any_element()
         })
         .collect();
     let omitted = report["omittedCount"].as_u64().unwrap_or(0);
@@ -547,4 +548,33 @@ mod tests {
         let artifacts = json!({"kind": "browser-artifacts", "outcome": "removed", "bytes": null, "files": 1200});
         assert_eq!(entry_size(&artifacts).as_deref(), Some("1,200 files"));
     }
+}
+
+/// The header of a fold inside a card (`FoldedSettingsSection`, header inside).
+fn fold_header(
+    id: impl Into<ElementId>,
+    title: &'static str,
+    summary: SharedString,
+    open: bool,
+    t: &Tokens,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    h_flex()
+        .id(id)
+        .min_h(px(44.))
+        .px_4()
+        .py_2()
+        .gap_2()
+        .cursor_pointer()
+        .on_click(move |_, window, cx| on_toggle(window, cx))
+        .child(
+            Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                .size(px(16.))
+                .text_color(t.muted_foreground),
+        )
+        .child(div().flex_none().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+        .when(!summary.is_empty(), |el| {
+            el.child(div().min_w_0().truncate().text_xs().text_color(t.muted_foreground).child(summary))
+        })
+        .into_any_element()
 }

@@ -3,18 +3,11 @@
 //! `BackgroundActivitySettings`, `StorageCleanupSections`, `DatabaseStorageNotice`, `AboutVersionTitle`,
 //! `MobileAppSettingsRow` and `ArchivedThreadsPanel`.
 //!
-//! Plain setting rows are declared in `MAINTENANCE_ROWS` and `LABS_ROWS` and drawn by the placeholder
-//! [`Workspace::render_setting_row`] with global patches, until the shared scoped widgets replace it.
-//! Scoped in the web (`serverScoped`, per environment): enableProviderUpdateChecks,
-//! continueThreadsAfterServerUpdate (also per project), backgroundActivity, storageCleanup.*,
-//! guestSharingEnabled, linkedEnvironmentsEnabled, simlockDeviceHostsEnabled. Client settings, kept by
-//! the app and not the server: boringSidebarEnabled, boringSidebarMultilineRows, planModeEnabled,
-//! contextWindowMeterEnabled; their rows wait for the client-settings store.
+//! Every setting here writes through the settings scope (`widgets.rs`).
 
 mod archive;
 mod background;
 mod cleanup;
-mod layout;
 
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,7 +21,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
@@ -37,149 +30,30 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use self::background::Profile;
-use self::layout::{Part, row, section};
+use super::widgets::{Part, RowFrame, SettingRow, rich_text, settings_section};
 use crate::app::Workspace;
 use crate::theme::{self, FONT_MONO, Tokens};
 
-/// A plain setting row, as `searchableSetting(id)` plus the row's props in the web.
-struct SettingRowSpec {
-    id: &'static str,
-    label: &'static str,
-    description: &'static [Part],
-    /// The key in the settings JSON.
-    path: &'static str,
-    control: Control,
-    /// `"client"` for client settings; otherwise the scopes the web can set it at.
-    scopes: &'static [&'static str],
-    /// The default a reset button restores, for rows that show one (`SettingResetButton`).
-    reset_to: Option<bool>,
-}
-
-enum Control {
-    Switch,
-}
-
-const SERVER: &[&str] = &["global", "environment"];
-const CLIENT: &[&str] = &["client"];
-
-const MAINTENANCE_ROWS: &[SettingRowSpec] = &[
-    SettingRowSpec {
-        id: "provider-update-checks",
-        label: "Provider update checks",
-        description: &[Part::Text(
-            "Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.",
-        )],
-        path: "enableProviderUpdateChecks",
-        control: Control::Switch,
-        scopes: SERVER,
-        reset_to: Some(true),
-    },
-    SettingRowSpec {
-        id: "continue-threads-after-server-update",
-        label: "Continue threads after restarts",
-        description: &[Part::Text(
-            "Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.",
-        )],
-        path: "continueThreadsAfterServerUpdate",
-        control: Control::Switch,
-        scopes: &["global", "environment", "project"],
-        reset_to: Some(true),
-    },
+const GUEST_LINKS: &[Part] = &[
+    Part::Text(
+        "Share a thread with a guest who watches it live in their browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
+    ),
+    Part::Section("Sharing & access", "access"),
+    Part::Text(". While it is off, every guest link stops working."),
 ];
-
-const LABS_ROWS: &[SettingRowSpec] = &[
-    // The web also shows this on while the removed legacy sidebar's opt-in
-    // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
-    SettingRowSpec {
-        id: "boring-sidebar",
-        label: "Boring sidebar (group by project)",
-        description: &[Part::Text(
-            "Group sidebar threads into project folders. Pinned threads stay on top, and Snoozed and Settled stay below the folders.",
-        )],
-        path: "boringSidebarEnabled",
-        control: Control::Switch,
-        scopes: CLIENT,
-        reset_to: None,
-    },
-    SettingRowSpec {
-        id: "boring-sidebar-multiline",
-        label: "Two-line folder rows",
-        description: &[Part::Text(
-            "In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.",
-        )],
-        path: "boringSidebarMultilineRows",
-        control: Control::Switch,
-        scopes: CLIENT,
-        reset_to: None,
-    },
-    // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has no
-    // T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).
-    SettingRowSpec {
-        id: "guest-links",
-        label: "Guest links",
-        description: &[
-            Part::Text(
-                "Share a thread with a guest who watches it live in their browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
-            ),
-            Part::Section("Sharing & access", "access"),
-            Part::Text(". While it is off, every guest link stops working."),
-        ],
-        path: "guestSharingEnabled",
-        control: Control::Switch,
-        scopes: SERVER,
-        reset_to: None,
-    },
-    SettingRowSpec {
-        id: "linked-environments-beta",
-        label: "Linked environments",
-        description: &[
-            Part::Text(
-                "Let agents here work on your other machines, and theirs here. Turn it on for each machine, then link them in ",
-            ),
-            Part::Section("Connections", "connections"),
-            Part::Text(". While it is off, nothing new starts over a link; tasks already running finish."),
-        ],
-        path: "linkedEnvironmentsEnabled",
-        control: Control::Switch,
-        scopes: SERVER,
-        reset_to: None,
-    },
-    SettingRowSpec {
-        id: "simlock-hosts",
-        label: "Simlock device hosts (alpha)",
-        description: &[
-            Part::Text("Let the Device panel lease simulators and emulators from your own "),
-            Part::Url("Simlock", "https://incubator.callstack.com/simlock/"),
-            Part::Text(" pool, added in "),
-            Part::Section("Devices", "devices"),
-            Part::Text(". An alpha that may change or break. T3 Code never installs Simlock."),
-        ],
-        path: "simlockDeviceHostsEnabled",
-        control: Control::Switch,
-        scopes: SERVER,
-        reset_to: None,
-    },
+const LINKED_ENVIRONMENTS: &[Part] = &[
+    Part::Text(
+        "Let agents here work on your other machines, and theirs here. Turn it on for each machine, then link them in ",
+    ),
+    Part::Section("Connections", "connections"),
+    Part::Text(". While it is off, nothing new starts over a link; tasks already running finish."),
 ];
-
-const LEGACY_ROWS: &[SettingRowSpec] = &[
-    SettingRowSpec {
-        id: "legacy-plan-mode",
-        label: "Plan mode (legacy)",
-        description: &[Part::Text("Restore Build/Plan, /plan, /default, and Shift+Tab. Off uses build mode.")],
-        path: "planModeEnabled",
-        control: Control::Switch,
-        scopes: CLIENT,
-        reset_to: None,
-    },
-    SettingRowSpec {
-        id: "legacy-context-window-indicator",
-        label: "Context window indicator (legacy)",
-        description: &[Part::Text("Shows context window usage as a circular indicator in the composer.")],
-        path: "contextWindowMeterEnabled",
-        control: Control::Switch,
-        scopes: CLIENT,
-        reset_to: None,
-    },
+const SIMLOCK: &[Part] = &[
+    Part::Text("Let the Device panel lease simulators and emulators from your own "),
+    Part::Url("Simlock", "https://incubator.callstack.com/simlock/"),
+    Part::Text(" pool, added in "),
+    Part::Section("Devices", "devices"),
+    Part::Text(". An alpha that may change or break. T3 Code never installs Simlock."),
 ];
 
 const PRIVACY_POLICY_URL: &str = "https://t3.codes/privacy-policy";
@@ -203,24 +77,108 @@ const MOBILE_STORES: [(&str, &str, &str, &str); 2] = [
 impl Workspace {
     pub(super) fn render_settings_maintenance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let updates = MAINTENANCE_ROWS.iter().map(|spec| self.render_setting_row(spec, &t, cx)).collect();
-        v_flex()
-            .gap_8()
-            .child(section("Updates", None, updates, true, &t))
-            .child(section("Background activity", None, vec![self.render_background_row(cx)], true, &t))
-            .children(self.render_storage_sections(window, cx))
-            .into_any_element()
+        let view = self.settings_view();
+        let connected = self.client().is_some();
+        let background = self.render_background_row(cx);
+        let storage = self.render_storage_sections(window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let updates = [
+            row(
+                self,
+                SettingRow::new("provider-update-checks")
+                    .description("Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.")
+                    .setting("enableProviderUpdateChecks")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("continue-threads-after-server-update")
+                    .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
+                    .status((!connected).then_some("All selected connected environments must support restart continuation."))
+                    .setting("continueThreadsAfterServerUpdate")
+                    .switch(),
+            ),
+        ];
+        let mut sections = vec![
+            settings_section("updates", "Updates", updates, &t),
+            settings_section("background-activity", "Background activity", [background], &t),
+        ];
+        sections.extend(storage);
+        self.settings_page("maintenance", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_labs(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_labs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let beta = LABS_ROWS.iter().map(|spec| self.render_setting_row(spec, &t, cx)).collect();
-        let legacy = LEGACY_ROWS.iter().map(|spec| self.render_setting_row(spec, &t, cx)).collect();
-        v_flex()
-            .gap_8()
-            .child(section("Beta", None, beta, true, &t))
-            .child(section("Legacy", None, legacy, true, &t))
-            .into_any_element()
+        let view = self.settings_view();
+        // The web also shows this on while the removed legacy sidebar's opt-in
+        // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
+        let boring = view.bool("boringSidebarEnabled") || view.bool("legacySidebarEnabled");
+        let boring_switch = super::widgets::switch(&"boring-sidebar".into(), boring, false, &t).on_click(cx.listener(
+            move |this, _, window, cx| {
+                let patch = json!({ "boringSidebarEnabled": !boring, "legacySidebarEnabled": false });
+                this.update_settings(patch, window, cx)
+            },
+        ));
+        let workspace = cx.weak_entity();
+        let described = |id: &'static str, parts: &'static [Part]| rich_text(id, parts, workspace.clone());
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let beta = [
+            row(
+                self,
+                SettingRow::new("boring-sidebar")
+                    .description("Group sidebar threads into project folders. Pinned threads stay on top, and Snoozed and Settled stay below the folders.")
+                    .setting("boringSidebarEnabled")
+                    .control(boring_switch),
+            ),
+            row(
+                self,
+                SettingRow::new("boring-sidebar-multiline")
+                    .description("In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.")
+                    .setting("boringSidebarMultilineRows")
+                    .switch(),
+            ),
+            // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has
+            // no T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).
+            row(
+                self,
+                SettingRow::new("guest-links")
+                    .description(described("guest-links-description", GUEST_LINKS))
+                    .setting("guestSharingEnabled")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("linked-environments-beta")
+                    .description(described("linked-environments-description", LINKED_ENVIRONMENTS))
+                    .setting("linkedEnvironmentsEnabled")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("simlock-hosts")
+                    .description(described("simlock-description", SIMLOCK))
+                    .setting("simlockDeviceHostsEnabled")
+                    .switch(),
+            ),
+        ];
+        let legacy = [
+            row(
+                self,
+                SettingRow::new("legacy-plan-mode")
+                    .description("Restore Build/Plan, /plan, /default, and Shift+Tab. Off uses build mode.")
+                    .setting("planModeEnabled")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("legacy-context-window-indicator")
+                    .description("Shows context window usage as a circular indicator in the composer.")
+                    .setting("contextWindowMeterEnabled")
+                    .switch(),
+            ),
+        ];
+        let sections = [settings_section("beta", "Beta", beta, &t), settings_section("legacy", "Legacy", legacy, &t)];
+        self.settings_page("labs", &view, sections, cx)
     }
 
     pub(super) fn render_settings_about(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -240,21 +198,26 @@ impl Workspace {
             });
             let description =
                 format!("This environment is managed by {organization}. Some settings and features follow its policy.");
-            app.push(row("Organization", Some(text(description)), None, help, &t).into_any_element());
+            app.push(
+                RowFrame::new("Organization")
+                    .description(text(description))
+                    .control(div().children(help))
+                    .render(&t)
+                    .into_any_element(),
+            );
         }
         app.push(
-            row(version_title(&t), Some(text("Current version of the application.")), None, None, &t)
+            RowFrame::new(version_title(&t))
+                .description(text("Current version of the application."))
+                .render(&t)
                 .into_any_element(),
         );
         app.push(
-            row(
-                "Mobile app",
-                Some(text("Connect to your server from your phone or tablet.")),
-                None,
-                Some(mobile_buttons(&t)),
-                &t,
-            )
-            .into_any_element(),
+            RowFrame::new("Mobile app")
+                .description(text("Connect to your server from your phone or tablet."))
+                .control(mobile_buttons(&t))
+                .render(&t)
+                .into_any_element(),
         );
         let privacy = match organization.filter(|_| policy.pointer("/limits/telemetry") == Some(&Value::Bool(false))) {
             Some(organization) => format!("How we handle your data. {organization} turned off anonymous usage data."),
@@ -265,15 +228,14 @@ impl Workspace {
             .small()
             .label("View policy")
             .on_click(|_, _, cx| cx.open_url(PRIVACY_POLICY_URL));
-        let legal = vec![
-            row("Privacy policy", Some(text(privacy)), None, Some(view_policy.into_any_element()), &t)
-                .into_any_element(),
-        ];
-        v_flex()
-            .gap_8()
-            .child(section("App", None, app, true, &t))
-            .child(section("Legal", None, legal, true, &t))
-            .into_any_element()
+        let legal = [RowFrame::new("Privacy policy")
+            .description(text(privacy))
+            .control(view_policy)
+            .render(&t)
+            .into_any_element()];
+        let view = self.settings_view();
+        let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
+        self.settings_page("about", &view, sections, cx)
     }
 
     pub(super) fn render_settings_archived(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -282,70 +244,6 @@ impl Workspace {
 
     fn settings_json(&self) -> &Value {
         &self.server_info.settings
-    }
-
-    /// `server.updateSettings` with a global patch; the reply is the whole new settings.
-    fn update_server_settings(&mut self, patch: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("server.updateSettings", json!({ "patch": patch })).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(settings) => {
-                        if let Err(error) = this.server_info.apply_settings(&settings) {
-                            log::warn!("bad settings reply: {error}");
-                        }
-                    }
-                    Err(error) => notify_error(window, cx, "Could not save settings", error.to_string()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// The placeholder renderer for a [`SettingRowSpec`].
-    fn render_setting_row(&self, spec: &'static SettingRowSpec, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let client_setting = spec.scopes == CLIENT;
-        let connected = self.client().is_some();
-        let value = self.settings_json()[spec.path].as_bool().unwrap_or(false);
-        let view = cx.entity();
-        let reset = spec.reset_to.filter(|default| connected && *default != value).map(|default| {
-            let view = view.clone();
-            Button::new(SharedString::from(format!("reset-{}", spec.id)))
-                .ghost()
-                .xsmall()
-                .icon(Icon::new(IconName::Undo2))
-                .tooltip("Reset to default")
-                .on_click(move |_, window, cx| {
-                    view.update(cx, |this, cx| this.update_server_settings(json!({ spec.path: default }), window, cx))
-                })
-        });
-        let title = h_flex().gap_1p5().child(spec.label).children(reset);
-        let control = match spec.control {
-            Control::Switch => Switch::new(SharedString::from(format!("switch-{}", spec.id)))
-                .checked(value)
-                .accessibility_label(spec.label)
-                // Client settings are not stored by this app yet.
-                .disabled(client_setting || !connected)
-                .on_click(move |checked, window, cx| {
-                    let checked = *checked;
-                    view.update(cx, |this, cx| this.update_server_settings(json!({ spec.path: checked }), window, cx))
-                })
-                .into_any_element(),
-        };
-        let status = (spec.path == "continueThreadsAfterServerUpdate" && !connected)
-            .then(|| "All selected connected environments must support restart continuation.".into());
-        let description = self.description(spec.id, spec.description, cx);
-        row(title, Some(description), status, Some(control), t).into_any_element()
-    }
-
-    /// A row description whose section links open that settings section.
-    fn description(&self, id: &'static str, parts: &'static [Part], cx: &mut Context<Self>) -> AnyElement {
-        let view = cx.weak_entity();
-        layout::rich_text(SharedString::from(format!("description-{id}")), parts, move |section, _, cx| {
-            let _ = view.update(cx, |this, cx| this.open_settings(section, cx));
-        })
     }
 
     /// `BackgroundActivitySettingsRow`; this client is one environment, so Advanced is always offered.
@@ -369,7 +267,7 @@ impl Workspace {
                 .on_click(move |_, window, cx| {
                     view.update(cx, |this, cx| {
                         let patch = json!({ "backgroundActivity": background::default_background() });
-                        this.update_server_settings(patch, window, cx)
+                        this.update_settings(patch, window, cx)
                     })
                 })
         });
@@ -382,7 +280,7 @@ impl Workspace {
                 )
                 .build(window, cx)
             });
-        let title = h_flex().gap_1p5().child("Background activity").child(info).children(reset);
+        let title = h_flex().gap_1p5().child("Background activity").child(info);
         let label = option.map_or("Advanced", Profile::label);
         let picker_view = view.clone();
         let picker = Button::new("background-activity-profile")
@@ -395,7 +293,7 @@ impl Workspace {
                 for profile in Profile::ALL {
                     menu = menu.item(PopupMenuItem::new(profile.label()).checked(option == Some(profile)).on_click(
                         window.listener_for(&picker_view, move |this, _, window, cx| {
-                            this.update_server_settings(background::profile_patch(profile), window, cx)
+                            this.update_settings(background::profile_patch(profile), window, cx)
                         }),
                     ));
                 }
@@ -411,14 +309,12 @@ impl Workspace {
                 .tooltip("Configure background activity")
                 .on_click(move |_, window, cx| view.update(cx, |this, cx| this.open_background_dialog(window, cx)))
         });
-        row(
-            title,
-            Some(text(description)),
-            None,
-            Some(h_flex().gap_2().child(picker).children(configure).into_any_element()),
-            &t,
-        )
-        .into_any_element()
+        RowFrame::new(title)
+            .description(text(description))
+            .reset(reset)
+            .control(h_flex().gap_2().child(picker).children(configure))
+            .render(&t)
+            .into_any_element()
     }
 
     /// `BackgroundActivityAdvancedDialog`.
@@ -473,7 +369,7 @@ impl Workspace {
                             PopupMenuItem::new(profile.label()).checked(resolved.profile == profile).on_click(
                                 window.listener_for(&policy_view, move |this, _, window, cx| {
                                     let patch = background::shared_policy_patch(&settings, profile);
-                                    this.update_server_settings(patch, window, cx)
+                                    this.update_settings(patch, window, cx)
                                 }),
                             ),
                         );
@@ -498,7 +394,7 @@ impl Workspace {
                             let checked = *checked;
                             view.update(cx, |this, cx| {
                                 let patch = background::override_patch(this.settings_json(), key, json!(checked));
-                                this.update_server_settings(patch, window, cx)
+                                this.update_settings(patch, window, cx)
                             })
                         },
                     ))
@@ -562,7 +458,7 @@ impl Workspace {
                             move |_, window, cx| {
                                 reset_view.update(cx, |this, cx| {
                                     let patch = json!({ "backgroundActivity": background::default_background() });
-                                    this.update_server_settings(patch, window, cx)
+                                    this.update_settings(patch, window, cx)
                                 })
                             },
                         ))
@@ -594,7 +490,7 @@ impl BackgroundFields {
                 NumberField::new(step, min, f64::MAX, window, cx, move |_, seconds, window, cx| {
                     let _ = workspace.update(cx, |this, cx| {
                         let patch = background::override_patch(this.settings_json(), key, json!(seconds as u64 * 1000));
-                        this.update_server_settings(patch, window, cx)
+                        this.update_settings(patch, window, cx)
                     });
                 })
             })
