@@ -34,8 +34,8 @@ pub fn set(window: &gpui_kit::Window, count: usize) {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = window;
         static WORKER: Worker<usize> = OnceLock::new();
+        let _ = window;
         send_latest(&WORKER, "launcher-badge", count, || {
             |count| {
                 if let Err(error) = launcher::set(count) {
