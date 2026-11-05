@@ -211,6 +211,11 @@ impl Workspace {
         self.endpoint().map(|e| e.http_base.as_str())
     }
 
+    /// One environment's address, for work bound to that environment.
+    pub(super) fn env_endpoint(&self, environment_id: &str) -> Option<&Endpoint> {
+        self.session(environment_id)?.endpoint.as_ref()
+    }
+
     /// Starts an environment's config and shell subscriptions on its socket.
     pub(super) fn start_session(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let primary = self.primary_environment() == Some(&environment_id);
