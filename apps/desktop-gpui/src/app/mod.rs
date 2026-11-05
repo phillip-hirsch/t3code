@@ -260,31 +260,45 @@ impl Workspace {
         }
         let shell = client.stream("orchestration.subscribeShell", shell_input);
         self._stream_tasks = vec![
-            Self::pump(config, window, cx, |this, value, _, cx| {
-                if let Err(error) = this.server_info.apply(value) {
-                    log::warn!("bad server config event: {error}");
-                }
-                this.notify_sidebar(cx);
-            }),
-            Self::pump(shell, window, cx, |this, value, _, cx| {
-                if let Err(error) = this.shell.apply(value) {
-                    log::warn!("bad shell event: {error}");
-                }
-                this.schedule_sidebar_clock(cx);
-                this.notify_sidebar(cx);
-                this.track_visit(cx);
-            }),
+            Self::pump(
+                config,
+                window,
+                cx,
+                |this, value| {
+                    if let Err(error) = this.server_info.apply(value) {
+                        log::warn!("bad server config event: {error}");
+                    }
+                },
+                |this, _, cx| this.notify_sidebar(cx),
+            ),
+            Self::pump(
+                shell,
+                window,
+                cx,
+                |this, value| {
+                    if let Err(error) = this.shell.apply(value) {
+                        log::warn!("bad shell event: {error}");
+                    }
+                },
+                |this, _, cx| {
+                    this.schedule_sidebar_clock(cx);
+                    this.notify_sidebar(cx);
+                    this.track_visit(cx);
+                },
+            ),
         ];
         self.subscribe_thread(window, cx);
         cx.notify();
     }
 
-    /// Applies every event already queued on `stream` before one re-render.
+    /// Applies every event already queued on `stream`, then runs `after_batch`
+    /// once and re-renders.
     fn pump(
         stream: RpcStream,
         window: &mut Window,
         cx: &mut Context<Self>,
-        apply: impl Fn(&mut Self, &Value, &mut Window, &mut Context<Self>) + 'static,
+        apply: impl Fn(&mut Self, &Value) + 'static,
+        after_batch: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Task<()> {
         cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = stream.next().await {
@@ -292,9 +306,13 @@ impl Workspace {
                 events.extend(std::iter::from_fn(|| stream.try_next()));
                 let ended = this.update_in(cx, |this, window, cx| {
                     let mut ended = false;
+                    let mut applied = false;
                     for event in events {
                         match event {
-                            StreamEvent::Item(value) => apply(this, &value, window, cx),
+                            StreamEvent::Item(value) => {
+                                apply(this, &value);
+                                applied = true;
+                            }
                             StreamEvent::End(result) => {
                                 ended = true;
                                 if let Err(error) = result {
@@ -304,6 +322,9 @@ impl Workspace {
                                 }
                             }
                         }
+                    }
+                    if applied {
+                        after_batch(this, window, cx);
                     }
                     cx.notify();
                     ended
@@ -324,16 +345,39 @@ impl Workspace {
         }
         let stream = client.stream("orchestration.subscribeThread", input);
         let thread_id = thread.id.clone();
-        thread._subscription = Some(Self::pump(stream, window, cx, move |this, value, window, cx| {
-            let Some(thread) = this.thread.as_mut().filter(|t| t.id == thread_id) else { return };
-            if let Err(error) = thread.state.apply(value) {
-                log::warn!("bad thread event: {error}");
-            }
-            this.refresh_rows(cx);
-            if this.sync_question() {
-                this.load_custom_answer(window, cx);
-            }
-        }));
+        let batch_thread_id = thread_id.clone();
+        thread._subscription = Some(Self::pump(
+            stream,
+            window,
+            cx,
+            move |this, value| {
+                let Some(thread) = this.thread.as_mut().filter(|t| t.id == thread_id) else { return };
+                if let Err(error) = thread.state.apply(value) {
+                    log::warn!("bad thread event: {error}");
+                }
+            },
+            move |this, window, cx| {
+                let Some(thread) = this.thread.as_ref().filter(|t| t.id == batch_thread_id) else { return };
+                if thread.state.deleted {
+                    this.close_thread(cx);
+                    return;
+                }
+                this.refresh_rows(cx);
+                if this.sync_question() {
+                    this.load_custom_answer(window, cx);
+                }
+            },
+        ));
+    }
+
+    /// Leaves a thread that was deleted, as the web ends its view.
+    fn close_thread(&mut self, cx: &mut Context<Self>) {
+        self.target = None;
+        self.thread = None;
+        self.model_override = None;
+        self.question = None;
+        self.reset_timeline(cx);
+        self.notify_sidebar(cx);
     }
 
     /// Rebuilds the timeline and tells the scroller which rows changed.

@@ -5,7 +5,20 @@
 //! values never fail a whole frame; only fields the UI reads are typed.
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+/// Decodes an array element by element, skipping elements that fail, like the
+/// TS `ForwardCompatibleArray`, so one new-shaped record never drops a frame.
+fn lossy<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<Vec<T>, D::Error> {
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| {
+            T::deserialize(value).map_err(|error| log::warn!("skipping undecodable element: {error}")).ok()
+        })
+        .collect())
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -158,7 +171,7 @@ impl ServerInfo {
         match event.get("type").and_then(Value::as_str).unwrap_or_default() {
             "snapshot" => {
                 let config = &event["config"];
-                self.providers = Vec::deserialize(&config["providers"])?;
+                self.providers = lossy(&config["providers"])?;
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
@@ -166,7 +179,7 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
             }
-            "providerStatuses" => self.providers = Vec::deserialize(&event["payload"]["providers"])?,
+            "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
             _ => {}
         }
@@ -356,7 +369,7 @@ pub struct ThreadShell {
     pub latest_user_authored_message_at: Option<Option<String>>,
     #[serde(default)]
     pub pending_guest_message_count: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub pending_background_tasks: Vec<PendingBackgroundTask>,
     #[serde(default)]
     pub goal: Option<ThreadGoal>,
@@ -393,9 +406,9 @@ pub fn is_active_run_status(status: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 struct ShellSnapshot {
     snapshot_sequence: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     projects: Vec<ProjectShell>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     threads: Vec<ThreadShell>,
 }
 
@@ -405,6 +418,8 @@ pub struct ShellState {
     pub threads: Vec<ThreadShell>,
     pub sequence: u64,
     pub live: bool,
+    /// A full snapshot failed to decode, so deltas wait for the next one.
+    needs_snapshot: bool,
 }
 
 impl ShellState {
@@ -413,15 +428,26 @@ impl ShellState {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
         let sequence = item.get("sequence").and_then(Value::as_u64);
         if let Some(sequence) = sequence {
-            if sequence <= self.sequence {
+            if sequence <= self.sequence || self.needs_snapshot {
                 return Ok(());
             }
         }
         match kind {
             "synchronized" => self.live = true,
             "snapshot" => {
-                let snapshot = ShellSnapshot::deserialize(&item["snapshot"])?;
-                match item.get("resolvedRepositoryIdentityRoots").and_then(Value::as_array) {
+                let roots = item.get("resolvedRepositoryIdentityRoots").and_then(Value::as_array);
+                let snapshot = match ShellSnapshot::deserialize(&item["snapshot"]) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        // Resume from scratch, so a resubscribe fetches a fresh snapshot.
+                        if roots.is_none() {
+                            self.sequence = 0;
+                            self.needs_snapshot = true;
+                        }
+                        return Err(error);
+                    }
+                };
+                match roots {
                     // Enrichment patch: only repository identity changes, for these roots.
                     Some(roots) => {
                         for root in roots.iter().filter_map(Value::as_str) {
@@ -449,6 +475,7 @@ impl ShellState {
                         self.projects = projects;
                         self.threads = snapshot.threads;
                         self.sequence = snapshot.snapshot_sequence;
+                        self.needs_snapshot = false;
                     }
                 }
             }
@@ -595,6 +622,8 @@ pub struct TurnItem {
     pub node_id: Option<String>,
     pub ordinal: i64,
     pub status: String,
+    /// The stream sequence that last wrote this item; 0 when unknown.
+    pub revision: u64,
     pub raw: Value,
 }
 
@@ -611,6 +640,7 @@ impl<'de> Deserialize<'de> for TurnItem {
             node_id: text("nodeId"),
             ordinal: raw.get("ordinal").and_then(Value::as_i64).unwrap_or_default(),
             status: text("status").unwrap_or_default(),
+            revision: 0,
             raw,
         })
     }
@@ -639,20 +669,20 @@ pub struct VisibleRow {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadProjection {
     pub thread: AppThread,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub runs: Vec<Run>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub attempts: Vec<RunAttempt>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub runtime_requests: Vec<RuntimeRequest>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub turn_items: Vec<TurnItem>,
     /// The timeline, in render order.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub visible_turn_items: Vec<VisibleRow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub provider_threads: Vec<ProviderThread>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lossy")]
     pub provider_turns: Vec<ProviderTurn>,
 }
 
@@ -722,7 +752,7 @@ impl ThreadProjection {
             .collect()
     }
 
-    fn apply_event(&mut self, event: &Value) -> Result<(), serde_json::Error> {
+    fn apply_event(&mut self, event: &Value, sequence: u64) -> Result<(), serde_json::Error> {
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
         let payload = &event["payload"];
         match event_type {
@@ -737,7 +767,11 @@ impl ThreadProjection {
             "runtime-request.updated" => {
                 upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id)
             }
-            "turn-item.updated" => self.apply_turn_item(TurnItem::deserialize(payload)?),
+            "turn-item.updated" => {
+                let mut item = TurnItem::deserialize(payload)?;
+                item.revision = sequence;
+                self.apply_turn_item(item);
+            }
             "provider-thread.updated" => {
                 upsert(&mut self.provider_threads, ProviderThread::deserialize(payload)?, |t| &t.id)
             }
@@ -863,6 +897,8 @@ pub struct ThreadState {
     pub projection: Option<ThreadProjection>,
     pub sequence: u64,
     pub live: bool,
+    /// Set by `thread.deleted`; the view should close.
+    pub deleted: bool,
 }
 
 impl ThreadState {
@@ -871,20 +907,38 @@ impl ThreadState {
         match item.get("kind").and_then(Value::as_str).unwrap_or_default() {
             "synchronized" => self.live = true,
             "snapshot" => {
-                self.projection = Some(ThreadProjection::deserialize(&item["projection"])?);
-                self.sequence = item["snapshotSequence"].as_u64().unwrap_or_default();
+                let sequence = item["snapshotSequence"].as_u64().unwrap_or_default();
+                match ThreadProjection::deserialize(&item["projection"]) {
+                    Ok(mut projection) => {
+                        let visible = projection.visible_turn_items.iter_mut().map(|row| &mut row.item);
+                        for item in projection.turn_items.iter_mut().chain(visible) {
+                            item.revision = sequence;
+                        }
+                        self.projection = Some(projection);
+                        self.sequence = sequence;
+                    }
+                    Err(error) => {
+                        // Resume from scratch, so a resubscribe fetches a fresh snapshot.
+                        self.projection = None;
+                        self.sequence = 0;
+                        return Err(error);
+                    }
+                }
             }
             "event" => {
                 let sequence = item["sequence"].as_u64().unwrap_or_default();
+                // Without a projection the cursor stays put, so a resubscribe refetches the snapshot.
+                let Some(projection) = self.projection.as_mut().filter(|_| !self.deleted) else { return Ok(()) };
                 if sequence <= self.sequence {
                     return Ok(());
                 }
                 self.sequence = sequence;
-                if let Some(projection) = &mut self.projection {
+                let event = &item["event"];
+                if event.get("type").and_then(Value::as_str) == Some("thread.deleted") {
+                    self.deleted = true;
+                } else if let Err(error) = projection.apply_event(event, sequence) {
                     // An event we cannot decode still advances the cursor, like `unknown-event`.
-                    if let Err(error) = projection.apply_event(&item["event"]) {
-                        log::warn!("skipping undecodable thread event {sequence}: {error}");
-                    }
+                    log::warn!("skipping undecodable thread event {sequence}: {error}");
                 }
             }
             _ => {}
@@ -978,6 +1032,55 @@ mod tests {
     }
 
     #[test]
+    fn thread_snapshots_skip_bad_elements_and_reset_the_cursor_on_failure() {
+        let mut state = ThreadState::default();
+        let mut value = projection(&[item("a", "user_message", "r1", 1)]);
+        value["turnItems"].as_array_mut().unwrap().push(json!({"type": "future"}));
+        value["visibleTurnItems"].as_array_mut().unwrap().push(json!({"position": 9}));
+        value["runs"].as_array_mut().unwrap().push(json!({"id": "r2"}));
+        state.apply(&json!({"kind": "snapshot", "snapshotSequence": 4, "projection": value})).unwrap();
+        let projection = state.projection.as_ref().unwrap();
+        assert_eq!((projection.turn_items.len(), projection.runs.len()), (1, 1));
+        assert_eq!(timeline(&state), ["a"]);
+        assert_eq!(projection.turn_items[0].revision, 4);
+
+        assert!(state.apply(&json!({"kind": "snapshot", "snapshotSequence": 6, "projection": {"runs": []}})).is_err());
+        state.apply(&event(7, "turn-item.updated", item("b", "reasoning", "r1", 2))).unwrap();
+        assert!(state.projection.is_none());
+        assert_eq!(state.sequence, 0, "a resubscribe refetches the snapshot");
+    }
+
+    #[test]
+    fn shell_snapshots_skip_bad_threads_and_reset_the_cursor_on_failure() {
+        let mut shell = ShellState::default();
+        let snapshot = |sequence: Value| json!({"kind": "snapshot", "snapshot": {"snapshotSequence": sequence, "projects": [project("a", None), {"id": "x"}], "threads": [thread("t", "1"), {"id": "bad"}]}});
+        shell.apply(&snapshot(json!(5))).unwrap();
+        assert_eq!((shell.projects.len(), shell.threads.len()), (1, 1));
+
+        assert!(shell.apply(&snapshot(json!(null))).is_err());
+        shell
+            .apply(&json!({"kind":"thread.updated","sequence":9,"location":"active","thread":thread("u", "2")}))
+            .unwrap();
+        assert_eq!((shell.sequence, shell.threads.len()), (0, 1), "deltas wait for a fresh snapshot");
+        shell.apply(&snapshot(json!(10))).unwrap();
+        shell
+            .apply(&json!({"kind":"thread.updated","sequence":11,"location":"active","thread":thread("u", "2")}))
+            .unwrap();
+        assert_eq!((shell.sequence, shell.threads.len()), (11, 2));
+    }
+
+    #[test]
+    fn deleting_the_thread_ends_the_stream() {
+        let mut state = ThreadState::default();
+        state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[])})).unwrap();
+        state.apply(&event(2, "thread.deleted", json!({"threadId": "t", "deletedAt": "x"}))).unwrap();
+        state.apply(&event(3, "turn-item.updated", item("a", "user_message", "r1", 1))).unwrap();
+        assert!(state.deleted);
+        assert!(timeline(&state).is_empty());
+        assert_eq!(state.projection.as_ref().unwrap().thread.title, "t", "the payload is not decoded as a thread");
+    }
+
+    #[test]
     fn rolled_back_runs_leave_the_timeline() {
         let mut state = ThreadState::default();
         state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[item("a", "user_message", "r1", 1)])})).unwrap();
@@ -991,6 +1094,7 @@ mod tests {
         info.apply(&json!({"version": 1, "type": "snapshot", "config": {
             "providers": [
                 {"instanceId": "off", "driver": "codex", "enabled": false, "status": "ready", "models": [{"slug": "a"}]},
+                {"driver": "future", "enabled": true, "status": "ready"},
                 {"instanceId": "claude", "driver": "claudeAgent", "enabled": true, "status": "ready",
                  "models": [{"slug": "custom", "isCustom": true}, {"slug": "haiku"}, {"slug": "opus", "isDefault": true}]}
             ],
@@ -999,6 +1103,7 @@ mod tests {
         }}))
         .unwrap();
         assert!(info.thread_stop);
+        assert_eq!(info.providers.len(), 2, "an undecodable provider is skipped");
         let selection = info.new_thread_model(None).unwrap();
         assert_eq!((selection.instance_id.as_str(), selection.model.as_str()), ("claude", "opus"));
     }

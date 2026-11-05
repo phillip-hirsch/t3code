@@ -203,10 +203,10 @@ fn is_resource_card(item_type: &str) -> bool {
     matches!(item_type, "fork" | "thread_created" | "secret_request" | "link_request")
 }
 
-/// Entries from the previous refresh, reused while their item's `updatedAt`
-/// and status are unchanged, so a streamed delta rebuilds only its own item.
+/// Entries from the previous refresh, reused while their item's revision is
+/// unchanged, so a streamed delta rebuilds only its own item.
 #[derive(Default)]
-pub struct EntryCache(HashMap<String, (String, Rc<TimelineEntry>)>);
+pub struct EntryCache(HashMap<String, (u64, Rc<TimelineEntry>)>);
 
 fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Vec<Rc<TimelineEntry>> {
     let mut next = HashMap::with_capacity(cache.0.len());
@@ -215,12 +215,11 @@ fn timeline_entries(projection: &ThreadProjection, cache: &mut EntryCache) -> Ve
         .iter()
         .filter_map(|row| {
             let item = &row.item;
-            let stamp = format!("{}|{}", item.str("updatedAt").unwrap_or_default(), item.status);
             let entry = match cache.0.get(&item.id) {
-                Some((cached, entry)) if *cached == stamp && item.str("updatedAt").is_some() => entry.clone(),
+                Some((revision, entry)) if *revision == item.revision && item.revision != 0 => entry.clone(),
                 _ => Rc::new(timeline_entry(item)?),
             };
-            next.insert(item.id.clone(), (stamp, entry.clone()));
+            next.insert(item.id.clone(), (item.revision, entry.clone()));
             Some(entry)
         })
         .collect();
@@ -855,7 +854,7 @@ mod tests {
         }
     }
 
-    fn projection(items: Vec<Value>, runs: Value) -> ThreadProjection {
+    fn projection_value(items: Vec<Value>, runs: Value) -> Value {
         let rows: Vec<Value> = items
             .into_iter()
             .map(|item| {
@@ -863,12 +862,11 @@ mod tests {
                 json!({"visibility": "visible", "sourceThreadId": "t", "sourceItemId": id, "item": item})
             })
             .collect();
-        serde_json::from_value(json!({
-            "thread": {"id": "t", "title": "T"},
-            "runs": runs,
-            "visibleTurnItems": rows,
-        }))
-        .unwrap()
+        json!({"thread": {"id": "t", "title": "T"}, "runs": runs, "visibleTurnItems": rows})
+    }
+
+    fn projection(items: Vec<Value>, runs: Value) -> ThreadProjection {
+        serde_json::from_value(projection_value(items, runs)).unwrap()
     }
 
     fn item(id: &str, kind: &str, run: &str, at: &str, extra: Value) -> Value {
@@ -1024,17 +1022,25 @@ mod tests {
     #[test]
     fn cached_entries_refresh_when_their_item_changes() {
         let mut cache = EntryCache::default();
+        let mut state = crate::model::ThreadState::default();
         let mut items = turn("r1")[..3].to_vec();
         items[2]["status"] = json!("running");
         let runs = json!([{"id": "r1", "status": "running"}]);
-        let live = |rows: Vec<Row>| describe(&rows).last().cloned().unwrap();
-        assert_eq!(
-            live(rows(&projection(items.clone(), runs.clone()), &HashSet::new(), &mut cache)),
-            "live Running ls"
-        );
+        state
+            .apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection_value(items.clone(), runs)}))
+            .unwrap();
+        let mut live = |state: &crate::model::ThreadState| {
+            describe(&rows(state.projection.as_ref().unwrap(), &HashSet::new(), &mut cache)).last().cloned().unwrap()
+        };
+        assert_eq!(live(&state), "live Running ls");
+        // Same `updatedAt` and status, new input: the revision still changes.
         items[2]["input"] = json!("cargo test");
-        items[2]["updatedAt"] = json!("2026-11-04T10:00:09.000Z");
-        assert_eq!(live(rows(&projection(items, runs), &HashSet::new(), &mut cache)), "live Running cargo");
+        state
+            .apply(
+                &json!({"kind": "event", "sequence": 2, "event": {"type": "turn-item.updated", "payload": items[2]}}),
+            )
+            .unwrap();
+        assert_eq!(live(&state), "live Running cargo");
     }
 
     #[test]
