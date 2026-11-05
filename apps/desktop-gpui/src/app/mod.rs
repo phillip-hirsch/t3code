@@ -314,6 +314,7 @@ impl Workspace {
                 |this, value| {
                     if let Err(error) = this.shell.apply(value) {
                         log::warn!("bad shell event: {error}");
+                        this.error = Some("Couldn't read the thread list from the server. Reconnect to retry.".into());
                     }
                 },
                 |this, _, cx| {
@@ -389,6 +390,7 @@ impl Workspace {
                 let Some(thread) = this.thread.as_mut().filter(|t| t.id == thread_id) else { return };
                 if let Err(error) = thread.state.apply(value) {
                     log::warn!("bad thread event: {error}");
+                    this.error = Some("Couldn't read this thread from the server. Open it again to retry.".into());
                 }
             },
             move |this, window, cx| {
@@ -503,6 +505,7 @@ impl Workspace {
             return;
         }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
+        let origin = target.clone();
         let (declines, text_is_feedback) = self.approval_declines(&text);
         let (method, mut payload, new_thread_id, workspace) = match target {
             Target::Thread(thread_id) => {
@@ -577,16 +580,14 @@ impl Workspace {
                 this.sending = false;
                 match result {
                     Ok(_) => {
-                        if let Some(thread_id) = new_thread_id {
+                        // Follow the new thread only from the draft that launched it.
+                        if let Some(thread_id) = new_thread_id.filter(|_| this.target.as_ref() == Some(&origin)) {
                             this.select_thread(thread_id, window, cx);
                         }
                     }
                     Err(error) => {
                         this.error = Some(error.into());
-                        // Give the text back so a failed send loses nothing.
-                        if this.composer.read(cx).value().is_empty() {
-                            this.set_composer_text(text, window, cx);
-                        }
+                        this.give_back_prompt(&origin, text, window, cx);
                     }
                 }
                 cx.notify();

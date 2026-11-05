@@ -57,6 +57,11 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
 
 /// What a target keeps of the composer while another one is on screen, like
 /// the web's `composerDraftStore` (in memory only).
+/// A failed message first, then whatever was typed after it.
+fn merge_prompt(failed: String, newer: &str) -> String {
+    if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
+}
+
 pub(super) enum ComposerDraft {
     Prompt(String),
     /// An open question card; its prompt is the one it set aside.
@@ -103,6 +108,36 @@ impl Workspace {
         } else {
             self.composer_drafts.insert(target, draft);
         }
+    }
+
+    /// Returns a failed send's text to the target it came from, ahead of anything
+    /// typed there since, so it never lands in another thread or gets dropped.
+    pub(super) fn give_back_prompt(
+        &mut self,
+        origin: &Target,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target.as_ref() == Some(origin) {
+            match &mut self.question {
+                Some(question) => question.prompt = merge_prompt(text, &question.prompt),
+                None => {
+                    let merged = merge_prompt(text, &self.composer.read(cx).value());
+                    self.set_composer_text(merged, window, cx);
+                }
+            }
+            return;
+        }
+        let slot = match self.composer_drafts.get_mut(origin) {
+            Some(ComposerDraft::Prompt(prompt)) => prompt,
+            Some(ComposerDraft::Question(question)) => &mut question.prompt,
+            None => {
+                self.composer_drafts.insert(origin.clone(), ComposerDraft::Prompt(text));
+                return;
+            }
+        };
+        *slot = merge_prompt(text, slot);
     }
 
     /// Brings back the new target's composer; call after the target changes.
@@ -1039,4 +1074,16 @@ fn white(alpha: f32) -> Hsla {
 
 fn black(alpha: f32) -> Hsla {
     gpui_kit::hsla(0., 0., 0., alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_send_keeps_newer_text_after_it() {
+        assert_eq!(merge_prompt("sent".into(), ""), "sent");
+        assert_eq!(merge_prompt("sent".into(), "  "), "sent");
+        assert_eq!(merge_prompt("sent".into(), "typed later"), "sent\n\ntyped later");
+    }
 }
