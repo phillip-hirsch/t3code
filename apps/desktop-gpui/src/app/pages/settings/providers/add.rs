@@ -27,7 +27,7 @@ use super::acp::{AcpRegistrySearch, AcpSearchEvent, RegistryAgent, rpc_message};
 use super::drivers::{self, Control, DRIVERS, Driver, Field, is_local_acp, next_config, visible_fields};
 use crate::app::Workspace;
 use crate::rpc::StreamEvent;
-use crate::theme::{FONT_MONO, Tokens, tokens};
+use crate::theme::{Tokens, tokens};
 
 pub(super) const ACP_REGISTRY: &str = "acpRegistry";
 
@@ -183,18 +183,11 @@ pub(super) fn settings_row(
                     .flex_1()
                     .min_w_0()
                     .gap(px(4.))
-                    .child(div().min_h(px(20.)).text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(title.into()))
+                    .child(div().min_h(px(20.)).text_sm().font_weight(FontWeight::MEDIUM).child(title.into()))
                     .children(description.map(|d| {
-                        div()
-                            .max_w(px(672.))
-                            .text_size(px(12.))
-                            .line_height(px(18.))
-                            .text_color(t.muted_foreground)
-                            .child(d)
+                        div().max_w(px(672.)).text_xs().line_height(px(18.)).text_color(t.muted_foreground).child(d)
                     }))
-                    .children(
-                        status.map(|s| div().pt(px(2.)).text_size(px(12.)).text_color(t.muted_foreground).child(s)),
-                    ),
+                    .children(status.map(|s| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(s))),
             )
             .children(control.map(|c| h_flex().flex_none().gap(px(8.)).justify_end().child(c))),
     )
@@ -458,7 +451,7 @@ impl ConfigForm {
                 list.child(v_flex().px(px(16.)).pb(px(8.)).gap(px(8.)).children(self.args.iter().map(
                     |(row, input)| {
                         let row = *row;
-                        h_flex().gap(px(6.)).child(Input::new(input).small().flex_1().font_family(FONT_MONO)).child(
+                        h_flex().gap(px(6.)).child(Input::new(input).small().flex_1().font_family(t.fonts.mono)).child(
                             Button::new(SharedString::from(format!("{}-remove-argument-{row}", self.id_prefix)))
                                 .ghost()
                                 .xsmall()
@@ -979,7 +972,7 @@ impl AddProviderWizard {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(14.))
+                    .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .border_1()
                     .map(|badge| {
@@ -1024,7 +1017,7 @@ impl AddProviderWizard {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(14.))
+                            .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(if current { t.foreground } else { t.muted_foreground })
                             .child(*label),
@@ -1070,7 +1063,7 @@ impl AddProviderWizard {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(14.))
+                        .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(t.foreground)
                         .child(option.label),
@@ -1124,7 +1117,7 @@ impl AddProviderWizard {
                 .border_1()
                 .border_color(t.info.opacity(0.32))
                 .bg(t.info.opacity(0.04))
-                .text_size(px(14.))
+                .text_sm()
                 .child(Icon::new(IconName::Info).size(px(16.)).text_color(t.info_foreground))
                 .child(format!("We do not recommend managing multiple {name} accounts in T3 Code."))
                 .child(
@@ -1179,7 +1172,7 @@ impl AddProviderWizard {
                             fold.child(
                                 h_flex()
                                     .gap(px(12.))
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .text_color(t.muted_foreground)
                                     .child(rule())
                                     .child("Or choose from ACP Registry")
@@ -1210,19 +1203,16 @@ impl AddProviderWizard {
                     .gap(px(12.))
                     .child(
                         v_flex()
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child(if local {
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(if local {
                                 "Local ACP command"
                             } else {
                                 "Enter manually"
                             }))
-                            .child(div().mt(px(2.)).text_size(px(12.)).text_color(t.muted_foreground).child(
-                                if local {
-                                    format!("Run an installed ACP executable on {environment}.")
-                                } else {
-                                    "Enter an official registry ID and any local executable or auth override."
-                                        .to_owned()
-                                },
-                            )),
+                            .child(div().mt(px(2.)).text_xs().text_color(t.muted_foreground).child(if local {
+                                format!("Run an installed ACP executable on {environment}.")
+                            } else {
+                                "Enter an official registry ID and any local executable or auth override.".to_owned()
+                            })),
                     )
                     .child(
                         Button::new("add-provider-search-registry").ghost().xsmall().label("Search registry").on_click(
@@ -1270,17 +1260,11 @@ impl AddProviderWizard {
                 .child(
                     v_flex()
                         .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(agent.name.clone()),
-                        )
+                        .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(agent.name.clone()))
                         .child(
                             div()
                                 .mt(px(2.))
-                                .text_size(px(12.))
+                                .text_xs()
                                 .text_color(t.muted_foreground)
                                 .child(format!("v{} · {}", agent.version, agent.distribution)),
                         ),
@@ -1483,12 +1467,10 @@ impl Render for AddProviderWizard {
             .gap(px(8.))
             .p(px(24.))
             .pb(px(12.))
-            .child(
-                div().text_size(px(20.)).line_height(px(27.5)).font_weight(FontWeight::SEMIBOLD).child("Add provider"),
-            )
+            .child(div().text_xl().line_height(px(27.5)).font_weight(FontWeight::SEMIBOLD).child("Add provider"))
             .child(
                 div()
-                    .text_size(px(14.))
+                    .text_sm()
                     .text_color(t.muted_foreground)
                     .child(format!("Add an account or configure a provider on {environment}.")),
             )
@@ -1512,7 +1494,7 @@ impl Render for AddProviderWizard {
                     .child(
                         v_flex()
                             .gap(px(8.))
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child("Provider"))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Provider"))
                             .child(self.render_option_grid("add-provider-featured", featured, &t, cx))
                             .children(self.render_multiple_accounts_note(&t, cx)),
                     )
@@ -1528,7 +1510,7 @@ impl Render for AddProviderWizard {
                 body = if self.driver.fields.is_empty() {
                     body.child(
                         div()
-                            .text_size(px(14.))
+                            .text_sm()
                             .text_color(t.muted_foreground)
                             .child("This driver has no required configuration. You can add the instance now."),
                     )

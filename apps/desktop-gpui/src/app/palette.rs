@@ -932,9 +932,11 @@ impl Workspace {
             Icon::new(IconName::Search).size(px(16.)).text_color(muted.opacity(0.8)).into_any_element()
         };
         let input_row = h_flex().flex_none().h(px(46.)).px(px(8.)).py(px(6.)).child(
-            h_flex().size_full().relative().child(div().absolute().left(px(11.)).child(lead_icon)).child(
-                div().flex_1().pl(px(32.)).child(Input::new(&input).appearance(false).text_size(px(14.)).h(px(34.))),
-            ),
+            h_flex()
+                .size_full()
+                .relative()
+                .child(div().absolute().left(px(11.)).child(lead_icon))
+                .child(div().flex_1().pl(px(32.)).child(Input::new(&input).appearance(false).text_sm().h(px(34.)))),
         );
         let mut index = 0usize;
         let mut list = v_flex().p(px(8.));
@@ -949,7 +951,7 @@ impl Workspace {
                         .px(px(8.))
                         .py(px(6.))
                         .when(gi > 0, |el| el.pt(px(12.)))
-                        .text_size(px(12.))
+                        .text_xs()
                         .line_height(px(16.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(muted)
@@ -984,7 +986,7 @@ impl Workspace {
             } else {
                 "No matching commands, projects, or threads."
             };
-            div().py(px(40.)).text_center().text_size(px(14.)).text_color(muted).child(text)
+            div().py(px(40.)).text_center().text_sm().text_color(muted).child(text)
         });
         let kbd = |label: SharedString| {
             div()
@@ -997,7 +999,7 @@ impl Workspace {
                 .justify_center()
                 .bg(fg.opacity(0.08))
                 .text_color(fg)
-                .text_size(px(12.))
+                .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .child(label)
         };
@@ -1014,7 +1016,7 @@ impl Workspace {
             .border_t_1()
             .border_color(fg.opacity(0.07))
             .bg(fg.opacity(0.025))
-            .text_size(px(14.))
+            .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .text_color(muted)
             .child(
@@ -1033,15 +1035,13 @@ impl Workspace {
                         .py(px(2.))
                         .rounded(px(6.))
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_xs()
                         .hover(|s| s.bg(fg.opacity(0.06)).text_color(fg))
                         .on_click(cx.listener(|this, _, window, cx| this.pick_project_folder(window, cx)))
                         .child("Open in File Explorer"),
                 )
             })
-            .when(!browsing && palette.messages.pending, |el| {
-                el.child(div().text_size(px(12.)).child("Searching messages…"))
-            });
+            .when(!browsing && palette.messages.pending, |el| el.child(div().text_xs().child("Searching messages…")));
         let height = window.viewport_size().height;
         Some(
             div()
@@ -1077,9 +1077,7 @@ impl Workspace {
                         )
                         .child(input_row)
                         .children(
-                            status.map(|text| {
-                                div().px(px(16.)).py(px(12.)).text_size(px(14.)).text_color(muted).child(text)
-                            }),
+                            status.map(|text| div().px(px(16.)).py(px(12.)).text_sm().text_color(muted).child(text)),
                         )
                         .child(
                             div().id("palette-list").flex_1().min_h_0().overflow_y_scroll().child(list).children(empty),
@@ -1165,7 +1163,7 @@ impl Workspace {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
-                                    .text_size(px(14.))
+                                    .text_sm()
                                     .line_height(px(20.))
                                     .text_color(tokens.foreground)
                                     .child(
@@ -1187,7 +1185,7 @@ impl Workspace {
                                     .flex_none()
                                     .min_w(px(48.))
                                     .text_right()
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .text_color(muted.opacity(0.7))
                                     .child(time)
                             }))
@@ -1195,7 +1193,7 @@ impl Workspace {
                                 div()
                                     .flex_none()
                                     .ml_auto()
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(tokens.sidebar.secondary_label)
                                     .child(shortcut)
@@ -1206,9 +1204,10 @@ impl Workspace {
                                 ))
                             }),
                     )
-                    .children(description.map(|d| {
-                        div().text_size(px(12.)).line_height(px(16.)).text_color(muted.opacity(0.7)).child(d)
-                    })),
+                    .children(
+                        description
+                            .map(|d| div().text_xs().line_height(px(16.)).text_color(muted.opacity(0.7)).child(d)),
+                    ),
             )
             .into_any_element()
     }

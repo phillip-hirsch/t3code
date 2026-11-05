@@ -31,7 +31,7 @@ use super::super::widgets::{SettingRow, SettingsView, section_with_action, setti
 use crate::app::Workspace;
 use crate::model::ModelSelection;
 use crate::rpc::{RpcClient, RpcError};
-use crate::theme::{FONT_MONO, Tokens, tokens};
+use crate::theme::{Tokens, tokens};
 
 const MERGE_METHODS: &[(&str, &str)] =
     &[("last", "Last selected"), ("merge", "Merge"), ("squash", "Squash and merge"), ("rebase", "Rebase and merge")];
@@ -639,7 +639,7 @@ impl Workspace {
                                     .child(label.clone()),
                             )
                             .children(version.map(|version| {
-                                div().font_family(FONT_MONO).text_xs().text_color(t.muted_foreground).child(version)
+                                div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(version)
                             }))
                             .when(not_ready, |el| {
                                 el.child(badge("Coming Soon", t.warning_foreground, t.warning.opacity(0.12)))
@@ -729,7 +729,7 @@ impl Workspace {
                         div()
                             .id(SharedString::from(format!("account-{kind}")))
                             .cursor_pointer()
-                            .font_family(FONT_MONO)
+                            .font_family(t.fonts.mono)
                             .text_size(px(10.))
                             .hover(|el| el.text_color(t.foreground))
                             .child(if revealed { account.to_owned() } else { redacted(account) })
@@ -853,7 +853,7 @@ impl Workspace {
                             div()
                                 .id("signed-in-account")
                                 .cursor_pointer()
-                                .font_family(FONT_MONO)
+                                .font_family(t.fonts.mono)
                                 .text_size(px(10.))
                                 .child(if revealed { account.to_owned() } else { redacted(account) })
                                 .on_click(move |_, _, cx| {
@@ -1131,7 +1131,7 @@ impl Workspace {
                     .child(
                         h_flex()
                             .gap(px(4.))
-                            .font_family(FONT_MONO)
+                            .font_family(t.fonts.mono)
                             .text_lg()
                             .font_weight(FontWeight::MEDIUM)
                             .children(cells),
@@ -1350,7 +1350,7 @@ impl Workspace {
         let login = move |account: &str| -> AnyElement {
             div()
                 .truncate()
-                .font_family(FONT_MONO)
+                .font_family(t.fonts.mono)
                 .text_size(px(10.))
                 .child(if revealed { account.to_owned() } else { redacted(account) })
                 .into_any_element()

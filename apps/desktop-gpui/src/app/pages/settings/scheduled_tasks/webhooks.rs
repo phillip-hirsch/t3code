@@ -40,7 +40,7 @@ use super::webhook_logic::{
 };
 use crate::app::Workspace;
 use crate::rpc::{RpcClient, RpcError};
-use crate::theme::{FONT_MONO, Tokens, tokens};
+use crate::theme::{Tokens, tokens};
 
 pub(super) use webhook_logic::DEFAULT_WEBHOOK_PROMPT;
 
@@ -781,8 +781,8 @@ fn block(title: &'static str, text: &str, id: &'static str, t: &Tokens) -> impl 
             .rounded(px(6.))
             .bg(t.muted)
             .p_2()
-            .font_family(FONT_MONO)
-            .text_size(px(12.))
+            .font_family(t.fonts.mono)
+            .text_xs()
             .line_height(px(16.))
             .text_color(t.foreground)
             .child(text.to_owned()),
@@ -815,7 +815,7 @@ pub(super) fn badge(tone: Tone, text: impl Into<SharedString>, t: &Tokens) -> im
         .border_color(if tone == Tone::Outline { t.input } else { gpui_kit::transparent_black() })
         .bg(bg)
         .text_color(fg)
-        .text_size(px(12.))
+        .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .child(text.into())
 }
@@ -834,15 +834,15 @@ fn field(title: &'static str, hint: Option<&'static str>, control: impl IntoElem
 
 /// `Label`: text-sm/4, medium.
 fn label(text: &'static str, t: &Tokens) -> impl IntoElement {
-    div().text_size(px(14.)).line_height(px(16.)).font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(text)
+    div().text_sm().line_height(px(16.)).font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(text)
 }
 
 fn text_sm<E: gpui_kit::Styled>(el: E, color: gpui_kit::Hsla) -> E {
-    el.text_size(px(14.)).line_height(px(20.)).text_color(color)
+    el.text_sm().line_height(px(20.)).text_color(color)
 }
 
 fn text_xs<E: gpui_kit::Styled>(el: E, color: gpui_kit::Hsla) -> E {
-    el.text_size(px(12.)).line_height(px(16.)).text_color(color)
+    el.text_xs().line_height(px(16.)).text_color(color)
 }
 
 /// `Button variant="outline" size="sm"`: 28px tall.

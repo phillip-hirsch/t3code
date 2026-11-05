@@ -968,7 +968,7 @@ impl Workspace {
                         el.child(
                             div()
                                 .truncate()
-                                .font_family(theme::FONT_MONO)
+                                .font_family(t.fonts.mono)
                                 .text_size(px(11.))
                                 .text_color(t.muted_foreground.opacity(0.7))
                                 .child(model.slug.clone()),
@@ -985,9 +985,11 @@ impl Workspace {
                     })
                     .tooltip(move |window, cx| {
                         let (name, slug) = name_tooltip.clone();
-                        gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+                        gpui_kit::component::tooltip::Tooltip::element(move |_, cx| {
                             v_flex().child(name.clone()).children(
-                                slug.clone().map(|s| div().font_family(theme::FONT_MONO).text_size(px(11.)).child(s)),
+                                slug.clone().map(|s| {
+                                    div().font_family(theme::tokens(cx).fonts.mono).text_size(px(11.)).child(s)
+                                }),
                             )
                         })
                         .build(window, cx)

@@ -26,11 +26,13 @@ use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
 use crate::model::{RuntimeRequest, TurnItem};
 use crate::requests::{self, Question, QuestionDraft};
-use crate::theme::{FONT_MONO, Tokens, tokens};
+use crate::theme::{Tokens, tokens};
 
 /// `max-h-52` (208px) over the 22.75px line.
 pub(super) const EDITOR_MAX_ROWS: usize = 9;
 const LINE_HEIGHT: f32 = 22.75;
+/// `leading-relaxed` over the Prompt font size (`--font-size-prompt`).
+const PROMPT_LEADING: f32 = 1.625;
 const DEFAULT_RUNTIME_MODE: &str = "full-access";
 const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
 /// Single-select picks advance after this, so the pick is seen first.
@@ -503,8 +505,9 @@ impl Workspace {
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
-            .text_size(px(14.))
-            .line_height(px(LINE_HEIGHT))
+            .font_family(t.fonts.composer)
+            .text_size(px(t.fonts.prompt_size))
+            .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| render_chip(token, &t))
@@ -538,8 +541,9 @@ impl Workspace {
                             .top_0()
                             .left_0()
                             .right_0()
-                            .text_size(px(14.))
-                            .line_height(px(LINE_HEIGHT))
+                            .font_family(t.fonts.composer)
+                            .text_size(px(t.fonts.prompt_size))
+                            .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                             .text_color(t.muted_foreground)
                             .truncate()
                             .child(placeholder),
@@ -882,7 +886,7 @@ impl Workspace {
                             .min_w_0()
                             .max_h(px(160.))
                             .overflow_y_scroll()
-                            .font_family(FONT_MONO)
+                            .font_family(t.fonts.mono)
                             .text_xs()
                             .line_height(px(20.))
                             .text_color(t.foreground)

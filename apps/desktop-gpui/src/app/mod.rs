@@ -242,7 +242,7 @@ impl Workspace {
         ];
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
-        crate::theme::set_preference(client_settings.theme, window, cx);
+        crate::theme::set_preference(client_settings.theme_choice(), window, cx);
         Self {
             connection: Connection::Starting,
             endpoint: None,

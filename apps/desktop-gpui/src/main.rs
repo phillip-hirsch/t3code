@@ -17,6 +17,8 @@ mod search;
 mod settings;
 mod terminal_text;
 mod theme;
+mod themes;
+mod thread_details;
 mod timeline;
 mod timestamp;
 mod usage;

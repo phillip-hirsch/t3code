@@ -3,10 +3,14 @@
 //! Alpha tokens stay translucent, as in CSS, so they composite over whatever
 //! surface they sit on.
 
-use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::{App, Global, Hsla, Window, WindowAppearance, hsla, rgb};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
-use crate::settings::ThemePreference;
+use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, rgb};
+
+use crate::settings::{Settings, TYPOGRAPHY_ADVANCED_KEY};
+use crate::themes::{ThemeChoice, ThemeColors};
 
 pub const FONT_SANS: &str = "Inter";
 pub const FONT_MONO: &str = "Consolas";
@@ -50,6 +54,7 @@ pub struct Tokens {
     pub sidebar: SidebarTokens,
     /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
     pub glass: f32,
+    pub fonts: Fonts,
 }
 
 /// The `[data-app-sidebar]` palette override (`index.css:1234-1278`).
@@ -121,6 +126,7 @@ impl Tokens {
                 icon: hex(0x8b8b8b),
             },
             glass: 0.8,
+            fonts: Fonts::default(),
         }
     }
 
@@ -164,35 +170,204 @@ impl Tokens {
                 icon: hex(0x86858e),
             },
             glass: 0.8,
+            fonts: Fonts::default(),
         }
     }
 }
 
-/// The client settings that recolor the tokens (`startClientAppearance` in `appInit.tsx`).
+/// The client settings that restyle the tokens (`startClientAppearance` in `appInit.tsx`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Appearance {
     /// `appearanceContrast`, 50-200 percent.
     pub contrast: f32,
     /// `glassOpacity`, 40-100 percent.
     pub glass: f32,
+    pub fonts: Fonts,
 }
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { contrast: 100., glass: 80. }
+        Self { contrast: 100., glass: 80., fonts: Fonts::default() }
     }
 }
 
 impl Global for Appearance {}
 
 impl Appearance {
-    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+    pub fn from_settings(settings: &Settings) -> Self {
         let percent = |key, default| settings.get(key).as_f64().map_or(default, |value| value as f32);
-        Self { contrast: percent("appearanceContrast", 100.), glass: percent("glassOpacity", 80.) }
+        Self {
+            contrast: percent("appearanceContrast", 100.),
+            glass: percent("glassOpacity", 80.),
+            fonts: Fonts::from_settings(settings),
+        }
     }
 }
 
+/// The typography settings as the app paints them (`applyAppearanceFontVariables` in
+/// `appearanceFonts.ts`). Families are interned so the tokens stay `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fonts {
+    /// `--font-sans`: everything outside code and the terminal.
+    pub sans: &'static str,
+    /// `--font-mono`: every monospace label, code block, diff and file preview.
+    pub mono: &'static str,
+    /// `--font-composer`: the prompt box.
+    pub composer: &'static str,
+    pub terminal: &'static str,
+    /// The root font size, which every rem scales with.
+    pub interface_size: f32,
+    /// `--font-size-prompt`, in px.
+    pub prompt_size: f32,
+    /// `--font-size-code` and `--diffs-font-size`, in px.
+    pub code_size: f32,
+    pub terminal_size: f32,
+}
+
+impl Default for Fonts {
+    /// `DEFAULT_CLIENT_SETTINGS`, without separate fonts.
+    fn default() -> Self {
+        Self {
+            sans: FONT_SANS,
+            mono: FONT_MONO,
+            composer: FONT_SANS,
+            terminal: FONT_MONO,
+            interface_size: INTERFACE_SIZES.2,
+            prompt_size: INTERFACE_SIZES.2 * 0.875,
+            code_size: CODE_SIZES.2,
+            terminal_size: CODE_SIZES.2,
+        }
+    }
+}
+
+/// `MIN_*_FONT_SIZE`, `MAX_*_FONT_SIZE` and the default, from `packages/contracts/src/settings.ts`.
+const INTERFACE_SIZES: (f32, f32, f32) = (12., 20., 16.);
+const PROMPT_SIZES: (f32, f32, f32) = (12., 20., 14.);
+const CODE_SIZES: (f32, f32, f32) = (10., 18., 13.);
+const TERMINAL_SIZES: (f32, f32, f32) = (8., 20., 12.);
+
+impl Fonts {
+    pub fn from_settings(settings: &Settings) -> Self {
+        let family = |key: &str| first_family(settings.get(key).as_str().unwrap_or_default());
+        let size = |key: &str, (min, max, fallback): (f32, f32, f32)| {
+            settings.get(key).as_f64().map_or(fallback, |value| (value as f32).round().clamp(min, max))
+        };
+        let separate = settings.bool(TYPOGRAPHY_ADVANCED_KEY);
+        let sans = family("fontFamilySans").unwrap_or(FONT_SANS);
+        let mono = family("fontFamilyCode").unwrap_or(FONT_MONO);
+        let interface_size = size("fontSizeInterface", INTERFACE_SIZES);
+        let code_size = size("fontSizeCode", CODE_SIZES);
+        Self {
+            sans,
+            mono,
+            composer: separate.then(|| family("fontFamilyComposer")).flatten().unwrap_or(sans),
+            // `resolveTerminalFontPreference`: the code font, or its own (default stack when unset).
+            terminal: if separate { family("fontFamilyTerminal").unwrap_or(FONT_MONO) } else { mono },
+            interface_size,
+            // `var(--text-sm)` unless set separately.
+            prompt_size: if separate { size("fontSizePrompt", PROMPT_SIZES) } else { interface_size * 0.875 },
+            code_size,
+            terminal_size: if separate { size("fontSizeTerminal", TERMINAL_SIZES) } else { code_size },
+        }
+    }
+
+    /// A family no installed font has falls back to the default, as the CSS stack does.
+    fn installed_or_default(mut self, cx: &mut App) -> Self {
+        let installed = installed_fonts(cx);
+        let known = |name: &str| name == FONT_SANS || installed.iter().any(|font| font.as_ref() == name);
+        let sans = if known(self.sans) { self.sans } else { FONT_SANS };
+        let mono = if known(self.mono) { self.mono } else { FONT_MONO };
+        if self.composer == self.sans || !known(self.composer) {
+            self.composer = sans;
+        }
+        if !known(self.terminal) {
+            self.terminal = if self.terminal == self.mono { mono } else { FONT_MONO };
+        }
+        (self.sans, self.mono) = (sans, mono);
+        self
+    }
+}
+
+/// The first family of a CSS family list, unquoted (`cssFontFamilies`).
+fn first_family(list: &str) -> Option<&'static str> {
+    let name =
+        list.split(',').map(|name| name.trim().trim_matches(['"', '\'']).trim()).find(|name| !name.is_empty())?;
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap_or_else(|poison| poison.into_inner());
+    Some(names.get(name).copied().unwrap_or_else(|| {
+        let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        names.insert(interned);
+        interned
+    }))
+}
+
+/// The platform's font families, listed once (`queryInstalledFontFamilies`).
+struct InstalledFonts(Vec<SharedString>);
+
+impl Global for InstalledFonts {}
+
+pub fn installed_fonts(cx: &mut App) -> &[SharedString] {
+    if cx.try_global::<InstalledFonts>().is_none() {
+        let names = cx.text_system().all_font_names().into_iter().filter(|name| !name.starts_with('.'));
+        cx.set_global(InstalledFonts(names.map(SharedString::from).collect()));
+    }
+    &cx.global::<InstalledFonts>().0
+}
+
+/// `isMonospaceFamily`: every probe glyph has the same advance.
+pub fn is_monospace(family: &str, cx: &App) -> bool {
+    let text_system = cx.text_system();
+    let id = text_system.resolve_font(&gpui_kit::font(SharedString::from(family.to_owned())));
+    let size = gpui_kit::px(32.);
+    let advances: Vec<f32> = ['i', 'M', 'W', '0', '@', '#', '.']
+        .into_iter()
+        .filter_map(|glyph| text_system.advance(id, size, glyph).ok().map(|advance| f32::from(advance.width)))
+        .collect();
+    advances.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.01)
+}
+
 impl Tokens {
+    /// A theme library palette over the standard tokens (`html[data-theme-id]` in `index.css`).
+    fn themed(mut self, c: &ThemeColors) -> Self {
+        self.background = c.canvas;
+        self.foreground = c.text;
+        self.card = c.surface;
+        self.popover = c.surface_overlay;
+        self.primary = c.message_action;
+        self.primary_foreground = c.message_action_foreground;
+        self.primary_hover = c.message_action_hover;
+        self.secondary = c.secondary;
+        self.muted = c.muted;
+        self.muted_foreground = c.muted_foreground;
+        self.accent = c.accent_surface;
+        self.message_surface = c.message_surface;
+        self.border = c.border;
+        self.input = c.input;
+        self.ring = c.focus;
+        self.error = c.error;
+        self.error_foreground = c.error_foreground;
+        self.warning = c.warning;
+        self.warning_foreground = c.warning_foreground;
+        self.sidebar = SidebarTokens {
+            background: c.sidebar,
+            foreground: c.sidebar_foreground,
+            muted_foreground: c.sidebar_muted_foreground,
+            secondary_label: c.secondary_label,
+            border: c.sidebar_border,
+            row_hover: c.sidebar_row_hover,
+            row_active: c.sidebar_row_active,
+            icon: c.icon_muted,
+        };
+        self
+    }
+
+    /// The tokens a theme choice paints with, before the contrast and glass settings.
+    pub fn for_choice(choice: &ThemeChoice, system_dark: bool) -> Self {
+        let (dark, colors) = choice.resolve(system_dark);
+        let base = if dark { Self::dark() } else { Self::light() };
+        colors.map_or(base, |colors| base.themed(colors))
+    }
+
     /// The `--contrast-*` tokens (`index.css`): below 100% text fades toward its surface and
     /// borders toward transparent; above it text moves toward black (light) or white
     /// (dark) and borders toward the text color.
@@ -218,6 +393,7 @@ impl Tokens {
             sidebar.row_active = with_alpha(sidebar.foreground, 0.11);
         }
         self.glass = appearance.glass / 100.;
+        self.fonts = appearance.fonts;
         self
     }
 }
@@ -234,7 +410,7 @@ fn mix_srgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
 }
 
 /// CSS `color-mix(in oklab, from, to t)` for opaque colors.
-fn mix_oklab(from: Hsla, to: Hsla, t: f32) -> Hsla {
+pub(crate) fn mix_oklab(from: Hsla, to: Hsla, t: f32) -> Hsla {
     if t <= 0. {
         return from;
     }
@@ -258,7 +434,7 @@ fn oklab(color: gpui_kit::Rgba) -> [f32; 3] {
     ]
 }
 
-fn srgb_from_oklab([l, a, b]: [f32; 3]) -> gpui_kit::Rgba {
+pub(crate) fn srgb_from_oklab([l, a, b]: [f32; 3]) -> gpui_kit::Rgba {
     let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
     let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
     let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
@@ -274,7 +450,7 @@ fn srgb_from_oklab([l, a, b]: [f32; 3]) -> gpui_kit::Rgba {
     }
 }
 
-/// Applies the contrast and glass settings now and on every later `sync`.
+/// Applies the contrast, glass and typography settings now and on every later `sync`.
 pub fn set_appearance(appearance: Appearance, window: &mut Window, cx: &mut App) {
     if cx.try_global::<Appearance>() == Some(&appearance) {
         return;
@@ -288,35 +464,38 @@ pub fn tokens(cx: &App) -> &Tokens {
     cx.global::<Tokens>()
 }
 
-/// The Appearance setting: follow the system, or force light or dark.
-#[derive(Clone, Copy, Default)]
-struct Preference(ThemePreference);
+/// The theme library pick: the appearance mode, the theme and the light/dark mix.
+#[derive(Clone, Default)]
+struct Preference(ThemeChoice);
 
 impl Global for Preference {}
 
-/// Applies the Appearance setting now and on every later `sync`.
-pub fn set_preference(preference: ThemePreference, window: &mut Window, cx: &mut App) {
-    cx.set_global(Preference(preference));
+/// Applies the theme library pick now and on every later `sync`.
+pub fn set_preference(choice: ThemeChoice, window: &mut Window, cx: &mut App) {
+    cx.set_global(Preference(choice));
     sync(window, cx);
     window.refresh();
+}
+
+pub fn system_dark(window: &Window) -> bool {
+    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
 }
 
 /// Installs the tokens for the preferred appearance and points the
 /// component library's palette at them. Call again when the appearance changes.
 pub fn sync(window: &mut Window, cx: &mut App) {
-    let dark = match cx.try_global::<Preference>().copied().unwrap_or_default().0 {
-        ThemePreference::Light => false,
-        ThemePreference::Dark => true,
-        ThemePreference::System => {
-            matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
-        }
-    };
-    let appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
-    let tokens = if dark { Tokens::dark() } else { Tokens::light() }.with_appearance(appearance);
+    let choice = cx.try_global::<Preference>().map(|preference| preference.0.clone()).unwrap_or_default();
+    let mut appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
+    appearance.fonts = appearance.fonts.installed_or_default(cx);
+    let tokens = Tokens::for_choice(&choice, system_dark(window)).with_appearance(appearance);
+    let (dark, fonts) = (tokens.dark, tokens.fonts);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |theme| {
-        theme.font_family = FONT_SANS.into();
-        theme.mono_font_family = FONT_MONO.into();
+        theme.font_family = fonts.sans.into();
+        theme.mono_font_family = fonts.mono.into();
+        // gpui-component's root sets the window's rem from this, like the web's `html` font size.
+        theme.font_size = gpui_kit::px(fonts.interface_size);
+        theme.mono_font_size = gpui_kit::px(fonts.code_size);
         theme.radius = gpui_kit::px(8.);
         theme.radius_lg = gpui_kit::px(12.);
         let colors = &mut theme.colors;
@@ -378,7 +557,7 @@ mod tests {
     fn contrast_and_glass_follow_the_web_tokens() {
         let at = |contrast, dark| {
             let base = if dark { Tokens::dark() } else { Tokens::light() };
-            base.with_appearance(Appearance { contrast, glass: 64. })
+            base.with_appearance(Appearance { contrast, glass: 64., ..Appearance::default() })
         };
         let default = at(100., true);
         assert_eq!(hex_of(default.foreground), hex_of(Tokens::dark().foreground), "100% changes nothing");
@@ -392,5 +571,51 @@ mod tests {
         // 200%: dark text all the way to white, light text to black.
         assert_eq!(hex_of(at(200., true).muted_foreground).0, 0xffffff);
         assert_eq!(hex_of(at(200., false).foreground).0, 0x000000);
+    }
+
+    #[test]
+    fn fonts_follow_the_typography_settings() {
+        let fonts = |stored: serde_json::Value| {
+            Fonts::from_settings(&Settings::layered(&crate::settings::contract().client_defaults, &stored))
+        };
+        assert_eq!(fonts(serde_json::Value::Null), Fonts::default());
+        // One monospace font for code and the terminal unless set separately; the prompt is `text-sm`.
+        let simple = fonts(serde_json::json!({
+            "fontFamilyCode": " \"JetBrains Mono\", monospace",
+            "fontFamilyTerminal": "Cascadia Mono",
+            "fontSizeInterface": 18,
+            "fontSizeCode": 99,
+        }));
+        assert_eq!((simple.mono, simple.terminal, simple.composer), ("JetBrains Mono", "JetBrains Mono", FONT_SANS));
+        assert_eq!(
+            (simple.interface_size, simple.prompt_size, simple.code_size, simple.terminal_size),
+            (18., 15.75, 18., 18.)
+        );
+        let separate = fonts(serde_json::json!({
+            TYPOGRAPHY_ADVANCED_KEY: true,
+            "fontFamilyCode": "Courier New",
+            "fontFamilyTerminal": "Cascadia Mono",
+            "fontSizePrompt": 16,
+            "fontSizeTerminal": 11,
+        }));
+        assert_eq!((separate.terminal, separate.composer), ("Cascadia Mono", FONT_SANS));
+        let unset = fonts(serde_json::json!({ TYPOGRAPHY_ADVANCED_KEY: true, "fontFamilyCode": "Courier New" }));
+        assert_eq!(unset.terminal, FONT_MONO, "an unset terminal font is the default stack, not the code font");
+        assert_eq!((separate.prompt_size, separate.terminal_size), (16., 11.));
+    }
+
+    #[test]
+    fn a_theme_repaints_the_tokens_it_maps() {
+        let grove = crate::themes::ThemeChoice { base: Some("grove".into()), ..Default::default() };
+        let colors = crate::themes::find("grove").unwrap().colors_for(true).unwrap();
+        let tokens = Tokens::for_choice(&grove, true);
+        assert!(tokens.dark);
+        assert_eq!(hex_of(tokens.background), hex_of(colors.canvas));
+        assert_eq!(hex_of(tokens.primary), hex_of(colors.message_action));
+        assert_eq!(hex_of(tokens.sidebar.row_active), hex_of(colors.sidebar_row_active));
+        assert_eq!(
+            hex_of(Tokens::for_choice(&Default::default(), false).background),
+            hex_of(Tokens::light().background)
+        );
     }
 }

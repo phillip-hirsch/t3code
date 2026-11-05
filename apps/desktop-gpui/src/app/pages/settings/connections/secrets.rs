@@ -20,7 +20,7 @@ use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, update_settings};
 use crate::app::Workspace;
 use crate::rpc::RpcClient;
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 /// What the page keeps: the session (for `providers:manage`) and revealed accounts.
 #[derive(Default)]
@@ -171,7 +171,7 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
         .min_w_0()
         .truncate()
         .cursor_pointer()
-        .font_family(FONT_MONO)
+        .font_family(t.fonts.mono)
         .text_size(px(11.))
         .text_color(t.muted_foreground)
         // The web blurs the placeholder; GPUI has no text blur, so it dims it instead.

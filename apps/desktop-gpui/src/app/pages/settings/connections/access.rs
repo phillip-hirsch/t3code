@@ -628,7 +628,7 @@ fn scope_summary(id: ElementId, scopes: &[String], t: &Tokens) -> AnyElement {
                 text_xs(v_flex().max_w(px(320.)))
                     .child(div().mb(px(4.)).font_weight(FontWeight::MEDIUM).child("Granted scopes"))
                     .children(scopes.iter().map(|scope| {
-                        div().font_family(theme::FONT_MONO).text_color(t.foreground.opacity(0.85)).child(scope.clone())
+                        div().font_family(t.fonts.mono).text_color(t.foreground.opacity(0.85)).child(scope.clone())
                     }))
             })
             .build(window, cx)

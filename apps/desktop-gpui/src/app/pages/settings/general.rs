@@ -1,17 +1,14 @@
 //! Settings sections in the general group; see `SETTINGS` in `mod.rs`.
 
-use gpui_kit::component::{h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{
-    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
-};
+use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::{Anchor, AnyElement, Context, StatefulInteractiveElement as _, Window};
 use serde_json::json;
 
-use super::widgets::{SettingRow, settings_section, subheading, switch};
+use super::widgets::{SettingRow, select_trigger, settings_section, switch};
 use crate::app::Workspace;
-use crate::settings::{ThemePreference, contract};
+use crate::app::details::thread_details_items_menu;
 use crate::theme::{self, Tokens};
+use crate::thread_details;
 
 const NOTIFICATION_MODES: &[(&str, &str)] = &[
     ("off", "Off"),
@@ -120,11 +117,11 @@ impl Workspace {
         self.settings_page("general", &view, sections, cx)
     }
 
-    /// `AppearanceSettingsPanel`: the color scheme and the Interface rows. The theme library,
-    /// thread details items and typography rows are ported separately.
+    /// `AppearanceSettingsPanel`: the theme library, the Interface rows and Typography.
     pub(super) fn render_settings_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
+        let details_row = self.thread_details_row(&t, cx);
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
         let interface = [
             row(self, SettingRow::new("setting-appearance-contrast")
@@ -139,6 +136,7 @@ impl Workspace {
                 .description("Set how wide messages and the composer can grow on large screens.")
                 .setting("chatWidth")
                 .select(CHAT_WIDTHS, 160.)),
+            row(self, details_row),
             row(self, SettingRow::new("effort-display")
                 .description("Show reasoning effort in the composer as its name, such as High, or as bars.")
                 .setting("effortDisplay")
@@ -173,106 +171,21 @@ impl Workspace {
         ];
         let fold = self.advanced_fold("appearance", advanced, cx);
         let interface = settings_section("appearance-interface", "Interface", interface.into_iter().chain([fold]), &t);
-        let sections = [self.render_color_scheme(cx), interface];
+        let sections = [self.render_theme_library(cx), interface, self.render_typography(window, cx)];
         self.settings_page("appearance", &view, sections, cx)
     }
 
-    /// "Color scheme": System, Light and Dark tiles over a wireframe of each palette.
-    fn render_color_scheme(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme::tokens(cx);
-        let current = self.client_settings.theme;
-        let title = contract().search_item("color-scheme").map_or("Color scheme", |i| i.title.as_str()).to_owned();
-        let tile = |preference: ThemePreference, label: &'static str| {
-            let active = current == preference;
-            v_flex()
-                .id(SharedString::from(format!("color-scheme-{}", preference.id())))
-                .flex_1()
-                .gap(px(6.))
-                .p(px(8.))
-                .rounded(px(12.))
-                .cursor_pointer()
-                .map(|el| {
-                    if active {
-                        el.border_2().border_color(t.ring).bg(t.accent.opacity(0.3)).p(px(7.))
-                    } else {
-                        el.border_1()
-                            .border_color(t.border.opacity(0.7))
-                            .bg(t.card.opacity(0.6))
-                            .hover(|s| s.bg(t.accent.opacity(0.1)))
-                    }
-                })
-                .on_click(cx.listener(move |this, _, window, cx| this.set_theme_preference(preference, window, cx)))
-                .child(match preference {
-                    ThemePreference::System => h_flex()
-                        .h(px(140.))
-                        .rounded(px(8.))
-                        .overflow_hidden()
-                        .child(div().flex_1().h_full().child(wireframe(&Tokens::light())))
-                        .child(div().flex_1().h_full().child(wireframe(&Tokens::dark())))
-                        .into_any_element(),
-                    ThemePreference::Light => div().h(px(140.)).child(wireframe(&Tokens::light())).into_any_element(),
-                    ThemePreference::Dark => div().h(px(140.)).child(wireframe(&Tokens::dark())).into_any_element(),
-                })
-                .child(
-                    div()
-                        .text_center()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if active { t.foreground } else { t.muted_foreground })
-                        .child(label),
-                )
-        };
-        v_flex()
-            .id("color-scheme")
-            .gap(px(12.))
-            .child(subheading(title))
-            .child(
-                h_flex()
-                    .gap(px(12.))
-                    .child(tile(ThemePreference::System, "System"))
-                    .child(tile(ThemePreference::Light, "Light"))
-                    .child(tile(ThemePreference::Dark, "Dark")),
-            )
-            .into_any_element()
+    /// `ThreadDetailsItemsRow`: "N of 12 on" opens the card's own items menu.
+    fn thread_details_row(&self, t: &Tokens, cx: &mut Context<Self>) -> SettingRow {
+        let settings = &self.client_settings.values;
+        let trigger = format!("{} of {} on", thread_details::visible_count(settings), thread_details::ITEMS.len());
+        let control = select_trigger(&"thread-details-items".into(), trigger, 160., t)
+            .dropdown_menu_with_anchor(Anchor::TopRight, thread_details_items_menu(cx.weak_entity()));
+        SettingRow::new("thread-details-items")
+            .description("Choose what the thread details card shows. You can also right-click the card.")
+            .control(control)
+            .reset((!thread_details::is_default(settings)).then(thread_details::reset))
     }
-}
-
-/// A miniature of the app in one palette: sidebar rows beside a chat with a composer.
-fn wireframe(t: &Tokens) -> impl IntoElement {
-    let line = |width: f32, color: Hsla| div().h(px(4.)).w(px(width)).rounded_full().bg(color);
-    h_flex()
-        .size_full()
-        .rounded(px(8.))
-        .overflow_hidden()
-        .border_1()
-        .border_color(t.border)
-        .bg(t.background)
-        .child(
-            v_flex()
-                .w(px(36.))
-                .h_full()
-                .gap(px(6.))
-                .p(px(6.))
-                .bg(t.sidebar.background)
-                .border_r_1()
-                .border_color(t.sidebar.border)
-                .child(line(20., t.sidebar.muted_foreground.opacity(0.5)))
-                .child(div().h(px(8.)).rounded(px(2.)).bg(t.sidebar.row_active))
-                .child(line(18., t.sidebar.muted_foreground.opacity(0.4)))
-                .child(line(22., t.sidebar.muted_foreground.opacity(0.4))),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .h_full()
-                .p(px(8.))
-                .gap(px(6.))
-                .child(h_flex().justify_end().child(div().h(px(10.)).w(px(40.)).rounded(px(4.)).bg(t.message_surface)))
-                .child(line(56., t.muted_foreground.opacity(0.5)))
-                .child(line(44., t.muted_foreground.opacity(0.4)))
-                .child(div().flex_1())
-                .child(div().h(px(18.)).rounded(px(5.)).border_1().border_color(t.border).bg(t.card)),
-        )
 }
 
 impl Workspace {

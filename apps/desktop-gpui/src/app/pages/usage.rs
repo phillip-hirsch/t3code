@@ -571,13 +571,17 @@ impl Workspace {
         let mut summary_column = v_flex().min_w_0().gap(px(20.)).child(
             v_flex()
                 .gap(px(4.))
-                .child(dim(div()).text_size(px(36.)).line_height(px(40.)).font_weight(FontWeight::SEMIBOLD).child(
-                    if tokens {
-                        logic::format_tokens(merged.total_tokens as f64)
-                    } else {
-                        logic::format_usd(merged.cost_usd)
-                    },
-                ))
+                .child(
+                    dim(div())
+                        .text_size(gpui_kit::rems(2.25))
+                        .line_height(px(40.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(if tokens {
+                            logic::format_tokens(merged.total_tokens as f64)
+                        } else {
+                            logic::format_usd(merged.cost_usd)
+                        }),
+                )
                 .child(
                     h_flex()
                         .gap(px(4.))
@@ -1367,7 +1371,7 @@ fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, now: i64, t: 
                                 .gap(px(8.))
                                 .child(
                                     div()
-                                        .text_size(px(30.))
+                                        .text_3xl()
                                         .line_height(px(36.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(format!("{}%", window.remaining_percent)),

@@ -791,7 +791,7 @@ impl Workspace {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .font_family(theme::FONT_MONO)
+                                            .font_family(t.fonts.mono)
                                             .text_size(px(11.))
                                             .child(command.clone()),
                                     )
@@ -891,7 +891,7 @@ impl Workspace {
                                                 .max_w(px(96.))
                                                 .flex_none()
                                                 .truncate()
-                                                .font_family(theme::FONT_MONO)
+                                                .font_family(t.fonts.mono)
                                                 .text_xs()
                                                 .text_color(t.muted_foreground)
                                                 .child(version),
@@ -964,7 +964,7 @@ impl Workspace {
                 )
             })
             .when_some(facts.version.clone(), |el, version| {
-                el.child(div().font_family(theme::FONT_MONO).text_xs().text_color(t.muted_foreground).child(version))
+                el.child(div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(version))
             })
             .children(advisory)
             .when(row.is_default && row.is_dirty, |el| {
@@ -1130,7 +1130,7 @@ impl Workspace {
                     div()
                         .id("provider-auth-email")
                         .cursor_pointer()
-                        .font_family(theme::FONT_MONO)
+                        .font_family(t.fonts.mono)
                         .text_size(px(11.))
                         .when(!revealed, |el| el.opacity(0.6))
                         .hover(|s| s.text_color(t.foreground))
@@ -1183,7 +1183,7 @@ impl Workspace {
                         .gap(px(6.))
                         .pt_1()
                         .child(div().text_color(t.foreground).child(message))
-                        .child(div().font_family(theme::FONT_MONO).text_size(px(11.)).child(url.clone()))
+                        .child(div().font_family(t.fonts.mono).text_size(px(11.)).child(url.clone()))
                         .child(
                             outline_button("provider-continue-auth", "Continue authentication")
                                 .xsmall()

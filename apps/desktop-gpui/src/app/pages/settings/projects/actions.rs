@@ -20,7 +20,7 @@ use super::scripts::{
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
 use crate::model::{ProjectScript, T3ProjectFile};
-use crate::theme::{self, FONT_MONO, Tokens};
+use crate::theme::{self, Tokens};
 
 const ROW_GROUP: &str = "project-action-row";
 
@@ -152,7 +152,7 @@ impl Workspace {
             .children(script.run_on_worktree_create.then(|| badge("setup")))
             .children((script.run_on_settle == Some(true)).then(|| badge("on settle")))
             .children(script.preview_url.is_some().then(|| badge("preview · desktop only")));
-        let command = div().max_w_full().truncate().font_family(FONT_MONO).child(script.command.clone());
+        let command = div().max_w_full().truncate().font_family(t.fonts.mono).child(script.command.clone());
         let shortcut = shortcut_label_for_command(
             self.server_info.keybindings_json(),
             command_for_project_script(&script.id).as_deref(),

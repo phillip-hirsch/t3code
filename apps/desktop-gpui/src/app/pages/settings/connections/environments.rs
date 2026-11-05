@@ -139,7 +139,7 @@ fn saved_environments(t: &Tokens) -> AnyElement {
         )
         .child(
             div()
-                .text_size(px(20.))
+                .text_xl()
                 .line_height(px(28.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("No saved remote environments"),

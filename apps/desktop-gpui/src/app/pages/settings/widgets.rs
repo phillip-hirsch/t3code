@@ -269,7 +269,7 @@ fn section_frame(
                     h_flex()
                         .min_w_0()
                         .gap(px(8.))
-                        .text_size(px(16.))
+                        .text_base()
                         .line_height(px(24.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
@@ -399,7 +399,7 @@ impl RowFrame {
                                     .gap(px(6.))
                                     .child(
                                         div()
-                                            .text_size(px(14.))
+                                            .text_sm()
                                             .line_height(px(20.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(t.foreground.opacity(text))
@@ -413,14 +413,16 @@ impl RowFrame {
                             .children(self.description.map(|description| {
                                 div()
                                     .max_w(px(672.))
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .line_height(px(18.))
                                     .text_color(t.muted_foreground.opacity(text))
                                     .child(description)
                             }))
-                            .children(self.status.map(|status| {
-                                div().pt(px(2.)).text_size(px(12.)).text_color(t.muted_foreground).child(status)
-                            })),
+                            .children(
+                                self.status.map(|status| {
+                                    div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(status)
+                                }),
+                            ),
                     )
                     .children(
                         self.control.map(|control| h_flex().flex_none().justify_end().gap(px(8.)).child(control)),
@@ -432,13 +434,7 @@ impl RowFrame {
 
 /// A footnote line inside a card (`px-3 py-2.5 text-xs text-muted-foreground`).
 pub(in crate::app) fn note(text: impl Into<SharedString>, t: &Tokens) -> AnyElement {
-    div()
-        .px(px(16.))
-        .py(px(10.))
-        .text_size(px(12.))
-        .text_color(t.muted_foreground)
-        .child(text.into())
-        .into_any_element()
+    div().px(px(16.)).py(px(10.)).text_xs().text_color(t.muted_foreground).child(text.into()).into_any_element()
 }
 
 /// `SettingsGroup` grouped: a bordered card whose rows are divided by hairlines.
@@ -465,7 +461,7 @@ pub(in crate::app) fn subheading(text: impl Into<SharedString>) -> impl IntoElem
     h_flex()
         .min_h(px(28.))
         .px(px(16.))
-        .text_size(px(16.))
+        .text_base()
         .line_height(px(24.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(text.into())
@@ -906,7 +902,7 @@ impl Workspace {
                             .child(
                                 div()
                                     .pb(px(6.))
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(t.muted_foreground)
                                     .child(label.clone()),
@@ -925,7 +921,7 @@ impl Workspace {
                                     h_flex()
                                         .px(px(8.))
                                         .justify_between()
-                                        .text_size(px(12.))
+                                        .text_xs()
                                         .text_color(t.muted_foreground)
                                         .child("Overridden by")
                                         .child(
@@ -943,7 +939,7 @@ impl Workspace {
                                         .px(px(8.))
                                         .py(px(4.))
                                         .gap(px(12.))
-                                        .text_size(px(14.))
+                                        .text_sm()
                                         .child(
                                             div()
                                                 .id(SharedString::from(format!("override-{id}")))
@@ -1035,8 +1031,8 @@ impl Workspace {
                             .rounded(px(6.))
                             .bg(t.muted)
                             .text_center()
-                            .font_family(theme::FONT_MONO)
-                            .text_size(px(12.))
+                            .font_family(t.fonts.mono)
+                            .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .child(format!("{value}{unit}")),
                     )
@@ -1225,7 +1221,7 @@ impl Workspace {
                                     v_flex().min_w_0().child(div().truncate().child(name.clone())).child(
                                         div()
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_xs()
                                             .text_color(t.muted_foreground)
                                             .child(location.clone()),
                                     )
@@ -1266,7 +1262,7 @@ impl Workspace {
             .gap_x(px(6.))
             .gap_y(px(4.))
             .px(px(16.))
-            .text_size(px(14.))
+            .text_sm()
             .text_color(t.muted_foreground)
             .child(h_flex().gap(px(6.)).child("Applying settings for").child(project_menu))
             .child(h_flex().gap(px(6.)).child(joiner).child(environment_menu))
@@ -1280,7 +1276,7 @@ fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoElement {
         .py(px(4.))
         .gap(px(12.))
         .rounded(px(6.))
-        .text_size(px(14.))
+        .text_sm()
         .when(layer.effective, |el| el.bg(t.foreground.opacity(0.06)))
         .child(
             div()
@@ -1351,7 +1347,7 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
         .border_1()
         .border_color(t.input)
         .bg(if t.dark { t.input.opacity(0.32) } else { t.background })
-        .text_size(px(14.))
+        .text_sm()
         .font_weight(FontWeight::NORMAL)
         .text_color(t.foreground)
         .child(
@@ -1374,7 +1370,7 @@ fn scope_trigger(id: &'static str, label: String, t: &Tokens) -> Button {
         .rounded(px(8.))
         .border_1()
         .border_color(t.input)
-        .text_size(px(14.))
+        .text_sm()
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.foreground)
         .child(

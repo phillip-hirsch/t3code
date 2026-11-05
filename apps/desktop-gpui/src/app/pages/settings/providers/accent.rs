@@ -343,12 +343,9 @@ impl AccentPicker {
             .bg(t.popover)
             .child(plane)
             .child(
-                v_flex()
-                    .gap_3()
-                    .p_3()
-                    .child(hue)
-                    .child(Input::new(&self.hex).small().font_family(theme::FONT_MONO))
-                    .when(!has_value, |el| {
+                v_flex().gap_3().p_3().child(hue).child(Input::new(&self.hex).small().font_family(t.fonts.mono)).when(
+                    !has_value,
+                    |el| {
                         el.child(Button::new("accent-add").primary().compact().label("Add color").on_click(
                             cx.listener(|this, _, window, cx| {
                                 let color = this.current();
@@ -356,7 +353,8 @@ impl AccentPicker {
                                 this.set_open(false, window, cx);
                             }),
                         ))
-                    }),
+                    },
+                ),
             )
             .when(has_value, |el| {
                 el.child(

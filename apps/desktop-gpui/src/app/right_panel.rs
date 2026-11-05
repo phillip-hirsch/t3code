@@ -948,7 +948,7 @@ impl Workspace {
                         h_flex()
                             .mr_1()
                             .gap_1()
-                            .font_family(theme::FONT_MONO)
+                            .font_family(tokens.fonts.mono)
                             .text_size(px(11.))
                             .child(div().text_color(git::addition_color(tokens)).child(format!("+{additions}")))
                             .child(div().text_color(git::deletion_color(tokens)).child(format!("-{deletions}")))
@@ -1053,12 +1053,12 @@ impl Workspace {
                     )
                 })
                 .child(
-                    // Pierre's default size for headers and code.
+                    // `--diffs-font-size`, the Code font size.
                     Diff::new(&self.right_panel.diff)
                         .soft_wrap(self.right_panel.wrap)
                         .flex_1()
                         .min_h_0()
-                        .text_size(px(13.)),
+                        .text_size(px(tokens.fonts.code_size)),
                 )
                 .into_any_element(),
         };

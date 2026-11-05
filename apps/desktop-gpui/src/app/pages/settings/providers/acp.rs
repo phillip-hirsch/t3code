@@ -28,7 +28,7 @@ use super::add::{is_configured_acp_agent, settings_row};
 use super::drivers::DRIVERS;
 use crate::app::Workspace;
 use crate::rpc::RpcError;
-use crate::theme::{FONT_MONO, Tokens, tokens};
+use crate::theme::{Tokens, tokens};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// `ACP_REGISTRY_MAX_AGENTS`.
@@ -316,19 +316,13 @@ impl AcpRegistrySearch {
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(agent.name.clone()),
-                        )
+                        .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(agent.name.clone()))
                         .when(!agent.description.is_empty(), |col| {
                             col.child(
                                 div()
                                     .mt(px(2.))
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .text_color(t.muted_foreground)
                                     .child(agent.description.clone()),
                             )
@@ -408,7 +402,7 @@ impl Render for AcpRegistrySearch {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(14.))
+                    .text_sm()
                     .text_color(t.muted_foreground)
                     .child("Searching the registry...")
                     .into_any_element(),
@@ -424,14 +418,8 @@ impl Render for AcpRegistrySearch {
                     .border_1()
                     .border_dashed()
                     .border_color(t.border)
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child("No compatible agents found"))
-                    .child(
-                        div()
-                            .mt(px(4.))
-                            .text_size(px(12.))
-                            .text_color(t.muted_foreground)
-                            .child("Try a broader search."),
-                    )
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("No compatible agents found"))
+                    .child(div().mt(px(4.)).text_xs().text_color(t.muted_foreground).child("Try a broader search."))
                     .into_any_element(),
             ),
             Some(results) => {
@@ -468,7 +456,7 @@ impl Render for AcpRegistrySearch {
                     .border_1()
                     .border_color(t.error.opacity(0.32))
                     .bg(t.error.opacity(0.04))
-                    .text_size(px(14.))
+                    .text_sm()
                     .text_color(t.error_foreground)
                     .child(error)
             }))
@@ -923,13 +911,13 @@ impl AcpSessions {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_xs()
                                             .child(session.title.clone().unwrap_or_else(|| session.session_id.clone())),
                                     )
                                     .child(
                                         div()
                                             .truncate()
-                                            .font_family(FONT_MONO)
+                                            .font_family(t.fonts.mono)
                                             .text_size(px(10.))
                                             .text_color(t.muted_foreground)
                                             .child(session.session_id.clone()),
@@ -1054,7 +1042,7 @@ impl AcpSessions {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(provider.provider_id.clone()),
                             )
@@ -1175,14 +1163,12 @@ impl AcpSessions {
                 .justify_between()
                 .gap(px(8.))
                 .child(
-                    v_flex()
-                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Agent providers"))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(t.muted_foreground)
-                                .child("Configure non-secret routing. Headers are write-only."),
-                        ),
+                    v_flex().child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Agent providers")).child(
+                        div()
+                            .text_xs()
+                            .text_color(t.muted_foreground)
+                            .child("Configure non-secret routing. Headers are write-only."),
+                    ),
                 )
                 .child(
                     Button::new("acp-list-providers")
