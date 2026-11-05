@@ -3,6 +3,7 @@ mod assets;
 mod backend;
 mod composer_search;
 mod composer_text;
+mod desktop;
 mod device;
 mod inbox;
 mod keybindings;
@@ -11,8 +12,8 @@ mod model_label;
 mod new_thread;
 mod notifications;
 mod preview;
-mod pull_request_detail;
 mod project_groups;
+mod pull_request_detail;
 mod pull_requests;
 mod quit_shortcut;
 mod requests;
@@ -30,7 +31,7 @@ mod work_log;
 
 use std::sync::OnceLock;
 
-use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui_kit::{AppContext as _, TitlebarOptions, WindowOptions, point, px, size};
 
 /// Network and process I/O run here; GPUI owns the UI thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -53,6 +54,17 @@ fn main() {
         std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // A second launch hands its command line to the running app and exits.
+    let launches = match settings::t3_home() {
+        Some(home) => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            match desktop::activation::claim(&home, &args, runtime().handle()) {
+                desktop::activation::Instance::Forwarded => return,
+                desktop::activation::Instance::Primary(launches) => Some(launches),
+            }
+        }
+        None => None,
+    };
     gpui_kit::application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
         // Windows shows OS notifications under this identity.
@@ -64,6 +76,9 @@ fn main() {
         app::keymap::install(&[], cx);
         cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-z", app::UndoThreadAction, None)]);
         cx.bind_keys(app::terminal_key_bindings());
+        let desktop = desktop::Desktop::load(launches, cx);
+        let window_bounds = desktop.window_bounds(cx);
+        cx.set_global(desktop);
         // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {
@@ -71,7 +86,7 @@ fn main() {
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.), px(13.))),
             }),
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))),
+            window_bounds: Some(window_bounds),
             window_min_size: Some(size(px(840.), px(620.))),
             ..Default::default()
         };

@@ -30,6 +30,7 @@ mod composer_menu;
 mod composer_meter;
 mod composer_plan;
 mod context_strip;
+mod desktop;
 mod details;
 mod git;
 mod header;
@@ -214,6 +215,8 @@ pub struct Workspace {
     /// Thread notifications: toasts, OS notifications and sounds.
     alerts: alerts::AlertState,
     quit: quit::QuitState,
+    /// Window bounds persistence and other desktop shell state.
+    desktop: desktop::DesktopShell,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -254,6 +257,9 @@ impl Workspace {
                 }
             }),
         ];
+        let (desktop, desktop_subscriptions) = desktop::DesktopShell::new(window, cx);
+        let mut subscriptions = subscriptions;
+        subscriptions.extend(desktop_subscriptions);
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
@@ -332,6 +338,7 @@ impl Workspace {
             terminals: terminal::Terminals::default(),
             alerts: Default::default(),
             quit: Default::default(),
+            desktop,
             _subscriptions: subscriptions,
         }
     }
@@ -540,6 +547,7 @@ impl Workspace {
                     this.shell_retried = false;
                 }
                 this.land(window, cx);
+                this.open_pending_links(window, cx);
                 this.observe_alerts(window, cx);
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);

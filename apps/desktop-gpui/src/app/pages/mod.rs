@@ -23,6 +23,8 @@ pub(super) fn settings_sections() -> impl Iterator<Item = (Option<&'static str>,
 pub(super) enum Page {
     PullRequests,
     Usage,
+    /// An app link being opened (`/_chat/new`); its state is `DesktopShell::link_page`.
+    Link,
 }
 
 impl Page {
@@ -30,6 +32,7 @@ impl Page {
         match self {
             Page::PullRequests => "Pull requests",
             Page::Usage => "Usage",
+            Page::Link => "T3 Code",
         }
     }
 
@@ -116,7 +119,7 @@ impl Workspace {
         match self.page {
             Some(Page::PullRequests) => self.pull_requests_opened(cx),
             Some(Page::Usage) => self.usage_opened(cx),
-            None => {}
+            Some(Page::Link) | None => {}
         }
     }
 
@@ -178,6 +181,7 @@ impl Workspace {
         match self.page? {
             Page::PullRequests => Some(self.render_pull_requests(window, cx)),
             Page::Usage => None,
+            Page::Link => Some(self.render_link_page(window, cx)),
         }
     }
 

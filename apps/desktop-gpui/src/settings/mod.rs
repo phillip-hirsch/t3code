@@ -255,7 +255,7 @@ impl ClientSettings {
     }
 }
 
-fn write_atomically(path: &Path, document: &Value) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, document: &Value) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -265,13 +265,16 @@ fn write_atomically(path: &Path, document: &Value) -> std::io::Result<()> {
 }
 
 /// The T3 home rule of `backend::LaunchConfig::from_env`: `T3CODE_HOME`, else `~/.t3-gpui`.
-fn client_settings_path() -> Option<PathBuf> {
-    let home = std::env::var_os("T3CODE_HOME").map(PathBuf::from).or_else(|| {
+pub(crate) fn t3_home() -> Option<PathBuf> {
+    std::env::var_os("T3CODE_HOME").map(PathBuf::from).or_else(|| {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(|home| PathBuf::from(home).join(".t3-gpui"))
-    })?;
-    Some(home.join("userdata").join("client-settings.json"))
+    })
+}
+
+fn client_settings_path() -> Option<PathBuf> {
+    Some(t3_home()?.join("userdata").join("client-settings.json"))
 }
 
 #[cfg(test)]
