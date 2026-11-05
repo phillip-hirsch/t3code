@@ -5,6 +5,7 @@ mod agents;
 mod code;
 mod connections;
 mod general;
+mod providers;
 mod system;
 
 use gpui_kit::{

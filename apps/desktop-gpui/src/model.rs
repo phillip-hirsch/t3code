@@ -173,6 +173,9 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The raw `ServerSettings` and `ServerProvider` records, for settings pages that edit them.
+    pub settings_json: Value,
+    pub providers_json: Vec<Value>,
 }
 
 impl ServerInfo {
@@ -181,6 +184,7 @@ impl ServerInfo {
             "snapshot" => {
                 let config = &event["config"];
                 self.providers = lossy(&config["providers"])?;
+                self.providers_json = config["providers"].as_array().cloned().unwrap_or_default();
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
@@ -189,7 +193,10 @@ impl ServerInfo {
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
             }
-            "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
+            "providerStatuses" => {
+                self.providers = lossy(&event["payload"]["providers"])?;
+                self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
+            }
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
             _ => {}
         }
@@ -205,6 +212,7 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.settings_json = settings.clone();
         Ok(())
     }
 
