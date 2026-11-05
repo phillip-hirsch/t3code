@@ -194,7 +194,7 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
             command.env("T3CODE_CLI_PATH", launcher);
         }
         Some(Err(error)) => log::warn!("could not install t3 launcher: {error:#}"),
-        None => {}
+        None => log::warn!("no t3 launcher: could not find {} or the server entry", config.node.display()),
     }
     let mut child = command
         .spawn()

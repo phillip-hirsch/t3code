@@ -79,7 +79,7 @@ fn which(program: &Path) -> Option<PathBuf> {
     } else {
         vec![String::new()]
     };
-    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+    std::env::split_paths(&crate::desktop::shell_env::search_path()?).find_map(|dir| {
         extensions.iter().map(|ext| dir.join(format!("{}{ext}", program.display()))).find(|path| path.is_file())
     })
 }
@@ -299,7 +299,7 @@ pub fn state() -> CliState {
             .into_iter()
             .map(|dir| dir.join("t3"))
             .find(|link| link.is_symlink() && is_our_launcher(link));
-        let first = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        let first = std::env::split_paths(&crate::desktop::shell_env::search_path().unwrap_or_default())
             .map(|dir| dir.join("t3"))
             .find(|candidate| candidate.is_file());
         let ours = |path: &PathBuf| {
@@ -345,7 +345,8 @@ fn try_install() -> Result<CliState> {
                 launcher.display()
             );
         }
-        let on_path: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        let on_path: Vec<PathBuf> =
+            std::env::split_paths(&crate::desktop::shell_env::search_path().unwrap_or_default()).collect();
         let (first, rest): (Vec<_>, Vec<_>) = unix_candidates().into_iter().partition(|dir| on_path.contains(dir));
         let linked = first.into_iter().chain(rest).any(|dir| {
             std::fs::create_dir_all(&dir).is_ok() && std::os::unix::fs::symlink(&launcher, dir.join("t3")).is_ok()

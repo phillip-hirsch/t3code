@@ -71,9 +71,27 @@ pub struct Patch {
     pub prepared: bool,
 }
 
+impl Patch {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+}
+
+static PROBED: tokio::sync::OnceCell<Patch> = tokio::sync::OnceCell::const_new();
+
+/// The server's environment, probed once per run like Electron's startup patch of
+/// `process.env`. Takes up to a few seconds the first time; run it off the UI thread.
+pub async fn probe() -> &'static Patch {
+    PROBED.get_or_init(probe_login_shell).await
+}
+
+/// The `PATH` that programs the app starts are found on: the probed one, else the app's own.
+pub fn search_path() -> Option<std::ffi::OsString> {
+    PROBED.get().and_then(|patch| patch.var("PATH")).map(Into::into).or_else(|| std::env::var_os("PATH"))
+}
+
 /// Probes the login shell (then `launchctl` on macOS) and works out the server's environment.
-/// Blocking for up to a few seconds; run it off the UI thread.
-pub async fn probe() -> Patch {
+async fn probe_login_shell() -> Patch {
     if cfg!(windows) {
         return Patch::default();
     }

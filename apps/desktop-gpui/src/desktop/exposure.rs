@@ -106,7 +106,13 @@ pub struct TailscaleHttps {
 /// not running here.
 pub fn tailscale_https(serve_enabled: bool, serve_port: u16) -> Option<TailscaleHttps> {
     let executable = if cfg!(windows) { "tailscale.exe" } else { "tailscale" };
-    let output = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    // From Finder the app's own PATH is bare; look where the login shell would.
+    #[cfg(not(windows))]
+    if let Some(path) = crate::desktop::shell_env::search_path() {
+        command.env("PATH", path);
+    }
+    let output = command
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
