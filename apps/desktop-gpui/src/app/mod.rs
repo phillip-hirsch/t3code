@@ -35,6 +35,7 @@ mod details;
 mod git;
 mod header;
 mod inspector;
+mod keep_alive;
 pub(crate) mod keymap;
 mod layout;
 mod message_actions;
@@ -217,6 +218,8 @@ pub struct Workspace {
     quit: quit::QuitState,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
+    /// Running threads synced in the background.
+    keep_alive: keep_alive::KeepAlive,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -339,6 +342,7 @@ impl Workspace {
             alerts: Default::default(),
             quit: Default::default(),
             desktop,
+            keep_alive: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -548,6 +552,7 @@ impl Workspace {
                 }
                 this.land(window, cx);
                 this.open_pending_links(window, cx);
+                this.keep_running_threads(cx);
                 this.observe_alerts(window, cx);
                 this.observe_inbox_while_hidden();
                 this.notify_sidebar(cx);
@@ -712,9 +717,14 @@ impl Workspace {
         self.page = None;
         self.stash_composer(cx);
         self.target = Some(Target::Thread(thread_id.clone()));
+        if let Some(old) = self.thread.take() {
+            self.retire_thread(old.id, old.state, cx);
+        }
+        let state = self.take_warm_thread(&thread_id).unwrap_or_default();
+        let resumed = state.projection.is_some();
         self.thread = Some(OpenThread {
             id: thread_id.clone(),
-            state: ThreadState::default(),
+            state,
             snapshot_failed: false,
             retried: false,
             _subscription: None,
@@ -723,6 +733,9 @@ impl Workspace {
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
+        if resumed {
+            self.refresh_rows(cx);
+        }
         self.load_previews(&thread_id, window, cx);
         self.open_visit(&thread_id, cx);
         self.focus_composer(window, cx);
@@ -735,7 +748,9 @@ impl Workspace {
         self.page = None;
         self.stash_composer(cx);
         self.target = Some(Target::Draft { project_id });
-        self.thread = None;
+        if let Some(old) = self.thread.take() {
+            self.retire_thread(old.id, old.state, cx);
+        }
         self.model_override = None;
         self.runtime_mode_override = None;
         self.restore_composer(window, cx);
