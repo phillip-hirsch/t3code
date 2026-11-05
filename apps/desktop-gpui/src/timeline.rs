@@ -3,9 +3,8 @@
 //! and `deriveMessagesTimelineRows` in
 //! `apps/web/src/components/chat/MessagesTimeline.logic.ts`.
 //!
-//! Not ported yet: worktree-setup rows, grouped subagent batches ("3 subagents"),
-//! the separate assistant-meta row after trailing work, and the compaction-run
-//! special cases.
+//! Not ported yet: the idle compaction titles and the resume-compaction age
+//! ("Context compacted after 2h idle").
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
