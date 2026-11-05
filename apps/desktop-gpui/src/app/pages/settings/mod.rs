@@ -6,6 +6,7 @@ mod agents;
 mod chat;
 pub(in crate::app) mod code;
 mod connections;
+mod diagnostics;
 mod diffs;
 mod fields;
 mod general;
@@ -411,7 +412,7 @@ impl Workspace {
         self.settings_ui.focus_on_render = true;
     }
 
-    fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
+    pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
         self.settings_ui.target = None;
         self.settings_ui.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.open_settings(id, cx);
@@ -716,8 +717,8 @@ impl Workspace {
             "connections" => self.render_settings_connections(window, cx),
             "access" => self.render_settings_access(window, cx),
             "secrets" => self.render_settings_secrets(window, cx),
-            // Diagnostics opens from Maintenance; its section agent gives it a page of its own.
-            "maintenance" | "diagnostics" => self.render_settings_maintenance(window, cx),
+            "maintenance" => self.render_settings_maintenance(window, cx),
+            "diagnostics" => self.render_settings_diagnostics(window, cx),
             "labs" => self.render_settings_labs(window, cx),
             "about" => self.render_settings_about(window, cx),
             "archived" => self.render_settings_archived(window, cx),
