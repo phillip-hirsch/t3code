@@ -51,7 +51,7 @@ impl Workspace {
     fn render_device_setting_row(&self, spec: &'static SettingRowSpec, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let Control::Switch { default } = spec.control;
-        let value = self.server_info.settings.get(spec.path).and_then(Value::as_bool).unwrap_or(default);
+        let value = self.server_info.settings.get(spec.path).as_bool().unwrap_or(default);
         let reset = (value != default).then(|| {
             Button::new("reset")
                 .ghost()

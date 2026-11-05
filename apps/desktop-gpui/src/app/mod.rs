@@ -118,6 +118,9 @@ pub struct Workspace {
     page: Option<pages::Page>,
     /// The Settings modal's open section.
     settings: Option<SharedString>,
+    settings_ui: pages::settings::SettingsUi,
+    /// This device's settings; the server's are in `server_info.settings`.
+    client_settings: crate::settings::ClientSettings,
     history: pages::History,
     devices: crate::device::Devices,
     _subscriptions: Vec<Subscription>,
@@ -142,6 +145,8 @@ impl Workspace {
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
         ];
+        let client_settings = crate::settings::ClientSettings::load();
+        crate::theme::set_preference(client_settings.theme, window, cx);
         Self {
             connection: Connection::Starting,
             endpoint: None,
@@ -182,6 +187,8 @@ impl Workspace {
             landed: false,
             page: None,
             settings: None,
+            settings_ui: pages::settings::SettingsUi::new(window, cx),
+            client_settings,
             history: pages::History::default(),
             devices: Default::default(),
             _subscriptions: subscriptions,
@@ -803,8 +810,9 @@ impl Render for Workspace {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
-                    this.close_settings(cx);
-                    cx.stop_propagation();
+                    if this.settings_escape(window, cx) {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 this.escape_details_popover(event, window, cx);

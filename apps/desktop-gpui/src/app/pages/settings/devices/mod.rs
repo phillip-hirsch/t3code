@@ -61,7 +61,7 @@ impl Workspace {
         let state = self.devices.state.as_ref().unwrap_or(&empty);
         let connected = self.client().is_some();
         let loaded = connected && self.devices.state.is_some();
-        let setting = |key: &str| self.server_info.settings.get(key).and_then(Value::as_bool) == Some(true);
+        let setting = |key: &str| self.server_info.settings.bool(key);
         let (enabled, agent_enabled) = (setting("enableDeviceSupport"), setting("enableAgentDeviceAccess"));
         let busy = state.readiness().busy;
         let pending = self.devices.pending;

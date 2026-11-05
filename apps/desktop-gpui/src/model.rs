@@ -216,8 +216,9 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
-    /// The raw `ServerSettings`, for settings rows not yet modelled above.
-    pub settings: Value,
+    /// The full `ServerSettings` over the contract's defaults; see `crate::settings`.
+    pub settings: crate::settings::Settings,
+    pub environment_id: Option<String>,
     /// The raw `config` of the last snapshot, its `settings` kept current by `settingsUpdated`.
     pub config: Value,
     /// The raw `ServerProvider` records, for settings pages that edit them.
@@ -238,6 +239,7 @@ impl ServerInfo {
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
+                self.environment_id = text("/environment/environmentId");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
                 self.platform_os = text("/environment/platform/os");
@@ -261,7 +263,8 @@ impl ServerInfo {
         Ok(())
     }
 
-    fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+    pub fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.settings = crate::settings::Settings::layered(&crate::settings::contract().server_defaults, settings);
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
         self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
@@ -270,7 +273,6 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
-        self.settings = settings.clone();
         Ok(())
     }
 

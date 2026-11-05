@@ -6,6 +6,8 @@
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::{App, Global, Hsla, Window, WindowAppearance, hsla, rgb};
 
+use crate::settings::ThemePreference;
+
 pub const FONT_SANS: &str = "Inter";
 pub const FONT_MONO: &str = "Consolas";
 
@@ -166,10 +168,29 @@ pub fn tokens(cx: &App) -> &Tokens {
     cx.global::<Tokens>()
 }
 
-/// Installs the tokens for the window's appearance and points the
+/// The Appearance setting: follow the system, or force light or dark.
+#[derive(Clone, Copy, Default)]
+struct Preference(ThemePreference);
+
+impl Global for Preference {}
+
+/// Applies the Appearance setting now and on every later `sync`.
+pub fn set_preference(preference: ThemePreference, window: &mut Window, cx: &mut App) {
+    cx.set_global(Preference(preference));
+    sync(window, cx);
+    window.refresh();
+}
+
+/// Installs the tokens for the preferred appearance and points the
 /// component library's palette at them. Call again when the appearance changes.
 pub fn sync(window: &mut Window, cx: &mut App) {
-    let dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+    let dark = match cx.try_global::<Preference>().copied().unwrap_or_default().0 {
+        ThemePreference::Light => false,
+        ThemePreference::Dark => true,
+        ThemePreference::System => {
+            matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+        }
+    };
     let tokens = if dark { Tokens::dark() } else { Tokens::light() };
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |theme| {

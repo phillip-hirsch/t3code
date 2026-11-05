@@ -1,0 +1,2324 @@
+{
+ "serverDefaults": {
+  "favorites": null,
+  "providerModelPreferences": null,
+  "worktreeCleanup": null,
+  "storageCleanup": {
+   "worktreeKeepWhen": "uncommitted-changes",
+   "worktreeAfterDays": null,
+   "worktreeSettledAfterDays": null,
+   "worktreeOnMerge": false,
+   "worktreeOnDelete": false,
+   "worktreeUnchanged": false,
+   "browserArtifactsAfterDays": null,
+   "logsAfterDays": null
+  },
+  "worktreesDirectory": "",
+  "previousWorktreesDirectories": [],
+  "responseStreamingMode": "paragraph",
+  "enableProviderUpdateChecks": true,
+  "continueThreadsAfterServerUpdate": true,
+  "enableAgentBrowserAccess": true,
+  "projectAgentBrowserAccessOverrides": {},
+  "defaultAutoPull": false,
+  "defaultProjectScripts": [],
+  "projectScriptOverrides": {},
+  "projectAutoPullOverrides": {},
+  "defaultModelSelection": null,
+  "fallbackModelSelection": null,
+  "defaultRuntimeMode": "full-access",
+  "projectSettingsOverrides": {},
+  "projectSettingsFolded": false,
+  "enableAgentDeviceAccess": false,
+  "enableDeviceSupport": false,
+  "deviceOnboardingCompleted": false,
+  "deviceHosts": [],
+  "easDeviceHosts": [],
+  "simlockDeviceHosts": [],
+  "simlockDeviceHostsEnabled": false,
+  "sidebarAutoSettleAfterDays": 3,
+  "compactIdleThreads": false,
+  "snoozeLimitedThreads": false,
+  "autoResumeLimitedThreads": false,
+  "snoozePresets": [
+   {
+    "kind": "after",
+    "minutes": 60
+   },
+   {
+    "kind": "after",
+    "minutes": 180
+   },
+   {
+    "kind": "at",
+    "day": "today",
+    "time": "18:00"
+   },
+   {
+    "kind": "at",
+    "day": "tomorrow",
+    "time": "09:00"
+   },
+   {
+    "kind": "at",
+    "day": "monday",
+    "time": "09:00"
+   }
+  ],
+  "hiddenThreadTags": [],
+  "hideTaggedThreads": false,
+  "guestSharingEnabled": false,
+  "linkedEnvironmentsEnabled": false,
+  "sidebarAutoSettleKeepPullRequests": false,
+  "sidebarAutoSettleOnMerge": true,
+  "backgroundActivity": {
+   "schemaVersion": 1,
+   "profile": "balanced",
+   "overrides": {}
+  },
+  "automaticGitFetchInterval": 30000,
+  "providerHealthRefreshInterval": 300000,
+  "backgroundActivityProfile": "balanced",
+  "defaultTheme": "",
+  "defaultThemeSetAt": "",
+  "environmentIcon": null,
+  "newWorktreesStartFromOrigin": true,
+  "worktreeSubmodules": null,
+  "addProjectBaseDirectory": "",
+  "ghqCloneLayout": false,
+  "textGenerationModelSelection": {
+   "instanceId": "codex",
+   "model": "gpt-6-luna",
+   "options": [
+    {
+     "id": "reasoningEffort",
+     "value": "low"
+    }
+   ]
+  },
+  "threadTitleInstructions": "",
+  "branchNamingMode": "static",
+  "branchNamePrefix": "t3",
+  "branchNameInstructions": "",
+  "removeAgentCreditsOnMerge": false,
+  "sourceControlWritingStyle": {
+   "mode": "repo_conventions",
+   "customInstructions": "",
+   "followChangeRequestTemplates": true
+  },
+  "sourceControlWriterModelSelection": null,
+  "reviewGuidesEnabled": false,
+  "reviewGuideModelSelection": null,
+  "reviewGuideInstructions": "",
+  "pullRequestMergeMethod": null,
+  "providerInstances": {},
+  "observability": {
+   "otlpTracesUrl": "",
+   "otlpMetricsUrl": "",
+   "otlpLogsUrl": ""
+  },
+  "sourceControlHosts": {},
+  "usageLimitSources": {},
+  "secretProviders": {},
+  "cursorKeychainUsageEnabled": false,
+  "usagePriceOverrides": {},
+  "usageModelAliases": {}
+ },
+ "clientDefaults": {
+  "notificationMode": "off",
+  "inAppNotificationsEnabled": false,
+  "diffColorScheme": "red-green",
+  "chatWidth": "comfortable",
+  "effortDisplay": "label",
+  "loadBalancingEnabled": false,
+  "loadBalancingWeights": {},
+  "appearanceContrast": 100,
+  "panelAnimationDurationMs": 0,
+  "browserDefaultViewport": {
+   "_tag": "fill"
+  },
+  "browserDefaultZoomFactor": 1,
+  "browserDefaultAppearance": "system",
+  "browserRecordingFrameRate": 30,
+  "browserRecordingShowKeyPresses": false,
+  "browserRecordingShowMousePresses": false,
+  "browserLinkTarget": "system",
+  "browserSearchEngine": "duckduckgo",
+  "browserCustomSearchUrl": "",
+  "browserAutoShowFloatingPreview": true,
+  "browserProfiles": [],
+  "browserDefaultProfileId": "default",
+  "confirmQuit": "hold",
+  "confirmThreadArchive": false,
+  "confirmThreadDelete": true,
+  "confirmThreadUnpin": false,
+  "diffFilesCollapsed": true,
+  "diffIgnoreWhitespace": true,
+  "diffLayout": "stacked",
+  "environmentIdentificationMode": "artwork",
+  "glassOpacity": 80,
+  "fontSizeInterface": 16,
+  "fontSizePrompt": 14,
+  "fontSizeCode": 13,
+  "fontSizeTerminal": 12,
+  "fontFamilyCode": "",
+  "fontFamilyComposer": "",
+  "fontFamilySans": "",
+  "fontFamilyTerminal": "",
+  "fontSmoothing": true,
+  "onboardingCompletedAt": null,
+  "persistComposerContextStrip": false,
+  "favorites": [],
+  "providerModelPreferences": {},
+  "pullRequestMergeMethodOverrides": {},
+  "pullRequestLinksOpenInApp": true,
+  "planModeEnabled": false,
+  "contextWindowMeterEnabled": false,
+  "composerRichTextEnabled": true,
+  "sendShortcut": "enter",
+  "followUpBehavior": "steer",
+  "proactivePanelsEnabled": false,
+  "showSkillsInSlashMenu": true,
+  "boringSidebarEnabled": false,
+  "boringSidebarMultilineRows": false,
+  "threadDetailsUsageEnabled": false,
+  "threadDetailsItems": {},
+  "legacySidebarEnabled": false,
+  "sidebarWorkingShelfEnabled": true,
+  "sidebarProjectGroupingMode": "repository",
+  "sidebarProjectGroupingOverrides": {},
+  "sidebarProjectSortOrder": "updated_at",
+  "sidebarThreadSortOrder": "updated_at",
+  "timestampFormat": "locale",
+  "snapShotEnabled": false,
+  "snapShotIncludeAccessibility": true,
+  "snapShotShortcut": {
+   "kind": "both-shift-keys"
+  },
+  "snapShotPlaySound": true,
+  "snapShotSound": "soft-pop",
+  "snapShotFlash": true,
+  "snapShotAnimations": true,
+  "wordWrap": true,
+  "mathRenderingEnabled": false
+ },
+ "projectScopedKeys": [
+  "worktreeCleanup",
+  "defaultModelSelection",
+  "defaultRuntimeMode",
+  "defaultThreadEnvMode",
+  "newWorktreesStartFromOrigin",
+  "worktreeSubmodules",
+  "defaultAutoPull",
+  "defaultProjectScripts",
+  "enableAgentBrowserAccess",
+  "enableAgentDeviceAccess",
+  "textGenerationModelSelection",
+  "threadTitleInstructions",
+  "sourceControlWriterModelSelection",
+  "reviewGuideModelSelection",
+  "reviewGuideInstructions",
+  "sourceControlWritingStyle",
+  "removeAgentCreditsOnMerge",
+  "branchNamingMode",
+  "branchNamePrefix",
+  "branchNameInstructions",
+  "pullRequestMergeMethod",
+  "sidebarAutoSettleOnMerge",
+  "sidebarAutoSettleAfterDays",
+  "sidebarAutoSettleKeepPullRequests",
+  "continueThreadsAfterServerUpdate",
+  "responseStreamingMode"
+ ],
+ "nullableOverrideKeys": [
+  "defaultModelSelection",
+  "sourceControlWriterModelSelection",
+  "reviewGuideModelSelection",
+  "pullRequestMergeMethod",
+  "sidebarAutoSettleAfterDays"
+ ],
+ "fileBackedBuiltIns": {
+  "defaultThreadEnvMode": "local",
+  "worktreeSubmodules": "recursive"
+ },
+ "search": [
+  {
+   "id": "storage-worktree-keep-when",
+   "targetId": "storage-worktrees",
+   "title": "Keep worktrees with local changes",
+   "to": "worktrees",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "any local files uncommitted changes edited tracked files ignored env build output cleanup"
+   ]
+  },
+  {
+   "id": "storage-delete-now",
+   "title": "Delete now",
+   "to": "maintenance",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "storage cleanup run now results report removed kept failed"
+   ]
+  },
+  {
+   "id": "storage-worktrees",
+   "title": "Worktree cleanup",
+   "to": "worktrees",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "disk storage automatic delete deleted archived threads old inactive merged settled unchanged worktrees retention days project inherit off custom"
+   ]
+  },
+  {
+   "id": "storage-worktrees-location",
+   "title": "Worktree location",
+   "to": "worktrees",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "worktree location folder directory path drive external disk"
+   ]
+  },
+  {
+   "id": "storage-artifacts",
+   "title": "Artifacts and logs",
+   "to": "maintenance",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "disk storage delete old browser artifacts screenshots captures rotated logs cleanup retention"
+   ]
+  },
+  {
+   "id": "project-defaults",
+   "title": "Project defaults and overrides",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "model workspace environments projects inheritance checkout"
+   ]
+  },
+  {
+   "id": "project-overview",
+   "title": "Project overview",
+   "to": "projects",
+   "searchTerms": [
+    "name icon emoji image checkout remove delete"
+   ]
+  },
+  {
+   "id": "default-model",
+   "title": "Default model",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "new thread project provider reasoning effort"
+   ]
+  },
+  {
+   "id": "fallback-model",
+   "title": "Fallback model",
+   "to": "threads",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "fallback agent provider out of usage new threads"
+   ],
+   "environmentOnly": true
+  },
+  {
+   "id": "default-permissions",
+   "title": "Permissions",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "new thread default runtime mode supervised approvals auto accept edits full access"
+   ]
+  },
+  {
+   "id": "color-scheme",
+   "title": "Color scheme",
+   "to": "appearance",
+   "searchTerms": [
+    "appearance light dark system mode"
+   ],
+   "targetId": "appearance"
+  },
+  {
+   "id": "theme",
+   "title": "Themes",
+   "to": "appearance",
+   "searchTerms": [
+    "appearance colors palette custom import"
+   ],
+   "targetId": "appearance"
+  },
+  {
+   "id": "setting-appearance-contrast",
+   "title": "Contrast",
+   "to": "appearance",
+   "searchTerms": [
+    "colors borders interface"
+   ]
+  },
+  {
+   "id": "setting-glass-opacity",
+   "title": "Glass opacity",
+   "to": "appearance",
+   "searchTerms": [
+    "transparent transparency solid menus dialogs composer"
+   ]
+  },
+  {
+   "id": "diff-color-scheme",
+   "title": "Diff colors",
+   "to": "diffs",
+   "searchTerms": [
+    "red green blue orange additions deletions changes counts palette colorblind"
+   ]
+  },
+  {
+   "id": "chat-width",
+   "title": "Chat width",
+   "to": "appearance",
+   "searchTerms": [
+    "wide full width column layout messages composer monitor"
+   ]
+  },
+  {
+   "id": "thread-details-items",
+   "title": "Thread details",
+   "to": "appearance",
+   "searchTerms": [
+    "customize show hide panel card environment editor scripts branch pull request git changes servers automations lineage usage limits 5 hour weekly quota tokens context window"
+   ]
+  },
+  {
+   "id": "effort-display",
+   "title": "Effort display",
+   "to": "appearance",
+   "searchTerms": [
+    "reasoning effort thinking bars graph word label level composer"
+   ]
+  },
+  {
+   "id": "math-rendering",
+   "title": "Render math",
+   "to": "appearance",
+   "searchTerms": [
+    "latex tex katex equations formulas markdown"
+   ]
+  },
+  {
+   "id": "panel-animations",
+   "title": "Panel animations",
+   "to": "appearance"
+  },
+  {
+   "id": "environment-identification",
+   "title": "Environment identification",
+   "to": "appearance",
+   "searchTerms": [
+    "dev nightly latest channel artwork pill label hide none"
+   ],
+   "targetId": "appearance-interface"
+  },
+  {
+   "id": "interface-font",
+   "title": "Interface font",
+   "to": "appearance",
+   "searchTerms": [
+    "typography family size system sans"
+   ]
+  },
+  {
+   "id": "prompt-font",
+   "title": "Prompt font",
+   "to": "appearance",
+   "searchTerms": [
+    "typography family size composer input"
+   ]
+  },
+  {
+   "id": "code-font",
+   "title": "Code font",
+   "to": "appearance",
+   "searchTerms": [
+    "typography family size monospace code blocks diffs file previews"
+   ]
+  },
+  {
+   "id": "terminal-font",
+   "title": "Terminal font",
+   "to": "appearance",
+   "searchTerms": [
+    "typography family size monospace output"
+   ]
+  },
+  {
+   "id": "separate-fonts",
+   "title": "Separate fonts",
+   "to": "appearance",
+   "searchTerms": [
+    "typography advanced prompt code terminal font family size individually"
+   ]
+  },
+  {
+   "id": "font-smoothing",
+   "title": "Font smoothing",
+   "to": "appearance",
+   "searchTerms": [
+    "typography text grayscale anti aliasing macos thin"
+   ],
+   "macOnly": true
+  },
+  {
+   "id": "word-wrap",
+   "title": "Word wrap",
+   "to": "appearance",
+   "searchTerms": [
+    "long lines code blocks diffs file previews"
+   ]
+  },
+  {
+   "id": "composer-context",
+   "title": "Composer context",
+   "to": "appearance"
+  },
+  {
+   "id": "project-grouping",
+   "title": "Project grouping",
+   "to": "general",
+   "searchTerms": [
+    "combine matching repositories environments sidebar"
+   ]
+  },
+  {
+   "id": "project-order",
+   "title": "Project order",
+   "to": "general",
+   "searchTerms": [
+    "sort projects sidebar manual created recent"
+   ]
+  },
+  {
+   "id": "snooze-options",
+   "title": "Snooze options",
+   "to": "threads",
+   "searchTerms": [
+    "snooze presets times later tonight tomorrow next week remind"
+   ],
+   "environmentOnly": true,
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "snooze-limited-threads",
+   "title": "Snooze until limits reset",
+   "to": "threads",
+   "searchTerms": [
+    "usage quota rate limit reset wake recover continue"
+   ]
+  },
+  {
+   "id": "auto-resume-limited-threads",
+   "title": "Resume after usage limits",
+   "to": "threads",
+   "searchTerms": [
+    "usage quota rate limit reset recover continue"
+   ]
+  },
+  {
+   "id": "working-shelf",
+   "title": "Working section",
+   "to": "general",
+   "searchTerms": [
+    "hide fold running monitoring threads inbox sidebar shelf"
+   ]
+  },
+  {
+   "id": "boring-sidebar",
+   "title": "Boring sidebar (group by project)",
+   "to": "labs",
+   "searchTerms": [
+    "beta folders project tree legacy old classic sidebar"
+   ]
+  },
+  {
+   "id": "boring-sidebar-multiline",
+   "title": "Two-line folder rows",
+   "to": "labs",
+   "searchTerms": [
+    "beta boring sidebar folder rows multiline branch pull request details"
+   ]
+  },
+  {
+   "id": "guest-links",
+   "title": "Guest links",
+   "to": "labs",
+   "scope": "environment",
+   "searchTerms": [
+    "beta share guest invite link teammate watch t3 connect tunnel"
+   ]
+  },
+  {
+   "id": "linked-environments-beta",
+   "title": "Linked environments",
+   "to": "labs",
+   "scope": "environment",
+   "searchTerms": [
+    "beta link another machine vps peer agents work there delegate"
+   ]
+  },
+  {
+   "id": "simlock-hosts",
+   "title": "Simlock device hosts (alpha)",
+   "to": "labs",
+   "scope": "environment",
+   "searchTerms": [
+    "beta alpha simlock callstack simulator emulator ios android pool lease gateway"
+   ]
+  },
+  {
+   "id": "auto-settle-inactive-threads",
+   "title": "Auto-settle inactive threads",
+   "to": "threads",
+   "searchTerms": [
+    "sidebar inactivity days no activity automatically"
+   ],
+   "requiresThreadAutoSettlement": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "compact-idle-threads",
+   "title": "Compact idle threads",
+   "to": "providers",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "claude context compaction idle cache tokens usage summary resume"
+   ]
+  },
+  {
+   "id": "auto-settle-merged-threads",
+   "title": "Auto-settle merged threads",
+   "to": "threads",
+   "searchTerms": [
+    "pull request merge closed automatically sidebar"
+   ],
+   "requiresThreadAutoSettlement": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "keep-threads-with-pull-requests",
+   "title": "Keep threads with a PR",
+   "to": "threads",
+   "targetId": "auto-settle-inactive-threads",
+   "searchTerms": [
+    "pull request inactivity auto-settle merge close sidebar"
+   ],
+   "requiresThreadAutoSettlement": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "days-before-auto-settle",
+   "title": "Days of inactivity before auto-settle",
+   "to": "threads",
+   "targetId": "auto-settle-inactive-threads",
+   "searchTerms": [
+    "thread timeout activity sidebar"
+   ],
+   "requiresThreadAutoSettlement": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "thread-notifications",
+   "title": "Thread notifications",
+   "to": "general",
+   "searchTerms": [
+    "notification sound alert completion input approval desktop"
+   ]
+  },
+  {
+   "id": "in-app-notifications",
+   "title": "In-app notifications",
+   "to": "general",
+   "searchTerms": [
+    "notification toast popup completion input approval failure"
+   ]
+  },
+  {
+   "id": "time-format",
+   "title": "Time format",
+   "to": "general",
+   "searchTerms": [
+    "timestamp clock locale system browser os 12 hour 24 hour"
+   ]
+  },
+  {
+   "id": "response-streaming",
+   "title": "Response streaming",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "output token paragraph buffered wait turn legacy"
+   ]
+  },
+  {
+   "id": "hide-whitespace-changes",
+   "title": "Hide whitespace changes",
+   "to": "diffs",
+   "searchTerms": [
+    "diff ignore spaces edits default"
+   ]
+  },
+  {
+   "id": "default-diff-file-state",
+   "title": "Default diff file state",
+   "to": "diffs",
+   "searchTerms": [
+    "collapsed expanded collapse expand files pull request pr code tab"
+   ]
+  },
+  {
+   "id": "diff-layout",
+   "title": "Diff layout",
+   "to": "diffs",
+   "searchTerms": [
+    "stacked split side by side unified inline view"
+   ]
+  },
+  {
+   "id": "proactive-panels",
+   "title": "Open pull requests and changes panels proactively",
+   "to": "diffs",
+   "searchTerms": [
+    "proactive automatically open diff pull request pr right panel agent completion"
+   ]
+  },
+  {
+   "id": "skills-in-slash-menu",
+   "title": "Show skills in slash menu",
+   "to": "chat",
+   "searchTerms": [
+    "command menu dollar $ slash /"
+   ]
+  },
+  {
+   "id": "composer-rich-text",
+   "title": "Rich text composer",
+   "to": "chat",
+   "searchTerms": [
+    "composer rich text tiptap bold italic markdown styled wysiwyg"
+   ]
+  },
+  {
+   "id": "send-shortcut",
+   "title": "Send shortcut",
+   "to": "chat",
+   "searchTerms": [
+    "enter return command ctrl multiline prompt new line composer"
+   ]
+  },
+  {
+   "id": "follow-up-behavior",
+   "title": "Follow-up behavior",
+   "to": "chat",
+   "searchTerms": [
+    "queue steer running turn send default behavior composer"
+   ]
+  },
+  {
+   "id": "provider-update-checks",
+   "title": "Provider update checks",
+   "to": "maintenance",
+   "searchTerms": [
+    "installed cli versions newer available codex claude cursor grok fx kiro opencode"
+   ],
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "continue-threads-after-server-update",
+   "title": "Continue threads after restarts",
+   "to": "maintenance",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "resume running active interrupted work restart reboot machine crash desktop update automatically"
+   ]
+  },
+  {
+   "id": "background-activity",
+   "title": "Background activity",
+   "to": "maintenance",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "balanced performance battery saver advanced git fetch provider health refresh host power monitor idle policy"
+   ]
+  },
+  {
+   "id": "new-threads",
+   "title": "New threads",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "default workspace mode draft local worktree"
+   ]
+  },
+  {
+   "id": "worktree-submodules",
+   "title": "Submodules",
+   "to": "worktrees",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "git submodule init recursive top-level none worktree t3.json"
+   ]
+  },
+  {
+   "id": "start-from-origin",
+   "title": "Start from remote",
+   "to": "worktrees",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "new worktrees start remote origin latest fetched branch local"
+   ]
+  },
+  {
+   "id": "add-project-starts-in",
+   "title": "Add project starts in",
+   "to": "threads",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "base directory folder browser path home"
+   ]
+  },
+  {
+   "id": "ghq-clone-layout",
+   "title": "Clone into host folders",
+   "to": "threads",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "ghq clone destination host owner repository root layout"
+   ]
+  },
+  {
+   "id": "unpin-confirmation",
+   "title": "Unpin confirmation",
+   "to": "general",
+   "searchTerms": [
+    "ask before thread pinned section"
+   ]
+  },
+  {
+   "id": "archive-confirmation",
+   "title": "Archive confirmation",
+   "to": "general",
+   "searchTerms": [
+    "ask before thread second click inline action"
+   ]
+  },
+  {
+   "id": "delete-confirmation",
+   "title": "Delete confirmation",
+   "to": "general",
+   "searchTerms": [
+    "ask before thread chat history"
+   ]
+  },
+  {
+   "id": "quit-confirmation",
+   "title": "Quit shortcut",
+   "to": "general",
+   "searchTerms": [
+    "confirmation desktop app exit direct hold double click press twice"
+   ],
+   "desktopOnly": true
+  },
+  {
+   "id": "text-generation-model",
+   "title": "Text generation model",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "generated thread titles source control content default provider"
+   ]
+  },
+  {
+   "id": "thread-title-instructions",
+   "title": "Thread title instructions",
+   "to": "threads",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "generated thread titles prompt custom style naming rename regenerate"
+   ]
+  },
+  {
+   "id": "app-version",
+   "title": "Version",
+   "to": "about",
+   "searchTerms": [
+    "about check for updates download install upgrade release"
+   ]
+  },
+  {
+   "id": "update-track",
+   "title": "Update track",
+   "to": "about",
+   "searchTerms": [
+    "release channel stable latest nightly prerelease"
+   ],
+   "releaseChannelOnly": true
+  },
+  {
+   "id": "cli-command",
+   "title": "t3 command",
+   "to": "about",
+   "searchTerms": [
+    "cli terminal shell path install command line"
+   ],
+   "desktopOnly": true
+  },
+  {
+   "id": "mobile-app",
+   "title": "Mobile app",
+   "to": "about",
+   "searchTerms": [
+    "phone tablet iPhone iPad iOS Android App Store Google Play QR"
+   ]
+  },
+  {
+   "id": "privacy-policy",
+   "title": "Privacy policy",
+   "to": "about",
+   "searchTerms": [
+    "telemetry analytics usage data tracking legal opt out"
+   ]
+  },
+  {
+   "id": "telemetry-export",
+   "title": "OpenTelemetry export",
+   "to": "diagnostics",
+   "targetId": "telemetry-export",
+   "scope": "environment",
+   "searchTerms": [
+    "OTel OTLP telemetry export endpoints logs traces metrics Grafana"
+   ]
+  },
+  {
+   "id": "diagnostics",
+   "title": "Diagnostics",
+   "to": "maintenance",
+   "searchTerms": [
+    "logs traces processes resource history failures spans cpu memory"
+   ]
+  },
+  {
+   "id": "open-source-licenses",
+   "title": "Open source licenses",
+   "to": "about"
+  },
+  {
+   "id": "legacy-plan-mode",
+   "title": "Plan mode (legacy)",
+   "to": "labs",
+   "searchTerms": [
+    "build plan composer old"
+   ]
+  },
+  {
+   "id": "legacy-context-window-indicator",
+   "title": "Context window indicator (legacy)",
+   "to": "labs",
+   "searchTerms": [
+    "composer meter usage tokens circle old"
+   ]
+  },
+  {
+   "id": "keybindings",
+   "title": "Keybindings",
+   "to": "keybindings",
+   "searchTerms": [
+    "keyboard shortcuts hotkeys commands bindings json"
+   ]
+  },
+  {
+   "id": "keybinding-appearance.cycle",
+   "title": "Appearance: Cycle",
+   "to": "keybindings",
+   "searchTerms": [
+    "appearance.cycle",
+    "mod+alt+shift+a"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-chat.find",
+   "title": "Chat: Find",
+   "to": "keybindings",
+   "searchTerms": [
+    "chat.find",
+    "mod+f"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-chat.new",
+   "title": "Chat: New",
+   "to": "keybindings",
+   "searchTerms": [
+    "chat.new",
+    "mod+n",
+    "mod+shift+o"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-chat.newLocal",
+   "title": "Chat: New Local",
+   "to": "keybindings",
+   "searchTerms": [
+    "chat.newLocal",
+    "mod+shift+n"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-chat.newWithoutProject",
+   "title": "Chat: New Without Project",
+   "to": "keybindings",
+   "searchTerms": [
+    "chat.newWithoutProject",
+    "mod+alt+n"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-commandPalette.toggle",
+   "title": "Command Palette: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "commandPalette.toggle",
+    "mod+k"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.branch",
+   "title": "Composer: Branch",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.branch",
+    "mod+shift+g"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.cycleHost",
+   "title": "Composer: Cycle Host",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.cycleHost"
+   ],
+   "secondary": true,
+   "targetId": "keybindings"
+  },
+  {
+   "id": "keybinding-composer.decreaseEffort",
+   "title": "Composer: Decrease Effort",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.decreaseEffort"
+   ],
+   "secondary": true,
+   "targetId": "keybindings"
+  },
+  {
+   "id": "keybinding-composer.effort",
+   "title": "Composer: Effort",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.effort",
+    "mod+shift+e"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.host",
+   "title": "Composer: Host",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.host",
+    "mod+shift+h"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.increaseEffort",
+   "title": "Composer: Increase Effort",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.increaseEffort"
+   ],
+   "secondary": true,
+   "targetId": "keybindings"
+  },
+  {
+   "id": "keybinding-composer.mode",
+   "title": "Composer: Mode",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.mode",
+    "mod+shift+a"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.sendAlternate",
+   "title": "Composer: Opposite Queue or Steer Action",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.sendAlternate",
+    "mod+enter"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.previousWorktree",
+   "title": "Composer: Previous Worktree",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.previousWorktree",
+    "mod+shift+l"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.sendAndNewThread",
+   "title": "Composer: Send and Start New Thread",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.sendAndNewThread",
+    "mod+alt+enter"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.sendBackground",
+   "title": "Composer: Start in Background",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.sendBackground",
+    "mod+enter",
+    "mod+alt+enter"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.stash",
+   "title": "Composer: Stash",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.stash",
+    "mod+s"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-composer.workspace",
+   "title": "Composer: Workspace",
+   "to": "keybindings",
+   "searchTerms": [
+    "composer.workspace",
+    "mod+shift+x"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-diff.toggle",
+   "title": "Diff: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "diff.toggle",
+    "mod+d"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-editor.openFavorite",
+   "title": "Editor: Open Favorite",
+   "to": "keybindings",
+   "searchTerms": [
+    "editor.openFavorite",
+    "mod+o"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-filePicker.toggle",
+   "title": "File Picker: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "filePicker.toggle",
+    "mod+p"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-workspace.focusNext",
+   "title": "Focus Next Workspace Area",
+   "to": "keybindings",
+   "searchTerms": [
+    "workspace.focusNext",
+    "f6",
+    "mod+f6"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-workspace.focusPrevious",
+   "title": "Focus Previous Workspace Area",
+   "to": "keybindings",
+   "searchTerms": [
+    "workspace.focusPrevious",
+    "shift+f6",
+    "mod+shift+f6"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.1",
+   "title": "Model Picker: Jump: 1",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.1",
+    "mod+1"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.2",
+   "title": "Model Picker: Jump: 2",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.2",
+    "mod+2"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.3",
+   "title": "Model Picker: Jump: 3",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.3",
+    "mod+3"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.4",
+   "title": "Model Picker: Jump: 4",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.4",
+    "mod+4"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.5",
+   "title": "Model Picker: Jump: 5",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.5",
+    "mod+5"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.6",
+   "title": "Model Picker: Jump: 6",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.6",
+    "mod+6"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.7",
+   "title": "Model Picker: Jump: 7",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.7",
+    "mod+7"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.8",
+   "title": "Model Picker: Jump: 8",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.8",
+    "mod+8"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.jump.9",
+   "title": "Model Picker: Jump: 9",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.jump.9",
+    "mod+9"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.nextProvider",
+   "title": "Model Picker: Next Provider",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.nextProvider",
+    "mod+shift+arrowdown"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.previousProvider",
+   "title": "Model Picker: Previous Provider",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.previousProvider",
+    "mod+shift+arrowup"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-modelPicker.toggle",
+   "title": "Model Picker: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "modelPicker.toggle",
+    "mod+shift+m"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-navigation.back",
+   "title": "Navigation: Back",
+   "to": "keybindings",
+   "searchTerms": [
+    "navigation.back",
+    "mod+["
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-navigation.forward",
+   "title": "Navigation: Forward",
+   "to": "keybindings",
+   "searchTerms": [
+    "navigation.forward",
+    "mod+]"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.focusUrl",
+   "title": "Preview: Focus URL",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.focusUrl",
+    "mod+l"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.refresh",
+   "title": "Preview: Refresh",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.refresh",
+    "mod+r"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.resetZoom",
+   "title": "Preview: Reset Zoom",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.resetZoom",
+    "mod+0"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.toggle",
+   "title": "Preview: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.toggle",
+    "mod+shift+j"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.zoomIn",
+   "title": "Preview: Zoom In",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.zoomIn",
+    "mod+=",
+    "mod++"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-preview.zoomOut",
+   "title": "Preview: Zoom Out",
+   "to": "keybindings",
+   "searchTerms": [
+    "preview.zoomOut",
+    "mod+-"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-projectSearch.toggle",
+   "title": "Project Search: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "projectSearch.toggle",
+    "mod+shift+f"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.copyReference",
+   "title": "Pull Request: Copy Link or Thread",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.copyReference",
+    "mod+shift+c"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-pullRequest.copyNumber",
+   "title": "Pull Request: Copy Number",
+   "to": "keybindings",
+   "searchTerms": [
+    "pullRequest.copyNumber",
+    "mod+shift+k"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.editQueuedMessage",
+   "title": "Queue: Edit Last Queued Message",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.editQueuedMessage",
+    "alt+arrowup"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.steerQueuedMessage",
+   "title": "Queue: Send First Queued Message",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.steerQueuedMessage",
+    "mod+shift+enter"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-view.reopenClosed",
+   "title": "Reopen Closed Tab",
+   "to": "keybindings",
+   "searchTerms": [
+    "view.reopenClosed",
+    "mod+shift+t"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-rightPanel.close",
+   "title": "Right Panel: Close",
+   "to": "keybindings",
+   "searchTerms": [
+    "rightPanel.close",
+    "mod+w"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-rightPanel.new",
+   "title": "Right Panel: New",
+   "to": "keybindings",
+   "searchTerms": [
+    "rightPanel.new",
+    "mod+t"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-rightPanel.toggle",
+   "title": "Right Panel: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "rightPanel.toggle",
+    "mod+alt+b"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-rightPanel.toggleMaximized",
+   "title": "Right Panel: Toggle Maximized",
+   "to": "keybindings",
+   "searchTerms": [
+    "rightPanel.toggleMaximized"
+   ],
+   "secondary": true,
+   "targetId": "keybindings"
+  },
+  {
+   "id": "keybinding-sidebar.toggle",
+   "title": "Sidebar: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "sidebar.toggle",
+    "mod+b"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-terminal.close",
+   "title": "Terminal: Close",
+   "to": "keybindings",
+   "searchTerms": [
+    "terminal.close",
+    "mod+w"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-terminal.new",
+   "title": "Terminal: New",
+   "to": "keybindings",
+   "searchTerms": [
+    "terminal.new",
+    "mod+n"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-terminal.split",
+   "title": "Terminal: Split",
+   "to": "keybindings",
+   "searchTerms": [
+    "terminal.split",
+    "mod+d"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-terminal.splitVertical",
+   "title": "Terminal: Split Vertical",
+   "to": "keybindings",
+   "searchTerms": [
+    "terminal.splitVertical",
+    "mod+shift+d"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-terminal.toggle",
+   "title": "Terminal: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "terminal.toggle",
+    "mod+j"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-themeEditor.toggle",
+   "title": "Theme Editor: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "themeEditor.toggle",
+    "mod+alt+shift+t"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-theme.select",
+   "title": "Theme: Select",
+   "to": "keybindings",
+   "searchTerms": [
+    "theme.select",
+    "mod+alt+a"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-threadPanel.toggle",
+   "title": "Thread Panel: Toggle",
+   "to": "keybindings",
+   "searchTerms": [
+    "threadPanel.toggle",
+    "mod+shift+b"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.1",
+   "title": "Thread: Jump: 1",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.1",
+    "mod+1"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.2",
+   "title": "Thread: Jump: 2",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.2",
+    "mod+2"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.3",
+   "title": "Thread: Jump: 3",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.3",
+    "mod+3"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.4",
+   "title": "Thread: Jump: 4",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.4",
+    "mod+4"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.5",
+   "title": "Thread: Jump: 5",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.5",
+    "mod+5"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.6",
+   "title": "Thread: Jump: 6",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.6",
+    "mod+6"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.7",
+   "title": "Thread: Jump: 7",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.7",
+    "mod+7"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.8",
+   "title": "Thread: Jump: 8",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.8",
+    "mod+8"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.jump.9",
+   "title": "Thread: Jump: 9",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.jump.9",
+    "mod+9"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.next",
+   "title": "Thread: Next",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.next",
+    "mod+shift+]"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.pin",
+   "title": "Thread: Pin",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.pin",
+    "mod+shift+p"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.previous",
+   "title": "Thread: Previous",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.previous",
+    "mod+shift+["
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.settle",
+   "title": "Thread: Settle",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.settle",
+    "mod+shift+s"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-thread.stop",
+   "title": "Thread: Stop",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.stop"
+   ],
+   "secondary": true,
+   "targetId": "keybindings"
+  },
+  {
+   "id": "keybinding-thread.undo",
+   "title": "Thread: Undo",
+   "to": "keybindings",
+   "searchTerms": [
+    "thread.undo",
+    "mod+z"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.cost",
+   "title": "Usage: Cost",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.cost",
+    "c"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.limits",
+   "title": "Usage: Limits",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.limits",
+    "l"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.open",
+   "title": "Usage: Open",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.open",
+    "mod+u"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.period.month",
+   "title": "Usage: Period: 30 days",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.period.month",
+    "mod+shift+3"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.period.week",
+   "title": "Usage: Period: 7 days",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.period.week",
+    "mod+shift+2"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.period.quarter",
+   "title": "Usage: Period: 90 days",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.period.quarter",
+    "mod+shift+4"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.period.day",
+   "title": "Usage: Period: Past 24h",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.period.day",
+    "mod+shift+1"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "keybinding-usage.tokens",
+   "title": "Usage: Tokens",
+   "to": "keybindings",
+   "searchTerms": [
+    "usage.tokens",
+    "t"
+   ],
+   "secondary": true
+  },
+  {
+   "id": "snap-shot-enabled",
+   "title": "SnapShots",
+   "searchTerms": [
+    "window capture screenshot"
+   ],
+   "to": "snap-shot"
+  },
+  {
+   "id": "snap-shot-accessibility",
+   "title": "Include app text",
+   "to": "snap-shot",
+   "targetId": "snap-shot-enabled",
+   "searchTerms": [
+    "capture accessibility data text UI structure elements privacy omit agent context"
+   ]
+  },
+  {
+   "id": "snap-shot-shortcut",
+   "title": "Capture shortcut",
+   "to": "snap-shot",
+   "targetId": "snap-shot-enabled"
+  },
+  {
+   "id": "snap-shot-sound",
+   "title": "Capture sound",
+   "to": "snap-shot",
+   "targetId": "snap-shot-enabled"
+  },
+  {
+   "id": "snap-shot-flash",
+   "title": "Capture flash",
+   "to": "snap-shot",
+   "targetId": "snap-shot-enabled"
+  },
+  {
+   "id": "snap-shot-animations",
+   "title": "Capture animations",
+   "to": "snap-shot",
+   "targetId": "snap-shot-enabled"
+  },
+  {
+   "id": "providers",
+   "title": "Providers",
+   "to": "providers",
+   "searchTerms": [
+    "agents cli codex claude cursor grok fx kiro opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"
+   ]
+  },
+  {
+   "id": "usage-providers",
+   "title": "Usage providers",
+   "to": "providers",
+   "searchTerms": [
+    "usage sources CLIProxyAPI CLI proxy hub quota subscription limits management key add remove"
+   ],
+   "providerSettingsOnly": true
+  },
+  {
+   "id": "cursor-keychain-usage",
+   "title": "Cursor account usage",
+   "to": "providers",
+   "searchTerms": [
+    "cursor macOS keychain usage tokens cost limits permission"
+   ],
+   "providerSettingsOnly": true,
+   "macProviderSettingsOnly": true
+  },
+  {
+   "id": "provider-health-check-interval",
+   "title": "Health check interval",
+   "to": "providers",
+   "searchTerms": [
+    "refresh availability versions auth state models background probes seconds off"
+   ],
+   "providerSettingsOnly": true
+  },
+  {
+   "id": "agent-browser-access",
+   "title": "Agent browser access",
+   "to": "browser",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "allow disable enable open drive preview tools sessions project override"
+   ]
+  },
+  {
+   "id": "device-sources",
+   "title": "Device sources",
+   "to": "devices",
+   "searchTerms": [
+    "device hosts ssh remote mac mini identity key connection eas expo cloud simlock pool gateway local simulators"
+   ]
+  },
+  {
+   "id": "agent-device-access",
+   "title": "Agents can use devices",
+   "to": "devices",
+   "targetId": "devices",
+   "searchTerms": [
+    "allow simulator emulator ios android drive tools sessions"
+   ]
+  },
+  {
+   "id": "device-hub",
+   "title": "Use devices",
+   "to": "devices",
+   "targetId": "devices",
+   "searchTerms": [
+    "device hub simulator emulator ios android install start version"
+   ]
+  },
+  {
+   "id": "device-platform-support",
+   "title": "Local simulators",
+   "to": "devices",
+   "targetId": "device-sources",
+   "searchTerms": [
+    "simulator support xcode android studio sdk avd runtime"
+   ]
+  },
+  {
+   "id": "browser-profiles",
+   "title": "Browser profiles",
+   "to": "browser",
+   "targetId": "browser"
+  },
+  {
+   "id": "browser-default-profile",
+   "title": "Default browser profile",
+   "to": "browser",
+   "targetId": "browser-profiles"
+  },
+  {
+   "id": "browser-default-viewport",
+   "title": "Default browser viewport",
+   "to": "browser",
+   "searchTerms": [
+    "preview size width height device desktop mobile rotate"
+   ]
+  },
+  {
+   "id": "browser-default-zoom",
+   "title": "Default browser zoom",
+   "to": "browser",
+   "searchTerms": [
+    "preview page scale tabs percent"
+   ]
+  },
+  {
+   "id": "browser-default-appearance",
+   "title": "Default browser appearance",
+   "to": "browser",
+   "searchTerms": [
+    "preview color scheme light dark system os"
+   ]
+  },
+  {
+   "id": "browser-recording-frame-rate",
+   "title": "Browser recording frame rate",
+   "to": "browser"
+  },
+  {
+   "id": "browser-recording-key-presses",
+   "title": "Show key presses in recordings",
+   "to": "browser",
+   "searchTerms": [
+    "browser preview keyboard shortcuts keystrokes overlay capture"
+   ]
+  },
+  {
+   "id": "browser-recording-mouse-presses",
+   "title": "Show mouse presses in recordings",
+   "to": "browser",
+   "searchTerms": [
+    "browser preview clicks buttons drag overlay capture"
+   ]
+  },
+  {
+   "id": "browser-link-target",
+   "title": "Open links in",
+   "to": "browser",
+   "searchTerms": [
+    "links default browser in-app browser external open"
+   ]
+  },
+  {
+   "id": "browser-search-engine",
+   "title": "Search engine",
+   "to": "browser",
+   "searchTerms": [
+    "address bar duckduckgo google bing brave kagi ecosia custom url"
+   ]
+  },
+  {
+   "id": "pull-request-links-open-in-app",
+   "title": "Open pull requests in T3 Code",
+   "to": "diffs",
+   "searchTerms": [
+    "pr commit links GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps browser external click default pull request view panel"
+   ]
+  },
+  {
+   "id": "browser-auto-show-floating-preview",
+   "title": "Auto-show floating preview",
+   "to": "browser",
+   "searchTerms": [
+    "agent opens browser device simulator pop into view hide"
+   ]
+  },
+  {
+   "id": "automatic-pull",
+   "title": "Automatically pull",
+   "to": "source-control",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "auto pull default branch current checkout fast forward upstream"
+   ]
+  },
+  {
+   "id": "remove-agent-credits-on-merge",
+   "title": "Remove agent credits when merging",
+   "to": "source-control",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"
+   ]
+  },
+  {
+   "id": "pull-request-merge-method",
+   "title": "Default merge method",
+   "to": "source-control",
+   "scope": "project-defaults",
+   "searchTerms": [
+    "pull request merge squash rebase last selected"
+   ]
+  },
+  {
+   "id": "source-control",
+   "title": "Source control",
+   "to": "source-control",
+   "scope": "environment-defaults",
+   "searchTerms": [
+    "version control git GitHub ghes enterprise GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"
+   ]
+  },
+  {
+   "id": "git-fetch-interval",
+   "title": "Git fetch interval",
+   "to": "maintenance",
+   "targetId": "background-activity",
+   "searchTerms": [
+    "automatic remote branch refresh background credentials security keys seconds off"
+   ],
+   "environmentOnly": true,
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "worktree-branch-naming",
+   "title": "Worktree branch naming",
+   "to": "worktrees",
+   "searchTerms": [
+    "static semantic prefix custom prompt instructions feat fix refactor chore"
+   ],
+   "environmentOnly": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "source-control-host-github",
+   "title": "GitHub accounts and token",
+   "to": "source-control",
+   "searchTerms": [
+    "GitHub ghes enterprise gh account login user host switch multiple accounts disable sign in token personal access token pat api key credential"
+   ],
+   "environmentOnly": true,
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "source-control-host-gitcafe",
+   "title": "GitCafe credentials",
+   "to": "source-control",
+   "searchTerms": [
+    "GitCafe token token credentials sign in"
+   ],
+   "environmentOnly": true,
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "source-control-host-bitbucket",
+   "title": "Bitbucket credentials",
+   "to": "source-control",
+   "searchTerms": [
+    "Bitbucket accessToken email apiToken token credentials sign in"
+   ],
+   "environmentOnly": true,
+   "scope": "environment-defaults"
+  },
+  {
+   "id": "source-control-writing-style",
+   "title": "Source control writing style",
+   "to": "source-control",
+   "searchTerms": [
+    "repository conventions conventional commits custom instructions change descriptions request titles"
+   ],
+   "environmentOnly": true
+  },
+  {
+   "id": "follow-change-request-templates",
+   "title": "Follow change request templates",
+   "to": "source-control",
+   "searchTerms": [
+    "repository pr pull request description structure"
+   ],
+   "environmentOnly": true
+  },
+  {
+   "id": "source-control-writer-model",
+   "title": "Source control writer model",
+   "to": "source-control",
+   "searchTerms": [
+    "override generated commit change request pr titles descriptions branch bookmark"
+   ],
+   "environmentOnly": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "review-guides",
+   "title": "Review guides (beta)",
+   "to": "source-control",
+   "searchTerms": [
+    "pull request pr guided review guide tour beta experimental"
+   ],
+   "environmentOnly": true
+  },
+  {
+   "id": "review-guide-model",
+   "title": "Review guide model",
+   "to": "source-control",
+   "targetId": "review-guides",
+   "searchTerms": [
+    "pull request pr guided review guide brief maintainer"
+   ],
+   "environmentOnly": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "review-guide-instructions",
+   "title": "Review guide instructions",
+   "to": "source-control",
+   "targetId": "review-guides",
+   "searchTerms": [
+    "pull request pr guided review guide preferences taste prompt custom"
+   ],
+   "environmentOnly": true,
+   "scope": "project-defaults"
+  },
+  {
+   "id": "project-actions",
+   "title": "Actions",
+   "to": "projects",
+   "searchTerms": [
+    "commands scripts setup run dev server checkout worktree t3.json import"
+   ]
+  },
+  {
+   "id": "environment-icon",
+   "title": "Environment icon",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "machine glyph sidebar mac mini studio laptop desktop server cloud vm"
+   ]
+  },
+  {
+   "id": "local-environment",
+   "title": "Local environment",
+   "to": "connections",
+   "searchTerms": [
+    "turn off on disable enable local server agents remote only restart"
+   ],
+   "desktopOnly": true
+  },
+  {
+   "id": "network-access",
+   "title": "Network access",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "expose backend remote pairing local machine interfaces host restart"
+   ],
+   "localBackendManagementOnly": true
+  },
+  {
+   "id": "tailscale-https",
+   "title": "Tailscale HTTPS",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "serve magicdns endpoint remote secure network"
+   ],
+   "desktopOnly": true,
+   "localBackendManagementOnly": true
+  },
+  {
+   "id": "wsl-backend",
+   "title": "WSL backend",
+   "to": "access",
+   "searchTerms": [
+    "windows subsystem linux distro second server projects stop windows backend restart wsl only"
+   ],
+   "desktopOnly": true,
+   "windowsOnly": true,
+   "localBackendManagementOnly": true,
+   "wslAvailableOnly": true
+  },
+  {
+   "id": "t3-connect",
+   "localEnvironmentOnly": true,
+   "title": "T3 Connect",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "managed tunnel cloud other devices remote tunnels limit t3 chat"
+   ],
+   "desktopOnly": true,
+   "cloudOnly": true
+  },
+  {
+   "id": "hold-webhooks-while-offline",
+   "localEnvironmentOnly": true,
+   "title": "Hold webhooks while offline",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "webhook automations offline queue mailbox t3 connect"
+   ],
+   "cloudOnly": true,
+   "managedTunnelOnly": true
+  },
+  {
+   "id": "publish-agent-activity",
+   "localEnvironmentOnly": true,
+   "title": "Publish agent activity",
+   "to": "access",
+   "targetId": "connections-environment",
+   "searchTerms": [
+    "mobile push notifications live activities cloud tunnel"
+   ],
+   "cloudOnly": true
+  },
+  {
+   "id": "connections-environment",
+   "title": "This machine",
+   "to": "access",
+   "searchTerms": [
+    "connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"
+   ]
+  },
+  {
+   "id": "linked-environments",
+   "peerLinksOnly": true,
+   "title": "Linked environments",
+   "to": "connections",
+   "targetId": "linked-environments",
+   "searchTerms": [
+    "link peer another machine vps agents work there handoff pairing code"
+   ]
+  },
+  {
+   "id": "remote-environments",
+   "title": "Environments",
+   "to": "connections",
+   "searchTerms": [
+    "add pair backend host code ssh config agent tunnel saved t3 connect"
+   ]
+  },
+  {
+   "id": "load-balancing",
+   "title": "Load balancing",
+   "to": "connections",
+   "searchTerms": [
+    "automatic machine environment resources cpu memory capacity preference weight shared projects"
+   ]
+  },
+  {
+   "id": "pull-request-routing",
+   "title": "Pull request sharing",
+   "to": "connections",
+   "searchTerms": [
+    "pull request routing trusted environments shared credentials permissions read actions source control GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps"
+   ]
+  },
+  {
+   "id": "secret-providers",
+   "title": "Secret providers",
+   "to": "secrets",
+   "searchTerms": [
+    "1password vault credentials api key"
+   ],
+   "secretsFeatureOnly": true
+  },
+  {
+   "id": "secret-providers-add",
+   "title": "Add secret provider",
+   "to": "secrets",
+   "targetId": "secret-providers",
+   "searchTerms": [
+    "new 1password vault op cli account"
+   ],
+   "secretsFeatureOnly": true
+  },
+  {
+   "id": "archive",
+   "title": "Archived threads",
+   "to": "archived",
+   "searchTerms": [
+    "restore reopen deleted history projects"
+   ]
+  }
+ ]
+}
