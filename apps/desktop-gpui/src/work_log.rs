@@ -716,7 +716,8 @@ fn t3_tool_name(label: &str) -> Option<&'static str> {
 }
 
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    (text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix)).then(|| &text[prefix.len()..])
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
 /// `resolveT3McpToolDefinition`: action tools resolve to the tool their action replaced.
@@ -1859,6 +1860,12 @@ pub fn format_duration(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_match_never_splits_a_character() {
+        assert_eq!(strip_prefix_ci("正在思考", "tool:"), None);
+        assert_eq!(strip_prefix_ci("Tool:read", "tool:"), Some("read"));
+    }
+
     use super::*;
     use serde_json::json;
 

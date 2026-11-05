@@ -29,6 +29,7 @@ mod header;
 mod layout;
 mod sidebar;
 mod titlebar;
+mod visits;
 
 gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
 
@@ -86,6 +87,8 @@ pub struct Workspace {
     responding: Option<String>,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
+    sidebar_view: Entity<sidebar::SidebarView>,
+    visit: visits::VisitTracker,
     /// Collapsed, the sidebar column is not rendered at all.
     sidebar_open: bool,
     details_open: bool,
@@ -136,18 +139,23 @@ impl Workspace {
             responding: None,
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
+            visit: visits::VisitTracker::default(),
+            sidebar_view: {
+                let workspace = cx.weak_entity();
+                cx.new(|_| sidebar::SidebarView(workspace))
+            },
             sidebar_open: true,
             details_open: true,
             lineage_expanded: None,
-            _connection_task: Self::connect(cx),
+            _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
 
     /// Starts or finds the server, then keeps one socket open, reconnecting after drops.
-    fn connect(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
+    fn connect(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
             let resolved = runtime().spawn(backend::resolve_endpoint()).await;
             let endpoint = match resolved {
                 Ok(Ok((endpoint, server))) => {
@@ -181,7 +189,8 @@ impl Workspace {
                 match RpcClient::connect(runtime().handle(), options).await {
                     Ok(client) => {
                         log::info!("connected");
-                        if this.update(cx, |this, cx| this.on_connected(client.clone(), cx)).is_err() {
+                        if this.update_in(cx, |this, window, cx| this.on_connected(client.clone(), window, cx)).is_err()
+                        {
                             return;
                         }
                         let reason = client.closed().await;
@@ -231,6 +240,7 @@ impl Workspace {
             }
         }
         self.connection = connection;
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -241,7 +251,7 @@ impl Workspace {
         }
     }
 
-    fn on_connected(&mut self, client: RpcClient, cx: &mut Context<Self>) {
+    fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = Connection::Connected(client.clone());
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
         let mut shell_input = json!({"requestCompletionMarker": true});
@@ -250,37 +260,41 @@ impl Workspace {
         }
         let shell = client.stream("orchestration.subscribeShell", shell_input);
         self._stream_tasks = vec![
-            Self::pump(config, cx, |this, value, _| {
+            Self::pump(config, window, cx, |this, value, _, cx| {
                 if let Err(error) = this.server_info.apply(value) {
                     log::warn!("bad server config event: {error}");
                 }
+                this.notify_sidebar(cx);
             }),
-            Self::pump(shell, cx, |this, value, cx| {
+            Self::pump(shell, window, cx, |this, value, _, cx| {
                 if let Err(error) = this.shell.apply(value) {
                     log::warn!("bad shell event: {error}");
                 }
-                this.sync_sidebar_tick(cx);
+                this.schedule_sidebar_clock(cx);
+                this.notify_sidebar(cx);
+                this.track_visit(cx);
             }),
         ];
-        self.subscribe_thread(cx);
+        self.subscribe_thread(window, cx);
         cx.notify();
     }
 
     /// Applies every event already queued on `stream` before one re-render.
     fn pump(
         stream: RpcStream,
+        window: &mut Window,
         cx: &mut Context<Self>,
-        apply: impl Fn(&mut Self, &Value, &mut Context<Self>) + 'static,
+        apply: impl Fn(&mut Self, &Value, &mut Window, &mut Context<Self>) + 'static,
     ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = stream.next().await {
                 let mut events = vec![first];
                 events.extend(std::iter::from_fn(|| stream.try_next()));
-                let ended = this.update(cx, |this, cx| {
+                let ended = this.update_in(cx, |this, window, cx| {
                     let mut ended = false;
                     for event in events {
                         match event {
-                            StreamEvent::Item(value) => apply(this, &value, cx),
+                            StreamEvent::Item(value) => apply(this, &value, window, cx),
                             StreamEvent::End(result) => {
                                 ended = true;
                                 if let Err(error) = result {
@@ -301,7 +315,7 @@ impl Workspace {
         })
     }
 
-    fn subscribe_thread(&mut self, cx: &mut Context<Self>) {
+    fn subscribe_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let Some(thread) = &mut self.thread else { return };
         let mut input = json!({"threadId": thread.id, "requestCompletionMarker": true});
@@ -310,13 +324,15 @@ impl Workspace {
         }
         let stream = client.stream("orchestration.subscribeThread", input);
         let thread_id = thread.id.clone();
-        thread._subscription = Some(Self::pump(stream, cx, move |this, value, cx| {
+        thread._subscription = Some(Self::pump(stream, window, cx, move |this, value, window, cx| {
             let Some(thread) = this.thread.as_mut().filter(|t| t.id == thread_id) else { return };
             if let Err(error) = thread.state.apply(value) {
                 log::warn!("bad thread event: {error}");
             }
             this.refresh_rows(cx);
-            this.sync_question();
+            if this.sync_question() {
+                this.load_custom_answer(window, cx);
+            }
         }));
     }
 
@@ -345,12 +361,14 @@ impl Workspace {
             return;
         }
         self.target = Some(Target::Thread(thread_id.clone()));
-        self.thread = Some(OpenThread { id: thread_id, state: ThreadState::default(), _subscription: None });
+        self.thread = Some(OpenThread { id: thread_id.clone(), state: ThreadState::default(), _subscription: None });
         self.model_override = None;
         self.question = None;
         self.reset_timeline(cx);
-        self.subscribe_thread(cx);
+        self.subscribe_thread(window, cx);
+        self.open_visit(&thread_id, cx);
         self.focus_composer(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -362,6 +380,7 @@ impl Workspace {
         self.question = None;
         self.reset_timeline(cx);
         self.focus_composer(window, cx);
+        self.notify_sidebar(cx);
         cx.notify();
     }
 
@@ -400,10 +419,8 @@ impl Workspace {
         if text.is_empty() || self.sending {
             return;
         }
-        if self.answer_approvals_with(&text, window, cx) {
-            return;
-        }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
+        let (declines, text_is_feedback) = self.approval_declines(&text);
         let (method, payload, new_thread_id) = match target {
             Target::Thread(thread_id) => {
                 let mut command = json!({
@@ -450,7 +467,17 @@ impl Workspace {
         self.sending = true;
         self.set_composer_text("", window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request(method, payload).await;
+            // Declines land first; a failed one keeps the text and sends nothing more.
+            let mut result = Ok(Value::Null);
+            for decline in declines {
+                result = client.request("orchestration.dispatchCommand", decline).await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_ok() && !text_is_feedback {
+                result = client.request(method, payload).await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
@@ -486,9 +513,9 @@ impl Workspace {
         self.dispatch(command, cx);
     }
 
-    /// Answers a runtime request; `response` holds `decision`, `feedback` or `answers`.
-    fn respond(&mut self, request_id: String, response: Value, cx: &mut Context<Self>) {
-        let (Some(thread), Some(client)) = (&self.thread, self.client()) else { return };
+    /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
+    fn respond_command(&self, request_id: &str, response: Value) -> Option<Value> {
+        let thread = self.thread.as_ref()?;
         let mut command = json!({
             "type": "runtime-request.respond",
             "commandId": new_id(),
@@ -498,6 +525,14 @@ impl Workspace {
         if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
             command.extend(fields);
         }
+        Some(command)
+    }
+
+    /// Answers a runtime request; `response` holds `decision`, `feedback` or `answers`.
+    fn respond(&mut self, request_id: String, response: Value, cx: &mut Context<Self>) {
+        let (Some(command), Some(client)) = (self.respond_command(&request_id, response), self.client()) else {
+            return;
+        };
         self.responding = Some(request_id.clone());
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
@@ -569,7 +604,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .child(
-                h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_sidebar(window, cx))).child(
+                h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_cached_sidebar())).child(
                     v_flex()
                         .flex_1()
                         .h_full()

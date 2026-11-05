@@ -67,6 +67,40 @@ pub fn format_relative(elapsed_ms: i64) -> String {
     }
 }
 
+/// Milliseconds until [`format_relative`] shows a different label.
+pub fn relative_changes_in(elapsed_ms: i64) -> i64 {
+    let elapsed = elapsed_ms.max(0);
+    let unit = match elapsed / 60_000 {
+        0..60 => 60_000,
+        60..1440 => 3_600_000,
+        _ => 86_400_000,
+    };
+    unit - elapsed % unit
+}
+
+/// Milliseconds until [`format_duration`] shows a different label: every
+/// second for the first minute, then every minute.
+pub fn duration_changes_in(elapsed_ms: i64) -> i64 {
+    let elapsed = elapsed_ms.max(0);
+    let unit = if elapsed < 60_000 { 1000 } else { 60_000 };
+    unit - elapsed % unit
+}
+
+/// Milliseconds until [`format_wake`] changes, or the wake itself; `None` once woken.
+pub fn wake_changes_in(remaining_ms: i64) -> Option<i64> {
+    const HOUR: i64 = 3_600_000;
+    let unit = match remaining_ms {
+        ..=0 => return None,
+        1..HOUR => 60_000,
+        HOUR..86_400_000 => HOUR,
+        _ => 86_400_000,
+    };
+    Some(match remaining_ms % unit {
+        0 => unit,
+        rest => rest,
+    })
+}
+
 /// `formatWorkingDurationLabel` in `client-runtime/src/state/models.ts`.
 pub fn format_duration(elapsed_ms: i64) -> String {
     let seconds = elapsed_ms.max(0) / 1000;
@@ -253,7 +287,7 @@ impl<'a> Facts<'a> {
     }
 
     /// `threadWokeAt`.
-    fn woke_at(&self, now: i64) -> Option<&'a str> {
+    pub fn woke_at(&self, now: i64) -> Option<&'a str> {
         let t = self.thread;
         let wake = ms(t.snoozed_until.as_deref())?;
         if self.raised_hand_while_snoozed() {
@@ -503,6 +537,18 @@ pub const PROJECT_COLORS: [(&str, u32, u32); 18] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn labels_report_when_they_next_change() {
+        assert_eq!(relative_changes_in(0), 60_000);
+        assert_eq!(relative_changes_in(61_000), 59_000);
+        assert_eq!(relative_changes_in(2 * 3_600_000 + 5), 3_600_000 - 5);
+        assert_eq!(duration_changes_in(1_500), 500);
+        assert_eq!(duration_changes_in(90_000), 30_000);
+        assert_eq!(wake_changes_in(0), None);
+        assert_eq!(wake_changes_in(90_000), Some(30_000));
+        assert_eq!(wake_changes_in(120_000), Some(60_000));
+    }
+
     use super::*;
     use serde::Deserialize as _;
     use serde_json::{Value, json};

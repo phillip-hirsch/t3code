@@ -9,10 +9,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, DragMoveEvent, EmptyView, Entity, Focusable as _,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowControlArea, deferred, div,
-    prelude::FluentBuilder as _, px, rgb, svg,
+    AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DragMoveEvent, EmptyView, Entity, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, WeakEntity, Window,
+    WindowControlArea, deferred, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::json;
 
@@ -39,9 +39,8 @@ pub(super) struct SidebarState {
     /// changes layout, so it is state rather than a paint-time group hover.
     hovered: Option<String>,
     search: Entity<InputState>,
-    /// The one-second repaint, alive only while a row shows a running duration.
-    ticking: bool,
-    _tick: Option<Task<()>>,
+    /// Wakes the sidebar when its next visible label or snooze deadline changes.
+    _clock: Option<Task<()>>,
     _search_subscription: Subscription,
 }
 
@@ -50,8 +49,8 @@ impl SidebarState {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.sync_sidebar_tick(cx);
-                cx.notify();
+                this.schedule_sidebar_clock(cx);
+                this.notify_sidebar(cx);
             }
         });
         Self {
@@ -62,10 +61,21 @@ impl SidebarState {
             settled_visible: SETTLED_INITIAL,
             hovered: None,
             search,
-            ticking: false,
-            _tick: None,
+            _clock: None,
             _search_subscription: subscription,
         }
+    }
+}
+
+/// The sidebar as its own view, so GPUI can reuse its frame while the rest of
+/// the window re-renders. It draws [`Workspace::render_sidebar`].
+pub(super) struct SidebarView(pub(super) WeakEntity<Workspace>);
+
+impl Render for SidebarView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.0
+            .update(cx, |workspace, cx| workspace.render_sidebar(window, cx).into_any_element())
+            .unwrap_or_else(|_| div().into_any_element())
     }
 }
 
@@ -98,7 +108,7 @@ enum Item<'a> {
     ShowMore(usize),
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
@@ -189,34 +199,67 @@ impl Workspace {
         items
     }
 
-    fn shows_running_duration(&self, cx: &App) -> bool {
-        let now = now_ms();
-        self.sidebar_items(now, &self.search_query(cx)).iter().any(|item| {
-            matches!(item, Item::Card(f) if matches!(f.status(), Status::Working | Status::Preparing | Status::Waiting))
-        })
+    /// Milliseconds until something the sidebar shows changes with time alone:
+    /// a duration or relative-time label, a wake label, or a snooze deadline.
+    fn next_clock_change(&self, now: i64, query: &str) -> Option<i64> {
+        let mut next: Option<i64> = None;
+        let mut at = |delay: i64| next = Some(next.map_or(delay, |n| n.min(delay)));
+        for item in self.sidebar_items(now, query) {
+            match item {
+                Item::Card(facts) => match facts.status() {
+                    Status::Working | Status::Preparing => {
+                        if let Some(from) = facts.working_started_at() {
+                            at(inbox::duration_changes_in(now - from));
+                        }
+                    }
+                    Status::Waiting => {
+                        if let Some(from) = inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()) {
+                            at(inbox::duration_changes_in(now - from));
+                        }
+                    }
+                    _ => {
+                        if let Some(from) = facts.activity_timestamp() {
+                            at(inbox::relative_changes_in(now - from));
+                        }
+                    }
+                },
+                Item::Slim(facts, shelf) => {
+                    let from = if shelf == Some(Shelf::Settled) {
+                        facts.settled_timestamp()
+                    } else {
+                        facts.activity_timestamp()
+                    };
+                    if let Some(from) = from {
+                        at(inbox::relative_changes_in(now - from));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Waking moves a thread between shelves even while its shelf is collapsed.
+        for thread in &self.shell.threads {
+            if let Some(delay) = inbox::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
+                .and_then(|until| inbox::wake_changes_in(until - now))
+            {
+                at(delay);
+            }
+        }
+        next
     }
 
-    /// Starts the one-second repaint when a visible row shows a running duration.
-    pub(super) fn sync_sidebar_tick(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar.ticking || !self.shows_running_duration(cx) {
+    /// Re-arms the sidebar clock. Idle sidebars wake at most once a minute;
+    /// only a duration in its first minute ticks every second.
+    pub(super) fn schedule_sidebar_clock(&mut self, cx: &mut Context<Self>) {
+        let Some(delay) = self.next_clock_change(now_ms(), &self.search_query(cx)) else {
+            self.sidebar._clock = None;
             return;
-        }
-        self.sidebar.ticking = true;
-        self.sidebar._tick = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let keep = this.update(cx, |this, cx| {
-                    let keep = this.shows_running_duration(cx);
-                    this.sidebar.ticking = keep;
-                    if keep {
-                        cx.notify();
-                    }
-                    keep
-                });
-                if !matches!(keep, Ok(true)) {
-                    break;
-                }
-            }
+        };
+        self.sidebar._clock = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(delay.max(0) as u64 + 5)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.notify_sidebar(cx);
+                this.schedule_sidebar_clock(cx);
+            });
         }));
     }
 
@@ -227,13 +270,13 @@ impl Workspace {
             Shelf::Settled => &mut self.sidebar.settled_expanded,
         };
         *expanded = !*expanded;
-        self.sync_sidebar_tick(cx);
-        cx.notify();
+        self.schedule_sidebar_clock(cx);
+        self.notify_sidebar(cx);
     }
 
     fn open_from_sidebar(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.select_thread(thread_id, window, cx);
-        self.sync_sidebar_tick(cx);
+        self.schedule_sidebar_clock(cx);
     }
 
     fn dispatch_thread_command(&mut self, kind: &str, thread_id: &str, cx: &mut Context<Self>) {
@@ -252,6 +295,18 @@ impl Workspace {
             None => None,
         };
         current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(|p| p.id.clone()))
+    }
+
+    /// Re-renders the sidebar. It is a cached view: the workspace re-rendering
+    /// (every timeline scroll frame, every streamed token) leaves it alone.
+    pub(super) fn notify_sidebar(&self, cx: &mut Context<Self>) {
+        self.sidebar_view.update(cx, |_, cx| cx.notify());
+    }
+
+    /// The sidebar view, reused from the last frame unless it was notified or resized.
+    pub(super) fn render_cached_sidebar(&self) -> impl IntoElement {
+        AnyView::from(self.sidebar_view.clone())
+            .cached(StyleRefinement::default().flex_none().h_full().w(self.sidebar.width))
     }
 
     pub(super) fn sidebar_width(&self) -> Pixels {
@@ -583,7 +638,8 @@ impl Workspace {
             .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar.settled_visible += SETTLED_PAGE;
-                cx.notify();
+                this.schedule_sidebar_clock(cx);
+                this.notify_sidebar(cx);
             }))
             .child(icon(IconName::ChevronDown, 16., sb.muted_foreground))
             .child(format!("Show {count} more"))
@@ -751,7 +807,7 @@ impl Workspace {
                         } else if this.sidebar.hovered.as_ref() == Some(&hover_id) {
                             this.sidebar.hovered = None;
                         }
-                        cx.notify();
+                        this.notify_sidebar(cx);
                     }))
                     .rounded(px(6.))
                     .overflow_hidden()

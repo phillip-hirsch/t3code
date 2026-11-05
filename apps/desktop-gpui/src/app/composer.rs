@@ -76,19 +76,22 @@ impl Workspace {
         self.on_composer_change(cx);
     }
 
-    /// Opens a fresh draft when the first pending question changes.
-    pub(super) fn sync_question(&mut self) {
+    /// Opens a fresh draft when the first pending question changes. Returns
+    /// true when the new active question carries a seeded answer, which the
+    /// caller loads into the editor (the editor is the custom answer's source).
+    pub(super) fn sync_question(&mut self) -> bool {
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let first = projection.and_then(|p| p.pending_user_inputs().into_iter().next());
         let Some((request, item)) = first else {
             self.question = None;
-            return;
+            return false;
         };
         if self.question.as_ref().is_some_and(|q| q.request_id == request.id) {
-            return;
+            return false;
         }
         let questions = requests::questions(item);
         self.question = (!questions.is_empty()).then(|| QuestionDraft::new(request.id.clone(), questions));
+        self.question.as_ref().is_some_and(|draft| draft.drafts.contains_key(&draft.questions[0].id))
     }
 
     fn pending_question_request(&self) -> Option<(&RuntimeRequest, &TurnItem)> {
@@ -109,7 +112,7 @@ impl Workspace {
         draft.drafts.insert(question.id.clone(), next);
     }
 
-    fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = &self.question else { return };
         let question = &draft.questions[draft.index];
         let text = draft.drafts.get(&question.id).and_then(|d| d.custom.clone()).unwrap_or_default();
@@ -175,30 +178,26 @@ impl Workspace {
         self.dispatch(command, cx);
     }
 
-    /// Sending while an approval waits declines it: with the text as feedback
-    /// when the provider takes feedback (returns true), else before the message goes out.
-    pub(super) fn answer_approvals_with(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return false };
-        let live: Vec<(String, bool)> = projection
-            .pending_approvals()
-            .into_iter()
-            .filter(|(request, _)| request.is_live())
-            .map(|(request, _)| (request.id.clone(), request.supports_feedback()))
-            .collect();
+    /// Sending while an approval waits declines it: with the text as its
+    /// feedback when the provider takes feedback (the text is then used up and
+    /// `true` comes back), else every live approval is declined before the
+    /// message goes out.
+    pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
+        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
+            return (Vec::new(), false);
+        };
+        let live: Vec<_> =
+            projection.pending_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
         match live.first() {
-            None => false,
-            Some((id, true)) => {
-                let id = id.clone();
-                self.set_composer_text("", window, cx);
-                self.respond(id, json!({"decision": "decline", "feedback": text}), cx);
-                true
+            None => (Vec::new(), false),
+            Some(first) if first.supports_feedback() => {
+                let decline = self.respond_command(&first.id, json!({"decision": "decline", "feedback": text}));
+                (decline.into_iter().collect(), true)
             }
-            Some(_) => {
-                for (id, _) in live {
-                    self.respond(id, json!({"decision": "decline"}), cx);
-                }
-                false
-            }
+            Some(_) => (
+                live.iter().filter_map(|r| self.respond_command(&r.id, json!({"decision": "decline"}))).collect(),
+                false,
+            ),
         }
     }
 
