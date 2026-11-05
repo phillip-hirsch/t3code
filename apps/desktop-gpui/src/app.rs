@@ -123,6 +123,7 @@ impl Workspace {
                     endpoint
                 }
                 Ok(Err(error)) => {
+                    log::error!("could not reach the server: {error:#}");
                     let _ = this.update(cx, |this, cx| {
                         this.set_connection(Connection::Failed(format!("{error:#}").into()), cx)
                     });
