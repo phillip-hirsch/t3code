@@ -42,6 +42,7 @@ mod minimap;
 mod model_picker;
 mod pages;
 mod palette;
+mod palette_actions;
 mod preview;
 mod quit;
 mod right_panel;
