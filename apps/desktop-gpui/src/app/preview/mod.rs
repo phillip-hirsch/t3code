@@ -1,4 +1,4 @@
-//! The browser panel and its floating mini player (`apps/web/src/components/preview/**`).
+//! The right panel's Browser surface and its floating mini player (`apps/web/src/components/preview/**`).
 //!
 //! This client hosts a thread's desktop-runtime preview tabs in native WebViews
 //! (WebView2 on Windows) and reports their navigation with `preview.reportStatus`,
@@ -10,18 +10,18 @@ use std::collections::{HashMap, HashSet};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, Empty, Entity, Focusable as _,
-    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div, point,
-    px,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div, point, px,
 };
 use gpui_webview::WebView;
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use serde_json::{Value, json};
 
+use super::right_panel::Surface;
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT};
 use super::{Target, Workspace};
 use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPreviews};
@@ -32,12 +32,6 @@ mod native;
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
-/// `usePreviewPanelInlineSize`: default and minimum width, and the chat column it leaves.
-const DEFAULT_WIDTH: f32 = 540.;
-const MIN_WIDTH: f32 = 360.;
-const SIBLING_MIN_WIDTH: f32 = 360.;
-/// The tab row clears the panel toggles and, on Windows, the caption buttons drawn over it.
-const TAB_ROW_RIGHT_INSET: f32 = if cfg!(target_os = "windows") { 138. + 13. + 92. } else { 13. + 92. };
 /// `previewMiniPlayerLayout.ts`.
 const MINI_SIZE: f32 = 320.;
 const MINI_EDGE_GAP: f32 = 12.;
@@ -59,12 +53,6 @@ pub(super) enum PageEvent {
     },
     /// The page asked for a new window (`window.open`, `target=_blank`).
     OpenLink(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Presentation {
-    Panel,
-    Floating,
 }
 
 struct HostedTab {
@@ -94,12 +82,15 @@ pub(super) struct PreviewState {
     tabs: HashMap<String, HostedTab>,
     /// Tabs whose native view is being built, with the URL it should end up on.
     starting: HashMap<String, String>,
-    shown: HashMap<String, Presentation>,
-    width: Pixels,
+    /// The tab each thread's mini player floats (`previewMiniPlayerStore`).
+    floating: HashMap<String, String>,
+    /// The tabs drawn this frame, by the panel and the mini player, with their page scale.
+    panel_view: Option<(String, f32)>,
+    mini_view: Option<(String, f32)>,
     address: Entity<InputState>,
     /// The tab whose URL the address bar shows.
     address_tab: Option<String>,
-    menu_open: bool,
+    pub(super) menu_open: bool,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
     _events: Option<Task<()>>,
@@ -123,9 +114,6 @@ impl HasWindowHandle for ParentWindow {
     }
 }
 
-/// Drag payload for the panel's resize rail.
-struct PanelResize;
-
 impl PreviewState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter URL"));
@@ -139,8 +127,9 @@ impl PreviewState {
             threads: HashMap::new(),
             tabs: HashMap::new(),
             starting: HashMap::new(),
-            shown: HashMap::new(),
-            width: px(DEFAULT_WIDTH),
+            floating: HashMap::new(),
+            panel_view: None,
+            mini_view: None,
             address,
             address_tab: None,
             menu_open: false,
@@ -190,29 +179,32 @@ impl Workspace {
         previews.active().filter(|session| !session.server_hosted()).or_else(|| Self::hosted_sessions(previews).last())
     }
 
-    fn presentation(&self) -> Option<(String, Presentation)> {
-        let thread_id = self.preview_thread_id()?;
-        Some((thread_id.to_owned(), *self.preview.shown.get(thread_id)?))
+    /// `browserAvailable`: a thread to host tabs for.
+    pub(super) fn browser_available(&self) -> bool {
+        self.preview_thread_id().is_some()
     }
 
-    /// Whether the panel takes a column beside the chat.
-    pub(super) fn preview_panel_open(&self) -> bool {
-        self.page.is_none() && matches!(self.presentation(), Some((_, Presentation::Panel)))
-    }
-
-    /// The panel's width, for the chat canvas beside it.
-    pub(super) fn preview_panel_width(&self) -> f32 {
-        if self.preview_panel_open() { f32::from(self.preview.width) } else { 0. }
-    }
-
-    /// The tab whose native view is on screen. A native view covers GPUI overlays in its
-    /// bounds on Windows, so it hides while Settings or the panel's menu is open.
-    fn shown_preview_tab(&self) -> Option<String> {
-        if self.page.is_some() || self.settings.is_some() || self.preview.menu_open {
-            return None;
+    /// A browser tab's label (`surfaceTitle`): the page title, else its host, else "Browser".
+    pub(super) fn browser_tab_title(&self, tab_id: &str) -> SharedString {
+        let session = self.preview_thread_id().and_then(|id| self.preview.threads.get(id)).and_then(|p| p.get(tab_id));
+        let hosted = self.preview.tabs.get(tab_id);
+        let title = hosted.and_then(|tab| tab.status.title()).or_else(|| session.and_then(|s| s.nav_status.title()));
+        let url = hosted.and_then(|tab| tab.status.url()).or_else(|| session.and_then(|s| s.nav_status.url()));
+        match (title.filter(|title| !title.trim().is_empty()), url) {
+            (Some(title), _) => title.to_owned().into(),
+            (None, Some(url)) => host_of(url).into(),
+            (None, None) => "Browser".into(),
         }
-        let (thread_id, _) = self.presentation()?;
-        self.active_session(&thread_id).map(|session| session.tab_id.clone())
+    }
+
+    /// Whether GPUI draws over the browser's area: a native view would cover it on Windows.
+    fn browser_covered(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.page.is_some()
+            || self.settings.is_some()
+            || self.palette.is_some()
+            || self.preview.menu_open
+            || self.right_panel.add_menu_open
+            || window.has_active_dialog(cx)
     }
 
     /// Subscribes to every thread's preview events for this connection.
@@ -285,9 +277,15 @@ impl Workspace {
         }
         let threads = &self.preview.threads;
         self.preview.tabs.retain(|tab_id, tab| threads.get(&tab.thread_id).is_none_or(|p| p.get(tab_id).is_some()));
-        self.preview.shown.retain(|thread_id, _| {
-            threads.get(thread_id).is_none_or(|p| !p.list_loaded || Self::hosted_sessions(p).next().is_some())
-        });
+        self.preview.floating.retain(|thread_id, tab| threads.get(thread_id).is_none_or(|p| p.get(tab).is_some()));
+        let loaded: Vec<(String, Vec<String>)> = threads
+            .iter()
+            .filter(|(_, previews)| previews.list_loaded)
+            .map(|(id, previews)| (id.clone(), Self::hosted_sessions(previews).map(|s| s.tab_id.clone()).collect()))
+            .collect();
+        for (thread_id, tabs) in &loaded {
+            self.reconcile_browser_surfaces(thread_id, &tabs.iter().map(String::as_str).collect::<Vec<_>>());
+        }
         self.sync_address(window, cx);
         cx.notify();
     }
@@ -316,28 +314,30 @@ impl Workspace {
         }
     }
 
-    /// `preview.toggle` and the titlebar's right-panel toggle (`togglePreviewPanel`).
+    /// `togglePreviewPanel` (`preview.toggle`): hides a panel showing the browser, else shows the
+    /// thread's focused tab, else opens a new one.
     pub(super) fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
-        if self.preview_panel_open() {
-            // Closing the panel floats its page over the chat, as the web does.
-            if self.active_session(&thread_id).is_some() {
-                self.preview.shown.insert(thread_id, Presentation::Floating);
-            } else {
-                self.preview.shown.remove(&thread_id);
-            }
-            self.preview.menu_open = false;
-            cx.notify();
-            return;
+        if matches!(self.active_surface(), Some(Surface::Browser(_))) {
+            return self.close_right_panel(cx);
         }
-        self.page = None;
-        if self.active_session(&thread_id).is_some() {
-            self.preview.shown.insert(thread_id, Presentation::Panel);
-            self.sync_address(window, cx);
-            cx.notify();
-        } else {
+        match self.active_session(&thread_id).map(|s| s.tab_id.clone()) {
+            Some(tab) => self.open_surface(Surface::Browser(tab), window, cx),
+            None => self.open_preview_tab(thread_id, None, window, cx),
+        }
+    }
+
+    /// `createBrowserSurface`: the launcher's and the "+" menu's Browser.
+    pub(super) fn add_browser_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(thread_id) = self.preview_thread_id().map(str::to_owned) {
             self.open_preview_tab(thread_id, None, window, cx);
         }
+    }
+
+    /// Hiding the panel floats the tab it showed over the chat.
+    pub(super) fn float_browser(&mut self, thread_id: String, tab_id: String, cx: &mut Context<Self>) {
+        self.preview.floating.insert(thread_id, tab_id);
+        cx.notify();
     }
 
     /// `openPreviewSession`: a new tab in the panel, optionally loading `url`. Project
@@ -361,8 +361,11 @@ impl Workspace {
                     serde_json::from_value::<Session>(v).map_err(|e| format!("Unexpected preview.open result: {e}"))
                 }) {
                     Ok(session) => {
+                        let tab = session.tab_id.clone();
                         this.preview.threads.entry(thread_id.clone()).or_default().apply_snapshot(session, true);
-                        this.preview.shown.insert(thread_id, Presentation::Panel);
+                        if this.preview_thread_id() == Some(thread_id.as_str()) {
+                            this.open_surface(Surface::Browser(tab), window, cx);
+                        }
                         if url.is_none() {
                             this.preview.address.update(cx, |input, cx| input.focus(window, cx));
                         }
@@ -375,15 +378,30 @@ impl Workspace {
         .detach();
     }
 
-    fn select_preview_tab(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(previews) = self.preview.threads.get_mut(thread_id) {
+    /// `setActivePreviewTab`: the tab the address bar and the chrome act on.
+    pub(super) fn focus_preview_tab(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(previews) =
+            self.preview.threads.get_mut(thread_id).filter(|p| p.active_tab.as_deref() != Some(tab_id))
+        {
             previews.active_tab = Some(tab_id.to_owned());
+            self.sync_address(window, cx);
         }
-        self.sync_address(window, cx);
-        cx.notify();
     }
 
-    fn close_preview_tab(&mut self, thread_id: String, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// `closePreviewSession`.
+    pub(super) fn close_preview_tab(
+        &mut self,
+        thread_id: String,
+        tab_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(previews) = self.preview.threads.get_mut(&thread_id) {
             previews.remove(&tab_id);
         }
@@ -639,23 +657,33 @@ impl Workspace {
         }
     }
 
-    /// Applies each hosted tab's zoom, colour scheme and visibility to its native view.
-    /// Runs every frame; it only calls into the native view when something changed.
-    fn sync_preview_views(&mut self, fit_scale: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.shown_preview_tab();
-        // The shown tab's page appears once it has a URL to load.
-        if let Some(tab_id) = shown.as_deref().filter(|tab| !self.preview.tabs.contains_key(*tab)) {
-            let thread_id = self.preview_thread_id().unwrap_or_default().to_owned();
-            if let Some(url) = self.active_session(&thread_id).and_then(|s| s.nav_status.url()).map(str::to_owned) {
-                self.host_tab(&thread_id, tab_id, &url, window, cx);
+    /// Applies each hosted tab's zoom, colour scheme and visibility to its native view, after the
+    /// panel and the mini player recorded what they draw. It only calls into a view on a change.
+    pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let covered = self.browser_covered(window, cx);
+        let panel = self.preview.panel_view.take().filter(|_| !covered);
+        let mini = self.preview.mini_view.take().filter(|_| !covered);
+        let shown =
+            |tab: &str| [&panel, &mini].into_iter().flatten().find(|(id, _)| id == tab).map(|(_, scale)| *scale);
+        // A shown tab's page appears once it has a URL to load.
+        if let Some(thread_id) = self.preview_thread_id().map(str::to_owned) {
+            for (tab_id, _) in [&panel, &mini].into_iter().flatten() {
+                if self.preview.tabs.contains_key(tab_id) {
+                    continue;
+                }
+                let url =
+                    self.preview.threads.get(&thread_id).and_then(|p| p.get(tab_id)).and_then(|s| s.nav_status.url());
+                if let Some(url) = url.map(str::to_owned) {
+                    self.host_tab(&thread_id, tab_id, &url, window, cx);
+                }
             }
         }
         for (tab_id, tab) in &mut self.preview.tabs {
-            let visible = shown.as_deref() == Some(tab_id.as_str());
+            let scale = shown(tab_id);
             let session = self.preview.threads.get(&tab.thread_id).and_then(|p| p.get(tab_id));
             let view = tab.view.read(cx);
-            if visible {
-                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(1.) * f64::from(fit_scale);
+            if let Some(scale) = scale {
+                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(1.) * f64::from(scale);
                 if (tab.zoom - zoom).abs() > 1e-6 {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);
@@ -670,91 +698,46 @@ impl Workspace {
                     });
                 }
             }
-            if tab.shown != visible {
-                tab.shown = visible;
-                let _ = view.set_visible(visible);
+            if tab.shown != scale.is_some() {
+                tab.shown = scale.is_some();
+                let _ = view.set_visible(tab.shown);
             }
         }
     }
 
-    /// The panel column beside the chat, or `None` while it is closed.
-    pub(super) fn render_preview_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.preview_panel_open() {
-            self.sync_preview_views(1., window, cx);
-            return None;
-        }
+    /// The Browser surface: the chrome row over the tab's page.
+    pub(super) fn render_browser_surface(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let tokens = *theme::tokens(cx);
-        let thread_id = self.preview_thread_id()?.to_owned();
-        let available = (
-            f32::from(self.preview.width) - f32::from(RIGHT_RESIZE_INSET) - 1.,
-            f32::from(window.viewport_size().height) - f32::from(TITLEBAR_HEIGHT) - CHROME_ROW,
-        );
-        let page = self.render_page_area(&thread_id, available, window, cx);
-        let rail = div()
-            .id("preview-rail")
-            .group("preview-rail")
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(px(-8.))
-            .w(px(16.))
-            .cursor_col_resize()
-            .on_drag(PanelResize, |_, _, _, cx| cx.new(|_| Empty))
-            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                if event.click_count() == 2 {
-                    this.preview.width = px(DEFAULT_WIDTH);
-                    cx.notify();
-                }
-            }))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(7.))
-                    .w(px(2.))
-                    .invisible()
-                    .group_hover("preview-rail", |s| s.visible())
-                    .bg(tokens.border),
-            );
-        Some(
-            v_flex()
-                .id("preview-panel")
-                .relative()
-                .flex_none()
-                .w(self.preview.width)
-                .h_full()
-                .pr(RIGHT_RESIZE_INSET)
-                .border_l_1()
-                .border_color(tokens.border)
-                .bg(tokens.background)
-                .on_drag_move(cx.listener(|this, event: &DragMoveEvent<PanelResize>, window, cx| {
-                    let right = event.bounds.right();
-                    let max = (window.viewport_size().width - px(SIBLING_MIN_WIDTH)).max(px(MIN_WIDTH));
-                    this.preview.width = (right - event.event.position.x).clamp(px(MIN_WIDTH), max);
-                    cx.notify();
-                }))
-                .child(self.render_preview_tabs(&thread_id, &tokens, cx))
-                .child(self.render_preview_chrome(&thread_id, &tokens, window, cx))
-                .child(page)
-                .child(deferred(rail).with_priority(1))
-                .into_any_element(),
-        )
+        let available =
+            (width - 1., f32::from(window.viewport_size().height) - f32::from(TITLEBAR_HEIGHT) - CHROME_ROW);
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_preview_chrome(thread_id, &tokens, window, cx))
+            .child(self.render_page_area(thread_id, tab_id, available, cx))
+            .into_any_element()
     }
 
     /// The page, the empty state of a blank tab, or a fixed viewport centered in the panel.
     fn render_page_area(
         &mut self,
         thread_id: &str,
+        tab_id: &str,
         available: (f32, f32),
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
-        let session = self.active_session(thread_id).cloned();
+        let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id)).cloned();
         let fixed = session.as_ref().and_then(|s| s.viewport.size()).map(|size| preview::fit_viewport(size, available));
-        self.sync_preview_views(fixed.map_or(1., |(_, scale)| scale), window, cx);
-        let view = session.as_ref().and_then(|s| self.preview.tabs.get(&s.tab_id)).map(|tab| tab.view.clone());
+        self.preview.panel_view = Some((tab_id.to_owned(), fixed.map_or(1., |(_, scale)| scale)));
+        let view = self.preview.tabs.get(tab_id).map(|tab| tab.view.clone());
         let Some(view) = view.filter(|_| !self.preview.menu_open) else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div().flex_1().min_h_0().when(blank, |el| el.child(render_empty_state(&tokens))).into_any_element();
@@ -773,91 +756,7 @@ impl Workspace {
         }
     }
 
-    /// `RightPanelTabs` for browser surfaces: one tab per page, then "+".
-    fn render_preview_tabs(&self, thread_id: &str, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let previews = self.preview.threads.get(thread_id);
-        let active = previews.and_then(|p| p.active_tab.clone());
-        let mut row = h_flex().h(TITLEBAR_HEIGHT).flex_none().items_center().gap_1().pl_2().pr(px(TAB_ROW_RIGHT_INSET));
-        for session in previews.into_iter().flat_map(Self::hosted_sessions) {
-            let is_active = active.as_deref() == Some(session.tab_id.as_str());
-            let hosted = self.preview.tabs.get(&session.tab_id);
-            let title: SharedString = hosted
-                .and_then(|tab| tab.status.title().map(str::to_owned))
-                .or_else(|| session.nav_status.title().map(str::to_owned))
-                .or_else(|| hosted.and_then(|tab| tab.status.url()).or(session.nav_status.url()).map(host_of))
-                .unwrap_or_else(|| "New tab".to_owned())
-                .into();
-            let (select_thread, select_tab) = (thread_id.to_owned(), session.tab_id.clone());
-            let (close_thread, close_tab) = (thread_id.to_owned(), session.tab_id.clone());
-            let group: SharedString = format!("preview-tab-{}", session.tab_id).into();
-            let (accent, foreground) = (tokens.accent, tokens.foreground);
-            row = row.child(
-                h_flex()
-                    .id(SharedString::from(format!("preview-tab:{}", session.tab_id)))
-                    .group(group.clone())
-                    .flex_none()
-                    .h(px(24.))
-                    .max_w(px(144.))
-                    .gap(px(2.))
-                    .pl(px(6.))
-                    .pr(px(4.))
-                    .rounded(px(6.))
-                    .text_xs()
-                    .cursor_pointer()
-                    .occlude()
-                    .map(|el| {
-                        if is_active {
-                            el.bg(accent).text_color(foreground)
-                        } else {
-                            el.text_color(tokens.muted_foreground)
-                                .hover(move |style| style.bg(accent.opacity(0.6)).text_color(foreground))
-                        }
-                    })
-                    .child(Icon::new(IconName::Globe).size(px(12.)).flex_none())
-                    .child(div().min_w_0().px(px(2.)).truncate().child(title))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("preview-tab-close:{}", session.tab_id)))
-                            .flex_none()
-                            .size(px(16.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .invisible()
-                            .when(is_active, |el| el.visible())
-                            .group_hover(group, |style| style.visible())
-                            .hover(|style| style.bg(tokens.muted))
-                            .child(Icon::new(IconName::X).size(px(12.)))
-                            .tooltip(tooltip("Close tab"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_preview_tab(close_thread.clone(), close_tab.clone(), window, cx);
-                            })),
-                    )
-                    .on_mouse_down(MouseButton::Middle, {
-                        let (thread, tab) = (thread_id.to_owned(), session.tab_id.clone());
-                        cx.listener(move |this, _, window, cx| {
-                            this.close_preview_tab(thread.clone(), tab.clone(), window, cx)
-                        })
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_preview_tab(&select_thread, &select_tab, window, cx)
-                    })),
-            );
-        }
-        let new_tab_thread = thread_id.to_owned();
-        row.child(
-            icon_button("preview-new-tab", IconName::Plus, true, tokens)
-                .occlude()
-                .tooltip(tooltip("New browser tab"))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_preview_tab(new_tab_thread.clone(), None, window, cx)
-                })),
-        )
-    }
-
-    /// `PreviewChromeRow` in the inline panel: back, forward, reload, the address bar and the menu.
+    /// `PreviewChromeRow`: back, forward, reload, the address bar and the menu.
     fn render_preview_chrome(
         &self,
         thread_id: &str,
@@ -1141,30 +1040,22 @@ impl Workspace {
             .child(deferred(anchored().anchor(Anchor::TopRight).position(corner).child(menu)).with_priority(2))
     }
 
-    /// `ThreadPreviewMiniPlayer`: the active tab floating over the chat's bottom-right corner.
-    pub(super) fn render_preview_mini_player(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let (thread_id, Presentation::Floating) = self.presentation()? else { return None };
-        if self.page.is_some() {
+    /// `ThreadPreviewMiniPlayer`: the floated tab over the chat's bottom-right corner, unless the
+    /// panel shows that same tab (`shouldRenderPreviewMiniPlayer`).
+    pub(super) fn render_preview_mini_player(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread_id = self.preview_thread_id()?.to_owned();
+        let tab_id = self.preview.floating.get(&thread_id)?.clone();
+        if self.page.is_some() || self.active_surface() == Some(&Surface::Browser(tab_id.clone())) {
             return None;
         }
         let tokens = *theme::tokens(cx);
-        let session = self.active_session(&thread_id)?.clone();
+        let session = self.preview.threads.get(&thread_id)?.get(&tab_id)?.clone();
         let body = (MINI_SIZE, MINI_SIZE - MINI_HEADER);
         let fixed = session.viewport.size().map(|size| preview::fit_viewport(size, body));
-        self.sync_preview_views(fixed.map_or(1., |(_, scale)| scale), window, cx);
-        let view = self.preview.tabs.get(&session.tab_id).map(|tab| tab.view.clone());
-        let title: SharedString = self
-            .preview
-            .tabs
-            .get(&session.tab_id)
-            .and_then(|tab| tab.status.title().map(str::to_owned).or_else(|| tab.status.url().map(host_of)))
-            .unwrap_or_else(|| "Browser".to_owned())
-            .into();
-        let expand_thread = thread_id.clone();
+        self.preview.mini_view = Some((tab_id.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        let view = self.preview.tabs.get(&tab_id).map(|tab| tab.view.clone());
+        let title = self.browser_tab_title(&tab_id);
+        let (expand_thread, expand_tab) = (thread_id.clone(), tab_id);
         let close_thread = thread_id.clone();
         Some(
             v_flex()
@@ -1196,16 +1087,15 @@ impl Workspace {
                             icon_button("mini-expand", IconName::PanelRight, true, &tokens)
                                 .tooltip(tooltip("Open in panel"))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.preview.shown.insert(expand_thread.clone(), Presentation::Panel);
-                                    this.sync_address(window, cx);
-                                    cx.notify();
+                                    this.preview.floating.remove(&expand_thread);
+                                    this.open_surface(Surface::Browser(expand_tab.clone()), window, cx);
                                 })),
                         )
                         .child(
                             icon_button("mini-close", IconName::X, true, &tokens)
                                 .tooltip(tooltip("Close floating preview"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.preview.shown.remove(&close_thread);
+                                    this.preview.floating.remove(&close_thread);
                                     cx.notify();
                                 })),
                         ),

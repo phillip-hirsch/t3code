@@ -836,11 +836,10 @@ impl Render for Workspace {
         if window.focused(cx).is_none() {
             self.focus.focus(window, cx);
         }
-        let panel_open = self.preview_panel_open();
-        let panel = self.render_preview_panel(window, cx);
-        let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_vcs(window, cx);
         let right_panel = self.render_right_panel(window, cx);
+        let mini_player = self.render_preview_mini_player(cx);
+        self.sync_preview_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()
@@ -865,7 +864,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
@@ -891,7 +890,7 @@ impl Render for Workspace {
                             .flex_1()
                             .h_full()
                             .min_w_0()
-                            .when(!panel_open && right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
+                            .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             .child(self.render_header(cx))
                             .children(self.render_error(cx))
                             .child(
@@ -944,8 +943,7 @@ impl Render for Workspace {
                     .children(
                         right_panel
                             .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
-                    )
-                    .children(panel),
+                    ),
             )
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_page_modal(window, cx))

@@ -1,21 +1,22 @@
-//! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`) with its
-//! Diff surface (`DiffPanel.tsx`). The panel owns the titlebar row above it,
-//! keeps per-thread open state and tabs, and resizes from its left edge.
-//! The web's other surfaces (browser, terminal, files, pull requests, devices,
-//! side chats) are not native yet, so the launcher offers Diff only.
+//! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
+//! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
+//! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
+//! The web's other surfaces (terminal, files, pull requests, devices, side chats) are not
+//! native yet, so the launcher offers Browser and Diff.
 
 use std::collections::HashMap;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, DragMoveEvent, Empty, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, WindowControlArea,
-    deferred, div, px,
+    AnyElement, AppContext as _, Context, DragMoveEvent, ElementId, Empty, Entity, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
+    Window, WindowControlArea, deferred, div, px,
 };
 use serde_json::{Value, json};
 
@@ -94,11 +95,61 @@ pub(super) fn rollback_command(projection: &ThreadProjection, turn_count: u32, r
     })
 }
 
+/// One tab of the panel (`RightPanelSurface`): the Diff, or one browser tab by its preview tab id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Surface {
+    Diff,
+    Browser(String),
+}
+
+/// A target's panel (`ThreadRightPanelState`).
 #[derive(Clone, Default)]
 struct PanelState {
     open: bool,
-    diff_tab: bool,
+    surfaces: Vec<Surface>,
+    active: Option<Surface>,
     scope: DiffScope,
+}
+
+impl PanelState {
+    /// `upsertSurface`: adds the surface if missing, shows the panel and activates it.
+    fn upsert(&mut self, surface: Surface) {
+        if !self.surfaces.contains(&surface) {
+            self.surfaces.push(surface.clone());
+        }
+        self.open = true;
+        self.active = Some(surface);
+    }
+
+    /// `closeSurface`: the panel hides with its last surface; the next one over takes focus.
+    fn close(&mut self, surface: &Surface) {
+        let Some(index) = self.surfaces.iter().position(|s| s == surface) else { return };
+        self.surfaces.remove(index);
+        self.open &= !self.surfaces.is_empty();
+        if self.active.as_ref() == Some(surface) {
+            self.active = self.surfaces.get(index.min(self.surfaces.len().saturating_sub(1))).cloned();
+        }
+    }
+
+    /// `reconcileBrowserSurfaces`: a tab per preview session, dropping closed ones. Closing the
+    /// last session hides the panel rather than leave it on the launcher.
+    fn reconcile_browsers(&mut self, tab_ids: &[&str]) {
+        let had_browser = self.surfaces.iter().any(|s| matches!(s, Surface::Browser(_)));
+        self.surfaces.retain(|s| !matches!(s, Surface::Browser(tab) if !tab_ids.contains(&tab.as_str())));
+        for tab in tab_ids {
+            let surface = Surface::Browser((*tab).to_owned());
+            if !self.surfaces.contains(&surface) {
+                self.surfaces.push(surface);
+            }
+        }
+        if self.active.as_ref().is_some_and(|active| !self.surfaces.contains(active)) {
+            let browser = self.surfaces.iter().find(|s| matches!(s, Surface::Browser(_)));
+            self.active = browser.or(self.surfaces.first()).cloned();
+        }
+        if self.surfaces.is_empty() && had_browser {
+            self.open = false;
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -129,6 +180,8 @@ struct Commit {
 pub(super) struct RightPanel {
     panels: HashMap<Target, PanelState>,
     width: f32,
+    /// The "+" menu is open; a native browser view must not cover it.
+    pub(super) add_menu_open: bool,
     diff: Entity<DiffState>,
     loaded: Option<DiffKey>,
     load: DiffLoad,
@@ -146,6 +199,7 @@ impl RightPanel {
         Self {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
+            add_menu_open: false,
             diff,
             loaded: None,
             load: DiffLoad::Idle,
@@ -176,6 +230,11 @@ impl Workspace {
         self.page.is_none() && self.panel_state().is_some_and(|panel| panel.open)
     }
 
+    /// The surface on screen (`selectActiveRightPanelSurface`).
+    pub(super) fn active_surface(&self) -> Option<&Surface> {
+        self.panel_state().filter(|panel| panel.open && self.page.is_none())?.active.as_ref()
+    }
+
     /// The panel's laid-out width while it is open.
     pub(super) fn right_panel_width(&self, window: &Window) -> Option<f32> {
         if !self.right_panel_open() {
@@ -186,25 +245,86 @@ impl Workspace {
         Some(clamp_width(self.right_panel.width, viewport, viewport - sidebar))
     }
 
-    /// `rightPanelStore.toggleOpen` (Ctrl+Alt+B and the titlebar toggle).
-    pub(super) fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut() {
-            panel.open = !panel.open;
+    /// `toggleRightPanel` (Ctrl+Alt+B and the titlebar toggle).
+    pub(super) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right_panel_open() {
+            self.close_right_panel(cx);
+        } else if let Some(panel) = self.panel_state_mut() {
+            panel.open = true;
+            self.sync_active_browser(window, cx);
             cx.notify();
         }
     }
 
-    /// The details card's Changes row: the Diff surface on the branch's changes.
-    pub(super) fn open_changes(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let available = self.diff_available();
-        if let Some(panel) = self.panel_state_mut() {
-            panel.open = true;
-            if available {
-                panel.diff_tab = true;
-                panel.scope = DiffScope::Branch;
-            }
-            cx.notify();
+    /// `closePreviewPanel`: hiding the panel floats the browser it showed.
+    pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
+        if let (Some(Target::Thread(thread_id)), Some(Surface::Browser(tab))) =
+            (self.target.clone(), self.active_surface().cloned())
+        {
+            self.float_browser(thread_id, tab, cx);
         }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.open = false;
+        }
+        self.preview.menu_open = false;
+        cx.notify();
+    }
+
+    /// Adds (or focuses) a surface and shows the panel.
+    pub(super) fn open_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = None;
+        if let Some(panel) = self.panel_state_mut() {
+            panel.upsert(surface);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    fn activate_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.panel_state_mut().filter(|panel| panel.surfaces.contains(&surface)) {
+            panel.open = true;
+            panel.active = Some(surface);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// Closes a tab; a browser tab's session closes with it.
+    fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.panel_state_mut() {
+            panel.close(&surface);
+        }
+        if let (Surface::Browser(tab), Some(Target::Thread(thread_id))) = (&surface, self.target.clone()) {
+            self.close_preview_tab(thread_id, tab.clone(), window, cx);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// Keeps the thread's focused preview tab on the browser surface the panel shows.
+    fn sync_active_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(Target::Thread(thread_id)), Some(Surface::Browser(tab))) =
+            (self.target.clone(), self.active_surface().cloned())
+        {
+            self.focus_preview_tab(&thread_id, &tab, window, cx);
+        }
+    }
+
+    /// Follows a thread's preview sessions: a panel tab per drawable session.
+    pub(super) fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[&str]) {
+        let panel = self.right_panel.panels.entry(Target::Thread(thread_id.to_owned())).or_default();
+        panel.reconcile_browsers(tab_ids);
+    }
+
+    /// `addDiffSurface`: the details card's Changes row and the launcher's Diff open the branch's changes.
+    pub(super) fn open_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.diff_available() {
+            return;
+        }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.scope = DiffScope::Branch;
+        }
+        self.open_surface(Surface::Diff, window, cx);
     }
 
     /// `diffAvailable`: a server thread in a git repository.
@@ -221,7 +341,10 @@ impl Workspace {
 
     /// Starts a fetch when the shown selection differs from the loaded one.
     fn sync_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(panel) = self.panel_state().filter(|p| p.open && p.diff_tab).cloned() else { return };
+        if self.active_surface() != Some(&Surface::Diff) {
+            return;
+        }
+        let Some(panel) = self.panel_state().cloned() else { return };
         let Some(target) = self.target.clone() else { return };
         let turns = self.open_projection().map(turn_summaries).unwrap_or_default();
         let scope = match &panel.scope {
@@ -414,10 +537,12 @@ impl Workspace {
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
         let panel = self.panel_state().cloned().unwrap_or_default();
-        let content = if panel.diff_tab {
-            self.render_diff_surface(&panel.scope, &tokens, cx)
-        } else {
-            self.render_launcher(&tokens, cx)
+        let content = match (&panel.active, self.target.clone()) {
+            (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, cx),
+            (Some(Surface::Browser(tab)), Some(Target::Thread(thread_id))) => {
+                self.render_browser_surface(&thread_id, tab, width, window, cx)
+            }
+            _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
             .id("right-panel-resize")
@@ -476,16 +601,22 @@ impl Workspace {
         // `wco:pr-(--workspace-native-controls-inset)` plus the `w-24` spacer for the toggles.
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
-        let available = self.diff_available();
+        let (diff, browser) = (self.diff_available(), self.browser_available());
+        let tabs: Vec<AnyElement> = panel
+            .surfaces
+            .iter()
+            .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, cx))
+            .collect();
         h_flex()
             .id("right-panel-tabbar")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
+            .min_w_0()
             .pl_2()
             .pr(reserve)
             .gap_1()
             .window_control_area(WindowControlArea::Drag)
-            .when(panel.diff_tab, |el| el.child(self.render_diff_tab(tokens, cx)))
+            .children(tabs)
             .child(
                 Button::new("right-panel-add")
                     .custom(
@@ -499,33 +630,56 @@ impl Workspace {
                     .size(px(24.))
                     .rounded(px(8.))
                     .dropdown_menu(move |menu: PopupMenu, window, _| {
-                        menu.min_w(px(200.)).item(
-                            PopupMenuItem::new("Diff")
-                                .icon(icon("icons/file-diff.svg"))
-                                .disabled(!available)
-                                .on_click(window.listener_for(&view, |this, _, _, cx| this.open_diff_tab(cx))),
-                        )
-                    }),
+                        menu.min_w(px(200.))
+                            .item(
+                                PopupMenuItem::new("Browser")
+                                    .icon(Icon::new(IconName::Globe))
+                                    .disabled(!browser)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.add_browser_surface(window, cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
+                                    window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
+                                ),
+                            )
+                    })
+                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                        this.right_panel.add_menu_open = *open;
+                        cx.notify();
+                    })),
             )
     }
 
-    fn open_diff_tab(&mut self, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut() {
-            panel.diff_tab = true;
-            cx.notify();
-        }
-    }
-
-    /// The Diff tab: `h-6 rounded-md pl-1.5 pr-2 text-xs`, its icon turning into a close button on hover.
-    fn render_diff_tab(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = tokens.muted;
-        div()
-            .id("right-panel-tab-diff")
-            .group("right-panel-tab-diff")
+    /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover.
+    fn render_surface_tab(
+        &self,
+        surface: &Surface,
+        active: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (key, title, glyph): (SharedString, SharedString, AnyElement) = match surface {
+            Surface::Diff => {
+                ("diff".into(), "Diff".into(), icon("icons/file-diff.svg").with_size(px(12.)).into_any_element())
+            }
+            Surface::Browser(tab) => (
+                format!("browser:{tab}").into(),
+                self.browser_tab_title(tab),
+                Icon::new(IconName::Globe).size(px(12.)).into_any_element(),
+            ),
+        };
+        let group: SharedString = format!("right-panel-tab:{key}").into();
+        let tooltip: SharedString = format!("Close {title}").into();
+        let (accent, foreground, muted) = (tokens.accent, tokens.foreground, tokens.muted);
+        let (close, activate, middle) = (surface.clone(), surface.clone(), surface.clone());
+        h_flex()
+            .id(ElementId::Name(group.clone()))
+            .group(group.clone())
+            .flex_none()
             .h(px(24.))
             .max_w(px(144.))
-            .flex()
-            .items_center()
             .gap(px(2.))
             .pl(px(6.))
             .pr_2()
@@ -533,11 +687,18 @@ impl Workspace {
             .occlude()
             .cursor_pointer()
             .text_xs()
-            .bg(tokens.accent)
-            .text_color(tokens.foreground)
+            .map(|el| {
+                if active {
+                    el.bg(accent).text_color(foreground)
+                } else {
+                    el.text_color(tokens.muted_foreground)
+                        .hover(move |style| style.bg(accent.opacity(0.6)).text_color(foreground))
+                }
+            })
             .child(
                 div()
-                    .id("right-panel-tab-diff-close")
+                    .id(ElementId::Name(format!("{group}:close").into()))
+                    .relative()
                     .size(px(16.))
                     .flex_none()
                     .flex()
@@ -545,55 +706,79 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(4.))
                     .hover(move |style| style.bg(muted))
-                    .child(
-                        div()
-                            .group_hover("right-panel-tab-diff", |style| style.invisible())
-                            .child(icon("icons/file-diff.svg").with_size(px(12.))),
-                    )
+                    .child(div().group_hover(group.clone(), |style| style.invisible()).child(glyph))
                     .child(
                         div()
                             .absolute()
                             .invisible()
-                            .group_hover("right-panel-tab-diff", |style| style.visible())
+                            .group_hover(group.clone(), |style| style.visible())
                             .child(icon("icons/x.svg").with_size(px(12.))),
                     )
-                    .tooltip(|window, cx| Tooltip::new("Close Diff").build(window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        if let Some(panel) = this.panel_state_mut() {
-                            panel.diff_tab = false;
-                        }
-                        cx.notify();
+                        this.close_surface(close.clone(), window, cx);
                     })),
             )
-            .child(div().truncate().child("Diff"))
+            .child(div().min_w_0().truncate().child(title))
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.activate_surface(activate.clone(), window, cx)))
+            .into_any_element()
     }
 
     /// `RightPanelEmptyState`: "Open a surface" with the surfaces this client has.
     fn render_launcher(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let available = self.diff_available();
         let hover = tokens.accent.opacity(0.6);
-        let diff_row = h_flex()
-            .id("right-panel-open-diff")
-            .h(px(32.))
-            .w_full()
-            .gap(px(10.))
-            .px(px(10.))
-            .rounded(px(8.))
-            .text_sm()
-            .child(icon("icons/file-diff.svg").with_size(px(16.)))
-            .child(div().flex_1().min_w_0().truncate().child("Diff"))
-            .child(kbd("D", tokens))
-            .map(|el| {
-                if available {
-                    el.cursor_pointer()
-                        .hover(move |style| style.bg(hover))
-                        .on_click(cx.listener(|this, _, _, cx| this.open_diff_tab(cx)))
-                } else {
-                    el.opacity(0.5)
-                        .tooltip(|window, cx| Tooltip::new("Available for Git repositories.").build(window, cx))
-                }
-            });
+        let row = |id: &'static str,
+                   glyph: AnyElement,
+                   label: &'static str,
+                   key: &'static str,
+                   available: bool,
+                   hint: &'static str| {
+            h_flex()
+                .id(id)
+                .h(px(32.))
+                .w_full()
+                .gap(px(10.))
+                .px(px(10.))
+                .rounded(px(8.))
+                .text_sm()
+                .child(glyph)
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(kbd(key, tokens))
+                .map(|el| {
+                    if available {
+                        el.cursor_pointer().hover(move |style| style.bg(hover))
+                    } else {
+                        el.opacity(0.5).tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                    }
+                })
+        };
+        let browser_available = self.browser_available();
+        let browser = row(
+            "right-panel-open-browser",
+            Icon::new(IconName::Globe).size(px(16.)).into_any_element(),
+            "Browser",
+            "B",
+            browser_available,
+            "Only available in a thread.",
+        )
+        .when(browser_available, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
+        });
+        let diff_available = self.diff_available();
+        let diff = row(
+            "right-panel-open-diff",
+            icon("icons/file-diff.svg").with_size(px(16.)).into_any_element(),
+            "Diff",
+            "D",
+            diff_available,
+            "Available for Git repositories.",
+        )
+        .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
         div()
             .flex_1()
             .min_h_0()
@@ -616,7 +801,7 @@ impl Workspace {
                             .text_color(tokens.foreground)
                             .child("Open a surface"),
                     )
-                    .child(v_flex().gap(px(2.)).child(diff_row)),
+                    .child(v_flex().gap(px(2.)).child(browser).child(diff)),
             )
             .into_any_element()
     }
@@ -998,6 +1183,38 @@ mod tests {
         assert_eq!(clamp_width(100., 1600., 1300.), MIN_WIDTH);
         // Too narrow for both: the panel keeps its minimum.
         assert_eq!(clamp_width(540., 600., 500.), MIN_WIDTH);
+    }
+
+    #[test]
+    fn closing_a_tab_focuses_its_neighbour_and_the_last_one_hides_the_panel() {
+        let browser = |tab: &str| Surface::Browser(tab.into());
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Diff);
+        panel.upsert(browser("a"));
+        panel.upsert(browser("b"));
+        panel.upsert(browser("a"));
+        assert_eq!(panel.surfaces, [Surface::Diff, browser("a"), browser("b")]);
+        panel.close(&browser("a"));
+        assert_eq!(panel.active, Some(browser("b")));
+        panel.close(&Surface::Diff);
+        panel.close(&browser("b"));
+        assert!(!panel.open && panel.active.is_none());
+    }
+
+    #[test]
+    fn browser_tabs_follow_the_preview_sessions() {
+        let browser = |tab: &str| Surface::Browser(tab.into());
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Diff);
+        panel.upsert(browser("gone"));
+        panel.reconcile_browsers(&["kept", "new"]);
+        assert_eq!(panel.surfaces, [Surface::Diff, browser("kept"), browser("new")]);
+        assert_eq!(panel.active, Some(browser("kept")), "a closed active tab falls back to a browser");
+        assert!(panel.open);
+        let mut only_browser = PanelState::default();
+        only_browser.upsert(browser("a"));
+        only_browser.reconcile_browsers(&[]);
+        assert!(!only_browser.open, "losing the last session hides the panel");
     }
 
     #[test]
