@@ -93,11 +93,11 @@ pub fn index_patch(patch: &str) -> Vec<FilePatch> {
             };
             hunk.lines.push(Line { change, old: at.0, new: at.1, text: line.get(1..).unwrap_or_default().to_owned() });
             if change != Change::Added {
-                at.0 += 1;
+                at.0 = at.0.saturating_add(1);
                 remaining.0 = remaining.0.saturating_sub(1);
             }
             if change != Change::Deleted {
-                at.1 += 1;
+                at.1 = at.1.saturating_add(1);
                 remaining.1 = remaining.1.saturating_sub(1);
             }
             continue;
@@ -131,8 +131,8 @@ pub fn index_patch(patch: &str) -> Vec<FilePatch> {
 /// `isLineInFileDiff`: only a line inside a hunk can anchor a comment.
 pub fn line_in_diff(file: &FilePatch, side: Side, line: u64) -> bool {
     file.hunks.iter().any(|hunk| match side {
-        Side::Left => line >= hunk.old_start && line < hunk.old_start + hunk.old_count,
-        Side::Right => line >= hunk.new_start && line < hunk.new_start + hunk.new_count,
+        Side::Left => line >= hunk.old_start && line < hunk.old_start.saturating_add(hunk.old_count),
+        Side::Right => line >= hunk.new_start && line < hunk.new_start.saturating_add(hunk.new_count),
     })
 }
 
@@ -557,6 +557,16 @@ deleted file mode 100644
         assert_eq!(review_position(a, Side::Left, 13), Some(Position::Deleted { old: 13 }));
         assert_eq!(review_position(a, Side::Left, 10), Some(Position::Context { old: 10, new: 10, side: Side::Left }));
         assert_eq!(review_position(a, Side::Right, 30), None, "a line outside every hunk anchors nothing");
+
+        let absurd = index_patch(
+            "diff --git a/x b/x
+@@ -18446744073709551615,2 +1 @@
+ a
+ b
+",
+        );
+        assert_eq!(absurd[0].hunks[0].lines.len(), 2, "a hunk at the end of the range doesn't overflow");
+        assert!(!line_in_diff(&absurd[0], Side::Left, 1));
     }
 
     #[test]

@@ -58,10 +58,15 @@ pub struct TokenTotals {
     pub output_tokens: u64,
 }
 
+/// Token counts come from outside, so their sums stop at the maximum instead of overflowing.
+fn sum<const N: usize>(counts: [u64; N]) -> u64 {
+    counts.into_iter().fold(0, u64::saturating_add)
+}
+
 impl TokenTotals {
     /// Reasoning tokens are already part of the output count.
     fn total(&self) -> u64 {
-        self.uncached_input_tokens + self.cached_input_tokens + self.cache_creation_tokens + self.output_tokens
+        sum([self.uncached_input_tokens, self.cached_input_tokens, self.cache_creation_tokens, self.output_tokens])
     }
 }
 
@@ -248,10 +253,10 @@ impl Period {
 
     fn add(&mut self, provider: &str, cost: f64, tokens: u64) {
         self.cost_usd += cost;
-        self.total_tokens += tokens;
+        self.total_tokens = self.total_tokens.saturating_add(tokens);
         let entry = self.by_provider.entry(provider.to_owned()).or_default();
         entry.0 += cost;
-        entry.1 += tokens;
+        entry.1 = entry.1.saturating_add(tokens);
     }
 }
 
@@ -311,13 +316,14 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         }
         owned_providers.push(provider);
         owned_sources.push((provider, source.fingerprint.resolved_home_path.as_str()));
-        merged.sessions += source.distinct_sessions;
+        merged.sessions = merged.sessions.saturating_add(source.distinct_sessions);
         if source.distinct_sessions > 0 {
-            provider_slot(&mut providers, provider).sessions += source.distinct_sessions;
+            let slot = provider_slot(&mut providers, provider);
+            slot.sessions = slot.sessions.saturating_add(source.distinct_sessions);
         }
     }
-    let mut records = 0;
-    let mut unpriced = 0;
+    let mut records: u64 = 0;
+    let mut unpriced: u64 = 0;
     let mut categories = CategoryCost::default();
     let mut models: Vec<ModelTotals> = Vec::new();
     let mut daily: HashMap<String, Period> = HashMap::new();
@@ -330,12 +336,12 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         let tokens = bucket.totals.total();
         merged.cost_usd += bucket.cost_usd;
         merged.cache_savings_usd += bucket.cache_savings_usd;
-        merged.uncached_input_tokens += bucket.totals.uncached_input_tokens;
-        merged.cached_input_tokens += bucket.totals.cached_input_tokens;
-        merged.cache_creation_tokens += bucket.totals.cache_creation_tokens;
-        merged.output_tokens += bucket.totals.output_tokens;
-        records += bucket.records;
-        unpriced += bucket.unpriced_records;
+        merged.uncached_input_tokens = merged.uncached_input_tokens.saturating_add(bucket.totals.uncached_input_tokens);
+        merged.cached_input_tokens = merged.cached_input_tokens.saturating_add(bucket.totals.cached_input_tokens);
+        merged.cache_creation_tokens = merged.cache_creation_tokens.saturating_add(bucket.totals.cache_creation_tokens);
+        merged.output_tokens = merged.output_tokens.saturating_add(bucket.totals.output_tokens);
+        records = records.saturating_add(bucket.records);
+        unpriced = unpriced.saturating_add(bucket.unpriced_records);
         if let Some(cost) = bucket.category_cost_usd {
             categories.input += cost.input;
             categories.cache_read += cost.cache_read;
@@ -347,7 +353,7 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         merged.speed.premium += bucket.speed_premium_usd.unwrap_or(0.);
         let provider = provider_slot(&mut providers, &bucket.provider);
         provider.cost_usd += bucket.cost_usd;
-        provider.total_tokens += tokens;
+        provider.total_tokens = provider.total_tokens.saturating_add(tokens);
         let model = match models.iter().position(|m| m.provider == bucket.provider && m.model == bucket.model) {
             Some(index) => &mut models[index],
             None => {
@@ -360,9 +366,9 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
             }
         };
         model.cost_usd += bucket.cost_usd;
-        model.total_tokens += tokens;
-        model.records += bucket.records;
-        model.unpriced_records += bucket.unpriced_records;
+        model.total_tokens = model.total_tokens.saturating_add(tokens);
+        model.records = model.records.saturating_add(bucket.records);
+        model.unpriced_records = model.unpriced_records.saturating_add(bucket.unpriced_records);
         daily.entry(bucket.day.clone()).or_insert_with(|| Period { day: bucket.day.clone(), ..Period::default() }).add(
             &bucket.provider,
             bucket.cost_usd,
@@ -375,8 +381,12 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
                 .add(&bucket.provider, bucket.cost_usd, tokens);
         }
     }
-    merged.total_tokens =
-        merged.uncached_input_tokens + merged.cached_input_tokens + merged.cache_creation_tokens + merged.output_tokens;
+    merged.total_tokens = sum([
+        merged.uncached_input_tokens,
+        merged.cached_input_tokens,
+        merged.cache_creation_tokens,
+        merged.output_tokens,
+    ]);
     let (cost, total) = (merged.cost_usd, merged.total_tokens);
     let share = |part: f64, whole: f64| if whole == 0. { 0. } else { part / whole };
     for provider in &mut providers {
@@ -1544,6 +1554,16 @@ mod tests {
 
         let without_claude = merge(&summary, &["claude".to_string()]);
         assert_eq!((without_claude.cost_usd, without_claude.sessions), (1., 3));
+
+        let huge = self::summary(
+            json!([
+                bucket("2026-10-01", "claude", "opus", 1., u64::MAX),
+                bucket("2026-10-02", "claude", "opus", 1., 1)
+            ]),
+            json!([source("claude", "ok", u64::MAX), source("claude", "ok", 1)]),
+        );
+        let merged = merge(&huge, &[]);
+        assert_eq!((merged.total_tokens, merged.sessions), (u64::MAX, u64::MAX), "outside counts saturate");
     }
 
     #[test]

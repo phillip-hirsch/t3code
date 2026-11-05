@@ -504,14 +504,14 @@ pub fn group_by_involvement(entries: Vec<Rc<Entry>>, viewers: &HashMap<String, S
 pub type Stats = HashMap<String, (u64, u64)>;
 
 pub fn diff_stat(entry: &Entry, stats: &Stats) -> Option<(u64, u64)> {
-    if entry.additions + entry.deletions > 0 {
+    if entry.additions.saturating_add(entry.deletions) > 0 {
         return Some((entry.additions, entry.deletions));
     }
     stats.get(&entry.stat_key()).copied()
 }
 
 fn size_of(entry: &Entry, stats: &Stats) -> (bool, u64) {
-    diff_stat(entry, stats).map_or((false, 0), |(a, d)| (true, a + d))
+    diff_stat(entry, stats).map_or((false, 0), |(a, d)| (true, a.saturating_add(d)))
 }
 
 fn readiness_tier(entry: &Entry) -> u8 {
