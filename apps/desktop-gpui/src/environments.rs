@@ -922,9 +922,24 @@ mod tests {
         assert!(text.starts_with("T3 Code connection to Box: This device could not prepare the connection\n\nThis device: FAILED\nT3 Code on Box: not checked\n\nCause: authentication"));
     }
 
+    /// DPAPI keeps its master keys in the user's profile (`%APPDATA%\Microsoft\Protect`). A
+    /// sandbox running as a user without a loaded profile fails every call with OS error 2.
+    /// A failure with the profile readable is a real failure, so the test still runs then.
+    #[cfg(windows)]
+    fn dpapi_unavailable() -> Option<String> {
+        let error = secure::protect(b"probe").err()?;
+        let keys = std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("Microsoft").join("Protect"));
+        let profile_readable = keys.is_some_and(|keys| std::fs::read_dir(keys).is_ok());
+        (!profile_readable).then_some(error)
+    }
+
     #[cfg(windows)]
     #[test]
     fn catalog_documents_round_trip_with_encrypted_tokens() {
+        if let Some(error) = dpapi_unavailable() {
+            eprintln!("skipped: DPAPI has no user profile here ({error})");
+            return;
+        }
         let catalog = Catalog {
             local_environment_enabled: false,
             environments: vec![SavedEnvironment {
