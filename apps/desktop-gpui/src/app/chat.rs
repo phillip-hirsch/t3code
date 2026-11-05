@@ -32,6 +32,11 @@ const LINE: f32 = 22.75;
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
 
+/// `shouldCollapseUserMessage`.
+pub(super) fn should_collapse(text: &str) -> bool {
+    text.chars().count() > COLLAPSE_CHARS || text.lines().count() > COLLAPSE_LINES
+}
+
 impl Workspace {
     pub(super) fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
@@ -119,7 +124,7 @@ impl Workspace {
     }
 
     /// Opens or closes a work group, turn fold or entry.
-    fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
+    pub(super) fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
@@ -132,6 +137,7 @@ impl Workspace {
         let working = rows.iter().any(|row| match row {
             Row::Working { started_at: Some(_) } => true,
             Row::Now(line) => line.ticks(),
+            Row::Workflow { row, .. } => row.phases.iter().flat_map(|p| &p.2).chain(&row.unphased).any(|c| c.live),
             Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
             Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
             _ => false,
@@ -176,6 +182,7 @@ fn thought_key(entry_id: &str) -> SharedString {
 fn shows_markdown(row: &Row, key: &str) -> bool {
     match row {
         Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
+        Row::Workflow { row, .. } => key.strip_prefix("workflow-script:") == Some(row.opening.message_id.as_str()),
         Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought_key(&entry.id) == key,
         Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
             entries.iter().any(|(entry, _)| thought_key(&entry.id) == key)
@@ -194,7 +201,7 @@ enum MarkdownKind {
 }
 
 /// `ChatMarkdown` for `text`, parsed once per `key` for as long as the thread is open.
-fn markdown(
+pub(super) fn markdown(
     this: &WeakEntity<Workspace>,
     key: SharedString,
     text: &SharedString,
@@ -533,6 +540,9 @@ fn render_row(
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
         Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::Workflow { row, expanded } => {
+            lane(16., super::workflow::workflow_row(row, *expanded, this, lane_width, &t, cx)).into_any_element()
+        }
         Row::WorktreeSetup { snapshot, embedded } => {
             super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
         }
@@ -629,7 +639,7 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
 
 /// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
 /// chevron when the subagent's thread can open.
-fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let muted = t.muted_foreground;
     let detail_color = if card.failed { t.error } else { muted };
     let dot = match card.dot {

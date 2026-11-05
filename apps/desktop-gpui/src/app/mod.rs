@@ -56,6 +56,7 @@ mod thread_menu;
 mod thread_now;
 mod titlebar;
 mod visits;
+mod workflow;
 mod worktree_setup;
 
 gpui_kit::actions!(
@@ -223,6 +224,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
     requests: request_cards::RequestUi,
@@ -348,6 +350,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,
             requests: Default::default(),
@@ -703,6 +706,7 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
+        self.apply_workflow_opening(&mut new_rows, cx);
         self.sync_worktree_setup(cx);
         self.insert_worktree_setup(&mut new_rows);
         new_rows.extend(self.now_rows(cx));

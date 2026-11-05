@@ -73,6 +73,11 @@ pub enum Row {
     },
     /// A centered lifecycle label between hairlines (`TimelineSystemDivider`): a stop, a fork.
     System(Rc<SystemDivider>),
+    /// A workflow thread's opening: its script as the plan, with the members' progress.
+    Workflow {
+        row: Rc<crate::workflow::WorkflowRow>,
+        expanded: bool,
+    },
     /// Subagents one provider turn started, folded under "3 subagents" (`V2SubagentGroup`).
     SubagentGroup {
         key: SharedString,
@@ -415,9 +420,9 @@ pub fn plain_detail(text: &str) -> String {
     lines.join(" ").replace('`', "").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn subagent_card(item: &TurnItem) -> SubagentCard {
-    let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty());
-    let (status_label, dot) = match item.status.as_str() {
+/// A subagent status's label and avatar dot.
+pub(crate) fn subagent_status(status: &str) -> (&'static str, Dot) {
+    match status {
         "pending" => ("Queued", Dot::Info),
         "running" => ("Running", Dot::Info),
         "waiting" => ("Waiting", Dot::Info),
@@ -425,7 +430,12 @@ fn subagent_card(item: &TurnItem) -> SubagentCard {
         "completed" => ("Completed", Dot::Success),
         "failed" => ("Failed", Dot::Destructive),
         _ => ("Stopped", Dot::Muted),
-    };
+    }
+}
+
+fn subagent_card(item: &TurnItem) -> SubagentCard {
+    let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty());
+    let (status_label, dot) = subagent_status(&item.status);
     let settled = matches!(item.status.as_str(), "completed" | "failed" | "cancelled" | "interrupted");
     let (result, progress) = (text("result"), text("progress"));
     let raw = if settled { result.or(progress) } else { progress.or(result) };
@@ -1615,6 +1625,7 @@ mod tests {
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
+                Row::Workflow { row, .. } => format!("workflow {}", row.opening.message_id),
                 Row::WorktreeSetup { snapshot, .. } => format!("setup {}", snapshot.phase),
                 Row::System(divider) => format!("system {}", divider.label),
                 Row::Request(card) => format!("request {}", card.item_id),
