@@ -53,9 +53,12 @@ pub(in crate::app) struct UsageState {
     redeemed: Vec<Redeem>,
     /// The chart's data, kept across pointer moves; render may refill it, hence the cell.
     chart: RefCell<Option<Rc<ChartData>>>,
-    /// The limit pools and what they were built from: server revision, hidden drivers, `limits_now`.
-    pools: Option<((u64, Vec<String>, i64), Rc<Vec<Pool>>)>,
+    /// The limit pools and what they were built from: each environment's config revision,
+    /// the hidden drivers, `limits_now`.
+    pools: Option<(PoolsKey, Rc<Vec<Pool>>)>,
 }
+
+type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
 
 /// What the usage chart draws, derived when its inputs change rather than on every pointer move.
 pub(in crate::app) struct ChartData {
@@ -254,16 +257,31 @@ impl Workspace {
         });
     }
 
+    /// The environments the page reads: every connected one.
+    fn usage_machines(&self) -> Vec<(SharedString, crate::rpc::RpcClient)> {
+        self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect()
+    }
+
+    /// The selected environments' provider and limit-source reads, with their labels.
+    fn limit_environments(&self) -> Vec<(SharedString, SharedString, &crate::model::ServerInfo)> {
+        self.sessions()
+            .iter()
+            .filter(|s| s.is_connected())
+            .filter_map(|s| {
+                let id = s.id.clone()?;
+                let label = s.server_info.environment_label.clone().map_or_else(|| id.clone(), SharedString::from);
+                Some((id, label, &s.server_info))
+            })
+            .collect()
+    }
+
     /// `server.getUsageSummary` for the current window on every connected machine, combined so a
     /// directory several machines read counts once. A refresh re-reads model prices first
     /// (`server.refreshUsageRates`); answers with slow sources still scanning are shown, then
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
-        let machines: Vec<(String, crate::rpc::RpcClient)> = self
-            .sessions()
-            .iter()
-            .filter_map(|session| Some((session.id.as_ref()?.to_string(), session.client.clone()?)))
-            .collect();
+        let machines: Vec<(String, crate::rpc::RpcClient)> =
+            self.usage_machines().into_iter().map(|(id, client)| (id.to_string(), client)).collect();
         if machines.is_empty() {
             return;
         }
@@ -336,7 +354,10 @@ impl Workspace {
     /// Re-probes provider limits (`refreshUsageLimits`): automatic refreshes wait five minutes
     /// between probes.
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let machines = self.usage_machines();
+        if machines.is_empty() {
+            return;
+        }
         let now = now_ms();
         if automatic && self.usage.limits_refreshed_at.is_some_and(|at| now - at < LIMITS_AUTO_REFRESH_MS) {
             return;
@@ -346,11 +367,16 @@ impl Workspace {
             self.usage.refreshing = true;
         }
         cx.spawn(async move |this, cx| {
-            let result = client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await;
+            let probes = machines.iter().map(|(id, client)| async move {
+                (id, client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await)
+            });
+            let results = futures::future::join_all(probes).await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(payload) = result {
+                // Each answer lands on the environment that gave it, if it is still here.
+                for (id, result) in results {
+                    let (Ok(payload), Some(info)) = (result, this.env_info_mut(id)) else { continue };
                     let event = json!({"type": "providerStatuses", "payload": payload});
-                    if let Err(error) = this.server_info_mut().apply(&event) {
+                    if let Err(error) = info.apply(&event) {
                         log::warn!("refreshed providers did not decode: {error}");
                     }
                 }
@@ -382,11 +408,11 @@ impl Workspace {
         &mut self,
         key: String,
         name: String,
-        input: Value,
+        (environment, input): (String, Value),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         if self.usage.redeem_busy(&key) {
             return;
         }
@@ -489,7 +515,9 @@ impl Workspace {
         let limits = usage.metric == "limits";
         let view = cx.entity();
         let separator = || div().flex_none().text_color(t.muted_foreground).child("/");
-        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "This environment".into());
+        let labels: Vec<SharedString> = self.limit_environments().into_iter().map(|(_, label, _)| label).collect();
+        let environment: SharedString =
+            if labels.is_empty() { "This environment".into() } else { labels.join(", ").into() };
         let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
         let has_issue = !limits && (usage.error.is_some() || summary.as_ref().is_some_and(|s| !s.compatible()));
         let env_label =
@@ -685,14 +713,15 @@ impl Workspace {
 
     /// The limit pools, rebuilt only when the server config, the hidden drivers or the clock moved.
     fn limit_pools(&mut self) -> Rc<Vec<Pool>> {
-        let key = (self.server_info().revision, self.usage.hidden.clone(), self.usage.limits_now);
+        let environments = self.limit_environments();
+        let revisions = environments.iter().map(|(id, _, info)| (id.clone(), info.revision)).collect();
+        let key = (revisions, self.usage.hidden.clone(), self.usage.limits_now);
         if let Some((held, pools)) = &self.usage.pools
             && *held == key
         {
             return pools.clone();
         }
-        let sources = &self.server_info().config["usageLimitSources"];
-        let accounts = logic::limit_accounts(&self.server_info().providers, sources, &self.usage.hidden_drivers());
+        let accounts = logic::limit_accounts(&limit_inputs(&environments), &self.usage.hidden_drivers());
         let pools = Rc::new(logic::limit_pools(accounts, self.usage.limits_now));
         self.usage.pools = Some((key, pools.clone()));
         pools
@@ -701,22 +730,21 @@ impl Workspace {
     fn render_limits(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let pools = self.limit_pools();
         let usage = &self.usage;
-        let providers = &self.server_info().providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let notices = logic::limit_notices(providers, &hidden);
-        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
-        let links = logic::external_links(providers, &environment, &hidden);
+        let environments = self.limit_environments();
+        let inputs = limit_inputs(&environments);
+        let notices = logic::limit_notices(&inputs, &hidden);
+        let links = logic::external_links(&inputs, &hidden);
         let mut body = v_flex().gap(px(32.));
         if pools.is_empty() && notices.is_empty() && links.is_empty() {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
-        let environment_label = self.server_info().environment_label.clone();
         for pool in pools.iter() {
             let view = cx.weak_entity();
             let redeemed = &self.usage.redeemed;
-            body = body.child(pool_section(pool, now, environment_label.as_deref(), redeemed, &view, t));
+            body = body.child(pool_section(pool, now, redeemed, &view, t));
         }
         for (label, url, message, accounts) in links {
             let open = url.clone();
@@ -1349,6 +1377,20 @@ impl Workspace {
     }
 }
 
+fn limit_inputs<'a>(
+    environments: &'a [(SharedString, SharedString, &'a crate::model::ServerInfo)],
+) -> Vec<logic::LimitEnvironment<'a>> {
+    environments
+        .iter()
+        .map(|(id, label, info)| logic::LimitEnvironment {
+            id,
+            label,
+            providers: &info.providers,
+            sources: &info.config["usageLimitSources"],
+        })
+        .collect()
+}
+
 fn usage_error(error: &crate::rpc::RpcError) -> String {
     match error {
         crate::rpc::RpcError::Failure(value) => {
@@ -1537,14 +1579,7 @@ fn share_bar(
 }
 
 /// `PoolSection`: one driver's windows, each pooled across its accounts.
-fn pool_section(
-    pool: &Pool,
-    now: i64,
-    environment: Option<&str>,
-    redeemed: &[Redeem],
-    view: &WeakEntity<Workspace>,
-    t: &Tokens,
-) -> AnyElement {
+fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let color = logic::driver_kind(&pool.driver).map_or(t.foreground, |kind| provider_color(kind, t));
     v_flex()
         .gap(px(12.))
@@ -1560,11 +1595,7 @@ fn pool_section(
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(
-            pool.windows
-                .iter()
-                .map(|window| pool_window_card(pool, window, color, now, environment, redeemed, view, t)),
-        )
+        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, redeemed, view, t)))
         // The confirm closed with no popover to report back in, so progress and the outcome show here.
         .children(redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
             let status = match &r.status {
@@ -1584,13 +1615,11 @@ fn pool_section(
         .into_any_element()
 }
 
-#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_window_card(
     pool: &Pool,
     window: &PoolWindow,
     color: Hsla,
     now: i64,
-    environment: Option<&str>,
     redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
@@ -1600,7 +1629,7 @@ fn pool_window_card(
     let several = window.columns.len() > 1;
     let segments = window.columns.iter().map(|member| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, environment, redeemed, view, t)
+        pool_segment(pool, window, member, several, color, now, redeemed, view, t)
     });
     v_flex()
         .gap(px(12.))
@@ -1704,7 +1733,6 @@ fn pool_segment(
     several: bool,
     color: Hsla,
     now: i64,
-    environment: Option<&str>,
     redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
@@ -1723,9 +1751,10 @@ fn pool_segment(
         (None, Some(email)) => account_chip(email).into_any_element(),
         (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
     };
+    let signed_in = account.environments.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>().join(", ");
     let where_label = match &account.source_label {
         Some(source) => Some(("Via", source.clone())),
-        None => environment.map(|label| ("Signed in", label.to_owned())),
+        None => (!signed_in.is_empty()).then_some(("Signed in", signed_in)),
     };
     let details: Vec<(&'static str, String)> = [
         account.plan.clone().map(|plan| ("Plan", plan)),

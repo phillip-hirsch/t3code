@@ -39,7 +39,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let state = window.use_keyed_state("settings-secrets", cx, |_, _| SecretsState::default());
+        let state =
+            window.use_keyed_state(self.settings_state_key("settings-secrets"), cx, |_, _| SecretsState::default());
         let started = state.read(cx).started;
         if let (Some(endpoint), Some(_), false) = (self.settings_endpoint().cloned(), self.settings_client(), started) {
             state.update(cx, |state, cx| {

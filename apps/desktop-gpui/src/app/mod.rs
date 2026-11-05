@@ -572,7 +572,6 @@ impl Workspace {
             if self.target_on_primary() {
                 self.end_target_streams();
             }
-            self.unfollow_pull_requests();
         }
         self.connection = connection;
         self.sync_connection_banner(cx);

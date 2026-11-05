@@ -26,7 +26,7 @@ use super::accent::{accent_color_picker, normalize_accent_color};
 use super::acp::{AcpRegistrySearch, AcpSearchEvent, RegistryAgent, rpc_message};
 use super::drivers::{self, Control, DRIVERS, Driver, Field, is_local_acp, next_config, visible_fields};
 use crate::app::Workspace;
-use crate::rpc::StreamEvent;
+use crate::rpc::{RpcClient, StreamEvent};
 use crate::theme::{Tokens, tokens};
 
 pub(super) const ACP_REGISTRY: &str = "acpRegistry";
@@ -555,6 +555,8 @@ struct Identity {
 
 pub(super) struct AddProviderWizard {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment at open: the provider is added there.
+    scope: Option<SharedString>,
     /// The Providers page, which selects the new instance (`onCreated`).
     page: Entity<super::ProvidersPage>,
     step: usize,
@@ -580,13 +582,24 @@ pub(super) struct AddProviderWizard {
 }
 
 impl AddProviderWizard {
+    /// The config of the environment the wizard adds to.
+    fn info<'a>(&self, cx: &'a App) -> Option<&'a crate::model::ServerInfo> {
+        self.workspace.upgrade()?.read(cx).env_info(self.scope.as_ref()?)
+    }
+
+    fn client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).env_client(self.scope.as_ref()?)
+    }
+
     fn new(
         workspace: Entity<Workspace>,
+        scope: Option<SharedString>,
         page: Entity<super::ProvidersPage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let policy = workspace.read(cx).settings_info().managed_policy.clone();
+        let info = scope.as_ref().and_then(|scope| workspace.read(cx).env_info(scope));
+        let policy = info.map(|info| info.managed_policy.clone()).unwrap_or_default();
         let first = DRIVERS
             .iter()
             .filter(|d| d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
@@ -595,7 +608,7 @@ impl AddProviderWizard {
             .unwrap_or(&DRIVERS[0]);
         let label_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Work"));
         let id_input = cx.new(|cx| InputState::new(window, cx));
-        let registry = cx.new(|cx| AcpRegistrySearch::new(workspace.downgrade(), window, cx));
+        let registry = cx.new(|cx| AcpRegistrySearch::new(workspace.downgrade(), scope.clone(), window, cx));
         let subscriptions = vec![
             cx.observe(&workspace, |_, _, cx| cx.notify()),
             cx.subscribe_in(&label_input, window, |this, input, event: &InputEvent, window, cx| {
@@ -619,6 +632,7 @@ impl AddProviderWizard {
         ];
         let mut wizard = Self {
             workspace: workspace.downgrade(),
+            scope,
             page,
             step: 0,
             driver: first,
@@ -677,10 +691,8 @@ impl AddProviderWizard {
     /// Codex and Claude default ids are reserved; they run before being configured.
     fn existing_ids(&self, cx: &App) -> HashSet<String> {
         let mut ids: HashSet<String> = ["codex".into(), "claudeAgent".into()].into();
-        if let Some(workspace) = self.workspace.upgrade() {
-            if let Some(instances) = workspace.read(cx).settings_info().provider_instances.as_object() {
-                ids.extend(instances.keys().cloned());
-            }
+        if let Some(instances) = self.info(cx).and_then(|info| info.provider_instances.as_object()) {
+            ids.extend(instances.keys().cloned());
         }
         ids
     }
@@ -758,10 +770,7 @@ impl AddProviderWizard {
             return form.clone();
         }
         let config = self.config().clone();
-        let locks = self
-            .workspace
-            .upgrade()
-            .and_then(|w| config_locks(&w.read(cx).settings_info().managed_policy, driver.kind));
+        let locks = self.info(cx).and_then(|info| config_locks(&info.managed_policy, driver.kind));
         let form = cx.new(|cx| {
             ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx)
         });
@@ -867,7 +876,7 @@ impl AddProviderWizard {
             cx.notify();
             return;
         }
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = self.client(cx) else { return };
         let identity = self.identity();
         let mut config = self.config().as_object().cloned().unwrap_or_default();
         if self.driver.kind == "codex" {
@@ -926,7 +935,7 @@ impl AddProviderWizard {
 
     /// `serverEnvironment.providerAuthState`: the `provider.auth.subscribe` stream.
     fn watch_auth(&mut self, instance_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = self.client(cx) else { return };
         let stream = client.stream("provider.auth.subscribe", json!({"instanceId": instance_id}));
         self._auth_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = stream.next().await {
@@ -1103,13 +1112,8 @@ impl AddProviderWizard {
             "claudeAgent" => "Claude",
             _ => return None,
         };
-        let workspace = self.workspace.upgrade()?;
-        let signed_in = workspace
-            .read(cx)
-            .settings_info()
-            .providers
-            .iter()
-            .any(|p| p.driver == self.driver.kind && p.auth.status == "authenticated");
+        let signed_in =
+            self.info(cx)?.providers.iter().any(|p| p.driver == self.driver.kind && p.auth.status == "authenticated");
         signed_in.then(|| {
             h_flex()
                 .gap(px(8.))
@@ -1135,8 +1139,7 @@ impl AddProviderWizard {
     }
 
     fn render_more(&mut self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let policy =
-            self.workspace.upgrade().map(|w| w.read(cx).settings_info().managed_policy.clone()).unwrap_or_default();
+        let policy = self.info(cx).map(|info| info.managed_policy.clone()).unwrap_or_default();
         let more: Vec<_> = DRIVERS
             .iter()
             .filter(|d| !d.featured && d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
@@ -1231,10 +1234,7 @@ impl AddProviderWizard {
     }
 
     fn environment_label(&self, cx: &App) -> String {
-        self.workspace
-            .upgrade()
-            .and_then(|w| w.read(cx).settings_info().environment_label.clone())
-            .unwrap_or_else(|| "this environment".to_owned())
+        self.info(cx).and_then(|info| info.environment_label.clone()).unwrap_or_else(|| "this environment".to_owned())
     }
 
     fn render_selected_acp(&self, t: &Tokens) -> Option<impl IntoElement> {
@@ -1329,8 +1329,7 @@ impl AddProviderWizard {
 
     fn render_auth_step(&mut self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let instance_id = self.created.clone().unwrap_or_default();
-        let workspace = self.workspace.upgrade();
-        let provider = workspace.as_ref().and_then(|w| w.read(cx).settings_info().provider(&instance_id).cloned());
+        let provider = self.info(cx).and_then(|info| info.provider(&instance_id).cloned());
         let phase = self.auth.as_ref().and_then(|a| a.get("phase")).and_then(Value::as_str).unwrap_or_default();
         let active = matches!(phase, "starting" | "waiting" | "verifying");
         let status = provider.as_ref().map(|p| p.auth.status.as_str()).unwrap_or_default();
@@ -1339,7 +1338,7 @@ impl AddProviderWizard {
         let discovering = !signed_in && self.auth_error.is_none() && methods.is_none();
         let can_authenticate = methods.is_some_and(|m| !m.is_empty());
         let section = (provider.is_some() && (can_authenticate || signed_in))
-            .then(|| workspace.as_ref())
+            .then(|| self.workspace.upgrade())
             .flatten()
             .and_then(|w| w.update(cx, |w, cx| w.render_provider_account(&instance_id, window, cx)));
         let body = section.unwrap_or_else(|| {
@@ -1395,11 +1394,8 @@ impl AddProviderWizard {
             }));
         let back = if step == 0 { back.ghost() } else { back.outline() };
         let primary: AnyElement = if step == 0 && self.driver.kind == "codex" {
-            let workspace = self.workspace.upgrade();
-            let locked = workspace.as_ref().is_none_or(|w| {
-                let w = w.read(cx);
-                config_locks(&w.settings_info().managed_policy, "codex")
-                    .is_some_and(|(keys, _)| keys.contains("setupMode"))
+            let locked = self.info(cx).is_none_or(|info| {
+                config_locks(&info.managed_policy, "codex").is_some_and(|(keys, _)| keys.contains("setupMode"))
             });
             h_flex()
                 .gap(px(8.))
@@ -1484,8 +1480,7 @@ impl Render for AddProviderWizard {
         if self.created.is_some() {
             return root.child(self.render_auth_step(window, &t, cx));
         }
-        let policy =
-            self.workspace.upgrade().map(|w| w.read(cx).settings_info().managed_policy.clone()).unwrap_or_default();
+        let policy = self.info(cx).map(|info| info.managed_policy.clone()).unwrap_or_default();
         let featured: Vec<_> = DRIVERS
             .iter()
             .filter(|d| d.featured && d.kind != ACP_REGISTRY && driver_allowed(&policy, d.kind))
@@ -1568,10 +1563,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workspace = cx.entity();
+        let (workspace, scope) = (cx.entity(), self.settings_environment());
         // The wizard reads the workspace, which this call is still updating.
         window.defer(cx, move |window, cx| {
-            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, page, window, cx));
+            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, scope, page, window, cx));
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog.entrance(DialogEntrance::None).p_0().w(px(768.)).centered().child(wizard.clone())
             });

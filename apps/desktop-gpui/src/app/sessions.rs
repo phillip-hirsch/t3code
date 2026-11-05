@@ -195,6 +195,16 @@ impl Workspace {
         self.env_client(&self.project_environment(project_id)?)
     }
 
+    /// One environment's address, for its HTTP routes.
+    pub(super) fn env_endpoint(&self, environment_id: &str) -> Option<&Endpoint> {
+        self.session(environment_id)?.endpoint.as_ref()
+    }
+
+    /// The address of the environment a listed project lives on.
+    pub(super) fn project_endpoint(&self, project_id: &str) -> Option<&Endpoint> {
+        self.env_endpoint(&self.project_environment(project_id)?)
+    }
+
     /// The socket for an orchestration command: its thread's environment, else its project's.
     pub(super) fn command_client(&self, command: &Value) -> Option<RpcClient> {
         if let Some(thread_id) = command.get("threadId").and_then(Value::as_str) {
@@ -214,11 +224,6 @@ impl Workspace {
     /// The connected server's HTTP origin, for its routes and signed asset URLs.
     pub(super) fn http_base(&self) -> Option<&str> {
         self.endpoint().map(|e| e.http_base.as_str())
-    }
-
-    /// One environment's address, for work bound to that environment.
-    pub(super) fn env_endpoint(&self, environment_id: &str) -> Option<&Endpoint> {
-        self.session(environment_id)?.endpoint.as_ref()
     }
 
     /// Starts an environment's config and shell subscriptions on its socket.
@@ -273,6 +278,7 @@ impl Workspace {
             self.sync_details(cx);
         }
         self.subscribe_shell(environment_id, window, cx);
+        self.sync_pull_request_refreshes(cx);
     }
 
     /// Ends the open target's own streams (thread, worktree setup, tool output, side chat)
@@ -490,16 +496,17 @@ impl Workspace {
         &self.sessions[self.settings_index()].server_info
     }
 
-    pub(super) fn settings_info_mut(&mut self) -> &mut ServerInfo {
-        let index = self.settings_index();
-        &mut self.sessions[index].server_info
-    }
-
     pub(super) fn settings_endpoint(&self) -> Option<&Endpoint> {
         self.sessions[self.settings_index()].endpoint.as_ref()
     }
 
     pub(super) fn settings_client(&self) -> Option<RpcClient> {
         self.sessions[self.settings_index()].client.clone()
+    }
+
+    /// The environment Settings reads, for a dialog or request to keep after the scope moves
+    /// (with `env_client` and `env_info`).
+    pub(super) fn settings_environment(&self) -> Option<SharedString> {
+        self.sessions[self.settings_index()].id.clone()
     }
 }

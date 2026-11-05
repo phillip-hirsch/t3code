@@ -132,7 +132,7 @@ impl Workspace {
             SIGNALS.map(|(key, ..)| saved_values[key].as_str().unwrap_or_default().trim().to_owned());
         let running = self.settings_info().config.get("observability").cloned().unwrap_or_default();
         let workspace = cx.weak_entity();
-        let inputs = window.use_keyed_state("otlp-inputs", cx, |window, cx| {
+        let inputs = window.use_keyed_state(self.settings_state_key("otlp-inputs"), cx, |window, cx| {
             let inputs = std::array::from_fn(|index| {
                 let (signal, value) = (SIGNALS[index].4, saved[index].clone());
                 cx.new(|cx| {

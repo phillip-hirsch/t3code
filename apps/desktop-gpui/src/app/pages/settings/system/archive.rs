@@ -94,7 +94,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let client = self.settings_client();
-        let state = window.use_keyed_state("settings-archive", cx, |_, cx| {
+        let state = window.use_keyed_state(self.settings_state_key("settings-archive"), cx, |_, cx| {
             let mut state = ArchiveState { groups: None, _load: None };
             state.load(client, cx);
             state
@@ -229,7 +229,8 @@ fn dispatch_and_reload(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(client) = view.read(cx).client() else { return };
+    // The settings environment, whose archive the state shows.
+    let Some(client) = view.read(cx).settings_client() else { return };
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {

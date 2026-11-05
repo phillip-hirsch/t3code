@@ -111,7 +111,10 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
     /// The panel's dragged width; `None` is half the window.
     pub(super) panel_width: Option<f32>,
-    pub(super) _live: Option<(gpui_kit::Task<()>, gpui_kit::Task<()>)>,
+    /// `pullRequests.subscribeRefreshes` per connected environment, with the socket it runs on.
+    pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
+    /// The slow re-read while the app is in front; set once the page is followed.
+    pub(super) _live_interval: Option<Task<()>>,
     /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
     pub(super) last_handoff: std::collections::HashMap<String, String>,
     /// The searchable Author or Labels picker, while open.
@@ -160,7 +163,8 @@ impl PullRequestsState {
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
             panel_width: None,
-            _live: None,
+            refreshes: std::collections::HashMap::new(),
+            _live_interval: None,
             facet_search: None,
         }
     }

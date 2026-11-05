@@ -32,6 +32,7 @@ use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
 use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
 use crate::app::{Workspace, new_id};
+use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
@@ -261,8 +262,22 @@ impl Workspace {
         self.update_projects(ids, json!({"title": title}), "Failed to rename project", window, cx, |_, _| {});
     }
 
-    /// `useProjectGroupUpdate`: writes one update to each checkout in turn and reports the
-    /// first failure. `done` runs either way.
+    /// Each checkout with its own environment's socket (none while that one is disconnected)
+    /// and that environment's name: a group can span machines.
+    fn member_targets(&self, members: Vec<(String, String)>) -> Vec<(String, String, Option<RpcClient>, String)> {
+        members
+            .into_iter()
+            .map(|(id, title)| {
+                let environment = self.project_environment(&id);
+                let label = environment.as_deref().and_then(|e| self.env_info(e)?.environment_label.clone());
+                let client = environment.and_then(|e| self.env_client(&e));
+                (id, title, client, label.unwrap_or_else(|| "the current environment".into()))
+            })
+            .collect()
+    }
+
+    /// `useProjectGroupUpdate`: writes one update to each checkout in turn, each on its own
+    /// environment, and reports the first failure. `done` runs either way.
     fn update_projects(
         &mut self,
         members: Vec<(String, String)>,
@@ -272,28 +287,27 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.settings_client() else {
-            toast_error(window, cx, failure_title, "Connect the selected environment and try again.");
-            done(self, cx);
-            return;
-        };
         let several = members.len() > 1;
-        let environment =
-            self.settings_info().environment_label.clone().unwrap_or_else(|| "the current environment".into());
+        let targets = self.member_targets(members);
         cx.spawn_in(window, async move |this, cx| {
             let mut failure = None;
-            for (id, _) in &members {
+            for (id, _, client, environment) in &targets {
+                let Some(client) = client else {
+                    let error = format!("Connect {environment} and try again.");
+                    failure = Some((environment.clone(), error));
+                    break;
+                };
                 let mut command = json!({"type": "project.update", "commandId": new_id(), "projectId": id});
                 if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), update.clone()) {
                     command.extend(fields);
                 }
                 if let Err(error) = client.request("projects.mutate", command).await {
-                    failure = Some(error.message());
+                    failure = Some((environment.clone(), error.message()));
                     break;
                 }
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(error) = failure {
+                if let Some((environment, error)) = failure {
                     let title =
                         if several { format!("{failure_title} on {environment}") } else { failure_title.into() };
                     toast_error(window, cx, title, error);
@@ -407,14 +421,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.settings_client() else { return };
+        let targets = self.member_targets(members);
         cx.spawn_in(window, async move |this, cx| {
-            for (id, title) in &members {
-                let command = json!({"type": "project.delete", "commandId": new_id(), "projectId": id, "force": true});
-                let result = client.request("projects.mutate", command).await;
+            for (id, title, client, environment) in &targets {
+                let result = match client {
+                    Some(client) => {
+                        let command =
+                            json!({"type": "project.delete", "commandId": new_id(), "projectId": id, "force": true});
+                        client.request("projects.mutate", command).await.map_err(|error| error.message())
+                    }
+                    None => Err(format!("Connect {environment} and try again.")),
+                };
                 let failed = this.update_in(cx, |this, window, cx| {
                     if let Err(error) = result {
-                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error.message());
+                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error);
                         return true;
                     }
                     // The project's draft goes with it.
@@ -464,18 +484,22 @@ impl Workspace {
             return None;
         }
         let resource = icon::favicon_resource(&member.project.workspace_root, member.project.favicon_path.as_deref());
-        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
+        let id = &member.project.id;
+        let (client, endpoint) = (self.project_client(id), self.project_endpoint(id).cloned());
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 
-    /// The file picker's "Open in Explorer" needs the server on this machine.
+    /// The file picker's "Open in Explorer" needs each checkout's server on this machine.
     fn can_pick_external_favicon(&self, members: &[Member]) -> bool {
-        let local = self.server.is_some()
-            || self.settings_endpoint().is_some_and(|endpoint| {
-                let host = endpoint.http_base.split("://").nth(1).unwrap_or_default();
-                ["127.0.0.1", "localhost", "[::1]"].iter().any(|local| host.starts_with(local))
-            });
-        local && members.iter().all(|m| favicon_picker::can_pick_external(&m.project.workspace_root))
+        let local = |member: &Member| {
+            let id = &member.project.id;
+            (self.server.is_some() && self.project_environment(id).as_ref() == self.primary_environment())
+                || self.project_endpoint(id).is_some_and(|endpoint| {
+                    let host = endpoint.http_base.split("://").nth(1).unwrap_or_default();
+                    ["127.0.0.1", "localhost", "[::1]"].iter().any(|local| host.starts_with(local))
+                })
+        };
+        members.iter().all(|m| local(m) && favicon_picker::can_pick_external(&m.project.workspace_root))
     }
 
     fn render_project_detail(
@@ -556,6 +580,7 @@ impl Workspace {
             let open_files = {
                 let (ids, panel, images) = (ids.clone(), panel.clone(), images.clone());
                 let cwd = representative.project.workspace_root.clone();
+                let representative_id = representative.project.id.clone();
                 let project_name: SharedString = group.display_name.clone().into();
                 let pick_external = self.can_pick_external_favicon(&group.members);
                 cx.listener(move |this, _, window, cx| {
@@ -566,7 +591,8 @@ impl Workspace {
                         let _ = workspace
                             .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
                     });
-                    let (client, endpoint) = (this.settings_client(), this.settings_endpoint().cloned());
+                    let client = this.project_client(&representative_id);
+                    let endpoint = this.project_endpoint(&representative_id).cloned();
                     let (cwd, project_name, images) = (cwd.clone(), project_name.clone(), images.clone());
                     let picker = cx.new(|cx| {
                         favicon_picker::FaviconPicker::new(

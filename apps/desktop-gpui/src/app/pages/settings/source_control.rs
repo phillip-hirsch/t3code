@@ -355,7 +355,8 @@ impl Workspace {
         let t = *tokens(cx);
         let client = self.settings_client();
         let first_scan = client.clone();
-        let state = window.use_keyed_state("settings-source-control", cx, move |window, cx| {
+        let key = self.settings_state_key("settings-source-control");
+        let state = window.use_keyed_state(key, cx, move |window, cx| {
             let mut state = SourceControlState::new(window, cx);
             if let Some(client) = first_scan {
                 state.scan(client, cx);

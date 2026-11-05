@@ -281,11 +281,12 @@ impl Workspace {
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
             return;
         }
+        let guides = self.review_guides_enabled(&reference.project_id);
         if self.show_pr_tab(reference, seed, cx) {
             return;
         }
         self.read_pr_detail(cx);
-        if self.server_info().settings.bool("reviewGuidesEnabled") {
+        if guides {
             self.read_pr_guide(cx);
         }
         cx.notify();
@@ -338,12 +339,18 @@ impl Workspace {
         self.project_client(&panel.reference.project_id)
     }
 
-    /// The socket of the shown pull request's machine.
+    /// The config of the machine a pull request's project lives on: its settings, not the chat's.
+    fn pull_request_info(&self, project_id: &str) -> Option<&crate::model::ServerInfo> {
+        self.env_info(&self.project_environment(project_id)?)
+    }
+
+    fn review_guides_enabled(&self, project_id: &str) -> bool {
+        self.pull_request_info(project_id).is_some_and(|info| info.settings.bool("reviewGuidesEnabled"))
+    }
+
+    /// The socket of the shown pull request's machine; none while no pull request is shown.
     pub(in crate::app) fn pull_request_client(&self) -> Option<RpcClient> {
-        match &self.pull_requests.panel {
-            Some(panel) => self.project_client(&panel.reference.project_id),
-            None => self.client(),
-        }
+        self.project_client(&self.pull_requests.panel.as_ref()?.reference.project_id)
     }
 
     fn shown_pr_key(&self) -> Option<String> {
@@ -498,7 +505,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.pull_request_client() else { return };
+        let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
@@ -750,7 +757,10 @@ impl Workspace {
     /// The merge method the header and menu use (`resolvePullRequestMergeMethod`).
     fn pr_merge_method(&self, panel: &Panel, detail: &Detail) -> &'static str {
         let project = self.shell.projects.iter().find(|p| p.id == detail.project_id);
-        let project_default = self.server_info().project_setting(project, "pullRequestMergeMethod");
+        let project_default = self
+            .pull_request_info(&detail.project_id)
+            .map(|info| info.project_setting(project, "pullRequestMergeMethod"))
+            .unwrap_or_default();
         logic::resolve_merge_method(
             &logic::allowed_merge_methods(detail),
             panel.merge_method.or(detail.auto_merge_method.as_deref().and_then(known_method)),
@@ -772,7 +782,7 @@ impl Workspace {
             };
             return frame.child(self.render_pr_seed_header(&t, cx)).child(body).into_any_element();
         };
-        let guides = self.server_info().settings.bool("reviewGuidesEnabled");
+        let guides = self.review_guides_enabled(&detail.project_id);
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
         let tab = match panel.tab {
             Tab::Guide if !guides => Tab::Summary,

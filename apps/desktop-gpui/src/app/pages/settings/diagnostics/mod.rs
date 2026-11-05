@@ -62,7 +62,8 @@ impl<T> Default for Query<T> {
 
 #[derive(Default)]
 pub(super) struct DiagnosticsState {
-    started: bool,
+    /// The socket the reads started on; a new one (a reconnect) starts them over.
+    started: Option<RpcClient>,
     session: SessionLoad,
     trace: Query<TraceDiagnostics>,
     processes: Query<ProcessDiagnostics>,
@@ -92,10 +93,13 @@ pub(super) struct DiagnosticsState {
 impl DiagnosticsState {
     fn start(&mut self, client: Option<RpcClient>, endpoint: Option<crate::backend::Endpoint>, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint)) = (client, endpoint) else { return };
-        if self.started {
+        if self.started.as_ref().is_some_and(|started| started.same_socket(&client)) {
             return;
         }
-        self.started = true;
+        if self.started.is_some() {
+            *self = Self::default();
+        }
+        self.started = Some(client.clone());
         self.history_window = 1;
         self.telemetry_window = 1;
         self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
@@ -188,7 +192,7 @@ impl DiagnosticsState {
                         StreamEvent::End(result) => {
                             match result {
                                 // Everything reloads on the next connection.
-                                Err(RpcError::Disconnected(_)) => this.started = false,
+                                Err(RpcError::Disconnected(_)) => this.started = None,
                                 Err(error) => this.telemetry_error = Some(error.message().into()),
                                 Ok(_) => {}
                             }
@@ -795,7 +799,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let state = window.use_keyed_state("settings-diagnostics", cx, |_, _| DiagnosticsState::default());
+        let key = self.settings_state_key("settings-diagnostics");
+        let state = window.use_keyed_state(key, cx, |_, _| DiagnosticsState::default());
         let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |s, cx| s.start(client.clone(), endpoint, cx));
         let t = *theme::tokens(cx);

@@ -156,11 +156,18 @@ fn save_patch<E: Editor>(
     .detach();
 }
 
-/// The connection and settings an editor saves against, from the workspace.
-fn context(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<(RpcClient, Value, String)> {
-    let workspace = workspace.upgrade()?;
+/// The connection, settings and name of the environment an editor opened on, which it saves
+/// against even after Settings moves to another environment.
+fn context(
+    workspace: &WeakEntity<Workspace>,
+    scope: Option<&SharedString>,
+    cx: &App,
+) -> Option<(RpcClient, Value, String)> {
+    let (workspace, scope) = (workspace.upgrade()?, scope?);
     let workspace = workspace.read(cx);
-    Some((workspace.client()?, (*workspace.settings_info().settings).clone(), workspace.environment_name()))
+    let info = workspace.env_info(scope)?;
+    let name = info.environment_label.clone().unwrap_or_else(|| "This environment".into());
+    Some((workspace.env_client(scope)?, (*info.settings).clone(), name))
 }
 
 fn token_placeholder(configured: bool, otherwise: &'static str) -> &'static str {
@@ -179,16 +186,16 @@ fn clear_button(id: &'static str, busy: bool, t: &Tokens) -> Button {
 
 impl Workspace {
     pub(super) fn open_ssh_editor(&mut self, host: Option<SshHost>, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let environment = self.environment_name();
-        let editor = cx.new(|cx| SshEditor::new(workspace, environment, host, window, cx));
+        let editor = cx.new(|cx| SshEditor::new(workspace, scope, environment, host, window, cx));
         open_editor(editor, window, cx);
     }
 
     pub(super) fn open_eas_editor(&mut self, host: Option<EasHost>, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let client = self.settings_client();
-        let editor = cx.new(|cx| EasEditor::new(workspace, client, host, window, cx));
+        let editor = cx.new(|cx| EasEditor::new(workspace, scope, client, host, window, cx));
         open_editor(editor, window, cx);
     }
 
@@ -198,9 +205,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workspace = cx.weak_entity();
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         let client = self.settings_client();
-        let editor = cx.new(|cx| SimlockEditor::new(workspace, client, host, window, cx));
+        let editor = cx.new(|cx| SimlockEditor::new(workspace, scope, client, host, window, cx));
         open_editor(editor, window, cx);
     }
 }
@@ -217,6 +224,8 @@ type ConnectionKey = (String, Option<i64>, Option<String>);
 
 struct SshEditor {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment at open, which the editor saves to.
+    scope: Option<SharedString>,
     environment: String,
     id: String,
     /// The saved host, matched by id or destination on save; `None` adds one.
@@ -242,6 +251,7 @@ impl Editor for SshEditor {
 impl SshEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
         environment: String,
         original: Option<SshHost>,
         window: &mut Window,
@@ -259,6 +269,7 @@ impl SshEditor {
         let subscriptions = [&name, &target, &identity, &port].map(|input| watch(input, window, cx, Self::save)).into();
         Self {
             workspace,
+            scope,
             environment,
             id: host.as_ref().map_or_else(new_host_id, |host| host.id.clone()),
             options_open: host.as_ref().is_some_and(|host| host.port.is_some() || host.identity_file.is_some()),
@@ -311,7 +322,7 @@ impl SshEditor {
 
     fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.input(cx) else { return };
-        let Some((client, _, _)) = context(&self.workspace, cx) else { return };
+        let Some((client, _, _)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let key = hosts::ssh_connection_key(&host);
         self.check = Some((key.clone(), Check::Pending));
         self.show_error = false;
@@ -338,7 +349,7 @@ impl SshEditor {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let named = self.draft(cx).is_some_and(|draft| !draft.label.trim().is_empty());
         let Some(host) = self.input(cx).filter(|_| named && !self.busy && !self.checking(cx)) else { return };
-        let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
+        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let original = self.original.clone().unwrap_or_else(|| host.clone());
         let next = hosts::host_list(&settings, "deviceHosts")
             .and_then(|saved| hosts::update_device_hosts(&saved, &host, false, &original).map_err(str::to_owned));
@@ -570,6 +581,8 @@ enum AccountCheck {
 
 struct EasEditor {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment at open, which the editor saves to.
+    scope: Option<SharedString>,
     /// Taken at open: the editor is built while the workspace is being updated.
     client: Option<RpcClient>,
     host: EasHost,
@@ -606,6 +619,7 @@ fn has_token(token: &Value) -> bool {
 impl EasEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
         client: Option<RpcClient>,
         host: Option<EasHost>,
         window: &mut Window,
@@ -645,6 +659,7 @@ impl EasEditor {
         }));
         let mut editor = Self {
             workspace,
+            scope,
             client,
             app_id: host.app_id.clone(),
             token: if saved { TokenEntry::Saved } else { TokenEntry::Cleared },
@@ -743,7 +758,7 @@ impl EasEditor {
         if self.busy || !hosts::valid_eas_draft(&next) {
             return;
         }
-        let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
+        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let keep_token = !self.is_new && self.token == TokenEntry::Saved;
         let saved = match hosts::host_list(&settings, "easDeviceHosts") {
             Ok(saved) => saved,
@@ -927,6 +942,8 @@ enum Identity {
 
 struct SimlockEditor {
     workspace: WeakEntity<Workspace>,
+    /// The settings environment at open, which the editor saves to.
+    scope: Option<SharedString>,
     /// Taken at open: the editor is built while the workspace is being updated.
     client: Option<RpcClient>,
     host: SimlockHost,
@@ -954,6 +971,7 @@ impl Editor for SimlockEditor {
 impl SimlockEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
         client: Option<RpcClient>,
         host: Option<SimlockHost>,
         window: &mut Window,
@@ -998,6 +1016,7 @@ impl SimlockEditor {
         }));
         let mut editor = Self {
             workspace,
+            scope,
             client,
             token: if saved { TokenEntry::Saved } else { TokenEntry::Cleared },
             host,
@@ -1091,7 +1110,7 @@ impl SimlockEditor {
         if self.busy {
             return;
         }
-        let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
+        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let saved = match hosts::host_list(&settings, "simlockDeviceHosts") {
             Ok(saved) => saved,
             Err(error) => return notify_error(window, cx, "Simlock host not saved", error),

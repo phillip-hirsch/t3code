@@ -939,6 +939,18 @@ pub fn provider_name(kind: &str) -> &'static str {
     }
 }
 
+/// Resyncs one follow per connected environment (`connected` pairs each with its socket): a
+/// follow whose socket was replaced or whose environment left is dropped, and the indexes of
+/// the connected environments left without one are returned, to start.
+pub fn resync_follows<K: Eq + std::hash::Hash, S, T>(
+    follows: &mut HashMap<K, (S, T)>,
+    connected: &[(K, S)],
+    same_socket: impl Fn(&S, &S) -> bool,
+) -> Vec<usize> {
+    follows.retain(|id, (socket, _)| connected.iter().any(|(c, s)| c == id && same_socket(s, socket)));
+    (0..connected.len()).filter(|&i| !follows.contains_key(&connected[i].0)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1183,18 @@ mod tests {
         assert_eq!(error_message(&unavailable), "This host has no working credentials.");
         assert_eq!(label_color(Some("#D73A4A")), Some(0xd73a4a));
         assert_eq!(label_color(Some("red")), None);
+    }
+
+    #[test]
+    fn follows_restart_on_a_new_socket_and_stop_for_a_departed_environment() {
+        let mut follows: HashMap<&str, (u32, ())> = HashMap::from([("a", (1, ())), ("b", (2, ())), ("gone", (3, ()))]);
+        // `b` reconnected on socket 5; `c` is new; `gone` left.
+        let connected = [("a", 1), ("b", 5), ("c", 6)];
+        let start = resync_follows(&mut follows, &connected, |x, y| x == y);
+        assert_eq!(start, vec![1, 2]);
+        assert_eq!(follows.keys().copied().collect::<Vec<_>>(), vec!["a"]);
+        // Once started, the same sockets need nothing.
+        follows.extend(start.into_iter().map(|i| (connected[i].0, (connected[i].1, ()))));
+        assert!(resync_follows(&mut follows, &connected, |x, y| x == y).is_empty());
     }
 }

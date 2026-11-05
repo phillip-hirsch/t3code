@@ -85,7 +85,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let root = self.shell.projects.iter().find(|p| p.id == request.project_id).map(|p| p.workspace_root.clone());
-        let (Some(client), Some(root)) = (self.pull_request_client(), root) else {
+        let (Some(client), Some(root)) = (self.project_client(&request.project_id), root) else {
             settled(self);
             return;
         };

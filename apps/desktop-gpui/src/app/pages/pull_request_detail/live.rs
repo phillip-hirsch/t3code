@@ -70,32 +70,77 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reads the shown pull request again in place, as a refresh from the host's side does.
-    fn refresh_pr_in_place(&mut self, cx: &mut Context<Self>) {
-        if self.pull_requests.panel.as_ref().is_some_and(|p| p.detail.is_some() && !p.detail_loading) {
-            self.read_pr_detail(cx);
-            self.refresh_pr_code(cx);
+    /// Reads the shown pull request again in place, as a refresh from the host's side does;
+    /// a refresh from one environment's host touches only a pull request on that environment.
+    fn refresh_pr_in_place(&mut self, environment: Option<&str>, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        if panel.detail.is_none() || panel.detail_loading {
+            return;
+        }
+        if let Some(environment) = environment
+            && self.project_environment(&panel.reference.project_id).as_deref() != Some(environment)
+        {
+            return;
+        }
+        self.read_pr_detail(cx);
+        self.refresh_pr_code(cx);
+    }
+
+    /// Starts following the hosts once the page opens: turn refreshes as they happen, and a slow
+    /// read while the app is in front. Neither repaints anything until an answer lands.
+    pub(in crate::app) fn follow_pull_requests(&mut self, cx: &mut Context<Self>) {
+        if self.pull_requests._live_interval.is_none() {
+            self.pull_requests._live_interval = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(LIVE_REFRESH).await;
+                    let alive = this.update(cx, |this, cx| {
+                        if cx.active_window().is_some() && this.page == Some(super::super::Page::PullRequests) {
+                            this.refresh_pr_in_place(None, cx);
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        self.sync_pull_request_refreshes(cx);
+    }
+
+    /// Once followed, keeps one refresh stream per connected environment: a new socket (the
+    /// primary's or a saved environment's reconnect) restarts its environment's stream.
+    pub(in crate::app) fn sync_pull_request_refreshes(&mut self, cx: &mut Context<Self>) {
+        if self.pull_requests._live_interval.is_none() {
+            return;
+        }
+        let connected: Vec<(SharedString, RpcClient)> =
+            self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect();
+        let start =
+            crate::pull_requests::resync_follows(&mut self.pull_requests.refreshes, &connected, RpcClient::same_socket);
+        for index in start {
+            let (environment, client) = connected[index].clone();
+            let task = self.follow_pr_refreshes(environment.clone(), client.clone(), cx);
+            self.pull_requests.refreshes.insert(environment, (client, task));
         }
     }
 
-    /// Starts following the host once the page opens: turn refreshes as they happen, and a slow
-    /// read while the app is in front. Neither repaints anything until an answer lands.
-    pub(in crate::app) fn follow_pull_requests(&mut self, cx: &mut Context<Self>) {
-        if self.pull_requests._live.is_some() {
-            return;
-        }
-        let Some(client) = self.client() else { return };
+    fn follow_pr_refreshes(
+        &mut self,
+        environment: SharedString,
+        client: RpcClient,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         let stream = client.stream("pullRequests.subscribeRefreshes", json!({}));
-        let refreshes = cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let mut first = true;
             while let Some(event) = stream.next().await {
                 match event {
                     // The first value is the current count, not a refresh.
                     StreamEvent::Item(_) if first => first = false,
                     StreamEvent::Item(_) => {
-                        let _ = this.update(cx, |this, cx| this.refresh_pr_in_place(cx));
+                        let _ = this.update(cx, |this, cx| this.refresh_pr_in_place(Some(&environment), cx));
                     }
-                    // A dropped socket restarts with the page on reconnect (`page_opened`);
+                    // A dropped socket restarts when its environment reconnects (`start_session`);
                     // anything else the server ended is asked for again after a pause.
                     StreamEvent::End(result) => {
                         let disconnected = matches!(result, Err(crate::rpc::RpcError::Disconnected(_)));
@@ -104,35 +149,19 @@ impl Workspace {
                             cx.background_executor().timer(RESUBSCRIBE_AFTER).await;
                         }
                         let _ = this.update(cx, |this, cx| {
-                            this.pull_requests._live = None;
+                            let refreshes = &mut this.pull_requests.refreshes;
+                            if refreshes.get(&environment).is_some_and(|(socket, _)| socket.same_socket(&client)) {
+                                refreshes.remove(&environment);
+                            }
                             if !disconnected {
-                                this.follow_pull_requests(cx);
+                                this.sync_pull_request_refreshes(cx);
                             }
                         });
                         break;
                     }
                 }
             }
-        });
-        let interval = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(LIVE_REFRESH).await;
-                let alive = this.update(cx, |this, cx| {
-                    if cx.active_window().is_some() && this.page == Some(super::super::Page::PullRequests) {
-                        this.refresh_pr_in_place(cx);
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
-        self.pull_requests._live = Some((refreshes, interval));
-    }
-
-    /// Stops following the host with the socket it ran on; the page follows again on reconnect.
-    pub(in crate::app) fn unfollow_pull_requests(&mut self) {
-        self.pull_requests._live = None;
+        })
     }
 
     /// Condenses the header once the shown tab has scrolled past its fold, and back near the top.

@@ -30,6 +30,8 @@ struct PriceRow {
 
 pub(in crate::app) struct PriceEditor {
     workspace: WeakEntity<Workspace>,
+    /// The environment whose prices the dialog opened on; it saves there.
+    environment: Option<SharedString>,
     label: String,
     prices: Value,
     aliases: Value,
@@ -126,7 +128,10 @@ impl PriceEditor {
         else {
             return;
         };
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
+        let Some(client) = self.environment.as_ref().and_then(|e| self.workspace.upgrade()?.read(cx).env_client(e))
+        else {
+            return;
+        };
         let mut patch = serde_json::Map::new();
         if !prices.is_empty() {
             patch.insert("usagePriceOverrides".into(), Value::Object(prices));
@@ -335,6 +340,7 @@ impl Workspace {
     /// Opens "Custom model prices", with a new row for `model` when it has no price yet
     /// (the model dialog's "Set price").
     pub(super) fn open_model_prices(&mut self, model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let environment = self.active_environment().cloned();
         let settings = &self.server_info().settings;
         let prices = settings.get("usagePriceOverrides").clone();
         let aliases = settings.get("usageModelAliases").clone();
@@ -343,6 +349,7 @@ impl Workspace {
         let editor = cx.new(|cx| {
             let mut editor = PriceEditor {
                 workspace,
+                environment,
                 label,
                 prices,
                 aliases,

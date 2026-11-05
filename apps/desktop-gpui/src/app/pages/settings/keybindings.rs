@@ -605,7 +605,7 @@ impl KeybindingsPanel {
             }),
             cx.observe(&workspace, |this, workspace, cx| {
                 let workspace = workspace.read(cx);
-                let connected = workspace.client().is_some();
+                let connected = workspace.settings_client().is_some();
                 if !Rc::ptr_eq(&this.catalog.source, &workspace.settings_info().keybindings)
                     || connected != this.connected
                 {
@@ -805,13 +805,18 @@ impl KeybindingsPanel {
         cx.notify();
     }
 
-    fn client(&self, cx: &App) -> Option<crate::rpc::RpcClient> {
-        self.workspace.upgrade()?.read(cx).client()
+    /// The settings environment and its socket, taken before a request so the reply lands there.
+    fn target_environment(&self, cx: &App) -> Option<(gpui_kit::SharedString, crate::rpc::RpcClient)> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        let environment = workspace.settings_environment()?;
+        let client = workspace.env_client(&environment)?;
+        Some((environment, client))
     }
 
     /// `server.upsertKeybinding`, or `server.removeKeybinding` when `remove`.
     fn send(&mut self, command: String, payload: Value, remove: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx) else { return };
+        let Some((environment, client)) = self.target_environment(cx) else { return };
         self.saving = Some(command);
         cx.notify();
         let method = if remove { "server.removeKeybinding" } else { "server.upsertKeybinding" };
@@ -831,7 +836,8 @@ impl KeybindingsPanel {
                         }
                         if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.settings_info_mut().keybindings = Rc::new(keybindings::decode_rules(rules));
+                                let Some(info) = workspace.env_info_mut(&environment) else { return };
+                                info.keybindings = Rc::new(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });
@@ -895,7 +901,7 @@ impl KeybindingsPanel {
         let workspace = workspace.read(cx);
         let info = &workspace.settings_info();
         let (client, path, editors) =
-            (workspace.client(), info.keybindings_config_path.clone(), info.available_editors.clone());
+            (workspace.settings_client(), info.keybindings_config_path.clone(), info.available_editors.clone());
         open_keybindings_file(client, path, &editors, window, cx);
     }
 }

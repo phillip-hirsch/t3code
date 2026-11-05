@@ -188,7 +188,8 @@ impl Workspace {
     pub(super) fn render_storage_sections(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
         let client = self.settings_client();
-        let state = window.use_keyed_state("settings-storage", cx, |_, cx| StorageState::new(client, cx));
+        let key = self.settings_state_key("settings-storage");
+        let state = window.use_keyed_state(key, cx, |_, cx| StorageState::new(client, cx));
         let info = &self.settings_info();
         let (cleanup, cleanup_run, database) = (
             info.capability("storageCleanup"),

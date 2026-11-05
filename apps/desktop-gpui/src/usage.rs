@@ -867,10 +867,25 @@ pub struct Account {
     pub plan: Option<String>,
     pub accent_color: Option<String>,
     pub limits: UsageLimits,
+    /// The environments signed in to it, as `(id, label)`; empty when only a source reports it.
+    pub environments: Vec<(String, String)>,
     /// The usage-limit source that reports it, when no provider here is signed in to it.
     pub source_label: Option<String>,
-    /// The `provider.consumeResetCredit` input that spends its next reset credit.
-    pub redeem: Option<Value>,
+    /// How to spend its next reset credit.
+    pub redeem: Option<Redemption>,
+}
+
+/// The environment to send `provider.consumeResetCredit` to, and the input that spends an
+/// account's next reset credit.
+pub type Redemption = (String, Value);
+
+/// One selected environment as the Limits view reads it (`LimitPresentations`' entry).
+pub struct LimitEnvironment<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    pub providers: &'a [Provider],
+    /// Its `config.usageLimitSources`.
+    pub sources: &'a Value,
 }
 
 impl Account {
@@ -953,8 +968,8 @@ struct Merging {
     account: Account,
     /// Some provider here is signed in to it, so it names no source.
     signed_in: bool,
-    credits: Option<(i64, Option<crate::model::ResetCredits>, Option<Value>)>,
-    hub_redeem: Option<(i64, Value)>,
+    credits: Option<(i64, Option<crate::model::ResetCredits>, Option<Redemption>)>,
+    hub_redeem: Option<(i64, Redemption)>,
     plan: Option<(i64, String)>,
 }
 
@@ -962,36 +977,38 @@ fn checked_ms(account: &Account) -> i64 {
     account.limits.checked_at.as_deref().and_then(parse_ms).unwrap_or(0)
 }
 
-/// `collectLimitAccounts` for this environment: its providers, then the hub accounts its
-/// usage-limit sources (`config.usageLimitSources`) report.
-pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &[&str]) -> Vec<Account> {
+/// `collectLimitAccounts` across the selected environments: their providers, then the hub
+/// accounts their usage-limit sources (`config.usageLimitSources`) report.
+pub fn limit_accounts(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&str]) -> Vec<Account> {
     let visible = |driver: &str| !hidden_drivers.contains(&driver);
-    let providers: Vec<&Provider> = providers.iter().filter(|p| visible(&p.driver)).collect();
-    let hubs: Vec<(String, String, HubAccount)> = sources
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|source| {
+    let label_environment = environments.len() > 1;
+    let mut providers: Vec<(&LimitEnvironment<'_>, &Provider)> = Vec::new();
+    let mut hubs: Vec<(&LimitEnvironment<'_>, String, String, HubAccount)> = Vec::new();
+    for environment in environments {
+        providers.extend(environment.providers.iter().filter(|p| visible(&p.driver)).map(|p| (environment, p)));
+        for source in environment.sources.as_array().into_iter().flatten() {
             let id = source["id"].as_str().unwrap_or_default().to_owned();
-            let label = source["label"].as_str().unwrap_or_default().to_owned();
-            let accounts: Vec<HubAccount> = source["accounts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|account| HubAccount::deserialize(account).ok())
-                .collect();
-            accounts.into_iter().map(move |account| (id.clone(), label.clone(), account))
-        })
-        .filter(|(_, _, account)| visible(&account.driver))
-        .collect();
+            let label = source["label"].as_str().unwrap_or_default();
+            let label = if label_environment { format!("{} · {label}", environment.label) } else { label.to_owned() };
+            hubs.extend(
+                source["accounts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|account| HubAccount::deserialize(account).ok())
+                    .filter(|account| visible(&account.driver))
+                    .map(|account| (environment, id.clone(), label.clone(), account)),
+            );
+        }
+    }
     let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
     let reports = providers
         .iter()
-        .filter(|p| p.enabled)
-        .map(|p| {
+        .filter(|(_, p)| p.enabled)
+        .map(|(_, p)| {
             (base_key(&p.driver, p.auth.email.as_deref(), p.usage_limits.as_ref()), p.auth.workspace_id.as_deref())
         })
-        .chain(hubs.iter().map(|(_, _, a)| {
+        .chain(hubs.iter().map(|(_, _, _, a)| {
             (base_key(&a.driver, a.email.as_deref(), Some(&a.usage_limits)), a.workspace_id.as_deref())
         }));
     for (base, workspace) in reports {
@@ -1003,29 +1020,30 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
         }
     }
     let mut candidates: Vec<(String, Account, bool)> = Vec::new();
-    for provider in providers.into_iter().filter(|p| reports_limits(p)) {
+    for (environment, provider) in providers.into_iter().filter(|(_, p)| reports_limits(p)) {
         let Some(limits) = provider.usage_limits.clone() else { continue };
         if limits_notice(&limits).is_some() {
             continue;
         }
         let auth = &provider.auth;
+        let own_key = format!("{}:{}", environment.id, provider.instance_id);
         let base = base_key(&provider.driver, auth.email.as_deref(), Some(&limits));
-        let key = resolve_key(base, auth.workspace_id.as_deref(), &workspaces)
-            .unwrap_or_else(|| provider.instance_id.clone());
+        let key = resolve_key(base, auth.workspace_id.as_deref(), &workspaces).unwrap_or_else(|| own_key.clone());
         let account = Account {
-            key: provider.instance_id.clone(),
+            key: own_key,
             driver: provider.driver.clone(),
             display_name: provider.display_name.as_ref().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()),
             email: auth.email.clone(),
             plan: auth.label.clone(),
             accent_color: provider.accent_color.clone(),
             limits,
+            environments: vec![(environment.id.to_owned(), environment.label.to_owned())],
             source_label: None,
-            redeem: Some(json!({"instanceId": provider.instance_id})),
+            redeem: Some((environment.id.to_owned(), json!({"instanceId": provider.instance_id}))),
         };
         candidates.push((key, account, true));
     }
-    for (source_id, source_label, hub) in hubs {
+    for (environment, source_id, source_label, hub) in hubs {
         if limits_notice(&hub.usage_limits).is_some() {
             continue;
         }
@@ -1035,12 +1053,9 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
         };
         let base = base_key(&hub.driver, hub.email.as_deref(), Some(&hub.usage_limits));
         let key = resolve_key(base, hub.workspace_id.as_deref(), &workspaces).unwrap_or_else(|| own_key.clone());
-        let redeem = hub
-            .usage_limits
-            .reset_credits
-            .as_ref()
-            .and_then(|c| c.next_credit_id.clone())
-            .map(|credit| json!({"sourceId": source_id, "accountId": hub.id, "creditId": credit}));
+        let redeem = hub.usage_limits.reset_credits.as_ref().and_then(|c| c.next_credit_id.clone()).map(|credit| {
+            (environment.id.to_owned(), json!({"sourceId": source_id, "accountId": hub.id, "creditId": credit}))
+        });
         let name = hub.id.strip_suffix(".json").or_else(|| hub.id.strip_suffix(".JSON")).unwrap_or(&hub.id).to_owned();
         let account = Account {
             key: own_key,
@@ -1050,6 +1065,7 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
             plan: hub.plan,
             accent_color: None,
             limits: hub.usage_limits,
+            environments: Vec::new(),
             source_label: Some(source_label),
             redeem,
         };
@@ -1058,7 +1074,7 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
     let mut merged: Vec<Merging> = Vec::new();
     for (key, next, signed_in) in candidates {
         let at = checked_ms(&next);
-        let hub_redeem = next.redeem.clone().filter(|r| r.get("sourceId").is_some()).map(|r| (at, r));
+        let hub_redeem = next.redeem.clone().filter(|(_, r)| r.get("sourceId").is_some()).map(|r| (at, r));
         let credits =
             next.limits.reset_credits.is_some().then(|| (at, next.limits.reset_credits.clone(), next.redeem.clone()));
         let plan = next.plan.clone().map(|plan| (at, plan));
@@ -1088,6 +1104,11 @@ pub fn limit_accounts(providers: &[Provider], sources: &Value, hidden_drivers: &
         previous.plan =
             group.plan.as_ref().map(|(_, plan)| plan.clone()).or(previous.plan.take()).or(next.plan.clone());
         previous.accent_color = previous.accent_color.take().or(next.accent_color.clone());
+        for environment in &next.environments {
+            if !previous.environments.iter().any(|(id, _)| *id == environment.0) {
+                previous.environments.push(environment.clone());
+            }
+        }
         group.signed_in |= signed_in;
         previous.source_label =
             if group.signed_in { None } else { previous.source_label.take().or(next.source_label.clone()) };
@@ -1526,48 +1547,60 @@ pub const CURSOR_WINDOWS: &[(&str, &str, &str)] = &[
     ("apiPercentUsed", "Other Models", "Claude, GPT, and Gemini use this pool. Grok and Composer fall back here."),
 ];
 
-/// `collectLimitNotices`: accounts that could not report, by name.
-pub fn limit_notices(providers: &[Provider], hidden_drivers: &[&str]) -> Vec<String> {
-    providers
-        .iter()
-        .filter(|p| reports_limits(p) && !hidden_drivers.contains(&p.driver.as_str()))
-        .filter_map(|provider| {
-            let limits = provider.usage_limits.as_ref()?;
+/// `collectLimitNotices`: accounts and sources that could not report, by name, each named
+/// with its environment when several are selected.
+pub fn limit_notices(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&str]) -> Vec<String> {
+    let several = environments.len() > 1;
+    let mut notices = Vec::new();
+    for environment in environments {
+        let label =
+            |subject: &str| if several { format!("{} · {subject}", environment.label) } else { subject.to_owned() };
+        for provider in
+            environment.providers.iter().filter(|p| reports_limits(p) && !hidden_drivers.contains(&p.driver.as_str()))
+        {
+            let Some(limits) = provider.usage_limits.as_ref() else { continue };
             let reason = limits.unavailable.as_ref().and_then(|u| u.get("reason")).and_then(Value::as_str);
             if reason == Some("unsupported") {
-                return None;
+                continue;
             }
             let name =
                 provider.display_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&provider.driver);
-            limits_notice(limits).map(|notice| format!("{name}: {notice}"))
-        })
-        .collect()
+            if let Some(notice) = limits_notice(limits) {
+                notices.push(format!("{}: {notice}", label(name)));
+            }
+        }
+    }
+    notices
 }
 
 /// `collectExternalUsageLinks`: hosts that show usage on their own site.
 pub fn external_links(
-    providers: &[Provider],
-    environment: &str,
+    environments: &[LimitEnvironment<'_>],
     hidden_drivers: &[&str],
 ) -> Vec<(String, String, Option<String>, Vec<String>)> {
     let mut links: Vec<(String, String, Option<String>, Vec<String>)> = Vec::new();
-    for provider in providers.iter().filter(|p| reports_limits(p) && !hidden_drivers.contains(&p.driver.as_str())) {
-        let Some(limits) = &provider.usage_limits else { continue };
-        let Some(external) = &limits.external_usage else { continue };
-        if provider.auth.status != "authenticated" {
-            continue;
-        }
-        let account = format!("{} on {environment}", provider.display_name.as_deref().unwrap_or(&provider.instance_id));
-        let message =
-            limits.unavailable.as_ref().and_then(|u| u.get("message")).and_then(Value::as_str).map(str::to_owned);
-        match links.iter_mut().find(|l| l.1 == external.url) {
-            Some(link) => {
-                if !link.3.contains(&account) {
-                    link.3.push(account);
-                }
-                link.2 = message;
+    for environment in environments {
+        for provider in
+            environment.providers.iter().filter(|p| reports_limits(p) && !hidden_drivers.contains(&p.driver.as_str()))
+        {
+            let Some(limits) = &provider.usage_limits else { continue };
+            let Some(external) = &limits.external_usage else { continue };
+            if provider.auth.status != "authenticated" {
+                continue;
             }
-            None => links.push((external.label.clone(), external.url.clone(), message, vec![account])),
+            let name = provider.display_name.as_deref().unwrap_or(&provider.instance_id);
+            let account = format!("{name} on {}", environment.label);
+            let message =
+                limits.unavailable.as_ref().and_then(|u| u.get("message")).and_then(Value::as_str).map(str::to_owned);
+            match links.iter_mut().find(|l| l.1 == external.url) {
+                Some(link) => {
+                    if !link.3.contains(&account) {
+                        link.3.push(account);
+                    }
+                    link.2 = message;
+                }
+                None => links.push((external.label.clone(), external.url.clone(), message, vec![account])),
+            }
         }
     }
     links
@@ -1724,6 +1757,11 @@ mod tests {
         .unwrap()
     }
 
+    /// One environment, as a single-machine Limits view reads it.
+    fn here<'a>(providers: &'a [Provider], sources: &'a Value) -> [LimitEnvironment<'a>; 1] {
+        [LimitEnvironment { id: "env-a", label: "Here", providers, sources }]
+    }
+
     #[test]
     fn model_price_rows_become_settings_patches() {
         let prices = json!({"old": {"inputCostPerMillionTokens": 1, "outputCostPerMillionTokens": 2}});
@@ -1776,7 +1814,7 @@ mod tests {
                 {"id": "other.json", "driver": "codex", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window}},
             ],
         }]);
-        let accounts = limit_accounts(&providers, &sources, &[]);
+        let accounts = limit_accounts(&here(&providers, &sources), &[]);
         assert_eq!(accounts.len(), 2);
         let me = &accounts[0];
         assert_eq!(
@@ -1785,7 +1823,10 @@ mod tests {
             "signed in here, so no source"
         );
         assert_eq!(me.limits.reset_credits.as_ref().map(|c| c.available_count), Some(2));
-        assert_eq!(me.redeem, Some(json!({"sourceId": "hub", "accountId": "me.json", "creditId": "c1"})));
+        assert_eq!(
+            me.redeem,
+            Some(("env-a".into(), json!({"sourceId": "hub", "accountId": "me.json", "creditId": "c1"})))
+        );
         let other = &accounts[1];
         assert_eq!((other.display_name.as_deref(), other.source_label.as_deref()), (Some("other"), Some("Team hub")));
         assert_eq!(other.redeem, None);
@@ -1812,7 +1853,7 @@ mod tests {
                 ]),
             ),
         ];
-        let pools = limit_pools(limit_accounts(&providers, &Value::Null, &[]), now);
+        let pools = limit_pools(limit_accounts(&here(&providers, &Value::Null), &[]), now);
         assert_eq!(pools.len(), 1);
         let pool = &pools[0];
         assert_eq!(pool.accounts.len(), 2);
@@ -1827,7 +1868,37 @@ mod tests {
         assert_eq!(session.remaining_percent, 40);
         assert_eq!(session.next_refill, Some(10), "me@'s 20% back, as a share of two accounts");
         assert!(pool.windows[1].columns[0].is_none(), "me@ has no weekly window");
-        assert!(limit_accounts(&providers, &Value::Null, &["claudeAgent"]).is_empty());
+        assert!(limit_accounts(&here(&providers, &Value::Null), &["claudeAgent"]).is_empty());
+    }
+
+    #[test]
+    fn limits_collect_across_environments_and_redeem_where_the_credit_is() {
+        let window = json!([{"id": "w", "kind": "session", "label": "5-hour", "usedPercent": 40}]);
+        let mut credited = provider("codex", "codex", "me@x.dev", window.clone());
+        let with_credit =
+            json!({"checkedAt": "2026-11-05T02:00:00Z", "windows": window, "resetCredits": {"availableCount": 1}});
+        credited.usage_limits = serde_json::from_value(with_credit).unwrap();
+        let mut unavailable = provider("claude", "claudeAgent", "me@x.dev", json!([]));
+        unavailable.usage_limits =
+            serde_json::from_value(json!({"checkedAt": "2026-11-05T00:00:00Z", "windows": [], "unavailable": {"reason": "error", "message": "Expired."}}))
+                .unwrap();
+        let (on_a, on_b) = (vec![provider("codex", "codex", "ME@x.dev", window.clone())], vec![credited, unavailable]);
+        let hub = json!([{"id": "hub", "label": "Team hub", "accounts": [
+            {"id": "other.json", "driver": "codex", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window}},
+        ]}]);
+        let environments = [
+            LimitEnvironment { id: "env-a", label: "Laptop", providers: &on_a, sources: &Value::Null },
+            LimitEnvironment { id: "env-b", label: "Server", providers: &on_b, sources: &hub },
+        ];
+        let accounts = limit_accounts(&environments, &[]);
+        assert_eq!(accounts.len(), 2);
+        let me = &accounts[0];
+        let signed_in: Vec<&str> = me.environments.iter().map(|(_, label)| label.as_str()).collect();
+        assert_eq!(signed_in, ["Laptop", "Server"], "one login on two machines is one account");
+        // The credit is on the server's instance, so the server spends it.
+        assert_eq!(me.redeem, Some(("env-b".into(), json!({"instanceId": "codex"}))));
+        assert_eq!(accounts[1].source_label.as_deref(), Some("Server · Team hub"));
+        assert!(limit_notices(&environments, &[]).iter().any(|n| n.starts_with("Server · claude")));
     }
 
     #[test]

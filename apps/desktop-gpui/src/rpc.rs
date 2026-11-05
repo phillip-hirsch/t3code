@@ -130,6 +130,11 @@ impl RpcClient {
         self.closed.recv().await.unwrap_or_else(|_| "closed".into())
     }
 
+    /// Both clients share one socket: a reconnect makes a new one.
+    pub fn same_socket(&self, other: &Self) -> bool {
+        self.commands.same_channel(&other.commands)
+    }
+
     pub async fn request(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.send(tag, payload, Pending::Unary(tx));

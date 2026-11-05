@@ -259,7 +259,7 @@ impl Workspace {
         }
         if s.grants(ENVIRONMENT_MAINTAIN) {
             let version = config.pointer("/environment/serverVersion").and_then(Value::as_str);
-            let url = self.http_base();
+            let url = self.settings_endpoint().map(|e| e.http_base.as_str());
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
             let description = if version.is_none() { "Loading\u{2026}".to_owned() } else { parts.join(" · ") };
             let row = RowFrame::new("Version").description(description).status(has_config.then_some("Up to date"));
