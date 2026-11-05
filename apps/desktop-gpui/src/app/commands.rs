@@ -224,6 +224,7 @@ impl Workspace {
             "projectSearch.toggle" => {
                 self.toggle_file_overlay(super::files::OverlayMode::Content, window, cx);
             }
+            "composer.stash" if chat && !palette_open => self.stash_shortcut(window, cx),
             "theme.select" => {
                 self.open_palette(palette::View::Themes, window, cx);
             }

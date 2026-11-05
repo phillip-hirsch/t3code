@@ -14,7 +14,7 @@ mod devices;
 mod threads;
 
 #[path = "scheduled_tasks/mod.rs"]
-mod scheduled_tasks;
+pub(in crate::app) mod scheduled_tasks;
 
 impl Workspace {
     pub(super) fn render_settings_providers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

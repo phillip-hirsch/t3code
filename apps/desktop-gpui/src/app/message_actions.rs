@@ -44,6 +44,12 @@ pub(super) struct CopyFeedback {
     _reset: Option<Task<()>>,
 }
 
+impl CopyFeedback {
+    pub(super) fn is(&self, id: &SharedString) -> bool {
+        self.id.as_ref() == Some(id)
+    }
+}
+
 /// `promptLinkFor`: a link that starts a new thread with this prompt.
 pub(super) fn prompt_link(prompt: &str) -> Option<String> {
     let prompt = prompt.trim();
@@ -62,7 +68,7 @@ pub(super) fn prompt_link(prompt: &str) -> Option<String> {
 }
 
 impl Workspace {
-    fn copied(&mut self, id: SharedString, duration: Duration, cx: &mut Context<Self>) {
+    pub(super) fn copied(&mut self, id: SharedString, duration: Duration, cx: &mut Context<Self>) {
         self.copy_feedback.id = Some(id);
         self.copy_feedback._reset = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(duration).await;

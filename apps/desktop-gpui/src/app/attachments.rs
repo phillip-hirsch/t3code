@@ -63,15 +63,48 @@ pub(super) struct Attachment {
 impl Attachment {
     /// A sent message's attachment, back in the composer as a new upload.
     pub(super) fn restored(kind: &str, name: String, mime: String, bytes: Vec<u8>) -> Self {
+        Self::restored_as(new_id(), kind, name, mime, bytes)
+    }
+
+    /// Restored under the id its prompt's chips still name.
+    pub(super) fn restored_as(local_id: String, kind: &str, name: String, mime: String, bytes: Vec<u8>) -> Self {
         let kind = if kind == "image" { Kind::Image } else { Kind::File };
         let image = image_format(&mime)
             .filter(|_| kind == Kind::Image)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        Self { local_id: new_id(), kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
+        Self { local_id, kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
     }
 
     pub(super) fn local_id(&self) -> &str {
         &self.local_id
+    }
+
+    pub(super) fn kind_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn mime(&self) -> &str {
+        &self.mime
+    }
+
+    pub(super) fn bytes(&self) -> &Arc<Vec<u8>> {
+        &self.bytes
+    }
+
+    pub(super) fn image(&self) -> Option<Arc<Image>> {
+        self.image.clone()
+    }
+
+    /// The server's id once the upload finished.
+    pub(super) fn uploaded_id(&self) -> Option<&str> {
+        match &self.upload {
+            Upload::Ready(id) => Some(id),
+            _ => None,
+        }
     }
 
     fn context_id(&self) -> String {
@@ -136,7 +169,7 @@ fn classify(name: &str) -> Result<(Kind, &'static str), String> {
 }
 
 /// `formatAttachmentSize`: whole KB, or one decimal of MB from 1024 KB.
-fn format_size(bytes: u64) -> String {
+pub(super) fn format_size(bytes: u64) -> String {
     let kb = (bytes as f64 / 1024.).ceil();
     if kb >= 1024. { format!("{:.1} MB", bytes as f64 / 1024. / 1024.) } else { format!("{kb} KB") }
 }
@@ -231,10 +264,54 @@ impl Workspace {
                     self.add_paths(paths.paths().to_vec(), window, cx);
                     handled = true;
                 }
+                gpui_kit::ClipboardEntry::String(text) if !handled => {
+                    handled = self.fold_pasted_text(text.text(), window, cx);
+                }
                 gpui_kit::ClipboardEntry::String(_) => {}
             }
         }
         handled
+    }
+
+    /// `foldPastedText`: a large paste, or one past the input limit, attaches as a text
+    /// file; one that can neither fit nor attach is refused.
+    pub(super) fn fold_pasted_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = self.composer.read(cx);
+        let selected = state.selected_range();
+        let value = state.value();
+        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected.clone()]);
+        let would_exceed = kept + composer_text::js_length(text) > composer_text::MAX_INPUT_CHARS;
+        if !composer_text::paste_folds(text, would_exceed) {
+            return false;
+        }
+        let limit = self.server_info.file_upload_limit().map(|l| l.min(MAX_FILE_BYTES));
+        let can_stage = self.target.is_some() && self.can_attach() && self.attachments.len() < MAX_ATTACHMENTS;
+        let refuse = |title: &'static str, description: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            let toast = gpui_kit::component::notification::Notification::error(description).title(title);
+            gpui_kit::component::WindowExt::push_notification(window, toast, cx);
+            true
+        };
+        let Some(limit) = limit.filter(|_| can_stage) else {
+            return would_exceed
+                && refuse(
+                    "Pasted text is too large for this message",
+                    "Remove some text or an attachment, then paste again.",
+                    window,
+                    cx,
+                );
+        };
+        if text.len() as u64 > limit {
+            return would_exceed
+                && refuse(
+                    "Pasted text is too large to attach",
+                    "Reduce the clipboard contents or save a smaller excerpt as a file.",
+                    window,
+                    cx,
+                );
+        }
+        let name = composer_text::next_pasted_text_name(self.attachments.iter().map(|a| a.name.as_str()));
+        self.add_attachment(name, Kind::File, "text/plain", text.as_bytes().to_vec(), window, cx);
+        true
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -395,7 +472,7 @@ impl Workspace {
         .detach();
     }
 
-    fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };
         let attachment = self.attachments.remove(index);
         if let (Upload::Ready(id), Some(client)) = (&attachment.upload, self.client()) {
@@ -579,6 +656,7 @@ impl Workspace {
             Upload::Failed(_) => "Attach again".to_owned(),
         };
         let failed = matches!(attachment.upload, Upload::Failed(_));
+        let preview_id = id.clone();
         h_flex()
             .id(ElementId::Name(format!("attachment-{id}").into()))
             .min_w_0()
@@ -586,7 +664,20 @@ impl Workspace {
             .py(px(4.))
             .text_sm()
             .child(Icon::new(Lucide::File).with_size(px(16.)).text_color(t.muted_foreground))
-            .child(div().flex_1().min_w_0().truncate().text_color(t.foreground).child(attachment.name.clone()))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("preview-{id}").into()))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(t.foreground)
+                    .hover(|s| s.underline())
+                    .child(attachment.name.clone())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.open_attachment_preview(&preview_id, window, cx)),
+                    ),
+            )
             .child(div().text_xs().text_color(t.muted_foreground).child(status))
             .when(failed, |el| {
                 el.child(

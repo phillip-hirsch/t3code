@@ -52,6 +52,10 @@ impl Workspace {
         worktree.or_else(|| self.target_project().map(|p| p.workspace_root.clone()))
     }
 
+    pub(super) fn composer_menu_open(&self) -> bool {
+        self.menu.trigger.is_some()
+    }
+
     /// Re-reads the trigger under the caret; called on every edit and caret move.
     pub(super) fn sync_trigger(&mut self, cx: &mut Context<Self>) {
         let state = self.composer.read(cx);

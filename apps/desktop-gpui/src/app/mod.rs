@@ -23,6 +23,7 @@ use crate::runtime;
 use crate::timeline::{self, Row};
 
 mod alerts;
+mod attachment_preview;
 mod attachments;
 mod banners;
 mod chat;
@@ -48,7 +49,9 @@ mod model_picker;
 mod pages;
 mod palette;
 mod palette_actions;
+mod plan_actions;
 mod preview;
+mod prompt_stash;
 mod queue;
 mod quit;
 mod right_panel;
@@ -151,6 +154,8 @@ pub struct Workspace {
     /// Plan mode per target and the dismissed fallback notice.
     composer_ui: composer_plan::ComposerUi,
     attachments: Vec<attachments::Attachment>,
+    /// Prompts set aside with `composer.stash`.
+    prompt_stash: prompt_stash::PromptStash,
     /// Where Up/Down prompt history stands.
     prompt_history: Option<crate::composer_text::HistoryPosition>,
     /// The editor's chip ids after the last edit, to notice deleted attachment chips.
@@ -174,6 +179,10 @@ pub struct Workspace {
     lineage_expanded: Option<String>,
     /// The git status of the open target's workspace.
     vcs: git::VcsWatch,
+    /// Local servers, while the details card's Servers section can show.
+    servers: details::servers::ServersWatch,
+    /// Scheduled tasks, while the details card's Automations section can show.
+    automations: details::automations::AutomationsWatch,
     /// The editor "Open in" launches, once picked.
     preferred_editor: Option<String>,
     right_panel: right_panel::RightPanel,
@@ -310,6 +319,7 @@ impl Workspace {
             draft_workspace: Default::default(),
             composer_ui: Default::default(),
             attachments: Vec::new(),
+            prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
             ctrl_held: false,
@@ -327,6 +337,8 @@ impl Workspace {
             details_popover: false,
             lineage_expanded: None,
             vcs: git::VcsWatch::default(),
+            servers: Default::default(),
+            automations: Default::default(),
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
@@ -920,6 +932,8 @@ impl Render for Workspace {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
+        self.sync_servers(window, cx);
+        self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);
         self.sync_preview_views(window, cx);

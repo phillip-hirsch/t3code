@@ -77,6 +77,14 @@ impl Workspace {
     /// A user edit. While a question is open the editor holds its custom answer;
     /// programmatic changes (`set_composer_text`) never reach the draft.
     pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+        self.close_stash_menu(cx);
+        if self.composer_ui.length_error.is_some() {
+            let error = composer_text::prompt_length_error(&self.composer.read(cx).value());
+            if error != self.composer_ui.length_error {
+                self.composer_ui.length_error = error;
+                cx.notify();
+            }
+        }
         self.save_custom_answer(cx);
         self.sync_composer_empty(cx);
         let state = self.composer.read(cx);
@@ -143,6 +151,7 @@ impl Workspace {
         };
         self.prompt_history = None;
         self.menu = Default::default();
+        self.prompt_stash.open = false;
         self.picker.dismiss();
         if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
             self.composer_drafts.remove(&target);
@@ -213,7 +222,8 @@ impl Workspace {
         if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
-        self.draft_workspace_key(keystroke, window, cx)
+        self.stash_menu_key(keystroke, window, cx)
+            || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
                 && (self.plan_toggle_key(keystroke, window, cx) || self.menu_key(keystroke, window, cx)))
     }
@@ -229,9 +239,55 @@ impl Workspace {
         if self.model_picker_open() {
             return false;
         }
+        if self.redirect_to_composer(keystroke, window, cx) {
+            return true;
+        }
         self.question_option_key(keystroke, window, cx)
             || (context.composer_focus
                 && (self.history_key(keystroke, window, cx) || self.send_key(keystroke, context, window, cx)))
+    }
+
+    /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
+    /// click on the timeline blurs the editor), typing and pasting land at the composer's end.
+    fn redirect_to_composer(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.focus.is_focused(window)
+            || self.target.is_none()
+            || self.palette.is_some()
+            || self.page.is_some()
+            || self.settings.is_some()
+        {
+            return false;
+        }
+        let m = keystroke.modifiers;
+        let paste = keystroke.key == "v" && (m.control || m.platform) && !m.alt;
+        let text = if paste {
+            let item = cx.read_from_clipboard();
+            let only_text = item
+                .as_ref()
+                .is_some_and(|item| item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_))));
+            match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
+                Some(text) => text,
+                None => return false,
+            }
+        } else if !m.control && !m.alt && !m.platform && !m.function {
+            match keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control)) {
+                Some(c) => c.clone(),
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        self.composer.update(cx, |state, cx| {
+            let end = state.value().len();
+            state.set_selected_range(end..end, cx);
+        });
+        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        // Ctrl+Shift+V pastes as text even when it is long (`isPasteAsTextShortcut`).
+        if paste && !m.shift && self.fold_pasted_text(&text, window, cx) {
+            return true;
+        }
+        self.composer.update(cx, |state, cx| state.insert(text, window, cx));
+        true
     }
 
     /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
@@ -518,6 +574,7 @@ impl Workspace {
         let placeholder = self.placeholder(first_approval);
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
+        let chip_view = view.clone();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -527,6 +584,15 @@ impl Workspace {
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| render_chip(token, &t))
+            // A file chip opens its preview (`composerContextActions.openFile`).
+            .on_token_click(move |event, window, cx| {
+                if let Some(Chip::Context { kind, id, .. }) = Chip::from_id(event.token().id())
+                    && kind == "file"
+                    && let Some(local_id) = id.strip_prefix("file_")
+                {
+                    let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+                }
+            })
             .on_paste(move |item, window, cx| {
                 view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
             });
@@ -566,16 +632,22 @@ impl Workspace {
                     )
                 }),
             ))
+            .children(self.composer_ui.length_error.clone().map(|error| {
+                div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
+            }))
             .child(self.render_footer(&t, cx));
         div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
-                .children(self.render_environment_banner(&t, cx))
-                .children(self.render_fallback_banner(&t, cx))
-                .children(self.render_recovery_banner(&t, cx))
-                .children(self.render_question(&t, cx))
-                .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
+                .children(self.render_banner_dock(&t, cx))
+                .child(
+                    div()
+                        .relative()
+                        .children(self.render_command_menu(&t, cx))
+                        .children(self.render_stash_menu(f32::from(window.viewport_size().height) * 0.4, &t, cx))
+                        .child(surface),
+                )
                 .children(self.render_context_strip(&t, cx)),
         )
     }
@@ -714,15 +786,34 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        if self.plan_follow_up_target().is_some() {
+        let sendable = !self.composer_empty || self.has_attachments();
+        let can_resume = self.can_resume();
+        if self.plan_follow_up_target().is_some() && (!self.composer_empty || !can_resume) {
             return self.render_plan_follow_up_action(t, cx);
         }
-        let sendable = !self.composer_empty || self.has_attachments();
         let editing = self.editing_queued();
         if running && !sendable && !editing {
             return stop().into_any_element();
         }
         let busy = self.sending || self.saving_queue_edit();
+        if can_resume && !sendable {
+            let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
+            let content = if self.sending {
+                Spinner::new().small().color(t.primary_foreground).into_any_element()
+            } else {
+                Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
+            };
+            return round_button("resume", t.primary, t.primary)
+                .child(content)
+                .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
+                .when(enabled, |el| {
+                    el.cursor_pointer()
+                        .hover(|s| s.bg(t.primary_hover))
+                        .on_click(cx.listener(|this, _, window, cx| this.resume_thread(window, cx)))
+                })
+                .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
+                .into_any_element();
+        }
         let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
         let can_send = sendable
             && self.target.is_some()
@@ -818,14 +909,17 @@ impl Workspace {
         let detail = item.and_then(|i| i.str("prompt")).filter(|p| !p.is_empty()).unwrap_or(label).to_owned();
         let app_name = item.and_then(|i| i.str("appName")).map(str::to_owned);
         let reason = item.and_then(|i| i.str("reason")).map(str::to_owned);
-        let options: Vec<(String, String)> = item
+        // (decision, label, warning)
+        let options: Vec<(String, String, Option<SharedString>)> = item
             .and_then(|i| i.raw.get("options"))
             .and_then(Value::as_array)
             .map(|options| {
                 options
                     .iter()
                     .filter_map(|o| {
-                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned()))
+                        let warning =
+                            o.get("warning").and_then(Value::as_str).map(|w| SharedString::from(w.to_owned()));
+                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned(), warning))
                     })
                     .collect()
             })
@@ -836,28 +930,34 @@ impl Workspace {
                     ("acceptForSession", "Always allow this session"),
                     ("accept", "Approve"),
                 ]
-                .map(|(d, l)| (d.to_owned(), l.to_owned()))
+                .map(|(d, l)| (d.to_owned(), l.to_owned(), None))
                 .to_vec()
             });
         let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
-        let inline = |decision: &str, label: &str, tone: Hsla, cx: &mut Context<Self>| {
-            let request_id = request.id.clone();
-            let decision = decision.to_owned();
-            div()
-                .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tone)
-                .child(label.to_owned())
-                .when(!enabled, |el| el.opacity(0.64))
-                .when(enabled, |el| {
-                    el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                        move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
-                    ))
-                })
-        };
-        let primary: Vec<_> = options.iter().filter(|(d, _)| d == "decline" || d == "accept").collect();
-        let more: Rc<Vec<(String, String)>> =
-            Rc::new(options.iter().filter(|(d, _)| d != "decline" && d != "accept").cloned().collect());
+        let inline =
+            |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
+                let request_id = request.id.clone();
+                let decision = decision.to_owned();
+                h_flex()
+                    .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
+                    .gap(px(4.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tone)
+                    .when(warning.is_some(), |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
+                    .child(label.to_owned())
+                    .when_some(warning, |el, warning| {
+                        el.tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx))
+                    })
+                    .when(!enabled, |el| el.opacity(0.64))
+                    .when(enabled, |el| {
+                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
+                            move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
+                        ))
+                    })
+            };
+        let primary: Vec<_> = options.iter().filter(|(d, ..)| d == "decline" || d == "accept").collect();
+        let more: Rc<Vec<_>> =
+            Rc::new(options.iter().filter(|(d, ..)| d != "decline" && d != "accept").cloned().collect());
         let mut actions = h_flex().flex_wrap().items_center().gap_x(px(8.)).gap_y(px(4.));
         if request.is_live() {
             actions = actions
@@ -869,9 +969,9 @@ impl Workspace {
                         .child("Waiting for approval"),
                 )
                 .child(div().text_color(t.muted_foreground).child("·"));
-            for (decision, label) in primary {
+            for (decision, label, warning) in primary {
                 let tone = if decision == "accept" { t.foreground } else { t.muted_foreground };
-                actions = actions.child(inline(decision, label, tone, cx));
+                actions = actions.child(inline(decision, label, warning.clone(), tone, cx));
             }
             if !more.is_empty() {
                 let view = cx.entity();
@@ -888,15 +988,15 @@ impl Workspace {
                         .text_color(t.muted_foreground)
                         .disabled(!enabled)
                         .dropdown_menu(move |mut menu, window, _| {
-                            for (decision, label) in more.iter() {
+                            for (decision, label, warning) in more.iter() {
                                 let request_id = request_id.clone();
                                 let decision = decision.clone();
-                                menu = menu.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
-                                    &view,
-                                    move |this, _, _, cx| {
-                                        this.respond(request_id.clone(), json!({"decision": decision}), cx)
-                                    },
-                                )));
+                                let item = PopupMenuItem::new(label.clone());
+                                let item =
+                                    if warning.is_some() { item.icon(Icon::new(Lucide::TriangleAlert)) } else { item };
+                                menu = menu.item(item.on_click(window.listener_for(&view, move |this, _, _, cx| {
+                                    this.respond(request_id.clone(), json!({"decision": decision}), cx)
+                                })));
                             }
                             menu
                         }),
@@ -963,6 +1063,29 @@ impl Workspace {
         crate::new_thread::usage_fallback(&self.server_info, default, Some(project_id), jiff::Timestamp::now())
     }
 
+    /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
+    /// on their right.
+    fn render_banner_dock(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let banners: Vec<AnyElement> = (self.render_environment_banner(t, cx).into_iter())
+            .chain(self.render_fallback_banner(t, cx))
+            .chain(self.render_recovery_banner(t, cx))
+            .chain(self.render_question(t, cx))
+            .collect();
+        let badge = self.render_stash_badge(t, cx);
+        if banners.is_empty() && badge.is_none() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .mx(px(22.))
+                .items_end()
+                .gap(px(4.))
+                .child(v_flex().flex_1().min_w_0().children(banners))
+                .children(badge)
+                .into_any_element(),
+        )
+    }
+
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Target::Draft { project_id }) = &self.target else { return None };
@@ -994,7 +1117,6 @@ impl Workspace {
         let use_default = format!("Use {}", model_name(&default));
         Some(
             div()
-                .mx(px(22.))
                 .mb(px(-17.))
                 .child(
                     h_flex()
@@ -1183,7 +1305,6 @@ impl Workspace {
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         Some(
             div()
-                .mx(px(22.))
                 .mb(px(-17.))
                 .child(
                     v_flex()

@@ -30,6 +30,8 @@ pub(super) struct ComposerUi {
     pub(super) dismissed_fallback: Option<String>,
     /// "Implement in a new thread" is creating its thread.
     implementing: bool,
+    /// Why the last send was refused for length; it follows edits until it clears.
+    pub(super) length_error: Option<String>,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.

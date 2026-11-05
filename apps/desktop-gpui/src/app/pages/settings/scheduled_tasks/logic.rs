@@ -14,7 +14,7 @@ use crate::model::{ModelSelection, ProjectShell, ServerInfo};
 /// strategy and model selection stay raw so a save sends back what it did not edit.
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ScheduledTask {
+pub(in crate::app) struct ScheduledTask {
     pub id: String,
     pub title: String,
     pub prompt: String,
@@ -53,7 +53,7 @@ impl ScheduledTask {
 
 /// `scheduledTasks.subscribe` elements: the whole list each time. Like the TS
 /// `ForwardCompatibleArray`, a task that fails to decode is skipped, not the frame.
-pub(super) fn decode_tasks(value: &Value) -> Vec<ScheduledTask> {
+pub(in crate::app) fn decode_tasks(value: &Value) -> Vec<ScheduledTask> {
     value["tasks"]
         .as_array()
         .map(|tasks| tasks.iter().filter_map(|task| ScheduledTask::deserialize(task).ok()).collect())
@@ -62,7 +62,7 @@ pub(super) fn decode_tasks(value: &Value) -> Vec<ScheduledTask> {
 
 /// `ScheduledTaskSchedule`, as far as the client reads it.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Schedule {
+pub(in crate::app) enum Schedule {
     Interval { every_ms: f64 },
     FixedTime { time_of_day: String, weekdays: Vec<u8> },
     Once { run_at: String },
@@ -421,7 +421,7 @@ pub(super) fn webhook_denial(policy: &Value) -> Option<String> {
 }
 
 /// `scheduleLabel`.
-pub(super) fn schedule_label<Tz: TimeZone>(schedule: &Schedule, tz: &Tz) -> String
+pub(in crate::app) fn schedule_label<Tz: TimeZone>(schedule: &Schedule, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -455,7 +455,7 @@ where
 }
 
 /// `relativeLabel`: past times as `formatRelativeTime`, upcoming ones as "in 5m".
-pub(super) fn relative_label(value: Option<&str>, now_ms: i64) -> String {
+pub(in crate::app) fn relative_label(value: Option<&str>, now_ms: i64) -> String {
     let Some(at) = value.and_then(parse_iso) else {
         return "Not scheduled".into();
     };

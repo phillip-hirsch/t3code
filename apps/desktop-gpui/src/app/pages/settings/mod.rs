@@ -2,7 +2,7 @@
 //! window with `SettingsSidebarNav`, a breadcrumb header and one section at a time. Rows and
 //! the scope layer are in `widgets.rs`.
 
-mod agents;
+pub(in crate::app) mod agents;
 mod chat;
 pub(in crate::app) mod code;
 mod connections;

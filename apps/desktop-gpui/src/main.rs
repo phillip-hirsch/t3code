@@ -13,6 +13,7 @@ mod new_thread;
 mod notifications;
 mod preview;
 mod project_groups;
+mod proposed_plan;
 mod pull_request_detail;
 mod pull_request_diff;
 mod pull_requests;
