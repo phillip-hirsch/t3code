@@ -15,7 +15,9 @@ use serde_json::Value;
 
 /// Decodes an array element by element, skipping elements that fail, like the
 /// TS `ForwardCompatibleArray`, so one new-shaped record never drops a frame.
-fn lossy<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<Vec<T>, D::Error> {
+pub(crate) fn lossy<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error> {
     let values = Vec::<Value>::deserialize(deserializer)?;
     Ok(values
         .into_iter()

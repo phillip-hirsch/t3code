@@ -71,7 +71,10 @@ impl SavedEnvironments {
     }
 
     fn save(&self) -> Result<(), String> {
-        self.catalog.save().map_err(|error| format!("Could not save environments: {error}"))
+        self.catalog.save().map_err(|error| {
+            log::warn!("could not save environments: {error:#}");
+            format!("Could not save environments: {error:#}")
+        })
     }
 
     /// Saves a paired environment and connects it (`registerPairingConnection`).

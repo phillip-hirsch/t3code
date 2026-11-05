@@ -206,7 +206,7 @@ fn is_our_launcher(path: &Path) -> bool {
 mod platform {
     use std::process::Command;
 
-    use anyhow::{Result, bail};
+    use anyhow::{Context as _, Result, bail};
     use base64::Engine as _;
 
     /// `WINDOWS_USER_PATH_SCRIPT`: keeps REG_EXPAND_SZ and `%VAR%`s, tells Explorer with
@@ -241,24 +241,22 @@ if ($env:T3_SET -eq '1') {
         if let Some(value) = set {
             command.env("T3_SET", "1").env("T3_PATH", value);
         }
-        let output = command.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output()?;
+        let output = command.stdin(std::process::Stdio::null()).output().context("could not run powershell")?;
         if !output.status.success() {
-            bail!("powershell exited with {}", output.status);
+            bail!("powershell exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     pub fn read_user_path() -> Result<String> {
-        let encoded =
-            powershell(None).map_err(|_| anyhow::anyhow!("Could not read your PATH, so it was left unchanged."))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .map_err(|_| anyhow::anyhow!("Could not read your PATH, so it was left unchanged."))?;
+        const UNREADABLE: &str = "Could not read your PATH, so it was left unchanged.";
+        let encoded = powershell(None).context(UNREADABLE)?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).context(UNREADABLE)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     pub fn write_user_path(value: &str) -> Result<()> {
-        powershell(Some(value)).map(|_| ()).map_err(|_| anyhow::anyhow!("Could not update your PATH."))
+        powershell(Some(value)).map(|_| ()).context("Could not update your PATH.")
     }
 }
 
@@ -310,16 +308,20 @@ pub fn state() -> CliState {
 /// `DesktopCliCommand.install`: the launcher, then its folder on the user PATH (Windows) or a
 /// `t3` link in a user bin folder (elsewhere). Blocking.
 pub fn install() -> Result<CliState> {
+    try_install().inspect_err(|error| log::warn!("could not install the t3 command: {error:#}"))
+}
+
+fn try_install() -> Result<CliState> {
     let target = Target::resolve().context("The t3 command needs this app's server and Node.")?;
     let launcher = write_launcher(&target)
-        .map_err(|_| anyhow::anyhow!("Could not set up the t3 launcher at {}.", target.launcher().display()))?;
+        .with_context(|| format!("Could not set up the t3 launcher at {}.", target.launcher().display()))?;
     #[cfg(windows)]
     {
         let bin = launcher.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default();
         if let Some(next) = with_path_entry(&platform::read_user_path()?, &bin) {
             platform::write_user_path(&next)?;
             std::fs::write(owned_path_marker(&target), format!("{bin}\n"))
-                .map_err(|_| anyhow::anyhow!("Added t3 to your PATH but could not record it."))?;
+                .context("Added t3 to your PATH but could not record it.")?;
         }
     }
     #[cfg(not(windows))]
@@ -329,7 +331,7 @@ pub fn install() -> Result<CliState> {
             if std::fs::read_link(existing).ok().as_deref() == Some(launcher.as_path()) {
                 return Ok(current);
             }
-            std::fs::remove_file(existing).map_err(|_| anyhow::anyhow!("Could not replace {}.", existing.display()))?;
+            std::fs::remove_file(existing).with_context(|| format!("Could not replace {}.", existing.display()))?;
         }
         if let Some(other) = state().shadowed_by {
             bail!(
@@ -355,6 +357,10 @@ pub fn install() -> Result<CliState> {
 
 /// `DesktopCliCommand.uninstall`: removes only what `install` added. Blocking.
 pub fn uninstall() -> Result<CliState> {
+    try_uninstall().inspect_err(|error| log::warn!("could not remove the t3 command: {error:#}"))
+}
+
+fn try_uninstall() -> Result<CliState> {
     let target = Target::resolve().context("The t3 command needs this app's server and Node.")?;
     #[cfg(windows)]
     {
@@ -372,7 +378,7 @@ pub fn uninstall() -> Result<CliState> {
         let _ = &target;
         for link in unix_candidates().into_iter().map(|dir| dir.join("t3")) {
             if link.is_symlink() && is_our_launcher(&link) {
-                std::fs::remove_file(&link).map_err(|_| anyhow::anyhow!("Could not remove {}.", link.display()))?;
+                std::fs::remove_file(&link).with_context(|| format!("Could not remove {}.", link.display()))?;
             }
         }
     }

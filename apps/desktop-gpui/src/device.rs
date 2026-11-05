@@ -16,6 +16,9 @@ pub enum HostStatus {
     Starting,
     Ready,
     Failed,
+    /// A status a newer server added.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -138,8 +141,10 @@ pub struct DeviceState {
     pub host_status: HostStatus,
     pub host_status_detail: Option<String>,
     pub host_statuses: HashMap<String, HostStatusEntry>,
+    #[serde(deserialize_with = "crate::model::lossy")]
     pub devices: Vec<DeviceSummary>,
     /// Every host: the wire's `hosts`, `easHosts` and `simlockHosts` merged, like the contract's decode.
+    #[serde(deserialize_with = "crate::model::lossy")]
     pub hosts: Vec<HostSummary>,
     pub onboarding_completed: bool,
     pub agent_access_enabled: bool,
@@ -150,9 +155,10 @@ impl DeviceState {
     pub fn decode(value: &Value) -> Result<Self, serde_json::Error> {
         let mut state = Self::deserialize(value)?;
         for key in ["easHosts", "simlockHosts"] {
-            if let Some(hosts) = value.get(key) {
-                state.hosts.extend(Vec::<HostSummary>::deserialize(hosts)?);
-            }
+            let hosts = value.get(key).and_then(Value::as_array).into_iter().flatten();
+            state.hosts.extend(hosts.filter_map(|host| {
+                HostSummary::deserialize(host).inspect_err(|error| log::warn!("skipping a {key} entry: {error}")).ok()
+            }));
         }
         Ok(state)
     }
@@ -341,6 +347,19 @@ mod tests {
         }));
         let ids: Vec<_> = state.hosts.iter().map(|host| host.id.as_str()).collect();
         assert_eq!(ids, ["local", "eas", "pool"]);
+    }
+
+    #[test]
+    fn a_new_status_or_one_bad_host_keeps_the_rest() {
+        let state = state(json!({
+            "hostStatus": "hibernating",
+            "hostStatuses": {"ssh": {"status": "paused"}},
+            "easHosts": [{"id": 7}, {"id": "eas", "kind": "eas", "label": "EAS"}],
+        }));
+        assert_eq!(state.host_status, HostStatus::Unknown);
+        assert_eq!(state.host_statuses["ssh"].status, HostStatus::Unknown);
+        let ids: Vec<_> = state.hosts.iter().map(|host| host.id.as_str()).collect();
+        assert_eq!(ids, ["local", "eas"]);
     }
 
     #[test]

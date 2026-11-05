@@ -74,7 +74,7 @@ fn main() {
     // A second launch hands its command line to the running app and exits.
     let launches = match settings::t3_home() {
         Some(home) => {
-            let args: Vec<String> = std::env::args().skip(1).collect();
+            let args = desktop::launch_args();
             match desktop::activation::claim(&home, &args, runtime().handle()) {
                 desktop::activation::Instance::Forwarded => return,
                 desktop::activation::Instance::Primary(launches) => Some(launches),

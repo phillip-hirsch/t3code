@@ -289,19 +289,19 @@ impl Descriptor {
     }
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().unwrap_or_default()
-}
-
 /// `fetchRemoteEnvironmentDescriptor`. Runs on the tokio runtime.
 pub async fn fetch_descriptor(http_base: &str) -> Result<Descriptor, Failure> {
     let url = format!("{http_base}/.well-known/t3/environment");
-    let response = http_client().get(&url).send().await.map_err(|error| Failure::request(error, &url))?;
+    let request = backend::http_client().get(&url).timeout(REQUEST_TIMEOUT);
+    let response = request.send().await.map_err(|error| Failure::request(error, &url))?;
     let status = response.status();
     if !status.is_success() {
         return Err(Failure::http(status.as_u16(), &url));
     }
-    response.json().await.map_err(|_| Failure::invalid_json(&url))
+    response.json().await.map_err(|error| {
+        log::warn!("{url}: {error}");
+        Failure::invalid_json(&url)
+    })
 }
 
 /// `bootstrapRemoteBearerSession`: redeems a pairing code for a bearer session.
@@ -323,12 +323,16 @@ async fn redeem_pairing_code(http_base: &str, code: &str) -> Result<String, Fail
         ("client_device_type", "desktop"),
         ("client_os", os),
     ];
-    let response = http_client().post(&url).form(&form).send().await.map_err(|error| Failure::request(error, &url))?;
+    let request = backend::http_client().post(&url).form(&form).timeout(REQUEST_TIMEOUT);
+    let response = request.send().await.map_err(|error| Failure::request(error, &url))?;
     let status = response.status();
     if !status.is_success() {
         return Err(Failure::http(status.as_u16(), &url));
     }
-    let body: Value = response.json().await.map_err(|_| Failure::invalid_json(&url))?;
+    let body: Value = response.json().await.map_err(|error| {
+        log::warn!("{url}: {error}");
+        Failure::invalid_json(&url)
+    })?;
     body["access_token"].as_str().map(str::to_owned).ok_or_else(|| Failure::invalid_json(&url))
 }
 
@@ -458,13 +462,17 @@ impl Catalog {
         Self { local_environment_enabled: document["localEnvironmentEnabled"] != Value::Bool(false), environments }
     }
 
-    fn document(&self) -> Result<Value, String> {
+    fn document(&self) -> anyhow::Result<Value> {
         let environments = self
             .environments
             .iter()
             .map(|environment| {
                 let encrypted_token = match &environment.token {
-                    Some(token) => hex(&secure::protect(token.as_bytes())?),
+                    Some(token) => {
+                        let sealed = secure::protect(token.as_bytes())
+                            .map_err(|error| anyhow::anyhow!("could not encrypt a token: {error}"))?;
+                        backend::hex(&sealed)
+                    }
                     None => String::new(),
                 };
                 serde_json::to_value(StoredEnvironment {
@@ -474,17 +482,17 @@ impl Catalog {
                     enabled: environment.enabled,
                     encrypted_token,
                 })
-                .map_err(|error| error.to_string())
+                .context("could not encode an environment")
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(
             json!({ "version": 1, "localEnvironmentEnabled": self.local_environment_enabled, "environments": environments }),
         )
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        let path = Self::path().ok_or("No T3 home directory.")?;
-        crate::settings::write_atomically(&path, &self.document()?).map_err(|error| error.to_string())
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::path().context("No T3 home directory.")?;
+        crate::settings::write_atomically(&path, &self.document()?).with_context(|| format!("writing {path:?}"))
     }
 
     pub fn get(&self, environment_id: &str) -> Option<&SavedEnvironment> {
@@ -508,10 +516,6 @@ impl Catalog {
 pub fn validate_label(label: &str) -> Result<String, &'static str> {
     let label = label.trim();
     if label.is_empty() { Err("Environment label cannot be empty.") } else { Ok(label.to_owned()) }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
