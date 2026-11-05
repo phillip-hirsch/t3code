@@ -7,9 +7,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    anchored, deferred, div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, anchored,
+    deferred, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::json;
 
@@ -428,7 +428,6 @@ impl Workspace {
                     )
                 },
             ));
-        let _ = FontWeight::NORMAL;
         Some(
             div()
                 .absolute()

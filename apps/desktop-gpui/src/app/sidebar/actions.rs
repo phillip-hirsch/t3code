@@ -267,13 +267,7 @@ impl Workspace {
         let action = notice.action;
         let mut plans: Vec<Vec<Value>> = Vec::new();
         for entry in notice.entries {
-            let command = |kind: &str, fields: Value| {
-                let mut command = json!({"type": kind, "commandId": new_id(), "threadId": entry.thread_id});
-                if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), fields) {
-                    command.extend(fields);
-                }
-                command
-            };
+            let command = |kind: &str, fields| Self::thread_command_value(kind, &entry.thread_id, fields);
             let repin =
                 || command("thread.pin", entry.pin_key.as_ref().map_or(json!({}), |key| json!({"orderKey": key})));
             let resnooze = entry

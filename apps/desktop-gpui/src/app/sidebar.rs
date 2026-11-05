@@ -621,9 +621,9 @@ impl Workspace {
         }
     }
 
-    /// Wakes the sidebar after `delay` ms, keeping a pending wake that still
-    /// fits. Idle sidebars wake at most once a minute; only a duration in its
-    /// first minute ticks every second.
+    /// Wakes the sidebar after `delay` ms, replacing a pending wake for another time.
+    /// Idle sidebars wake at most once a minute; only a duration in its first
+    /// minute ticks every second.
     fn arm_sidebar_clock(&mut self, delay: Option<i64>, now: i64, cx: &mut Context<Self>) {
         let at = delay.map(|delay| now + delay.max(0) + 5);
         if at == self.sidebar.clock_at {

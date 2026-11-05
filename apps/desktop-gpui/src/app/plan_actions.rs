@@ -77,7 +77,8 @@ impl Workspace {
         let picked = cx.prompt_for_new_path(&downloads, Some(&filename));
         cx.spawn_in(window, async move |_, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
-            if let Err(error) = std::fs::write(&path, contents) {
+            let written = cx.background_executor().spawn(async move { std::fs::write(&path, contents) }).await;
+            if let Err(error) = written {
                 let _ = cx.update(|window, cx| toast_error(window, cx, "Could not download plan", error.to_string()));
             }
         })

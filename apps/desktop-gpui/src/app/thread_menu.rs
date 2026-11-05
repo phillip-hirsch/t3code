@@ -29,13 +29,18 @@ pub(super) struct TitleState {
 
 /// `hostedThreadLink`: every character outside `[A-Za-z0-9_-]` percent-encoded.
 pub(super) fn hosted_thread_link(environment_id: &str, thread_id: &str) -> String {
+    use std::fmt::Write as _;
     let segment = |id: &str| {
-        id.bytes()
-            .map(|byte| match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => (byte as char).to_string(),
-                _ => format!("%{byte:02X}"),
-            })
-            .collect::<String>()
+        let mut out = String::with_capacity(id.len());
+        for byte in id.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => out.push(byte as char),
+                _ => {
+                    let _ = write!(out, "%{byte:02X}");
+                }
+            }
+        }
+        out
     };
     format!("https://app.t3.codes/threads/{}/{}", segment(environment_id), segment(thread_id))
 }

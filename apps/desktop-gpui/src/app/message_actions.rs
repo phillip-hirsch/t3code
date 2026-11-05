@@ -59,21 +59,26 @@ fn prompt_link_fits(prompt: &str) -> bool {
 
 /// `promptLinkFor`: a link that starts a new thread with this prompt.
 pub(super) fn prompt_link(prompt: &str) -> Option<String> {
-    use std::fmt::Write as _;
     if !prompt_link_fits(prompt) {
         return None;
     }
     let mut url = String::from("https://app.t3.codes/new?prompt=");
-    for byte in prompt.trim().bytes() {
+    form_encode_into(&mut url, prompt.trim());
+    Some(url)
+}
+
+/// `URLSearchParams` encoding of `value`, appended to `out`.
+pub(super) fn form_encode_into(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    for byte in value.bytes() {
         match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => url.push(byte as char),
-            b' ' => url.push('+'),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => out.push(byte as char),
+            b' ' => out.push('+'),
             _ => {
-                let _ = write!(url, "%{byte:02X}");
+                let _ = write!(out, "%{byte:02X}");
             }
         }
     }
-    Some(url)
 }
 
 impl Workspace {

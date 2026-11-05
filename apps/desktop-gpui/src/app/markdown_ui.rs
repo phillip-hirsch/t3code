@@ -343,6 +343,7 @@ fn is_web_link(url: &str) -> bool {
 /// `matchInlineSkills` over prose: each `$name` of a known skill, outside code, becomes
 /// `[Label](t3-skill:name)` for [`SkillChips`] to draw.
 pub(super) fn skill_links(text: &str, skills: &[InlineSkill]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     let mut fenced = false;
     for line in text.split_inclusive('\n') {
@@ -372,7 +373,7 @@ pub(super) fn skill_links(text: &str, skills: &[InlineSkill]) -> String {
                 let crate::composer_text::Chip::Skill { name } = chip else { continue };
                 let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
                 out.push_str(&part[last..range.start]);
-                out.push_str(&format!("[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name));
+                let _ = write!(out, "[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name);
                 last = range.end;
             }
             out.push_str(&part[last..]);

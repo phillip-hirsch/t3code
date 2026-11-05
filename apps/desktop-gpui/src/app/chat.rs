@@ -981,9 +981,7 @@ fn rule_row(t: &Tokens) -> gpui_kit::Div {
         .line_height(px(LINE))
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
-}
+use super::sidebar::now_ms;
 
 /// `formatWorkingTimer`: whole seconds, then `formatDuration`.
 fn working_duration(ms: i64) -> String {

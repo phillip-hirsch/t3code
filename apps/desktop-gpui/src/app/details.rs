@@ -1101,7 +1101,6 @@ impl Workspace {
     }
 }
 
-/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 /// `ThreadDetailsItemsMenuItems`: the card's context menu, its empty state and Settings share it.
 pub(in crate::app) fn thread_details_items_menu(
     workspace: WeakEntity<Workspace>,
@@ -1125,6 +1124,7 @@ pub(in crate::app) fn thread_details_items_menu(
     }
 }
 
+/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
     discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
         let auth = &provider["auth"];
