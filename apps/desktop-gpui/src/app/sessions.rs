@@ -9,14 +9,17 @@
 
 use std::mem;
 
-use gpui_kit::{Context, SharedString, Task, Window};
+use gpui_kit::{App, Context, Hsla, SharedString, Task, Window};
 use serde_json::{Value, json};
 
 use super::{Target, Workspace};
 use crate::backend::Endpoint;
+use crate::device::DeviceState;
+use crate::environments::Presented;
 use crate::model::ServerInfo;
 use crate::project_groups::ScratchRoot;
 use crate::rpc::RpcClient;
+use crate::theme::Tokens;
 
 /// The primary session's index in `Workspace::sessions`; it is always there.
 const PRIMARY: usize = 0;
@@ -30,10 +33,14 @@ pub(super) struct EnvironmentSession {
     pub server_info: ServerInfo,
     /// The `SavedEnvironments` connection the streams run on; `None` for the primary.
     generation: Option<u64>,
+    /// `subscribeDeviceState`; `None` until this connection's first state arrives.
+    pub device_state: Option<DeviceState>,
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
-    _tasks: Vec<Task<()>>,
+    /// Config, terminal, preview and device streams.
+    _streams: Vec<Task<()>>,
+    _shell: Option<Task<()>>,
 }
 
 impl EnvironmentSession {
@@ -51,7 +58,8 @@ impl EnvironmentSession {
 
     pub(super) fn disconnect(&mut self) {
         self.client = None;
-        self._tasks.clear();
+        self._streams.clear();
+        self._shell = None;
     }
 }
 
@@ -64,6 +72,11 @@ impl Target {
 }
 
 impl Workspace {
+    /// Every environment's session, the primary first.
+    pub(super) fn sessions(&self) -> &[EnvironmentSession] {
+        &self.sessions
+    }
+
     /// The workspace's own server (or `T3_SERVER_URL`'s), once its descriptor is read.
     pub(super) fn primary_environment(&self) -> Option<&SharedString> {
         self.sessions[PRIMARY].id.as_ref()
@@ -91,6 +104,23 @@ impl Workspace {
         self.active_index() == PRIMARY
     }
 
+    /// The footer status of the saved environment the open target lives on, read as the
+    /// primary's is: nothing once synced, else what the connection is doing.
+    pub(super) fn saved_target_status(&self, tokens: &Tokens, cx: &App) -> Option<(SharedString, Hsla)> {
+        let environment = self.active_environment()?;
+        let saved = self.saved_environments.read(cx);
+        let state = &saved.session(environment)?.state;
+        let muted = |text: &str| Some((SharedString::from(text.to_owned()), tokens.muted_foreground));
+        match state.presented() {
+            Presented::Connected if self.shell.sequence(environment) > 0 => None,
+            Presented::Connected => muted("Syncing…"),
+            Presented::Available => None,
+            Presented::Connecting => muted("Connecting…"),
+            Presented::Reconnecting => Some((state.status_text().into(), tokens.warning_foreground)),
+            Presented::Unsupported | Presented::Error => Some((state.status_text().into(), tokens.error_foreground)),
+        }
+    }
+
     /// The open target's session's index, so callers can borrow it beside other fields.
     pub(super) fn active_index(&self) -> usize {
         self.target.as_ref().and_then(|t| self.session_index(t.environment())).unwrap_or(PRIMARY)
@@ -113,6 +143,17 @@ impl Workspace {
     /// One environment's config, to apply what it saved.
     pub(super) fn env_info_mut(&mut self, environment_id: &str) -> Option<&mut ServerInfo> {
         Some(&mut self.session_mut(environment_id)?.server_info)
+    }
+
+    /// The device state of the environment Settings reads.
+    pub(super) fn settings_device_state(&self) -> Option<&DeviceState> {
+        self.sessions[self.settings_index()].device_state.as_ref()
+    }
+
+    pub(super) fn set_device_state(&mut self, environment_id: &str, state: DeviceState) {
+        if let Some(session) = self.session_mut(environment_id) {
+            session.device_state = Some(state);
+        }
     }
 
     /// The primary environment's config: client-wide reads such as keybindings.
@@ -204,8 +245,15 @@ impl Workspace {
                 this.refresh_menu_items(cx);
             },
         );
+        let streams = vec![
+            config_task,
+            self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
+            self.subscribe_previews(&environment_id, &client, window, cx),
+            self.subscribe_device_state(environment_id.clone(), &client, window, cx),
+        ];
         let Some(session) = self.session_mut(&environment_id) else { return };
-        session._tasks = vec![config_task];
+        session._streams = streams;
+        session.device_state = None;
         // The open thread on this environment resumes on the new socket.
         if self.active_environment() == Some(&environment_id) {
             self.subscribe_thread(window, cx);
@@ -261,9 +309,7 @@ impl Workspace {
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {
-            // The shell pump replaces an earlier one; the config pump stays first.
-            session._tasks.truncate(1);
-            session._tasks.push(task);
+            session._shell = Some(task);
         }
     }
 

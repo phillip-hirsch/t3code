@@ -86,6 +86,8 @@ pub(super) struct Terminals {
     panes: HashMap<String, Pane>,
     /// By thread, in server order; `None` until the first snapshot.
     summaries: Option<HashMap<String, Vec<Summary>>>,
+    /// The environment whose metadata stream reported each thread's terminals.
+    summary_environments: HashMap<String, SharedString>,
     /// The id a draft's thread will launch with, so its terminals carry over.
     draft_threads: HashMap<String, String>,
     focus_pending: Option<String>,
@@ -93,7 +95,6 @@ pub(super) struct Terminals {
     pub(super) contexts: HashMap<String, Value>,
     /// Right-panel terminal tabs, by surface id.
     panel: HashMap<String, panel::PanelGroup>,
-    _metadata: Option<Task<()>>,
 }
 
 /// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS` and `clampContextText`'s marker.
@@ -155,19 +156,25 @@ impl Terminals {
         layout::terminal_label(terminal_id, summary.map(|s| s.label.as_str()))
     }
 
-    fn apply_metadata(&mut self, event: &Value) {
+    /// Applies one element of `environment`'s `subscribeTerminalMetadata`; a snapshot replaces
+    /// only that environment's threads.
+    fn apply_metadata(&mut self, environment: &SharedString, event: &Value) {
         let all = self.summaries.get_or_insert_default();
+        let owners = &mut self.summary_environments;
         match event["type"].as_str() {
             Some("snapshot") => {
-                all.clear();
+                all.retain(|thread_id, _| owners.get(thread_id) != Some(environment));
+                owners.retain(|_, owner| owner != environment);
                 for (thread_id, summary) in
                     event["terminals"].as_array().into_iter().flatten().filter_map(Summary::parse)
                 {
+                    owners.insert(thread_id.clone(), environment.clone());
                     all.entry(thread_id).or_default().push(summary);
                 }
             }
             Some("upsert") => {
                 let Some((thread_id, summary)) = Summary::parse(&event["terminal"]) else { return };
+                owners.insert(thread_id.clone(), environment.clone());
                 let list = all.entry(thread_id).or_default();
                 match list.iter_mut().find(|s| s.terminal_id == summary.terminal_id) {
                     Some(existing) => *existing = summary,
@@ -248,26 +255,33 @@ impl Workspace {
         self.shown_terminal_thread().and_then(|id| self.terminals.drawers.get(id)).is_some_and(|d| d.open)
     }
 
+    /// Streams one environment's terminal list and reattaches the shown terminals that run there.
     pub(super) fn subscribe_terminal_metadata(
         &mut self,
+        environment: SharedString,
         client: &RpcClient,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<()> {
         let stream = client.stream("subscribeTerminalMetadata", json!({}));
-        self.terminals._metadata = Some(Self::pump(
+        let apply_environment = environment.clone();
+        let task = Self::pump(
             stream,
             window,
             cx,
-            |this, value| this.terminals.apply_metadata(value),
+            move |this, value| this.terminals.apply_metadata(&apply_environment, value),
             |this, _, cx| {
                 this.reconcile_terminals();
                 this.notify_sidebar(cx);
             },
-        ));
+        );
         for pane in self.terminals.panes.values() {
-            pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
+            let thread_id = &pane.session.read(cx).thread_id;
+            if self.thread_environment(thread_id).as_ref() == Some(&environment) {
+                pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
+            }
         }
+        task
     }
 
     /// Mounted drawers follow the server's terminal list (`PersistentThreadTerminalDrawer`).

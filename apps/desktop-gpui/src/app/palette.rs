@@ -385,7 +385,9 @@ impl Workspace {
         slot: fn(&mut Workspace) -> Option<&mut MessageSearch>,
         cx: &mut Context<Self>,
     ) {
-        let client = self.client();
+        // Every connected environment is searched, as `useThreadSearch` does over its ids.
+        let clients: Vec<crate::rpc::RpcClient> =
+            self.sessions().iter().filter_map(|session| session.client.clone()).collect();
         let Some(search) = slot(self) else { return };
         let query: String = query.trim().chars().take(200).collect::<String>().trim().to_owned();
         if search.query == query {
@@ -394,18 +396,23 @@ impl Workspace {
         search.query = query.clone();
         search.matches.clear();
         search._task = None;
-        search.pending = search::has_long_token(&query) && client.is_some();
-        let Some(client) = client.filter(|_| search.pending) else { return };
+        search.pending = search::has_long_token(&query) && !clients.is_empty();
+        if !search.pending {
+            return;
+        }
         search._task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(MESSAGE_DEBOUNCE).await;
-            let result = client.request("orchestration.searchThreads", json!({"query": query})).await;
+            let requests =
+                clients.iter().map(|client| client.request("orchestration.searchThreads", json!({"query": query})));
+            // An environment that fails to answer leaves the others' matches showing.
+            let answers = futures::future::join_all(requests).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(search) = slot(this).filter(|s| s.query == query) else { return };
                 search.pending = false;
-                search.matches = result
-                    .ok()
-                    .and_then(|value| value["matches"].as_array().cloned())
+                search.matches = answers
                     .into_iter()
+                    .filter_map(Result::ok)
+                    .filter_map(|value| value["matches"].as_array().cloned())
                     .flatten()
                     .filter_map(|m| {
                         Some(MessageMatch {
@@ -453,7 +460,7 @@ impl Workspace {
 
     /// The live shortcut label of `command` (`shortcutCommand`).
     fn shortcut(&self, command: &str) -> Option<SharedString> {
-        let keybindings = self.server_info().keybindings_json();
+        let keybindings = self.primary_info().keybindings_json();
         super::pages::settings::code::projects::scripts::shortcut_label_for_command(keybindings, Some(command))
             .map(Into::into)
     }
