@@ -1039,7 +1039,7 @@ impl Workspace {
         let can_authenticate = live.as_ref().and_then(|p| p.pointer("/setup/canAuthenticate")).and_then(Value::as_bool);
         let acp_installed = live.as_ref().is_some_and(|p| p["driver"] == "acpRegistry" && p["installed"] == true);
         if can_authenticate == Some(true) || acp_installed || row.driver == "antigravity" {
-            setup.extend(self.render_provider_account(&row.id, window, cx));
+            setup.push(self.render_provider_account(&row.id, window, cx));
         } else if row.driver == "cursor" && can_authenticate == Some(false) {
             setup.push(
                 settings_row(

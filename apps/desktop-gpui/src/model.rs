@@ -112,6 +112,49 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub auth: ProviderAuth,
+    #[serde(default)]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub runtime_paths: Option<RuntimePaths>,
+}
+
+/// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub can_logout: Option<bool>,
+    #[serde(default)]
+    pub subscription_sharing: Option<bool>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSetup {
+    pub can_authenticate: bool,
+    pub can_install: bool,
+    #[serde(default)]
+    pub documentation_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePaths {
+    pub home_path: String,
+    #[serde(default)]
+    pub shadow_home_path: Option<String>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -179,6 +222,7 @@ pub struct ServerInfo {
     pub config: Value,
     /// The raw `ServerProvider` records, for settings pages that edit them.
     pub providers_json: Vec<Value>,
+    pub platform_os: Option<String>,
 }
 
 impl ServerInfo {
@@ -196,6 +240,7 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.platform_os = text("/environment/platform/os");
             }
             "providerStatuses" => {
                 self.providers = lossy(&event["payload"]["providers"])?;

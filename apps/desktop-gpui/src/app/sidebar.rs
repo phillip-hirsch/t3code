@@ -868,6 +868,7 @@ impl Workspace {
         let open_id = thread.id.clone();
         let hover_id = thread.id.clone();
         let has_meta = meta.is_some();
+        let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
         div()
             .py(px(2.))
             .child(
@@ -885,9 +886,14 @@ impl Workspace {
                     .rounded(px(6.))
                     .overflow_hidden()
                     .cursor_pointer()
-                    .map(|el| if active { el.bg(sb.row_active) } else { el.hover(|s| s.bg(sb.row_hover)) })
-                    .when(recede && matches!(status, Status::Working | Status::Preparing), |el| {
-                        el.opacity(0.7).hover(|s| s.bg(sb.row_hover).opacity(1.))
+                    .when(active, |el| el.bg(sb.row_active))
+                    .when(receding_run, |el| el.opacity(0.7))
+                    // GPUI allows one hover style per element.
+                    .when(!active || receding_run, |el| {
+                        el.hover(move |s| {
+                            let s = s.bg(sb.row_hover);
+                            if receding_run { s.opacity(1.) } else { s }
+                        })
                     })
                     .on_click(cx.listener(move |this, _, window, cx| this.select_thread(open_id.clone(), window, cx)))
                     .child(

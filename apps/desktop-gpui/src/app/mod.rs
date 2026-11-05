@@ -334,7 +334,10 @@ impl Workspace {
                     log::warn!("bad server config event: {error}");
                 }
             },
-            |this, _, cx| this.notify_sidebar(cx),
+            |this, window, cx| {
+                this.notify_sidebar(cx);
+                this.check_chatgpt_welcome(window, cx);
+            },
         )];
         let devices = self.subscribe_device_state(window, cx);
         self._stream_tasks.push(devices);

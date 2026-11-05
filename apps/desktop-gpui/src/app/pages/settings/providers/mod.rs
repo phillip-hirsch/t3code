@@ -5,7 +5,10 @@
 //! there are no device tabs. Rows the web scopes (global/project/checkout) live in [`ADVANCED_ROWS`]
 //! for the shared settings rows to take over; everything else here is environment-wide.
 
+mod accent;
 mod accounts;
+mod codex_callback;
+mod usage_sources;
 mod add;
 mod drivers;
 mod instances;
