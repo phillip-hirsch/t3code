@@ -19,7 +19,7 @@ use crate::thread_pull_requests::{self as links, PullRequestLink};
 
 impl Workspace {
     fn open_thread_shell(&self) -> Option<&crate::model::ThreadShell> {
-        let Some(super::super::Target::Thread(id)) = &self.target else { return None };
+        let Some(super::super::Target::Thread { id, .. }) = &self.target else { return None };
         self.shell.threads.iter().find(|t| &t.id == id)
     }
 

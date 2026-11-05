@@ -57,8 +57,8 @@ impl Workspace {
         let initial = match script_id {
             None => ScriptInput::default(),
             Some(id) => {
-                match resolve_project_scripts(&self.server_info.settings, project).iter().find(|s| s.id == id) {
-                    Some(script) => ScriptInput::from_script(script, self.server_info.keybindings_json()),
+                match resolve_project_scripts(&self.settings_info().settings, project).iter().find(|s| s.id == id) {
+                    Some(script) => ScriptInput::from_script(script, self.settings_info().keybindings_json()),
                     None => return,
                 }
             }
@@ -77,7 +77,7 @@ impl Workspace {
     ) {
         let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
         let script_ids =
-            resolve_project_scripts(&self.server_info.settings, project).into_iter().map(|s| s.id).collect();
+            resolve_project_scripts(&self.settings_info().settings, project).into_iter().map(|s| s.id).collect();
         let workspace = cx.weak_entity();
         let editor =
             cx.new(|cx| ScriptEditor::new(workspace, project_id, script_id, script_ids, initial, error, window, cx));

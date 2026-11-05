@@ -153,7 +153,7 @@ impl Workspace {
     fn side_chat_origin(&self) -> Option<Origin> {
         Some(match self.target.as_ref()? {
             Target::Draft { .. } => Origin::Draft,
-            Target::Thread(id) => match self.shell_thread(id) {
+            Target::Thread { id, .. } => match self.shell_thread(id) {
                 Some(shell) if shell.lineage.side_chat == Some(true) => Origin::SideChat,
                 Some(shell) if shell.lineage.relationship_to_parent.as_deref() == Some("subagent") => Origin::Subagent,
                 _ => Origin::Thread,
@@ -165,14 +165,14 @@ impl Workspace {
     /// [`Self::side_chat_disabled_reason`].
     pub(super) fn side_chats_offered(&self) -> bool {
         matches!(self.side_chat_origin(), Some(Origin::Thread | Origin::Draft))
-            && self.server_info.capability("sideChats")
+            && self.server_info().capability("sideChats")
     }
 
     pub(super) fn side_chat_disabled_reason(&self) -> Option<&'static str> {
         let origin = self.side_chat_origin()?;
-        let capability = self.client().map(|_| self.server_info.capability("sideChats"));
+        let capability = self.client().map(|_| self.server_info().capability("sideChats"));
         let pending = match &self.target {
-            Some(Target::Thread(id)) => worktree_pending(
+            Some(Target::Thread { id, .. }) => worktree_pending(
                 self.shell_thread(id).and_then(|t| t.worktree_path.as_deref()),
                 self.open_projection().map_or(&[], |p| p.runs.as_slice()),
             ),
@@ -193,7 +193,9 @@ impl Workspace {
         if self.side_chat_disabled_reason().is_some() || self.side_chat.starting {
             return;
         }
-        let (Some(client), Some(Target::Thread(source))) = (self.client(), self.target.clone()) else { return };
+        let (Some(client), Some(Target::Thread { id: source, .. })) = (self.client(), self.target.clone()) else {
+            return;
+        };
         self.side_chat.starting = true;
         let target = new_id();
         let fork = json!({
@@ -424,7 +426,7 @@ impl Workspace {
     fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
         let Some(projection) = self.side_chat_projection() else { return };
         let thread_id = projection.thread.id.clone();
-        let command = if self.server_info.capability("threadStop") {
+        let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
@@ -544,7 +546,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let Some(Target::Thread(parent_id)) = self.target.clone() else { return div().into_any_element() };
+        let Some(Target::Thread { id: parent_id, .. }) = self.target.clone() else { return div().into_any_element() };
         let shell = self.shell_thread(thread_id);
         let title: SharedString = shell.map_or_else(|| "Side chat".into(), |s| s.title.clone().into());
         let blocked = self.bring_back_blocked(&parent_id);
@@ -600,7 +602,7 @@ impl Workspace {
                         ),
                 );
         let body = match (shell, self.side_chat.view.as_ref()) {
-            (None, _) if self.shell.sequence > 0 => div()
+            (None, _) if self.active_environment().is_some_and(|id| self.shell.sequence(id) > 0) => div()
                 .p_3()
                 .text_xs()
                 .text_color(t.muted_foreground)

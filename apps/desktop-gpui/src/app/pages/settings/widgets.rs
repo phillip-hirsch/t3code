@@ -44,20 +44,44 @@ pub(in crate::app) struct SettingsView {
     pub(in crate::app) targets: Vec<Target>,
     /// Settings' project groups, archived ones included (`useSettingsProjectGroups`).
     pub(in crate::app) groups: Vec<ProjectGroup>,
-    environment_id: String,
-    environment_label: String,
-    /// `None` while disconnected.
-    environment_settings: Option<Settings>,
+    /// The environments the scope can pick, the primary first.
+    environments: Vec<ViewEnvironment>,
     client: Settings,
 }
 
+/// One environment as Settings reads it.
+struct ViewEnvironment {
+    id: String,
+    label: String,
+    /// `None` while disconnected.
+    settings: Option<Settings>,
+}
+
+impl ViewEnvironment {
+    fn scoped(&self) -> scope::Environment<'_> {
+        scope::Environment { id: &self.id, label: &self.label, settings: self.settings.as_ref() }
+    }
+}
+
 impl SettingsView {
-    pub(in crate::app) fn environment(&self) -> scope::Environment<'_> {
-        scope::Environment {
-            id: &self.environment_id,
-            label: &self.environment_label,
-            settings: self.environment_settings.as_ref(),
-        }
+    pub(in crate::app) fn environments(&self) -> Vec<scope::Environment<'_>> {
+        self.environments.iter().map(ViewEnvironment::scoped).collect()
+    }
+
+    /// The environment a row's values come from: the first target's, else the first selected,
+    /// else the primary (`useSettingsScope().environment`). `None` before any is known.
+    pub(in crate::app) fn environment(&self) -> Option<scope::Environment<'_>> {
+        let id = self.targets.first().map(|t| &t.environment_id).or(self.scope.environment_ids.first());
+        id.and_then(|id| self.environment_by_id(id)).or(self.environments.first().map(ViewEnvironment::scoped))
+    }
+
+    fn environment_by_id(&self, id: &str) -> Option<scope::Environment<'_>> {
+        self.environments.iter().find(|e| e.id == id).map(ViewEnvironment::scoped)
+    }
+
+    /// An environment's name, for labels that say where something lives.
+    pub(in crate::app) fn label_of(&self, id: &str) -> &str {
+        self.environments.iter().find(|e| e.id == id).map_or("this environment", |e| e.label.as_str())
     }
 
     /// The value a row shows: this device's for client keys, else the scope's first target's
@@ -92,6 +116,14 @@ impl SettingsView {
     fn group_of(&self, project_id: &str) -> Option<&ProjectGroup> {
         self.groups.iter().find(|g| g.members.iter().any(|m| m.project.id == project_id))
     }
+}
+
+/// A server write on its way, with what the toast and the dropped-key check need.
+struct PendingWrite {
+    client: Option<crate::rpc::RpcClient>,
+    previous: Settings,
+    label: String,
+    write: scope::ServerWrite,
 }
 
 /// One settings row (`SettingsRow`).
@@ -488,7 +520,7 @@ enum RowControl {
 
 /// Sections whose rows apply to this device only show no scope sentence
 /// (`SETTINGS_DEVICE_ONLY_PATHS`).
-pub(super) fn device_only(section: &str) -> bool {
+pub(in crate::app) fn device_only(section: &str) -> bool {
     matches!(section, "general" | "appearance" | "chat" | "diffs" | "snap-shot" | "connections" | "access" | "about")
 }
 
@@ -505,6 +537,7 @@ impl Workspace {
                     .iter()
                     .map(|m| scope::Project {
                         id: m.project.id.clone(),
+                        environment_id: m.project.environment_id.to_string(),
                         name: project_name(&m.project).to_string(),
                         legacy_model_selection: m.project.default_model_selection.as_ref().map(|m| m.to_json()),
                         legacy_thread_env_mode: m.project.default_thread_env_mode.clone(),
@@ -512,18 +545,32 @@ impl Workspace {
                     .collect(),
             })
             .collect();
-        let connected = self.client().is_some() && self.server_info.environment_id.is_some();
+        let environments = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let id = session.id.as_ref()?.to_string();
+                let info = &session.server_info;
+                Some(ViewEnvironment {
+                    label: info.environment_label.clone().unwrap_or_else(|| id.clone()),
+                    settings: session.is_connected().then(|| info.settings.clone()),
+                    id,
+                })
+            })
+            .collect();
         let mut view = SettingsView {
-            scope: Scope { kind: ScopeKind::All, label: String::new() },
+            scope: Scope { kind: ScopeKind::All, label: String::new(), environment_ids: Vec::new() },
             targets: Vec::new(),
             groups,
-            environment_id: self.server_info.environment_id.clone().unwrap_or_default(),
-            environment_label: self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
-            environment_settings: connected.then(|| self.server_info.settings.clone()),
+            environments,
             client: self.client_settings.values.clone(),
         };
-        view.scope = scope::resolve(&self.settings_ui.scope, &scope_groups, &view.environment());
-        view.targets = scope::targets(&view.scope, &view.environment());
+        let environments = view.environments();
+        let scope = scope::resolve(&self.settings_ui.scope, &scope_groups, &environments);
+        let targets = scope::targets(&scope, &environments);
+        drop(environments);
+        view.scope = scope;
+        view.targets = targets;
         view
     }
 
@@ -542,7 +589,7 @@ impl Workspace {
     ) {
         let Value::Object(patch) = patch else { return };
         let view = self.settings_view();
-        let plan = scope::plan_patch(&view.scope, &view.environment(), &patch);
+        let plan = scope::plan_patch(&view.scope, &view.environments(), &patch);
         self.run_settings_plan(plan, window, cx, done);
     }
 
@@ -554,13 +601,13 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         cx.spawn(async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
             let _ = this.update(cx, |this, cx| {
                 match &result {
                     Ok(saved) => {
-                        if let Err(error) = this.server_info.apply_settings(saved) {
+                        if let Err(error) = this.settings_info_mut().apply_settings(saved) {
                             log::warn!("bad saved settings: {error}");
                         }
                     }
@@ -581,7 +628,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let view = self.settings_view();
-        let plan = scope::plan_clear(&view.scope, &view.environment(), keys);
+        let plan = scope::plan_clear(&view.scope, &view.environments(), keys);
         self.run_settings_plan(plan, window, cx, |_, _, _| {});
     }
 
@@ -595,7 +642,8 @@ impl Workspace {
     ) {
         let view = self.settings_view();
         let ids: Vec<&str> = project_ids.iter().map(String::as_str).collect();
-        let plan = scope::plan_clear_projects(&view.environment(), &ids, keys);
+        let Some(environment) = view.environment() else { return };
+        let plan = scope::plan_clear_projects(&environment, &ids, keys);
         self.run_settings_plan(plan, window, cx, |_, _, _| {});
     }
 
@@ -623,33 +671,73 @@ impl Workspace {
             self.report_browser_profiles(cx);
             self.sync_snap_shot(window, cx);
         }
-        let Some(patch) = plan.server_patch else { return done(self, true, cx) };
-        let Some(client) = self.client() else { return done(self, false, cx) };
-        let previous = self.server_info.settings.clone();
-        let label = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+        if plan.server_writes.is_empty() {
+            return done(self, true, cx);
+        }
+        let writes: Vec<PendingWrite> = plan
+            .server_writes
+            .into_iter()
+            .map(|write| {
+                let session = self.session(&write.environment_id);
+                PendingWrite {
+                    client: session.and_then(|s| s.client.clone()),
+                    previous: session.map(|s| s.server_info.settings.clone()).unwrap_or_default(),
+                    label: session
+                        .and_then(|s| s.server_info.environment_label.clone())
+                        .unwrap_or_else(|| "this environment".into()),
+                    write,
+                }
+            })
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                done(this, result.is_ok(), cx);
-                let message = match result {
-                    Ok(saved) => {
-                        let saved_settings = Settings::layered(&contract().server_defaults, &saved);
-                        let dropped = scope::dropped_keys(&patch, &previous, &saved_settings);
-                        if let Err(error) = this.server_info.apply_settings(&saved) {
-                            log::warn!("bad saved settings: {error}");
-                        }
-                        cx.notify();
-                        if dropped.is_empty() {
-                            return;
-                        }
-                        "This environment does not support this setting. Update T3 Code on it.".to_owned()
+            let mut failed: Vec<String> = Vec::new();
+            let mut saved_on: Vec<String> = Vec::new();
+            for PendingWrite { client, previous, label, write } in writes {
+                let result = match client {
+                    Some(client) => {
+                        client.request("server.updateSettings", serde_json::json!({ "patch": write.patch })).await
                     }
-                    Err(error) => error.to_string(),
+                    None => {
+                        failed.push(format!("Could not save on {label}: it is not connected."));
+                        continue;
+                    }
                 };
-                window.push_notification(
-                    Notification::error(format!("Could not save on {label}: {message}")).title("Setting not saved"),
-                    cx,
-                );
+                let saved = match result {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        failed.push(format!("Could not save on {label}: {error}"));
+                        continue;
+                    }
+                };
+                let saved_settings = Settings::layered(&contract().server_defaults, &saved);
+                let dropped = scope::dropped_keys(&write.patch, &previous, &saved_settings);
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(info) = this.env_info_mut(&write.environment_id)
+                        && let Err(error) = info.apply_settings(&saved)
+                    {
+                        log::warn!("bad saved settings: {error}");
+                    }
+                    cx.notify();
+                });
+                if dropped.is_empty() {
+                    saved_on.push(label);
+                } else {
+                    failed.push(format!(
+                        "Could not save on {label}: This environment does not support this setting. Update T3 Code on it."
+                    ));
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                done(this, failed.is_empty(), cx);
+                if failed.is_empty() {
+                    return;
+                }
+                let title = if saved_on.is_empty() { "Setting not saved" } else { "Setting saved on some environments" };
+                let mut lines = failed;
+                if !saved_on.is_empty() {
+                    lines.push(format!("Saved on {}.", saved_on.join(", ")));
+                }
+                window.push_notification(Notification::error(lines.join("\n")).title(title), cx);
             });
         })
         .detach();
@@ -726,7 +814,7 @@ impl Workspace {
         let mixed = !keys.is_empty() && view.mixed(&keys);
         let environment_wide = project_scope && server_scoped && scoped_keys.is_empty();
         let disconnected = server_scoped && view.targets.is_empty();
-        let overriding: Vec<String> = match (&view.environment_settings, project_scope) {
+        let overriding: Vec<String> = match (view.environment().and_then(|e| e.settings), project_scope) {
             (Some(settings), false) => scope::overriding_projects(settings, &scoped_keys),
             _ => Vec::new(),
         };
@@ -734,7 +822,10 @@ impl Workspace {
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
         let SettingRow { id, title, description, status, tip, body, control, unavailable, .. } = row;
-        let (state, summary) = scope::row_inheritance(&view.scope, &view.targets, &view.environment(), &keys);
+        let (state, summary) = match view.environment() {
+            Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
+            None => (InheritanceState::Default, "Built-in default".to_owned()),
+        };
         let inheritance = (server_scoped && !keys.is_empty() && !view.targets.is_empty())
             .then(|| self.render_inheritance(view, &id, &keys, state, summary, overriding, &t, cx));
         let quiet_marker = quiet_marker
@@ -875,19 +966,20 @@ impl Workspace {
             InheritanceState::Mixed => t.warning,
             _ => t.muted_foreground,
         };
-        let environment_settings = view.environment_settings.clone().unwrap_or_default();
+        let environment_settings = view.environment().and_then(|e| e.settings).cloned().unwrap_or_default();
         let chains: Rc<Vec<(String, Vec<scope::Layer>)>> = Rc::new(
             view.targets
                 .iter()
-                .map(|target| {
+                .filter_map(|target| {
+                    let environment = view.environment_by_id(&target.environment_id)?;
                     let label = match &target.project_id {
                         Some(project) => {
                             let name = view.group_of(project).map_or(project.as_str(), |g| g.display_name.as_str());
-                            format!("{} · {name}", view.environment_label)
+                            format!("{} · {name}", environment.label)
                         }
-                        None => view.environment_label.clone(),
+                        None => environment.label.to_owned(),
                     };
-                    (label, scope::inheritance_layers(target, &environment_settings, key))
+                    Some((label, scope::inheritance_layers(target, environment.settings?, key)))
                 })
                 .collect(),
         );
@@ -1241,12 +1333,12 @@ impl Workspace {
             (None, None) => "All projects".to_owned(),
         };
         let environment_label = match &search.machine {
-            Some(id) if *id == view.environment_id => view.environment_label.clone(),
-            Some(_) => "Unavailable environment".to_owned(),
+            Some(id) => view.environment_by_id(id).map_or("Unavailable environment", |e| e.label).to_owned(),
             None => "All environments".to_owned(),
         };
         let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
-        let environment = (view.environment_id.clone(), view.environment_label.clone());
+        let environments: Vec<(String, String)> =
+            view.environments.iter().map(|e| (e.id.clone(), e.label.clone())).collect();
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 workspace.update(cx, |this, cx| {
@@ -1316,17 +1408,21 @@ impl Workspace {
             scope_trigger("settings-scope-environment", None, environment_label, &t).dropdown_menu_with_anchor(
                 gpui_kit::Anchor::TopLeft,
                 move |menu, _, _| {
-                    menu.item(
-                        PopupMenuItem::new("All environments")
-                            .checked(search.machine.is_none())
-                            .on_click(pick(workspace.clone(), search.with_machine(None))),
-                    )
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(environment.1.clone())
-                            .checked(search.machine.as_deref() == Some(environment.0.as_str()))
-                            .on_click(pick(workspace.clone(), search.with_machine(Some(environment.0.clone())))),
-                    )
+                    let mut menu = menu
+                        .item(
+                            PopupMenuItem::new("All environments")
+                                .checked(search.machine.is_none())
+                                .on_click(pick(workspace.clone(), search.with_machine(None))),
+                        )
+                        .separator();
+                    for (id, label) in &environments {
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(search.machine.as_deref() == Some(id.as_str()))
+                                .on_click(pick(workspace.clone(), search.with_machine(Some(id.clone())))),
+                        );
+                    }
+                    menu
                 },
             )
         };
@@ -1496,8 +1592,9 @@ impl Workspace {
             .map(|group| {
                 let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
                 let representative = group.representative();
-                let location =
-                    shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
+                let location = shared.then(|| {
+                    format!("{} · {}", view.label_of(&representative.environment_id), representative.workspace_root)
+                });
                 let secondary = match (group.archived, location) {
                     (true, Some(location)) => Some(format!("Archived · {location}")),
                     (true, None) => Some("Archived".to_owned()),

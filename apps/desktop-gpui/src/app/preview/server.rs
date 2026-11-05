@@ -178,7 +178,7 @@ impl Workspace {
         if self.preview.server.streams.contains_key(tab_id) {
             return;
         }
-        let Some(endpoint) = self.endpoint.as_ref() else { return };
+        let Some(endpoint) = self.endpoint() else { return };
         let scale = window.scale_factor();
         let size = window.viewport_size();
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
@@ -646,7 +646,7 @@ impl Workspace {
         Some(if session.server_hosted() {
             "Open on this computer".into()
         } else {
-            let label = self.server_info.environment_label.as_deref().unwrap_or("the environment");
+            let label = self.server_info().environment_label.as_deref().unwrap_or("the environment");
             format!("Open in {label}'s browser").into()
         })
     }

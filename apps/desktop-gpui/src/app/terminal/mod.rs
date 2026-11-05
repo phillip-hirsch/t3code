@@ -202,8 +202,8 @@ impl Workspace {
     /// draft's thread will launch with (created on first use).
     pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
         match self.target.as_ref()? {
-            Target::Thread(id) => Some(id.clone()),
-            Target::Draft { project_id } => match self.terminals.draft_threads.get(project_id) {
+            Target::Thread { id, .. } => Some(id.clone()),
+            Target::Draft { project_id, .. } => match self.terminals.draft_threads.get(project_id) {
                 Some(id) => Some(id.clone()),
                 None if create => {
                     let id = super::new_id();
@@ -217,19 +217,19 @@ impl Workspace {
 
     fn shown_terminal_thread(&self) -> Option<&str> {
         match self.target.as_ref()? {
-            Target::Thread(id) => Some(id),
-            Target::Draft { project_id } => self.terminals.draft_threads.get(project_id).map(String::as_str),
+            Target::Thread { id, .. } => Some(id),
+            Target::Draft { project_id, .. } => self.terminals.draft_threads.get(project_id).map(String::as_str),
         }
     }
 
     /// Where new terminals start: the thread's worktree, else its project root.
     fn terminal_launch(&self) -> Option<Launch> {
         let (project_id, worktree_path) = match self.target.as_ref()? {
-            Target::Thread(id) => {
+            Target::Thread { id, .. } => {
                 let thread = self.shell.threads.iter().find(|t| &t.id == id)?;
                 (thread.project_id.as_str(), thread.worktree_path.clone())
             }
-            Target::Draft { project_id } => (project_id.as_str(), None),
+            Target::Draft { project_id, .. } => (project_id.as_str(), None),
         };
         let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
         Some(Launch {

@@ -24,7 +24,7 @@ use super::{error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::environments::SavedEnvironments;
 use crate::app::sidebar::now_ms;
-use crate::environments::{self, HopResult, Phase, Presented, SavedEnvironment};
+use crate::environments::{self, ConnectionState, HopResult, Phase, Presented, SavedEnvironment};
 use crate::theme::{self, Tokens};
 
 /// Per-section state: open diagnosis panels, and the once-a-second tick that keeps
@@ -76,7 +76,7 @@ impl Workspace {
             (false, true) => ui._tick = None,
             _ => {}
         });
-        let primary_id = self.server_info.environment_id.clone();
+        let primary_id = self.settings_info().environment_id.clone();
         let action = {
             let saved = self.saved_environments.downgrade();
             WebButton::new("add-environment", "Add environment")
@@ -87,6 +87,8 @@ impl Workspace {
         };
         let now = now_ms();
         let saved = self.saved_environments.read(cx);
+        // The app's own environment saved here runs on the workspace's socket, so it shows that.
+        let primary_phase = if self.sessions[0].is_connected() { Phase::Connected } else { Phase::Connecting };
         let rows: Vec<AnyElement> = if saved.environments().is_empty() {
             vec![empty_state(&t)]
         } else {
@@ -95,8 +97,14 @@ impl Workspace {
                 .environments()
                 .iter()
                 .map(|environment| {
-                    let expanded = open.contains(&environment.environment_id);
-                    saved_row(&self.saved_environments, &ui, saved, environment, expanded, now, &t)
+                    let id = &environment.environment_id;
+                    let state = match saved.session(id) {
+                        _ if saved.is_primary(id) => ConnectionState { phase: primary_phase, ..Default::default() },
+                        Some(session) => session.state.clone(),
+                        None => ConnectionState::default(),
+                    };
+                    let expanded = open.contains(id);
+                    saved_row(&self.saved_environments, &ui, saved, environment, state, expanded, now, &t)
                 })
                 .collect()
         };
@@ -143,13 +151,13 @@ fn saved_row(
     ui: &Entity<SavedUi>,
     saved: &SavedEnvironments,
     environment: &SavedEnvironment,
+    state: ConnectionState,
     expanded: bool,
     now: i64,
     t: &Tokens,
 ) -> AnyElement {
     let id = environment.environment_id.clone();
     let session = saved.session(&id);
-    let state = session.map(|s| s.state.clone()).unwrap_or_default();
     let unsupported = state.presented() == Presented::Unsupported;
     let enabled = environment.enabled && !unsupported;
     let label = environment.label.clone();

@@ -45,13 +45,13 @@ impl Workspace {
             (None, _) => no_thread(&t),
             // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
             (Some(Target::Draft { .. }), _) => div().into_any_element(),
-            (Some(Target::Thread(_)), Some(thread)) if thread.state.projection.is_none() => {
+            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => {
                 centered_note("Loading thread…", &t)
             }
-            (Some(Target::Thread(_)), _) if self.rows.is_empty() => {
+            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => {
                 centered_note("Send a message to start the conversation.", &t)
             }
-            (Some(Target::Thread(_)), _) => {
+            (Some(Target::Thread { .. }), _) => {
                 let rows = self.rows.clone();
                 let this = cx.weak_entity();
                 let background = t.background;

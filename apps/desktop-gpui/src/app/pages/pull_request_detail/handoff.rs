@@ -131,7 +131,7 @@ impl Workspace {
                 let branch = value["branch"].as_str().unwrap_or_default().to_owned();
                 let worktree = value["worktreePath"].as_str().map(str::to_owned);
                 let on_head = value["isOnPullRequestHead"].as_bool() != Some(false);
-                if !matches!(&this.target, Some(Target::Draft { project_id: p }) if *p == project_id) {
+                if !matches!(&this.target, Some(Target::Draft { project_id: p, .. }) if *p == project_id) {
                     toast_error(
                         window,
                         cx,

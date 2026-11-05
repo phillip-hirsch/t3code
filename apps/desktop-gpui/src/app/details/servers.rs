@@ -73,7 +73,7 @@ pub(in crate::app) struct ServersWatch {
 
 impl Workspace {
     fn servers_wanted(&self, window: &Window) -> bool {
-        matches!(self.target, Some(Target::Thread(_)))
+        matches!(self.target, Some(Target::Thread { .. }))
             && self.details_shown(window)
             && self.details_item_shown("servers")
             && self.client().is_some()
@@ -111,7 +111,7 @@ impl Workspace {
     }
 
     fn open_server(&mut self, url: String, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let m = event.modifiers();
         if m.control || m.platform {
             cx.open_url(&url);
@@ -150,12 +150,12 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
-        let Some(Target::Thread(thread_id)) = &self.target else { return None };
+        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return None };
         let servers: Vec<&LocalServer> = self.servers.servers.iter().filter(|s| s.belongs_to(thread_id)).collect();
         if servers.is_empty() {
             return None;
         }
-        let can_stop = self.server_info.capability("localServerStop");
+        let can_stop = self.server_info().capability("localServerStop");
         let visible = self.servers.visible.unwrap_or(PAGE);
         let hidden = servers.len().saturating_sub(visible);
         let rows: Vec<AnyElement> = servers

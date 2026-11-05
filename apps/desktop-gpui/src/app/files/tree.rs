@@ -606,13 +606,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
-        let editors = self.server_info.available_editors.clone();
-        let config = &self.server_info.config;
+        let editors = self.server_info().available_editors.clone();
+        let config = &self.server_info().config;
         let file_manager = editors.iter().any(|e| e == "file-manager");
         let reveal = (file_manager && config["shellRevealInFileManager"] == true).then(|| {
             logic::reveal_label(
                 config["shellRevealInFileManagerKind"].as_str(),
-                self.server_info.platform_os.as_deref(),
+                self.server_info().platform_os.as_deref(),
             )
         });
         let absolute = logic::absolute_path(cwd, path);

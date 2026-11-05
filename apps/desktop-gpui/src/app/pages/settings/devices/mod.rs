@@ -32,7 +32,7 @@ impl Workspace {
     /// Streams `subscribeDeviceState` for this connection; the task ends with the socket.
     pub(in crate::app) fn subscribe_device_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
         self.devices.state = None;
-        let Some(client) = self.client() else { return Task::ready(()) };
+        let Some(client) = self.settings_client() else { return Task::ready(()) };
         let stream = client.stream("subscribeDeviceState", json!({}));
         Self::pump(
             stream,
@@ -57,9 +57,9 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let empty = DeviceState::default();
         let state = self.devices.state.as_ref().unwrap_or(&empty);
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         let loaded = connected && self.devices.state.is_some();
-        let setting = |key: &str| self.server_info.settings.bool(key);
+        let setting = |key: &str| self.settings_info().settings.bool(key);
         let (enabled, agent_enabled) = (setting("enableDeviceSupport"), setting("enableAgentDeviceAccess"));
         let busy = state.readiness().busy;
         let pending = self.devices.pending;
@@ -305,9 +305,9 @@ impl Workspace {
 
     /// `device.configure` with the hub or agent switch's change; the state stream reports the result.
     fn configure_devices(&mut self, kind: Pending, input: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         self.devices.pending = Some(kind);
-        let label = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let label = self.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("device.configure", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -327,7 +327,7 @@ impl Workspace {
 
     /// `device.list` to check versions (`inspectOnly`) or install a tool (`updateTool`).
     fn list_devices(&mut self, kind: Pending, input: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         self.devices.pending = Some(kind);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("device.list", input).await;
@@ -345,7 +345,7 @@ impl Workspace {
 
     /// `device.list { retryHostId }` for a host that failed to start.
     fn retry_device_host(&mut self, host_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         self.devices.retrying = Some(host_id.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("device.list", json!({ "retryHostId": host_id })).await;

@@ -63,7 +63,7 @@ impl Workspace {
 
     /// The open thread is still rolling back, so a send would race the rewind.
     pub(super) fn target_rewinding(&self) -> bool {
-        matches!(&self.target, Some(Target::Thread(id)) if self.rewinding.contains(id))
+        matches!(&self.target, Some(Target::Thread { id, .. }) if self.rewinding.contains(id))
     }
 
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
@@ -121,7 +121,7 @@ impl Workspace {
         let mut settings_commands = Vec::new();
         let mut sent_mode = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
-            Target::Thread(thread_id) => {
+            Target::Thread { id: thread_id, .. } => {
                 // A plan follow-up refines in plan mode, or implements in build mode (`resolvePlanFollowUpSubmission`).
                 let (message_text, interaction_mode) = match &follow_up {
                     Some((_, markdown)) => composer_plan::plan_follow_up(&text, markdown),
@@ -158,7 +158,7 @@ impl Workspace {
                 }
                 ("orchestration.dispatchCommand", command, None, None)
             }
-            Target::Draft { project_id } => {
+            Target::Draft { project_id, .. } => {
                 let Some(model) = self.composer_model() else {
                     self.error = Some("No provider is ready. Set one up in the T3 server first.".into());
                     cx.notify();
@@ -177,7 +177,10 @@ impl Workspace {
                 let workspace = strategy.is_none().then(|| {
                     let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
                     let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
-                    Some((DraftWorkspace::new(&self.server_info, project, has_threads), project.workspace_root.clone()))
+                    Some((
+                        DraftWorkspace::new(self.server_info(), project, has_threads),
+                        project.workspace_root.clone(),
+                    ))
                 });
                 let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
                 let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
@@ -201,7 +204,7 @@ impl Workspace {
                 ("orchestration.launchThread", input, Some(thread_id), workspace.flatten())
             }
         };
-        let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread(_));
+        let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
         let project_id = self.target_project().map(|p| p.id.clone());
         let sent_attachments = std::mem::take(&mut self.attachments);
         self.sending = true;
@@ -290,14 +293,14 @@ impl Workspace {
 
     /// The open thread can pick up where it stopped (`deriveResumableRunId`, held queue).
     pub(super) fn can_resume(&self) -> bool {
-        matches!(self.target, Some(Target::Thread(_)))
+        matches!(self.target, Some(Target::Thread { .. }))
             && self.open_projection().is_some_and(|p| p.resumable_run_id().is_some() || p.has_held_queued_runs())
     }
 
     /// `useComposerResume`: "Continue where you left off." on the resumable run, then the
     /// held queue; with nothing to continue, only the queue.
     pub(super) fn resume_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let (Some(client), Some(projection)) = (self.client(), self.open_projection()) else { return };
         if self.sending || self.target_rewinding() {
             return;

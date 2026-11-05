@@ -52,7 +52,7 @@ impl Workspace {
     /// Reads the pending approvals of each child that asks for one; the shell only says that it does.
     pub(super) fn sync_child_approvals(&mut self, cx: &mut Context<Self>) {
         let parent = match &self.target {
-            Some(Target::Thread(id)) => id.clone(),
+            Some(Target::Thread { id, .. }) => id.clone(),
             _ => {
                 self.subagents.approvals.clear();
                 return;
@@ -314,8 +314,8 @@ impl Workspace {
     pub(super) fn render_provider_subagent_bar(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let projection = self.open_provider_subagent()?;
         let selection = projection.thread.model_selection.as_ref();
-        let provider = selection.and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = selection.and_then(|s| self.server_info.model(s));
+        let provider = selection.and_then(|s| self.server_info().provider(&s.instance_id));
+        let model = selection.and_then(|s| self.server_info().model(s));
         let driver = provider.map(|p| p.driver.as_str()).unwrap_or_default();
         let name = match (selection, model) {
             (_, Some(model)) => model_label::trigger_model_name(model, driver),

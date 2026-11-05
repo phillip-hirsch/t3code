@@ -353,7 +353,7 @@ impl SourceControlState {
 impl Workspace {
     pub(super) fn render_source_control_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
-        let client = self.client();
+        let client = self.settings_client();
         let first_scan = client.clone();
         let state = window.use_keyed_state("settings-source-control", cx, move |window, cx| {
             let mut state = SourceControlState::new(window, cx);
@@ -420,7 +420,7 @@ impl Workspace {
 
     fn scan_button(&self, state: &Entity<SourceControlState>, cx: &mut Context<Self>) -> AnyElement {
         let pending = state.read(cx).pending;
-        let client = self.client();
+        let client = self.settings_client();
         let state = state.clone();
         Button::new("rescan-source-control")
             .ghost()
@@ -438,7 +438,7 @@ impl Workspace {
     }
 
     fn rescan(&self, state: &Entity<SourceControlState>, cx: &mut Context<Self>) {
-        if let Some(client) = self.client() {
+        if let Some(client) = self.settings_client() {
             state.update(cx, |state, cx| state.scan(client, cx));
         }
     }
@@ -528,7 +528,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *tokens(cx);
-        let client = self.client();
+        let client = self.settings_client();
         let scan_state = state.clone();
         let body = v_flex()
             .items_center()
@@ -826,7 +826,7 @@ impl Workspace {
     }
 
     fn host_settings(&self, kind: &str) -> Value {
-        self.server_info.settings.get("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
+        self.settings_info().settings.get("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
     }
 
     /// `SourceControlAppSignInSettings`: the device-code sign-in card.
@@ -904,7 +904,7 @@ impl Workspace {
         } else if let SignIn::Waiting { .. } = sign_in {
             subtitle = div().child("Approve the app on GitHub to finish signing in.").into_any_element();
             let (state, input) = (state.clone(), input.clone());
-            let client = self.client();
+            let client = self.settings_client();
             action = Button::new("source-control-sign-in-cancel")
                 .ghost()
                 .xsmall()
@@ -1028,7 +1028,7 @@ impl Workspace {
 
     /// `signIn`: start the device flow, show its code, then wait for the user to approve it.
     fn start_sign_in(&mut self, state: &Entity<SourceControlState>, input: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         state.update(cx, |state, cx| {
             state.sign_in = SignIn::Starting;
             cx.notify();
@@ -1626,7 +1626,7 @@ impl Workspace {
     /// `SourceControlWritingSettingsSection`: writing style, review guides, and the writer model.
     fn writing_rows(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         let style = view.value("sourceControlWritingStyle").clone();
         let mode = style["mode"].as_str().unwrap_or("repo_conventions").to_owned();
         let instructions = style["customInstructions"].as_str().unwrap_or_default().to_owned();
@@ -1664,7 +1664,7 @@ impl Workspace {
             },
         );
 
-        let providers = &self.server_info.providers;
+        let providers = &self.settings_info().providers;
         let usable: Vec<&crate::model::Provider> =
             providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
         let stored_text: Option<ModelSelection> =

@@ -67,9 +67,9 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let state = window.use_keyed_state("usage-sources", cx, |_, _| UsageSourcesState::default());
-        let sources = self.server_info.settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
-        let cursor_enabled = self.server_info.settings["cursorKeychainUsageEnabled"].as_bool() == Some(true);
-        let darwin = self.server_info.platform_os.as_deref() == Some("darwin");
+        let sources = self.settings_info().settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
+        let cursor_enabled = self.settings_info().settings["cursorKeychainUsageEnabled"].as_bool() == Some(true);
+        let darwin = self.settings_info().platform_os.as_deref() == Some("darwin");
         let updating = state.read(cx).updating_cursor;
 
         let mut rows = v_flex();
@@ -145,7 +145,7 @@ impl Workspace {
     }
 
     fn set_cursor_usage(&mut self, enabled: bool, state: Entity<UsageSourcesState>, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         state.update(cx, |state, cx| {
             state.updating_cursor = true;
             cx.notify();
@@ -238,7 +238,7 @@ impl AddHub {
         let sources = self
             .workspace
             .upgrade()
-            .and_then(|w| w.read(cx).server_info.settings["usageLimitSources"].as_object().cloned())
+            .and_then(|w| w.read(cx).settings_info().settings["usageLimitSources"].as_object().cloned())
             .unwrap_or_default();
         let id = source_id_from_url(&url, &sources);
         let mut source = json!({ "kind": "cliproxy", "url": url, "managementKey": key, "enabled": true });
@@ -259,7 +259,7 @@ impl AddHub {
         let environment = self
             .workspace
             .upgrade()
-            .and_then(|w| w.read(cx).server_info.environment_label.clone())
+            .and_then(|w| w.read(cx).settings_info().environment_label.clone())
             .unwrap_or_else(|| "this environment".into());
         let (url, key, _) = self.values(cx);
         let field = |label: &'static str, input: &Entity<InputState>| {

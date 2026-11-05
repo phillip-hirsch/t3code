@@ -39,7 +39,7 @@ pub(super) struct NowUi {
 impl Workspace {
     /// The open thread's lines, in the web's order: what needs you, its work, its goal, its status.
     fn now_lines(&self) -> Vec<Rc<NowLine>> {
-        let (Some(Target::Thread(thread_id)), Some(projection)) =
+        let (Some(Target::Thread { id: thread_id, .. }), Some(projection)) =
             (&self.target, self.thread.as_ref().and_then(|t| t.state.projection.as_ref()))
         else {
             return Vec::new();
@@ -116,8 +116,10 @@ impl Workspace {
 
     /// `useForceStopThread`: for an agent that no longer answers Stop.
     fn force_stop(&mut self, run_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread(thread_id))) = (self.client(), self.target.clone()) else { return };
-        if !self.server_info.capability("threadForceStop") || self.now.force_stopping.is_some() {
+        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
+            return;
+        };
+        if !self.server_info().capability("threadForceStop") || self.now.force_stopping.is_some() {
             return;
         }
         self.now.force_stopping = Some(thread_id.clone());
@@ -146,13 +148,13 @@ impl Workspace {
 
     /// Stops the background work a finished run left running (`handleStopBackgroundWork`).
     fn stop_background_work(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         if self.background_stop_pending(&thread_id) {
             return;
         }
         let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
         let task_ids = shell.pending_background_tasks.iter().map(|t| t.task_id.clone()).collect();
-        let command = if self.server_info.capability("threadStop") {
+        let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = self.open_projection().and_then(|p| p.runs.last()) else { return };
@@ -200,7 +202,9 @@ impl Workspace {
 
     /// `sendStandaloneCommand`: a `/goal` command sent as its own message.
     fn send_goal_command(&mut self, text: &'static str, failure: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread(thread_id))) = (self.client(), self.target.clone()) else { return };
+        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
+            return;
+        };
         if self.sending {
             return;
         }
@@ -233,7 +237,9 @@ impl Workspace {
 
     /// Wake now / Un-settle from the status line, with the web's failure toasts.
     fn change_status(&mut self, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(Target::Thread(thread_id))) = (self.client(), self.target.clone()) else { return };
+        let (Some(client), Some(Target::Thread { id: thread_id, .. })) = (self.client(), self.target.clone()) else {
+            return;
+        };
         if self.now.status_busy.is_some() {
             return;
         }
@@ -270,7 +276,7 @@ impl Workspace {
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at the time it woke.
     fn acknowledge_open_thread_woke(&mut self, woke_at: SharedString, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let command =
             json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": woke_at});
         self.dispatch(command, cx);
@@ -328,7 +334,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let workspace = workspace.read(cx);
     let thread_id = match &workspace.target {
-        Some(Target::Thread(id)) => id.clone(),
+        Some(Target::Thread { id, .. }) => id.clone(),
         _ => String::new(),
     };
     let (fg, muted) = (t.foreground, t.muted_foreground);
@@ -367,7 +373,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
         }
         NowLine::RunStop(stop) => {
             actions.push(clock(stop.requested_at_ms));
-            if stop.unresponsive && workspace.server_info.capability("threadForceStop") {
+            if stop.unresponsive && workspace.server_info().capability("threadForceStop") {
                 let stopping = workspace.now.force_stopping.as_deref() == Some(thread_id.as_str());
                 let run_id = stop.run_id.clone();
                 let this = this.clone();

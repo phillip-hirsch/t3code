@@ -102,7 +102,7 @@ fn open_entries(rows: &[Row]) -> impl Iterator<Item = &Rc<Entry>> {
 impl Workspace {
     /// Starts loading the output of entries that just opened and drops it for closed ones.
     pub(super) fn sync_details(&mut self, cx: &mut Context<Self>) {
-        let streams_output = self.server_info.capability("commandOutputStreaming");
+        let streams_output = self.server_info().capability("commandOutputStreaming");
         let open: Vec<Rc<Entry>> = open_entries(&self.rows).filter(|entry| has_inspector(entry)).cloned().collect();
         self.details.0.retain(|id, _| open.iter().any(|entry| entry.id == *id));
         for entry in open {

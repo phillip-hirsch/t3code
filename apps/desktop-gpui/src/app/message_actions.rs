@@ -179,7 +179,11 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rewinding.remove(&thread_id);
                 match result {
-                    Ok(files) => this.restore_rewound(Target::Thread(thread_id), text, files, window, cx),
+                    Ok(files) => {
+                        if let Some(target) = this.thread_target(&thread_id) {
+                            this.restore_rewound(target, text, files, window, cx);
+                        }
+                    }
                     Err(error) => this.error = Some(error.into()),
                 }
                 cx.notify();
@@ -231,7 +235,7 @@ impl Workspace {
     pub(super) fn supports_rollback(&self) -> bool {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return false };
         let instance = projection.thread.model_selection.as_ref().map(|m| m.instance_id.as_str());
-        self.server_info
+        self.server_info()
             .providers
             .iter()
             .find(|provider| Some(provider.instance_id.as_str()) == instance)

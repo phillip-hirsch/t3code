@@ -28,7 +28,7 @@ impl Workspace {
     /// Keeps one `subscribeWorktreeSetup` stream on an open thread that has or is preparing a worktree.
     pub(super) fn sync_worktree_setup(&mut self, cx: &mut Context<Self>) {
         let wanted = match (&self.target, self.open_projection()) {
-            (Some(Target::Thread(id)), Some(projection)) => {
+            (Some(Target::Thread { id, .. }), Some(projection)) => {
                 let preparing = projection.runs.last().is_some_and(|run| run.status == "preparing");
                 (preparing || projection.thread.worktree_path.is_some()).then(|| id.clone())
             }

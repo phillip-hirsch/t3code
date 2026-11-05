@@ -161,12 +161,12 @@ impl Workspace {
             // Saved remote environments are not part of this single-environment client.
             AppLink::Pair { .. } => toast_error(window, cx, "Could not add backend", "Failed to add backend."),
             AppLink::Thread { environment_id, thread_id, query } => {
-                let ours = self.server_info.environment_id.as_deref() == Some(environment_id.as_str());
-                if !ours || !self.shell.threads.iter().any(|t| t.id == thread_id) {
+                let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);
+                if !listed {
                     toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");
                     return;
                 }
-                self.select_thread(thread_id, window, cx);
+                self.select_thread_in(environment_id.into(), thread_id, window, cx);
                 match links::parse_thread_link_prompt(&query) {
                     Err(error) => toast_error(window, cx, "Could not open the linked prompt", error),
                     Ok(Some(prompt)) => self.place_linked_prompt(prompt, Vec::new(), window, cx),
@@ -196,7 +196,7 @@ impl Workspace {
     fn launch_new_thread_link(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
         let recent: Vec<_> = crate::inbox::projects_by_recency(&self.shell.projects, &self.shell.threads)
             .into_iter()
-            .filter(|p| Some(p.workspace_root.as_str()) != self.server_info.scratch_workspace_root.as_deref())
+            .filter(|p| Some(p.workspace_root.as_str()) != self.server_info().scratch_workspace_root.as_deref())
             .collect();
         match &link {
             NewThreadLink::New { repository: None, .. } => self.open_scratch_draft(link, window, cx),
@@ -273,7 +273,7 @@ impl Workspace {
     /// `openScratchDraft`: the "No project" workspace, with the pull request's URL when the
     /// link names one.
     fn open_scratch_draft(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client().filter(|_| self.server_info.scratch_workspace_root.is_some()) else {
+        let Some(client) = self.client().filter(|_| self.server_info().scratch_workspace_root.is_some()) else {
             let message = "None of your machines can start a thread without a project right now.";
             self.show_link_page(
                 LinkPage::Failed { title: "Could not open the link".into(), message: message.into() },
@@ -320,7 +320,7 @@ impl Workspace {
         self.start_draft(project_id, window, cx);
         let mut notes = Vec::new();
         if let NewThreadLink::New { provider: Some(provider), model, .. } = link {
-            let resolved = links::resolve_model(&self.server_info.providers, provider, model.as_deref());
+            let resolved = links::resolve_model(&self.server_info().providers, provider, model.as_deref());
             if let Some((selection, _)) = &resolved {
                 self.model_override = Some(selection.clone());
             }

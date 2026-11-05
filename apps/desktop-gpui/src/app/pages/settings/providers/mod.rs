@@ -90,7 +90,7 @@ fn card_height(window: &Window) -> f32 {
 impl Workspace {
     pub(super) fn render_providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        if self.server_info.settings.is_null() {
+        if self.settings_info().settings.is_null() {
             return div()
                 .p_8()
                 .text_sm()
@@ -101,8 +101,8 @@ impl Workspace {
         let page = window.use_keyed_state("settings-providers", cx, |_, _| ProvidersPage::default());
         let view = self.settings_view();
         let override_projects =
-            instances::override_projects(&view, self.server_info.capability("projectProviderInstanceOverrides"));
-        let rows = instances::instance_rows(&self.server_info.settings, &self.server_info.providers_json);
+            instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
+        let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);
         let selected = {
             let chosen = page.read(cx).selected.clone();
             rows.iter().find(|row| Some(&row.id) == chosen.as_ref()).or(rows.first()).cloned()
@@ -214,11 +214,11 @@ impl Workspace {
         let state = page.read(cx);
         let refreshing = state.refreshing;
         let updating_all = state.updating_all;
-        let candidates = instances::one_click_update_candidates(&self.server_info.providers_json);
+        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
         let label: Option<SharedString> = if refreshing {
             Some("Refreshing providers".into())
         } else {
-            instances::last_checked_label(&self.server_info.providers_json, now_ms()).map(Into::into)
+            instances::last_checked_label(&self.settings_info().providers_json, now_ms()).map(Into::into)
         };
         let refresh_page = page.clone();
         let update_page = page.clone();
@@ -253,10 +253,10 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
 
-        let resolved = background::resolve_server(&self.server_info.settings);
+        let resolved = background::resolve_server(&self.settings_info().settings);
         let seconds = resolved.seconds(HEALTH);
         let reset_health = (seconds != background::preset(resolved.profile).seconds(HEALTH)).then(|| {
-            let mut patch = background::override_patch(&self.server_info.settings, HEALTH_KEY, Value::Null);
+            let mut patch = background::override_patch(&self.settings_info().settings, HEALTH_KEY, Value::Null);
             if let Some(overrides) = patch["backgroundActivity"]["overrides"].as_object_mut() {
                 overrides.remove(HEALTH_KEY);
             }
@@ -269,7 +269,8 @@ impl Workspace {
             window,
             cx,
             |this, seconds, window, cx| {
-                let patch = background::override_patch(&this.server_info.settings, HEALTH_KEY, json!(seconds * 1000));
+                let patch =
+                    background::override_patch(&this.settings_info().settings, HEALTH_KEY, json!(seconds * 1000));
                 this.update_settings(patch, window, cx);
             },
         );
@@ -318,7 +319,7 @@ impl Workspace {
             .description("When to compact an idle Claude thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Each Claude provider can override this.")
             .setting("idleCompaction")
             .setting("compactIdleThreads")
-            .reset((mode_of(&self.server_info.settings) != default_mode).then(|| json!({ "idleCompaction": default_mode })))
+            .reset((mode_of(&self.settings_info().settings) != default_mode).then(|| json!({ "idleCompaction": default_mode })))
             .control(select);
 
         let rows = [self.setting_row(&view, health, window, cx), self.setting_row(&view, compact, window, cx)];
@@ -338,7 +339,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.providers_request("server.updateSettings", payload, failure, window, cx, |this, reply, _, _| {
-            let _ = this.server_info.apply(&json!({"type": "settingsUpdated", "payload": {"settings": reply}}));
+            let _ = this.settings_info_mut().apply(&json!({"type": "settingsUpdated", "payload": {"settings": reply}}));
         });
     }
 
@@ -351,7 +352,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let settings = &self.server_info.settings;
+        let settings = &self.settings_info().settings;
         let previous = instances::instance_config(settings, instance_id);
         let disabling = !instances::resolve_enabled(&next) && previous.as_ref().is_none_or(instances::resolve_enabled);
         let mut patch = json!({});
@@ -390,7 +391,7 @@ impl Workspace {
             cx,
             move |this, result, _, cx| {
                 if let Ok(reply) = result {
-                    let _ = this.server_info.apply(&json!({"type": "providerStatuses", "payload": reply}));
+                    let _ = this.settings_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
                 }
                 page.update(cx, |page, cx| {
                     page.refreshing = false;
@@ -428,7 +429,7 @@ impl Workspace {
             move |this, result, window, cx| {
                 match result {
                     Ok(reply) => {
-                        let _ = this.server_info.apply(&json!({"type": "providerStatuses", "payload": reply}));
+                        let _ = this.settings_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
                     }
                     Err(error) => window.push_notification(
                         Notification::error(error).title(SharedString::from(format!("Could not update {label}"))),
@@ -445,8 +446,8 @@ impl Workspace {
 
     /// "Update all": every one-click update candidate, then one summary notification.
     fn update_all_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
-        let candidates = instances::one_click_update_candidates(&self.server_info.providers_json);
-        let Some(client) = self.client() else { return };
+        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
+        let Some(client) = self.settings_client() else { return };
         if candidates.is_empty() || page.read(cx).updating_all {
             return;
         }
@@ -506,7 +507,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, Result<Value, String>, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.settings_client() else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await.map_err(|error| error.to_string());
             let _ = this.update_in(cx, |this, window, cx| {

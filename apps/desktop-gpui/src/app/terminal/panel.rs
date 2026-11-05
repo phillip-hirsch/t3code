@@ -9,8 +9,8 @@ use gpui_kit::{
     div, px,
 };
 
+use super::Workspace;
 use super::layout::{self, Split};
-use super::{Target, Workspace};
 use crate::app::right_panel::Surface;
 use crate::theme;
 
@@ -140,9 +140,12 @@ impl Workspace {
                 None => emptied.push(surface.clone()),
             }
         }
+        let target = self.thread_target(thread_id);
         for surface in emptied {
             self.terminals.panel.remove(&surface);
-            self.drop_surface(&Target::Thread(thread_id.to_owned()), &Surface::Terminal(surface));
+            if let Some(target) = &target {
+                self.drop_surface(target, &Surface::Terminal(surface));
+            }
         }
     }
 

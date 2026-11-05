@@ -197,11 +197,11 @@ impl Workspace {
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let threads: Vec<_> = ids.iter().filter_map(|id| self.shell.threads.iter().find(|t| &t.id == id)).collect();
-        let loaded = self.server_info.environment_id.is_some();
+        let loaded = self.server_info().environment_id.is_some();
         let pick = |keep: &dyn Fn(&crate::model::ThreadShell) -> bool| -> Vec<String> {
             threads.iter().filter(|t| keep(t)).map(|t| t.id.clone()).collect()
         };
-        let settings = inbox::snooze_settings(self.server_info.settings.get("snoozePresets"));
+        let settings = inbox::snooze_settings(self.server_info().settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
         Some(BulkMenu {
             pinned: pick(&|t| loaded && t.pinned_at.is_some()),
@@ -222,10 +222,10 @@ impl Workspace {
             self.push_undo(UndoAction::Settled, entry, cx);
         }
         self.clear_selection(cx);
-        if let Some(Target::Thread(open)) = self.target.clone() {
-            if ids.contains(&open) {
-                self.leave_threads(&open, ids, window, cx);
-            }
+        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
+            && ids.contains(&open)
+        {
+            self.leave_threads(&open, ids, window, cx);
         }
     }
 
@@ -253,10 +253,10 @@ impl Workspace {
             },
             cx,
         );
-        if let Some(Target::Thread(open)) = self.target.clone() {
-            if ids.contains(&open) {
-                self.leave_threads(&open, ids, window, cx);
-            }
+        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
+            && ids.contains(&open)
+        {
+            self.leave_threads(&open, ids, window, cx);
         }
     }
 

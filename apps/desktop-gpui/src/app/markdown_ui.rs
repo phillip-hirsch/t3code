@@ -133,7 +133,7 @@ impl Workspace {
 
     /// The composer provider's user-invocable skills, as chips name them.
     fn markdown_skills(&self) -> Vec<InlineSkill> {
-        let Some(provider) = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id).cloned())
+        let Some(provider) = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id).cloned())
         else {
             return Vec::new();
         };
@@ -262,9 +262,9 @@ impl Workspace {
 
     /// The label of the file manager reveal, when the server offers one (`markdownServerConfigFields`).
     fn reveal_label(&self) -> Option<&'static str> {
-        let config = &self.server_info.config;
+        let config = &self.server_info().config;
         let offered = config["shellRevealInFileManager"] == true
-            && self.server_info.available_editors.iter().any(|e| e == "file-manager");
+            && self.server_info().available_editors.iter().any(|e| e == "file-manager");
         if !offered {
             return None;
         }
@@ -272,7 +272,7 @@ impl Workspace {
             Some("finder") => "Reveal in Finder",
             Some("file-explorer") => "Reveal in File Explorer",
             Some(_) => "Reveal in Files",
-            None => match self.server_info.platform_os.as_deref() {
+            None => match self.server_info().platform_os.as_deref() {
                 Some("darwin") => "Reveal in Finder",
                 Some("windows") => "Reveal in File Explorer",
                 _ => "Reveal in Files",

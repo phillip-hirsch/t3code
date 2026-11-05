@@ -109,7 +109,7 @@ impl AccountSection {
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let (instance, provider, environment, client) = {
             let workspace = workspace.read(cx);
-            let info = &workspace.server_info;
+            let info = &workspace.settings_info();
             (
                 info.settings
                     .get("providerInstances")

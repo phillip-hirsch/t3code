@@ -5,7 +5,9 @@
 use serde_json::{Value, json};
 
 use crate::model::{ProjectShell, ThreadShell};
-pub(super) use crate::project_groups::{GroupingMode, GroupingSettings, Member, ProjectGroup, SCRATCH_PROJECT_TITLE};
+pub(super) use crate::project_groups::{
+    GroupingMode, GroupingSettings, Member, ProjectGroup, SCRATCH_PROJECT_TITLE, ScratchRoot,
+};
 
 const SCRATCH_ICON_NAME: &str = "message-square-dashed";
 const SCRATCH_ICON_COLOR: &str = "gray";
@@ -14,10 +16,9 @@ const SCRATCH_ICON_COLOR: &str = "gray";
 pub(super) fn build_groups(
     projects: &[ProjectShell],
     settings: &GroupingSettings,
-    environment_id: &str,
-    scratch_root: Option<&str>,
+    scratch_roots: &[ScratchRoot],
 ) -> Vec<ProjectGroup> {
-    let mut groups = crate::project_groups::build_groups(projects, settings, environment_id, scratch_root, false);
+    let mut groups = crate::project_groups::build_groups(projects, settings, scratch_roots, false);
     groups.sort_by(|a, b| {
         a.display_name
             .to_lowercase()

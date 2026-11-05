@@ -820,7 +820,7 @@ fn tree_name(
 impl Workspace {
     pub(super) fn render_settings_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = window.use_keyed_state("settings-diagnostics", cx, |_, _| DiagnosticsState::default());
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |s, cx| s.start(client.clone(), endpoint, cx));
         let t = *theme::tokens(cx);
         let view = self.settings_view();
@@ -1767,7 +1767,7 @@ impl Workspace {
         // Trace Diagnostics
         let trace = s.trace.data.as_ref();
         let logs_path = self
-            .server_info
+            .settings_info()
             .config
             .pointer("/observability/logsDirectoryPath")
             .and_then(Value::as_str)
@@ -2078,7 +2078,7 @@ impl Workspace {
 
     /// The editor "Open logs folder" uses: the last one picked, else the first available.
     fn logs_editor(&self) -> Option<String> {
-        let available = &self.server_info.available_editors;
+        let available = &self.settings_info().available_editors;
         self.preferred_editor
             .as_deref()
             .filter(|editor| available.iter().any(|id| id == editor))

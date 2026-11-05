@@ -232,7 +232,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 if let Ok(payload) = result {
                     let event = json!({"type": "providerStatuses", "payload": payload});
-                    if let Err(error) = this.server_info.apply(&event) {
+                    if let Err(error) = this.server_info_mut().apply(&event) {
                         log::warn!("refreshed providers did not decode: {error}");
                     }
                 }
@@ -365,7 +365,7 @@ impl Workspace {
         let limits = usage.metric == "limits";
         let view = cx.entity();
         let separator = || div().flex_none().text_color(t.muted_foreground).child("/");
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "This environment".into());
+        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "This environment".into());
         let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
         let has_issue = !limits && (usage.error.is_some() || summary.as_ref().is_some_and(|s| !s.compatible()));
         let env_label =
@@ -561,20 +561,20 @@ impl Workspace {
 
     fn render_limits(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
-        let providers = &self.server_info.providers;
+        let providers = &self.server_info().providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let sources = &self.server_info.config["usageLimitSources"];
+        let sources = &self.server_info().config["usageLimitSources"];
         let pools = logic::limit_pools(logic::limit_accounts(providers, sources, &hidden), now);
         let notices = logic::limit_notices(providers, &hidden);
-        let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         let links = logic::external_links(providers, &environment, &hidden);
         let mut body = v_flex().gap(px(32.));
         if pools.is_empty() && notices.is_empty() && links.is_empty() {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
-        let environment_label = self.server_info.environment_label.clone();
+        let environment_label = self.server_info().environment_label.clone();
         for pool in &pools {
             let view = cx.weak_entity();
             let redeemed = &self.usage.redeemed;
