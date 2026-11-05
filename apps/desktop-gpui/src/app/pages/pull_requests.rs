@@ -100,6 +100,16 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) panel: Option<super::pull_request_detail::Panel>,
     /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
     pub(super) last_merge_method: &'static str,
+    /// Unsent reviews by pull request, kept across panels (`usePullRequestReviewStore`).
+    pub(super) reviews: std::collections::HashMap<String, super::pull_request_detail::write::ReviewDraft>,
+    /// Open pull requests in tab order; `panel` is the shown one and `parked` holds the rest.
+    pub(super) tabs: Vec<Reference>,
+    pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
+    /// The panel's dragged width; `None` is half the window.
+    pub(super) panel_width: Option<f32>,
+    pub(super) _live: Option<(gpui_kit::Task<()>, gpui_kit::Task<()>)>,
+    /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
+    pub(super) last_handoff: std::collections::HashMap<String, String>,
 }
 
 impl PullRequestsState {
@@ -139,6 +149,12 @@ impl PullRequestsState {
             _search_subscription: subscription,
             panel: None,
             last_merge_method: "merge",
+            reviews: std::collections::HashMap::new(),
+            last_handoff: std::collections::HashMap::new(),
+            tabs: Vec::new(),
+            parked: std::collections::HashMap::new(),
+            panel_width: None,
+            _live: None,
         }
     }
 
@@ -184,6 +200,7 @@ impl Workspace {
         if self.pull_requests.list.is_none() && !self.pull_requests.loading {
             self.read_pull_requests(false, cx);
         }
+        self.follow_pull_requests(cx);
     }
 
     /// Changes what the list asks for and reads it again from the first page.
@@ -412,23 +429,7 @@ impl Workspace {
         if self.pull_requests.panel.is_none() {
             return column.into_any_element();
         }
-        // `RightPanelTabs mode="inline"` opens at half the window.
-        let width = (f32::from(window.viewport_size().width) / 2.).max(360.);
-        h_flex()
-            .size_full()
-            .min_h_0()
-            .child(column)
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(width))
-                    .h_full()
-                    .min_h_0()
-                    .border_l_1()
-                    .border_color(tokens.border)
-                    .child(self.render_pull_request_panel(window, cx)),
-            )
-            .into_any_element()
+        h_flex().size_full().min_h_0().child(column).child(self.render_pr_panel_column(window, cx)).into_any_element()
     }
 
     fn render_pull_request_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {

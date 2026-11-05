@@ -35,6 +35,14 @@ use crate::pull_requests::{self as list_logic, Entry};
 use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
 
+mod avatars;
+mod code;
+mod guide;
+mod handoff;
+mod header;
+mod live;
+pub(in crate::app) mod write;
+
 const CONVERSATION_PAGE: usize = 10;
 /// How long an inline "Confirm …?" stays armed (`useInlineActionConfirm`).
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
@@ -47,6 +55,7 @@ pub(super) enum Tab {
     Summary,
     Guide,
     Timeline,
+    Code,
 }
 
 /// One open pull request.
@@ -86,6 +95,25 @@ pub(in crate::app) struct Panel {
     guide_error: Option<SharedString>,
     guide_starting: bool,
     _guide_poll: Option<Task<()>>,
+    code: Option<code::CodeTab>,
+    write: write::WriteState,
+    stack: Option<Rc<logic::Stack>>,
+    stack_failed: bool,
+    linked: Option<Vec<header::LinkedThread>>,
+    checks_all: bool,
+    maintainer_saving: bool,
+    /// A maintainer-edits choice saved and not yet read back.
+    maintainer_choice: Option<bool>,
+    _picker_search: Option<Subscription>,
+    /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
+    handoff: Option<String>,
+    /// The header's fold scrolled away.
+    condensed: bool,
+    guide_head: Option<String>,
+    guide_position: usize,
+    guide_seen: HashSet<usize>,
+    guide_rail_open: bool,
+    guide_files_open: HashSet<String>,
 }
 
 impl Panel {
@@ -123,6 +151,22 @@ impl Panel {
             guide_error: None,
             guide_starting: false,
             _guide_poll: None,
+            code: None,
+            write: write::WriteState::default(),
+            stack: None,
+            stack_failed: false,
+            linked: None,
+            checks_all: false,
+            maintainer_saving: false,
+            maintainer_choice: None,
+            _picker_search: None,
+            handoff: None,
+            condensed: false,
+            guide_head: None,
+            guide_position: 0,
+            guide_seen: HashSet::new(),
+            guide_rail_open: false,
+            guide_files_open: HashSet::new(),
         }
     }
 
@@ -189,7 +233,9 @@ impl Workspace {
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
             return;
         }
-        self.pull_requests.panel = Some(Panel::new(reference, seed));
+        if self.show_pr_tab(reference, seed, cx) {
+            return;
+        }
         self.read_pr_detail(cx);
         if self.server_info.settings.bool("reviewGuidesEnabled") {
             self.read_pr_guide(cx);
@@ -197,8 +243,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// "Collapse pull request panel": every tab closes with it.
     pub(super) fn close_pull_request_panel(&mut self, cx: &mut Context<Self>) {
         self.pull_requests.panel = None;
+        self.pull_requests.tabs.clear();
+        self.pull_requests.parked.clear();
         cx.notify();
     }
 
@@ -226,8 +275,12 @@ impl Workspace {
         true
     }
 
+    /// The open pull request `key` names, shown or parked in its tab, for an answer to land in.
     fn pr_panel(&mut self, key: &str) -> Option<&mut Panel> {
-        self.pull_requests.panel.as_mut().filter(|p| p.reference.key() == key)
+        if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference.key() == key) {
+            return self.pull_requests.panel.as_mut();
+        }
+        self.pull_requests.parked.get_mut(key)
     }
 
     /// Reads the detail and its activity; each lands on its own.
@@ -248,8 +301,14 @@ impl Workspace {
                 panel.detail_loading = false;
                 match result.map(serde_json::from_value::<Detail>) {
                     Ok(Ok(detail)) => {
+                        let first = panel.detail.is_none();
                         panel.detail = Some(Rc::new(detail));
                         panel.detail_error = None;
+                        panel.maintainer_choice = None;
+                        if first {
+                            this.read_pr_extras(cx);
+                        }
+                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => {
                         panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false))
@@ -272,6 +331,8 @@ impl Workspace {
                     Ok(Ok(activity)) => {
                         panel.activity = Some(Rc::new(activity));
                         panel.activity_error = None;
+                        panel.write.reactions.clear();
+                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => panel.activity_error = Some(format!("Unreadable activity: {error}").into()),
                     Err(error) => panel.activity_error = Some(list_logic::error_message(&error).into()),
@@ -297,6 +358,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail(cx);
+                this.refresh_pr_code(cx);
             });
         })
         .detach();
@@ -308,6 +370,18 @@ impl Workspace {
         &mut self,
         action: &'static str,
         method: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform_pr_action_with(action, method, None, window, cx);
+    }
+
+    /// `perform` with the update method `update-branch` takes.
+    fn perform_pr_action_with(
+        &mut self,
+        action: &'static str,
+        method: Option<&'static str>,
+        update_method: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -325,6 +399,9 @@ impl Workspace {
         if let Some(method) = method {
             input["mergeMethod"] = json!(method);
         }
+        if let Some(update) = update_method {
+            input["updateMethod"] = json!(update);
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("pullRequests.runAction", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -333,7 +410,10 @@ impl Workspace {
                 }
                 match result {
                     Err(error) => {
-                        let (title, hint) = logic::action_failure(action, term);
+                        let (title, mut hint) = logic::action_failure(action, term);
+                        if update_method == Some("rebase") {
+                            hint = "The host refused it. A rebase stops at the first commit that does not apply cleanly; updating with a merge commit may still work.".into();
+                        }
                         toast_error(
                             window,
                             cx,
@@ -592,15 +672,27 @@ impl Workspace {
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
         let tab = match panel.tab {
             Tab::Guide if !guides => Tab::Summary,
+            Tab::Code if !detail.capabilities.diff => Tab::Summary,
             tab => tab,
         };
         let header = self.render_pr_header(&detail, tab, guides, &t, window, cx);
         let body = match tab {
             Tab::Summary => self.render_pr_summary(&detail, &t, window, cx),
             Tab::Timeline => self.render_pr_timeline(&detail, &t, cx),
-            Tab::Guide => self.render_pr_guide(&t, cx),
+            Tab::Guide => {
+                let width = self.pr_panel_width(window);
+                self.render_pr_guide(&t, width, cx)
+            }
+            Tab::Code => self.render_pr_code(&detail, &t, window, cx),
         };
-        frame.child(header).child(div().flex_1().min_h_0().relative().child(body)).into_any_element()
+        let composer = self.render_pr_composer(&detail, &t, cx);
+        frame
+            .child(header)
+            .child(
+                self.pr_scroll_watch(body, cx)
+                    .children(composer.map(|c| div().absolute().right(px(16.)).bottom(px(12.)).child(c))),
+            )
+            .into_any_element()
     }
 
     /// The crumbs and collapse button while the detail is not in yet (`PullRequestDetailGhost`).
@@ -726,6 +818,8 @@ impl Workspace {
             });
         let open_label = list_logic::open_on_host_label(&detail.provider);
         let number = number_link(&detail.url, detail.number, state_color, open_label);
+        let condensed = panel.condensed;
+        let condensed_row = self.render_pr_condensed_row(detail, t);
         let crumbs = h_flex()
             .flex_1()
             .min_w_0()
@@ -734,15 +828,28 @@ impl Workspace {
             .gap(px(4.))
             .text_xs()
             .text_color(t.muted_foreground)
-            .child(repository)
-            .child(number);
+            .when(!condensed, |el| el.child(repository))
+            .child(number)
+            .when(condensed, |el| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.foreground)
+                        .child(detail.title.clone()),
+                )
+            });
 
         let actions = h_flex()
             .flex_none()
             .h(px(28.))
             .mr(px(16.))
             .gap(px(4.))
+            .children(self.render_pr_thread_count(t, cx))
+            .children(self.render_pr_stack(detail, method, t, cx))
             .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
+            .child(self.render_pr_checkout(detail, t, cx))
             .child(self.render_pr_menu(detail, primary, method, guides, &view, t))
             .child(collapse_button(t, cx));
 
@@ -788,7 +895,7 @@ impl Workspace {
                     .gap(px(6.))
                     .font_family(FONT_MONO)
                     .text_color(Hsla { a: 0.7, ..t.muted_foreground })
-                    .child(div().flex_none().child(detail.base_branch.clone()))
+                    .child(self.render_pr_base_branch(detail, t, cx))
                     .child(
                         Icon::new(Lucide::ArrowLeft)
                             .with_size(px(14.))
@@ -835,33 +942,60 @@ impl Workspace {
                     .children(diff_stat(detail.additions, detail.deletions, 12., t)),
             );
 
-        let title = div()
-            .min_h(px(24.))
-            .min_w_0()
-            .truncate()
-            .text_base()
-            .line_height(px(22.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(t.foreground)
-            .child(detail.title.clone());
+        let title = match self.render_pr_title_input(t) {
+            Some(input) => input,
+            None => h_flex()
+                .min_h(px(24.))
+                .min_w_0()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_base()
+                        .line_height(px(22.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.foreground)
+                        .child(detail.title.clone()),
+                )
+                .group(write::EDIT_GROUP)
+                .when(logic::can_edit_change_request(detail), |el| {
+                    el.child(write::hover_only(
+                        ghost_button("pr-edit-title", t)
+                            .size(px(20.))
+                            .p_0()
+                            .tooltip("Edit title")
+                            .child(Icon::new(Lucide::Pencil).with_size(px(12.)))
+                            .on_click(cx.listener(|this, _, window, cx| this.begin_pr_title_edit(window, cx))),
+                    ))
+                })
+                .into_any_element(),
+        };
 
         let mut tabs = vec![(Tab::Summary, "Summary")];
         if guides {
             tabs.push((Tab::Guide, "Guide"));
         }
         tabs.push((Tab::Timeline, "Timeline"));
+        if detail.capabilities.diff {
+            tabs.push((Tab::Code, "Code"));
+        }
         let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, cx, |this, tab, cx| {
             let Some(panel) = this.pull_requests.panel.as_mut() else { return };
             panel.tab = tab;
             if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
                 this.read_pr_guide(cx);
             }
+            // The guide's excerpts come from the change's diff.
+            if matches!(tab, Tab::Code | Tab::Guide) {
+                this.open_pr_code(cx);
+            }
             cx.notify();
         });
         let status = match tab {
             Tab::Summary => Some(self.render_pr_checks_status(detail, checks_state, checks_stale, t, window, cx)),
             Tab::Timeline => Some(self.render_pr_timeline_status(t, cx)),
-            Tab::Guide => None,
+            Tab::Guide | Tab::Code => None,
         };
         let tab_bar = h_flex()
             .flex_wrap()
@@ -880,7 +1014,15 @@ impl Workspace {
             .border_b_1()
             .border_color(hairline)
             .child(h_flex().items_start().gap(px(8.)).child(crumbs).child(actions))
-            .child(v_flex().mt(px(4.)).px(px(16.)).pb(px(16.)).min_w_0().child(title).child(meta).child(branches))
+            .map(|el| {
+                if condensed {
+                    el.child(condensed_row)
+                } else {
+                    el.child(
+                        v_flex().mt(px(4.)).px(px(16.)).pb(px(16.)).min_w_0().child(title).child(meta).child(branches),
+                    )
+                }
+            })
             .child(tab_bar)
             .into_any_element()
     }
@@ -968,8 +1110,8 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
-            // Resolving conflicts hands the checkout to an agent thread, which this panel cannot do yet.
-            Some(Primary::Resolve) | None => {}
+            Some(Primary::Resolve) => out.push(self.render_pr_resolve_conflicts(detail, t, cx)),
+            None => {}
         }
         out
     }
@@ -993,6 +1135,11 @@ impl Workspace {
         let refreshing = panel.refreshing || panel.detail_loading;
         let guide_running = panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running");
         let guide_written = panel.guide.as_ref().is_some_and(|g| !g["guide"].is_null());
+        let maintainer = logic::can_edit_maintainer_edits(detail)
+            .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
+        let can_link = logic::parse_change_request_url(&detail.url).is_some();
+        let handoff = panel.handoff.clone();
+        let can_fix = self.shell.projects.iter().any(|p| p.id == detail.project_id);
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1013,12 +1160,59 @@ impl Workspace {
                 let on = |f: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
                     window.listener_for(&view, move |this, _, window, cx| f(this, window, cx))
                 };
+                if can_link {
+                    menu = menu.item(
+                        PopupMenuItem::new("Link to thread")
+                            .icon(Lucide::Link)
+                            .on_click(on(|this, window, cx| this.open_pr_thread_picker(window, cx))),
+                    );
+                }
                 menu = menu.item(
                     PopupMenuItem::new("Refresh")
                         .icon(Lucide::RefreshCw)
                         .disabled(refreshing)
                         .on_click(on(|this, _, cx| this.refresh_pr_from_host(cx))),
                 );
+                let two_line = |label: String, note: String, icon: Lucide| {
+                    PopupMenuItem::element(move |_, cx| {
+                        let muted = theme::tokens(cx).muted_foreground;
+                        h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.))))
+                            .child(v_flex().child(label.clone()).child(div().text_xs().text_color(muted).child(note.clone())))
+                    })
+                };
+                let busy_handoff = handoff.is_some();
+                menu = menu
+                    .item(
+                        two_line(
+                            if handoff.as_deref() == Some("ask") { "Opening..." } else { "Ask a question" }.into(),
+                            format!("Opens a thread that knows which {term} you mean."),
+                            Lucide::MessageCircleQuestionMark,
+                        )
+                        .disabled(busy_handoff)
+                        .on_click(on(|this, window, cx| this.ask_about_pr(window, cx))),
+                    )
+                    .item(
+                        two_line(
+                            if handoff.as_deref() == Some("explain") { "Opening...".into() } else { format!("Explain this {short}") },
+                            "A walk through the diff and what to read closely.".into(),
+                            Lucide::BookOpen,
+                        )
+                        .disabled(busy_handoff)
+                        .on_click(on(|this, window, cx| this.explain_pr(window, cx))),
+                    )
+                    .item(
+                        PopupMenuItem::new(if handoff.as_deref() == Some("findings") {
+                            "Preparing..."
+                        } else {
+                            "Fix findings in a thread"
+                        })
+                        .icon(Lucide::Hammer)
+                        .disabled(busy_handoff || !can_fix)
+                        .on_click(on(|this, window, cx| this.fix_pr_findings(window, cx))),
+                    );
                 if guides {
                     let label = if guide_running {
                         "Writing guide..."
@@ -1035,6 +1229,16 @@ impl Workspace {
                     );
                 }
                 menu = menu.separator();
+                if let Some((allowed, saving)) = maintainer {
+                    let label = if saving { "Allow edits from maintainers (saving…)" } else { "Allow edits from maintainers" };
+                    menu = menu
+                        .item(PopupMenuItem::new(label).checked(allowed).disabled(saving).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| this.save_pr_maintainer_edits(!allowed, window, cx),
+                        )))
+                        .label("Maintainers can push to this branch. If your fork has workflows, this can also give access to its secrets.")
+                        .separator();
+                }
                 if detail.state == "open" {
                     if actions.draft_toggle {
                         let (label, action, icon) = if detail.is_draft {
@@ -1253,8 +1457,8 @@ impl Workspace {
         } else {
             logic::summarize_checks(&detail.checks)
         };
-        let icon = match state.and_then(|s| checks_glyph(s, t)) {
-            Some((icon, color, tip)) => glyph("pr-checks-state".into(), icon, 14., color, tip).into_any_element(),
+        let icon = match state.filter(|s| checks_glyph(s, t).is_some()) {
+            Some(state) => self.render_pr_checks_popover(detail, state, stale, t, cx),
             None => Icon::new(Lucide::CircleDot).with_size(px(14.)).text_color(t.muted_foreground).into_any_element(),
         };
         h_flex()
@@ -1348,39 +1552,66 @@ impl Workspace {
         let outcomes = logic::latest_review_outcomes(comments, commits);
         let reviewers = logic::reviewer_entries(reviewers, &outcomes);
 
+        let reviewer_picker = (detail.capabilities.reviewers.request && detail.capabilities.reviewers.list_candidates)
+            .then(|| self.render_pr_picker(true, detail.viewer_permissions.request_reviewers, t, cx));
         let reviewer_row = meta_row(
             Lucide::Users,
             "Reviewers",
-            if reviewers.is_empty() {
-                div().text_color(t.muted_foreground).child("None").into_any_element()
-            } else {
-                h_flex()
-                    .children(
-                        reviewers
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (actor, outcome))| reviewer_avatar(index, actor, outcome.as_ref(), t)),
-                    )
-                    .into_any_element()
-            },
+            h_flex()
+                .gap(px(6.))
+                .child(if reviewers.is_empty() {
+                    div().text_color(t.muted_foreground).child("None").into_any_element()
+                } else {
+                    h_flex()
+                        .children(
+                            reviewers
+                                .iter()
+                                .enumerate()
+                                .map(|(index, (actor, outcome))| reviewer_avatar(index, actor, outcome.as_ref(), t)),
+                        )
+                        .into_any_element()
+                })
+                .children(reviewer_picker)
+                .into_any_element(),
             t,
         );
+        let label_picker = (detail.capabilities.labels == Some(true))
+            .then(|| self.render_pr_picker(false, detail.viewer_permissions.labels != Some(false), t, cx));
         let label_row = (!detail.labels.is_empty() || detail.capabilities.labels == Some(true)).then(|| {
-            let value = if detail.labels.is_empty() {
-                div().text_color(t.muted_foreground).child("None").into_any_element()
-            } else {
-                h_flex()
-                    .flex_wrap()
-                    .gap(px(4.))
-                    .children(detail.labels.iter().map(|l| label_chip(&l.name, l.color.as_deref(), 0, t)))
-                    .into_any_element()
-            };
+            let value = h_flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .when(detail.labels.is_empty(), |el| el.child(div().text_color(t.muted_foreground).child("None")))
+                .children(detail.labels.iter().map(|l| label_chip(&l.name, l.color.as_deref(), 0, t)))
+                .children(label_picker)
+                .into_any_element();
             meta_row(Lucide::Tag, "Labels", value, t)
         });
 
         let description = description_open.then(|| {
+            if self.pr_editing("description") {
+                return self.render_pr_editor(t, cx);
+            }
             let text = if detail.body.trim().is_empty() { "_No description provided._" } else { detail.body.as_str() };
-            self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()))
+            let markdown =
+                self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()));
+            let edit = logic::can_edit_change_request(detail)
+                .then(|| self.pr_edit_button("description".into(), "description", detail.body.clone(), t, cx));
+            let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
+            Some(
+                v_flex()
+                    .gap(px(8.))
+                    .child(
+                        h_flex()
+                            .group(write::EDIT_GROUP)
+                            .items_start()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w_0().children(markdown))
+                            .children(edit),
+                    )
+                    .children(reactions)
+                    .into_any_element(),
+            )
         });
         let checks = checks_open.then(|| render_checks(&detail.checks, stale, t, cx));
         let comment_total = activity.as_ref().map_or(0, |a| a.comment_total());
@@ -1670,6 +1901,17 @@ impl Workspace {
     ) -> AnyElement {
         let body = logic::visible_body(&comment.body);
         let markdown = body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), b, cx));
+        let can_edit = self
+            .pull_requests
+            .panel
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+            .is_some_and(|d| logic::can_edit_comment(d, &comment.kind, comment.author.as_ref(), comment.can_edit));
+        let editor = if self.pr_editing(&comment.id) { self.render_pr_editor(t, cx) } else { None };
+        let edit_kind: &'static str = if comment.kind == "review-comment" { "review-comment" } else { "issue-comment" };
+        let edit = (can_edit && editor.is_none())
+            .then(|| self.pr_edit_button(comment.id.clone(), edit_kind, comment.body.clone(), t, cx));
+        let reactions = self.render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx);
         let outcome = logic::review_outcome(comment.review_state.as_deref());
         let state = match (outcome, comment.review_state.as_deref()) {
             (Some(outcome), _) => Some(outcome_badge(outcome, t)),
@@ -1692,14 +1934,31 @@ impl Workspace {
                     .px(px(12.))
                     .py(px(10.))
                     .child(comment_identity(comment, t))
-                    .children(state),
+                    .children(state)
+                    .children(reactions.map(|r| div().ml_auto().child(r))),
             )
             .when(!reply, |el| {
                 el.children(comment_location(comment, thread, t).map(|row| div().px(px(12.)).child(row)))
             })
-            .children(
-                markdown.map(|state| div().px(px(12.)).py(px(12.)).child(pr_markdown_view(&state, t, cx.entity()))),
-            )
+            .map(|el| match editor {
+                Some(editor) => el.child(div().px(px(12.)).py(px(12.)).child(editor)),
+                None if markdown.is_some() || edit.is_some() => el.child(
+                    h_flex()
+                        .group(write::EDIT_GROUP)
+                        .items_start()
+                        .gap(px(4.))
+                        .px(px(12.))
+                        .py(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .children(markdown.map(|state| pr_markdown_view(&state, t, cx.entity()))),
+                        )
+                        .children(edit),
+                ),
+                None => el,
+            })
             .into_any_element()
     }
 
@@ -1777,7 +2036,7 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn render_pr_guide(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pr_guide(&mut self, t: &Tokens, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let result = panel.guide.clone().unwrap_or(Value::Null);
         let running = panel.guide_starting || result["run"]["_tag"] == "Running";
@@ -1856,19 +2115,15 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().child(text))
                 .when(!running, |el| el.child(write_button("Rewrite", cx)))
         });
-        let stops: Vec<Value> = guide["stops"].as_array().cloned().unwrap_or_default();
-        let mut cards = Vec::with_capacity(stops.len());
-        for (index, stop) in stops.iter().enumerate() {
-            let summary = stop["summary"].as_str().unwrap_or_default();
-            let markdown = self.pr_markdown(&format!("guide:{index}"), summary, cx);
-            cards.push(guide_stop(index, stop, markdown, t, cx));
+        match serde_json::from_value::<logic::Guide>(guide.clone()) {
+            Ok(guide) => self.render_pr_guide_tour(&guide, banner.map(IntoElement::into_any_element), width, t, cx),
+            Err(error) => div()
+                .p(px(16.))
+                .text_xs()
+                .text_color(t.error)
+                .child(format!("Unreadable review guide: {error}"))
+                .into_any_element(),
         }
-        v_flex()
-            .id("pr-guide")
-            .size_full()
-            .overflow_y_scroll()
-            .child(v_flex().w_full().max_w(px(768.)).mx_auto().p(px(16.)).gap(px(16.)).children(banner).children(cards))
-            .into_any_element()
     }
 }
 
@@ -1903,8 +2158,22 @@ fn collapse_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
         .on_click(cx.listener(|this, _, _, cx| this.close_pull_request_panel(cx)))
 }
 
+/// `Button size="xs" variant="outline"`.
+fn xs_outline(id: impl Into<ElementId>, t: &Tokens) -> Button {
+    Button::new(id)
+        .outline()
+        .xsmall()
+        .h(px(24.))
+        .px(px(8.))
+        .gap(px(4.))
+        .rounded(px(6.))
+        .border_color(t.input)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+}
+
 /// `Button size="xs" variant="ghost-muted"`.
-fn ghost_button(id: &'static str, t: &Tokens) -> Button {
+fn ghost_button(id: impl Into<ElementId>, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .xsmall()
@@ -1975,10 +2244,10 @@ fn meta_line<const N: usize>(segments: [Option<AnyElement>; N], t: &Tokens) -> g
     line
 }
 
-/// `PullRequestActorAvatar` as its fallback: the login's initial. Avatars are not fetched.
+/// `PullRequestActorAvatar`: the picture once read, else the login's initial.
 fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
     let login = actor.map_or("ghost", |a| a.login.as_str());
-    div()
+    let initial = div()
         .size(px(size))
         .flex_none()
         .flex()
@@ -1989,7 +2258,8 @@ fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
         .text_size(px((size * 0.6).min(11.)))
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.muted_foreground)
-        .child(login.chars().next().unwrap_or('?').to_uppercase().to_string())
+        .child(login.chars().next().unwrap_or('?').to_uppercase().to_string());
+    avatars::avatar_or(actor, size, initial)
 }
 
 /// `PullRequestActorLabel`: avatar and login, with the display name on hover.
@@ -2063,16 +2333,6 @@ fn outcome_icon(outcome: &str) -> Lucide {
         "changes-requested" => Lucide::CircleX,
         _ => Lucide::CircleDashed,
     }
-}
-
-fn glyph(id: String, icon: Lucide, size: f32, color: Hsla, label: impl Into<SharedString>) -> impl IntoElement {
-    let label: SharedString = label.into();
-    div()
-        .id(ElementId::Name(id.into()))
-        .flex_none()
-        .flex()
-        .child(Icon::new(icon).with_size(px(size)).text_color(color))
-        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
 }
 
 /// `Badge size="control"`: an icon and label in a tinted pill, with the label as its tooltip.
@@ -2413,91 +2673,6 @@ fn failure_details(detail: String, t: &Tokens) -> impl IntoElement {
                 .font_family(FONT_MONO)
                 .child(detail),
         )
-}
-
-/// One stop of a review guide: its title, why it matters, what to read and what to ask.
-fn guide_stop(
-    index: usize,
-    stop: &Value,
-    summary: Option<Entity<TextViewState>>,
-    t: &Tokens,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-    let attention = stop["attention"].as_object().map(|a| {
-        let kind = a.get("kind").and_then(Value::as_str).unwrap_or_default();
-        let note = a.get("note").and_then(Value::as_str).unwrap_or_default();
-        h_flex()
-            .gap(px(8.))
-            .items_start()
-            .rounded(px(6.))
-            .bg(Hsla { a: 0.08, ..t.warning })
-            .px(px(8.))
-            .py(px(6.))
-            .text_xs()
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.warning_foreground)
-                    .child(logic::capitalize(kind)),
-            )
-            .child(div().flex_1().min_w_0().text_color(t.foreground).child(note.to_owned()))
-    });
-    let files: Vec<(String, String)> = stop["files"]
-        .as_array()
-        .map(|f| f.iter().map(|f| (text(&f["path"]), text(&f["note"]))).collect())
-        .unwrap_or_default();
-    let questions: Vec<String> = stop["questions"].as_array().map(|q| q.iter().map(text).collect()).unwrap_or_default();
-    v_flex()
-        .gap(px(10.))
-        .p(px(16.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .font_family(FONT_MONO)
-                        .text_color(t.muted_foreground)
-                        .child(format!("{}", index + 1)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.foreground)
-                        .child(text(&stop["title"])),
-                ),
-        )
-        .children(summary.map(|state| pr_markdown_view(&state, t, cx.entity())))
-        .children(attention)
-        .when(!files.is_empty(), |el| {
-            el.child(v_flex().gap(px(4.)).children(files.into_iter().map(|(path, note)| {
-                h_flex()
-                    .min_w_0()
-                    .gap(px(8.))
-                    .text_xs()
-                    .child(Icon::new(Lucide::FileCode).with_size(px(12.)).text_color(t.muted_foreground))
-                    .child(div().flex_none().font_family(FONT_MONO).text_color(t.foreground).child(path))
-                    .child(div().min_w_0().truncate().text_color(t.muted_foreground).child(note))
-            })))
-        })
-        .when(!questions.is_empty(), |el| {
-            el.child(
-                v_flex()
-                    .gap(px(4.))
-                    .text_xs()
-                    .text_color(t.muted_foreground)
-                    .children(questions.into_iter().map(|q| div().child(format!("? {q}")))),
-            )
-        })
-        .into_any_element()
 }
 
 // Timeline rows (`PullRequestTimelineTab`). Each sits 48px right of the connector line.

@@ -13,6 +13,7 @@ mod notifications;
 mod preview;
 mod project_groups;
 mod pull_request_detail;
+mod pull_request_diff;
 mod pull_requests;
 mod queue;
 mod quit_shortcut;
