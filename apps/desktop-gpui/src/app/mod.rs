@@ -27,6 +27,7 @@ mod chat;
 mod composer;
 mod details;
 mod header;
+pub(crate) mod keymap;
 mod layout;
 mod pages;
 mod sidebar;
@@ -117,6 +118,14 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    /// Device-local settings (Settings → Chat, Diffs, SnapShots).
+    client_settings: crate::client_settings::ClientSettings,
+    /// The keybindings last installed into GPUI's keymap; see [`keymap`].
+    installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    /// Settings → Keybindings, created the first time it opens.
+    keybindings_panel: Option<gpui_kit::AnyView>,
+    /// Open "Advanced" folds in Settings sections, by section id.
+    settings_folds: HashSet<&'static str>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +188,10 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            client_settings: crate::client_settings::ClientSettings::load(),
+            installed_keybindings: Rc::default(),
+            keybindings_panel: None,
+            settings_folds: HashSet::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -323,7 +336,10 @@ impl Workspace {
                     log::warn!("bad server config event: {error}");
                 }
             },
-            |this, _, cx| this.notify_sidebar(cx),
+            |this, _, cx| {
+                this.sync_keymap(cx);
+                this.notify_sidebar(cx)
+            },
         )];
         self.shell_retried = false;
         self.subscribe_shell(window, cx);
@@ -784,6 +800,9 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::GoBack, window, cx| this.go_back(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::GoForward, window, cx| this.go_forward(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::OpenUsage, _, cx| this.open_page(pages::Page::Usage, cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {

@@ -2,9 +2,14 @@
 //! over the whole window with `SettingsSidebarNav` and one section at a time).
 
 mod agents;
+mod chat;
 mod code;
 mod connections;
+mod diffs;
 mod general;
+mod keybindings;
+mod placeholder;
+mod snap_shot;
 mod system;
 
 use gpui_kit::{

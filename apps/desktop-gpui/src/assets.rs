@@ -38,6 +38,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "code-xml",
     "corner-left-up",
     "corner-up-right",
+    "file-braces",
     "folder",
     "folder-git",
     "folder-git-2",

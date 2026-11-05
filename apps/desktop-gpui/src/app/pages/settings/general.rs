@@ -13,19 +13,19 @@ impl Workspace {
         div().child("Appearance").into_any_element()
     }
 
-    pub(super) fn render_settings_chat(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Chat").into_any_element()
+    pub(super) fn render_settings_chat(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_chat_section(cx)
     }
 
-    pub(super) fn render_settings_diffs(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Diffs & pull requests").into_any_element()
+    pub(super) fn render_settings_diffs(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_diffs_section(cx)
     }
 
-    pub(super) fn render_settings_keybindings(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Keybindings").into_any_element()
+    pub(super) fn render_settings_keybindings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_keybindings_section(window, cx)
     }
 
-    pub(super) fn render_settings_snap_shot(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("SnapShots").into_any_element()
+    pub(super) fn render_settings_snap_shot(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_snap_shot_section(cx)
     }
 }

@@ -1,7 +1,9 @@
 mod app;
 mod assets;
 mod backend;
+mod client_settings;
 mod inbox;
+mod keybindings;
 mod model;
 mod model_label;
 mod new_thread;
@@ -13,7 +15,7 @@ mod work_log;
 
 use std::sync::OnceLock;
 
-use gpui_kit::{AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 
 /// Network and process I/O run here; GPUI owns the UI thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -35,10 +37,8 @@ fn main() {
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
-        cx.bind_keys([
-            KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
-            KeyBinding::new("ctrl-shift-b", app::ToggleThreadDetails, None),
-        ]);
+        // The defaults until the server's keybindings arrive.
+        app::keymap::install(&[], cx);
         // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {
