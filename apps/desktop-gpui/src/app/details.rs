@@ -842,7 +842,7 @@ impl Workspace {
 
     /// `sourceControl.publishRepository` with the web's defaults: `origin` over SSH.
     fn publish_repository(&mut self, provider: String, repository: String, visibility: &str, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
         let input = json!({
             "cwd": cwd,
             "provider": provider,

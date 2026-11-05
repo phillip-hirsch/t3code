@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use gpui_kit::{Context, Task};
+use gpui_kit::{Context, SharedString, Task};
 use serde_json::json;
 
 use super::Workspace;
@@ -46,25 +46,31 @@ impl Workspace {
     /// ones that settled.
     pub(super) fn keep_running_threads(&mut self, cx: &mut Context<Self>) {
         let open = self.thread.as_ref().map(|t| t.id.clone());
-        let running: Vec<String> = self
+        let running: Vec<(SharedString, String)> = self
             .shell
             .threads
             .iter()
             .filter(|t| running(&t.status) && Some(&t.id) != open.as_ref())
-            .map(|t| t.id.clone())
+            .map(|t| (t.environment_id.clone(), t.id.clone()))
             .collect();
-        self.keep_alive.threads.retain(|id, warm| running.contains(id) || !settled(&warm.state));
-        for id in running {
+        self.keep_alive.threads.retain(|id, warm| running.iter().any(|(_, r)| r == id) || !settled(&warm.state));
+        for (environment, id) in running {
             if !self.keep_alive.threads.contains_key(&id) {
-                self.keep_warm(id, ThreadState::default(), cx);
+                self.keep_warm(&environment, id, ThreadState::default(), cx);
             }
         }
     }
 
-    /// Keeps a thread leaving the screen synced while it still runs.
-    pub(super) fn retire_thread(&mut self, thread_id: String, state: ThreadState, cx: &mut Context<Self>) {
+    /// Keeps a thread leaving the screen synced on `environment`, its own, while it still runs.
+    pub(super) fn retire_thread(
+        &mut self,
+        environment: &str,
+        thread_id: String,
+        state: ThreadState,
+        cx: &mut Context<Self>,
+    ) {
         if self.shell_running(&thread_id) || (state.projection.is_some() && !settled(&state)) {
-            self.keep_warm(thread_id, state, cx);
+            self.keep_warm(environment, thread_id, state, cx);
         }
     }
 
@@ -73,8 +79,8 @@ impl Workspace {
         self.keep_alive.threads.remove(thread_id).map(|warm| warm.state)
     }
 
-    fn keep_warm(&mut self, thread_id: String, state: ThreadState, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+    fn keep_warm(&mut self, environment: &str, thread_id: String, state: ThreadState, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(environment) else { return };
         let mut input = json!({"threadId": thread_id, "requestCompletionMarker": true});
         if state.sequence > 0 {
             input["afterSequence"] = state.sequence.into();

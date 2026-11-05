@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -17,8 +18,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, ElementId, ExternalPaths, Image, ImageFormat, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, PathPromptOptions, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div,
-    img, prelude::FluentBuilder as _, px,
+    ParentElement as _, PathPromptOptions, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
@@ -67,6 +68,8 @@ pub(super) struct Attachment {
     bytes: Bytes,
     image: Option<Arc<Image>>,
     upload: Upload,
+    /// The environment `upload` went to; its id only works there.
+    upload_env: Option<SharedString>,
     /// A SnapShot's source, sent with the image.
     source: Option<SnapShotSource>,
 }
@@ -83,7 +86,17 @@ impl Attachment {
         let image = image_format(&mime)
             .filter(|_| kind == Kind::Image)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        Self { local_id, kind, name, mime, bytes: Bytes::from(bytes), image, upload: Upload::Uploading, source: None }
+        Self {
+            local_id,
+            kind,
+            name,
+            mime,
+            bytes: Bytes::from(bytes),
+            image,
+            upload: Upload::Uploading,
+            upload_env: None,
+            source: None,
+        }
     }
 
     pub(super) fn local_id(&self) -> &str {
@@ -110,12 +123,19 @@ impl Attachment {
         self.image.clone()
     }
 
-    /// The server's id once the upload finished.
-    pub(super) fn uploaded_id(&self) -> Option<&str> {
-        match &self.upload {
-            Upload::Ready(id) => Some(id),
+    /// Starts a new upload to `environment`, handing back a finished one (with the
+    /// environment that holds it) for deletion.
+    fn begin_upload(&mut self, environment: Option<SharedString>) -> Option<(SharedString, String)> {
+        let previous = mem::replace(&mut self.upload, Upload::Uploading);
+        match (previous, mem::replace(&mut self.upload_env, environment)) {
+            (Upload::Ready(id), Some(held_by)) => Some((held_by, id)),
             _ => None,
         }
+    }
+
+    /// Whether an upload to `environment` that just finished is the one this attachment waits for.
+    fn awaits_upload_on(&self, environment: &str) -> bool {
+        self.upload == Upload::Uploading && self.upload_env.as_deref() == Some(environment)
     }
 
     fn context_id(&self) -> String {
@@ -146,17 +166,21 @@ impl Attachment {
     }
 }
 
-/// An attachment in the composer on screen or in the draft it was stashed with.
+/// An attachment in the composer on screen (no target: the open one's) or in the draft it was
+/// stashed with, beside that draft's target.
 fn find_attachment<'a>(
     active: &'a mut [Attachment],
     drafts: &'a mut HashMap<Target, ComposerDraft>,
     local_id: &str,
-) -> Option<&'a mut Attachment> {
-    let stashed = drafts.values_mut().filter_map(|draft| match draft {
-        ComposerDraft::Prompt(_, kept) => Some(kept.as_mut_slice()),
+) -> Option<(Option<&'a Target>, &'a mut Attachment)> {
+    let stashed = drafts.iter_mut().filter_map(|(target, draft)| match draft {
+        ComposerDraft::Prompt(_, kept) => Some((Some(target), kept.as_mut_slice())),
         ComposerDraft::Question(_) => None,
     });
-    std::iter::once(active).chain(stashed).flatten().find(|a| a.local_id == local_id)
+    std::iter::once((None, active))
+        .chain(stashed)
+        .flat_map(|(target, attachments)| attachments.iter_mut().map(move |attachment| (target, attachment)))
+        .find(|(_, attachment)| attachment.local_id == local_id)
 }
 
 /// A dropped file's bytes, or its size when it is over the limit and was not read.
@@ -461,6 +485,7 @@ impl Workspace {
             bytes: Bytes::from(bytes),
             image,
             upload: Upload::Uploading,
+            upload_env: None,
             source: None,
         };
         // Files always get an inline chip; images only once the prompt has text.
@@ -537,23 +562,36 @@ impl Workspace {
         Ok(())
     }
 
-    /// Mints a signed upload URL, then POSTs the bytes to it.
+    /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.
     pub(super) fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
-        let (client, http_base) = (self.client(), self.http_base().map(str::to_owned));
-        let Some(attachment) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
+        let Some((draft, _)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
             return;
         };
-        let (Some(client), Some(http_base)) = (client, http_base) else {
-            attachment.upload = Upload::Failed("Not connected".into());
+        let environment = draft.map(Target::environment).cloned();
+        let environment = environment.or_else(|| self.active_environment().cloned());
+        let client = environment.as_deref().and_then(|id| self.env_client(id));
+        let http_base = environment.as_deref().and_then(|id| self.env_endpoint(id)).map(|e| e.http_base.clone());
+        let Some((_, attachment)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
             return;
         };
-        attachment.upload = Upload::Uploading;
+        let released = attachment.begin_upload(environment.clone());
         let mut input =
             json!({"name": attachment.name, "mimeType": attachment.mime, "sizeBytes": attachment.bytes.len()});
         if attachment.kind == Kind::File {
             input["type"] = "file".into();
         }
         let (bytes, mime) = (attachment.bytes.clone(), attachment.mime.clone());
+        let connected = match (environment, client, http_base) {
+            (Some(environment), Some(client), Some(http_base)) => Some((environment, client, http_base)),
+            _ => {
+                attachment.upload = Upload::Failed("Not connected".into());
+                None
+            }
+        };
+        if let Some((held_by, id)) = released {
+            self.delete_upload(&held_by, id, cx);
+        }
+        let Some((environment, client, http_base)) = connected else { return };
         cx.spawn(async move |this, cx| {
             let result = async {
                 let minted = client.request("attachments.createUploadUrl", input).await.map_err(|error| {
@@ -589,15 +627,17 @@ impl Workspace {
             }
             .await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(attachment) = find_attachment(&mut this.attachments, &mut this.composer_drafts, &local_id) {
+                let waiting = find_attachment(&mut this.attachments, &mut this.composer_drafts, &local_id)
+                    .map(|(_, attachment)| attachment)
+                    .filter(|attachment| attachment.awaits_upload_on(&environment));
+                if let Some(attachment) = waiting {
                     attachment.upload = match result {
                         Ok(id) => Upload::Ready(id),
                         Err(reason) => Upload::Failed(reason),
                     };
-                } else if let (Ok(id), Some(client)) = (result, this.client()) {
-                    // Removed from every composer while uploading: let the server drop the pending file.
-                    cx.spawn(async move |_, _| client.request("attachments.delete", json!({"attachmentId": id})).await)
-                        .detach();
+                } else if let Ok(id) = result {
+                    // Removed, moved to another machine or uploaded again meanwhile: the server drops the pending file.
+                    this.delete_upload(&environment, id, cx);
                 }
                 cx.notify();
             });
@@ -605,13 +645,33 @@ impl Workspace {
         .detach();
     }
 
+    /// The draft moved to another machine: what was uploaded elsewhere uploads its bytes again,
+    /// since an upload id only works where it was taken (`startAttachmentUpload`).
+    pub(super) fn sync_attachment_uploads(&mut self, cx: &mut Context<Self>) {
+        let environment = self.active_environment().cloned();
+        let moved: Vec<String> =
+            self.attachments.iter().filter(|a| a.upload_env != environment).map(|a| a.local_id.clone()).collect();
+        for local_id in moved {
+            self.upload(local_id, cx);
+        }
+    }
+
+    /// Lets the environment that took `attachment`'s finished upload drop it.
+    pub(super) fn release_upload(&self, attachment: &Attachment, cx: &mut Context<Self>) {
+        if let (Upload::Ready(id), Some(environment)) = (&attachment.upload, &attachment.upload_env) {
+            self.delete_upload(environment, id.clone(), cx);
+        }
+    }
+
+    fn delete_upload(&self, environment: &str, id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(environment) else { return };
+        cx.spawn(async move |_, _| client.request("attachments.delete", json!({"attachmentId": id})).await).detach();
+    }
+
     pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };
         let attachment = self.attachments.remove(index);
-        if let (Upload::Ready(id), Some(client)) = (&attachment.upload, self.client()) {
-            let input = json!({"attachmentId": id});
-            cx.spawn(async move |_, _| client.request("attachments.delete", input).await).detach();
-        }
+        self.release_upload(&attachment, cx);
         let chip_id = attachment.chip_id();
         self.composer.update(cx, |state, cx| {
             if let Some(span) = state.tokens().iter().find(|s| s.token().id().as_ref() == chip_id).map(|s| s.range()) {
@@ -645,7 +705,9 @@ impl Workspace {
 
     /// The send payload's `attachments` and `context`, or why it cannot send yet.
     pub(super) fn attachment_payload(&self, text: &str) -> Result<(Vec<Value>, Option<Value>), String> {
-        if self.attachments_busy() {
+        // An upload on another machine is re-uploading here (`sync_attachment_uploads`).
+        let here = self.active_environment();
+        if self.attachments_busy() || self.attachments.iter().any(|a| a.upload_env.as_ref() != here) {
             return Err("Attachment(s) still uploading".into());
         }
         if self.attachments.iter().any(|a| matches!(a.upload, Upload::Failed(_))) {
@@ -930,21 +992,37 @@ mod tests {
             bytes: Bytes::new(),
             image: None,
             upload: Upload::Uploading,
+            upload_env: None,
             source: None,
         };
+        let stashed_in = Target::Thread { env: "e".into(), id: "t1".into() };
         let mut active = vec![attachment("on-screen")];
-        let mut drafts = HashMap::from([(
-            Target::Thread { env: "e".into(), id: "t1".into() },
-            ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]),
-        )]);
-        find_attachment(&mut active, &mut drafts, "stashed").unwrap().upload = Upload::Ready("srv".into());
-        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&Target::Thread { env: "e".into(), id: "t1".into() })
-        else {
-            panic!()
-        };
+        let mut drafts =
+            HashMap::from([(stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]))]);
+        let (target, found) = find_attachment(&mut active, &mut drafts, "stashed").unwrap();
+        assert_eq!(target, Some(&stashed_in), "a stashed attachment uploads to its draft's environment");
+        found.upload = Upload::Ready("srv".into());
+        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&stashed_in) else { panic!() };
         assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
-        assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some());
+        assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some_and(|(target, _)| target.is_none()));
         assert!(find_attachment(&mut active, &mut drafts, "removed").is_none());
+    }
+
+    #[test]
+    fn an_upload_lands_only_on_the_machine_its_attachment_waits_on() {
+        let mut attachment = Attachment::restored("file", "a.txt".into(), "text/plain".into(), vec![1]);
+        assert_eq!(attachment.begin_upload(Some("a".into())), None);
+        assert!(attachment.awaits_upload_on("a"));
+        attachment.upload = Upload::Ready("on-a".into());
+
+        // The draft moved to b: a's finished upload goes back to a for deletion.
+        assert_eq!(attachment.begin_upload(Some("b".into())), Some(("a".into(), "on-a".into())));
+        assert!(!attachment.awaits_upload_on("a"), "a late upload to a must not land on b's draft");
+        assert!(attachment.awaits_upload_on("b"));
+
+        // A second upload finishing after the first landed is stale too.
+        attachment.upload = Upload::Ready("on-b".into());
+        assert!(!attachment.awaits_upload_on("b"));
     }
 
     #[test]

@@ -195,11 +195,15 @@ impl Workspace {
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let threads: Vec<_> = ids.iter().filter_map(|id| self.shell.threads.iter().find(|t| &t.id == id)).collect();
-        let loaded = self.server_info().environment_id.is_some();
+        // Offered once every selected thread's machine has sent its config.
+        let loaded =
+            threads.iter().all(|t| self.env_info(&t.environment_id).is_some_and(|i| i.environment_id.is_some()));
         let pick = |keep: &dyn Fn(&crate::model::ThreadShell) -> bool| -> Vec<String> {
             threads.iter().filter(|t| keep(t)).map(|t| t.id.clone()).collect()
         };
-        let settings = inbox::snooze_settings(self.server_info().settings.get("snoozePresets"));
+        let clicked = self.shell.threads.iter().find(|t| t.id == thread_id);
+        let info = clicked.and_then(|t| self.env_info(&t.environment_id)).unwrap_or_else(|| self.server_info());
+        let settings = inbox::snooze_settings(info.settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
         Some(BulkMenu {
             pinned: pick(&|t| loaded && t.pinned_at.is_some()),
@@ -212,9 +216,14 @@ impl Workspace {
         })
     }
 
+    /// Every thread's machine is connected, so no command of a batch is dropped.
+    fn threads_connected(&self, ids: &[String]) -> bool {
+        ids.iter().all(|id| self.thread_client(id).is_some())
+    }
+
     /// `settleThreads`: settles each, moving on past all of them from the open one.
     fn settle_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
-        if self.client().is_none() {
+        if !self.threads_connected(ids) {
             return;
         }
         for id in ids {
@@ -237,7 +246,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if self.client().is_none() {
+        if !self.threads_connected(ids) {
             return;
         }
         self.clear_selection(cx);

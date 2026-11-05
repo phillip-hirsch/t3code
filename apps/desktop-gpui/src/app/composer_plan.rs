@@ -164,11 +164,12 @@ impl Workspace {
     /// `useImplementPlanInNewThread`: a fresh default-mode thread that implements
     /// the plan; it is deleted again when its first message fails.
     fn implement_plan_in_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some((plan_id, markdown)), Some(client), Some(Target::Thread { id: source_id, .. })) =
-            (self.plan_follow_up_target(), self.client(), self.target.clone())
+        let (Some((plan_id, markdown)), Some(Target::Thread { env, id: source_id })) =
+            (self.plan_follow_up_target(), self.target.clone())
         else {
             return;
         };
+        let Some(client) = self.env_client(&env) else { return };
         let (Some(project), Some(model)) = (self.target_project(), self.composer_model()) else { return };
         if self.composer_ui.implementing || self.sending {
             return;
@@ -223,7 +224,8 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.composer_ui.implementing = false;
                 match result {
-                    Ok(()) => this.select_thread(thread_id, window, cx),
+                    // The shell may not list the new thread yet; it lives beside its plan.
+                    Ok(()) => this.select_thread_in(env, thread_id, window, cx),
                     Err(error) => this.error = Some(format!("Could not start implementation thread: {error}").into()),
                 }
                 cx.notify();

@@ -19,7 +19,7 @@ use gpui_kit::{
     StyledImage as _, Window, div, img, px, relative,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use super::attachments::{Attachment, MAX_ATTACHMENTS};
 use super::{Workspace, new_id};
@@ -470,11 +470,8 @@ impl Workspace {
             return;
         }
         // The bytes are on disk; a restore uploads them again.
-        if let Some(client) = self.client() {
-            for id in self.attachments.iter().filter_map(Attachment::uploaded_id) {
-                let (client, input) = (client.clone(), json!({ "attachmentId": id }));
-                cx.spawn(async move |_, _| client.request("attachments.delete", input).await).detach();
-            }
+        for attachment in &self.attachments {
+            self.release_upload(attachment, cx);
         }
         self.attachments.clear();
         self.set_composer_text("", window, cx);
@@ -872,6 +869,7 @@ fn count_label(count: usize, t: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn entry(prompt: &str, kinds: &[&str]) -> StashEntry {
         StashEntry {

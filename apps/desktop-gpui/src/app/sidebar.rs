@@ -588,14 +588,15 @@ impl Workspace {
     /// The stage art the sidebar header and send button show (`environmentIdentificationMode`).
     pub(super) fn stage_art(&self) -> Option<StageArt> {
         let mode = self.client_settings.values.get("environmentIdentificationMode").as_str().unwrap_or("artwork");
-        let version = self.server_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        // The primary server's stage, as the web's `primaryServerConfigAtom`.
+        let version = self.primary_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
         stage_art(mode, version)
     }
 
     /// The "Nightly" pill of `pill` mode, shown only on a Nightly server.
     fn stage_pill(&self) -> Option<&'static str> {
         let mode = self.client_settings.values.get("environmentIdentificationMode").as_str();
-        let version = self.server_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
+        let version = self.primary_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
         (mode == Some("pill") && version.is_some_and(is_nightly_version)).then_some("Nightly")
     }
 
@@ -879,7 +880,9 @@ impl Workspace {
             .as_deref()
             .filter(|_| facts.runtime_status().is_some())
             .or(thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
-        let provider = instance.and_then(|id| self.server_info().provider(id));
+        // The hovered thread's machine, which need not be the open one.
+        let info = self.env_info(&thread.environment_id);
+        let provider = instance.and_then(|id| info?.provider(id));
         let model = thread.model_selection.as_ref().map(|selection| {
             let found = provider.and_then(|p| p.models.iter().find(|m| m.slug == selection.model).map(|m| (p, m)));
             match found {
@@ -893,7 +896,7 @@ impl Workspace {
                 svg().path(path).size(px(12.)).text_color(tint.unwrap_or(tokens.foreground).grayscale().opacity(0.6));
             Some(line(mark.into_any_element(), model.into()))
         });
-        let machine = match self.server_info().machine_kind() {
+        let machine = match info.map_or("", |info| info.machine_kind()) {
             "desktop" | "mac-studio" | "mac-mini" => IconName::Monitor,
             "laptop" => IconName::Laptop,
             "cloud" => IconName::Cloud,
@@ -948,9 +951,7 @@ impl Workspace {
                         project.map(|p| line(project_icon(p, tokens, false, 12., self.favicon(p)), project_name(p))),
                     )
                     .children(
-                        self.server_info()
-                            .environment_label
-                            .clone()
+                        info.and_then(|info| info.environment_label.clone())
                             .map(|label| line(muted_icon(machine), label.into())),
                     )
                     .children(thread.branch.clone().map(|branch| line(muted_icon(IconName::GitBranch), branch.into())))
@@ -1670,7 +1671,7 @@ impl Workspace {
             thread.model_selection.as_ref().map(|m| m.instance_id.as_str())
         }
         .or(thread.provider_instance_id.as_deref())?;
-        let driver = &self.server_info().provider(instance)?.driver;
+        let driver = &self.env_info(&thread.environment_id)?.provider(instance)?.driver;
         let (path, tint) = crate::assets::provider_icon(driver)?;
         let color = tint.unwrap_or(foreground);
         Some(svg().path(path).size(px(14.)).flex_none().text_color(color.opacity(0.6)).into_any_element())

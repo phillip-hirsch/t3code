@@ -19,6 +19,7 @@ use crate::desktop::links::{self, AppLink, LinkedPrompt, NewThreadLink, Reposito
 use crate::desktop::settings::WindowRect;
 use crate::desktop::window_state::{self, BoundsPersistence};
 use crate::desktop::{self, Desktop};
+use crate::model::ProjectShell;
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest, terminology};
 
 /// `MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS`.
@@ -194,9 +195,14 @@ impl Workspace {
     /// `NewThreadLinkView`'s launch decision: the pull request's thread, a draft in the
     /// repository's most recent project, or a draft without a project.
     fn launch_new_thread_link(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
+        // Every machine's "No project" folder is left out, not only the open one's.
+        let scratch = |p: &ProjectShell| {
+            self.env_info(&p.environment_id).and_then(|info| info.scratch_workspace_root.as_deref())
+                == Some(p.workspace_root.as_str())
+        };
         let recent: Vec<_> = crate::inbox::projects_by_recency(&self.shell.projects, &self.shell.threads)
             .into_iter()
-            .filter(|p| Some(p.workspace_root.as_str()) != self.server_info().scratch_workspace_root.as_deref())
+            .filter(|p| !scratch(p))
             .collect();
         match &link {
             NewThreadLink::New { repository: None, .. } => self.open_scratch_draft(link, window, cx),
@@ -210,22 +216,28 @@ impl Workspace {
                 }
             }
             NewThreadLink::PullRequest { pull_request, .. } => {
-                let projects: Vec<String> =
-                    links::find_projects(&recent, &pull_request.repository).iter().map(|p| p.id.clone()).collect();
-                if projects.is_empty() {
+                let found = links::find_projects(&recent, &pull_request.repository);
+                if found.is_empty() {
                     let repository = pull_request.repository.clone();
                     self.show_link_page(LinkPage::MissingRepository { link, repository }, cx);
                     return;
                 }
-                let Some(client) = self.client() else { return };
-                let project_id = projects[0].clone();
+                let project_id = found[0].id.clone();
+                // Each project asks the machine it lives on.
+                let projects: Vec<_> = found
+                    .iter()
+                    .filter_map(|p| Some((p.id.clone(), p.environment_id.clone(), self.env_client(&p.environment_id)?)))
+                    .collect();
+                if projects.is_empty() {
+                    return;
+                }
                 self.show_link_page(LinkPage::Opening, cx);
                 let repository = format!("{}/{}", pull_request.repository.owner, pull_request.repository.name);
                 let number = pull_request.number;
                 self.desktop._link_task = Some(cx.spawn_in(window, async move |this, cx| {
                     // A pull request's thread can be an older settled thread the shell no longer holds.
                     let mut found = None;
-                    for project_id in projects {
+                    for (project_id, environment, client) in projects {
                         let input = json!({"projectId": project_id, "repository": repository, "number": number});
                         let Ok(answer) = client.request("pullRequests.linkedThreads", input).await else { continue };
                         found = answer["threads"]
@@ -233,7 +245,7 @@ impl Workspace {
                             .into_iter()
                             .flatten()
                             .find(|t| t["archivedAt"].is_null())
-                            .and_then(|t| t["id"].as_str().map(str::to_owned));
+                            .and_then(|t| t["id"].as_str().map(|id| (environment, id.to_owned())));
                         if found.is_some() {
                             break;
                         }
@@ -241,10 +253,10 @@ impl Workspace {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let NewThreadLink::PullRequest { pull_request, prompt } = &link else { return };
                         match found {
-                            Some(thread_id) => {
+                            Some((environment, thread_id)) => {
                                 this.desktop.link_page = Some(LinkPage::Opened { link: link.clone() });
                                 let prompt = prompt.clone();
-                                this.select_thread(thread_id, window, cx);
+                                this.select_thread_in(environment, thread_id, window, cx);
                                 if let Some(prompt) = prompt {
                                     this.place_linked_prompt(prompt, Vec::new(), window, cx);
                                 }

@@ -434,7 +434,9 @@ impl Workspace {
     }
 
     fn refresh_provider_status(&mut self, instance_id: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        // The reply is this environment's, even if the user switches meanwhile.
+        let Some(environment) = self.active_environment().cloned() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         if self.banners.refreshing_provider {
             return;
         }
@@ -447,7 +449,9 @@ impl Workspace {
                 this.banners.refreshing_provider = false;
                 match result {
                     Ok(reply) => {
-                        let _ = this.server_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
+                        if let Some(info) = this.env_info_mut(&environment) {
+                            let _ = info.apply(&json!({"type": "providerStatuses", "payload": reply}));
+                        }
                     }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
@@ -494,10 +498,12 @@ impl Workspace {
             Connection::Failed(reason) => (false, Some(reason.clone())),
             _ => return None,
         };
-        if !self.banners.was_connected || (reconnecting && !self.banners.reconnect_warning) {
+        // `connection` is the primary's; a saved environment's state shows in the footer.
+        if !self.banners.was_connected || (reconnecting && !self.banners.reconnect_warning) || !self.target_on_primary()
+        {
             return None;
         }
-        let label = self.server_info().environment_label.clone().unwrap_or_else(|| "Server".into());
+        let label = self.primary_info().environment_label.clone().unwrap_or_else(|| "Server".into());
         let title = format!("{label} is {}", if reconnecting { "reconnecting" } else { "offline" });
         let actions = (!reconnecting).then(|| {
             Button::new("reconnect-server")
@@ -738,7 +744,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(thread_id) else { return };
         let reset_passed =
             update["resetAt"].as_str().and_then(parse_ms).is_none_or(|reset| reset <= crate::timestamp::now_ms());
         if snooze && update["snooze"] == true && reset_passed {

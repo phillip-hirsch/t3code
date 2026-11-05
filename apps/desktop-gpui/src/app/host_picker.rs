@@ -182,6 +182,7 @@ impl Workspace {
             return;
         }
         self.target = Some(Target::Draft { env, project_id });
+        self.sync_attachment_uploads(cx);
         self.model_override = None;
         self.notify_sidebar(cx);
         cx.notify();

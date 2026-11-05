@@ -193,9 +193,10 @@ impl Workspace {
         if self.side_chat_disabled_reason().is_some() || self.side_chat.starting {
             return;
         }
-        let (Some(client), Some(Target::Thread { id: source, .. })) = (self.client(), self.target.clone()) else {
+        let (Some(client), Some(Target::Thread { env, id: source })) = (self.client(), self.target.clone()) else {
             return;
         };
+        let origin = Target::Thread { env, id: source.clone() };
         self.side_chat.starting = true;
         let target = new_id();
         let fork = json!({
@@ -221,17 +222,25 @@ impl Workspace {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.side_chat.starting = false;
+                // On the socket it was forked on: the shell may not list the side chat yet.
+                let delete_unused = |cx: &mut Context<Self>| {
+                    let (client, command) = (client.clone(), delete_command(&target, true));
+                    cx.spawn(async move |_, _| client.request("orchestration.dispatchCommand", command).await).detach();
+                };
                 let failure = match (forked, sent) {
                     (Err(error), _) => Some(error.to_string()),
                     (Ok(_), Some(Err(error))) => {
                         // Drops the empty side chat the failed send left behind.
-                        this.dispatch(delete_command(&target, true), cx);
+                        delete_unused(cx);
                         Some(error.to_string())
                     }
                     _ => None,
                 };
                 match failure {
                     Some(error) => this.error = Some(error.into()),
+                    // The source thread left the screen meanwhile; its tab would open on another
+                    // thread's panel, so a side chat that never ran goes.
+                    None if this.target.as_ref() != Some(&origin) => delete_unused(cx),
                     None => {
                         this.open_surface(Surface::SideChat(target), window, cx);
                         on_started(this, window, cx);

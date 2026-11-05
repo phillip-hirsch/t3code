@@ -11,7 +11,8 @@ use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px, relative,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
+    relative,
 };
 use serde_json::json;
 
@@ -37,7 +38,7 @@ pub(super) struct MenuState {
     loading: bool,
     _search: Option<Task<()>>,
     /// Provider/checkout pairs already asked for a workspace skills snapshot.
-    snapshots_requested: HashSet<(String, String)>,
+    snapshots_requested: HashSet<(Option<SharedString>, String, String)>,
 }
 
 impl Workspace {
@@ -129,7 +130,7 @@ impl Workspace {
 
     /// `server.refreshProviders` for one checkout, so `$` and `/` list its skills.
     fn request_workspace_snapshot(&mut self, instance_id: &str, cwd: &str, cx: &mut Context<Self>) {
-        let key = (instance_id.to_owned(), cwd.to_owned());
+        let key = (self.active_environment().cloned(), instance_id.to_owned(), cwd.to_owned());
         let Some(client) = self.client().filter(|_| self.menu.snapshots_requested.insert(key)) else { return };
         let input = json!({"instanceId": instance_id, "cwd": cwd, "workspaceSnapshotsOnDemand": true});
         cx.spawn(async move |this, cx| {

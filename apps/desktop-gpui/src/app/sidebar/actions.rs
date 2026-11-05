@@ -491,7 +491,7 @@ impl Workspace {
             level: PromptLevel::Critical,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
-            if this.client().is_some() {
+            if this.thread_client(&thread_id).is_some() {
                 this.expire_undo(&thread_id);
                 this.thread_command("thread.delete", &thread_id, json!({}), cx);
             }
@@ -616,7 +616,8 @@ impl Workspace {
         let now = now_ms();
         let requests = inbox::child_requests(&self.shell.threads);
         let facts = Facts::new(thread, &requests);
-        let info = &self.server_info();
+        // The thread's own machine: the menu can open on any listed thread.
+        let info = self.env_info(&thread.environment_id).unwrap_or_else(|| self.server_info());
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let sidebar = origin == MenuOrigin::Sidebar;
         let groups = self.project_groups();
