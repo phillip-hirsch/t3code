@@ -95,6 +95,7 @@ impl ToolVersions {
 #[serde(rename_all = "camelCase")]
 pub struct PlatformAvailability {
     pub platform: String,
+    #[serde(default)]
     pub available: bool,
     pub reason: Option<String>,
 }
@@ -158,6 +159,10 @@ impl DeviceState {
 
     pub fn local_host(&self) -> Option<&HostSummary> {
         self.hosts.iter().find(|host| host.kind == "local")
+    }
+
+    pub fn platforms(&self, host_id: &str) -> Option<&[PlatformAvailability]> {
+        self.hosts.iter().find(|host| host.id == host_id).map(|host| host.platforms.as_slice())
     }
 
     /// `deviceHubReadiness`: `host_status` only tracks this machine. A machine without simulator

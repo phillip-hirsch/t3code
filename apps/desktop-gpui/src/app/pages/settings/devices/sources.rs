@@ -3,10 +3,8 @@
 //! editors that add and change them.
 //!
 //! GPUI connects to one environment, so each row has one environment's answer and the
-//! web's per-environment breakdowns and partial-availability dots never appear. Writes
-//! are plain global `server.updateSettings` patches: the web disables this list in a
-//! project or checkout scope, which waits on the shared scope layer.
-//! The section card below is a private stand-in for the shared settings widgets.
+//! web's per-environment breakdowns and partial-availability dots never appear. Statuses
+//! come from the workspace's `subscribeDeviceState` stream (`Workspace::devices`).
 
 mod editors;
 mod hosts;
@@ -23,24 +21,20 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     Anchor, AnyElement, App, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
-use self::hosts::{DeviceState, EasHost, PlatformAvailability, SimlockHost, SourceStatus, SshHost, Tone};
+use self::hosts::{EasHost, SimlockHost, SourceStatus, SshHost, Tone};
 use crate::app::Workspace;
-use crate::rpc::{RpcClient, RpcError, StreamEvent};
+use crate::device::{DeviceState, PlatformAvailability};
+use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{Tokens, tokens};
 
-/// The live `subscribeDeviceState` answer and this list's own in-flight work. It lives
-/// while the section renders; leaving the section ends the subscription.
+/// This list's own in-flight work, kept while the section renders.
 #[derive(Default)]
 pub(super) struct DeviceSources {
-    state: Option<DeviceState>,
-    /// A subscription is open; it closes with the connection and reopens on the next render.
-    subscribed: bool,
-    _stream: Option<Task<()>>,
     /// A settings write from a row is in flight.
     busy: bool,
     /// SSH hosts whose "Test connection" from the row menu is running.
@@ -80,17 +74,12 @@ struct SourceRow {
 impl Workspace {
     pub(in crate::app) fn render_device_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let sources = window.use_keyed_state("device-sources", cx, |_, _| DeviceSources::default());
-        if !sources.read(cx).subscribed {
-            if let Some(client) = self.client() {
-                subscribe(&sources, client, cx);
-            }
-        }
         let t = *tokens(cx);
         let settings = &self.server_info.settings;
         let enabled = settings.bool("enableDeviceSupport");
         let simlock_enabled = settings.bool("simlockDeviceHostsEnabled");
         let model = sources.read(cx);
-        let state = model.state.as_ref();
+        let state = self.devices.state.as_ref();
         let supports_eas = state.is_some_and(|state| state.supports_eas_hosts);
         let supports_simlock = state.is_some_and(|state| state.supports_simlock_hosts) && simlock_enabled;
         let disabled = model.busy || self.client().is_none();
@@ -416,35 +405,6 @@ impl Workspace {
     fn environment_name(&self) -> String {
         self.server_info.environment_label.clone().unwrap_or_else(|| "This environment".into())
     }
-}
-
-fn subscribe(sources: &Entity<DeviceSources>, client: RpcClient, cx: &mut App) {
-    let stream = client.stream("subscribeDeviceState", json!({}));
-    let weak = sources.downgrade();
-    let task = cx.spawn(async move |cx| {
-        while let Some(event) = stream.next().await {
-            let ended = matches!(event, StreamEvent::End(_));
-            let updated = weak.update(cx, |sources, cx| {
-                match event {
-                    StreamEvent::Item(value) => match serde_json::from_value(value) {
-                        Ok(state) => sources.state = Some(state),
-                        Err(error) => log::warn!("bad device state: {error}"),
-                    },
-                    // A dropped socket reopens with the next connection; a refusal stays closed.
-                    StreamEvent::End(Ok(()) | Err(RpcError::Disconnected(_))) => sources.subscribed = false,
-                    StreamEvent::End(Err(error)) => log::warn!("device state stream failed: {error}"),
-                }
-                cx.notify();
-            });
-            if ended || updated.is_err() {
-                break;
-            }
-        }
-    });
-    sources.update(cx, |sources, _| {
-        sources.subscribed = true;
-        sources._stream = Some(task);
-    });
 }
 
 fn source_rows(

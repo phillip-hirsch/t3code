@@ -8,7 +8,7 @@
 //! GPUI talks to one environment, so the web's per-environment plans reduce to one host
 //! list, and `groupDeviceHosts` (which only merges lists across environments) has no port.
 
-use std::collections::HashMap;
+use crate::device::{DeviceState, HostStatus};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -324,70 +324,6 @@ pub(super) fn plan_simlock_save(
     Ok(update_simlock_hosts(hosts, &SimlockHost { agent_token, ..draft.clone() }, false))
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub(super) struct PlatformAvailability {
-    pub platform: String,
-    #[serde(default)]
-    pub available: bool,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(super) struct HostSummary {
-    pub id: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub platforms: Vec<PlatformAvailability>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct HostStatus {
-    pub status: String,
-    #[serde(default)]
-    pub detail: Option<String>,
-    #[serde(default)]
-    pub android_discovery_incomplete: bool,
-}
-
-/// The parts of `DeviceServiceState` the sources list reads. On the wire, EAS and
-/// Simlock summaries travel apart from `hosts`.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct DeviceState {
-    #[serde(default)]
-    pub supports_host_retry: bool,
-    #[serde(default)]
-    pub supports_eas_hosts: bool,
-    #[serde(default)]
-    pub supports_simlock_hosts: bool,
-    #[serde(default)]
-    pub host_statuses: HashMap<String, HostStatus>,
-    #[serde(default)]
-    hosts: Vec<HostSummary>,
-    #[serde(default)]
-    eas_hosts: Vec<HostSummary>,
-    #[serde(default)]
-    simlock_hosts: Vec<HostSummary>,
-}
-
-impl DeviceState {
-    pub fn local_host(&self) -> Option<&HostSummary> {
-        self.hosts.iter().find(|host| host.kind == "local")
-    }
-
-    pub fn platforms(&self, host_id: &str) -> Option<&[PlatformAvailability]> {
-        self.hosts
-            .iter()
-            .chain(&self.eas_hosts)
-            .chain(&self.simlock_hosts)
-            .find(|host| host.id == host_id)
-            .map(|host| host.platforms.as_slice())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tone {
     Pending,
@@ -407,10 +343,10 @@ pub(super) struct SourceStatus {
 pub(super) fn host_status(state: Option<&DeviceState>, host_id: &str) -> Option<SourceStatus> {
     let Some(state) = state else { return Some(SourceStatus { tone: Tone::Pending, label: "Loading", detail: None }) };
     let status = state.host_statuses.get(host_id)?;
-    let (tone, label) = match status.status.as_str() {
-        "ready" if status.android_discovery_incomplete => (Tone::Warning, "Android list may be incomplete"),
-        "installing" | "starting" => (Tone::Pending, "Starting"),
-        "failed" => (Tone::Error, "Failed"),
+    let (tone, label) = match status.status {
+        HostStatus::Ready if status.android_discovery_incomplete => (Tone::Warning, "Android list may be incomplete"),
+        HostStatus::Installing | HostStatus::Starting => (Tone::Pending, "Starting"),
+        HostStatus::Failed => (Tone::Error, "Failed"),
         _ => return None,
     };
     Some(SourceStatus { tone, label, detail: status.detail.clone() })
@@ -595,14 +531,14 @@ mod tests {
     #[test]
     fn host_status_names_what_is_not_simply_working() {
         assert_eq!(host_status(None, "mac").map(|status| status.label), Some("Loading"));
-        let state: DeviceState = serde_json::from_value(serde_json::json!({
+        let state = DeviceState::decode(&serde_json::json!({
             "hostStatuses": {
                 "ready": {"status": "ready"},
                 "partial": {"status": "ready", "androidDiscoveryIncomplete": true},
                 "boot": {"status": "starting", "detail": "Installing hub"},
                 "down": {"status": "failed", "detail": "ssh: timeout"},
             },
-            "hosts": [], "easHosts": [{"id": "eas", "kind": "eas", "platforms": [{"platform": "ios", "available": true}]}],
+            "hosts": [], "easHosts": [{"id": "eas", "kind": "eas", "label": "EAS", "platforms": [{"platform": "ios", "available": true}]}],
         }))
         .unwrap();
         assert_eq!(host_status(Some(&state), "ready"), None);
