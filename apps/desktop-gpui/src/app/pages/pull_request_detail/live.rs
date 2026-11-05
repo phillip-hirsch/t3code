@@ -42,6 +42,7 @@ impl Workspace {
             Some(panel) => {
                 self.pull_requests.panel = Some(panel);
                 self.rebuild_pr_timeline();
+                self.read_pr_avatars(cx);
                 cx.notify();
                 true
             }

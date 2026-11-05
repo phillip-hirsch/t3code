@@ -450,6 +450,51 @@ pub(super) fn ancestors(path: &str) -> Vec<String> {
     out
 }
 
+/// One ordered write queue per file (`FileSaveCoordinator`): every edit is a new revision, at
+/// most one write is in flight, and the newest revision is written after it settles, so a
+/// revert made while a write is in flight is still written.
+#[derive(Debug, Default)]
+pub(super) struct SaveQueue {
+    revision: u64,
+    confirmed: u64,
+    writing: bool,
+}
+
+impl SaveQueue {
+    /// An edit; true when a debounced write should be scheduled (none in flight).
+    pub(super) fn change(&mut self) -> bool {
+        self.revision += 1;
+        !self.writing
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Edits not yet confirmed on disk, or a write in flight.
+    pub(super) fn pending(&self) -> bool {
+        self.writing || self.revision != self.confirmed
+    }
+
+    /// Starts a write of the newest revision unless one is in flight or nothing is unwritten.
+    pub(super) fn start(&mut self) -> Option<u64> {
+        if self.writing || self.revision == self.confirmed {
+            return None;
+        }
+        self.writing = true;
+        Some(self.revision)
+    }
+
+    /// Settles a write; true when newer edits arrived meanwhile and need their own write.
+    pub(super) fn finish(&mut self, revision: u64, ok: bool) -> bool {
+        self.writing = false;
+        if ok {
+            self.confirmed = revision;
+        }
+        self.revision != revision
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +618,23 @@ mod tests {
         assert_eq!(absolute_path("/home/me/repo", "src/a.rs"), "/home/me/repo/src/a.rs");
         assert_eq!(absolute_path("/repo", "/etc/hosts"), "/etc/hosts");
         assert_eq!(split_path("a/b/c.rs"), ("c.rs", "a/b"));
+    }
+
+    #[test]
+    fn save_queue_writes_a_revert_made_during_a_write() {
+        let mut queue = SaveQueue::default();
+        assert!(queue.change(), "an edit schedules a write");
+        let first = queue.start().unwrap();
+        assert!(!queue.change(), "the revert waits for the write in flight");
+        assert_eq!(queue.start(), None, "writes are serialized");
+        assert!(queue.finish(first, true), "the revert still needs its own write");
+        let revert = queue.start().unwrap();
+        assert!(!queue.finish(revert, true));
+        assert!(!queue.pending());
+
+        queue.change();
+        let failed = queue.start().unwrap();
+        assert!(!queue.finish(failed, false), "a failed write with no newer edits is not retried");
+        assert!(queue.pending(), "but its edits stay unsaved");
     }
 }

@@ -283,10 +283,21 @@ impl Workspace {
         self.pull_requests.parked.get_mut(key)
     }
 
-    /// Reads the detail and its activity; each lands on its own.
+    fn shown_pr_key(&self) -> Option<String> {
+        self.pull_requests.panel.as_ref().map(|p| p.reference.key())
+    }
+
+    /// Reads the shown pull request's detail and activity.
     fn read_pr_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.shown_pr_key() {
+            self.read_pr_detail_of(&key, cx);
+        }
+    }
+
+    /// Reads the detail and activity of the pull request `key` names, shown or parked; each lands on its own.
+    fn read_pr_detail_of(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
         panel.detail_loading = true;
         panel.activity_loading = true;
         let key = panel.reference.key();
@@ -347,8 +358,14 @@ impl Workspace {
 
     /// Refresh: the host is asked again rather than the server's cache.
     fn refresh_pr_from_host(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.shown_pr_key() {
+            self.refresh_pr_from_host_of(&key, cx);
+        }
+    }
+
+    fn refresh_pr_from_host_of(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
         panel.refreshing = true;
         let key = panel.reference.key();
         let input = json!({"reference": panel.reference.to_json()});
@@ -357,8 +374,10 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
-                this.read_pr_detail(cx);
-                this.refresh_pr_code(cx);
+                this.read_pr_detail_of(&key, cx);
+                if this.shown_pr_key().as_deref() == Some(key.as_str()) {
+                    this.refresh_pr_code(cx);
+                }
             });
         })
         .detach();
@@ -385,8 +404,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(key) = self.shown_pr_key() {
+            self.perform_pr_action_on(&key, action, method, update_method, window, cx);
+        }
+    }
+
+    /// `perform` on the pull request `key` names, shown or parked.
+    fn perform_pr_action_on(
+        &mut self,
+        key: &str,
+        action: &'static str,
+        method: Option<&'static str>,
+        update_method: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
         }
@@ -428,9 +462,9 @@ impl Workspace {
                             _ => {}
                         }
                         if logic::needs_host_refresh(action) {
-                            this.refresh_pr_from_host(cx);
+                            this.refresh_pr_from_host_of(&key, cx);
                         } else {
-                            this.read_pr_detail(cx);
+                            this.read_pr_detail_of(&key, cx);
                         }
                         this.read_pull_requests(false, cx);
                     }
