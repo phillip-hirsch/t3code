@@ -68,6 +68,8 @@ wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 webview2-com = "0.38"
 windows-core = "0.61"
 win32job = "2"
+# DPAPI for saved environments' bearer tokens.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 # gpui-base 0.9.0 plus one patch (text decorations on the textarea); see vendor/README.md.
 [patch.crates-io]

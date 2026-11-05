@@ -35,6 +35,7 @@ mod composer_plan;
 mod context_strip;
 mod desktop;
 mod details;
+pub(crate) mod environments;
 mod files;
 mod find;
 mod git;
@@ -244,6 +245,8 @@ pub struct Workspace {
     desktop: desktop::DesktopShell,
     /// Running threads synced in the background.
     keep_alive: keep_alive::KeepAlive,
+    /// Paired remote environments and their background connections.
+    saved_environments: Entity<environments::SavedEnvironments>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -258,7 +261,9 @@ impl Workspace {
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let weak = cx.weak_entity();
+        let saved_environments = cx.new(environments::SavedEnvironments::new);
         let subscriptions = vec![
+            cx.observe(&saved_environments, |_, _, cx| cx.notify()),
             cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::Change = event {
                     this.on_composer_change(cx);
@@ -383,6 +388,7 @@ impl Workspace {
             banners: Default::default(),
             desktop,
             keep_alive: Default::default(),
+            saved_environments,
             _subscriptions: subscriptions,
         }
     }
@@ -390,7 +396,7 @@ impl Workspace {
     /// Starts or finds the server, then keeps one socket open, reconnecting after drops.
     fn connect(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn_in(window, async move |this, cx| {
-            let resolved = runtime().spawn(backend::resolve_endpoint()).await;
+            let resolved = runtime().spawn(crate::environments::resolve_workspace_endpoint()).await;
             let endpoint = match resolved {
                 Ok(Ok((endpoint, server))) => {
                     log::info!("server ready at {}", endpoint.http_base);

@@ -6,6 +6,7 @@ mod composer_search;
 mod composer_text;
 mod desktop;
 mod device;
+mod environments;
 mod inbox;
 mod keybindings;
 mod model;

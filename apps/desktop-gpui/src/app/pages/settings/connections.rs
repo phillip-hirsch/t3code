@@ -2,9 +2,9 @@
 //!
 //! Environments (`ConnectionsSettings view="environments"`), Sharing & access
 //! (`ConnectionsSettings view="access"`) and Secrets (`SecretsSettingsPanel`).
-//! This app is one environment's client with no desktop bridge and no T3 Connect
-//! account, so it renders what the web renders in that case: no saved-environment
-//! catalog, no network/Tailscale/WSL controls, no T3 Connect rows. None of these
+//! This app keeps a catalog of paired remote environments (`saved.rs`) but has no
+//! network/Tailscale/WSL controls and no T3 Connect account, so it renders what the
+//! web renders without them: no network exposure or T3 Connect rows. None of these
 //! sections has a plain scoped setting row; secret providers are environment-wide
 //! (read-only under a project scope in the web).
 //!
@@ -15,6 +15,7 @@ mod access;
 mod environments;
 mod exposure;
 mod logic;
+mod saved;
 mod secrets;
 mod ui;
 

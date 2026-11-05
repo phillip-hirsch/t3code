@@ -1,7 +1,8 @@
-//! Environments (`ConnectionsSettings view="environments"`): saved remote
-//! environments and this environment's linked environments
-//! (`LinkedEnvironmentsSettings.tsx`). Load balancing and pull request sharing
-//! need two environments, so a one-environment client never shows them.
+//! Environments (`ConnectionsSettings view="environments"`): this app's local
+//! environment switch and saved remote environments (`saved.rs`), then this
+//! environment's linked environments (`LinkedEnvironmentsSettings.tsx`). Load
+//! balancing and pull request sharing route work across environments, which this
+//! client does not do yet, so it never shows them.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
@@ -14,7 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::super::widgets::{RowFrame, section_with_action, settings_section};
+use super::super::widgets::{RowFrame, section_with_action};
 use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone, Session};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, success_toast};
@@ -71,7 +72,7 @@ impl Workspace {
             });
         }
         let t = *theme::tokens(cx);
-        let mut sections = vec![saved_environments(&t)];
+        let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
         let info = &self.server_info;
         let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
         let readable = state.read(cx).session.as_ref().is_some_and(|s| s.grants(ACCESS_READ));
@@ -113,38 +114,6 @@ impl Workspace {
         };
         section_with_action("linked-environments", "Linked environments", action, rows, t)
     }
-}
-
-/// The saved-environments section. This client keeps no catalog of other
-/// environments, so it has nothing to add and shows the web's empty state without
-/// the "Add environment" hint.
-fn saved_environments(t: &Tokens) -> AnyElement {
-    let empty = v_flex()
-        .min_h(px(208.))
-        .p(px(48.))
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .mb(px(24.))
-                .size(px(36.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .border_1()
-                .border_color(t.border)
-                .bg(t.card)
-                .child(ui::glyph("icons/chevrons-left-right-ellipsis.svg", 18., t.foreground)),
-        )
-        .child(
-            div()
-                .text_xl()
-                .line_height(px(28.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("No saved remote environments"),
-        );
-    settings_section("environments", "Environments", [empty.into_any_element()], t)
 }
 
 fn linked_row(

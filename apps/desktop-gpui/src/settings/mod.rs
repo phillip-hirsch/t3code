@@ -274,7 +274,7 @@ pub(crate) fn t3_home() -> Option<PathBuf> {
 }
 
 /// `<T3 home>/userdata`.
-pub fn userdata_dir() -> Option<PathBuf> {
+pub(crate) fn userdata_dir() -> Option<PathBuf> {
     Some(t3_home()?.join("userdata"))
 }
 

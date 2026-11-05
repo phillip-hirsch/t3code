@@ -1,0 +1,219 @@
+//! Saved remote environments and one background connection per enabled one
+//! (`connection/supervisor.ts`): connecting, connected, backing off, or blocked until a retry.
+//! The workspace's own thread and shell state stays on its one environment.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use gpui_kit::{Context, Task};
+
+use crate::environments::{self, Catalog, ConnectionState, Failure, Phase, SavedEnvironment};
+use crate::rpc::{self, ConnectOptions, RpcClient};
+use crate::runtime;
+
+#[derive(Default)]
+pub(crate) struct Session {
+    pub state: ConnectionState,
+    /// From the environment's descriptor, read on each attempt.
+    pub server_version: Option<String>,
+    pub machine: Option<String>,
+    /// The open socket while connected.
+    pub client: Option<RpcClient>,
+    _task: Option<Task<()>>,
+}
+
+pub(crate) struct SavedEnvironments {
+    catalog: Catalog,
+    sessions: HashMap<String, Session>,
+}
+
+impl SavedEnvironments {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let mut this = Self { catalog: Catalog::load(), sessions: HashMap::new() };
+        let ids: Vec<String> = this.catalog.environments.iter().map(|e| e.environment_id.clone()).collect();
+        for id in ids {
+            this.restart(&id, cx);
+        }
+        this
+    }
+
+    pub fn environments(&self) -> &[SavedEnvironment] {
+        &self.catalog.environments
+    }
+
+    pub fn session(&self, environment_id: &str) -> Option<&Session> {
+        self.sessions.get(environment_id)
+    }
+
+    pub fn local_environment_enabled(&self) -> bool {
+        self.catalog.local_environment_enabled
+    }
+
+    fn save(&self) -> Result<(), String> {
+        self.catalog.save().map_err(|error| format!("Could not save environments: {error}"))
+    }
+
+    /// Saves a paired environment and connects it (`registerPairingConnection`).
+    pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Result<(), String> {
+        let id = environment.environment_id.clone();
+        self.catalog.upsert(environment);
+        self.save()?;
+        self.restart(&id, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_enabled(&mut self, environment_id: &str, enabled: bool, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(environment) = self.catalog.get_mut(environment_id) else { return Ok(()) };
+        environment.enabled = enabled;
+        self.save()?;
+        self.restart(environment_id, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn rename(&mut self, environment_id: &str, label: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let label = environments::validate_label(label)?;
+        let Some(environment) = self.catalog.get_mut(environment_id) else { return Ok(()) };
+        environment.label = label;
+        self.save()?;
+        cx.notify();
+        Ok(())
+    }
+
+    /// Forgets the pairing and credential here; the session on that machine stays until revoked there.
+    pub fn remove(&mut self, environment_id: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        self.catalog.environments.retain(|environment| environment.environment_id != environment_id);
+        self.save()?;
+        self.sessions.remove(environment_id);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_local_environment_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.catalog.local_environment_enabled = enabled;
+        self.save()
+    }
+
+    /// Starts an environment's connection loop afresh (startup, switched on, paired again).
+    pub fn restart(&mut self, environment_id: &str, cx: &mut Context<Self>) {
+        let Some(environment) = self.catalog.get(environment_id).cloned() else { return };
+        let session = self.sessions.entry(environment_id.to_owned()).or_default();
+        session.state = ConnectionState::default();
+        session.client = None;
+        session._task = environment.enabled.then(|| Self::supervise(environment, 0, cx));
+        cx.notify();
+    }
+
+    /// `retryNow`: attempts at once, keeping the failure and attempt count on screen meanwhile.
+    pub fn retry(&mut self, environment_id: &str, cx: &mut Context<Self>) {
+        let Some(environment) = self.catalog.get(environment_id).cloned().filter(|e| e.enabled) else { return };
+        let Some(session) = self.sessions.get_mut(environment_id) else { return };
+        let failures = session.state.attempt;
+        session._task = Some(Self::supervise(environment, failures, cx));
+    }
+
+    fn update_session(&mut self, environment_id: &str, cx: &mut Context<Self>, update: impl FnOnce(&mut Session)) {
+        if let Some(session) = self.sessions.get_mut(environment_id) {
+            update(session);
+            cx.notify();
+        }
+    }
+
+    fn supervise(environment: SavedEnvironment, failures: u32, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let id = environment.environment_id.clone();
+            let mut failures = failures;
+            loop {
+                let attempt = failures + 1;
+                let entered = this.update(cx, |this, cx| {
+                    this.update_session(&id, cx, |s| {
+                        s.state =
+                            ConnectionState { phase: Phase::Connecting, attempt, retry_at: None, ..s.state.clone() };
+                    })
+                });
+                if entered.is_err() {
+                    return;
+                }
+                let attempt_result = runtime().spawn(connect(environment.clone())).await;
+                let result = attempt_result.unwrap_or_else(|error| Err((Failure::transport(error.to_string()), None)));
+                match result {
+                    Ok((client, descriptor)) => {
+                        failures = 0;
+                        let connected = this.update(cx, |this, cx| {
+                            this.update_session(&id, cx, |s| {
+                                s.state = ConnectionState { phase: Phase::Connected, attempt, ..Default::default() };
+                                s.server_version = descriptor.server_version.clone();
+                                s.machine = descriptor.machine();
+                                s.client = Some(client.clone());
+                            })
+                        });
+                        if connected.is_err() {
+                            return;
+                        }
+                        let reason = client.closed().await;
+                        let dropped = this.update(cx, |this, cx| {
+                            this.update_session(&id, cx, |s| {
+                                s.client = None;
+                                s.state.last_failure = Some(Failure::transport(reason));
+                            })
+                        });
+                        if dropped.is_err() {
+                            return;
+                        }
+                    }
+                    Err((failure, descriptor)) => {
+                        let blocks = failure.reason.blocks();
+                        let delay = (!blocks).then(|| {
+                            failures += 1;
+                            let random = getrandom::u32().unwrap_or(0) as f64 / u32::MAX as f64;
+                            environments::retry_delay_ms(failures - 1, random)
+                        });
+                        let failed = this.update(cx, |this, cx| {
+                            this.update_session(&id, cx, |s| {
+                                if let Some(descriptor) = &descriptor {
+                                    s.server_version = descriptor.server_version.clone();
+                                    s.machine = descriptor.machine();
+                                }
+                                s.state = ConnectionState {
+                                    phase: if blocks { Phase::Blocked } else { Phase::Backoff },
+                                    attempt,
+                                    retry_at: delay.map(|delay| crate::app::sidebar::now_ms() + delay as i64),
+                                    last_failure: Some(failure),
+                                };
+                            })
+                        });
+                        let Some(delay) = delay else { return };
+                        if failed.is_err() {
+                            return;
+                        }
+                        cx.background_executor().timer(Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// One attempt: the descriptor (identity and protocol), then the socket. Runs on the tokio runtime.
+async fn connect(
+    environment: SavedEnvironment,
+) -> Result<(RpcClient, environments::Descriptor), (Failure, Option<environments::Descriptor>)> {
+    let Some(endpoint) = environment.endpoint() else {
+        return Err((Failure::credential_missing(&environment), None));
+    };
+    let descriptor = environments::fetch_descriptor(&endpoint.http_base).await.map_err(|failure| (failure, None))?;
+    if descriptor.environment_id != environment.environment_id {
+        let failure = Failure::environment_mismatch(&environment.environment_id, &descriptor.environment_id);
+        return Err((failure, Some(descriptor)));
+    }
+    if let Some(failure) = descriptor.compatibility_error() {
+        return Err((failure, Some(descriptor)));
+    }
+    let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
+    match RpcClient::connect(runtime().handle(), options).await {
+        Ok(client) => Ok((client, descriptor)),
+        Err(error) if rpc::is_unauthorized(&error) => Err((Failure::http(401, &endpoint.ws_url()), Some(descriptor))),
+        Err(error) => Err((Failure::transport(format!("{error:#}")), Some(descriptor))),
+    }
+}
