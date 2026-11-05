@@ -183,22 +183,35 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
     for key in UNSET_SERVER_ENV {
         command.env_remove(key);
     }
+    // Like Electron, the server learns where the `t3` launcher is so agents can run it.
+    match crate::desktop::cli::Target::from_config(&config).map(|target| crate::desktop::cli::write_launcher(&target)) {
+        Some(Ok(launcher)) => {
+            command.env("T3CODE_CLI_PATH", launcher);
+        }
+        Some(Err(error)) => log::warn!("could not install t3 launcher: {error:#}"),
+        None => {}
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("start {} {}", config.node.display(), config.server_entry.display()))?;
     #[cfg(windows)]
     let job = contain(&child);
 
+    // Network access and Tailscale Serve, as `DesktopServerExposure` starts the server; the
+    // client still talks to it over loopback.
+    let desktop = crate::desktop::settings::DesktopSettings::load();
+    let (exposure, tailscale_serve_enabled, tailscale_serve_port) =
+        crate::desktop::exposure::for_launch(&desktop, port);
     let bootstrap = json!({
         "mode": "desktop",
         "noBrowser": true,
         "port": port,
         "t3Home": config.home,
-        "host": "127.0.0.1",
+        "host": exposure.bind_host,
         "desktopBootstrapToken": bootstrap_token(&secret, now_ms()),
         "desktopBootstrapSecret": secret,
-        "tailscaleServeEnabled": false,
-        "tailscaleServePort": 443,
+        "tailscaleServeEnabled": tailscale_serve_enabled,
+        "tailscaleServePort": tailscale_serve_port,
     });
     let mut stdin = child.stdin.take().context("server stdin")?;
     stdin.write_all(format!("{bootstrap}\n").as_bytes()).await?;

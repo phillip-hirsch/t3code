@@ -180,8 +180,9 @@ impl Workspace {
         self.settings_page("labs", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_about(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
+        let cli_row = self.about_cli_row(&t, window, cx);
         let policy = &self.server_info.managed_policy;
         let organization = policy["organization"].as_str().map(str::to_owned);
         let mut app = Vec::new();
@@ -207,10 +208,12 @@ impl Workspace {
         }
         app.push(
             RowFrame::new(version_title(&t))
-                .description(text("Current version of the application."))
+                .description(text(self.about_update_description()))
+                .control(self.about_update_button())
                 .render(&t)
                 .into_any_element(),
         );
+        app.extend(cli_row);
         app.push(
             RowFrame::new("Mobile app")
                 .description(text("Connect to your server from your phone or tablet."))

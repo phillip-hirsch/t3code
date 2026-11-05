@@ -6,6 +6,7 @@ mod agents;
 mod chat;
 pub(in crate::app) mod code;
 mod connections;
+mod desktop_rows;
 mod diffs;
 mod fields;
 mod general;
