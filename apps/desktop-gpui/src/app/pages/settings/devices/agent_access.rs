@@ -45,10 +45,10 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_setting_row(&AGENT_BROWSER_ACCESS, cx)
+        self.render_device_setting_row(&AGENT_BROWSER_ACCESS, cx)
     }
 
-    fn render_setting_row(&self, spec: &'static SettingRowSpec, cx: &mut Context<Self>) -> AnyElement {
+    fn render_device_setting_row(&self, spec: &'static SettingRowSpec, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let Control::Switch { default } = spec.control;
         let value = self.server_info.settings.get(spec.path).and_then(Value::as_bool).unwrap_or(default);
