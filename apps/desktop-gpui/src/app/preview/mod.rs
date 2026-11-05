@@ -13,7 +13,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, Focusable as _, FontWeight,
+    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, Focusable as _, FontWeight,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div, point, px,
 };
@@ -66,6 +66,9 @@ struct HostedTab {
     /// The page zoom and colour scheme last applied to the native view.
     zoom: f64,
     appearance: Option<Appearance>,
+    /// `browserDefaultZoomFactor` / `browserDefaultAppearance` when the tab was created; they
+    /// apply until the tab is adjusted (`browserDefaultTabState`).
+    defaults: (f64, Appearance),
     shown: bool,
     _events: Task<()>,
 }
@@ -173,10 +176,45 @@ impl Workspace {
         previews.sessions.iter().filter(|session| !session.server_hosted())
     }
 
-    /// The thread's focused tab, or its last drawable one when an agent focused a server tab.
+    /// The tab the panel shows, else the thread's focused tab, or its last drawable one when an
+    /// agent focused a server tab. Another client may move the focus without changing the panel.
     fn active_session(&self, thread_id: &str) -> Option<&Session> {
         let previews = self.preview.threads.get(thread_id)?;
-        previews.active().filter(|session| !session.server_hosted()).or_else(|| Self::hosted_sessions(previews).last())
+        let shown = match self.active_surface() {
+            Some(Surface::Browser(tab)) => previews.get(tab),
+            _ => None,
+        };
+        shown
+            .or_else(|| previews.active().filter(|session| !session.server_hosted()))
+            .or_else(|| Self::hosted_sessions(previews).last())
+    }
+
+    /// A tab's zoom and page colour scheme: its own, else the defaults it was created with.
+    fn tab_look(&self, session: &Session) -> (f64, Appearance) {
+        let defaults =
+            self.preview.tabs.get(&session.tab_id).map_or_else(|| self.browser_defaults(), |tab| tab.defaults);
+        (session.zoom_factor.unwrap_or(defaults.0), session.color_scheme.unwrap_or(defaults.1))
+    }
+
+    /// `browserDefaultZoomFactor` and `browserDefaultAppearance`.
+    fn browser_defaults(&self) -> (f64, Appearance) {
+        let settings = &self.client_settings.values;
+        let zoom = settings.get("browserDefaultZoomFactor").as_f64().unwrap_or(1.);
+        let appearance = serde_json::from_value(settings.get("browserDefaultAppearance").clone()).unwrap_or_default();
+        (zoom, appearance)
+    }
+
+    /// `useOpenLink`: a web link opens in a new browser tab when "Open links in" is the app,
+    /// else (and when that fails) in the system browser.
+    pub(super) fn open_link(&mut self, url: &str, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.modifiers();
+        let middle = matches!(event, ClickEvent::Mouse(click) if click.down.button == MouseButton::Middle);
+        let modified = modifiers.control || modifiers.platform || middle;
+        let in_app = preview::link_opens_in_app(url, modified, &self.client_settings.values, self.browser_available());
+        match self.preview_thread_id().map(str::to_owned).filter(|_| in_app) {
+            Some(thread_id) => self.request_preview_tab(thread_id, Some(url.to_owned()), true, window, cx),
+            None => cx.open_url(url),
+        }
     }
 
     /// `browserAvailable`: a thread to host tabs for.
@@ -349,10 +387,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.request_preview_tab(thread_id, url, false, window, cx);
+    }
+
+    /// `preview.open` with the default viewport; `external_fallback` opens `url` in the system
+    /// browser when the tab can't be opened, as `useOpenLink` does.
+    fn request_preview_tab(
+        &mut self,
+        thread_id: String,
+        url: Option<String>,
+        external_fallback: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.client() else { return };
         let mut input = json!({"threadId": thread_id});
         if let Some(url) = &url {
             input["url"] = url.clone().into();
+        }
+        let viewport = self.client_settings.values.get("browserDefaultViewport");
+        if viewport.is_object() {
+            input["viewport"] = viewport.clone();
         }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
@@ -370,7 +425,13 @@ impl Workspace {
                             this.preview.address.update(cx, |input, cx| input.focus(window, cx));
                         }
                     }
-                    Err(error) => this.error = Some(format!("Unable to open browser: {error}").into()),
+                    Err(error) => match url.as_deref().filter(|_| external_fallback) {
+                        Some(url) => {
+                            log::warn!("preview.open failed, opening the system browser: {error}");
+                            cx.open_url(url);
+                        }
+                        None => this.error = Some(format!("Unable to open browser: {error}").into()),
+                    },
                 }
                 this.after_preview_change(window, cx);
             });
@@ -427,7 +488,7 @@ impl Workspace {
         if text.trim().is_empty() {
             return;
         }
-        let url = match preview::resolve_address(text, preview::DEFAULT_SEARCH_TEMPLATE) {
+        let url = match preview::resolve_address(text, &preview::search_template(&self.client_settings.values)) {
             Ok(url) => url,
             Err(message) => {
                 self.error = Some(format!("Could not open this address. {message}").into());
@@ -552,6 +613,7 @@ impl Workspace {
                 reported: None,
                 zoom: 1.,
                 appearance: None,
+                defaults: self.browser_defaults(),
                 shown: false,
                 _events: pump,
             },
@@ -576,7 +638,14 @@ impl Workspace {
                 | NavStatus::LoadFailed { title, .. } => *title = new_title,
                 NavStatus::Idle => {}
             },
-            PageEvent::History => {}
+            // Same-document navigation (pushState, fragments) has no load events: read the URL.
+            PageEvent::History => {
+                if let Ok(current) = tab.view.read(cx).raw().url()
+                    && let NavStatus::Loading { url, .. } | NavStatus::Success { url, .. } = &mut tab.status
+                {
+                    *url = current;
+                }
+            }
             PageEvent::Failed { url, code, description } => {
                 tab.status = NavStatus::LoadFailed { url, title, code, description };
             }
@@ -683,12 +752,12 @@ impl Workspace {
             let session = self.preview.threads.get(&tab.thread_id).and_then(|p| p.get(tab_id));
             let view = tab.view.read(cx);
             if let Some(scale) = scale {
-                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(1.) * f64::from(scale);
+                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(tab.defaults.0) * f64::from(scale);
                 if (tab.zoom - zoom).abs() > 1e-6 {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);
                 }
-                let appearance = session.and_then(|s| s.color_scheme).unwrap_or_default();
+                let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
                 if tab.appearance != Some(appearance) {
                     tab.appearance = Some(appearance);
                     let _ = view.set_theme(match appearance {
@@ -880,8 +949,7 @@ impl Workspace {
                 }),
             );
         let Some(session) = session.filter(|_| self.preview.menu_open) else { return div().child(trigger) };
-        let zoom = session.zoom_factor.unwrap_or(1.);
-        let appearance = session.color_scheme.unwrap_or_default();
+        let (zoom, appearance) = self.tab_look(session);
         let preset = session.viewport.preset_id().map(str::to_owned);
         let fill = session.viewport.size().is_none();
 

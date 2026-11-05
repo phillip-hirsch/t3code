@@ -272,14 +272,43 @@ pub fn menu_actions(status: &VcsStatus, busy: bool) -> Vec<MenuAction> {
     vec![commit, push, create_pr]
 }
 
-/// `--diff-addition-foreground`: emerald 400 dark, 700 light.
-pub fn addition_color(tokens: &Tokens) -> Hsla {
-    rgb(if tokens.dark { 0x00d492 } else { 0x007a55 }).into()
+/// `diffColorScheme`, which `index.css` applies through `data-diff-color-scheme`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffColorScheme {
+    #[default]
+    RedGreen,
+    BlueOrange,
 }
 
-/// `--diff-deletion-foreground`: red 400 dark, 700 light.
-pub fn deletion_color(tokens: &Tokens) -> Hsla {
-    rgb(if tokens.dark { 0xff6467 } else { 0xc10007 }).into()
+impl DiffColorScheme {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        match settings.get("diffColorScheme").as_str() {
+            Some("blue-orange") => Self::BlueOrange,
+            _ => Self::RedGreen,
+        }
+    }
+}
+
+/// `--diff-addition-foreground`: emerald 400 dark, 700 light; blue 400 / 600 when blue-orange.
+pub fn addition_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    rgb(match (scheme, tokens.dark) {
+        (DiffColorScheme::RedGreen, true) => 0x00d492,
+        (DiffColorScheme::RedGreen, false) => 0x007a55,
+        (DiffColorScheme::BlueOrange, true) => 0x51a2ff,
+        (DiffColorScheme::BlueOrange, false) => 0x155dfc,
+    })
+    .into()
+}
+
+/// `--diff-deletion-foreground`: red 400 dark, 700 light; orange 400 / 600 when blue-orange.
+pub fn deletion_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    rgb(match (scheme, tokens.dark) {
+        (DiffColorScheme::RedGreen, true) => 0xff6467,
+        (DiffColorScheme::RedGreen, false) => 0xc10007,
+        (DiffColorScheme::BlueOrange, true) => 0xff8904,
+        (DiffColorScheme::BlueOrange, false) => 0xf54900,
+    })
+    .into()
 }
 
 /// `Intl.NumberFormat("en-US")` for a count.
@@ -356,6 +385,7 @@ impl Workspace {
                             }
                         }
                     }
+                    this.observe_proactive_panels(cx);
                     cx.notify();
                     ended
                 });

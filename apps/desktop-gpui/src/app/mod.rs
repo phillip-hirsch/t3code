@@ -630,6 +630,7 @@ impl Workspace {
                 }
                 this.refresh_rows(cx);
                 this.sync_question(window, cx);
+                this.observe_proactive_panels(cx);
             },
         ));
     }

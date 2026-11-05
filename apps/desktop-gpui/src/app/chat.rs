@@ -827,20 +827,14 @@ fn markdown_view(
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
-        .on_link_click(move |url, event, window, cx| match thread_link(url) {
-            Some(thread_id) => {
-                let _ = link_this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
-            }
-            None => {
-                let external = event.modifiers().secondary(cx);
-                let opened = !external
-                    && link_this
-                        .update(cx, |workspace, cx| workspace.open_change_request_link(url, cx))
-                        .unwrap_or(false);
-                if !opened {
-                    cx.open_url(url);
-                }
-            }
+        .on_link_click(move |url, event, window, cx| {
+            let _ = link_this.update(cx, |workspace, cx| match thread_link(url) {
+                Some(thread_id) => workspace.select_thread(thread_id, window, cx),
+                // A project's pull request opens in its panel (`pullRequestLinksOpenInApp`); Ctrl-click and
+                // every other link follow `browserLinkTarget`.
+                None if !event.modifiers().secondary(cx) && workspace.open_change_request_link(url, cx) => {}
+                None => workspace.open_link(url, event, window, cx),
+            });
         })
 }
 
