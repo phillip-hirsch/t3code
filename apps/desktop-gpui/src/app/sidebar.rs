@@ -1084,7 +1084,7 @@ fn guest_foreground(tokens: &Tokens) -> Hsla {
 /// `ProjectFavicon` without the repo favicon: a custom monogram, else one
 /// derived from the title (`ProjectMonogram.tsx`).
 /// `grayscale` shows it in gray until the row is hovered (`grayscale` in CSS).
-fn project_icon(project: &ProjectShell, tokens: &Tokens, grayscale: bool) -> AnyElement {
+pub(in crate::app) fn project_icon(project: &ProjectShell, tokens: &Tokens, grayscale: bool) -> AnyElement {
     let custom = project.project_icon.as_ref().filter(|icon| icon["kind"] == "monogram");
     let text = custom
         .and_then(|icon| icon["text"].as_str())

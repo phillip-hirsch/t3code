@@ -175,6 +175,8 @@ pub struct ServerInfo {
     pub new_projects_root: Option<String>,
     /// The raw `ServerSettings`, for settings rows not yet modelled above.
     pub settings: Value,
+    /// The raw `config` of the last snapshot, its `settings` kept current by `settingsUpdated`.
+    pub config: Value,
 }
 
 impl ServerInfo {
@@ -190,10 +192,20 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.config = config.clone();
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
-            "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "settingsUpdated" => self.set_settings(&event["payload"]["settings"])?,
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Takes a full `ServerSettings`, from `settingsUpdated` or `server.updateSettings`.
+    pub fn set_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.apply_settings(settings)?;
+        if let Some(config) = self.config.as_object_mut() {
+            config.insert("settings".into(), settings.clone());
         }
         Ok(())
     }
