@@ -10,18 +10,24 @@ use gpui_kit::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     Styled as _, Task, Window, div, px,
 };
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, settings_section};
 use super::{notify_error, now_ms, relative_label, text};
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::{Workspace, new_id, sidebar};
 use crate::model::ProjectShell;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+/// Projects with their archived threads, decoded once per load.
+type Groups = std::rc::Rc<[(ProjectShell, Vec<ArchivedThread>)]>;
+
 pub(super) struct ArchiveState {
-    snapshot: Option<Result<Value, String>>,
+    groups: Option<Result<Groups, String>>,
     _load: Option<Task<()>>,
 }
 
@@ -29,13 +35,13 @@ impl ArchiveState {
     /// `orchestration.getArchivedShellSnapshot`; the live shell leaves archived threads out.
     fn load(&mut self, client: Option<RpcClient>, cx: &mut Context<Self>) {
         let Some(client) = client else {
-            self.snapshot = Some(Err("Not connected to the server.".into()));
+            self.groups = Some(Err("Not connected to the server.".into()));
             return;
         };
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.getArchivedShellSnapshot", json!({})).await;
             let _ = this.update(cx, |this, cx| {
-                this.snapshot = Some(result.map_err(|error| error.to_string()));
+                this.groups = Some(result.map(|snapshot| groups(&snapshot).into()).map_err(|error| error.message()));
                 cx.notify();
             });
         }));
@@ -63,35 +69,40 @@ impl ArchivedThread {
 fn groups(snapshot: &Value) -> Vec<(ProjectShell, Vec<ArchivedThread>)> {
     let decode = |key: &str| snapshot[key].as_array().map(Vec::as_slice).unwrap_or_default();
     let mut threads: Vec<ArchivedThread> =
-        decode("threads").iter().filter_map(|t| serde_json::from_value(t.clone()).ok()).collect();
+        decode("threads").iter().filter_map(|t| ArchivedThread::deserialize(t).ok()).collect();
     threads.sort_by(|a, b| b.archived().cmp(a.archived()).then_with(|| b.id.cmp(&a.id)));
+    let mut by_project: HashMap<String, Vec<ArchivedThread>> = HashMap::new();
+    for thread in threads {
+        by_project.entry(thread.project_id.clone()).or_default().push(thread);
+    }
     decode("projects")
         .iter()
-        .filter_map(|p| serde_json::from_value::<ProjectShell>(p.clone()).ok())
+        .filter_map(|p| ProjectShell::deserialize(p).ok())
         .filter_map(|project| {
-            let (mine, rest) = std::mem::take(&mut threads).into_iter().partition(|t| t.project_id == project.id);
-            threads = rest;
-            let mine: Vec<ArchivedThread> = mine;
-            (!mine.is_empty()).then_some((project, mine))
+            let mine = by_project.remove(&project.id)?;
+            Some((project, mine))
         })
         .collect()
 }
 
 impl Workspace {
-    pub(super) fn render_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_archive(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let client = self.settings_client();
         let state = window.use_keyed_state("settings-archive", cx, |_, cx| {
-            let mut state = ArchiveState { snapshot: None, _load: None };
+            let mut state = ArchiveState { groups: None, _load: None };
             state.load(client, cx);
             state
         });
-        let groups = match &state.read(cx).snapshot {
-            Some(Ok(snapshot)) => groups(snapshot),
-            _ => Vec::new(),
-        };
-        if groups.is_empty() {
-            let (icon, title, description) = match &state.read(cx).snapshot {
+        let loaded = state.read(cx).groups.clone();
+        let groups = loaded.as_ref().and_then(|groups| groups.as_ref().ok()).filter(|groups| !groups.is_empty());
+        let Some(groups) = groups else {
+            let (icon, title, description) = match &loaded {
                 None => (
                     Spinner::new().small().color(t.muted_foreground).into_any_element(),
                     "Loading archived threads",
@@ -105,26 +116,24 @@ impl Workspace {
             };
             let title = h_flex().gap_2().child(icon).child(title);
             let row = RowFrame::new(title).description(text(description)).render(&t).into_any_element();
-            let view = self.settings_view();
             return self.settings_page(
                 "archived",
                 &view,
                 [settings_section("archived", "Archived threads", [row], &t)],
                 cx,
             );
-        }
+        };
         let now = now_ms();
         let sections: Vec<AnyElement> = groups
-            .into_iter()
+            .iter()
             .map(|(project, threads)| {
                 let rows: Vec<AnyElement> =
                     threads.iter().map(|thread| self.archived_row(thread, &state, now, &t, cx)).collect();
-                let icon = sidebar::project_icon(&project, &t, false, 16., self.favicon(&project));
+                let icon = sidebar::project_icon(project, &t, false, 16., self.favicon(project));
                 let title = h_flex().gap_2().child(icon).child(project.title.clone());
                 settings_section(SharedString::from(format!("archived-{}", project.id)), title, rows, &t)
             })
             .collect();
-        let view = self.settings_view();
         self.settings_page("archived", &view, sections, cx)
     }
 

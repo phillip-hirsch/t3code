@@ -21,16 +21,15 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, px,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
+use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
 use crate::app::{Workspace, new_id};
 use crate::settings::scope::ScopeKind;
@@ -67,23 +66,26 @@ impl ProjectsPanel {
     }
 }
 
-pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    let text = text.into();
-    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
-}
-
 fn toast_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString>, message: impl Into<SharedString>) {
     window.push_notification(Notification::error(message).title(title), cx);
 }
 
 impl Workspace {
-    pub(super) fn render_settings_projects_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_projects_panel(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let panel = window.use_keyed_state("settings-projects-panel", cx, ProjectsPanel::new);
         self.watch_project_name(&panel, window, cx);
-        let mut view = self.settings_view();
-        if self.follow_regrouped_project(&panel, &view, cx) {
-            view = self.settings_view();
-        }
+        let regrouped;
+        let view = if self.follow_regrouped_project(&panel, view, cx) {
+            regrouped = self.settings_view();
+            &regrouped
+        } else {
+            view
+        };
         let t = *theme::tokens(cx);
         let group = self.scoped_project_group(&view);
         let detail = group.is_some();
@@ -286,7 +288,7 @@ impl Workspace {
                     command.extend(fields);
                 }
                 if let Err(error) = client.request("projects.mutate", command).await {
-                    failure = Some(error.to_string());
+                    failure = Some(error.message());
                     break;
                 }
             }
@@ -350,6 +352,16 @@ impl Workspace {
     }
 
     /// `removeMembers`: confirm, then delete each checkout entry with its threads.
+    /// Removes one checkout of the group with this key, or all of them, looked up at the click
+    /// so rows don't hold copies of their group.
+    fn remove_group_members(&mut self, key: &str, checkout: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let view = self.settings_view();
+        let Some(group) = view.groups.iter().find(|group| group.key == key) else { return };
+        let members: Vec<Member> =
+            group.members.iter().filter(|m| checkout.is_none_or(|c| m.physical_key == c)).cloned().collect();
+        self.remove_project_members(group, members, window, cx);
+    }
+
     fn remove_project_members(
         &mut self,
         group: &ProjectGroup,
@@ -402,7 +414,7 @@ impl Workspace {
                 let result = client.request("projects.mutate", command).await;
                 let failed = this.update_in(cx, |this, window, cx| {
                     if let Err(error) = result {
-                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error.to_string());
+                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error.message());
                         return true;
                     }
                     // The project's draft goes with it.
@@ -745,13 +757,13 @@ impl Workspace {
                         })
                 };
             let remove = several.then(|| {
-                let (group, member) = (group.clone(), member.clone());
-                Button::new(ElementId::Name(format!("remove-checkout-{}", member.physical_key).into()))
+                let (key, checkout) = (group.key.clone(), member.physical_key.clone());
+                Button::new(ElementId::Name(format!("remove-checkout-{checkout}").into()))
                     .outline()
                     .small()
                     .label("Remove")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.remove_project_members(&group, vec![member.clone()], window, cx)
+                        this.remove_group_members(&key, Some(&checkout), window, cx)
                     }))
             });
             rows.push(
@@ -784,17 +796,14 @@ impl Workspace {
             )
         };
         let remove = {
-            let group = group.clone();
+            let key = group.key.clone();
             Button::new("remove-project")
                 .danger()
                 .outline()
                 .small()
                 .icon(Icon::new(IconName::Trash).size(px(16.)))
                 .label(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let members = group.members.clone();
-                    this.remove_project_members(&group, members, window, cx)
-                }))
+                .on_click(cx.listener(move |this, _, window, cx| this.remove_group_members(&key, None, window, cx)))
         };
         settings_section(
             "danger",

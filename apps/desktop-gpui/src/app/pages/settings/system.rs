@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use self::background::Profile;
 use super::widgets::{Part, RowFrame, SettingRow, rich_text, settings_section};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
 const GUEST_LINKS: &[Part] = &[
@@ -74,9 +75,13 @@ const MOBILE_STORES: [(&str, &str, &str, &str); 2] = [
 ];
 
 impl Workspace {
-    pub(super) fn render_settings_maintenance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_maintenance(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let connected = self.settings_client().is_some();
         let background = self.render_background_row(cx);
         let storage = self.render_storage_sections(window, cx);
@@ -125,9 +130,13 @@ impl Workspace {
         self.settings_page("maintenance", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_labs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_labs(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         // The web also shows this on while the removed legacy sidebar's opt-in
         // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
         let boring = view.bool("boringSidebarEnabled") || view.bool("legacySidebarEnabled");
@@ -199,7 +208,12 @@ impl Workspace {
         self.settings_page("labs", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_about(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let cli_row = self.about_cli_row(&t, window, cx);
         let policy = &self.settings_info().managed_policy;
@@ -266,13 +280,17 @@ impl Workspace {
                 .render(&t)
                 .into_any_element(),
         ];
-        let view = self.settings_view();
         let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
         self.settings_page("about", &view, sections, cx)
     }
 
-    pub(super) fn render_settings_archived(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_archive(window, cx)
+    pub(super) fn render_settings_archived(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_archive(view, window, cx)
     }
 
     fn settings_json(&self) -> &Value {
@@ -365,8 +383,10 @@ impl Workspace {
                 let key = background::DURATION_KEYS[index];
                 let seconds = resolved.seconds(index) as i64;
                 view.update(cx, |this, cx| {
-                    this.number_field(key, seconds, (min, i64::MAX, step), window, cx, move |this, seconds, window, cx| {
-                        let patch = background::override_patch(this.settings_json(), key, json!(seconds * 1000));
+                    // Saved in milliseconds, so the seconds must fit `i64` times 1000.
+                    let max = i64::MAX / 1000;
+                    this.number_field(key, seconds, (min, max, step), window, cx, move |this, seconds, window, cx| {
+                        let patch = background::override_patch(this.settings_json(), key, json!(seconds.saturating_mul(1000)));
                         this.update_settings(patch, window, cx)
                     })
                 })
@@ -528,14 +548,7 @@ fn now_ms() -> i64 {
 
 /// `formatRelativeTimeLabel` (`apps/web/src/timestampFormat.ts`).
 fn relative_label(iso: &str, now_ms: i64) -> String {
-    let Some(at) = crate::timestamp::parse_ms(iso) else { return String::new() };
-    let minutes = (now_ms - at).max(0) / 60_000;
-    match minutes {
-        0 => "just now".into(),
-        1..60 => format!("{minutes}m ago"),
-        60..1440 => format!("{}h ago", minutes / 60),
-        _ => format!("{}d ago", minutes / 1440),
-    }
+    crate::timestamp::parse_ms(iso).map_or_else(String::new, |at| super::ago_label(now_ms - at))
 }
 
 /// `formatBytes` (`apps/web/src/lib/formatBytes.ts`).

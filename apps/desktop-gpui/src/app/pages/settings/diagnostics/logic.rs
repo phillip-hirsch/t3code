@@ -529,14 +529,7 @@ pub(super) fn scale_max(values: impl Iterator<Item = f64>) -> f64 {
 
 /// `formatRelativeElapsed` as one label ("just now", "5m ago").
 pub(super) fn relative_label(iso: &str, now_ms: i64) -> Option<String> {
-    let elapsed = now_ms - crate::timestamp::parse_ms(iso)?;
-    let minutes = elapsed.max(0) / 60_000;
-    Some(match minutes {
-        0 => "just now".into(),
-        1..60 => format!("{minutes}m ago"),
-        60..1440 => format!("{}h ago", minutes / 60),
-        _ => format!("{}d ago", minutes / 1440),
-    })
+    Some(crate::app::pages::settings::ago_label(now_ms - crate::timestamp::parse_ms(iso)?))
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -290,25 +290,29 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let settings = &self.settings_info().settings;
-        let (patch, failed) = match &host {
-            RowHost::Ssh(host) => {
-                match hosts::update_device_hosts(&hosts::host_list(settings, "deviceHosts"), host, true, host) {
-                    Ok(next) => (json!({"deviceHosts": next}), "Device host not removed everywhere"),
-                    Err(error) => {
-                        notify_error(window, cx, "Device host not saved", error.to_owned());
-                        return;
-                    }
-                }
-            }
-            RowHost::Eas(host) => (
-                json!({"easDeviceHosts": hosts::update_eas_hosts(&hosts::host_list(settings, "easDeviceHosts"), host, true, false)}),
-                "EAS host not removed everywhere",
-            ),
-            RowHost::Simlock(host) => (
-                json!({"simlockDeviceHosts": hosts::update_simlock_hosts(&hosts::host_list(settings, "simlockDeviceHosts"), host, true)}),
-                "Simlock host not removed everywhere",
-            ),
+        let planned = match &host {
+            RowHost::Ssh(host) => hosts::host_list(settings, "deviceHosts").and_then(|saved| {
+                hosts::update_device_hosts(&saved, host, true, host)
+                    .map(|next| (json!({"deviceHosts": next}), "Device host not removed everywhere"))
+                    .map_err(str::to_owned)
+            }),
+            RowHost::Eas(host) => hosts::host_list(settings, "easDeviceHosts").map(|saved| {
+                (
+                    json!({"easDeviceHosts": hosts::update_eas_hosts(&saved, host, true, false)}),
+                    "EAS host not removed everywhere",
+                )
+            }),
+            RowHost::Simlock(host) => hosts::host_list(settings, "simlockDeviceHosts").map(|saved| {
+                (
+                    json!({"simlockDeviceHosts": hosts::update_simlock_hosts(&saved, host, true)}),
+                    "Simlock host not removed everywhere",
+                )
+            }),
             RowHost::Local => return,
+        };
+        let (patch, failed) = match planned {
+            Ok(planned) => planned,
+            Err(error) => return notify_error(window, cx, "Device host not saved", error),
         };
         let Some(client) = self.settings_client() else { return };
         let label = self.environment_name();
@@ -408,7 +412,7 @@ fn source_rows(
         host: RowHost::Local,
     }];
     let retry = state.is_some_and(|state| state.supports_host_retry);
-    for host in hosts::host_list::<SshHost>(settings, "deviceHosts") {
+    for host in hosts::readable_hosts::<SshHost>(settings, "deviceHosts") {
         let mut status = if testing.contains(&host.id) && enabled {
             Some(SourceStatus { tone: Tone::Pending, label: "Testing connection", detail: None })
         } else {
@@ -432,7 +436,7 @@ fn source_rows(
         });
     }
     if supports_eas {
-        for host in hosts::host_list::<EasHost>(settings, "easDeviceHosts") {
+        for host in hosts::readable_hosts::<EasHost>(settings, "easDeviceHosts") {
             rows.push(SourceRow {
                 key: format!("eas:{}", host.id).into(),
                 title: host.label.clone().into(),
@@ -447,7 +451,7 @@ fn source_rows(
         }
     }
     if supports_simlock {
-        for host in hosts::host_list::<SimlockHost>(settings, "simlockDeviceHosts") {
+        for host in hosts::readable_hosts::<SimlockHost>(settings, "simlockDeviceHosts") {
             let origin = host.gateway_url.trim_start_matches("https://").trim_start_matches("http://");
             rows.push(SourceRow {
                 key: format!("simlock:{}", host.id).into(),

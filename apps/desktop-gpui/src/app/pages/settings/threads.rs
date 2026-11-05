@@ -85,9 +85,13 @@ impl SnoozeEditor {
 }
 
 impl Workspace {
-    pub(super) fn render_threads_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_threads_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
-        let view = self.settings_view();
         let connected = self.settings_client().is_some();
         let base = self.add_project_field(&view, window, cx);
         let new_threads = self.new_threads_section(&view, true, window, cx);
@@ -172,7 +176,7 @@ impl Workspace {
                 this.update_settings(json!({ key: pick.to_json() }), window, cx)
             }
         };
-        let stored: Option<ModelSelection> = serde_json::from_value(view.value("defaultModelSelection").clone()).ok();
+        let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("defaultModelSelection")).ok();
         let selection = stored
             .filter(|s| self.settings_info().provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
             .or_else(|| self.settings_info().automatic_model());
@@ -291,7 +295,7 @@ impl Workspace {
         let pick = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx)
         };
-        let stored: Option<ModelSelection> = serde_json::from_value(view.value("fallbackModelSelection").clone()).ok();
+        let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("fallbackModelSelection")).ok();
         let Some(shown) = stored.as_ref().or(default) else {
             return muted("No providers available", &t).into_any_element();
         };
@@ -429,7 +433,7 @@ impl Workspace {
     ) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let stored: Option<ModelSelection> =
-            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
         let selection = resolve_text_generation(stored.as_ref(), &self.settings_info().providers);
         let connected = self.settings_client().is_some();
         let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
@@ -477,9 +481,7 @@ impl Workspace {
 
     fn snooze_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
-        let saved: Vec<Preset> = serde_json::from_value::<Vec<Preset>>(view.value("snoozePresets").clone())
-            .map(|presets| presets.into_iter().filter(Preset::in_range).collect())
-            .unwrap_or_else(|_| snooze::defaults());
+        let saved = snooze::saved_presets(view.value("snoozePresets"));
         let editor = window.use_keyed_state("settings-snooze-editor", cx, |_, _| SnoozeEditor::default());
         editor.update(cx, |editor, _| editor.adopt(&saved));
         let presets = editor.read(cx).presets();
@@ -490,7 +492,7 @@ impl Workspace {
         for ((key, preset), preview) in keys.iter().copied().zip(presets.iter()).zip(previews) {
             list.push(self.snooze_preset_row(&editor, key, preset, preview, window, cx));
         }
-        let full = presets.len() >= snooze::MAX_PRESETS;
+        let full = presets.len() + snooze::unreadable_count(view.value("snoozePresets")) >= snooze::MAX_PRESETS;
         let add_editor = editor.clone();
         let settle_editor = editor.clone();
         let body = v_flex()
@@ -729,7 +731,8 @@ impl Workspace {
             cx.notify();
         });
         let editor = editor.clone();
-        self.update_settings_then(json!({ "snoozePresets": presets }), window, cx, move |_, ok, cx| {
+        let list = snooze::write_value(self.settings_view().value("snoozePresets"), &presets);
+        self.update_settings_then(json!({ "snoozePresets": list }), window, cx, move |_, ok, cx| {
             if !ok {
                 editor.update(cx, |e, cx| {
                     e.written.clear();

@@ -8,14 +8,19 @@ use serde_json::{Value, json};
 
 use super::widgets::{SettingRow, settings_section};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
 const LAYOUTS: &[(&str, &str)] = &[("stacked", "Stacked"), ("split", "Split")];
 
 impl Workspace {
-    pub(super) fn render_diffs_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_diffs_section(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let collapsed = view.value("diffFilesCollapsed").clone();
         let file_state_label = if collapsed == true { "Collapsed" } else { "Expanded" };
         let file_state = self.value_select(

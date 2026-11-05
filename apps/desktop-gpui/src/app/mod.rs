@@ -597,6 +597,8 @@ impl Workspace {
     ) {
         self.connection = Connection::Connected;
         self.set_primary_connection(Some(client.clone()), Some(endpoint));
+        // Read per connection: the files may have changed, or never loaded while down.
+        self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
         self.page_opened(cx);
         if let Some(primary) = self.primary_environment().cloned() {

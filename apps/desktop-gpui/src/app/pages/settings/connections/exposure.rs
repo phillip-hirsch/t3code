@@ -13,8 +13,8 @@ use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement as _,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use serde_json::Value;
 
+use super::logic::remote_clients_denial;
 use super::ui;
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::RowFrame;
@@ -22,14 +22,6 @@ use crate::desktop::Desktop;
 use crate::desktop::exposure::{self, ExposureView};
 use crate::desktop::settings::ExposureMode;
 use crate::theme::Tokens;
-
-/// `managedCapabilityDenial(policy, "remoteClients")`.
-fn remote_clients_denial(policy: &Value) -> Option<String> {
-    let clients = policy.pointer("/limits/clients")?.as_array()?;
-    let organization = policy["organization"].as_str()?;
-    (!clients.iter().any(|client| client == "remote"))
-        .then(|| format!("{organization}'s policy does not allow connecting from other devices."))
-}
 
 impl Workspace {
     /// The rows for a backend this app manages, or `None` when it connected to one it did not
@@ -253,25 +245,5 @@ impl Workspace {
                         .child(button),
                 )
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn only_a_policy_without_remote_clients_denies_network_access() {
-        assert_eq!(remote_clients_denial(&json!({})), None);
-        assert_eq!(
-            remote_clients_denial(&json!({ "organization": "Acme", "limits": { "clients": ["remote"] } })),
-            None
-        );
-        assert_eq!(
-            remote_clients_denial(&json!({ "organization": "Acme", "limits": { "clients": ["local"] } })).as_deref(),
-            Some("Acme's policy does not allow connecting from other devices.")
-        );
     }
 }

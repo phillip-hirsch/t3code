@@ -73,13 +73,15 @@ pub(in crate::app) enum Schedule {
 impl Schedule {
     pub fn of(value: &Value) -> Self {
         let text = |key: &str| value[key].as_str().unwrap_or_default().to_owned();
+        // `0..=6`, Sunday first; anything else is dropped rather than wrapped.
+        let weekday = |day: &Value| day.as_u64().and_then(|day| u8::try_from(day).ok()).filter(|day| *day < 7);
         match value["type"].as_str() {
             Some("interval") => Schedule::Interval { every_ms: value["everyMs"].as_f64().unwrap_or(0.) },
             Some("fixed_time") => Schedule::FixedTime {
                 time_of_day: text("timeOfDay"),
                 weekdays: value["weekdays"]
                     .as_array()
-                    .map(|days| days.iter().filter_map(|d| d.as_u64().map(|d| d as u8)).collect())
+                    .map(|days| days.iter().filter_map(weekday).collect())
                     .unwrap_or_default(),
             },
             Some("once") => Schedule::Once { run_at: text("runAt") },
@@ -461,13 +463,7 @@ pub(in crate::app) fn relative_label(value: Option<&str>, now_ms: i64) -> String
     };
     let diff_ms = at.timestamp_millis() - now_ms;
     if diff_ms <= 0 {
-        let minutes = -diff_ms / 60_000;
-        return match minutes {
-            0 => "just now".into(),
-            1..60 => format!("{minutes}m ago"),
-            60..1440 => format!("{}h ago", minutes / 60),
-            _ => format!("{}d ago", minutes / 1440),
-        };
+        return crate::app::pages::settings::ago_label(-diff_ms);
     }
     let minutes = (diff_ms + 59_999) / 60_000;
     if minutes < 2 {
@@ -540,6 +536,8 @@ mod tests {
             task_to_draft(&task(json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [5, 1]})), &zone());
         assert_eq!(draft.schedule_mode, ScheduleMode::Fixed);
         assert_eq!(draft.weekdays, BTreeSet::from([1, 5]));
+        let wrapped = Schedule::of(&json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [256, 263, 3]}));
+        assert_eq!(wrapped, Schedule::FixedTime { time_of_day: "07:15".into(), weekdays: vec![3] });
         assert_eq!(
             schedule_from_draft(&draft, &zone()),
             Some(json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [1, 5]}))

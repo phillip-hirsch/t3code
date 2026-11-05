@@ -49,6 +49,7 @@ use crate::settings::scope::{ScopeKind, ScopeSearch};
 use crate::settings::{SearchItem, ThemePreference, contract};
 use crate::theme::{self, Tokens};
 use crate::themes::ThemeChoice;
+use widgets::SettingsView;
 
 /// The sections in sidebar order (`SETTINGS_NAV_GROUPS`, `SETTINGS_SECTION_LABELS` in
 /// `apps/web/src/components/settings/settingsSearch.ts`). A `None` heading is set apart by space alone.
@@ -181,8 +182,8 @@ impl SettingsUi {
                 cx.notify();
             }
             InputEvent::PressEnter { .. } => {
-                if let Some(item) = this.settings_results(cx).get(this.settings_ui.active_result).cloned() {
-                    this.open_settings_search_result(&item, window, cx);
+                if let Some(item) = this.settings_results(cx).get(this.settings_ui.active_result).copied() {
+                    this.open_settings_search_result(item, window, cx);
                 }
             }
             _ => {}
@@ -282,31 +283,48 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Agent browser access", &["enableAgentBrowserAccess"]),
 ];
 
-/// The restore labels whose settings differ from their defaults, and the patch that resets
-/// every restorable key the contract knows.
-fn restore_plan(value: impl Fn(&str) -> Value, theme: &ThemeChoice) -> (Vec<&'static str>, Map<String, Value>) {
+/// One HTTP client for the settings pages, so requests share its connection pool. Use it
+/// only on `crate::runtime()`, where its connections live.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(reqwest::Client::new);
+    &CLIENT
+}
+
+/// `formatRelativeTimeLabel` for a past time: "just now", "5m ago", "3h ago", "2d ago".
+fn ago_label(elapsed_ms: i64) -> String {
+    match crate::inbox::format_relative(elapsed_ms) {
+        now if now == "now" => "just now".into(),
+        label => format!("{label} ago"),
+    }
+}
+
+fn restorable(key: &str) -> bool {
     let contract = contract();
-    let known = |key: &str| contract.server_defaults.contains_key(key) || contract.client_defaults.contains_key(key);
+    contract.server_defaults.contains_key(key) || contract.client_defaults.contains_key(key)
+}
+
+/// The restore labels whose settings differ from their defaults.
+fn restore_changes(is_default: impl Fn(&str) -> bool, theme: &ThemeChoice) -> Vec<&'static str> {
     let halves = &theme.halves;
     let theme_labels = [
         (theme.base.is_some(), "Theme"),
         (theme.mode != ThemePreference::System, "Follow system"),
         (halves.light.is_some() || halves.dark.is_some(), "Theme mix"),
     ];
-    let changed = theme_labels.into_iter().filter(|(changed, _)| *changed).map(|(_, label)| label).chain(
-        RESTORE
-            .iter()
-            .filter(|(_, keys)| {
-                keys.iter().filter(|key| known(key)).any(|key| value(key) != *contract.default_value(key))
-            })
-            .map(|(label, _)| *label),
-    );
-    let patch = RESTORE
+    let changed_keys = RESTORE
         .iter()
-        .flat_map(|(_, keys)| keys.iter().filter(|key| known(key)))
-        .map(|key| ((*key).to_owned(), contract.default_value(key).clone()))
-        .collect();
-    (changed.collect(), patch)
+        .filter(|(_, keys)| keys.iter().any(|key| restorable(key) && !is_default(key)))
+        .map(|(label, _)| *label);
+    theme_labels.into_iter().filter(|(changed, _)| *changed).map(|(_, label)| label).chain(changed_keys).collect()
+}
+
+/// The patch that resets every restorable key the contract knows.
+fn restore_patch() -> Map<String, Value> {
+    RESTORE
+        .iter()
+        .flat_map(|(_, keys)| keys.iter().filter(|key| restorable(key)))
+        .map(|key| ((*key).to_owned(), contract().default_value(key).clone()))
+        .collect()
 }
 
 impl Workspace {
@@ -321,8 +339,9 @@ impl Workspace {
             window.focus(&self.settings_ui.focus, cx);
         }
         let t = *theme::tokens(cx);
-        self.sync_scope_project_picker(window, cx);
-        let content = self.render_settings_section(&section, window, cx);
+        let view = self.settings_view();
+        self.sync_scope_project_picker(&view, window, cx);
+        let content = self.render_settings_section(&section, &view, window, cx);
         Some(
             div()
                 .id("settings-modal")
@@ -360,7 +379,7 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .h_full()
-                                    .child(self.render_settings_header(&section, cx))
+                                    .child(self.render_settings_header(&section, &view, cx))
                                     .child(v_flex().flex_1().min_h_0().child(content)),
                             ),
                     ),
@@ -417,14 +436,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn settings_results(&self, cx: &gpui_kit::App) -> Vec<SearchItem> {
-        let query = self.settings_ui.search.read(cx).value();
-        search::search(&query, contract().search.iter().filter(|item| search::available(item)), |to| {
-            section_label(to).unwrap_or_default()
-        })
-        .into_iter()
-        .cloned()
-        .collect()
+    fn settings_results(&self, cx: &gpui_kit::App) -> Vec<&'static SearchItem> {
+        search::search(&self.settings_ui.search.read(cx).value(), search::shipped())
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).
@@ -516,7 +529,7 @@ impl Workspace {
                     .gap(px(4.))
                     .children(results.into_iter().enumerate().map(|(index, item)| {
                         let is_active = index == active;
-                        let open = item.clone();
+                        let open = item;
                         h_flex()
                             .id(SharedString::from(format!("settings-search-result-{}", item.id)))
                             .min_h(px(40.))
@@ -535,7 +548,7 @@ impl Workspace {
                                 }
                             }))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_settings_search_result(&open, window, cx)
+                                this.open_settings_search_result(open, window, cx)
                             }))
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(
@@ -622,10 +635,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_settings_header(&mut self, section: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_header(&mut self, section: &str, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let restore = (section == "general").then(|| {
-            let (changed, _) = self.restore_defaults_plan();
+            let changed = self.restore_defaults_changes(view);
             Button::new("settings-restore-defaults")
                 .ghost()
                 .h(px(24.))
@@ -672,18 +685,19 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn restore_defaults_plan(&self) -> (Vec<&'static str>, Map<String, Value>) {
-        let view = self.settings_view();
-        restore_plan(|key| view.value(key).clone(), &self.client_settings.theme_choice())
+    fn restore_defaults_changes(&self, view: &SettingsView) -> Vec<&'static str> {
+        let is_default = |key: &str| view.value(key) == contract().default_value(key);
+        restore_changes(is_default, &self.client_settings.theme_choice())
     }
 
     /// `RestoreDeviceDefaultsButton`: confirms, then resets the theme and every listed setting.
     fn confirm_restore_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (changed, patch) = self.restore_defaults_plan();
+        let changed = self.restore_defaults_changes(&self.settings_view());
         if changed.is_empty() {
             return;
         }
         let description: SharedString = format!("This will reset: {}.", changed.join(", ")).into();
+        let patch = restore_patch();
         let workspace = cx.entity();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let (workspace, patch) = (workspace.clone(), patch.clone());
@@ -717,9 +731,14 @@ impl Workspace {
     }
 
     /// One section's content, behind the scope checks of `SettingsScopeBoundary`.
-    fn render_settings_section(&mut self, section: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_section(
+        &mut self,
+        section: &str,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if !widgets::device_only(section) && section != "projects" {
-            let view = self.settings_view();
             let message = match &view.scope.kind {
                 ScopeKind::Unavailable { message } => Some((*message).to_owned()),
                 ScopeKind::Environment if view.targets.is_empty() => {
@@ -730,35 +749,35 @@ impl Workspace {
             if let Some(message) = message {
                 let t = *theme::tokens(cx);
                 let note = div().px(px(16.)).text_sm().text_color(t.muted_foreground).child(message);
-                return self.settings_page(section, &view, [note.into_any_element()], cx);
+                return self.settings_page(section, view, [note.into_any_element()], cx);
             }
         }
         match section {
-            "general" => self.render_settings_general(window, cx),
-            "appearance" => self.render_settings_appearance(window, cx),
-            "chat" => self.render_settings_chat(window, cx),
-            "diffs" => self.render_settings_diffs(window, cx),
-            "keybindings" => self.render_settings_keybindings(window, cx),
-            "snap-shot" => self.render_settings_snap_shot(window, cx),
+            "general" => self.render_settings_general(view, window, cx),
+            "appearance" => self.render_settings_appearance(view, window, cx),
+            "chat" => self.render_settings_chat(view, window, cx),
+            "diffs" => self.render_settings_diffs(view, window, cx),
+            "keybindings" => self.render_settings_keybindings(view, window, cx),
+            "snap-shot" => self.render_settings_snap_shot(view, window, cx),
             "providers" => self.render_settings_providers(window, cx),
-            "threads" => self.render_settings_threads(window, cx),
-            "browser" => self.render_settings_browser(window, cx),
-            "devices" => self.render_settings_devices(window, cx),
-            "scheduled-tasks" => self.render_settings_scheduled_tasks(window, cx),
-            "projects" => self.render_settings_projects(window, cx),
-            "source-control" => self.render_settings_source_control(window, cx),
-            "worktrees" => self.render_settings_worktrees(window, cx),
-            "connections" => self.render_settings_connections(window, cx),
-            "access" => self.render_settings_access(window, cx),
+            "threads" => self.render_settings_threads(view, window, cx),
+            "browser" => self.render_settings_browser(view, window, cx),
+            "devices" => self.render_settings_devices(view, window, cx),
+            "scheduled-tasks" => self.render_settings_scheduled_tasks(view, window, cx),
+            "projects" => self.render_settings_projects(view, window, cx),
+            "source-control" => self.render_settings_source_control(view, window, cx),
+            "worktrees" => self.render_settings_worktrees(view, window, cx),
+            "connections" => self.render_settings_connections(view, window, cx),
+            "access" => self.render_settings_access(view, window, cx),
             // The web redirects the route to General without the feature flag.
-            "secrets" if secrets_enabled() => self.render_settings_secrets(window, cx),
-            "maintenance" => self.render_settings_maintenance(window, cx),
-            "diagnostics" => self.render_settings_diagnostics(window, cx),
-            "labs" => self.render_settings_labs(window, cx),
-            "about" => self.render_settings_about(window, cx),
-            "archived" => self.render_settings_archived(window, cx),
-            "open-source-licenses" => self.render_settings_licenses(window, cx),
-            _ => self.render_settings_general(window, cx),
+            "secrets" if secrets_enabled() => self.render_settings_secrets(view, window, cx),
+            "maintenance" => self.render_settings_maintenance(view, window, cx),
+            "diagnostics" => self.render_settings_diagnostics(view, window, cx),
+            "labs" => self.render_settings_labs(view, window, cx),
+            "about" => self.render_settings_about(view, window, cx),
+            "archived" => self.render_settings_archived(view, window, cx),
+            "open-source-licenses" => self.render_settings_licenses(view, window, cx),
+            _ => self.render_settings_general(view, window, cx),
         }
     }
 
@@ -827,18 +846,13 @@ mod tests {
 
     #[test]
     fn restore_lists_changed_settings_and_resets_known_keys() {
-        let defaults = |key: &str| contract().default_value(key).clone();
-        let (changed, patch) = restore_plan(defaults, &ThemeChoice::default());
-        assert!(changed.is_empty());
+        assert!(restore_changes(|_| true, &ThemeChoice::default()).is_empty());
+        let patch = restore_patch();
         assert_eq!(patch.get("confirmThreadDelete"), Some(contract().default_value("confirmThreadDelete")));
         assert!(patch.keys().all(|k| contract().is_server_key(k) || contract().is_client_key(k)));
 
-        let edited = |key: &str| match key {
-            "fontSizeCode" => Value::from(20),
-            _ => contract().default_value(key).clone(),
-        };
         let theme = ThemeChoice { mode: ThemePreference::Dark, base: Some("grove".into()), ..Default::default() };
-        let (changed, _) = restore_plan(edited, &theme);
+        let changed = restore_changes(|key| key != "fontSizeCode", &theme);
         assert_eq!(changed, ["Theme", "Follow system", "Code font"]);
     }
 

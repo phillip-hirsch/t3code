@@ -24,26 +24,15 @@ use serde_json::{Value, json};
 use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
-    Session,
 };
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
-use super::{auth_request, error_toast, success_toast, update_settings};
+use super::{SessionLoad, auth_request, check_session, error_toast, success_toast, update_settings};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
 use crate::rpc::{RpcClient, StreamEvent};
 use crate::theme::{self, Tokens};
-
-const SESSION_RETRY: Duration = Duration::from_secs(5);
-
-/// The session check: pending, answered, or failed (and retrying).
-#[derive(Default)]
-enum SessionLoad {
-    #[default]
-    Pending,
-    Ready(Session),
-    Failed,
-}
 
 /// Everything the access page holds while it is open.
 #[derive(Default)]
@@ -76,30 +65,11 @@ impl AccessState {
             return;
         }
         self.started = true;
-        self._session_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let result = auth_request(Some(endpoint.clone()), "/api/auth/session", None).await;
-                let ready = result.is_ok();
-                let Ok(()) = this.update(cx, |this, cx| {
-                    match result {
-                        Ok(value) => {
-                            let session = Session::from_json(&value);
-                            if session.grants(ACCESS_READ) {
-                                this.subscribe(client.clone(), cx);
-                            }
-                            this.session = SessionLoad::Ready(session);
-                        }
-                        Err(_) => this.session = SessionLoad::Failed,
-                    }
-                    cx.notify();
-                }) else {
-                    return;
-                };
-                if ready {
-                    return;
-                }
-                cx.background_executor().timer(SESSION_RETRY).await;
+        self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
+            if session.grants(ACCESS_READ) {
+                this.subscribe(client.clone(), cx);
             }
+            this.session = session;
         }));
     }
 
@@ -161,7 +131,7 @@ impl AccessState {
     }
 
     fn grants(&self, scope: &str) -> bool {
-        matches!(&self.session, SessionLoad::Ready(session) if session.grants(scope))
+        self.session.grants(scope)
     }
 }
 
@@ -208,7 +178,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
             let result = auth_request(endpoint, path, Some(body)).await;
             let _ = cx.update(|window, cx| {
                 let _ = state.update(cx, |state, cx| {
-                    match target {
+                    match &target {
                         Revoke::Link(_) => state.revoking_link = None,
                         Revoke::Client(_) => state.revoking_session = None,
                         Revoke::Others => state.revoking_others = false,
@@ -220,7 +190,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
                     cx.notify();
                 });
                 match result {
-                    Ok(value) if path.ends_with("revoke-others") => {
+                    Ok(value) if matches!(target, Revoke::Others) => {
                         let count = value["revokedCount"].as_u64().unwrap_or(0);
                         let title = if count == 1 {
                             "Revoked 1 other client".to_owned()
@@ -245,7 +215,12 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
 }
 
 impl Workspace {
-    pub(super) fn render_access(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_access(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-access", cx, |_, _| AccessState::default());
         let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |state, cx| state.start(client, endpoint, cx));
@@ -256,7 +231,6 @@ impl Workspace {
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
-        let view = self.settings_view();
         self.settings_page("access", &view, sections, cx)
     }
 
@@ -275,7 +249,12 @@ impl Workspace {
         let label: SharedString = self.environment_label().unwrap_or("This machine").to_owned().into();
         let mut rows = Vec::new();
         if let Some(organization) = config.pointer("/managedPolicy/organization").and_then(Value::as_str) {
-            let support = config.pointer("/managedPolicy/supportUrl").and_then(Value::as_str).map(str::to_owned);
+            // Only a web page: the OS would open any scheme it is handed.
+            let support = config
+                .pointer("/managedPolicy/supportUrl")
+                .and_then(Value::as_str)
+                .filter(|url| url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "https" | "http")))
+                .map(str::to_owned);
             rows.push(managed_notice(organization, support, t));
         }
         if s.grants(ENVIRONMENT_MAINTAIN) {
@@ -370,7 +349,8 @@ impl Workspace {
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &App, t: &Tokens) -> AnyElement {
         let s = state.read(cx);
         let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
-        let snapshot = s.access.clone().unwrap_or_default();
+        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
+        let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =
             snapshot.sorted_links().into_iter().filter(|l| logic::ms(&l.expires_at) > now).collect();
@@ -416,7 +396,7 @@ impl Workspace {
                     .child("This connection can create access links but cannot view authorized clients.")
                     .into_any_element(),
             );
-        } else {
+        } else if open {
             if let Some(error) = s.mutation_error.clone().or(s.access_error.clone()) {
                 body.push(
                     ui::item_row(text_xs(div().text_color(t.error_foreground)).child(error), None).into_any_element(),
@@ -826,7 +806,8 @@ impl CreateLinkForm {
                     Ok(created) => {
                         let (Some(id), Some(credential)) = (created["id"].as_str(), created["credential"].as_str())
                         else {
-                            return;
+                            let message = "The environment sent no pairing credential.";
+                            return error_toast(window, cx, "Could not create pairing URL", message.to_owned());
                         };
                         let _ = this.access.update(cx, |access, cx| {
                             access.credentials.insert(id.to_owned(), credential.to_owned());

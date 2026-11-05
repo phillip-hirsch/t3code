@@ -24,7 +24,7 @@ use super::logic::{
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
 use super::worktree_mode::{self, NewWorktreeMode};
-use super::{ScheduledTasksView, error_message, notify_error};
+use super::{ScheduledTasksView, notify_error};
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
 use crate::app::pages::settings::widgets::select_trigger;
@@ -155,6 +155,10 @@ impl TaskEditor {
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
         }
+        // A list refresh hands the stored task to the webhook fields (its URL and stored secret).
+        if let Some(list) = list.upgrade() {
+            subscriptions.push(cx.observe_in(&list, window, |this, _, window, cx| this.sync_webhook_task(window, cx)));
+        }
         Self {
             workspace,
             list,
@@ -177,7 +181,7 @@ impl TaskEditor {
     }
 
     /// The tasks the list has loaded; `None` while it loads or failed.
-    fn loaded_tasks(&self, cx: &App) -> Option<Rc<Vec<ScheduledTask>>> {
+    fn loaded_tasks(&self, cx: &App) -> Option<super::Tasks> {
         self.list.upgrade()?.read(cx).loaded_tasks()
     }
 
@@ -204,10 +208,10 @@ impl TaskEditor {
     }
 
     /// The stored version of the task being edited, as the list last saw it.
-    fn live_task(&self, cx: &App) -> Option<ScheduledTask> {
+    fn live_task(&self, cx: &App) -> Option<Rc<ScheduledTask>> {
         match (self.loaded_tasks(cx), &self.draft.editing_id) {
             (Some(tasks), Some(id)) => tasks.iter().find(|task| &task.id == id).cloned(),
-            (None, _) => self.task.clone(),
+            (None, _) => self.task.clone().map(Rc::new),
             (Some(_), None) => None,
         }
     }
@@ -229,20 +233,21 @@ impl TaskEditor {
         projects
     }
 
-    pub(super) fn selected_project(&self, cx: &App) -> Option<ProjectShell> {
-        let projects = self.projects(cx);
-        let id =
-            if self.draft.project_id.is_empty() { projects.first()?.id.clone() } else { self.draft.project_id.clone() };
-        projects.into_iter().find(|p| p.id == id)
+    /// The picked project among `projects`, else the first.
+    fn selected_project<'a>(&self, projects: &'a [ProjectShell]) -> Option<&'a ProjectShell> {
+        if self.draft.project_id.is_empty() {
+            return projects.first();
+        }
+        projects.iter().find(|p| p.id == self.draft.project_id)
     }
 
     /// The picked model while its provider is usable, else the default (`activeSelection`).
-    fn active_selection(&self, cx: &App) -> Option<ModelSelection> {
+    fn active_selection(&self, project: Option<&ProjectShell>, cx: &App) -> Option<ModelSelection> {
         let workspace = self.workspace.upgrade()?;
         let info = &workspace.read(cx).settings_info();
         logic::split_model_key(&self.draft.model_key)
             .filter(|s| info.providers.iter().any(|p| p.instance_id == s.instance_id && p.enabled))
-            .or_else(|| logic::default_model(info, self.selected_project(cx).as_ref()))
+            .or_else(|| logic::default_model(info, project))
     }
 
     fn connected(&self, cx: &App) -> bool {
@@ -281,10 +286,9 @@ impl TaskEditor {
         };
         let draft = self.draft.clone();
         let projects = self.projects(cx);
-        let project = self.selected_project(cx);
-        let selection = self.active_selection(cx);
-        let (Some(project), Some(selection)) = (project.filter(|p| projects.iter().any(|q| q.id == p.id)), selection)
-        else {
+        let project = self.selected_project(&projects).cloned();
+        let selection = self.active_selection(project.as_ref(), cx);
+        let (Some(project), Some(selection)) = (project, selection) else {
             return fail(
                 DraftError::new("Scheduled task is incomplete", "Add a title, prompt, project, and model."),
                 window,
@@ -390,7 +394,7 @@ impl TaskEditor {
                     Ok(_) => window.close_dialog(cx),
                     Err(error) => {
                         this.submission_pending = false;
-                        notify_error(window, cx, "Could not save scheduled task", error_message(&error));
+                        notify_error(window, cx, "Could not save scheduled task", error.message());
                     }
                 }
                 cx.notify();
@@ -407,7 +411,6 @@ impl TaskEditor {
 
 impl Render for TaskEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_webhook_task(window, cx);
         let t = *theme::tokens(cx);
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let editor = cx.entity();
@@ -415,8 +418,8 @@ impl Render for TaskEditor {
         let tasks_loaded = self.loaded_tasks(cx).is_some();
         let missing = self.editing_task_missing(cx);
         let projects = self.projects(cx);
-        let project = self.selected_project(cx);
-        let selection = self.active_selection(cx);
+        let project = self.selected_project(&projects);
+        let selection = self.active_selection(project, cx);
         let (offers_once, denial, env_label, machine, destination) = {
             let workspace = workspace.read(cx);
             let info = &workspace.settings_info();

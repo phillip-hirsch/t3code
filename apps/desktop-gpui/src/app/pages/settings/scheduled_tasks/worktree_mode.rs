@@ -1,14 +1,6 @@
 //! The editor's "Create a new worktree" workspace mode: its "Base branch" field with the
 //! `WorktreeBaseBranchPicker` (`apps/web/src/components/WorktreeBaseBranchPicker.tsx`,
 //! `BranchPicker.tsx`, `usePaginatedBranches` in `apps/web/src/state/queries.ts`).
-//!
-//! How the editor uses it: create `cx.new(|cx| NewWorktreeMode::new(client, cwd, task, window, cx))`
-//! when the dialog opens (`cwd` is the selected project's `workspaceRoot`, `task` the edited task's
-//! JSON or `None`), and keep it for the dialog's life. Show `render_new_worktree_mode(&mode)` while
-//! the workspace mode is "worktree". Call `set_project` when the project changes (the picked branch
-//! stays, as on the web), `set_disabled` while saving or disconnected, and on save use
-//! `mode.read(cx).strategy()` as the upsert's `workspaceStrategy`. Switching environments resets the
-//! branch to "main" from remote: create a fresh one.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
@@ -107,7 +99,6 @@ impl NewWorktreeMode {
     }
 
     /// The editor's project changed; the web remounts the picker, keeping the picked branch.
-    #[allow(dead_code, reason = "called by the task list's editor")]
     pub(super) fn set_project(&mut self, cwd: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if self.cwd == cwd {
             return;

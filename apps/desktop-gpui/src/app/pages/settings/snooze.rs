@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Datelike as _, Duration, NaiveTime, TimeZone, Timelike as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub(super) const MAX_PRESETS: usize = 8;
 pub(super) const MAX_MINUTES: i64 = crate::inbox::MAX_SNOOZE_PRESET_MINUTES;
@@ -25,6 +26,41 @@ impl Preset {
             Preset::At { .. } => true,
         }
     }
+}
+
+/// A saved entry the editor can show and edit; others are kept as stored.
+fn readable(entry: &Value) -> Option<Preset> {
+    Preset::deserialize(entry).ok().filter(Preset::in_range)
+}
+
+/// The saved `snoozePresets` the editor shows: every entry it can read, or the defaults when
+/// nothing is saved. One bad entry hides only itself.
+pub(super) fn saved_presets(stored: &Value) -> Vec<Preset> {
+    match stored.as_array() {
+        Some(entries) => entries.iter().filter_map(readable).collect(),
+        None => defaults(),
+    }
+}
+
+/// Saved entries the editor can't read; a write keeps them, so they count toward the cap.
+pub(super) fn unreadable_count(stored: &Value) -> usize {
+    stored.as_array().map_or(0, |entries| entries.iter().filter(|entry| readable(entry).is_none()).count())
+}
+
+/// The list to write for the editor's `presets`: a preset that is still saved keeps its stored
+/// entry (and any fields this client doesn't know), and unreadable entries stay at the end.
+pub(super) fn write_value(stored: &Value, presets: &[Preset]) -> Value {
+    let entries = stored.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut unused: Vec<(Option<Preset>, &Value)> = entries.iter().map(|entry| (readable(entry), entry)).collect();
+    let mut list: Vec<Value> = presets
+        .iter()
+        .map(|preset| match unused.iter().position(|(saved, _)| saved.as_ref() == Some(preset)) {
+            Some(index) => unused.remove(index).1.clone(),
+            None => serde_json::to_value(preset).unwrap_or_default(),
+        })
+        .collect();
+    list.extend(unused.into_iter().filter(|(saved, _)| saved.is_none()).map(|(_, entry)| entry.clone()));
+    Value::Array(list)
 }
 
 pub(super) fn defaults() -> Vec<Preset> {
@@ -307,6 +343,32 @@ pub(super) fn menu_order<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bad_preset_hides_only_itself_and_writes_keep_what_the_editor_cannot_read() {
+        let stored = serde_json::json!([
+            {"kind": "after", "minutes": 60, "label": "Lunch"},
+            {"kind": "after", "minutes": "soon"},
+            {"kind": "weekday", "day": "friday"},
+            {"kind": "at", "day": "today", "time": "18:00"},
+        ]);
+        let presets = super::saved_presets(&stored);
+        assert_eq!(presets, [super::after(60), super::at("today", "18:00")]);
+        assert_eq!(super::unreadable_count(&stored), 2);
+        assert_eq!(super::saved_presets(&serde_json::Value::Null), super::defaults());
+
+        // Edit the second preset: the first keeps its unknown field, unreadable entries stay.
+        let edited = [super::after(60), super::at("tomorrow", "09:00")];
+        assert_eq!(
+            super::write_value(&stored, &edited),
+            serde_json::json!([
+                {"kind": "after", "minutes": 60, "label": "Lunch"},
+                {"kind": "at", "day": "tomorrow", "time": "09:00"},
+                {"kind": "after", "minutes": "soon"},
+                {"kind": "weekday", "day": "friday"},
+            ])
+        );
+    }
+
     use super::*;
     use chrono::{FixedOffset, NaiveDate};
 

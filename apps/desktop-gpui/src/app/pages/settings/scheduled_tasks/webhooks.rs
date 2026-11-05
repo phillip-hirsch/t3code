@@ -2,19 +2,6 @@
 //! (`WebhookEndpointField`, `WebhookDeliveryMode`, `WebhookFiltersField`, the webhook branch of
 //! `ScheduledTaskEditorForm` and `WebhookDeliveriesDialog` in
 //! `apps/web/src/components/settings/ScheduledTasksSettings.tsx`).
-//!
-//! How the editor and the list use this file:
-//! - `Workspace::webhook_context()` captures the client, HTTP origin and session once, when the
-//!   editor or a menu opens.
-//! - Editor: create `cx.new(|cx| WebhookFields::new(context, task, window, cx))` when the dialog opens
-//!   (`task` is the edited `ScheduledTask` JSON, `None` for a new task) and keep it for the dialog's
-//!   life, so typed text survives re-renders. Show `render_webhook_fields(&fields)` while the schedule
-//!   mode is "webhook". Call `set_task` when the task list refreshes (`liveTask`), `set_disabled`
-//!   while saving, and on save `fields.read(cx).schedule(cx)`: `Ok` is the upsert's `schedule`,
-//!   `Err` the toasts to show, in order. When switching to "On webhook", fill an empty prompt with
-//!   `DEFAULT_WEBHOOK_PROMPT`. A managed `webhookTasks` denial still hides these fields, as on the web.
-//! - List row: the web shows no URL on rows; a webhook task's actions menu has "Deliveries" in place
-//!   of "Run now". Add it with `webhook_menu_item(menu, &context, &task)`; `open_deliveries` opens the dialog directly.
 
 use std::time::Duration;
 
@@ -34,12 +21,13 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::logic::relative_label;
 use super::webhook_logic::{
     self, Encoding, FilterDraft, FilterOp, FormError, MAX_WEBHOOK_FILTERS, Tone, WebhookDraft, delivery_label,
-    delivery_tone, relative_label,
+    delivery_tone,
 };
 use crate::app::Workspace;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
 pub(super) use webhook_logic::DEFAULT_WEBHOOK_PROMPT;
@@ -239,7 +227,7 @@ impl WebhookFields {
         };
         self._link_state = Some(cx.spawn(async move |this, cx| {
             let request = async move {
-                let response = reqwest::Client::new()
+                let response = crate::app::pages::settings::http()
                     .get(format!("{}/api/connect/link-state", endpoint.http_base))
                     .bearer_auth(&endpoint.bearer_token)
                     .send()
@@ -294,7 +282,7 @@ impl WebhookFields {
                 this.rotating = false;
                 match result {
                     Ok(result) => this.set_task(Some(result["task"].clone()), window, cx),
-                    Err(error) => toast(window, cx, "Could not rotate webhook URL", &rpc_message(&error)),
+                    Err(error) => toast(window, cx, "Could not rotate webhook URL", &error.message()),
                 }
                 cx.notify();
             });
@@ -587,7 +575,7 @@ impl Deliveries {
                         this.list = Some(result["deliveries"].as_array().cloned().unwrap_or_default());
                         this.list_error = None;
                     }
-                    Err(error) => this.list_error = Some(rpc_message(&error).into()),
+                    Err(error) => this.list_error = Some(error.message().into()),
                 }
                 cx.notify();
             });
@@ -604,7 +592,7 @@ impl Deliveries {
                 if let Some(selected) = &mut this.selected {
                     match result {
                         Ok(result) => selected.delivery = Some(result["delivery"].clone()),
-                        Err(error) => selected.error = Some(rpc_message(&error).into()),
+                        Err(error) => selected.error = Some(error.message().into()),
                     }
                 }
                 cx.notify();
@@ -799,7 +787,6 @@ pub(super) fn badge(tone: Tone, text: impl Into<SharedString>, t: &Tokens) -> im
         Tone::Success => tint(t.success_foreground),
         Tone::Warning => (t.warning.opacity(if t.dark { 0.16 } else { 0.08 }), t.warning_foreground),
         Tone::Error => (t.error.opacity(if t.dark { 0.16 } else { 0.08 }), t.error_foreground),
-        Tone::Info => (t.info.opacity(if t.dark { 0.16 } else { 0.08 }), t.info_foreground),
         Tone::Outline => (if t.dark { t.input.opacity(0.32) } else { t.background }, t.foreground),
     };
     div()
@@ -852,12 +839,4 @@ fn outline_button(id: impl Into<gpui_kit::ElementId>) -> Button {
 
 fn toast(window: &mut Window, cx: &mut App, title: &'static str, description: &str) {
     window.push_notification(Notification::error(description.to_owned()).title(title), cx);
-}
-
-/// The handler's message without its error tag, like `squashAtomCommandFailure`.
-fn rpc_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(failure) => failure["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
-    }
 }

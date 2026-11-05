@@ -40,6 +40,23 @@ fn byte_size(bytes: u64) -> String {
     }
 }
 
+/// A theme file's name and text, read at most one byte past the limit so a special or
+/// growing file can't make the read unbounded.
+fn read_theme_file(path: &std::path::Path) -> (String, Result<String, String>) {
+    use std::io::Read as _;
+    let name = path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    if let Some(message) = std::fs::metadata(path).ok().and_then(|meta| oversized(meta.len())) {
+        return (name, Err(message));
+    }
+    let mut text = String::new();
+    let read = std::fs::File::open(path).and_then(|file| file.take(MAX_THEME_FILE_BYTES + 1).read_to_string(&mut text));
+    let text = match read {
+        Err(error) => Err(format!("Could not read {name} ({error}). Paste the JSON below instead.")),
+        Ok(_) => oversized(text.len() as u64).map_or(Ok(text), Err),
+    };
+    (name, text)
+}
+
 /// `describeOversizedThemeFile`.
 fn oversized(bytes: u64) -> Option<String> {
     (bytes > MAX_THEME_FILE_BYTES).then(|| {
@@ -325,33 +342,32 @@ impl ThemeImport {
         .detach();
     }
 
-    /// `readThemeFiles`: one file fills the editor; several install at once.
+    /// `readThemeFiles`: one file fills the editor; several install at once. The reads run off
+    /// the UI thread.
     fn read_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_target = false;
-        let read = |path: &PathBuf| -> (String, Result<String, String>) {
-            let name = path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            if let Some(message) = oversized(size) {
-                return (name, Err(message));
-            }
-            (
-                name,
-                std::fs::read_to_string(path)
-                    .map_err(|_| "Could not read that file. Paste the JSON below instead.".to_owned()),
-            )
-        };
-        match &paths[..] {
-            [] => {}
-            [path] => match read(path) {
-                (name, Ok(text)) => {
-                    self.json.update(cx, |json, cx| json.set_value(text, window, cx));
-                    (self.file_name, self.error) = (Some(name), None);
-                }
-                (_, Err(error)) => self.error = Some(error),
-            },
-            paths => self.install_batch(paths.iter().map(read).collect(), window, cx),
+        if paths.is_empty() || self.reading {
+            return cx.notify();
         }
+        self.reading = true;
         cx.notify();
+        let read = cx.background_spawn(async move { paths.iter().map(|path| read_theme_file(path)).collect() });
+        cx.spawn_in(window, async move |this, cx| {
+            let files: Vec<(String, Result<String, String>)> = read.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reading = false;
+                match <[_; 1]>::try_from(files) {
+                    Ok([(name, Ok(text))]) => {
+                        this.json.update(cx, |json, cx| json.set_value(text, window, cx));
+                        (this.file_name, this.error) = (Some(name), None);
+                    }
+                    Ok([(_, Err(error))]) => this.error = Some(error),
+                    Err(files) => this.install_batch(files, window, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// `installThemeBatch`.
@@ -851,6 +867,19 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_files_read_up_to_the_limit() {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-theme-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (small, big) = (dir.join("small.json"), dir.join("big.json"));
+        std::fs::write(&small, "{}").unwrap();
+        std::fs::write(&big, vec![b' '; 300 * 1024]).unwrap();
+        assert_eq!(read_theme_file(&small), ("small.json".to_owned(), Ok("{}".to_owned())));
+        assert!(read_theme_file(&big).1.unwrap_err().contains("300 KB"));
+        assert!(read_theme_file(&dir.join("missing.json")).1.unwrap_err().starts_with("Could not read missing.json"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn sizes_and_counts_read_like_the_web() {

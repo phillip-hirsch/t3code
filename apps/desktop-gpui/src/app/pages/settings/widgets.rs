@@ -587,7 +587,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Value::Object(patch) = patch else { return };
+        let Value::Object(patch) = patch else { return done(self, false, cx) };
         let view = self.settings_view();
         let plan = scope::plan_patch(&view.scope, &view.environments(), &patch);
         self.run_settings_plan(plan, window, cx, done);
@@ -601,7 +601,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.settings_client() else { return };
+        let Some(client) = self.settings_client() else { return done(self, false, cx) };
         cx.spawn(async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
             let _ = this.update(cx, |this, cx| {
@@ -1614,14 +1614,18 @@ impl Workspace {
 
     /// Keeps the searchable project picker on the current projects and scope; it needs a window,
     /// which the scope sentence does not get.
-    pub(super) fn sync_scope_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn sync_scope_project_picker(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Groups never outnumber projects, so few projects skip the grouping.
         if self.shell.projects.len() <= SCOPE_MENU_LIMIT {
             self.settings_ui.project_picker = None;
             return;
         }
-        let view = self.settings_view();
-        let projects = self.scope_projects(&view);
+        let projects = self.scope_projects(view);
         if projects.len() <= SCOPE_MENU_LIMIT {
             self.settings_ui.project_picker = None;
             return;

@@ -4,11 +4,11 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::{Context, Keystroke, Task, Window};
+use serde::Deserialize as _;
 use serde_json::{Map, Value, json};
 
 use crate::app::Workspace;
 use crate::model::{ProjectScript, ProjectShell, ServerInfo, T3ProjectFile, T3ProjectFileScript};
-use crate::rpc::RpcError;
 
 const MAX_SCRIPT_ID_LENGTH: usize = 24;
 const MAX_KEYBINDING_LENGTH: usize = 64;
@@ -177,7 +177,7 @@ pub(super) fn next_project_script_id<'a>(name: &str, existing: impl IntoIterator
 }
 
 fn scripts_at(value: Option<&Value>) -> Option<Vec<ProjectScript>> {
-    serde_json::from_value(value?.clone()).ok()
+    Vec::<ProjectScript>::deserialize(value?).ok()
 }
 
 fn override_entry<'a>(settings: &'a Value, project_id: &str) -> Option<&'a Map<String, Value>> {
@@ -491,15 +491,6 @@ pub(super) fn importable_scripts<'a>(
         .collect()
 }
 
-/// The message a toast or form shows for a failed request (`error.message`).
-pub(super) fn rpc_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(value) => value.get("message").and_then(Value::as_str).map(str::to_owned),
-        _ => None,
-    }
-    .unwrap_or_else(|| error.to_string())
-}
-
 impl Workspace {
     fn project(&self, project_id: &str) -> Option<&ProjectShell> {
         self.shell.projects.iter().find(|project| project.id == project_id)
@@ -532,19 +523,23 @@ impl Workspace {
             let settings = client
                 .request("server.updateSettings", json!({"patch": write.patch}))
                 .await
-                .map_err(|e| rpc_message(&e))?;
+                .map_err(|e| e.message())?;
             let _ = this.update(cx, |this, cx| {
-                let _ = this
-                    .settings_info_mut()
-                    .apply(&json!({"type": "settingsUpdated", "payload": {"settings": settings}}));
+                let event = json!({"type": "settingsUpdated", "payload": {"settings": settings}});
+                if let Err(error) = this.settings_info_mut().apply(&event) {
+                    log::warn!("saved settings did not decode: {error}");
+                }
                 cx.notify();
             });
             for (method, input) in write.bindings {
-                let result = client.request(method, input).await.map_err(|e| rpc_message(&e))?;
+                let result = client.request(method, input).await.map_err(|e| e.message())?;
+                // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
+                let Some(keybindings) = result.get("keybindings").filter(|rules| rules.is_array()) else { continue };
                 let _ = this.update(cx, |this, cx| {
-                    let event =
-                        json!({"type": "keybindingsUpdated", "payload": {"keybindings": result["keybindings"]}});
-                    let _ = this.settings_info_mut().apply(&event);
+                    let event = json!({"type": "keybindingsUpdated", "payload": {"keybindings": keybindings}});
+                    if let Err(error) = this.settings_info_mut().apply(&event) {
+                        log::warn!("saved keybindings did not decode: {error}");
+                    }
                     cx.notify();
                 });
             }
@@ -669,26 +664,27 @@ impl Workspace {
 
     /// The checkout's `t3.json`, read once per root (`useT3ProjectFileState`).
     pub(super) fn t3_project_file(&mut self, workspace_root: &str, cx: &mut Context<Self>) -> &T3ProjectFile {
+        static LOADING: T3ProjectFile = T3ProjectFile::Loading;
         if !self.t3_project_files.contains_key(workspace_root) {
+            // Without a client nothing is cached, so the read starts once one connects.
+            let Some(client) = self.settings_client() else { return &LOADING };
             self.t3_project_files.insert(workspace_root.to_owned(), T3ProjectFile::Loading);
-            if let Some(client) = self.settings_client() {
-                let root = workspace_root.to_owned();
-                let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});
-                cx.spawn(async move |this, cx| {
-                    let result = client.request("projects.readFile", input).await;
-                    let file = match result {
-                        Ok(read) if read["exists"] != false && read["truncated"] != true => {
-                            read["contents"].as_str().map(T3ProjectFile::parse).unwrap_or(T3ProjectFile::Missing)
-                        }
-                        _ => T3ProjectFile::Missing,
-                    };
-                    let _ = this.update(cx, |this, cx| {
-                        this.t3_project_files.insert(root, file);
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
+            let root = workspace_root.to_owned();
+            let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});
+            cx.spawn(async move |this, cx| {
+                let result = client.request("projects.readFile", input).await;
+                let file = match result {
+                    Ok(read) if read["exists"] != false && read["truncated"] != true => {
+                        read["contents"].as_str().map(T3ProjectFile::parse).unwrap_or(T3ProjectFile::Missing)
+                    }
+                    _ => T3ProjectFile::Missing,
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.t3_project_files.insert(root, file);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         &self.t3_project_files[workspace_root]
     }

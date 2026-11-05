@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use super::connections::ui::WebButton;
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
 /// One notice row (`ThirdPartyLicenseEntry`).
@@ -260,13 +261,15 @@ async fn fetch_manifest(endpoint: Option<crate::backend::Endpoint>) -> Result<Ve
     let request = async move {
         let url = format!("{}/third-party-licenses.json", endpoint.http_base.trim_end_matches('/'));
         let response =
-            reqwest::Client::new().get(url).timeout(Duration::from_secs(30)).send().await.map_err(|error| {
-                if error.is_timeout() {
-                    "The license manifest took too long to load.".to_owned()
-                } else {
-                    error.to_string()
-                }
-            })?;
+            crate::app::pages::settings::http().get(url).timeout(Duration::from_secs(30)).send().await.map_err(
+                |error| {
+                    if error.is_timeout() {
+                        "The license manifest took too long to load.".to_owned()
+                    } else {
+                        error.to_string()
+                    }
+                },
+            )?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("The license manifest request failed with status {}.", status.as_u16()));
@@ -369,12 +372,16 @@ fn notice_row(state: &Entity<LicensesState>, entry: &Entry, open: bool, t: &Toke
 }
 
 impl Workspace {
-    pub(super) fn render_settings_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_licenses(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let endpoint = self.settings_endpoint().cloned();
         let state =
             window.use_keyed_state("settings-licenses", cx, |window, cx| LicensesState::new(endpoint, window, cx));
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let s = state.read(cx);
         let (filtered, total) = (s.visible.len(), s.entries.len());
         let count = div().whitespace_nowrap().text_xs().text_color(t.muted_foreground).child(if filtered == total {

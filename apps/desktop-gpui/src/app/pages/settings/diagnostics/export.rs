@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use super::super::connections::logic::SETTINGS_WRITE;
 use super::super::connections::ui::{Variant, WebButton};
 use super::super::widgets::{SettingsView, section_with_action};
-use super::{DiagnosticsState, rpc_message, success};
+use super::{DiagnosticsState, success};
 use crate::app::Workspace;
 use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
@@ -99,6 +99,9 @@ impl DiagnosticsState {
         let signal = SIGNALS[index].4;
         cx.spawn(async move |this, cx| {
             let response = client.request("server.checkOtlpEndpoint", json!({ "signal": signal, "url": url })).await;
+            if let Err(error) = &response {
+                log::warn!("server.checkOtlpEndpoint failed: {error}");
+            }
             let _ = this.update(cx, |this, cx| {
                 let slot = &mut this.export.checks[index];
                 if slot.as_ref().is_none_or(|check| check.url != url || check.result.is_some()) {
@@ -121,11 +124,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        if view.scope.kind != ScopeKind::Environment || self.settings_client().is_none() {
+        let Some(client) = self.settings_client().filter(|_| view.scope.kind == ScopeKind::Environment) else {
             return self.export_scope_notice(view, &t, cx);
-        }
-        let client = self.settings_client().expect("checked above");
-        let saved_values = &self.settings_info().settings.get("observability").clone();
+        };
+        let saved_values = self.settings_info().settings.get("observability");
         let saved: [String; 3] =
             SIGNALS.map(|(key, ..)| saved_values[key].as_str().unwrap_or_default().trim().to_owned());
         let running = self.settings_info().config.get("observability").cloned().unwrap_or_default();
@@ -337,7 +339,7 @@ impl Workspace {
                                 match result {
                                     Ok(_) => s.export.message = Some("Saved. Restart the server to apply."),
                                     Err(error) => window.push_notification(
-                                        gpui_kit::component::notification::Notification::error(rpc_message(&error))
+                                        gpui_kit::component::notification::Notification::error(error.message())
                                             .title("Could not save settings"),
                                         cx,
                                     ),

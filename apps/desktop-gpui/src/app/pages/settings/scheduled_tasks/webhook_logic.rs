@@ -414,8 +414,6 @@ pub(super) enum Tone {
     Success,
     Warning,
     Error,
-    #[allow(dead_code, reason = "the task list's running status badge uses it")]
-    Info,
     Outline,
 }
 
@@ -427,33 +425,6 @@ pub(super) fn delivery_tone(outcome: &str, pending_window: bool) -> Tone {
         "dispatch_failed" | "rejected_signature" => Tone::Error,
         _ => Tone::Outline,
     }
-}
-
-/// `relativeLabel` in `ScheduledTasksSettings.tsx`: past times like `formatRelativeTime`, future ones as "in 5m".
-pub(super) fn relative_label(value: Option<&str>, now_ms: i64) -> String {
-    let Some(at) = value.and_then(crate::timestamp::parse_ms) else { return "Not scheduled".into() };
-    let diff = at - now_ms;
-    if diff <= 0 {
-        let minutes = -diff / 60_000;
-        return match minutes {
-            0 => "just now".into(),
-            1..60 => format!("{minutes}m ago"),
-            60..1440 => format!("{}h ago", minutes / 60),
-            _ => format!("{}d ago", minutes / 1440),
-        };
-    }
-    let minutes = (diff + 59_999) / 60_000;
-    if minutes < 2 {
-        return "in under a minute".into();
-    }
-    if minutes < 60 {
-        return format!("in {minutes}m");
-    }
-    let hours = (minutes as f64 / 60.0).round() as i64;
-    if hours < 24 {
-        return format!("in {hours}h");
-    }
-    format!("in {}d", (hours as f64 / 24.0).round() as i64)
 }
 
 #[cfg(test)]
@@ -633,17 +604,5 @@ mod tests {
         assert_eq!(delivery_tone("accepted", true), Tone::Warning);
         assert_eq!(delivery_tone("filtered", false), Tone::Outline);
         assert_eq!(delivery_tone("dispatch_failed", false), Tone::Error);
-    }
-
-    #[test]
-    fn relative_labels_cover_past_and_future() {
-        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00.000Z").unwrap();
-        let at = |iso: &str| relative_label(Some(iso), now);
-        assert_eq!(at("2026-11-05T11:59:30Z"), "just now");
-        assert_eq!(at("2026-11-05T09:00:00Z"), "3h ago");
-        assert_eq!(at("2026-11-05T12:00:30Z"), "in under a minute");
-        assert_eq!(at("2026-11-05T12:45:00Z"), "in 45m");
-        assert_eq!(at("2026-11-07T12:00:00Z"), "in 2d");
-        assert_eq!(relative_label(None, now), "Not scheduled");
     }
 }

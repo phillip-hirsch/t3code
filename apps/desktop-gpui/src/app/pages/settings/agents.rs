@@ -3,6 +3,7 @@
 use gpui_kit::{AnyElement, Context, Window};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 
 #[path = "browser.rs"]
 mod browser;
@@ -21,23 +22,39 @@ impl Workspace {
         self.render_providers_page(window, cx)
     }
 
-    pub(super) fn render_settings_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_threads_settings(window, cx)
+    pub(super) fn render_settings_threads(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_threads_settings(view, window, cx)
     }
 
-    pub(super) fn render_settings_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_browser_settings(window, cx)
+    pub(super) fn render_settings_browser(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_browser_settings(view, window, cx)
     }
 
-    pub(super) fn render_settings_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_devices_settings(window, cx)
+    pub(super) fn render_settings_devices(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_devices_settings(view, window, cx)
     }
 
     pub(super) fn render_settings_scheduled_tasks(
         &mut self,
+        view: &SettingsView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        scheduled_tasks::render(self, window, cx)
+        scheduled_tasks::render(self, view, window, cx)
     }
 }

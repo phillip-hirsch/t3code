@@ -18,19 +18,20 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px, relative,
-    rems,
+    AnyElement, AnyWindowHandle, App, ClipboardItem, Context, ElementId, Entity, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, Window, div, px, relative, rems,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use self::logic::*;
-use super::connections::auth_request;
-use super::connections::logic::{DIAGNOSTICS_READ, ENVIRONMENT_MAINTAIN, ORCHESTRATION_OPERATE, Session};
-use super::connections::ui::WebButton;
+use super::connections::logic::{DIAGNOSTICS_READ, ENVIRONMENT_MAINTAIN, ORCHESTRATION_OPERATE};
+use super::connections::ui::{WebButton, tooltip};
+use super::connections::{SessionLoad, check_session};
 use super::widgets::section_with_action;
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
@@ -57,14 +58,6 @@ impl<T> Default for Query<T> {
     fn default() -> Self {
         Self { data: None, error: None, pending: false, _task: None }
     }
-}
-
-#[derive(Default)]
-enum SessionLoad {
-    #[default]
-    Pending,
-    Ready(Session),
-    Failed,
 }
 
 #[derive(Default)]
@@ -96,40 +89,25 @@ pub(super) struct DiagnosticsState {
     _copied_task: Option<Task<()>>,
 }
 
-fn rpc_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(value) => value.get("message").and_then(Value::as_str).map(str::to_owned),
-        _ => None,
-    }
-    .unwrap_or_else(|| error.to_string())
-}
-
 impl DiagnosticsState {
     fn start(&mut self, client: Option<RpcClient>, endpoint: Option<crate::backend::Endpoint>, cx: &mut Context<Self>) {
-        let Some(client) = client else { return };
+        let (Some(client), Some(endpoint)) = (client, endpoint) else { return };
         if self.started {
             return;
         }
         self.started = true;
         self.history_window = 1;
         self.telemetry_window = 1;
-        self._session_task = Some(cx.spawn(async move |this, cx| {
-            let result = auth_request(endpoint, "/api/auth/session", None).await;
-            let _ = this.update(cx, |this, cx| {
-                this.session = match result {
-                    Ok(value) => SessionLoad::Ready(Session::from_json(&value)),
-                    Err(_) => SessionLoad::Failed,
-                };
-                if this.grants(DIAGNOSTICS_READ) {
-                    this.refresh_all(&client, cx);
-                }
-                cx.notify();
-            });
+        self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
+            this.session = session;
+            if this.grants(DIAGNOSTICS_READ) {
+                this.refresh_all(&client, cx);
+            }
         }));
     }
 
     fn grants(&self, scope: &str) -> bool {
-        matches!(&self.session, SessionLoad::Ready(session) if session.grants(scope))
+        self.session.grants(scope)
     }
 
     fn refresh_all(&mut self, client: &RpcClient, cx: &mut Context<Self>) {
@@ -155,9 +133,7 @@ impl DiagnosticsState {
             let _ = this.update(cx, |this, cx| {
                 let query = slot(this);
                 query.pending = false;
-                match result
-                    .map_err(|e| rpc_message(&e))
-                    .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+                match result.map_err(|e| e.message()).and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
                 {
                     Ok(data) => {
                         query.data = Some(data);
@@ -210,8 +186,11 @@ impl DiagnosticsState {
                             false
                         }
                         StreamEvent::End(result) => {
-                            if let Err(error) = result {
-                                this.telemetry_error = Some(rpc_message(&error).into());
+                            match result {
+                                // Everything reloads on the next connection.
+                                Err(RpcError::Disconnected(_)) => this.started = false,
+                                Err(error) => this.telemetry_error = Some(error.message().into()),
+                                Ok(_) => {}
                             }
                             true
                         }
@@ -241,7 +220,7 @@ impl DiagnosticsState {
                         this.load_telemetry_history(client.clone(), cx);
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(rpc_message(&error)).title("Could not restart resource monitor"),
+                        Notification::error(error.message()).title("Could not restart resource monitor"),
                         cx,
                     ),
                 }
@@ -251,8 +230,16 @@ impl DiagnosticsState {
         .detach();
     }
 
-    /// `signalProcess` for the Live Processes table.
-    fn signal_live(&mut self, client: RpcClient, pid: u64, signal: &'static str, cx: &mut Context<Self>) {
+    /// `signalProcess` for the Live Processes table. The result toasts in `window`, the
+    /// one clicked, whether or not it is still focused.
+    fn signal_live(
+        &mut self,
+        client: RpcClient,
+        pid: u64,
+        signal: &'static str,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         let Some(process) = self.processes.data.as_ref().and_then(|d| d.processes.iter().find(|p| p.pid == pid)) else {
             return;
         };
@@ -262,44 +249,37 @@ impl DiagnosticsState {
         self.signaling_pid = Some(pid);
         let input = json!({ "pid": pid, "startTimeMs": process.start_time_ms, "signal": signal });
         cx.notify();
-        let entity = cx.entity();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = client.request("server.signalProcess", input).await;
-            let _ = cx.update(|cx| {
-                let Some(window) = cx.active_window() else { return };
-                let _ = window.update(cx, |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.signaling_pid = None;
-                        let title = format!("Could not send {signal}");
-                        match result {
-                            Err(RpcError::Disconnected(_)) => {}
-                            Err(error) => {
-                                window.push_notification(Notification::error(rpc_message(&error)).title(title), cx)
-                            }
-                            Ok(value) if value["signaled"].as_bool() == Some(true) => {
-                                this.load_processes(client.clone(), cx)
-                            }
-                            Ok(value) => {
-                                let message = some(&value["message"]).and_then(Value::as_str).map(str::to_owned);
-                                this.load_processes(client.clone(), cx);
-                                if is_stale_signal_message(message.as_deref()) {
-                                    window.push_notification(
-                                        Notification::info(
-                                            "The process is not a child of the T3 Server. It might already have exited.",
-                                        )
-                                        .title("Process already exited"),
-                                        cx,
-                                    );
-                                } else {
-                                    let message = message.unwrap_or_else(|| format!("Failed to send {signal}."));
-                                    window.push_notification(Notification::error(message).title(title), cx);
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })
-                });
+            let toast = this.update(cx, |this, cx| {
+                this.signaling_pid = None;
+                cx.notify();
+                let title = format!("Could not send {signal}");
+                match result {
+                    Err(RpcError::Disconnected(_)) => None,
+                    Err(error) => Some(Notification::error(error.message()).title(title)),
+                    Ok(value) if value["signaled"].as_bool() == Some(true) => {
+                        this.load_processes(client.clone(), cx);
+                        None
+                    }
+                    Ok(value) => {
+                        let message = some(&value["message"]).and_then(Value::as_str).map(str::to_owned);
+                        this.load_processes(client.clone(), cx);
+                        Some(if is_stale_signal_message(message.as_deref()) {
+                            Notification::info(
+                                "The process is not a child of the T3 Server. It might already have exited.",
+                            )
+                            .title("Process already exited")
+                        } else {
+                            let message = message.unwrap_or_else(|| format!("Failed to send {signal}."));
+                            Notification::error(message).title(title)
+                        })
+                    }
+                }
             });
+            if let Ok(Some(toast)) = toast {
+                let _ = window.update(cx, |_, window, cx| window.push_notification(toast, cx));
+            }
         })
         .detach();
     }
@@ -310,6 +290,7 @@ impl DiagnosticsState {
         client: RpcClient,
         identity: Identity,
         signal: &'static str,
+        window: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let key = identity.key();
@@ -318,31 +299,26 @@ impl DiagnosticsState {
         }
         let input = json!({ "pid": identity.pid, "startTimeMs": identity.start_time_ms, "signal": signal });
         cx.notify();
-        let entity = cx.entity();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = client.request("server.signalProcess", input).await;
-            let _ = cx.update(|cx| {
-                let Some(window) = cx.active_window() else { return };
-                let _ = window.update(cx, |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.signaling_keys.remove(&key);
-                        let title = format!("Could not send {signal}");
-                        let failure = match result {
-                            Err(RpcError::Disconnected(_)) => None,
-                            Err(error) => Some(rpc_message(&error)),
-                            Ok(value) if value["signaled"].as_bool() == Some(true) => None,
-                            Ok(value) => Some(some(&value["message"]).and_then(Value::as_str).map_or_else(
-                                || format!("Failed to send {signal} to process {}.", identity.pid),
-                                str::to_owned,
-                            )),
-                        };
-                        if let Some(message) = failure {
-                            window.push_notification(Notification::error(message).title(title), cx);
-                        }
-                        cx.notify();
-                    })
-                });
+            let _ = this.update(cx, |this, cx| {
+                this.signaling_keys.remove(&key);
+                cx.notify();
             });
+            let failure = match result {
+                Err(RpcError::Disconnected(_)) => None,
+                Err(error) => Some(error.message()),
+                Ok(value) if value["signaled"].as_bool() == Some(true) => None,
+                Ok(value) => Some(
+                    some(&value["message"])
+                        .and_then(Value::as_str)
+                        .map_or_else(|| format!("Failed to send {signal} to process {}.", identity.pid), str::to_owned),
+                ),
+            };
+            if let Some(message) = failure {
+                let toast = Notification::error(message).title(format!("Could not send {signal}"));
+                let _ = window.update(cx, |_, window, cx| window.push_notification(toast, cx));
+            }
         })
         .detach();
     }
@@ -388,11 +364,6 @@ fn tone_color(tone: Tone, t: &Tokens) -> Hsla {
         Tone::Warning => t.warning_foreground,
         Tone::Danger => t.error_foreground,
     }
-}
-
-fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
-    let text = text.into();
-    move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
 }
 
 /// A ghost icon button (`size="icon-xs"`/`"icon-micro"`, `variant="ghost-muted"`).
@@ -818,12 +789,16 @@ fn tree_name(
 }
 
 impl Workspace {
-    pub(super) fn render_settings_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings_diagnostics(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let state = window.use_keyed_state("settings-diagnostics", cx, |_, _| DiagnosticsState::default());
         let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |s, cx| s.start(client.clone(), endpoint, cx));
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let s = state.read(cx);
         let blocked = match (&client, &s.session) {
             (None, _) => Some("Connect an environment to see diagnostics."),
@@ -1347,9 +1322,9 @@ impl Workspace {
                     let (state, client, identity) = (state.clone(), client.clone(), p.identity);
                     let disabled = !maintain || s.signaling_keys.contains(&key);
                     signal_actions(&format!("tree-{key}"), disabled, t, move |signal, window, cx| {
-                        let (state, client) = (state.clone(), client.clone());
+                        let (state, client, handle) = (state.clone(), client.clone(), window.window_handle());
                         let send = move |cx: &mut App| {
-                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, cx))
+                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, handle, cx))
                         };
                         if signal == "SIGKILL" {
                             confirm_kill(identity.pid, window, cx, send);
@@ -1584,9 +1559,10 @@ impl Workspace {
                 let (signal_state, signal_client) = (state.clone(), client.clone());
                 let disabled = !maintain || s.signaling_pid == Some(pid);
                 let actions = signal_actions(&format!("proc-{pid}"), disabled, t, move |signal, window, cx| {
-                    let (state, client) = (signal_state.clone(), signal_client.clone());
-                    let send =
-                        move |cx: &mut App| state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, cx));
+                    let (state, client, handle) = (signal_state.clone(), signal_client.clone(), window.window_handle());
+                    let send = move |cx: &mut App| {
+                        state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, handle, cx))
+                    };
                     if signal == "SIGKILL" {
                         confirm_kill(pid, window, cx, send);
                     } else {
@@ -1792,7 +1768,7 @@ impl Workspace {
                             if let Err(error) = result
                                 && !matches!(error, RpcError::Disconnected(_))
                             {
-                                s.logs_error = Some(rpc_message(&error).into());
+                                s.logs_error = Some(error.message().into());
                             }
                             cx.notify();
                         });

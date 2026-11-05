@@ -5,6 +5,7 @@ use gpui_kit::{AnyElement, Context, Window};
 
 use super::widgets::{SettingRow, settings_section};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme;
 
 const MOD: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
@@ -37,9 +38,13 @@ fn follow_up_description(send_shortcut: &str) -> String {
 }
 
 impl Workspace {
-    pub(super) fn render_chat_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_chat_section(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let view = self.settings_view();
         let follow_up = follow_up_description(view.str("sendShortcut"));
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
         let skills = row(

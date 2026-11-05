@@ -28,6 +28,7 @@ use super::widgets::{RowFrame, card, select_trigger, settings_section};
 
 const MOD_LABEL: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::keybindings::{
     self, Rule, STATIC_COMMANDS, Shortcut, When, defaults, parse_shortcut, parse_when, shortcut_input, when_expression,
 };
@@ -823,10 +824,14 @@ impl KeybindingsPanel {
                         if !remove {
                             this.adding = None;
                         }
-                        if let Some(workspace) = this.workspace.upgrade() {
+                        // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
+                        let rules = value.get("keybindings").filter(|rules| rules.is_array());
+                        if rules.is_none() {
+                            log::warn!("{method} reply has no keybindings list; keeping the current keymap");
+                        }
+                        if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.settings_info_mut().keybindings =
-                                    Rc::new(keybindings::decode_rules(&value["keybindings"]));
+                                workspace.settings_info_mut().keybindings = Rc::new(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });
@@ -838,7 +843,7 @@ impl KeybindingsPanel {
                         } else {
                             ("Unable to save keybinding", "The keybinding was not saved.")
                         };
-                        let message = error.to_string();
+                        let message = error.message();
                         let message = if message.is_empty() { fallback.to_owned() } else { message };
                         window.push_notification(Notification::error(message).title(title), cx);
                     }
@@ -1688,7 +1693,7 @@ pub(in crate::app) fn open_keybindings_file(
             if let Err(error) = client.request("shell.openInEditor", payload).await {
                 let _ = cx.update(|window, cx| {
                     window.push_notification(
-                        Notification::error(error.to_string()).title("Unable to open keybindings file"),
+                        Notification::error(error.message()).title("Unable to open keybindings file"),
                         cx,
                     )
                 });
@@ -1704,17 +1709,21 @@ impl Workspace {
         panel.is_some_and(|panel| panel.read(cx).recording.is_some())
     }
 
-    pub(super) fn render_keybindings_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_keybindings_section(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (workspace, source, connected) =
             (cx.entity(), self.settings_info().keybindings.clone(), self.settings_client().is_some());
-        let view = self
+        let panel = self
             .keybindings_panel
             .get_or_insert_with(|| cx.new(|cx| KeybindingsPanel::new(workspace, source, connected, window, cx)).into())
             .clone();
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.
-        let settings = self.settings_view();
-        self.settings_page("keybindings", &settings, [div().child(view).into_any_element()], cx)
+        self.settings_page("keybindings", view, [div().child(panel).into_any_element()], cx)
     }
 }
 

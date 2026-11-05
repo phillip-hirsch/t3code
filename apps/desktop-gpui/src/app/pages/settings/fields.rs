@@ -134,13 +134,12 @@ impl NumberField {
         let subscriptions = [
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let typed = this.input.read(cx).value().trim().parse::<f64>().ok();
-                    this.commit(typed.map(|typed| typed.round() as i64), window, cx);
+                    let typed = parse_number(&this.input.read(cx).value());
+                    this.commit(typed, window, cx);
                 }
             }),
             cx.subscribe_in(&input, window, |this, _, NumberInputEvent::Step(action), window, cx| {
-                let typed = this.input.read(cx).value().trim().parse::<f64>();
-                let current = typed.map_or(this.value, |typed| typed.round() as i64);
+                let current = parse_number(&this.input.read(cx).value()).unwrap_or(this.value);
                 let step = if matches!(action, StepAction::Increment) { this.step } else { -this.step };
                 this.commit(Some(current.saturating_add(step)), window, cx);
             }),
@@ -166,6 +165,13 @@ impl NumberField {
         let (Some(on_commit), Some(workspace)) = (self.on_commit.clone(), self.workspace.upgrade()) else { return };
         workspace.update(cx, |this, cx| on_commit(this, next, window, cx));
     }
+}
+
+/// A typed number rounded to a whole one; `None` (keep the saved value) when it isn't a
+/// finite number. Out-of-range values saturate, and the field's clamp then applies.
+fn parse_number(typed: &str) -> Option<i64> {
+    let typed = typed.trim().parse::<f64>().ok().filter(|typed| typed.is_finite())?;
+    Some(typed.round() as i64)
 }
 
 #[derive(Clone)]
@@ -382,5 +388,15 @@ mod tests {
         assert_eq!(resolve_pasted_path("", r"'/it'\''s'"), "/it's");
         assert_eq!(resolve_pasted_path("", r"D:\worktrees"), r"D:\worktrees");
         assert_eq!(resolve_pasted_path("ab", "abc def"), "abc def", "a paste that isn't a path is left alone");
+    }
+
+    #[test]
+    fn typed_numbers_round_and_reject_non_numbers() {
+        assert_eq!(parse_number(" 2.5 "), Some(3));
+        assert_eq!(parse_number("-7"), Some(-7));
+        assert_eq!(parse_number("99999999999999999999"), Some(i64::MAX));
+        for typed in ["", "nan", "inf", "-infinity", "12px"] {
+            assert_eq!(parse_number(typed), None, "{typed}");
+        }
     }
 }

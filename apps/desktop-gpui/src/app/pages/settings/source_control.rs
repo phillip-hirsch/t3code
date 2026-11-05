@@ -11,6 +11,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -30,7 +32,7 @@ use super::super::model_select::{generates_text, muted, resolve_text_generation}
 use super::super::widgets::{SettingRow, SettingsView, section_with_action, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
 const MERGE_METHODS: &[(&str, &str)] =
@@ -176,13 +178,6 @@ fn has_secret(value: &Value) -> bool {
     value.as_str().map_or(!value.is_null(), |text| !text.is_empty())
 }
 
-fn failure_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(failure) => failure["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
-    }
-}
-
 /// `redactedPlaceholder`: the same length and punctuation, other characters scrambled stably.
 fn redacted(value: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
@@ -277,7 +272,7 @@ enum SignIn {
 /// What Source control keeps across frames: the discovery scan, folds and the in-progress
 /// GitHub sign-in and token form.
 struct SourceControlState {
-    discovery: Option<Value>,
+    discovery: Option<Rc<Value>>,
     error: Option<String>,
     pending: bool,
     _scan: Option<Task<()>>,
@@ -337,10 +332,10 @@ impl SourceControlState {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(result) => {
-                        this.discovery = Some(result);
+                        this.discovery = Some(Rc::new(result));
                         this.error = None;
                     }
-                    Err(error) => this.error = Some(failure_message(&error)),
+                    Err(error) => this.error = Some(error.message()),
                 }
                 this.pending = false;
                 cx.notify();
@@ -351,7 +346,12 @@ impl SourceControlState {
 }
 
 impl Workspace {
-    pub(super) fn render_source_control_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_source_control_settings(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *tokens(cx);
         let client = self.settings_client();
         let first_scan = client.clone();
@@ -362,7 +362,6 @@ impl Workspace {
             }
             state
         });
-        let view = self.settings_view();
         let stored = view.value("pullRequestMergeMethod").clone();
         let method = stored.as_str().unwrap_or("last");
         let merge_method = self.value_select(
@@ -819,14 +818,15 @@ impl Workspace {
         }
         parts.push(self.token_form(state, host.kind, credentials, window, cx));
         if item["status"] == "available" {
-            let accounts = item["auth"]["accounts"].as_array().cloned().unwrap_or_default();
-            parts.push(self.account_choices(state, host.kind, credentials, &accounts, cx));
+            let accounts = item["auth"]["accounts"].as_array().map_or(&[][..], Vec::as_slice);
+            parts.push(self.account_choices(state, host.kind, credentials, accounts, cx));
         }
         v_flex().gap(px(24.)).children(parts).into_any_element()
     }
 
-    fn host_settings(&self, kind: &str) -> Value {
-        self.settings_info().settings.get("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
+    /// The saved settings of one host kind; `Null` (reads as empty) when it has none.
+    fn host_settings(&self, kind: &str) -> &Value {
+        &self.settings_info().settings.get("sourceControlHosts")[kind]
     }
 
     /// `SourceControlAppSignInSettings`: the device-code sign-in card.
@@ -1040,7 +1040,7 @@ impl Workspace {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     let _ = state.update(cx, |state, cx| {
-                        state.sign_in = SignIn::Failed(failure_message(&error));
+                        state.sign_in = SignIn::Failed(error.message());
                         cx.notify();
                     });
                     return;
@@ -1061,7 +1061,7 @@ impl Workspace {
                 if matches!(&state.sign_in, SignIn::Waiting { user_code: code, .. } if *code == user_code) {
                     state.sign_in = match &finished {
                         Ok(_) => SignIn::Idle,
-                        Err(error) => SignIn::Failed(failure_message(error)),
+                        Err(error) => SignIn::Failed(error.message()),
                     };
                     cx.notify();
                 }
@@ -1211,7 +1211,10 @@ impl Workspace {
         let save = {
             let (state, tokens_map) = (state.clone(), tokens_map.clone());
             move |this: &mut Self, host: String, token: String, cx: &mut Context<Self>| {
-                state.update(cx, |state, _| state.saving = true);
+                state.update(cx, |state, cx| {
+                    state.saving = true;
+                    cx.notify();
+                });
                 // The whole map: other tokens' redaction markers keep their values.
                 let mut tokens = tokens_map.as_object().cloned().unwrap_or_default();
                 tokens.insert(host, json!(token));
@@ -1371,7 +1374,10 @@ impl Workspace {
                   enabled: Option<bool>,
                   account: Option<Option<&str>>,
                   cx: &mut Context<Self>| {
-                state.update(cx, |state, _| state.saving = true);
+                state.update(cx, |state, cx| {
+                    state.saving = true;
+                    cx.notify();
+                });
                 let choices = next_host_choices(&hosts, host, enabled, account);
                 let state = state.clone();
                 this.update_environment_settings(
@@ -1559,7 +1565,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *tokens(cx);
-        let saved = self.host_settings(host.kind);
+        let saved = self.host_settings(host.kind).clone();
         let kind = host.kind;
         let mut column = v_flex().gap(px(12.));
         for field in host.fields {
@@ -1668,10 +1674,10 @@ impl Workspace {
         let usable: Vec<&crate::model::Provider> =
             providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
         let stored_text: Option<ModelSelection> =
-            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
         let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
         let writer: Option<ModelSelection> =
-            serde_json::from_value(view.value("sourceControlWriterModelSelection").clone()).ok();
+            serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
         let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
         let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
         let can_dedicate =
@@ -1679,7 +1685,7 @@ impl Workspace {
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
             let guide: Option<ModelSelection> =
-                serde_json::from_value(view.value("reviewGuideModelSelection").clone()).ok();
+                serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
             let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
             let guide_selection = guide_usable.cloned().or_else(|| active.clone());
             self.dedicated_model_control(

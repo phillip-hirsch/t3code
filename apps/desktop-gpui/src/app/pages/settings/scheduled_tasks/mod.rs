@@ -4,7 +4,6 @@
 //! path (`ScheduledTaskEnvironmentSection`); the web's multi-environment list, scope filtering
 //! (`matchesScheduledTaskScope`, everything matches the global scope) and `?taskId=` deep links
 //! do not apply yet. The section has no plain setting rows: every control is RPC-backed.
-//! `section`, `group` and `row` below are placeholders for the foundation's settings widgets.
 
 mod editor;
 pub(in crate::app) mod logic;
@@ -32,13 +31,19 @@ use serde_json::json;
 use self::logic::{ScheduledTask, decode_tasks, relative_label, schedule_label};
 use super::super::widgets::{RowFrame, section_with_action};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
 const SECTION: &str = "scheduled-tasks";
 
 /// The section body: one retained view, so its subscription outlives a frame.
-pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
+pub(super) fn render(
+    workspace: &mut Workspace,
+    settings: &SettingsView,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let view = workspace
         .scheduled_tasks_view
         .get_or_insert_with(|| {
@@ -46,7 +51,6 @@ pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
             AnyView::from(cx.new(|cx| ScheduledTasksView::new(owner, cx)))
         })
         .clone();
-    let settings = workspace.settings_view();
     // `scope.kind === "unavailable"`: the selection names a project or machine that is gone.
     if let crate::settings::scope::ScopeKind::Unavailable { message } = settings.scope.kind {
         let t = *crate::theme::tokens(cx);
@@ -57,9 +61,12 @@ pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
     workspace.settings_page("scheduled-tasks", &settings, [view.into_any_element()], cx)
 }
 
+/// The task list, shared so a row or the editor holds a task without copying it.
+pub(super) type Tasks = Rc<[Rc<ScheduledTask>]>;
+
 enum Load {
     Loading,
-    Loaded(Rc<Vec<ScheduledTask>>),
+    Loaded(Tasks),
     Failed(SharedString),
 }
 
@@ -119,7 +126,9 @@ impl ScheduledTasksView {
                 let ended = matches!(event, StreamEvent::End(_));
                 let applied = this.update(cx, |this, cx| {
                     match event {
-                        StreamEvent::Item(value) => this.tasks = Load::Loaded(Rc::new(decode_tasks(&value))),
+                        StreamEvent::Item(value) => {
+                            this.tasks = Load::Loaded(decode_tasks(&value).into_iter().map(Rc::new).collect())
+                        }
                         // A dropped socket shows as disconnected; the next connection resubscribes.
                         StreamEvent::End(Ok(()) | Err(RpcError::Disconnected(_))) => {
                             this.subscribed = false;
@@ -127,7 +136,7 @@ impl ScheduledTasksView {
                         }
                         StreamEvent::End(Err(error)) => {
                             this.subscribed = false;
-                            this.tasks = Load::Failed(error_message(&error).into());
+                            this.tasks = Load::Failed(error.message().into());
                         }
                     }
                     cx.notify();
@@ -165,7 +174,7 @@ impl ScheduledTasksView {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy.remove(&id);
                 if let Err(error) = result {
-                    notify_error(window, cx, "Could not update scheduled task", error_message(&error));
+                    notify_error(window, cx, "Could not update scheduled task", error.message());
                 }
                 cx.notify();
             });
@@ -180,14 +189,14 @@ impl ScheduledTasksView {
     }
 
     /// The loaded list, for the editor's "task no longer exists" check and live webhook state.
-    fn loaded_tasks(&self) -> Option<Rc<Vec<ScheduledTask>>> {
+    fn loaded_tasks(&self) -> Option<Tasks> {
         match &self.tasks {
             Load::Loaded(tasks) => Some(tasks.clone()),
             _ => None,
         }
     }
 
-    fn render_row(&self, task: &ScheduledTask, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
+    fn render_row(&self, task: &Rc<ScheduledTask>, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
         let busy = self.busy.contains(&task.id);
         let schedule = task.schedule();
         let webhook = schedule == logic::Schedule::Webhook;
@@ -213,9 +222,13 @@ impl ScheduledTasksView {
 
         let id = task.id.clone();
         let view = cx.entity();
-        let menu_task = Rc::new(task.clone());
+        let menu_task = Rc::clone(task);
         let client = client.clone();
-        let context = self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx));
+        let context = if webhook {
+            self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx))
+        } else {
+            None
+        };
         let menu = Button::new(SharedString::from(format!("scheduled-task-actions-{id}")))
             .ghost()
             .small()
@@ -256,7 +269,7 @@ impl ScheduledTasksView {
             });
 
         let enabled = task.enabled;
-        let toggle_task = task.clone();
+        let toggle_task = Rc::clone(task);
         let control = div()
             .flex()
             .items_center()
@@ -326,14 +339,6 @@ impl Render for ScheduledTasksView {
 
         let rows = body.into_iter().map(|row| row.render(&t).into_any_element());
         section_with_action("scheduled-tasks", "Scheduled tasks", Some(new_task.into_any_element()), rows, &t)
-    }
-}
-
-/// `squashAtomCommandFailure`: the server's message without its error tag.
-fn error_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(value) => value["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
     }
 }
 
