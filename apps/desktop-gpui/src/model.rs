@@ -409,8 +409,20 @@ pub struct ThreadShell {
     pub pin_order_key: Option<String>,
     #[serde(default)]
     pub active_order_key: Option<String>,
-    #[serde(default)]
-    pub last_visited_at: Option<String>,
+    /// Absent on servers without visit tracking; `Some(None)` when never visited.
+    #[serde(default, deserialize_with = "present")]
+    pub last_visited_at: Option<Option<String>>,
+}
+
+impl ThreadShell {
+    pub fn last_visited(&self) -> Option<&str> {
+        self.last_visited_at.as_ref()?.as_deref()
+    }
+
+    /// The server keeps a read watermark for this thread.
+    pub fn tracks_visits(&self) -> bool {
+        self.last_visited_at.is_some()
+    }
 }
 
 impl ThreadShell {

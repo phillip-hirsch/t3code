@@ -57,6 +57,10 @@ enum Target {
 struct OpenThread {
     id: String,
     state: ThreadState,
+    /// A snapshot failed to decode in the batch just applied.
+    snapshot_failed: bool,
+    /// One automatic resubscribe per open; a second failure is shown.
+    retried: bool,
     _subscription: Option<Task<()>>,
 }
 
@@ -101,6 +105,12 @@ pub struct Workspace {
     lineage_expanded: Option<String>,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
+    _shell_task: Option<Task<()>>,
+    /// Shell twin of [`OpenThread::snapshot_failed`] / [`OpenThread::retried`].
+    shell_snapshot_failed: bool,
+    shell_retried: bool,
+    /// The last-opened thread is reopened once, after the first shell snapshot.
+    route_restored: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -156,6 +166,10 @@ impl Workspace {
             lineage_expanded: None,
             _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
+            _shell_task: None,
+            shell_snapshot_failed: false,
+            shell_retried: false,
+            route_restored: false,
             _subscriptions: subscriptions,
         }
     }
@@ -271,6 +285,7 @@ impl Workspace {
         }
         if !matches!(connection, Connection::Connected(_)) {
             self._stream_tasks.clear();
+            self._shell_task = None;
             if let Some(thread) = &mut self.thread {
                 thread._subscription = None;
             }
@@ -290,42 +305,55 @@ impl Workspace {
     fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = Connection::Connected(client.clone());
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
-        let mut shell_input = json!({"requestCompletionMarker": true});
-        if self.shell.sequence > 0 {
-            shell_input["afterSequence"] = self.shell.sequence.into();
-        }
-        let shell = client.stream("orchestration.subscribeShell", shell_input);
-        self._stream_tasks = vec![
-            Self::pump(
-                config,
-                window,
-                cx,
-                |this, value| {
-                    if let Err(error) = this.server_info.apply(value) {
-                        log::warn!("bad server config event: {error}");
-                    }
-                },
-                |this, _, cx| this.notify_sidebar(cx),
-            ),
-            Self::pump(
-                shell,
-                window,
-                cx,
-                |this, value| {
-                    if let Err(error) = this.shell.apply(value) {
-                        log::warn!("bad shell event: {error}");
-                        this.error = Some("Couldn't read the thread list from the server. Reconnect to retry.".into());
-                    }
-                },
-                |this, _, cx| {
-                    this.observe_inbox_while_hidden();
-                    this.notify_sidebar(cx);
-                    this.track_visit(cx);
-                },
-            ),
-        ];
+        self._stream_tasks = vec![Self::pump(
+            config,
+            window,
+            cx,
+            |this, value| {
+                if let Err(error) = this.server_info.apply(value) {
+                    log::warn!("bad server config event: {error}");
+                }
+            },
+            |this, _, cx| this.notify_sidebar(cx),
+        )];
+        self.shell_retried = false;
+        self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);
         cx.notify();
+    }
+
+    fn subscribe_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else { return };
+        let mut input = json!({"requestCompletionMarker": true});
+        if self.shell.sequence > 0 {
+            input["afterSequence"] = self.shell.sequence.into();
+        }
+        let stream = client.stream("orchestration.subscribeShell", input);
+        self._shell_task = Some(Self::pump(
+            stream,
+            window,
+            cx,
+            |this, value| {
+                if let Err(error) = this.shell.apply(value) {
+                    log::warn!("bad shell event: {error}");
+                    this.shell_snapshot_failed = true;
+                }
+            },
+            |this, window, cx| {
+                // The reducer reset its cursor, so one resubscribe fetches a fresh snapshot.
+                if std::mem::take(&mut this.shell_snapshot_failed) {
+                    if !std::mem::replace(&mut this.shell_retried, true) {
+                        this.subscribe_shell(window, cx);
+                        return;
+                    }
+                    this.error = Some("Couldn't read the thread list from the server. Reconnect to retry.".into());
+                }
+                this.restore_last_thread(window, cx);
+                this.observe_inbox_while_hidden();
+                this.notify_sidebar(cx);
+                this.track_visit(cx);
+            },
+        ));
     }
 
     /// Applies every event already queued on `stream`, then runs `after_batch`
@@ -391,11 +419,20 @@ impl Workspace {
                 let Some(thread) = this.thread.as_mut().filter(|t| t.id == thread_id) else { return };
                 if let Err(error) = thread.state.apply(value) {
                     log::warn!("bad thread event: {error}");
-                    this.error = Some("Couldn't read this thread from the server. Open it again to retry.".into());
+                    thread.snapshot_failed = true;
                 }
             },
             move |this, window, cx| {
-                let Some(thread) = this.thread.as_ref().filter(|t| t.id == batch_thread_id) else { return };
+                let Some(thread) = this.thread.as_mut().filter(|t| t.id == batch_thread_id) else { return };
+                // The reducer reset its cursor, so one resubscribe fetches a fresh snapshot.
+                if std::mem::take(&mut thread.snapshot_failed) {
+                    if !std::mem::replace(&mut thread.retried, true) {
+                        this.subscribe_thread(window, cx);
+                        return;
+                    }
+                    this.error = Some("Couldn't read this thread from the server. Open it again to retry.".into());
+                }
+                let Some(thread) = this.thread.as_ref() else { return };
                 if thread.state.deleted {
                     this.close_thread(window, cx);
                     return;
@@ -404,6 +441,24 @@ impl Workspace {
                 this.sync_question(window, cx);
             },
         ));
+    }
+
+    /// Reopens the thread open at the last launch, as the web restores its route.
+    fn restore_last_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.route_restored || self.shell.sequence == 0 {
+            return;
+        }
+        self.route_restored = true;
+        if self.target.is_some() {
+            return;
+        }
+        let Some(thread_id) = last_thread_file().and_then(|path| std::fs::read_to_string(path).ok()) else { return };
+        let thread_id = thread_id.trim();
+        let exists =
+            self.shell.threads.iter().any(|t| t.id == thread_id && t.archived_at.is_none() && t.deleted_at.is_none());
+        if exists {
+            self.select_thread(thread_id.to_owned(), window, cx);
+        }
     }
 
     /// Leaves a thread that was deleted, as the web ends its view.
@@ -446,12 +501,23 @@ impl Workspace {
         }
         self.stash_composer(cx);
         self.target = Some(Target::Thread(thread_id.clone()));
-        self.thread = Some(OpenThread { id: thread_id.clone(), state: ThreadState::default(), _subscription: None });
+        self.thread = Some(OpenThread {
+            id: thread_id.clone(),
+            state: ThreadState::default(),
+            snapshot_failed: false,
+            retried: false,
+            _subscription: None,
+        });
         self.model_override = None;
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
         self.open_visit(&thread_id, cx);
+        // Best effort: a missing file only means the next launch starts on the empty view.
+        if let Some(path) = last_thread_file() {
+            let _ = path.parent().map(std::fs::create_dir_all);
+            let _ = std::fs::write(path, &thread_id);
+        }
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
@@ -659,6 +725,14 @@ impl Workspace {
         })
         .detach();
     }
+}
+
+/// Where the last-opened thread id is kept between launches.
+fn last_thread_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))?;
+    Some(base.join("t3-desktop-gpui").join("last-thread"))
 }
 
 fn new_id() -> String {

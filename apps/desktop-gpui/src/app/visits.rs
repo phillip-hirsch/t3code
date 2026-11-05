@@ -51,6 +51,10 @@ fn decide(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>, no
 }
 
 fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>, now: i64) -> Visit {
+    // A server without visit tracking has no watermark to move (the web keeps a local one instead).
+    if !shell.tracks_visits() {
+        return Visit::Skip;
+    }
     let Some(updated) = inbox::parse_ms(&shell.updated_at) else { return Visit::Skip };
     let woke = woke_at.and_then(inbox::parse_ms).filter(|woke| *woke > updated);
     let (visited_at, updated) = match (woke, woke_at) {
@@ -66,7 +70,7 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
         state.open_pending = false;
         return send(state, true);
     }
-    let last_visited = shell.last_visited_at.as_deref().and_then(inbox::parse_ms);
+    let last_visited = shell.last_visited().and_then(inbox::parse_ms);
     if last_visited.is_some_and(|visited| visited >= updated) {
         // Already seen, so a later mark-unread stays sticky.
         if state.last_dispatched.is_none_or(|sent| sent < updated) {
@@ -134,6 +138,16 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn servers_without_visit_tracking_get_no_visits() {
+        let mut state = VisitState { open_pending: true, ..VisitState::default() };
+        let mut thread = shell(T0, None, None);
+        thread.last_visited_at = None;
+        let now = inbox::parse_ms(T2).unwrap();
+        assert_eq!(decide(&mut state, &thread, None, now), Visit::Skip);
+        assert!(state.open_pending, "the open waits for a server that tracks visits");
+    }
+
     use super::*;
 
     fn shell(updated_at: &str, last_visited_at: Option<&str>, completed_at: Option<&str>) -> ThreadShell {

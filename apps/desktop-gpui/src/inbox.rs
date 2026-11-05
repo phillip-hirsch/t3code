@@ -338,7 +338,7 @@ impl<'a> Facts<'a> {
     /// Woke and not visited since, the "Woke" top status.
     pub fn is_woke(&self, now: i64) -> bool {
         let Some(woke_at) = ms(self.woke_at(now)) else { return false };
-        let visited_before = match &self.thread.last_visited_at {
+        let visited_before = match self.thread.last_visited() {
             None => true,
             Some(visited) => parse_ms(visited).is_none_or(|v| v < woke_at),
         };
@@ -348,7 +348,7 @@ impl<'a> Facts<'a> {
     /// `hasUnseenCompletion`.
     pub fn is_unread(&self) -> bool {
         let Some(completed) = ms(self.latest_run_completed_at()) else { return false };
-        let Some(visited) = self.thread.last_visited_at.as_deref() else { return false };
+        let Some(visited) = self.thread.last_visited() else { return false };
         parse_ms(visited).is_none_or(|visited| completed > visited)
     }
 
