@@ -491,8 +491,10 @@ impl Workspace {
                 if let Err(error) = this.server_info.apply(value) {
                     log::warn!("bad server config event: {error}");
                 }
+                this.note_keybindings_event(value);
             },
             |this, window, cx| {
+                this.show_keybindings_toasts(window, cx);
                 this.sync_keymap(cx);
                 this.notify_sidebar(cx);
                 this.check_chatgpt_welcome(window, cx);

@@ -1062,23 +1062,29 @@ impl Workspace {
             (Control::Slider { min, max, step, unit }, Some(key)) => {
                 let value = view.value(key).as_f64().unwrap_or_default() as f32;
                 let state = self.settings_slider(key, min, max, step, value, window, cx);
+                let preview = (key == "panelAnimationDurationMs").then(|| panel_preview(value, window, cx, &t));
                 h_flex()
-                    .w(px(208.))
-                    .gap(px(12.))
+                    .gap(px(16.))
+                    .children(preview)
                     .child(
-                        div()
-                            .min_w(px(48.))
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .bg(t.muted)
-                            .text_center()
-                            .font_family(t.fonts.mono)
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("{value}{unit}")),
+                        h_flex()
+                            .w(px(208.))
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .min_w(px(48.))
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .bg(t.muted)
+                                    .text_center()
+                                    .font_family(t.fonts.mono)
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{value}{unit}")),
+                            )
+                            .child(div().flex_1().min_w_0().child(Slider::new(&state).horizontal())),
                     )
-                    .child(div().flex_1().min_w_0().child(Slider::new(&state).horizontal()))
                     .into_any_element()
             }
             _ => return None,
@@ -1464,4 +1470,102 @@ pub(in crate::app) fn reset_button(
         .rounded(px(4.))
         .child(Icon::new(IconName::Undo2).size(px(12.)).text_color(t.muted_foreground))
         .tooltip(tooltip.into())
+}
+
+/// Whether `PanelAnimationsPreview` shows its panels, and how many times it was clicked.
+#[derive(Default)]
+struct PanelPreview {
+    closed: bool,
+    toggles: usize,
+}
+
+/// `PanelAnimationsPreview`: a sketch of the window whose panels slide shut or open at the
+/// chosen duration on each click. It animates once per click, never continuously.
+fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, t: &Tokens) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _};
+    let state = window.use_keyed_state("panel-animation-preview", cx, |_, _| PanelPreview::default());
+    let (closed, toggles) = (state.read(cx).closed, state.read(cx).toggles);
+    let t = *t;
+    // `open` runs 1 (shown) to 0 (hidden).
+    let sketch = move |open: f32| {
+        let line = |width: f32, alpha: f32| {
+            div().h(px(2.)).w(gpui_kit::relative(width)).rounded_full().bg(t.muted_foreground.opacity(alpha))
+        };
+        h_flex()
+            .size_full()
+            .child(div().h_full().flex_none().w(px(16. * open)).rounded(px(6.)).bg(t.sidebar.background))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px(px(4.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .gap(px(4.))
+                            .pt(px(4.))
+                            .child(line(1., 0.25))
+                            .child(line(0.8, 0.2))
+                            .child(line(0.6, 0.15)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .h(px(8. * open))
+                            .overflow_hidden()
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .bg(t.foreground.opacity(0.05))
+                            .when(open > 0., |el| el.border_t_1().border_color(t.border.opacity(0.7)))
+                            .child(
+                                div()
+                                    .h(px(1.))
+                                    .w(gpui_kit::relative(0.66))
+                                    .rounded_full()
+                                    .bg(t.muted_foreground.opacity(0.25)),
+                            ),
+                    ),
+            )
+            .child(div().h_full().flex_none().w(px(20. * open)).rounded(px(6.)).bg(t.muted))
+    };
+    let target = if closed { 0. } else { 1. };
+    let body = if toggles == 0 || duration_ms <= 0. {
+        sketch(target).into_any_element()
+    } else {
+        sketch(target)
+            .with_animation(
+                ElementId::NamedInteger("panel-preview".into(), toggles as u64),
+                Animation::new(std::time::Duration::from_millis(duration_ms as u64))
+                    .with_easing(|d| 1. - (1. - d) * (1. - d)),
+                move |_, delta| sketch(if closed { 1. - delta } else { delta }),
+            )
+            .into_any_element()
+    };
+    div()
+        .id("panel-animation-preview")
+        .w(px(112.))
+        .h(px(40.))
+        .flex_none()
+        .overflow_hidden()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .p(px(4.))
+        .cursor_pointer()
+        .tooltip(|window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new("Replay panel animation preview").build(window, cx)
+        })
+        .on_click(move |_, _, cx| {
+            state.update(cx, |preview, cx| {
+                preview.closed = !preview.closed;
+                preview.toggles += 1;
+                cx.notify();
+            })
+        })
+        .child(body)
+        .into_any_element()
 }

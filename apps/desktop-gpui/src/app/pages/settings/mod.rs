@@ -10,6 +10,7 @@ mod diagnostics;
 mod diffs;
 mod fields;
 mod general;
+mod keybinding_toasts;
 mod keybindings;
 mod licenses;
 mod model_select;
@@ -140,6 +141,7 @@ pub(in crate::app) struct SettingsUi {
     advanced_open: HashSet<&'static str>,
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
+    keybinding_toasts: keybinding_toasts::KeybindingToasts,
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
@@ -174,6 +176,7 @@ impl SettingsUi {
             open_marker: None,
             advanced_open: HashSet::new(),
             font_pickers: HashMap::new(),
+            keybinding_toasts: Default::default(),
             last_grouping_mode: "repository",
             focus: cx.focus_handle(),
             focus_on_render: false,
