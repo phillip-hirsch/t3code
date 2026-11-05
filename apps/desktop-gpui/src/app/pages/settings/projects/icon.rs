@@ -289,14 +289,14 @@ enum Slot {
 /// The web defers thumbnails until they scroll into view; callers here ask only for what
 /// they draw, which the virtual list already limits.
 #[derive(Default)]
-pub(super) struct Images {
+pub(in crate::app) struct Images {
     slots: HashMap<String, Slot>,
 }
 
 impl Images {
     /// The image for `resource`, starting its fetch on first use. `None` while loading or
     /// when it has no usable image (a missing favicon, an undecodable format).
-    pub(super) fn get(
+    pub(in crate::app) fn get(
         &mut self,
         resource: Value,
         client: Option<RpcClient>,

@@ -1,8 +1,8 @@
 //! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
 //! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
 //! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
-//! The web's other surfaces (terminal, files, pull requests, devices, side chats) are not
-//! native yet, so the launcher offers Browser and Diff.
+//! The Files and file surfaces render in `files/`. The web's other surfaces (terminal, pull
+//! requests, devices, side chats) are not native yet, so the launcher offers Browser, Files and Diff.
 
 use std::collections::{HashMap, HashSet};
 
@@ -97,11 +97,14 @@ pub(super) fn rollback_command(projection: &ThreadProjection, turn_count: u32, r
     })
 }
 
-/// One tab of the panel (`RightPanelSurface`): the Diff, or one browser tab by its preview tab id.
+/// One tab of the panel (`RightPanelSurface`): the Diff, one browser tab by its preview tab id,
+/// the Files tree, or a file (or folder) by its workspace path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Surface {
     Diff,
     Browser(String),
+    Files,
+    File(String),
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -150,6 +153,41 @@ impl PanelState {
         if self.active.as_ref() == Some(surface) {
             self.active = self.surfaces.get(index.min(self.surfaces.len().saturating_sub(1))).cloned();
         }
+    }
+
+    /// `openFile`: a file's tab replaces the standalone Files tree and keeps its place when open.
+    fn open_file(&mut self, path: String) {
+        self.surfaces.retain(|s| *s != Surface::Files);
+        let surface = Surface::File(path);
+        if !self.surfaces.contains(&surface) {
+            self.surfaces.push(surface.clone());
+        }
+        self.open = true;
+        self.active = Some(surface);
+    }
+
+    /// `navigateFolder`: `source` turns into the folder (the root is the Files tree), or with
+    /// `keep_source` the folder opens beside it. A folder already open is focused instead.
+    fn navigate_folder(&mut self, source: &Surface, folder: &str, keep_source: bool) {
+        let Some(index) = self.surfaces.iter().position(|s| s == source) else { return };
+        let target = if folder.is_empty() { Surface::Files } else { Surface::File(folder.to_owned()) };
+        let existing = self.surfaces.iter().enumerate().any(|(i, s)| i != index && *s == target);
+        let mut surfaces = Vec::new();
+        for (i, surface) in self.surfaces.drain(..).enumerate() {
+            if i == index {
+                if keep_source {
+                    surfaces.push(surface);
+                }
+                if !existing {
+                    surfaces.push(target.clone());
+                }
+            } else if existing || !(matches!(target, Surface::File(_)) && surface == Surface::Files) {
+                surfaces.push(surface);
+            }
+        }
+        self.surfaces = surfaces;
+        self.open = true;
+        self.active = Some(target);
     }
 
     /// `reconcileBrowserSurfaces`: a tab per preview session, dropping closed ones. Closing the
@@ -377,6 +415,42 @@ impl Workspace {
             panel.scope = DiffScope::Branch;
         }
         self.open_surface(Surface::Diff, window, cx);
+    }
+
+    /// `openFile` for the open target's panel.
+    pub(super) fn open_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = None;
+        if let Some(panel) = self.user_panel_state() {
+            panel.open_file(path);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// `navigateFolder` from the tab showing `source`.
+    pub(super) fn navigate_file_folder(
+        &mut self,
+        source: Surface,
+        folder: &str,
+        keep_source: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = self.user_panel_state() {
+            panel.navigate_folder(&source, folder, keep_source);
+        }
+        cx.notify();
+    }
+
+    /// The workspace mutation the open thread last saw, so file surfaces refetch after agent edits.
+    pub(super) fn current_workspace_mutation(&self) -> (Option<String>, Option<String>) {
+        let Some(projection) = self.open_projection() else { return (None, None) };
+        // The newest turn as `turn_summaries` orders them, without sorting every frame.
+        let latest = projection
+            .checkpoints
+            .iter()
+            .filter(|c| c.run_id.is_some() && c.app_run_ordinal.is_some_and(|n| u32::try_from(n).is_ok()))
+            .max_by(|a, b| a.app_run_ordinal.cmp(&b.app_run_ordinal).then_with(|| a.captured_at.cmp(&b.captured_at)));
+        workspace_mutation_id(projection, latest.map(|c| c.captured_at.as_str()))
     }
 
     /// `diffAvailable`: a server thread in a git repository.
@@ -712,6 +786,8 @@ impl Workspace {
             (Some(Surface::Browser(tab)), Some(Target::Thread(thread_id))) => {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
+            (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
+            (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -771,7 +847,7 @@ impl Workspace {
         // `wco:pr-(--workspace-native-controls-inset)` plus the `w-24` spacer for the toggles.
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
-        let (diff, browser) = (self.diff_available(), self.browser_available());
+        let (diff, browser, files) = (self.diff_available(), self.browser_available(), self.project_target().is_some());
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -820,6 +896,13 @@ impl Workspace {
                                     })),
                             )
                             .item(
+                                PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
+                                    window.listener_for(&view, |this, _, window, cx| {
+                                        this.open_surface(Surface::Files, window, cx)
+                                    }),
+                                ),
+                            )
+                            .item(
                                 PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
                                     window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
                                 ),
@@ -848,6 +931,14 @@ impl Workspace {
                 format!("browser:{tab}").into(),
                 self.browser_tab_title(tab),
                 Icon::new(IconName::Globe).size(px(12.)).into_any_element(),
+            ),
+            Surface::Files => {
+                ("files".into(), "Files".into(), Icon::new(IconName::Files).size(px(12.)).into_any_element())
+            }
+            Surface::File(path) => (
+                format!("file:{path}").into(),
+                path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(),
+                Icon::new(IconName::File).size(px(12.)).into_any_element(),
             ),
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
@@ -949,6 +1040,18 @@ impl Workspace {
         .when(browser_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
         });
+        let files_available = self.project_target().is_some();
+        let files = row(
+            "right-panel-open-files",
+            Icon::new(IconName::Files).size(px(16.)).into_any_element(),
+            "Files",
+            "F",
+            files_available,
+            "Available when a project is open.",
+        )
+        .when(files_available, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::Files, window, cx)))
+        });
         let diff_available = self.diff_available();
         let diff = row(
             "right-panel-open-diff",
@@ -981,7 +1084,7 @@ impl Workspace {
                             .text_color(tokens.foreground)
                             .child("Open a surface"),
                     )
-                    .child(v_flex().gap(px(2.)).child(browser).child(diff)),
+                    .child(v_flex().gap(px(2.)).child(browser).child(files).child(diff)),
             )
             .into_any_element()
     }
@@ -1546,6 +1649,26 @@ mod tests {
         panel.close(&Surface::Diff);
         panel.close(&browser("b"));
         assert!(!panel.open && panel.active.is_none());
+    }
+
+    #[test]
+    fn files_open_in_place_of_the_tree_and_folders_navigate_in_place() {
+        let file = |path: &str| Surface::File(path.into());
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Diff);
+        panel.upsert(Surface::Files);
+        panel.open_file("src/a.rs".into());
+        assert_eq!(panel.surfaces, [Surface::Diff, file("src/a.rs")], "a file replaces the standalone tree");
+        panel.open_file("src/a.rs".into());
+        assert_eq!(panel.surfaces.len(), 2, "reopening a file focuses its tab");
+        panel.navigate_folder(&file("src/a.rs"), "src", true);
+        assert_eq!(panel.surfaces, [Surface::Diff, file("src/a.rs"), file("src")]);
+        assert_eq!(panel.active, Some(file("src")));
+        panel.navigate_folder(&file("src"), "", false);
+        assert_eq!(panel.surfaces, [Surface::Diff, file("src/a.rs"), Surface::Files], "the root is the Files tree");
+        panel.navigate_folder(&Surface::Files, "src/a.rs", false);
+        assert_eq!(panel.surfaces, [Surface::Diff, file("src/a.rs")], "an open target is focused, not duplicated");
+        assert_eq!(panel.active, Some(file("src/a.rs")));
     }
 
     #[test]

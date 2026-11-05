@@ -32,6 +32,7 @@ mod composer_meter;
 mod composer_plan;
 mod context_strip;
 mod details;
+mod files;
 mod find;
 mod git;
 mod header;
@@ -66,7 +67,9 @@ gpui_kit::actions!(
         NewThread,
         NewThreadInProject,
         UndoThreadAction,
-        FindInThread
+        FindInThread,
+        ToggleFilePicker,
+        ToggleProjectSearch
     ]
 );
 pub use preview::TogglePreview;
@@ -211,6 +214,8 @@ pub struct Workspace {
     palette: Option<palette::Palette>,
     /// The thread find bar, while open.
     find: Option<find::ThreadFind>,
+    /// Go to file, Search project contents, and the Files and file panel surfaces.
+    files: files::FilesState,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
@@ -336,6 +341,7 @@ impl Workspace {
             keybindings_panel: None,
             palette: None,
             find: None,
+            files: files::FilesState::default(),
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
@@ -920,6 +926,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .on_action(cx.listener(Self::on_steer_queued))
             .on_action(cx.listener(Self::on_edit_queued))
+            .on_action(cx.listener(|this, _: &ToggleFilePicker, window, cx| {
+                this.toggle_file_overlay(files::OverlayMode::Files, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
+                this.toggle_file_overlay(files::OverlayMode::Content, window, cx)
+            }))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
@@ -1020,6 +1032,7 @@ impl Render for Workspace {
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
             .children(self.render_palette(window, cx))
+            .children(self.render_file_overlay(window, cx))
             .children(self.render_quit_hint(cx))
     }
 }

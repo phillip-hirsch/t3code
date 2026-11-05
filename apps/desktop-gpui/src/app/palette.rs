@@ -3,8 +3,9 @@
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
 //! with the native dialog, then `projects.mutate`).
 //!
-//! Actions this client has no surface for yet (file picker, content search, guest sharing,
-//! PR linking, new project, clone, WSL folders, the theme editor, workspace focus) are left out.
+//! Go to file and Search project contents open the child searches in `files/`.
+//! Actions this client has no surface for yet (guest sharing, PR linking, new project, clone, WSL folders,
+//! the theme editor, workspace focus) are left out.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -94,6 +95,8 @@ enum Run {
     PinProjects(Vec<String>, bool),
     Theme(crate::themes::CardId),
     Appearance(crate::settings::ThemePreference),
+    /// Go to file or Search project contents, returning here on Esc.
+    FileSearch(super::files::OverlayMode),
 }
 
 enum RowIcon {
@@ -243,6 +246,11 @@ impl Workspace {
             self.push_palette_view(view, window, cx);
         }
         cx.notify();
+    }
+
+    /// Puts back the query the palette had before a child search opened.
+    pub(super) fn restore_palette_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_palette_query(query, window, cx);
     }
 
     pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -526,6 +534,24 @@ impl Workspace {
             row.terms = &["restart", "reset", "reload", "agent", "session", "skills", "plugins", "mcp"];
             rows.push(row);
         }
+        let mut row = lucide(
+            "open-file-picker",
+            IconName::FileSearch,
+            "Go to file",
+            Run::FileSearch(super::files::OverlayMode::Files),
+        );
+        row.terms = &["go to file", "open file", "file picker", "find file", "quick open"];
+        row.shortcut = self.shortcut("filePicker.toggle");
+        rows.push(row);
+        let mut row = lucide(
+            "search-project-contents",
+            IconName::TextSearch,
+            "Search project contents",
+            Run::FileSearch(super::files::OverlayMode::Content),
+        );
+        row.terms = &["search project", "find in files", "grep", "content search", "text search"];
+        row.shortcut = self.shortcut("projectSearch.toggle");
+        rows.push(row);
         let mut row = lucide("add-project", IconName::FolderPlus, "Add project", Run::Open(View::AddProject));
         row.terms = &["add project", "folder", "directory", "browse", "environment"];
         rows.push(row);
@@ -897,6 +923,10 @@ impl Workspace {
         match run {
             Run::Open(view) => return self.push_palette_view(view, window, cx),
             Run::BrowseTo(path) => return self.set_palette_query(&path, window, cx),
+            Run::FileSearch(mode) => {
+                let query = self.palette_query(cx);
+                return self.open_file_overlay(mode, Some(query), window, cx);
+            }
             _ => {}
         }
         self.close_palette(window, cx);
@@ -926,7 +956,7 @@ impl Workspace {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
             }
-            Run::Open(_) | Run::BrowseTo(_) => {}
+            Run::Open(_) | Run::BrowseTo(_) | Run::FileSearch(_) => {}
         }
     }
 
