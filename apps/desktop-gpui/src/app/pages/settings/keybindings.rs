@@ -822,10 +822,14 @@ impl KeybindingsPanel {
                         if !remove {
                             this.adding = None;
                         }
-                        if let Some(workspace) = this.workspace.upgrade() {
+                        // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
+                        let rules = value.get("keybindings").filter(|rules| rules.is_array());
+                        if rules.is_none() {
+                            log::warn!("{method} reply has no keybindings list; keeping the current keymap");
+                        }
+                        if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
-                                workspace.server_info.keybindings =
-                                    Rc::new(keybindings::decode_rules(&value["keybindings"]));
+                                workspace.server_info.keybindings = Rc::new(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });

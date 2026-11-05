@@ -540,7 +540,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Value::Object(patch) = patch else { return };
+        let Value::Object(patch) = patch else { return done(self, false, cx) };
         let view = self.settings_view();
         let plan = scope::plan_patch(&view.scope, &view.environment(), &patch);
         self.run_settings_plan(plan, window, cx, done);
@@ -554,7 +554,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.client() else { return done(self, false, cx) };
         cx.spawn(async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
             let _ = this.update(cx, |this, cx| {

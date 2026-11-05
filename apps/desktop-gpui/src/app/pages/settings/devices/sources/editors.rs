@@ -289,6 +289,7 @@ impl SshEditor {
             target: value(&self.target, cx),
             identity_file: (!identity.is_empty()).then_some(identity),
             port,
+            extra: serde_json::Map::new(),
         })
     }
 
@@ -339,11 +340,12 @@ impl SshEditor {
         let Some(host) = self.input(cx).filter(|_| named && !self.busy && !self.checking(cx)) else { return };
         let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
         let original = self.original.clone().unwrap_or_else(|| host.clone());
-        let next =
-            match hosts::update_device_hosts(&hosts::host_list(&settings, "deviceHosts"), &host, false, &original) {
-                Ok(next) => next,
-                Err(error) => return notify_error(window, cx, "Device host not saved", error.to_owned()),
-            };
+        let next = hosts::host_list(&settings, "deviceHosts")
+            .and_then(|saved| hosts::update_device_hosts(&saved, &host, false, &original).map_err(str::to_owned));
+        let next = match next {
+            Ok(next) => next,
+            Err(error) => return notify_error(window, cx, "Device host not saved", error),
+        };
         self.busy = true;
         cx.notify();
         let patch = json!({"deviceHosts": next});
@@ -743,7 +745,11 @@ impl EasEditor {
         }
         let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
         let keep_token = !self.is_new && self.token == TokenEntry::Saved;
-        let hosts = hosts::update_eas_hosts(&hosts::host_list(&settings, "easDeviceHosts"), &next, false, keep_token);
+        let saved = match hosts::host_list(&settings, "easDeviceHosts") {
+            Ok(saved) => saved,
+            Err(error) => return notify_error(window, cx, "EAS host not saved", error),
+        };
+        let hosts = hosts::update_eas_hosts(&saved, &next, false, keep_token);
         self.busy = true;
         cx.notify();
         let patch = json!({"easDeviceHosts": hosts});
@@ -1086,7 +1092,10 @@ impl SimlockEditor {
             return;
         }
         let Some((client, settings, environment)) = context(&self.workspace, cx) else { return };
-        let saved = hosts::host_list(&settings, "simlockDeviceHosts");
+        let saved = match hosts::host_list(&settings, "simlockDeviceHosts") {
+            Ok(saved) => saved,
+            Err(error) => return notify_error(window, cx, "Simlock host not saved", error),
+        };
         let Ok(hosts) = hosts::plan_simlock_save(&saved, &self.next(cx), &self.token) else { return };
         self.busy = true;
         cx.notify();

@@ -365,8 +365,10 @@ impl Workspace {
                 let key = background::DURATION_KEYS[index];
                 let seconds = resolved.seconds(index) as i64;
                 view.update(cx, |this, cx| {
-                    this.number_field(key, seconds, (min, i64::MAX, step), window, cx, move |this, seconds, window, cx| {
-                        let patch = background::override_patch(this.settings_json(), key, json!(seconds * 1000));
+                    // Saved in milliseconds, so the seconds must fit `i64` times 1000.
+                    let max = i64::MAX / 1000;
+                    this.number_field(key, seconds, (min, max, step), window, cx, move |this, seconds, window, cx| {
+                        let patch = background::override_patch(this.settings_json(), key, json!(seconds.saturating_mul(1000)));
                         this.update_settings(patch, window, cx)
                     })
                 })

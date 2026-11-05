@@ -335,27 +335,48 @@ pub(super) fn favicon_resource(workspace_root: &str, favicon_path: Option<&str>)
     resource
 }
 
+/// Project images are icons and thumbnails; anything bigger is not read.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// `relativeUrl` resolved under the server's base URL; an absolute URL stays as is.
+fn asset_url(http_base: &str, relative: &str) -> Result<url::Url, url::ParseError> {
+    match url::Url::parse(relative) {
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            url::Url::parse(&format!("{}/{}", http_base.trim_end_matches('/'), relative.trim_start_matches('/')))
+        }
+        parsed => parsed,
+    }
+}
+
 async fn fetch(client: &RpcClient, endpoint: Endpoint, resource: Value) -> anyhow::Result<Arc<Image>> {
     let result = client.request("assets.createUrl", serde_json::json!({"resource": resource})).await?;
     let relative = result["relativeUrl"].as_str().unwrap_or_default().to_owned();
     // `isProjectFaviconFallbackUrl`: the server's stand-in for "no favicon".
     let path = relative.split(['?', '#']).next().unwrap_or_default();
     anyhow::ensure!(!path.ends_with("/project-favicon-missing"), "no favicon");
-    let url = if relative.starts_with("http") {
-        relative.clone()
-    } else {
-        format!("{}/{}", endpoint.http_base, relative.trim_start_matches('/'))
-    };
+    let url = asset_url(&endpoint.http_base, &relative)?;
+    // Only the server's own origin gets the session token.
+    let token = url::Url::parse(&endpoint.http_base)
+        .is_ok_and(|base| base.origin() == url.origin())
+        .then_some(endpoint.bearer_token);
     let response = crate::runtime()
         .spawn(async move {
-            let response = reqwest::Client::new().get(url).bearer_auth(&endpoint.bearer_token).send().await?;
-            let response = response.error_for_status()?;
+            let mut request = reqwest::Client::new().get(url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let mut response = request.send().await?.error_for_status()?;
             let mime = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.split(';').next().unwrap_or_default().trim().to_owned());
-            anyhow::Ok((mime, response.bytes().await?.to_vec()))
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                anyhow::ensure!(bytes.len() + chunk.len() <= MAX_IMAGE_BYTES, "image is over {MAX_IMAGE_BYTES} bytes");
+                bytes.extend_from_slice(&chunk);
+            }
+            anyhow::Ok((mime, bytes))
         })
         .await??;
     let (mime, bytes) = response;
@@ -417,6 +438,19 @@ mod tests {
         assert!(!is_monogram_text("-A"));
         assert!(!is_monogram_text("A B"));
         assert!(!is_monogram_text(&"A".repeat(33)));
+    }
+
+    #[test]
+    fn asset_urls_resolve_under_the_server_and_keep_foreign_origins_apart() {
+        let base = "http://127.0.0.1:3999/relay/env";
+        let origin = |url: &str| url::Url::parse(url).unwrap().origin();
+        let local = asset_url(base, "/api/assets/a.png?t=1").unwrap();
+        assert_eq!(local.as_str(), "http://127.0.0.1:3999/relay/env/api/assets/a.png?t=1");
+        assert_eq!(local.origin(), origin(base));
+        for foreign in ["https://evil.test/a.png", "httpfoo://127.0.0.1:3999/a.png", "http://127.0.0.1:4000/a.png"] {
+            assert_ne!(asset_url(base, foreign).unwrap().origin(), origin(base), "{foreign}");
+        }
+        assert_eq!(asset_url(base, "//evil.test/a.png").unwrap().origin(), origin(base));
     }
 
     #[test]

@@ -18,9 +18,9 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px, relative,
-    rems,
+    AnyElement, AnyWindowHandle, App, ClipboardItem, Context, ElementId, Entity, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, Window, div, px, relative, rems,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -251,8 +251,16 @@ impl DiagnosticsState {
         .detach();
     }
 
-    /// `signalProcess` for the Live Processes table.
-    fn signal_live(&mut self, client: RpcClient, pid: u64, signal: &'static str, cx: &mut Context<Self>) {
+    /// `signalProcess` for the Live Processes table. The result toasts in `window`, the
+    /// one clicked, whether or not it is still focused.
+    fn signal_live(
+        &mut self,
+        client: RpcClient,
+        pid: u64,
+        signal: &'static str,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
         let Some(process) = self.processes.data.as_ref().and_then(|d| d.processes.iter().find(|p| p.pid == pid)) else {
             return;
         };
@@ -262,44 +270,37 @@ impl DiagnosticsState {
         self.signaling_pid = Some(pid);
         let input = json!({ "pid": pid, "startTimeMs": process.start_time_ms, "signal": signal });
         cx.notify();
-        let entity = cx.entity();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = client.request("server.signalProcess", input).await;
-            let _ = cx.update(|cx| {
-                let Some(window) = cx.active_window() else { return };
-                let _ = window.update(cx, |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.signaling_pid = None;
-                        let title = format!("Could not send {signal}");
-                        match result {
-                            Err(RpcError::Disconnected(_)) => {}
-                            Err(error) => {
-                                window.push_notification(Notification::error(rpc_message(&error)).title(title), cx)
-                            }
-                            Ok(value) if value["signaled"].as_bool() == Some(true) => {
-                                this.load_processes(client.clone(), cx)
-                            }
-                            Ok(value) => {
-                                let message = some(&value["message"]).and_then(Value::as_str).map(str::to_owned);
-                                this.load_processes(client.clone(), cx);
-                                if is_stale_signal_message(message.as_deref()) {
-                                    window.push_notification(
-                                        Notification::info(
-                                            "The process is not a child of the T3 Server. It might already have exited.",
-                                        )
-                                        .title("Process already exited"),
-                                        cx,
-                                    );
-                                } else {
-                                    let message = message.unwrap_or_else(|| format!("Failed to send {signal}."));
-                                    window.push_notification(Notification::error(message).title(title), cx);
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })
-                });
+            let toast = this.update(cx, |this, cx| {
+                this.signaling_pid = None;
+                cx.notify();
+                let title = format!("Could not send {signal}");
+                match result {
+                    Err(RpcError::Disconnected(_)) => None,
+                    Err(error) => Some(Notification::error(rpc_message(&error)).title(title)),
+                    Ok(value) if value["signaled"].as_bool() == Some(true) => {
+                        this.load_processes(client.clone(), cx);
+                        None
+                    }
+                    Ok(value) => {
+                        let message = some(&value["message"]).and_then(Value::as_str).map(str::to_owned);
+                        this.load_processes(client.clone(), cx);
+                        Some(if is_stale_signal_message(message.as_deref()) {
+                            Notification::info(
+                                "The process is not a child of the T3 Server. It might already have exited.",
+                            )
+                            .title("Process already exited")
+                        } else {
+                            let message = message.unwrap_or_else(|| format!("Failed to send {signal}."));
+                            Notification::error(message).title(title)
+                        })
+                    }
+                }
             });
+            if let Ok(Some(toast)) = toast {
+                let _ = window.update(cx, |_, window, cx| window.push_notification(toast, cx));
+            }
         })
         .detach();
     }
@@ -310,6 +311,7 @@ impl DiagnosticsState {
         client: RpcClient,
         identity: Identity,
         signal: &'static str,
+        window: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let key = identity.key();
@@ -318,31 +320,26 @@ impl DiagnosticsState {
         }
         let input = json!({ "pid": identity.pid, "startTimeMs": identity.start_time_ms, "signal": signal });
         cx.notify();
-        let entity = cx.entity();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = client.request("server.signalProcess", input).await;
-            let _ = cx.update(|cx| {
-                let Some(window) = cx.active_window() else { return };
-                let _ = window.update(cx, |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.signaling_keys.remove(&key);
-                        let title = format!("Could not send {signal}");
-                        let failure = match result {
-                            Err(RpcError::Disconnected(_)) => None,
-                            Err(error) => Some(rpc_message(&error)),
-                            Ok(value) if value["signaled"].as_bool() == Some(true) => None,
-                            Ok(value) => Some(some(&value["message"]).and_then(Value::as_str).map_or_else(
-                                || format!("Failed to send {signal} to process {}.", identity.pid),
-                                str::to_owned,
-                            )),
-                        };
-                        if let Some(message) = failure {
-                            window.push_notification(Notification::error(message).title(title), cx);
-                        }
-                        cx.notify();
-                    })
-                });
+            let _ = this.update(cx, |this, cx| {
+                this.signaling_keys.remove(&key);
+                cx.notify();
             });
+            let failure = match result {
+                Err(RpcError::Disconnected(_)) => None,
+                Err(error) => Some(rpc_message(&error)),
+                Ok(value) if value["signaled"].as_bool() == Some(true) => None,
+                Ok(value) => Some(
+                    some(&value["message"])
+                        .and_then(Value::as_str)
+                        .map_or_else(|| format!("Failed to send {signal} to process {}.", identity.pid), str::to_owned),
+                ),
+            };
+            if let Some(message) = failure {
+                let toast = Notification::error(message).title(format!("Could not send {signal}"));
+                let _ = window.update(cx, |_, window, cx| window.push_notification(toast, cx));
+            }
         })
         .detach();
     }
@@ -1347,9 +1344,9 @@ impl Workspace {
                     let (state, client, identity) = (state.clone(), client.clone(), p.identity);
                     let disabled = !maintain || s.signaling_keys.contains(&key);
                     signal_actions(&format!("tree-{key}"), disabled, t, move |signal, window, cx| {
-                        let (state, client) = (state.clone(), client.clone());
+                        let (state, client, handle) = (state.clone(), client.clone(), window.window_handle());
                         let send = move |cx: &mut App| {
-                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, cx))
+                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, handle, cx))
                         };
                         if signal == "SIGKILL" {
                             confirm_kill(identity.pid, window, cx, send);
@@ -1584,9 +1581,10 @@ impl Workspace {
                 let (signal_state, signal_client) = (state.clone(), client.clone());
                 let disabled = !maintain || s.signaling_pid == Some(pid);
                 let actions = signal_actions(&format!("proc-{pid}"), disabled, t, move |signal, window, cx| {
-                    let (state, client) = (signal_state.clone(), signal_client.clone());
-                    let send =
-                        move |cx: &mut App| state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, cx));
+                    let (state, client, handle) = (signal_state.clone(), signal_client.clone(), window.window_handle());
+                    let send = move |cx: &mut App| {
+                        state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, handle, cx))
+                    };
                     if signal == "SIGKILL" {
                         confirm_kill(pid, window, cx, send);
                     } else {

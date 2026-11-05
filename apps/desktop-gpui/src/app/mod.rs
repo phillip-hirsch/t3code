@@ -569,6 +569,8 @@ impl Workspace {
 
     fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = Connection::Connected(client.clone());
+        // Read per connection: the files may have changed, or never loaded while down.
+        self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
         self.page_opened(cx);
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));

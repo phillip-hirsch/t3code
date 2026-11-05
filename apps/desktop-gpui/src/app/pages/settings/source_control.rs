@@ -1211,7 +1211,10 @@ impl Workspace {
         let save = {
             let (state, tokens_map) = (state.clone(), tokens_map.clone());
             move |this: &mut Self, host: String, token: String, cx: &mut Context<Self>| {
-                state.update(cx, |state, _| state.saving = true);
+                state.update(cx, |state, cx| {
+                    state.saving = true;
+                    cx.notify();
+                });
                 // The whole map: other tokens' redaction markers keep their values.
                 let mut tokens = tokens_map.as_object().cloned().unwrap_or_default();
                 tokens.insert(host, json!(token));
@@ -1371,7 +1374,10 @@ impl Workspace {
                   enabled: Option<bool>,
                   account: Option<Option<&str>>,
                   cx: &mut Context<Self>| {
-                state.update(cx, |state, _| state.saving = true);
+                state.update(cx, |state, cx| {
+                    state.saving = true;
+                    cx.notify();
+                });
                 let choices = next_host_choices(&hosts, host, enabled, account);
                 let state = state.clone();
                 this.update_environment_settings(

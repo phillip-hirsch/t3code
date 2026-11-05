@@ -660,26 +660,27 @@ impl Workspace {
 
     /// The checkout's `t3.json`, read once per root (`useT3ProjectFileState`).
     pub(super) fn t3_project_file(&mut self, workspace_root: &str, cx: &mut Context<Self>) -> &T3ProjectFile {
+        static LOADING: T3ProjectFile = T3ProjectFile::Loading;
         if !self.t3_project_files.contains_key(workspace_root) {
+            // Without a client nothing is cached, so the read starts once one connects.
+            let Some(client) = self.client() else { return &LOADING };
             self.t3_project_files.insert(workspace_root.to_owned(), T3ProjectFile::Loading);
-            if let Some(client) = self.client() {
-                let root = workspace_root.to_owned();
-                let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});
-                cx.spawn(async move |this, cx| {
-                    let result = client.request("projects.readFile", input).await;
-                    let file = match result {
-                        Ok(read) if read["exists"] != false && read["truncated"] != true => {
-                            read["contents"].as_str().map(T3ProjectFile::parse).unwrap_or(T3ProjectFile::Missing)
-                        }
-                        _ => T3ProjectFile::Missing,
-                    };
-                    let _ = this.update(cx, |this, cx| {
-                        this.t3_project_files.insert(root, file);
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
+            let root = workspace_root.to_owned();
+            let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});
+            cx.spawn(async move |this, cx| {
+                let result = client.request("projects.readFile", input).await;
+                let file = match result {
+                    Ok(read) if read["exists"] != false && read["truncated"] != true => {
+                        read["contents"].as_str().map(T3ProjectFile::parse).unwrap_or(T3ProjectFile::Missing)
+                    }
+                    _ => T3ProjectFile::Missing,
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.t3_project_files.insert(root, file);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         &self.t3_project_files[workspace_root]
     }

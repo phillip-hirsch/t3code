@@ -10,8 +10,9 @@
 
 use crate::device::{DeviceState, HostStatus};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 fn ssh_kind() -> String {
     "ssh".into()
@@ -30,6 +31,9 @@ pub(super) struct SshHost {
     pub identity_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<i64>,
+    /// Fields this client doesn't know, written back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub(super) struct EasHost {
     pub idle_minutes: i64,
     #[serde(default = "two")]
     pub max_concurrent_sessions: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -65,6 +71,8 @@ pub(super) struct SimlockHost {
     pub max_leases: i64,
     #[serde(default = "sixty")]
     pub max_lease_minutes: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 fn empty_token() -> Value {
@@ -83,9 +91,20 @@ fn sixty() -> i64 {
     60
 }
 
-/// A host list from the raw settings, or empty when missing or unreadable.
-pub(super) fn host_list<T: for<'de> Deserialize<'de>>(settings: &Value, key: &str) -> Vec<T> {
-    settings.get(key).and_then(|hosts| serde_json::from_value(hosts.clone()).ok()).unwrap_or_default()
+/// The saved host list to edit and write back. Fails when any entry doesn't decode:
+/// writing a partial list would delete the entries this client can't read.
+pub(super) fn host_list<T: DeserializeOwned>(settings: &Value, key: &str) -> Result<Vec<T>, String> {
+    match settings.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(hosts) => Vec::<T>::deserialize(hosts)
+            .map_err(|error| format!("The saved hosts can't be read ({error}), so they were left unchanged.")),
+    }
+}
+
+/// The saved hosts that decode, for display.
+pub(super) fn readable_hosts<T: DeserializeOwned>(settings: &Value, key: &str) -> Vec<T> {
+    let Some(hosts) = settings.get(key).and_then(Value::as_array) else { return Vec::new() };
+    hosts.iter().filter_map(|host| T::deserialize(host).ok()).collect()
 }
 
 /// `ConfiguredDeviceHostId`.
@@ -116,6 +135,7 @@ pub(super) fn parse_ssh_draft(host: &SshHost) -> Option<SshHost> {
         target,
         identity_file: host.identity_file.as_deref().and_then(non_blank),
         port: host.port,
+        extra: host.extra.clone(),
     })
 }
 
@@ -159,11 +179,13 @@ pub(super) fn update_device_hosts(
     Ok(match existing_id {
         Some(id) => hosts
             .iter()
-            .map(
-                |candidate| {
-                    if candidate.id == id { SshHost { id: id.clone(), ..host.clone() } } else { candidate.clone() }
-                },
-            )
+            .map(|candidate| {
+                if candidate.id == id {
+                    SshHost { id: id.clone(), extra: candidate.extra.clone(), ..host.clone() }
+                } else {
+                    candidate.clone()
+                }
+            })
             .collect(),
         None => hosts.iter().cloned().chain([host.clone()]).collect(),
     })
@@ -179,6 +201,7 @@ pub(super) fn new_eas_host(id: String) -> EasHost {
         max_session_minutes: 30,
         idle_minutes: 10,
         max_concurrent_sessions: 2,
+        extra: Map::new(),
     }
 }
 
@@ -244,6 +267,7 @@ pub(super) fn new_simlock_host(id: String) -> SimlockHost {
         agent_token: String::new(),
         max_leases: 2,
         max_lease_minutes: 60,
+        extra: Map::new(),
     }
 }
 
@@ -364,7 +388,32 @@ mod tests {
             target: target.into(),
             identity_file: None,
             port: None,
+            extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn an_unreadable_entry_blocks_writes_without_hiding_the_others() {
+        let settings = serde_json::json!({"deviceHosts": [
+            {"kind": "ssh", "id": "mac", "label": "Mac", "target": "me@mac", "future": {"a": 1}},
+            {"kind": "ssh", "id": "pi", "label": "Pi", "target": "me@pi", "port": "22"},
+        ]});
+        assert!(host_list::<SshHost>(&settings, "deviceHosts").is_err());
+        let readable = readable_hosts::<SshHost>(&settings, "deviceHosts");
+        assert_eq!(readable.iter().map(|host| host.id.as_str()).collect::<Vec<_>>(), ["mac"]);
+        assert_eq!(host_list::<SshHost>(&serde_json::json!({}), "deviceHosts"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_edit_keeps_fields_this_client_does_not_know() {
+        let settings = serde_json::json!({"deviceHosts": [
+            {"kind": "ssh", "id": "mac", "label": "Mac", "target": "me@mac", "future": {"a": 1}},
+        ]});
+        let saved = host_list::<SshHost>(&settings, "deviceHosts").unwrap();
+        let edited = parse_ssh_draft(&ssh("mac", "Renamed", "me@mac")).unwrap();
+        let next = serde_json::to_value(update(&saved, &edited, false)).unwrap();
+        assert_eq!(next[0]["label"], "Renamed");
+        assert_eq!(next[0]["future"], serde_json::json!({"a": 1}));
     }
 
     fn update(hosts: &[SshHost], host: &SshHost, remove: bool) -> Vec<SshHost> {
