@@ -4,8 +4,11 @@
 mod actions;
 pub(super) use actions::{MenuOrigin, Renaming};
 mod custom_snooze;
+mod drafts;
 mod filter;
+mod provider_update;
 mod search_results;
+mod selection;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -70,6 +73,14 @@ pub(super) struct SidebarState {
     collapsed_folders: HashSet<String>,
     /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
     inbox_order: Vec<String>,
+    /// Every thread row in sidebar order, as last drawn, for Shift-click ranges.
+    thread_order: Vec<String>,
+    selection: selection::Selection,
+    /// Draft rows by project, newest first.
+    draft_order: Vec<String>,
+    provider_pill: provider_update::PillState,
+    /// Each local checkout's current branch, read when a hover card opens, by workspace root.
+    checkout_branches: HashMap<String, String>,
     filter: Option<filter::FilterMenu>,
     filter_closed_at: Option<std::time::Instant>,
     /// The search result Up/Down or the pointer picked; `None` paints none.
@@ -131,6 +142,11 @@ impl SidebarState {
             groups: RefCell::default(),
             collapsed_folders: HashSet::new(),
             inbox_order: Vec::new(),
+            thread_order: Vec::new(),
+            selection: Default::default(),
+            draft_order: Vec::new(),
+            provider_pill: Default::default(),
+            checkout_branches: HashMap::new(),
             filter: None,
             filter_closed_at: None,
             search_highlight: None,
@@ -286,7 +302,7 @@ impl Shelf {
 }
 
 enum Item<'a> {
-    Draft(&'a str),
+    Draft(drafts::DraftRow),
     DraftDivider,
     Card(Facts<'a>),
     Slim(Facts<'a>, Option<Shelf>),
@@ -367,6 +383,7 @@ impl SidebarState {
         shell: &'a ShellState,
         groups: &'a [ProjectGroup],
         target: Option<&'a Target>,
+        drafts: Vec<drafts::DraftRow>,
         working_shelf: bool,
         boring: bool,
         now: i64,
@@ -384,11 +401,9 @@ impl SidebarState {
             inbox::partition(&shell.threads, now, working_shelf && !boring, boring, &mut self.returns, |t| {
                 in_scope(&t.project_id)
             });
-        let mut items = Vec::new();
-        if let Some(Target::Draft { project_id }) =
-            target.filter(|t| matches!(t, Target::Draft { project_id } if in_scope(project_id)))
-        {
-            items.push(Item::Draft(project_id));
+        let mut items: Vec<Item> =
+            drafts.into_iter().filter(|row| in_scope(&row.project_id)).map(Item::Draft).collect();
+        if !items.is_empty() {
             items.push(Item::DraftDivider);
         }
         items.extend(sections.pinned.into_iter().map(Item::Card));
@@ -666,6 +681,20 @@ impl Workspace {
 
     /// A row click opens the thread; the second click of a double-click renames it.
     fn click_row(&mut self, thread_id: &str, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.modifiers();
+        let toggle = if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control };
+        if toggle {
+            self.sidebar.selection.toggle(thread_id);
+            self.notify_sidebar(cx);
+            return;
+        }
+        if modifiers.shift {
+            let order = std::mem::take(&mut self.sidebar.thread_order);
+            self.sidebar.selection.range_to(thread_id, &order);
+            self.sidebar.thread_order = order;
+            self.notify_sidebar(cx);
+            return;
+        }
         if event.click_count() >= 2 {
             // Opening a thread can move the rows, so the second click may land on another one.
             let same_row = self.sidebar.clicked.as_deref() == Some(thread_id);
@@ -675,7 +704,10 @@ impl Workspace {
             return;
         }
         self.sidebar.clicked = Some(thread_id.to_owned());
+        self.sidebar.selection.clear();
+        self.sidebar.selection.set_anchor(thread_id);
         self.select_thread(thread_id.to_owned(), window, cx);
+        self.notify_sidebar(cx);
     }
 
     /// The right-click menu builder for a row.
@@ -687,9 +719,11 @@ impl Workspace {
         let view = cx.weak_entity();
         let thread_id = thread_id.to_owned();
         move |menu, window, cx| {
-            let model = view
-                .upgrade()
-                .and_then(|workspace| workspace.read(cx).thread_menu(&thread_id, MenuOrigin::Sidebar, cx));
+            let Some(workspace) = view.upgrade() else { return menu };
+            if let Some(bulk) = workspace.read(cx).bulk_menu(&thread_id) {
+                return bulk.build(&view, menu, window, cx);
+            }
+            let model = workspace.read(cx).thread_menu(&thread_id, MenuOrigin::Sidebar, cx);
             match model {
                 Some(model) => model.build(&view, menu.min_w(px(200.)), window, cx),
                 None => menu,
@@ -780,6 +814,7 @@ impl Workspace {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.sidebar.hovered.as_ref() == Some(&thread_id) {
+                        this.read_checkout_branch(&thread_id, cx);
                         this.sidebar.hover_card = Some(thread_id);
                         this.notify_sidebar(cx);
                     }
@@ -791,6 +826,32 @@ impl Workspace {
             self.sidebar._hover_card_delay = None;
         }
         self.notify_sidebar(cx);
+    }
+
+    /// A local thread's checkout may have moved to another branch since; the hover card warns
+    /// then (`resolveLocalCheckoutBranchMismatch`). Read fresh each time a card opens.
+    fn read_checkout_branch(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        if thread.worktree_path.is_some() || thread.branch.is_none() {
+            return;
+        }
+        let Some(cwd) =
+            self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.workspace_root.clone())
+        else {
+            return;
+        };
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let Ok(status) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
+            let Some(branch) = status["refName"].as_str().map(str::to_owned) else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar.checkout_branches.get(&cwd) != Some(&branch) {
+                    this.sidebar.checkout_branches.insert(cwd, branch);
+                    this.notify_sidebar(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// The row's hover card, drawn to the right of the row (`SidebarThreadTooltip`).
@@ -841,6 +902,19 @@ impl Workspace {
                     div().min_w_0().truncate().child(if limit { "Usage limit reached" } else { "Error occurred" }),
                 )
             });
+        let mismatch = thread.worktree_path.is_none()
+            && project
+                .and_then(|p| self.sidebar.checkout_branches.get(&p.workspace_root))
+                .is_some_and(|current| thread.branch.as_ref().is_some_and(|branch| branch != current));
+        let mismatch = mismatch.then(|| {
+            h_flex()
+                .min_w_0()
+                .items_start()
+                .gap(px(8.))
+                .text_color(tokens.warning)
+                .child(div().mt(px(2.)).child(icon(IconName::CircleAlert, 12., tokens.warning)))
+                .child(div().min_w_0().flex_1().child("You're currently checked out on another branch."))
+        });
         let card = text_xs(v_flex())
             .max_w(px(320.))
             .px(px(12.))
@@ -872,6 +946,7 @@ impl Workspace {
                         self.server_info.environment_label.clone().map(|label| line(muted_icon(machine), label.into())),
                     )
                     .children(thread.branch.clone().map(|branch| line(muted_icon(IconName::GitBranch), branch.into())))
+                    .children(mismatch)
                     .children(provider_line)
                     .children(error),
             );
@@ -1002,6 +1077,8 @@ impl Workspace {
 
     /// Sets the project filter; the settled tail starts over at its first page.
     pub(super) fn set_scope(&mut self, scope: Vec<String>, cx: &mut Context<Self>) {
+        // A selection made under one scope can hold threads the next one hides.
+        self.sidebar.selection.clear();
         self.sidebar.scope = scope;
         self.sidebar.settled_visible = SETTLED_INITIAL;
         self.notify_sidebar(cx);
@@ -1065,7 +1142,9 @@ impl Workspace {
         let boring = self.boring_sidebar();
         let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
         let groups = self.project_groups();
-        let items = self.sidebar.items(&self.shell, &groups, self.target.as_ref(), working_shelf, boring, now);
+        let draft_rows = self.draft_rows();
+        let items =
+            self.sidebar.items(&self.shell, &groups, self.target.as_ref(), draft_rows, working_shelf, boring, now);
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();
@@ -1078,6 +1157,7 @@ impl Workspace {
             .filter_map(|item| matches!(item, Item::Card(_) | Item::FolderRow(_)).then(|| item.thread_id()).flatten())
             .collect();
         let nav_rows: Vec<SharedString> = items.iter().filter_map(Item::nav_key).collect();
+        let thread_order: Vec<String> = items.iter().filter_map(Item::thread_id).collect();
         let list_focused = self.sidebar.list_focus.is_focused(window);
         let cursor = self.sidebar.cursor.clone().filter(|_| list_focused);
         let has_rows = items.iter().any(|item| {
@@ -1094,7 +1174,9 @@ impl Workspace {
             for (index, item) in items.into_iter().enumerate() {
                 let key = item.nav_key();
                 let element = match item {
-                    Item::Draft(project_id) => self.render_draft(projects.get(project_id).copied(), &tokens, cx),
+                    Item::Draft(row) => {
+                        self.render_draft(&row, projects.get(row.project_id.as_str()).copied(), &tokens, cx)
+                    }
                     Item::DraftDivider => {
                         div().mx(px(10.)).my(px(6.)).h(px(1.)).bg(sb.border.opacity(0.6)).into_any_element()
                     }
@@ -1135,6 +1217,7 @@ impl Workspace {
         }
         self.sidebar.inbox_order = inbox_order;
         self.sidebar.nav_rows = nav_rows;
+        self.sidebar.thread_order = thread_order;
         self.arm_sidebar_clock(clock, now, cx);
 
         let rail = div()
@@ -1226,6 +1309,10 @@ impl Workspace {
                         }),
                     )
                     .child(list),
+            )
+            .children(
+                self.render_provider_pill(&tokens, cx)
+                    .map(|pill| div().flex_none().px(px(8.)).pt(px(4.)).pb(px(4.)).child(pill)),
             )
             .child(self.render_sidebar_footer(&tokens, cx))
             .child(deferred(rail).with_priority(1))
@@ -1344,9 +1431,14 @@ impl Workspace {
                                 .justify_center()
                                 .rounded(px(4.))
                                 .hover(|s| s.bg(sb.row_hover))
+                                .tooltip(tooltip("Clear thread search"))
                                 .child(icon(IconName::X, 12., tokens.muted_foreground))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.sidebar.search.update(cx, |search, cx| search.set_value("", window, cx));
+                                    this.sidebar.search.update(cx, |search, cx| {
+                                        search.set_value("", window, cx);
+                                        search.focus(window, cx);
+                                    });
+                                    this.on_search_changed(cx);
                                 })),
                         )
                     }),
@@ -1558,47 +1650,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_draft(&self, project: Option<&ProjectShell>, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let sb = tokens.sidebar;
-        div()
-            .id("sidebar-draft")
-            .context_menu(self.draft_menu(cx))
-            .py(px(2.))
-            .child(
-                div().rounded(px(6.)).bg(sb.row_active).child(
-                    v_flex()
-                        .h(px(78.))
-                        .px(px(10.))
-                        .py(px(8.))
-                        .child(
-                            h_flex()
-                                .h(px(20.))
-                                .gap(px(6.))
-                                .child(icon(IconName::SquarePen, 12., tokens.warning_foreground))
-                                .children(project.map(|p| project_icon(p, tokens, false, 16., self.favicon(p))))
-                                .child(
-                                    text_xs(div())
-                                        .min_w_0()
-                                        .flex_1()
-                                        .truncate()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(sb.secondary_label)
-                                        .children(project.map(|p| p.title.clone())),
-                                ),
-                        )
-                        .child(
-                            text_sm(div())
-                                .mt(px(2.))
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(sb.foreground.opacity(0.9))
-                                .child("New thread"),
-                        ),
-                ),
-            )
-            .into_any_element()
-    }
-
     fn provider_mark(&self, facts: &Facts, foreground: Hsla) -> Option<AnyElement> {
         let thread = facts.thread;
         let instance = if facts.runtime_status().is_some() {
@@ -1629,8 +1680,11 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let recede = inbox::recedes(status, unread, woke, active);
+        let selected = !active && self.sidebar.selection.contains(&thread.id);
+        let draft = !active && self.has_unsent_draft(&thread.id);
+        let recede = inbox::recedes(status, unread, woke, active || selected);
         let top = top_status(status, woke, unread, thread.goal.as_ref().is_some_and(|g| g.status == "active"), tokens);
+        let woke_status = top.is_some_and(|(_, label, _)| label == "Woke");
         let duration_from = match status {
             Status::Working | Status::Preparing => facts.working_started_at(),
             Status::Waiting => inbox::parse_ms(facts.latest_run_completed_at().unwrap_or_default()),
@@ -1644,7 +1698,7 @@ impl Workspace {
                 .child(icon(name, 16., color))
                 .child(label)
                 .children(duration_from.map(|from| inbox::format_duration(now - from)))
-                .into_any_element(),
+                .map(|el| if woke_status { self.woke_dismiss(el, &thread.id, cx) } else { el.into_any_element() }),
             None => div()
                 .text_color(sb.secondary_label)
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
@@ -1690,10 +1744,35 @@ impl Workspace {
             }))
             .child(Icon::new(IconName::Check).size(px(14.)))
             .child("Settle");
+        let discard = draft.then(|| {
+            let target = Target::Thread(thread.id.clone());
+            div()
+                .id(SharedString::from(format!("discard-{}", thread.id)))
+                .flex()
+                .h_full()
+                .items_center()
+                .px(px(6.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_color(tokens.muted_foreground)
+                .hover(|s| s.text_color(sb.foreground))
+                .tooltip(tooltip("Discard draft"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.discard_draft(target.clone(), window, cx);
+                }))
+                .child(Icon::new(IconName::X).size(px(14.)))
+        });
+        // A Woke label stays up beside the row controls: it is the button that dismisses it.
         let status_slot =
             text_xs(h_flex()).relative().ml_auto().h(px(20.)).min_w(px(32.)).flex_none().justify_end().child(
                 if hovered || menu_open {
-                    h_flex().h_full().children(snooze).child(settle)
+                    h_flex()
+                        .h_full()
+                        .when(woke_status, |el| el.child(status_label))
+                        .children(discard)
+                        .children(snooze)
+                        .child(settle)
                 } else {
                     h_flex().h_full().child(status_label)
                 },
@@ -1726,11 +1805,13 @@ impl Workspace {
                     .overflow_hidden()
                     .cursor_pointer()
                     .when(active, |el| el.bg(sb.row_active))
+                    .when(selected, |el| el.bg(row_selected(tokens)))
                     .when(receding_run, |el| el.opacity(0.7))
                     // GPUI allows one hover style per element.
-                    .when(!active || receding_run, |el| {
-                        el.hover(move |s| {
-                            let s = s.bg(sb.row_hover);
+                    .when(!active && !selected || receding_run, |el| {
+                        let hover = if draft && !active { tokens.warning.opacity(0.08) } else { sb.row_hover };
+                        el.when(draft && !selected, |el| el.bg(tokens.warning.opacity(0.04))).hover(move |s| {
+                            let s = s.bg(hover);
                             if receding_run { s.opacity(1.) } else { s }
                         })
                     })
@@ -1747,6 +1828,7 @@ impl Workspace {
                                     .h(px(20.))
                                     .min_w_0()
                                     .gap(px(6.))
+                                    .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
                                     .children(project.map(|p| project_icon(p, tokens, false, 16., self.favicon(p))))
                                     .when(thread.pinned_at.is_some(), |el| {
                                         el.child(self.render_unpin(&thread.id, tokens, cx))
@@ -1972,32 +2054,36 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let recede = inbox::recedes(status, unread, woke, active);
+        let selected = !active && self.sidebar.selection.contains(&thread.id);
+        let draft = !active && self.has_unsent_draft(&thread.id);
+        let recede = inbox::recedes(status, unread, woke, active || selected);
         let goal = thread.goal.as_ref().is_some_and(|g| g.status == "active");
+        let top = top_status(status, woke, unread, goal, tokens);
+        let woke_status = top.is_some_and(|(_, label, _)| label == "Woke");
         // Folder rows have no status line, so the status takes the time slot.
-        let label: AnyElement = match top_status(status, woke, unread, goal, tokens) {
+        let label: AnyElement = match top {
             Some((name, label, color)) => h_flex()
                 .gap(px(4.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(color)
                 .child(icon(name, 12., color))
                 .child(label)
-                .into_any_element(),
+                .map(|el| if woke_status { self.woke_dismiss(el, &thread.id, cx) } else { el.into_any_element() }),
             None => div()
                 .text_color(sb.secondary_label)
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
                 .into_any_element(),
         };
         let thread_id = thread.id.clone();
+        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
+        // Beside a Woke label the action takes its own place (`isWoke && ...:static`).
+        let beside = woke_status && hovered;
         let settle = h_flex()
             .id(SharedString::from(format!("folder-settle-{}", thread.id)))
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right_0()
+            .when(!beside, |el| el.absolute().top_0().bottom_0().right_0().invisible())
+            .h_full()
             .px(px(8.))
             .rounded(px(6.))
-            .invisible()
             .group_hover(ROW_GROUP, |s| s.visible())
             .text_color(tokens.muted_foreground)
             .hover(|s| s.text_color(sb.foreground))
@@ -2014,7 +2100,7 @@ impl Workspace {
             .min_w(px(32.))
             .flex_none()
             .justify_end()
-            .child(div().group_hover(ROW_GROUP, |s| s.invisible()).child(label))
+            .child(div().when(!woke_status, |el| el.group_hover(ROW_GROUP, |s| s.invisible())).child(label))
             .child(settle);
         let title_color = if recede {
             sb.foreground.opacity(0.75)
@@ -2039,6 +2125,7 @@ impl Workspace {
             .when(!multiline, |el| el.size_full())
             .min_w_0()
             .gap(px(10.))
+            .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
             .child(title)
             .map(|el| self.with_rename(el, &thread.id, 36., tokens, cx))
             .children(title_icons);
@@ -2062,9 +2149,12 @@ impl Workspace {
             .map(|el| {
                 if active {
                     el.bg(sb.row_active)
+                } else if selected {
+                    el.bg(row_selected(tokens))
                 } else {
-                    el.hover(move |s| {
-                        let s = s.bg(sb.row_hover);
+                    let hover = if draft { tokens.warning.opacity(0.08) } else { sb.row_hover };
+                    el.when(draft, |el| el.bg(tokens.warning.opacity(0.04))).hover(move |s| {
+                        let s = s.bg(hover);
                         if receding_run { s.opacity(1.) } else { s }
                     })
                 }
@@ -2094,7 +2184,9 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let recede = inbox::recedes(status, unread, woke, active);
+        let selected = !active && self.sidebar.selection.contains(&thread.id);
+        let draft = !active && self.has_unsent_draft(&thread.id);
+        let recede = inbox::recedes(status, unread, woke, active || selected);
         let settled = shelf == Some(Shelf::Settled);
         let title_color = if settled && !active {
             sb.secondary_label
@@ -2114,6 +2206,16 @@ impl Workspace {
                 .child(icon(IconName::AlarmClock, 12., tokens.info_foreground))
                 .child(inbox::format_wake(inbox::parse_ms(until).unwrap_or(now) - now))
                 .into_any_element(),
+            _ if woke => {
+                let color = tokens.warning_foreground;
+                let label = h_flex()
+                    .gap(px(4.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(color)
+                    .child(icon(IconName::AlarmClock, 12., color))
+                    .child("Woke");
+                self.woke_dismiss(label, &thread.id, cx)
+            }
             _ => {
                 let at = if settled { facts.settled_timestamp() } else { facts.activity_timestamp() };
                 div()
@@ -2127,17 +2229,16 @@ impl Workspace {
             Some(Shelf::Snoozed) => Some((Shelf::Snoozed, IconName::AlarmClockOff, 12., "Wake thread now")),
             _ => None,
         };
+        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
+        let beside = woke && hovered;
         let action = action.map(|(action_shelf, name, size, label)| {
             let thread_id = thread.id.clone();
             h_flex()
                 .id(SharedString::from(format!("{}-{}", action_shelf.label(), thread.id)))
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right(px(-4.))
+                .when(!beside, |el| el.absolute().top_0().bottom_0().right(px(-4.)).invisible())
+                .h_full()
                 .px(px(6.))
                 .rounded(px(6.))
-                .invisible()
                 .group_hover(ROW_GROUP, |s| s.visible())
                 .text_color(tokens.muted_foreground)
                 .hover(|s| s.text_color(sb.foreground))
@@ -2149,7 +2250,6 @@ impl Workspace {
                 .child(Icon::new(name).size(px(size)))
         });
         let muted_icon = !active || settled;
-        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
         let hover_card = self.render_hover_card(&facts, project, tokens);
         let open_id = thread.id.clone();
         let hover_id = thread.id.clone();
@@ -2165,7 +2265,17 @@ impl Workspace {
             .gap(px(10.))
             .rounded(px(6.))
             .cursor_pointer()
-            .map(|el| if active { el.bg(sb.row_active) } else { el.hover(|s| s.bg(sb.row_hover)) })
+            .map(|el| {
+                if active {
+                    el.bg(sb.row_active)
+                } else if selected {
+                    el.bg(row_selected(tokens))
+                } else if draft {
+                    drafts::draft_surface(el, tokens)
+                } else {
+                    el.hover(|s| s.bg(sb.row_hover))
+                }
+            })
             .on_click(
                 cx.listener(move |this, event: &ClickEvent, window, cx| this.click_row(&open_id, event, window, cx)),
             )
@@ -2175,6 +2285,7 @@ impl Workspace {
                     .when(muted_icon, |el| el.opacity(0.4).group_hover(ROW_GROUP, |s| s.opacity(1.)))
                     .child(project_icon(p, tokens, muted_icon && !hovered, 16., self.favicon(p)))
             }))
+            .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
             .child(
                 text_sm(div())
                     .min_w_0()
@@ -2195,7 +2306,11 @@ impl Workspace {
                     .min_w(px(32.))
                     .flex_none()
                     .justify_end()
-                    .child(div().when(action.is_some(), |el| el.group_hover(ROW_GROUP, |s| s.invisible())).child(label))
+                    .child(
+                        div()
+                            .when(action.is_some() && !woke, |el| el.group_hover(ROW_GROUP, |s| s.invisible()))
+                            .child(label),
+                    )
                     .children(action),
             )
             .context_menu(self.row_menu(&thread.id, cx))
@@ -2224,6 +2339,29 @@ fn top_status(
         Status::Ready if unread => (IconName::CircleCheck, "Done", tokens.success_foreground),
         Status::Ready => return None,
     })
+}
+
+/// `--sidebar-row-selected`: white in light themes, a 7% tint in dark ones.
+fn row_selected(tokens: &Tokens) -> Hsla {
+    if tokens.dark { tokens.sidebar.foreground.opacity(0.07) } else { tokens.sidebar.row_active }
+}
+
+impl Workspace {
+    /// Makes a Woke label the button that dismisses it (`handleAcknowledgeWokeClick`).
+    fn woke_dismiss(&self, label: impl IntoElement, thread_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let id = thread_id.to_owned();
+        div()
+            .id(SharedString::from(format!("woke-{thread_id}")))
+            .cursor_pointer()
+            .hover(|s| s.underline())
+            .tooltip(tooltip("Dismiss Woke notification"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.acknowledge_woke(&id, cx);
+            }))
+            .child(label)
+            .into_any_element()
+    }
 }
 
 fn guest_foreground(tokens: &Tokens) -> Hsla {

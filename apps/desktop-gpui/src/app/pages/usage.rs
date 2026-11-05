@@ -2,6 +2,7 @@
 //! over the last main view). Cost and Tokens read `server.getUsageSummary`; Limits shows the
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
+mod prices;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -14,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Bounds, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px, relative, rgb, svg,
+    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -50,6 +51,8 @@ pub(in crate::app) struct UsageState {
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
     scroll: ScrollHandle,
+    /// Reset credits being spent (`None`) or spent, with the outcome, by account key.
+    redeemed: Vec<(String, String, Option<String>)>,
 }
 
 impl Default for UsageState {
@@ -73,6 +76,7 @@ impl Default for UsageState {
             by_time: false,
             hover: None,
             scroll: ScrollHandle::new(),
+            redeemed: Vec::new(),
         }
     }
 }
@@ -256,6 +260,47 @@ impl Workspace {
     }
 
     /// The modal layer over the whole window while Usage is open.
+    /// "Use a reset credit?", then `provider.consumeResetCredit` (`useResetCredit`).
+    fn redeem_reset_credit(
+        &mut self,
+        key: String,
+        name: String,
+        input: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client() else { return };
+        let answer = window.prompt(
+            gpui_kit::PromptLevel::Warning,
+            "Use a reset credit?",
+            Some("This redeems one credit on your account and clears the current rate-limit windows. It cannot be undone."),
+            &["Use credit", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let set = |this: &mut Self, status: Option<String>| {
+                this.usage.redeemed.retain(|(k, ..)| *k != key);
+                this.usage.redeemed.push((key.clone(), name.clone(), status));
+            };
+            let _ = this.update(cx, |this, cx| {
+                set(this, None);
+                cx.notify();
+            });
+            let status = match client.request("provider.consumeResetCredit", input).await {
+                Ok(result) => logic::reset_outcome_text(&result),
+                Err(error) => error.to_string(),
+            };
+            let _ = this.update(cx, |this, cx| {
+                set(this, Some(status));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(in crate::app) fn render_usage_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let viewport = window.viewport_size();
@@ -378,6 +423,12 @@ impl Workspace {
                         })),
                     )
                     .when_some(error_line.filter(|_| !limits), |menu, error| menu.separator().label(error))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
+                            window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
+                        ),
+                    )
                 }
             });
 
@@ -493,7 +544,7 @@ impl Workspace {
             return muted_line(format!("Select an environment to see {what}."), t).into_any_element();
         }
         if limits {
-            return self.render_limits(t);
+            return self.render_limits(t, cx);
         }
         match (&usage.summary, &usage.error) {
             (None, Some(error)) => v_flex()
@@ -508,12 +559,13 @@ impl Workspace {
         }
     }
 
-    fn render_limits(&self, t: &Tokens) -> AnyElement {
+    fn render_limits(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let providers = &self.server_info.providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let pools = logic::limit_pools(logic::limit_accounts(providers, &hidden), now);
+        let sources = &self.server_info.config["usageLimitSources"];
+        let pools = logic::limit_pools(logic::limit_accounts(providers, sources, &hidden), now);
         let notices = logic::limit_notices(providers, &hidden);
         let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "this environment".into());
         let links = logic::external_links(providers, &environment, &hidden);
@@ -522,8 +574,11 @@ impl Workspace {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
+        let environment_label = self.server_info.environment_label.clone();
         for pool in &pools {
-            body = body.child(pool_section(pool, now, t));
+            let view = cx.weak_entity();
+            let redeemed = &self.usage.redeemed;
+            body = body.child(pool_section(pool, now, environment_label.as_deref(), redeemed, &view, t));
         }
         for (label, url, message, accounts) in links {
             let open = url.clone();
@@ -1354,7 +1409,14 @@ fn share_bar(
 }
 
 /// `PoolSection`: one driver's windows, each pooled across its accounts.
-fn pool_section(pool: &Pool, now: i64, t: &Tokens) -> AnyElement {
+fn pool_section(
+    pool: &Pool,
+    now: i64,
+    environment: Option<&str>,
+    redeemed: &[(String, String, Option<String>)],
+    view: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
     let color = logic::driver_kind(&pool.driver).map_or(t.foreground, |kind| provider_color(kind, t));
     v_flex()
         .gap(px(12.))
@@ -1370,17 +1432,36 @@ fn pool_section(pool: &Pool, now: i64, t: &Tokens) -> AnyElement {
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, t)))
+        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, environment, view, t)))
+        // The confirm closed with no popover to report back in, so progress and the outcome show here.
+        .children(redeemed.iter().filter(|(key, ..)| pool.accounts.iter().any(|a| &a.key == key)).map(
+            |(_, name, status)| {
+                h_flex()
+                    .gap(px(4.))
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(name.clone()))
+                    .child(status.clone().unwrap_or_else(|| "Using reset credit…".into()))
+            },
+        ))
         .into_any_element()
 }
 
-fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, now: i64, t: &Tokens) -> AnyElement {
+fn pool_window_card(
+    pool: &Pool,
+    window: &PoolWindow,
+    color: Hsla,
+    now: i64,
+    environment: Option<&str>,
+    view: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
     let cursor = (pool.driver == "cursor").then(|| logic::CURSOR_WINDOWS.iter().find(|w| w.0 == window.id)).flatten();
     let label = cursor.map_or(window.label.clone(), |w| w.1.to_owned());
     let several = window.columns.len() > 1;
     let segments = window.columns.iter().map(|member| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, t)
+        pool_segment(pool, window, member, several, color, now, environment, view, t)
     });
     v_flex()
         .gap(px(12.))
@@ -1484,9 +1565,13 @@ fn pool_segment(
     several: bool,
     color: Hsla,
     now: i64,
+    environment: Option<&str>,
+    view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
     let account = &pool.accounts[member.account];
+    let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0);
+    let redeem = account.redeem.clone().filter(|_| credits.is_some());
     let color = crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into());
     let remaining = logic::remaining_percent(&member.window);
     let time_left = logic::pace_remaining_percent(&member.window, now);
@@ -1498,8 +1583,13 @@ fn pool_segment(
         (None, Some(email)) => account_chip(email).into_any_element(),
         (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
     };
+    let where_label = match &account.source_label {
+        Some(source) => Some(("Via", source.clone())),
+        None => environment.map(|label| ("Signed in", label.to_owned())),
+    };
     let details: Vec<(&'static str, String)> = [
         account.plan.clone().map(|plan| ("Plan", plan)),
+        where_label,
         Some(("Left", format!("{remaining}%"))),
         resets_in.clone().map(|r| ("Resets", r.replace("resets in ", "in "))),
         time_left.map(|left| ("Even pace", format!("{left}% left by now"))),
@@ -1510,6 +1600,9 @@ fn pool_segment(
     .into_iter()
     .flatten()
     .collect();
+    // The web's popover holds a "Use reset" button; here the segment itself is that button.
+    let credit_line = credits.as_ref().filter(|_| redeem.is_some()).map(|c| logic::reset_credits_summary(c, now, true));
+    let border = t.border;
     let title = account.name();
     let email = account.email.clone().filter(|_| account.display_name.is_some());
     let fill = Hsla { a: color.a * 0.35, ..color };
@@ -1548,22 +1641,46 @@ fn pool_segment(
                     el.child(name)
                         .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("{remaining}%")))
                 })
-                .children(resets_in.map(|r| {
-                    div()
-                        .ml_auto()
-                        .flex_none()
-                        .rounded(px(4.))
-                        .bg(Hsla { a: 0.85, ..t.background })
-                        .px(px(6.))
-                        .py(px(2.))
-                        .text_size(px(11.))
-                        .child(r.replace("resets in ", "↻ "))
-                })),
+                .when(resets_in.is_some() || credits.is_some(), |el| {
+                    el.child(
+                        h_flex()
+                            .ml_auto()
+                            .flex_none()
+                            .gap(px(6.))
+                            .rounded(px(4.))
+                            .bg(Hsla { a: 0.85, ..t.background })
+                            .px(px(6.))
+                            .py(px(2.))
+                            .text_size(gpui_kit::rems(0.6875))
+                            .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
+                            .when_some(credits.as_ref(), |el, credits| {
+                                el.when(resets_in.is_some(), |el| {
+                                    el.child(div().text_color(t.muted_foreground).child("·"))
+                                })
+                                .child(
+                                    h_flex()
+                                        .gap(px(2.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
+                                        .child(credits.available_count.to_string()),
+                                )
+                            }),
+                    )
+                }),
         )
+        .when_some(redeem, |el, input| {
+            let (view, key, name) = (view.clone(), account.key.clone(), account.name());
+            el.on_click(move |_, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx)
+                });
+            })
+        })
         .tooltip(move |window, cx| {
             let details = details.clone();
             let title = title.clone();
             let email = email.clone();
+            let credit_line = credit_line.clone();
             Tooltip::element(move |_, _| {
                 v_flex()
                     .w(px(288.))
@@ -1577,6 +1694,17 @@ fn pool_segment(
                     )
                     .children(details.iter().map(|(label, value)| {
                         h_flex().gap(px(12.)).child(div().w(px(72.)).flex_none().child(*label)).child(value.clone())
+                    }))
+                    .children(credit_line.clone().map(|line| {
+                        h_flex().gap(px(12.)).child(line).child(
+                            div()
+                                .ml_auto()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(border)
+                                .px(px(6.))
+                                .child("Use reset"),
+                        )
                     }))
             })
             .build(window, cx)

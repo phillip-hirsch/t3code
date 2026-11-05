@@ -160,6 +160,8 @@ pub struct Provider {
     pub reports_context_window: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
@@ -272,6 +274,20 @@ pub struct UsageLimits {
     pub credential_fingerprint: Option<String>,
     #[serde(default)]
     pub external_usage: Option<ExternalUsage>,
+    #[serde(default)]
+    pub reset_credits: Option<ResetCredits>,
+}
+
+/// `ServerProviderResetCredits`: banked credits that clear the rate-limit windows.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredits {
+    #[serde(default)]
+    pub available_count: u32,
+    #[serde(default)]
+    pub next_expires_at: Option<String>,
+    #[serde(default)]
+    pub next_credit_id: Option<String>,
 }
 
 /// A host that shows usage on its own site instead of reporting windows.
@@ -390,6 +406,11 @@ impl ServerInfo {
                 self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
             }
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "usageLimitSourcesUpdated" => {
+                if let Some(config) = self.config.as_object_mut() {
+                    config.insert("usageLimitSources".into(), event["payload"]["sources"].clone());
+                }
+            }
             _ => {}
         }
         Ok(())

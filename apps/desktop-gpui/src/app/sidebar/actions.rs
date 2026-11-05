@@ -29,6 +29,7 @@ pub(super) enum UndoAction {
     Snoozed,
     Unpinned,
     Archived,
+    Discarded,
 }
 
 impl UndoAction {
@@ -38,7 +39,45 @@ impl UndoAction {
             UndoAction::Snoozed => "Snoozed",
             UndoAction::Unpinned => "Unpinned",
             UndoAction::Archived => "Archived",
+            UndoAction::Discarded => "Discarded",
         }
+    }
+
+    /// The toast title of a failed undo (`failureTitle` in `useThreadActions.ts`).
+    fn failure_title(self) -> &'static str {
+        match self {
+            UndoAction::Settled => "Failed to undo settle",
+            UndoAction::Snoozed => "Failed to wake thread",
+            UndoAction::Unpinned => "Failed to undo unpin",
+            UndoAction::Archived => "Failed to undo archive",
+            UndoAction::Discarded => "Failed to restore draft",
+        }
+    }
+}
+
+/// The toast title the web shows when a thread command fails (`useThreadActions.ts`, `Sidebar.tsx`).
+fn failure_title(kind: &str, fields: &Value) -> Option<&'static str> {
+    Some(match kind {
+        "thread.settle" => "Failed to settle thread",
+        "thread.unsettle" => "Failed to un-settle thread",
+        "thread.snooze" => "Failed to snooze thread",
+        "thread.unsnooze" => "Failed to wake thread",
+        "thread.pin" => "Failed to pin thread",
+        "thread.unpin" => "Failed to unpin thread",
+        "thread.archive" => "Failed to archive thread",
+        "thread.delete" => "Failed to delete thread",
+        "thread.auto-settle.set" => "Failed to update auto-settle",
+        "thread.metadata.update" if fields.get("regenerateTitle").is_some() => "Failed to regenerate thread title",
+        "thread.metadata.update" => "Failed to rename thread",
+        _ => return None,
+    })
+}
+
+/// A failure toast's text: its title, then the error.
+pub(in crate::app) fn failure_message(title: Option<&str>, error: &str) -> String {
+    match title {
+        Some(title) => format!("{title}: {error}"),
+        None => error.to_owned(),
     }
 }
 
@@ -54,12 +93,14 @@ pub(super) struct UndoEntry {
 pub(super) struct UndoNotice {
     pub(super) action: UndoAction,
     entries: Vec<UndoEntry>,
+    /// A discarded draft, for `UndoAction::Discarded`.
+    draft: Option<super::drafts::Discarded>,
     _expire: Task<()>,
 }
 
 impl UndoNotice {
     pub(super) fn count(&self) -> usize {
-        self.entries.len()
+        self.entries.len().max(usize::from(self.draft.is_some()))
     }
 }
 
@@ -103,14 +144,64 @@ impl Workspace {
         fields: Value,
         cx: &mut Context<Self>,
     ) {
+        let title = failure_title(kind, &fields);
+        let command = Self::thread_command_value(kind, thread_id, fields);
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(failure_message(title, &error.to_string()).into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// `{type, commandId, threadId, ..fields}`.
+    pub(super) fn thread_command_value(kind: &str, thread_id: &str, fields: Value) -> Value {
         let mut command = json!({"type": kind, "commandId": new_id(), "threadId": thread_id});
         if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), fields) {
             command.extend(fields);
         }
-        self.dispatch(command, cx);
+        command
     }
 
-    fn undo_entry(&self, thread_id: &str) -> UndoEntry {
+    /// Dispatches `commands` in order, then reports failures as one toast titled by
+    /// `title(failed, succeeded)`. `stop_at_failure` ends the batch at the first one.
+    pub(super) fn dispatch_batch(
+        &mut self,
+        commands: Vec<Value>,
+        stop_at_failure: bool,
+        title: fn(usize, usize) -> String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let (mut failed, mut succeeded, mut first_error) = (0, 0, None);
+            for command in commands {
+                match client.request("orchestration.dispatchCommand", command).await {
+                    Ok(_) => succeeded += 1,
+                    Err(error) => {
+                        failed += 1;
+                        first_error.get_or_insert(error.to_string());
+                        if stop_at_failure {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(failure_message(Some(&title(failed, succeeded)), &error).into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn undo_entry(&self, thread_id: &str) -> UndoEntry {
         let thread = self.thread(thread_id);
         UndoEntry {
             thread_id: thread_id.to_owned(),
@@ -122,13 +213,24 @@ impl Workspace {
 
     /// Adds `entry` to the notice, or replaces a notice for another action;
     /// every new action restarts the 5 s timeout.
-    fn push_undo(&mut self, action: UndoAction, entry: UndoEntry, cx: &mut Context<Self>) {
+    pub(super) fn push_undo(&mut self, action: UndoAction, entry: UndoEntry, cx: &mut Context<Self>) {
         let mut entries = match self.sidebar.undo.take() {
             Some(notice) if notice.action == action => notice.entries,
             _ => Vec::new(),
         };
         entries.retain(|e| e.thread_id != entry.thread_id);
         entries.push(entry);
+        self.set_undo(action, entries, None, cx);
+    }
+
+    /// Shows the undo notice for 5 s.
+    pub(super) fn set_undo(
+        &mut self,
+        action: UndoAction,
+        entries: Vec<UndoEntry>,
+        draft: Option<super::drafts::Discarded>,
+        cx: &mut Context<Self>,
+    ) {
         let expire = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(UNDO_TIMEOUT).await;
             let _ = this.update(cx, |this, cx| {
@@ -136,7 +238,7 @@ impl Workspace {
                 this.notify_sidebar(cx);
             });
         });
-        self.sidebar.undo = Some(UndoNotice { action, entries, _expire: expire });
+        self.sidebar.undo = Some(UndoNotice { action, entries, draft, _expire: expire });
         self.notify_sidebar(cx);
     }
 
@@ -151,9 +253,14 @@ impl Workspace {
     }
 
     /// Runs the notice's undo: each thread's steps in order, stopping at a failure.
-    pub(in crate::app) fn undo_thread_action(&mut self, cx: &mut Context<Self>) {
-        let (Some(notice), Some(client)) = (self.sidebar.undo.take(), self.client()) else { return };
+    pub(in crate::app) fn undo_thread_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut notice) = self.sidebar.undo.take() else { return };
         self.notify_sidebar(cx);
+        if let Some(draft) = notice.draft.take() {
+            self.restore_discarded(draft, window, cx);
+            return;
+        }
+        let Some(client) = self.client() else { return };
         let now = now_ms();
         let action = notice.action;
         let mut plans: Vec<Vec<Value>> = Vec::new();
@@ -187,6 +294,7 @@ impl Workspace {
                     steps.extend(resnooze);
                 }
                 UndoAction::Archived => steps.push(command("thread.unarchive", json!({}))),
+                UndoAction::Discarded => {}
             }
             plans.push(steps);
         }
@@ -195,7 +303,8 @@ impl Workspace {
                 for step in steps {
                     if let Err(error) = client.request("orchestration.dispatchCommand", step).await {
                         let _ = this.update(cx, |this, cx| {
-                            this.error = Some(format!("Could not undo: {error}").into());
+                            let message = failure_message(Some(action.failure_title()), &error.to_string());
+                            this.error = Some(message.into());
                             cx.notify();
                         });
                         break;
@@ -210,14 +319,24 @@ impl Workspace {
     /// to the next inbox thread in sidebar order (wrapping), else a new draft
     /// in its project.
     fn leave_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_threads(thread_id, &[], window, cx);
+    }
+
+    /// `leave_thread`, also passing over `parked`: threads parked with it (`coParkingKeys`).
+    pub(super) fn leave_threads(
+        &mut self,
+        thread_id: &str,
+        parked: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.target.as_ref() != Some(&Target::Thread(thread_id.to_owned())) {
             return;
         }
         let order = &self.sidebar.inbox_order;
-        let next = order
-            .iter()
-            .position(|id| id == thread_id)
-            .and_then(|at| order[at + 1..].iter().chain(&order[..at]).find(|id| *id != thread_id).cloned());
+        let next = order.iter().position(|id| id == thread_id).and_then(|at| {
+            order[at + 1..].iter().chain(&order[..at]).find(|id| *id != thread_id && !parked.contains(id)).cloned()
+        });
         match next {
             Some(next) => self.select_thread(next, window, cx),
             None => {
@@ -273,6 +392,14 @@ impl Workspace {
     pub(super) fn wake_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.expire_undo(thread_id);
         self.thread_command("thread.unsnooze", thread_id, json!({"reason": "user"}), cx);
+    }
+
+    /// `useAcknowledgeThreadWoke`: marks the thread visited at its wake, which clears "Woke".
+    pub(super) fn acknowledge_woke(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(thread_id).filter(|t| t.tracks_visits()) else { return };
+        let requests = inbox::child_requests(&self.shell.threads);
+        let Some(woke_at) = Facts::new(thread, &requests).woke_at(now_ms()).map(str::to_owned) else { return };
+        self.thread_command("thread.visit", thread_id, json!({"visitedAt": woke_at}), cx);
     }
 
     pub(in crate::app) fn pin_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -535,7 +662,7 @@ impl Workspace {
                         .text_color(tokens.foreground)
                         .cursor_pointer()
                         .hover(|s| s.underline())
-                        .on_click(cx.listener(|this, _, _, cx| this.undo_thread_action(cx)))
+                        .on_click(cx.listener(|this, _, window, cx| this.undo_thread_action(window, cx)))
                         .tooltip(move |window, cx| {
                             gpui_kit::component::tooltip::Tooltip::new(undo_tooltip.clone()).build(window, cx)
                         })
@@ -606,7 +733,8 @@ impl SnoozeItems {
         }
         let (view, thread_id, advance) = (view.clone(), self.thread_id.clone(), self.advance);
         menu.item(PopupMenuItem::new("Custom…").on_click(move |_, window, cx| {
-            let _ = view.update(cx, |workspace, cx| workspace.open_custom_snooze(&thread_id, advance, window, cx));
+            let _ = view
+                .update(cx, |workspace, cx| workspace.open_custom_snooze(&[thread_id.clone()], advance, window, cx));
         }))
     }
 }

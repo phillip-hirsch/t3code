@@ -1,15 +1,13 @@
 //! Thread menu actions beyond the shared ones in `sidebar::actions` (`useThreadActionMenu.ts`,
-//! `Sidebar.tsx`): a new thread on the thread's branch, turning a No project thread into a
-//! project, and the draft row's menu (`buildDraftActionMenuItems`).
+//! `Sidebar.tsx`): a new thread on the thread's branch and turning a No project thread into a
+//! project. The draft row's menu is in `sidebar::drafts`.
 
-use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Icon, WindowExt as _};
-use gpui_kit::{ClipboardItem, Context, Window, px};
+use gpui_kit::{Context, Window};
 use serde_json::json;
 
-use super::{Target, Workspace};
+use super::Workspace;
 use crate::new_thread::{EnvMode, WorkspaceChoice};
 
 /// The draft's workspace for "New thread on `branch`": the thread's worktree, else its branch locally.
@@ -67,79 +65,6 @@ impl Workspace {
             });
         })
         .detach();
-    }
-
-    /// The draft row's menu: Copy (path, branch), Project settings, Discard draft.
-    pub(in crate::app) fn draft_menu(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-        let view = cx.weak_entity();
-        move |menu, window, cx| {
-            let Some(workspace) = view.upgrade() else { return menu };
-            let (path, branch, has_project) = {
-                let this = workspace.read(cx);
-                let Some(Target::Draft { project_id }) = &this.target else { return menu };
-                let project = this.shell.projects.iter().find(|p| &p.id == project_id);
-                let choice = &this.draft_workspace.choice;
-                let worktree = choice.existing_worktree.as_ref();
-                let path = worktree.map(|(path, _)| path.clone()).or_else(|| project.map(|p| p.workspace_root.clone()));
-                let branch = worktree.and_then(|(_, branch)| branch.clone()).or_else(|| choice.branch.clone());
-                (path, branch, project.is_some())
-            };
-            let menu = menu.min_w(px(200.)).submenu_with_icon(
-                Some(Icon::new(Lucide::Copy)),
-                "Copy",
-                window,
-                cx,
-                move |mut menu, _, _| {
-                    let copy = |text: String| {
-                        move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                        }
-                    };
-                    if let Some(path) = &path {
-                        menu = menu.item(
-                            PopupMenuItem::new("Path").icon(Icon::new(Lucide::Folder)).on_click(copy(path.clone())),
-                        );
-                    }
-                    if let Some(branch) = &branch {
-                        menu = menu.item(
-                            PopupMenuItem::new("Branch")
-                                .icon(Icon::new(Lucide::GitBranch))
-                                .on_click(copy(branch.clone())),
-                        );
-                    }
-                    menu
-                },
-            );
-            let (settings, discard) = (view.clone(), view.clone());
-            let menu = if has_project {
-                menu.item(PopupMenuItem::new("Project settings").icon(Icon::new(Lucide::Settings)).on_click(
-                    move |_, _, cx| {
-                        let _ = settings.update(cx, |this, cx| this.open_settings("projects", cx));
-                    },
-                ))
-            } else {
-                menu
-            };
-            menu.separator().item(PopupMenuItem::new("Discard draft").icon(Icon::new(Lucide::Trash)).on_click(
-                move |_, window, cx| {
-                    let _ = discard.update(cx, |this, cx| this.discard_draft(window, cx));
-                },
-            ))
-        }
-    }
-
-    /// `discardComposerDraft`: the draft's text, attachments and workspace choice go.
-    fn discard_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
-        self.composer_drafts.remove(&target);
-        self.attachments.clear();
-        self.set_composer_text("", window, cx);
-        self.draft_workspace.choice = WorkspaceChoice::default();
-        self.notify_sidebar(cx);
-        cx.notify();
     }
 }
 

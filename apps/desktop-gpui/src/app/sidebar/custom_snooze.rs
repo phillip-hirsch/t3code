@@ -1,9 +1,10 @@
 //! The "Custom snooze" dialog (`apps/web/src/components/CustomSnoozeDialog.tsx`).
-//! The web's calendar popover and native time field are plain date and time
-//! inputs here; validation and the wake time match `resolveCustomSnooze`.
+//! The date opens a calendar from today on; the time is a plain `HH:MM` field.
+//! Validation and the wake time match `resolveCustomSnooze`.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::date_picker::{DatePicker, DatePickerState};
+use gpui_kit::component::input::{Input, InputState, NumberInput};
 use gpui_kit::component::{Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString, Styled as _, WeakEntity,
@@ -15,11 +16,11 @@ use crate::inbox::{self, CustomSnooze, SnoozeUnit};
 
 pub(super) struct CustomSnoozeForm {
     workspace: WeakEntity<Workspace>,
-    thread_id: String,
+    thread_ids: Vec<String>,
     /// Move on from the open thread once it is snoozed, as the sidebar does.
     advance: bool,
     duration: bool,
-    date: Entity<InputState>,
+    date: Entity<DatePickerState>,
     time: Entity<InputState>,
     amount: Entity<InputState>,
     unit: SnoozeUnit,
@@ -32,14 +33,17 @@ impl CustomSnoozeForm {
             CustomSnooze::Duration { amount: self.amount.read(cx).value().to_string(), unit: self.unit }
         } else {
             CustomSnooze::Date {
-                date: self.date.read(cx).value().to_string(),
+                date: self.date.read(cx).date().start().map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
                 time: self.time.read(cx).value().to_string(),
             }
         };
         match inbox::resolve_custom_snooze(&input, &chrono::Local::now()) {
             Ok(wake) => {
-                let (thread_id, advance) = (self.thread_id.clone(), self.advance);
-                let _ = self.workspace.update(cx, |this, cx| this.snooze_thread(&thread_id, wake, advance, window, cx));
+                let (ids, advance) = (self.thread_ids.clone(), self.advance);
+                let _ = self.workspace.update(cx, |this, cx| match ids.as_slice() {
+                    [id] => this.snooze_thread(id, wake, advance, window, cx),
+                    ids => this.snooze_threads(ids, wake, window, cx),
+                });
                 window.close_dialog(cx);
             }
             Err(error) => {
@@ -62,12 +66,13 @@ impl Render for CustomSnoozeForm {
                 },
             ))
         };
-        let field = |label: &'static str, input: &Entity<InputState>| {
+        let field = |label: &'static str, input: gpui_kit::AnyElement| {
             v_flex()
                 .flex_1()
+                .min_w_0()
                 .gap(px(6.))
                 .child(div().text_sm().font_weight(gpui_kit::FontWeight::MEDIUM).child(label))
-                .child(Input::new(input))
+                .child(input)
         };
         let unit = |id: &'static str, unit: SnoozeUnit, current: SnoozeUnit, cx: &mut Context<Self>| {
             Button::new(id)
@@ -98,21 +103,30 @@ impl Render for CustomSnoozeForm {
             .map(|el| {
                 if self.duration {
                     el.child(
-                        h_flex().gap(px(12.)).items_end().child(field("Snooze for", &self.amount)).child(
-                            v_flex()
-                                .gap(px(6.))
-                                .child(div().text_sm().font_weight(gpui_kit::FontWeight::MEDIUM).child("Unit"))
-                                .child(
-                                    h_flex()
-                                        .gap(px(4.))
-                                        .child(unit("custom-snooze-minutes", SnoozeUnit::Minutes, self.unit, cx))
-                                        .child(unit("custom-snooze-hours", SnoozeUnit::Hours, self.unit, cx))
-                                        .child(unit("custom-snooze-days", SnoozeUnit::Days, self.unit, cx)),
-                                ),
-                        ),
+                        h_flex()
+                            .gap(px(12.))
+                            .items_end()
+                            .child(field("Snooze for", NumberInput::new(&self.amount).into_any_element()))
+                            .child(
+                                v_flex()
+                                    .gap(px(6.))
+                                    .child(div().text_sm().font_weight(gpui_kit::FontWeight::MEDIUM).child("Unit"))
+                                    .child(
+                                        h_flex()
+                                            .gap(px(4.))
+                                            .child(unit("custom-snooze-minutes", SnoozeUnit::Minutes, self.unit, cx))
+                                            .child(unit("custom-snooze-hours", SnoozeUnit::Hours, self.unit, cx))
+                                            .child(unit("custom-snooze-days", SnoozeUnit::Days, self.unit, cx)),
+                                    ),
+                            ),
                     )
                 } else {
-                    el.child(h_flex().gap(px(12.)).child(field("Date", &self.date)).child(field("Time", &self.time)))
+                    el.child(
+                        h_flex()
+                            .gap(px(12.))
+                            .child(field("Date", DatePicker::new(&self.date).into_any_element()))
+                            .child(field("Time", Input::new(&self.time).into_any_element())),
+                    )
                 }
             })
             .children(self.error.map(|error| div().text_sm().text_color(tokens.error_foreground).child(error)))
@@ -154,7 +168,7 @@ impl Workspace {
     /// Opens the dialog, seeded with now + 1 h (date mode) and 2 hours (duration mode).
     pub(super) fn open_custom_snooze(
         &mut self,
-        thread_id: &str,
+        thread_ids: &[String],
         advance: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -167,13 +181,20 @@ impl Workspace {
                 state
             })
         };
-        let date = text_input(seed.format("%Y-%m-%d").to_string(), "YYYY-MM-DD", window, cx);
+        let today = chrono::Local::now().date_naive();
+        let date = cx.new(|cx| {
+            let mut picker = DatePickerState::new(window, cx)
+                .date_format("%b %-d, %Y")
+                .disabled_matcher(gpui_kit::component::calendar::Matcher::interval(Some(today), None));
+            picker.set_date(seed.date_naive(), window, cx);
+            picker
+        });
         let time = text_input(seed.format("%H:%M").to_string(), "HH:MM", window, cx);
-        let amount = text_input("2".into(), "2", window, cx);
+        let amount = cx.new(|cx| InputState::new(window, cx).placeholder("2").default_value("2").min(0.));
         let workspace = cx.weak_entity();
         let form = cx.new(|_| CustomSnoozeForm {
             workspace,
-            thread_id: thread_id.to_owned(),
+            thread_ids: thread_ids.to_vec(),
             advance,
             duration: false,
             date,
@@ -183,7 +204,11 @@ impl Workspace {
             error: None,
         });
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title(SharedString::from("Custom snooze")).width(px(384.)).child(form.clone())
+            dialog
+                .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+                .title(SharedString::from("Custom snooze"))
+                .width(px(384.))
+                .child(form.clone())
         });
     }
 }

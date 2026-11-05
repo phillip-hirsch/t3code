@@ -114,7 +114,7 @@ impl Workspace {
                 if !chat || palette_open || context.model_picker_open || !self.sidebar.has_undo() {
                     return false;
                 }
-                self.undo_thread_action(cx);
+                self.undo_thread_action(window, cx);
             }
             "thread.previous" | "thread.next" => {
                 return !held
