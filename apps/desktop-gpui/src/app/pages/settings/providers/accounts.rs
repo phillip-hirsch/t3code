@@ -475,11 +475,12 @@ impl Workspace {
         });
     }
 
-    /// Shows the ChatGPT plan notice once per connected sharing profile.
+    /// Shows the ChatGPT plan notice once per connected sharing profile of this machine's own
+    /// environment, whose config calls it.
     pub(in crate::app) fn check_chatgpt_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let environment = self.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
+        let environment = self.primary_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         let next =
-            self.settings_info().providers.iter().filter(|p| uses_chatgpt_sharing(&p.auth)).find_map(|provider| {
+            self.primary_info().providers.iter().filter(|p| uses_chatgpt_sharing(&p.auth)).find_map(|provider| {
                 let profile =
                     provider.auth.profile_id.as_deref().or(provider.auth.email.as_deref()).unwrap_or("default");
                 let key = json!(["local", provider.instance_id, profile]).to_string();

@@ -917,11 +917,13 @@ impl KeybindingsPanel {
     }
 
     fn open_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else { return };
+        let (Some(workspace), Some(environment)) = (self.workspace.upgrade(), self.environment.as_ref()) else {
+            return;
+        };
         let workspace = workspace.read(cx);
-        let info = &workspace.settings_info();
+        let Some(info) = workspace.env_info(environment) else { return };
         let (client, path, editors) =
-            (workspace.settings_client(), info.keybindings_config_path.clone(), info.available_editors.clone());
+            (workspace.env_client(environment), info.keybindings_config_path.clone(), info.available_editors.clone());
         open_keybindings_file(client, path, &editors, window, cx);
     }
 }
@@ -1013,7 +1015,9 @@ impl Render for KeybindingsPanel {
 impl KeybindingsPanel {
     fn render_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let can_open = self.connected
-            && self.workspace.upgrade().is_some_and(|w| w.read(cx).settings_info().keybindings_config_path.is_some());
+            && self.workspace.upgrade().zip(self.environment.as_ref()).is_some_and(|(w, environment)| {
+                w.read(cx).env_info(environment).is_some_and(|info| info.keybindings_config_path.is_some())
+            });
         h_flex()
             .flex_wrap()
             .gap(px(8.))

@@ -373,9 +373,18 @@ impl Workspace {
         if self.settings_client().is_none() {
             return;
         }
-        let view = cx.entity();
+        let (view, scope) = (cx.entity(), self.settings_environment());
         window.open_dialog(cx, move |dialog: Dialog, window, cx| {
             let t = *theme::tokens(cx);
+            // Settings fell back to another environment (this one disconnected): edit nothing there.
+            if view.read(cx).settings_environment() != scope {
+                return dialog.w(px(576.)).title("Background Activity").child(
+                    div()
+                        .text_sm()
+                        .text_color(t.muted_foreground)
+                        .child("This environment disconnected. Reconnect it to change its background activity."),
+                );
+            }
             let settings = view.read(cx).settings_json().clone();
             let resolved = background::resolve_server(&settings);
             // (min, step) per `background::DURATION_KEYS`, as the web's `IntervalSecondsField`s.

@@ -169,10 +169,11 @@ impl Workspace {
     }
 
     fn confirm_remove_hub(&mut self, id: String, label: String, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = cx.weak_entity();
+        // The hub's key lives on this environment's server, even if Settings moves on meanwhile.
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
         window.open_alert_dialog(cx, move |alert, _, _| {
             let alert = alert.entrance(DialogEntrance::None);
-            let workspace = workspace.clone();
+            let (workspace, scope) = (workspace.clone(), scope.clone());
             let id = id.clone();
             alert
                 .title(format!("Remove {label}?"))
@@ -182,17 +183,18 @@ impl Workspace {
                 .show_cancel(true)
                 .ok_text("Remove hub")
                 .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
+                .on_ok(move |_, _, cx| {
                     let patch = json!({ "usageLimitSources": { id.clone(): null } });
-                    let _ = workspace.update(cx, |this, cx| this.update_settings(patch, window, cx));
+                    let scope = scope.clone();
+                    let _ = workspace.update(cx, |this, cx| this.update_settings_on(scope, patch, cx, |_, _, _| {}));
                     true
                 })
         });
     }
 
     fn open_add_hub_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = cx.weak_entity();
-        let dialog = cx.new(|cx| AddHub::new(workspace, window, cx));
+        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
+        let dialog = cx.new(|cx| AddHub::new(workspace, scope, window, cx));
         window.open_dialog(cx, move |modal, _, cx| {
             dialog.update(cx, |this, cx| this.render_dialog(modal.entrance(DialogEntrance::None), cx))
         });
@@ -201,6 +203,8 @@ impl Workspace {
 
 struct AddHub {
     workspace: WeakEntity<Workspace>,
+    /// The environment whose server keeps the hub's key.
+    scope: Option<SharedString>,
     url: Entity<InputState>,
     key: Entity<InputState>,
     label: Entity<InputState>,
@@ -208,7 +212,12 @@ struct AddHub {
 }
 
 impl AddHub {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        scope: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let url = cx.new(|cx| InputState::new(window, cx).placeholder("https://hub.example.ts.net:8318"));
         let key = cx.new(|cx| InputState::new(window, cx).masked(true));
         let label = cx.new(|cx| InputState::new(window, cx).placeholder("Defaults to the hub's host name"));
@@ -223,7 +232,11 @@ impl AddHub {
             })
             .collect();
         url.update(cx, |url, cx| url.focus(window, cx));
-        Self { workspace, url, key, label, _subscriptions: subscriptions }
+        Self { workspace, scope, url, key, label, _subscriptions: subscriptions }
+    }
+
+    fn info<'a>(&self, cx: &'a App) -> Option<&'a crate::model::ServerInfo> {
+        self.workspace.upgrade()?.read(cx).env_info(self.scope.as_ref()?)
     }
 
     fn values(&self, cx: &App) -> (String, String, String) {
@@ -236,18 +249,17 @@ impl AddHub {
         if url.is_empty() || key.is_empty() {
             return;
         }
-        let sources = self
-            .workspace
-            .upgrade()
-            .and_then(|w| w.read(cx).settings_info().settings["usageLimitSources"].as_object().cloned())
-            .unwrap_or_default();
+        // A disconnected environment keeps the dialog open rather than saving elsewhere.
+        let Some(info) = self.info(cx) else { return };
+        let sources = info.settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
         let id = source_id_from_url(&url, &sources);
         let mut source = json!({ "kind": "cliproxy", "url": url, "managementKey": key, "enabled": true });
         if !label.is_empty() {
             source["label"] = label.into();
         }
         let patch = json!({ "usageLimitSources": { id: source } });
-        let _ = self.workspace.update(cx, |this, cx| this.update_settings(patch, window, cx));
+        let scope = self.scope.clone();
+        let _ = self.workspace.update(cx, |this, cx| this.update_settings_on(scope, patch, cx, |_, _, _| {}));
         window.close_dialog(cx);
     }
 
@@ -257,11 +269,8 @@ impl AddHub {
         cx: &mut Context<Self>,
     ) -> gpui_kit::component::dialog::Dialog {
         let t = *theme::tokens(cx);
-        let environment = self
-            .workspace
-            .upgrade()
-            .and_then(|w| w.read(cx).settings_info().environment_label.clone())
-            .unwrap_or_else(|| "this environment".into());
+        let environment =
+            self.info(cx).and_then(|info| info.environment_label.clone()).unwrap_or_else(|| "this environment".into());
         let (url, key, _) = self.values(cx);
         let field = |label: &'static str, input: &Entity<InputState>| {
             v_flex()

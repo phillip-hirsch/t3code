@@ -607,7 +607,19 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
     ) {
-        let target = self.settings_environment().and_then(|id| Some((self.env_client(&id)?, id)));
+        let environment = self.settings_environment();
+        self.update_settings_on(environment, patch, cx, done);
+    }
+
+    /// [`Self::update_environment_settings`] on `environment`, the one a dialog opened on.
+    pub(in crate::app) fn update_settings_on(
+        &mut self,
+        environment: Option<SharedString>,
+        patch: Value,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+    ) {
+        let target = environment.and_then(|id| Some((self.env_client(&id)?, id)));
         let Some((client, environment)) = target else { return done(self, false, cx) };
         cx.spawn(async move |this, cx| {
             let result = client.request("server.updateSettings", serde_json::json!({ "patch": patch })).await;
