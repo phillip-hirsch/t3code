@@ -14,6 +14,8 @@ anyhow = "1"
 async-channel = "2"
 # Decodes the user PATH the `t3` command installer reads through PowerShell.
 base64 = "0.22"
+# Attachment bytes: clones share one buffer, and reqwest uploads it without a copy.
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 env_logger = "0.11"
 # Inflates Open VSX theme packages and gzip archives in file previews; GPUI already builds this crate.
