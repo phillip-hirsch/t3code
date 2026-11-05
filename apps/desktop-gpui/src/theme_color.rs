@@ -578,9 +578,57 @@ pub fn update_family(dark_appearance: bool, colors: &Roles, role: &str, value: &
     next
 }
 
+/// `hexToHsv` (`lib/color.ts`): hue in degrees, saturation and value in 0..=1.
+pub fn hex_to_hsv(hex: &str) -> [f32; 3] {
+    let value = u32::from_str_radix(hex.trim_start_matches('#').get(..6).unwrap_or("000000"), 16).unwrap_or(0);
+    let [r, g, b] = [16, 8, 0].map(|shift| ((value >> shift) & 255) as f32 / 255.);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let delta = max - min;
+    let mut hue = 0.;
+    if delta != 0. {
+        hue = if max == r {
+            ((g - b) / delta) % 6.
+        } else if max == g {
+            (b - r) / delta + 2.
+        } else {
+            (r - g) / delta + 4.
+        } * 60.;
+        if hue < 0. {
+            hue += 360.;
+        }
+    }
+    [hue, if max == 0. { 0. } else { delta / max }, max]
+}
+
+/// `hsvToHex`.
+pub fn hsv_to_hex([hue, saturation, value]: [f32; 3]) -> String {
+    let h = hue.rem_euclid(360.);
+    let chroma = value * saturation;
+    let x = chroma * (1. - ((h / 60.) % 2. - 1.).abs());
+    let m = value - chroma;
+    let (r, g, b) = match h {
+        h if h < 60. => (chroma, x, 0.),
+        h if h < 120. => (x, chroma, 0.),
+        h if h < 180. => (0., chroma, x),
+        h if h < 240. => (0., x, chroma),
+        h if h < 300. => (x, 0., chroma),
+        _ => (chroma, 0., x),
+    };
+    let channel = |c: f32| ((c + m) * 255.).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hsv_round_trips_hex() {
+        for hex in ["#1b4ed8", "#ff0000", "#00ff80", "#808080", "#000000"] {
+            assert_eq!(hsv_to_hex(hex_to_hsv(hex)), hex);
+        }
+        assert_eq!(hex_to_hsv("#ff0000"), [0., 1., 1.]);
+    }
 
     #[test]
     fn colors_canonicalize_to_oklch_like_culori() {

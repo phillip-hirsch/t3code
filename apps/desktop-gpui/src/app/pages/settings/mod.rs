@@ -21,9 +21,10 @@ mod search;
 mod snap_shot;
 mod star_prompt;
 mod system;
-mod theme_library;
+pub(in crate::app) mod theme_import;
+pub(in crate::app) mod theme_library;
 mod typography;
-mod widgets;
+pub(in crate::app) mod widgets;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -163,6 +164,7 @@ pub(in crate::app) struct SettingsUi {
     star_prompt_shown: bool,
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
+    theme_library: theme_library::LibraryUi,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
     focus: FocusHandle,
     focus_on_render: bool,
@@ -198,6 +200,7 @@ impl SettingsUi {
             star_prompt_shown: false,
             project_picker: None,
             last_grouping_mode: "repository",
+            theme_library: Default::default(),
             focus: cx.focus_handle(),
             focus_on_render: false,
             _search_subscription: subscription,

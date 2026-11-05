@@ -214,10 +214,6 @@ impl ThemeDefinition {
         if dark == self.dark { Some(&self.colors) } else { self.variant.as_ref() }
     }
 
-    pub fn roles_for(&self, dark: bool) -> Option<&Roles> {
-        if dark == self.dark { Some(&self.roles) } else { self.variant_roles.as_ref() }
-    }
-
     /// `singleAppearanceOf`: the one appearance a palette has, if it lacks the other.
     pub fn single_appearance(&self) -> Option<bool> {
         self.variant.is_none().then_some(self.dark)

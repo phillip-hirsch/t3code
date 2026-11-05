@@ -1,21 +1,113 @@
 //! The Appearance page's color scheme tiles and theme cards (`ThemeLibrary` in `ThemeSettings.tsx`).
 
+use std::collections::{HashMap, HashSet};
+
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogEntrance;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, hsla, linear_color_stop, linear_gradient, px, relative,
+    AnyElement, App, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, hsla, linear_color_stop, linear_gradient,
+    px, relative,
 };
 
 use super::widgets::subheading;
 use crate::app::Workspace;
+use crate::app::theme_editor::Session;
 use crate::settings::{ThemePreference, contract};
 use crate::theme::{self, Tokens};
-use crate::themes::{self, CardId, Preview};
+use crate::themes::{self, CardId, Preview, ThemeChoice, ThemeDefinition};
 
 fn title(id: &str, fallback: &'static str) -> String {
     contract().search_item(id).map_or(fallback, |item| item.title.as_str()).to_owned()
+}
+
+/// Card state the web keeps in component state: each collection's shown variant, the open
+/// variant fan, and the removal being confirmed.
+#[derive(Default)]
+pub(in crate::app) struct LibraryUi {
+    variant: HashMap<String, usize>,
+    fan: Option<(String, bool)>,
+    removal: Option<Removal>,
+}
+
+struct Removal {
+    theme: ThemeDefinition,
+    collection: Vec<ThemeDefinition>,
+    selected: HashSet<String>,
+}
+
+/// What a card's click does (`onUse`).
+#[derive(Clone)]
+enum Use {
+    Standard,
+    Theme(String),
+    /// `selectCollectionDefaults`: the first light and dark variants.
+    Collection(String, Vec<ThemeDefinition>),
+}
+
+/// One `ThemeLibraryCard`.
+struct Card {
+    key: String,
+    label: String,
+    card: CardId,
+    on_use: Use,
+    previews: Vec<(bool, Preview)>,
+    duplicate: Session,
+    /// A saved theme and the collection it belongs to: Edit, Export and Remove.
+    custom: Option<(ThemeDefinition, Vec<ThemeDefinition>)>,
+}
+
+fn previews_of(theme: &ThemeDefinition) -> Vec<(bool, Preview)> {
+    theme.modes().into_iter().map(|dark| (dark, Preview::of(theme.colors_for(dark).unwrap_or(&theme.colors)))).collect()
+}
+
+fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
+    let text = text.into();
+    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+}
+
+/// `collectionVariantLabels`: each variant's label without the words all of them share.
+fn variant_labels(themes: &[ThemeDefinition]) -> Vec<String> {
+    let words: Vec<Vec<&str>> = themes.iter().map(|theme| theme.label.split_whitespace().collect()).collect();
+    let Some(first) = words.first() else { return Vec::new() };
+    let shared = first
+        .iter()
+        .enumerate()
+        .position(|(i, word)| words.iter().any(|w| w.get(i).is_none_or(|w| !w.eq_ignore_ascii_case(word))));
+    let prefix = shared.unwrap_or(first.len().saturating_sub(1));
+    themes
+        .iter()
+        .zip(&words)
+        .map(|(theme, words)| {
+            let short = words.get(prefix..).unwrap_or_default().join(" ");
+            if short.trim().is_empty() { theme.label.clone() } else { short }
+        })
+        .collect()
+}
+
+/// Saved themes grouped by collection, in library order (`customThemeCollections`).
+fn collections(themes: &[ThemeDefinition]) -> Vec<(String, Vec<ThemeDefinition>)> {
+    let mut groups: Vec<(String, Vec<ThemeDefinition>)> = Vec::new();
+    for theme in themes {
+        let key = match &theme.collection {
+            Some(collection) => format!("collection:{}", collection.id),
+            None => format!("theme:{}", theme.id),
+        };
+        match groups.iter_mut().find(|(id, _)| *id == key) {
+            Some((_, group)) => group.push(theme.clone()),
+            None => groups.push((key, vec![theme.clone()])),
+        }
+    }
+    groups
+}
+
+pub(in crate::app) fn toast(window: &mut Window, cx: &mut App, title: String, description: String) {
+    window.push_notification(Notification::success(description).title(title), cx);
 }
 
 impl Workspace {
@@ -26,25 +118,97 @@ impl Workspace {
         let choice = self.client_settings.theme_choice();
         let owners = [choice.owner(false), choice.owner(true)];
         let tiles = self.render_mode_tiles(&owners, &t, cx);
-        let cards: Vec<AnyElement> = std::iter::once((None, "T3 Code"))
-            .chain(themes::built_in().iter().map(|theme| (Some(theme.id.clone()), theme.label.as_str())))
-            .map(|(card, label)| self.render_theme_card(card, label, &owners, &t, cx))
-            .collect();
+        let initial_dark = t.dark;
+        let seed = |id: Option<&str>, label: &str| Session::duplicate(id, label, initial_dark);
+        let mut cards = vec![Card {
+            key: "default".into(),
+            label: "T3 Code".into(),
+            card: None,
+            on_use: Use::Standard,
+            previews: vec![(false, Preview::standard(false)), (true, Preview::standard(true))],
+            duplicate: seed(None, "T3 Code"),
+            custom: None,
+        }];
+        cards.extend(themes::built_in().iter().map(|theme| Card {
+            key: theme.id.clone(),
+            label: theme.label.clone(),
+            card: Some(theme.id.clone()),
+            on_use: Use::Theme(theme.id.clone()),
+            previews: previews_of(theme),
+            duplicate: seed(Some(&theme.id), &theme.label),
+            custom: None,
+        }));
+        let mut rendered: Vec<AnyElement> =
+            cards.into_iter().map(|card| self.render_theme_card(card, &owners, None, &t, cx)).collect();
+        for (key, group) in collections(self.client_settings.themes.custom()) {
+            let index = self.settings_ui.theme_library.variant.get(&key).copied().unwrap_or_else(|| {
+                group.iter().position(|theme| owners.iter().any(|o| o.as_deref() == Some(&theme.id))).unwrap_or(0)
+            });
+            let theme = group[index.min(group.len() - 1)].clone();
+            let on_use = if group.len() == 1 {
+                Use::Theme(theme.id.clone())
+            } else {
+                Use::Collection(key.clone(), group.clone())
+            };
+            let card = Card {
+                key: key.clone(),
+                label: theme.label.clone(),
+                card: Some(theme.id.clone()),
+                on_use,
+                previews: previews_of(&theme),
+                duplicate: seed(Some(&theme.id), &theme.label),
+                custom: Some((theme, group.clone())),
+            };
+            let fan = (group.len() > 1).then_some(group.as_slice());
+            rendered.push(self.render_theme_card(card, &owners, fan, &t, cx));
+        }
+        let create_seed = owners[initial_dark as usize].clone();
+        let header = h_flex()
+            .min_h(px(32.))
+            .pt(px(20.))
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .child(subheading(title("theme", "Theme")))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(
+                        Button::new("theme-create")
+                            .outline()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Paintbrush))
+                            .label("Create theme")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let session = Session { seed: create_seed.clone(), ..Session::new(initial_dark) };
+                                this.open_theme_editor(session, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("theme-add")
+                            .outline()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Plus))
+                            .label("Add theme")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_theme_import(window, cx))),
+                    ),
+            );
         v_flex()
             .id("theme")
             .gap(px(12.))
             .child(subheading(title("color-scheme", "Color scheme")))
             .child(tiles)
-            .child(div().pt(px(20.)).child(subheading(title("theme", "Theme"))))
-            .child(div().grid().grid_cols(3).gap(px(8.)).children(cards))
+            .child(header)
+            .child(div().grid().grid_cols(3).gap(px(8.)).children(rendered))
             .into_any_element()
     }
 
     /// System, Light and Dark tiles, each a wireframe in the theme that owns its appearance.
     fn render_mode_tiles(&self, owners: &[CardId; 2], t: &Tokens, cx: &mut Context<Self>) -> Div {
         let current = self.client_settings.theme;
-        let [light, dark] = [false, true]
-            .map(|dark| Preview::of_card(owners[dark as usize].as_deref(), dark, &self.client_settings.themes));
+        let library = &self.client_settings.themes;
+        let [light, dark] = [false, true].map(|dark| Preview::of_card(owners[dark as usize].as_deref(), dark, library));
         let tile = |mode: ThemePreference, label: &'static str| {
             let active = current == mode;
             let wireframe = match mode {
@@ -70,7 +234,7 @@ impl Workspace {
                     }
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    let choice = themes::ThemeChoice { mode, ..this.client_settings.theme_choice() };
+                    let choice = ThemeChoice { mode, ..this.client_settings.theme_choice() };
                     this.set_theme_choice(choice, window, cx);
                 }))
                 .child(wireframe)
@@ -90,54 +254,122 @@ impl Workspace {
             .child(tile(ThemePreference::Dark, "Dark"))
     }
 
-    /// `ThemeLibraryCard`: the card uses the theme; a circle gives it one appearance.
+    fn use_card_action(&mut self, on_use: &Use, window: &mut Window, cx: &mut Context<Self>) {
+        let mut choice = self.client_settings.theme_choice();
+        match on_use {
+            Use::Standard => choice.use_theme(None),
+            Use::Theme(id) => choice.use_card(Some(id.clone())),
+            Use::Collection(key, themes) => {
+                for dark in [false, true] {
+                    if let Some(theme) = themes.iter().find(|theme| theme.colors_for(dark).is_some()) {
+                        choice.assign_half(dark, Some(theme.id.clone()));
+                    }
+                }
+                self.settings_ui.theme_library.variant.insert(key.clone(), 0);
+            }
+        }
+        self.set_theme_choice(choice, window, cx);
+    }
+
+    fn pick_half(&mut self, dark: bool, card: CardId, window: &mut Window, cx: &mut Context<Self>) {
+        let mut choice = self.client_settings.theme_choice();
+        choice.assign_half(dark, card);
+        self.set_theme_choice(choice, window, cx);
+    }
+
+    /// `ThemeLibraryCard`: the card uses the theme; a circle gives it one appearance. Saved
+    /// themes also edit, export and remove; a collection's circles fan out its variants.
     fn render_theme_card(
         &self,
-        card: CardId,
-        label: &str,
+        card: Card,
         owners: &[CardId; 2],
+        fan: Option<&[ThemeDefinition]>,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let key = card.clone().unwrap_or_else(|| "default".into());
-        let circles = [false, true].map(|dark| {
-            let picked = owners[dark as usize] == card;
-            let colors = Preview::of_card(card.as_deref(), dark, &self.client_settings.themes);
-            let card = card.clone();
-            div()
-                .id(SharedString::from(format!("theme-{key}-{}", if dark { "dark" } else { "light" })))
-                .relative()
-                .size(px(68.))
-                .p(px(6.))
-                .rounded_full()
-                .cursor_pointer()
+        let key = card.key.clone();
+        let circles = match fan {
+            Some(themes) => self.render_variant_fan(&key, themes, owners, t, cx),
+            None => h_flex()
+                .min_h(px(64.))
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .pt(px(12.))
+                .children(card.previews.iter().map(|(dark, colors)| {
+                    let dark = *dark;
+                    let target = card.card.clone();
+                    let mode = if dark { "dark" } else { "light" };
+                    let picked = owners[dark as usize] == card.card;
+                    circle_button(SharedString::from(format!("theme-{key}-{mode}")), colors, dark, picked, t)
+                        .tooltip(tip(format!("Use {} for {mode} mode", card.label)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.pick_half(dark, target.clone(), window, cx);
+                        }))
+                        .into_any_element()
+                }))
+                .into_any_element(),
+        };
+        let card_tip: SharedString = if fan.is_some() {
+            "Use the first variants for light and dark".into()
+        } else if card.previews.len() > 1 {
+            "Use for both light and dark".into()
+        } else {
+            let mode = if card.previews.first().is_some_and(|p| p.0) { "dark" } else { "light" };
+            format!("Use for {mode} mode only").into()
+        };
+        let label = match (&card.custom, fan) {
+            (Some((theme, _)), Some(_)) => theme.collection.as_ref().map_or(card.label.clone(), |c| c.label.clone()),
+            _ => card.label.clone(),
+        };
+        let icon_button = |id: &str, icon: IconName, text: &'static str| {
+            Button::new(SharedString::from(format!("theme-{id}-{key}")))
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon))
+                .tooltip(text)
+        };
+        let duplicate = card.duplicate.clone();
+        let mut actions = vec![
+            icon_button("duplicate", IconName::Copy, "Duplicate theme")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    let mut choice = this.client_settings.theme_choice();
-                    choice.assign_half(dark, card.clone());
-                    this.set_theme_choice(choice, window, cx);
+                    this.open_theme_editor(duplicate.clone(), window, cx);
                 }))
-                .child(preview_circle(&colors, dark, t))
-                .when(picked, |el| {
-                    el.child(div().absolute().inset_0().rounded_full().border_2().border_color(t.ring)).child(
-                        div()
-                            .absolute()
-                            .bottom(px(2.))
-                            .right(px(2.))
-                            .size(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(t.border.opacity(0.7))
-                            .bg(t.background)
-                            .text_color(t.foreground)
-                            .shadow_sm()
-                            .child(Icon::new(if dark { IconName::Moon } else { IconName::Sun }).size(px(12.))),
-                    )
-                })
-        });
+                .into_any_element(),
+        ];
+        if let Some((theme, group)) = card.custom.clone() {
+            let edit = Session { editing: Some(theme.id.clone()), ..Session::new(t.dark) };
+            let export = theme.clone();
+            actions.push(
+                icon_button("edit", IconName::PenLine, "Edit theme")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_theme_editor(edit.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+            actions.push(
+                icon_button("export", IconName::Upload, "Export theme file")
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        export_theme(&export, window, cx);
+                    })
+                    .into_any_element(),
+            );
+            actions.push(
+                icon_button("remove", IconName::Trash, if fan.is_some() { "Remove themes" } else { "Remove theme" })
+                    .text_color(t.error_foreground)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.confirm_remove_theme(theme.clone(), group.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let on_use = card.on_use.clone();
         v_flex()
             .id(SharedString::from(format!("theme-card-{key}")))
             .overflow_hidden()
@@ -147,34 +379,374 @@ impl Workspace {
             .bg(t.card.opacity(0.6))
             .cursor_pointer()
             .hover(|s| s.bg(t.accent.opacity(0.1)))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                let mut choice = this.client_settings.theme_choice();
-                choice.use_card(card.clone());
-                this.set_theme_choice(choice, window, cx);
-            }))
+            .tooltip(tip(card_tip))
+            .on_click(cx.listener(move |this, _, window, cx| this.use_card_action(&on_use, window, cx)))
+            .child(circles)
             .child(
                 h_flex()
-                    .min_h(px(64.))
-                    .items_center()
-                    .justify_center()
-                    .gap(px(10.))
-                    .px(px(12.))
-                    .pt(px(12.))
-                    .children(circles),
-            )
-            .child(
-                div()
+                    .gap(px(8.))
                     .px(px(12.))
                     .pb(px(12.))
                     .pt(px(8.))
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.foreground)
-                    .child(label.to_owned()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.foreground)
+                            .child(label),
+                    )
+                    .child(h_flex().flex_none().gap(px(4.)).children(actions)),
             )
             .into_any_element()
     }
+
+    /// A collection card's variant picker: a root circle per appearance at the picked variant
+    /// that fans out the others on hover (all at once; no motion).
+    fn render_variant_fan(
+        &self,
+        key: &str,
+        themes: &[ThemeDefinition],
+        owners: &[CardId; 2],
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let labels = variant_labels(themes);
+        let open = self.settings_ui.theme_library.fan.as_ref().filter(|(k, _)| k == key).map(|(_, dark)| *dark);
+        let mut layer = div().id(SharedString::from(format!("theme-fan-{key}"))).relative().h(px(80.)).on_hover(
+            cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.settings_ui.theme_library.fan.take().is_some() {
+                    cx.notify();
+                }
+            }),
+        );
+        for dark in [false, true] {
+            let options: Vec<(usize, &ThemeDefinition)> =
+                themes.iter().enumerate().filter(|(_, theme)| theme.colors_for(dark).is_some()).collect();
+            let active = |theme: &ThemeDefinition| owners[dark as usize].as_deref() == Some(theme.id.as_str());
+            let Some(&(selected_index, selected)) = options.iter().find(|(_, theme)| active(theme)).or(options.first())
+            else {
+                continue;
+            };
+            let offset = if dark { 52. } else { -52. };
+            let mode = if dark { "Dark" } else { "Light" };
+            let colors = Preview::of(selected.colors_for(dark).unwrap_or(&selected.colors));
+            let selected_label = labels[selected_index].clone();
+            let (fan_key, hover_key, root_id) = (key.to_owned(), key.to_owned(), selected.id.clone());
+            layer = layer.child(
+                div().absolute().top(px(8.)).left(relative(0.5)).ml(px(offset - 28.)).child(
+                    circle_button(
+                        SharedString::from(format!("theme-fan-{key}-{mode}")),
+                        &colors,
+                        dark,
+                        active(selected),
+                        t,
+                    )
+                    .size(px(56.))
+                    .p_0()
+                    .tooltip(tip(format!("{mode}: {selected_label}")))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.settings_ui.theme_library.fan != Some((hover_key.clone(), dark)) {
+                            this.settings_ui.theme_library.fan = Some((hover_key.clone(), dark));
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.settings_ui.theme_library.variant.insert(fan_key.clone(), selected_index);
+                        this.pick_half(dark, Some(root_id.clone()), window, cx);
+                    })),
+                ),
+            );
+            layer = layer.child(
+                h_flex()
+                    .absolute()
+                    .bottom_0()
+                    .left(relative(0.5))
+                    .ml(px(offset - 48.))
+                    .w(px(96.))
+                    .justify_center()
+                    .gap(px(4.))
+                    .text_size(gpui_kit::rems(0.6875))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.foreground)
+                    .child(div().min_w_0().truncate().child(selected_label))
+                    .when(options.len() > 1, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .rounded_full()
+                                .bg(t.muted)
+                                .px(px(4.))
+                                .text_size(gpui_kit::rems(0.625))
+                                .text_color(t.muted_foreground)
+                                .child(format!("+{}", options.len() - 1)),
+                        )
+                    }),
+            );
+            if open != Some(dark) || options.len() < 2 {
+                continue;
+            }
+            for (position, (theme_index, theme)) in options.iter().enumerate() {
+                let progress = position as f32 / (options.len() - 1) as f32 - 0.5;
+                let (x, y) = (offset + progress * 68., progress.abs() * 10.);
+                let colors = Preview::of(theme.colors_for(dark).unwrap_or(&theme.colors));
+                let (fan_key, id, index) = (key.to_owned(), theme.id.clone(), *theme_index);
+                layer = layer.child(
+                    div()
+                        .id(SharedString::from(format!("theme-fan-{key}-{mode}-{}", theme.id)))
+                        .absolute()
+                        .top(px(4. + y))
+                        .left(relative(0.5))
+                        .ml(px(x - 14.))
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(t.background)
+                        .shadow_sm()
+                        .border_2()
+                        .border_color(if active(theme) { t.ring } else { t.border.opacity(0.7) })
+                        .child(preview_circle(&colors, dark, t).size(px(22.)).border_1())
+                        .tooltip(tip(format!("Use {} for {} mode", labels[index], mode.to_lowercase())))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.settings_ui.theme_library.variant.insert(fan_key.clone(), index);
+                            this.pick_half(dark, Some(id.clone()), window, cx);
+                        })),
+                );
+            }
+        }
+        layer.into_any_element()
+    }
+
+    /// The removal confirmation; a collection lists its variants to pick from.
+    fn confirm_remove_theme(
+        &mut self,
+        theme: ThemeDefinition,
+        collection: Vec<ThemeDefinition>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = if collection.len() > 1 { HashSet::new() } else { HashSet::from([theme.id.clone()]) };
+        self.settings_ui.theme_library.removal = Some(Removal { theme, collection, selected });
+        let workspace = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let t = *theme::tokens(cx);
+            let Some(removal) = &workspace.read(cx).settings_ui.theme_library.removal else { return dialog };
+            let many = removal.collection.len() > 1;
+            let label = removal.theme.collection.as_ref().map_or(&removal.theme.label, |c| &c.label);
+            let (title, description) = if many {
+                (
+                    format!("Remove themes from “{label}”?"),
+                    "Select the variants you want to remove. You can restore them by importing the extension again.",
+                )
+            } else {
+                (
+                    format!("Remove “{}”?", removal.theme.label),
+                    "You can bring it back anytime by importing its JSON file.",
+                )
+            };
+            let count = removal.selected.len();
+            let tiles: Vec<AnyElement> = if many {
+                removal.collection.iter().map(|variant| removal_tile(variant, removal, &workspace, &t)).collect()
+            } else {
+                Vec::new()
+            };
+            let confirm = workspace.clone();
+            let remove_label = match (many, count) {
+                (false, _) => "Remove theme".to_owned(),
+                (true, 0) => "Remove selected".to_owned(),
+                (true, count) => format!("Remove selected ({count})"),
+            };
+            dialog
+                .entrance(DialogEntrance::None)
+                .title(title)
+                .child(div().text_sm().text_color(t.muted_foreground).child(description))
+                .when(many, |dialog| {
+                    dialog.child(
+                        div()
+                            .id("remove-theme-variants")
+                            .mt(px(8.))
+                            .max_h(px(288.))
+                            .overflow_y_scroll()
+                            .grid()
+                            .grid_cols(2)
+                            .gap(px(8.))
+                            .children(tiles),
+                    )
+                })
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("remove-theme-cancel")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("remove-theme-confirm")
+                                .with_variant(ButtonVariant::Danger)
+                                .disabled(count == 0)
+                                .label(remove_label)
+                                .on_click(move |_, window, cx| {
+                                    confirm.update(cx, |this, cx| this.remove_selected_themes(window, cx));
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// `handleConfirmRemoveTheme`: a removed base falls back to the standard palette and a
+    /// removed half is cleared, then the themes go.
+    fn remove_selected_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(removal) = self.settings_ui.theme_library.removal.take() else { return };
+        let ids: Vec<String> = removal.selected.into_iter().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let library = self.client_settings.themes.remove(&ids);
+        let choice = ThemeChoice { library: library.clone(), ..self.client_settings.theme_choice().without(&ids) };
+        self.store_themes(library, choice, window, cx);
+    }
+}
+
+/// One variant in the collection removal grid, a checkbox in its corner.
+fn removal_tile(
+    variant: &ThemeDefinition,
+    removal: &Removal,
+    workspace: &gpui_kit::Entity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let checked = removal.selected.contains(&variant.id);
+    let (id, workspace) = (variant.id.clone(), workspace.clone());
+    v_flex()
+        .id(SharedString::from(format!("remove-theme-{}", variant.id)))
+        .relative()
+        .min_h(px(112.))
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .p(px(12.))
+        .rounded(px(8.))
+        .border_1()
+        .cursor_pointer()
+        .map(|el| {
+            if checked {
+                el.border_color(t.ring).bg(t.accent.opacity(0.2))
+            } else {
+                el.border_color(t.border.opacity(0.7)).bg(t.muted.opacity(0.25)).hover(|s| s.bg(t.muted.opacity(0.4)))
+            }
+        })
+        .child(
+            div()
+                .absolute()
+                .top(px(8.))
+                .right(px(8.))
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(if checked { t.primary } else { t.input })
+                .bg(if checked { t.primary } else { t.background })
+                .when(checked, |el| {
+                    el.child(Icon::new(IconName::Check).size(px(12.)).text_color(t.primary_foreground))
+                }),
+        )
+        .child(h_flex().min_h(px(48.)).gap(px(4.)).children(previews_of(variant).into_iter().map(|(dark, colors)| {
+            div()
+                .size(px(44.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(preview_circle(&colors, dark, t).size(px(42.)))
+        })))
+        .child(
+            div()
+                .max_w_full()
+                .truncate()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.foreground)
+                .child(variant.label.clone()),
+        )
+        .on_click(move |_, _, cx| {
+            workspace.update(cx, |this, cx| {
+                if let Some(removal) = &mut this.settings_ui.theme_library.removal {
+                    if !removal.selected.remove(&id) {
+                        removal.selected.insert(id.clone());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+/// `downloadThemeFile`: saves `<id>.json` where the person picks.
+fn export_theme(theme: &ThemeDefinition, window: &mut Window, cx: &mut App) {
+    let contents = match crate::theme_file::serialize_theme_file(theme) {
+        Ok(contents) => contents,
+        Err(error) => {
+            window.push_notification(Notification::error(error).title("Could not export theme"), cx);
+            return;
+        }
+    };
+    let downloads = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+        .unwrap_or_default();
+    let picked = cx.prompt_for_new_path(&downloads, Some(&format!("{}.json", theme.id)));
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            if let Err(error) = std::fs::write(&path, contents) {
+                let _ = cx.update(|window, cx| {
+                    window
+                        .push_notification(Notification::error(error.to_string()).title("Could not export theme"), cx);
+                });
+            }
+        })
+        .detach();
+}
+
+/// A theme circle with the picked ring and the sun or moon badge.
+fn circle_button(id: SharedString, colors: &Preview, dark: bool, picked: bool, t: &Tokens) -> gpui_kit::Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .size(px(68.))
+        .p(px(6.))
+        .rounded_full()
+        .cursor_pointer()
+        .child(preview_circle(colors, dark, t))
+        .when(picked, |el| {
+            el.child(div().absolute().inset_0().rounded_full().border_2().border_color(t.ring)).child(
+                div()
+                    .absolute()
+                    .bottom(px(2.))
+                    .right(px(2.))
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(t.border.opacity(0.7))
+                    .bg(t.background)
+                    .text_color(t.foreground)
+                    .shadow_sm()
+                    .child(Icon::new(if dark { IconName::Moon } else { IconName::Sun }).size(px(12.))),
+            )
+        })
 }
 
 /// `ThemePreviewCircle`: the canvas lifted toward white or black, with the accent and the

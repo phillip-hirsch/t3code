@@ -228,6 +228,7 @@ impl Workspace {
             "theme.select" => {
                 self.open_palette(palette::View::Themes, window, cx);
             }
+            "themeEditor.toggle" => self.toggle_theme_editor(window, cx),
             _ => return false,
         }
         true

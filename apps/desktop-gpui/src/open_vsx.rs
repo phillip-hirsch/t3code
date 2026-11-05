@@ -80,9 +80,9 @@ const USED_WORKBENCH_COLORS: &[&str] = &[
 /// `OpenVsxThemeSort`, with the web's sort labels.
 pub const SORTS: &[(&str, &str)] = &[
     ("downloadCount", "Most downloaded"),
-    ("rating", "Top rated"),
-    ("timestamp", "Recently updated"),
-    ("relevance", "Relevance"),
+    ("rating", "Best rated"),
+    ("timestamp", "Newest"),
+    ("relevance", "Most relevant"),
 ];
 
 #[derive(Clone, Debug, PartialEq)]

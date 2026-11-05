@@ -60,6 +60,7 @@ mod send;
 mod side_chat;
 mod sidebar;
 mod terminal;
+mod theme_editor;
 mod thread_menu;
 mod thread_menu_actions;
 mod titlebar;
@@ -221,6 +222,8 @@ pub struct Workspace {
     pending_reload: Option<keymap::Reload>,
     /// Settings → Keybindings, created the first time it opens.
     keybindings_panel: Option<gpui_kit::AnyView>,
+    /// The floating theme editor (`ThemeEditorHost`), over every surface.
+    theme_editor: Option<Entity<theme_editor::ThemeEditor>>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
     /// The thread find bar, while open.
@@ -373,6 +376,7 @@ impl Workspace {
             reload_toasts: Default::default(),
             pending_reload: None,
             keybindings_panel: None,
+            theme_editor: None,
             palette: None,
             find: None,
             files: files::FilesState::default(),
@@ -1074,6 +1078,7 @@ impl Render for Workspace {
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
+            .children(self.theme_editor.clone())
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
             .children(self.render_quit_hint(cx))
