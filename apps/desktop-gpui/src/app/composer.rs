@@ -758,12 +758,19 @@ impl Workspace {
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
-                let keys = if super::send::requires_modifier(shortcut, &self.composer.read(cx).value()) {
-                    "Ctrl+Shift+Enter"
-                } else {
-                    "Ctrl+Enter"
+                let context = super::keymap::ShortcutContext {
+                    composer_focus: true,
+                    turn_running: true,
+                    composer_requires_modifier: super::send::requires_modifier(
+                        shortcut,
+                        &self.composer.read(cx).value(),
+                    ),
+                    ..Default::default()
                 };
-                Some(format!("Click to {follow_up}, Ctrl-click or {keys} to {alternate}").into())
+                let keys = super::keymap::label_for(&self.keymap, "composer.sendAlternate", &context)
+                    .map(|keys| format!(" or {keys}"))
+                    .unwrap_or_default();
+                Some(format!("Click to {follow_up}, Ctrl-click{keys} to {alternate}").into())
             }
             _ => None,
         };

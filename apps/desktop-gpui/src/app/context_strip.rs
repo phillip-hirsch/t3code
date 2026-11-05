@@ -514,7 +514,10 @@ impl Workspace {
         strip_button("env-mode", t)
             .child(Icon::new(icon).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label))
-            .tooltip(format!("{label} · Ctrl+Shift+X"))
+            .tooltip(match self.shortcut_label("composer.workspace") {
+                Some(keys) => format!("{label} · {keys}"),
+                None => label.to_owned(),
+            })
             .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |menu, window, _| {
                 let mut menu = menu
                     .label("Workspace")
@@ -752,7 +755,12 @@ impl Workspace {
             .child(Icon::new(icon).with_size(px(if footer { 14. } else { 12. })))
             .child(div().max_w(px(240.)).truncate().child(label))
             .when(footer, |b| b.child(Icon::new(Lucide::ChevronUp).with_size(px(12.))))
-            .when(!footer, |b| b.tooltip("Permissions · Ctrl+Shift+A"));
+            .when(!footer, |b| {
+                b.tooltip(match self.shortcut_label("composer.mode") {
+                    Some(keys) => format!("Permissions · {keys}"),
+                    None => "Permissions".to_owned(),
+                })
+            });
         let view = cx.entity();
         let mut popover = Popover::new(SharedString::from(format!("{id}-popover")))
             .anchor(gpui_kit::Anchor::BottomRight)

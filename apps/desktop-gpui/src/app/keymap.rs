@@ -98,21 +98,55 @@ fn web_key(key: &str) -> &str {
     }
 }
 
+/// `US_SHIFTED_TO_UNSHIFTED_KEYS`: GPUI on Windows reports Shift+4 as `$` with Shift
+/// consumed, where the web still sees `Digit4` with Shift held.
+fn unshifted(key: &str) -> Option<&'static str> {
+    const PAIRS: [(&str, &str); 21] = [
+        ("!", "1"),
+        ("@", "2"),
+        ("#", "3"),
+        ("$", "4"),
+        ("%", "5"),
+        ("^", "6"),
+        ("&", "7"),
+        ("*", "8"),
+        ("(", "9"),
+        (")", "0"),
+        ("~", "`"),
+        ("_", "-"),
+        ("+", "="),
+        ("{", "["),
+        ("}", "]"),
+        ("|", "\\"),
+        (":", ";"),
+        ("\"", "'"),
+        ("<", ","),
+        (">", "."),
+        ("?", "/"),
+    ];
+    PAIRS.iter().find(|(shifted, _)| *shifted == key).map(|(_, plain)| *plain)
+}
+
 /// `matchesKeybindingShortcut`: GPUI's `key` is the unshifted key (the web's `code`),
 /// `key_char` the typed character (the web's `key`); either may match.
 pub(super) fn matches(keystroke: &Keystroke, shortcut: &Shortcut, mac: bool) -> bool {
     let m = &keystroke.modifiers;
     let meta = shortcut.meta_key || (shortcut.mod_key && mac);
     let ctrl = shortcut.ctrl_key || (shortcut.mod_key && !mac);
-    if m.platform != meta || m.control != ctrl || m.shift != shortcut.shift_key || m.alt != shortcut.alt_key {
+    if m.platform != meta || m.control != ctrl || m.alt != shortcut.alt_key {
         return false;
     }
     let key = keystroke.key.to_lowercase();
-    web_key(&key) == shortcut.key
-        || keystroke
-            .key_char
-            .as_deref()
-            .is_some_and(|typed| typed.chars().count() == 1 && typed.to_lowercase() == shortcut.key)
+    if m.shift == shortcut.shift_key
+        && (web_key(&key) == shortcut.key
+            || keystroke
+                .key_char
+                .as_deref()
+                .is_some_and(|typed| typed.chars().count() == 1 && typed.to_lowercase() == shortcut.key))
+    {
+        return true;
+    }
+    !m.shift && shortcut.shift_key && unshifted(&key) == Some(shortcut.key.as_str())
 }
 
 /// `resolveShortcutCommand`.
@@ -416,6 +450,9 @@ mod tests {
             modifiers: Modifiers { control: true, shift: true, ..Default::default() },
         };
         assert!(matches(&shifted_one, &compile("mod+shift+1", "usage.period.day", None).unwrap().shortcut, false));
+        let folded = Keystroke { key: "$".into(), key_char: None, modifiers: Modifiers::control() };
+        assert!(matches(&folded, &compile("mod+shift+4", "usage.period.quarter", None).unwrap().shortcut, false));
+        assert!(!matches(&folded, &compile("mod+4", "thread.jump.4", None).unwrap().shortcut, false));
         assert!(matches(&key("up"), &compile("arrowup", "x", None).unwrap().shortcut, false));
         assert!(matches(&key("cmd-k"), &compile("mod+k", "x", None).unwrap().shortcut, true));
         assert!(!matches(&key("ctrl-k"), &compile("mod+k", "x", None).unwrap().shortcut, true));

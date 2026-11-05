@@ -621,6 +621,13 @@ impl Workspace {
         let star_selection = row.selection.clone();
         let group: SharedString = format!("model-row-{}-{}", row.selection.instance_id, row.selection.model).into();
         let highlighted = index == self.picker.highlighted;
+        // `modelPicker.jump.N`'s live shortcut, read with the picker open.
+        let jump_label = (docked && index < 9)
+            .then(|| {
+                let context = super::keymap::ShortcutContext { model_picker_open: true, ..Default::default() };
+                super::keymap::label_for(&self.keymap, &format!("modelPicker.jump.{}", index + 1), &context)
+            })
+            .flatten();
         let star_visible = row.favorite && !favorites_tab;
         h_flex()
             .id(ElementId::Name(group.clone()))
@@ -709,7 +716,7 @@ impl Workspace {
                                 this.toggle_favorite(&star_selection, cx);
                             })),
                     )
-                    .when(docked && index < 9, |el| el.child(kbd(&format!("Ctrl+{}", index + 1), t))),
+                    .when_some(jump_label, |el, label| el.child(kbd(&label, t))),
             )
             .into_any_element()
     }
