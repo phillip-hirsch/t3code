@@ -60,7 +60,7 @@ pub(super) struct TreeState {
     expand_all: bool,
     query: Entity<InputState>,
     search: PathSearch,
-    rows: Rc<Vec<TreeRow>>,
+    rows: Rc<[TreeRow]>,
     rows_dirty: bool,
     /// Derived with the rows: the first folder error still in the tree, whether every folder
     /// "Expand all" would open is open, and whether any folder shows.
@@ -105,7 +105,7 @@ impl TreeState {
         self.all_open =
             self.expand_all || (!expandable.is_empty() && expandable.iter().all(|p| self.expanded.contains(p)));
         self.has_folders = folders.len() > 1;
-        self.rows = Rc::new(if self.search.query.is_empty() {
+        self.rows = Rc::from(if self.search.query.is_empty() {
             logic::tree_rows(&entries, &self.expanded, None)
         } else {
             let hits: &[Entry] = if self.search.pending { &[] } else { &self.search.hits };

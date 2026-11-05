@@ -96,7 +96,7 @@ pub(in crate::app) struct PullRequestsState {
     refreshing: bool,
     error: Option<SharedString>,
     stats: Stats,
-    rows: Rc<Vec<Row>>,
+    rows: Rc<[Row]>,
     list_state: ListState,
     _debounce: Option<Task<()>>,
     _search_subscription: Subscription,
@@ -508,7 +508,7 @@ impl Workspace {
             }
         }
         state.list_state.reset(rows.len());
-        state.rows = Rc::new(rows);
+        state.rows = Rc::from(rows);
     }
 
     pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

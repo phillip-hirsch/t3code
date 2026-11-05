@@ -179,7 +179,7 @@ struct GroupsKey {
 #[derive(Default)]
 struct GroupsCache {
     key: Option<GroupsKey>,
-    groups: Rc<Vec<ProjectGroup>>,
+    groups: Rc<[ProjectGroup]>,
 }
 
 /// The filter's groups that still exist and are open, in sidebar order; empty is all projects.
@@ -545,7 +545,7 @@ impl Workspace {
     /// The project groups in sidebar order (`useSidebarProjectGroups`): grouped by
     /// `sidebarProjectGroupingMode` and its overrides, ordered by `sidebarProjectSortOrder`.
     /// They rebuild only when the shell or those settings change.
-    pub(super) fn project_groups(&self) -> Rc<Vec<ProjectGroup>> {
+    pub(super) fn project_groups(&self) -> Rc<[ProjectGroup]> {
         let settings = &self.client_settings.values;
         let (order, grouping) = (SortOrder::from_settings(settings), GroupingSettings::from_settings(settings));
         let mut cache = self.sidebar.groups.borrow_mut();
@@ -560,7 +560,7 @@ impl Workspace {
             let mut groups =
                 project_groups::build_groups(&self.shell.projects, &key.grouping, &key.scratch_roots, true);
             project_groups::sort_groups(&mut groups, &self.shell.threads, key.order);
-            *cache = GroupsCache { key: Some(key), groups: Rc::new(groups) };
+            *cache = GroupsCache { key: Some(key), groups: Rc::from(groups) };
         }
         cache.groups.clone()
     }

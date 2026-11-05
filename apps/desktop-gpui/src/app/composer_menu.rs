@@ -33,7 +33,7 @@ pub(super) struct MenuState {
     trigger: Option<Trigger>,
     /// Escape hid the trigger starting here, until the caret leaves it.
     dismissed: Option<(TriggerKind, usize)>,
-    items: Rc<Vec<MenuItem>>,
+    items: Rc<[MenuItem]>,
     highlighted: usize,
     loading: bool,
     _search: Option<Task<()>>,
@@ -125,7 +125,7 @@ impl Workspace {
             _ => composer_search::slash_items(skills, commands, &trigger.query, at_start, plan_mode),
         };
         self.menu.highlighted = self.menu.highlighted.min(items.len().saturating_sub(1));
-        self.menu.items = Rc::new(items);
+        self.menu.items = Rc::from(items);
     }
 
     /// `server.refreshProviders` for one checkout, so `$` and `/` list its skills.
@@ -166,7 +166,7 @@ impl Workspace {
                     return;
                 }
                 this.menu.loading = false;
-                this.menu.items = Rc::new(match result {
+                this.menu.items = Rc::from(match result {
                     Ok(value) => composer_search::file_items(&value),
                     Err(error) => {
                         log::warn!("file search failed: {error}");

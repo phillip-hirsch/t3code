@@ -66,8 +66,8 @@ pub(in crate::app) struct Panel {
     detail: Option<Rc<Detail>>,
     activity: Option<Rc<Activity>>,
     /// Derived from `activity` once when it lands (`set_activity`), so render only borrows.
-    conversations: Rc<Vec<Conversation>>,
-    review_outcomes: Rc<Vec<(String, logic::ReviewOutcome)>>,
+    conversations: Rc<[Conversation]>,
+    review_outcomes: Rc<[(String, logic::ReviewOutcome)]>,
     newest_commit: Option<i64>,
     /// The detail and activity reads in flight; a newer read drops (cancels) the older one.
     _detail_read: Option<Task<()>>,
@@ -96,7 +96,7 @@ pub(in crate::app) struct Panel {
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
     summary_scroll: ScrollHandle,
     timeline: ListState,
-    timeline_rows: Rc<Vec<TimelineRow>>,
+    timeline_rows: Rc<[TimelineRow]>,
     guide: Option<Rc<Value>>,
     /// `guide["guide"]` decoded once when it lands (`set_guide`); `None` while there is none.
     guide_tour: Option<Result<Rc<logic::Guide>, SharedString>>,
@@ -190,8 +190,8 @@ impl Panel {
     }
 
     fn set_activity(&mut self, activity: Activity) {
-        self.conversations = Rc::new(logic::conversations(&activity.comments, &activity.review_threads));
-        self.review_outcomes = Rc::new(logic::latest_review_outcomes(&activity.comments, &activity.commits));
+        self.conversations = Rc::from(logic::conversations(&activity.comments, &activity.review_threads));
+        self.review_outcomes = Rc::from(logic::latest_review_outcomes(&activity.comments, &activity.commits));
         self.newest_commit = logic::newest_commit_ms(&activity.commits);
         self.activity = Some(Rc::new(activity));
     }
@@ -219,7 +219,7 @@ impl Panel {
         }
         let rows = logic::group_timeline(events);
         self.timeline.reset(rows.len());
-        self.timeline_rows = Rc::new(rows);
+        self.timeline_rows = Rc::from(rows);
     }
 
     fn provider(&self) -> &str {

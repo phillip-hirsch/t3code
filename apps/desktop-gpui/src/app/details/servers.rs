@@ -67,7 +67,7 @@ impl LocalServer {
 pub(in crate::app) struct ServersWatch {
     /// The environment the servers run on.
     environment: Option<SharedString>,
-    servers: Rc<Vec<LocalServer>>,
+    servers: Rc<[LocalServer]>,
     task: Option<Task<()>>,
     stopping: Option<(Option<u32>, u16)>,
     visible: Option<usize>,
@@ -113,7 +113,7 @@ impl Workspace {
                 };
                 let updated = this.update(cx, |this, cx| {
                     if *this.servers.servers != servers {
-                        this.servers.servers = Rc::new(servers);
+                        this.servers.servers = Rc::from(servers);
                         cx.notify();
                     }
                 });

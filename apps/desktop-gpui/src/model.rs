@@ -362,7 +362,7 @@ pub struct ServerInfo {
     /// `environment.capabilities` from the config snapshot.
     pub capabilities: Value,
     /// `config.keybindings`, the server's resolved rules (defaults not merged in).
-    pub keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    pub keybindings: Rc<[crate::keybindings::Rule]>,
     pub keybindings_config_path: Option<String>,
     /// `config.availableEditors`, editor ids that can open a path on the server's host.
     pub available_editors: Vec<String>,
@@ -393,7 +393,7 @@ impl ServerInfo {
                 self.new_projects_root = text("/newProjectsRoot");
                 self.platform_os = text("/environment/platform/os");
                 self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
-                self.keybindings = Rc::new(crate::keybindings::decode_rules(&config["keybindings"]));
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(&config["keybindings"]));
                 self.keybindings_config_path = text("/keybindingsConfigPath");
                 self.available_editors = config["availableEditors"]
                     .as_array()
@@ -404,7 +404,7 @@ impl ServerInfo {
             }
             "keybindingsUpdated" => {
                 let keybindings = &event["payload"]["keybindings"];
-                self.keybindings = Rc::new(crate::keybindings::decode_rules(keybindings));
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(keybindings));
                 if let Some(config) = self.config.as_object_mut() {
                     config.insert("keybindings".into(), keybindings.clone());
                 }

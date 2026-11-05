@@ -320,7 +320,7 @@ impl super::Workspace {
     pub(super) fn sync_keymap(&mut self, _cx: &mut Context<Self>) {
         if *self.installed_keybindings != *self.primary_info().keybindings {
             self.installed_keybindings = self.primary_info().keybindings.clone();
-            self.keymap = Rc::new(keybindings::merge_with_defaults(&self.installed_keybindings));
+            self.keymap = Rc::from(keybindings::merge_with_defaults(&self.installed_keybindings));
         }
     }
 

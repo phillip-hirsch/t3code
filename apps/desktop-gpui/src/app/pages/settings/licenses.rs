@@ -185,9 +185,9 @@ enum ServerNotices {
 }
 
 pub(super) struct LicensesState {
-    entries: Rc<Vec<Entry>>,
+    entries: Rc<[Entry]>,
     /// Indexes into `entries` matching the search.
-    visible: Rc<Vec<usize>>,
+    visible: Rc<[usize]>,
     server: ServerNotices,
     search: Entity<InputState>,
     search_open: bool,
@@ -210,9 +210,9 @@ impl LicensesState {
         });
         let entries: Vec<Entry> = merge(&[]);
         let mut state = Self {
-            visible: Rc::new((0..entries.len()).collect()),
+            visible: (0..entries.len()).collect(),
             list: ListState::new(entries.len(), ListAlignment::Top, px(600.)),
-            entries: Rc::new(entries),
+            entries: Rc::from(entries),
             server: ServerNotices::Loading,
             search,
             search_open: false,
@@ -232,7 +232,7 @@ impl LicensesState {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(server) => {
-                        this.entries = Rc::new(merge(&server));
+                        this.entries = Rc::from(merge(&server));
                         this.server = ServerNotices::Ready;
                     }
                     Err(error) => this.server = ServerNotices::Failed(error.into()),
@@ -244,7 +244,7 @@ impl LicensesState {
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.search.read(cx).value().to_string();
-        self.visible = Rc::new(filter_entries(&self.entries, &query));
+        self.visible = Rc::from(filter_entries(&self.entries, &query));
         self.list.reset(self.visible.len());
         cx.notify();
     }

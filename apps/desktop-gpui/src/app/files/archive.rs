@@ -6,6 +6,7 @@ use std::io::Read as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::{Icon, h_flex, v_flex};
@@ -105,7 +106,7 @@ fn epoch_date(seconds: i64) -> Option<String> {
 }
 
 /// `tarEntries`: ustar, GNU long names and pax `path`/`size`/`mtime` records.
-fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Arc<Vec<u8>>>) -> Result<Vec<ArchiveEntry>, String> {
+fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Bytes>) -> Result<Vec<ArchiveEntry>, String> {
     let damaged = || "An archive entry is too large or damaged.".to_owned();
     let text = |offset: usize, length: usize| -> String {
         let slice = &bytes[offset..(offset + length).min(bytes.len())];
@@ -191,7 +192,7 @@ fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Arc<Vec<u8>>>) -> Resul
                 };
                 let directory = kind == "5";
                 if !directory {
-                    files.insert(path.clone(), Arc::new(content.to_vec()));
+                    files.insert(path.clone(), Bytes::copy_from_slice(content));
                 }
                 entries.push(ArchiveEntry { path, size, modified: epoch_date(seconds), directory });
             }
@@ -227,7 +228,7 @@ fn pax_records(content: &[u8]) -> Option<Vec<(String, String)>> {
 /// The parsed archive: its entries and the bytes of its files.
 pub(super) struct Listing {
     pub entries: Vec<ArchiveEntry>,
-    pub files: HashMap<String, Arc<Vec<u8>>>,
+    pub files: HashMap<String, Bytes>,
 }
 
 pub(super) fn open_archive(name: &str, bytes: &[u8]) -> Result<Listing, String> {
@@ -241,7 +242,7 @@ pub(super) fn open_archive(name: &str, bytes: &[u8]) -> Result<Listing, String> 
                 .map(|part| {
                     let size = part.bytes.len() as u64;
                     if !part.directory {
-                        files.insert(part.name.clone(), Arc::new(part.bytes));
+                        files.insert(part.name.clone(), Bytes::from(part.bytes));
                     }
                     ArchiveEntry { path: part.name, size, modified: part.modified, directory: part.directory }
                 })
@@ -255,7 +256,7 @@ pub(super) fn open_archive(name: &str, bytes: &[u8]) -> Result<Listing, String> 
             } else {
                 let path = if inner.is_empty() { "contents".to_owned() } else { inner.to_owned() };
                 let size = expanded.len() as u64;
-                files.insert(path.clone(), Arc::new(expanded));
+                files.insert(path.clone(), Bytes::from(expanded));
                 vec![ArchiveEntry { path, size, modified: None, directory: false }]
             }
         } else {
@@ -313,18 +314,18 @@ pub(super) struct Archive {
     listing: Listing,
     size: u64,
     folder: String,
-    children: Rc<Vec<Child>>,
+    children: Rc<[Child]>,
     selected: Option<(String, Opened)>,
 }
 
 impl Archive {
     pub(super) fn new(listing: Listing, size: u64) -> Self {
-        let children = Rc::new(folder_children(&listing.entries, ""));
+        let children = Rc::from(folder_children(&listing.entries, ""));
         Self { listing, size, folder: String::new(), children, selected: None }
     }
 
     fn set_folder(&mut self, folder: String) {
-        self.children = Rc::new(folder_children(&self.listing.entries, &folder));
+        self.children = Rc::from(folder_children(&self.listing.entries, &folder));
         self.folder = folder;
     }
 }
@@ -603,7 +604,7 @@ mod tests {
         let paths: Vec<(&str, u64, bool)> =
             listing.entries.iter().map(|e| (e.path.as_str(), e.size, e.directory)).collect();
         assert_eq!(paths, [("src/", 0, true), ("src/a.rs", 9, false), ("README", 2, false)]);
-        assert_eq!(listing.files["README"].as_slice(), b"hi");
+        assert_eq!(listing.files["README"].as_ref(), b"hi");
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut gz, b"plain").unwrap();
         let single = open_archive("notes.txt.gz", &gz.finish().unwrap()).unwrap();

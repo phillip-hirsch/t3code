@@ -24,7 +24,7 @@ const PARENT_REFRESH: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub(super) struct WorkflowUi {
     parent: Option<(String, Instant)>,
-    subagents: Option<Rc<Vec<Value>>>,
+    subagents: Option<Rc<[Value]>>,
     _fetch: Option<Task<()>>,
 }
 
@@ -74,7 +74,7 @@ impl Workspace {
         }
         let (id, text) = (id.to_string(), text.to_string());
         self.load_workflow_parent(parent, cx);
-        let opening = workflow::opening(&thread_id, &id, &text, self.workflow.subagents.as_deref().map(Vec::as_slice));
+        let opening = workflow::opening(&thread_id, &id, &text, self.workflow.subagents.as_deref());
         let driver = opening.driver.clone().unwrap_or_default();
         let phases = opening
             .phases
@@ -118,7 +118,7 @@ impl Workspace {
             };
             let subagents = value["subagents"].as_array().cloned().unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
-                this.workflow.subagents = Some(Rc::new(subagents));
+                this.workflow.subagents = Some(Rc::from(subagents));
                 this.refresh_rows(cx);
                 cx.notify();
             });

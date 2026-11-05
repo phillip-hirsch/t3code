@@ -34,7 +34,7 @@ pub(in crate::app) struct CodeTab {
     /// The shown patch indexed by path, for anchoring threads and comments.
     patches: Rc<HashMap<String, FilePatch>>,
     /// Shown files in the viewer's order.
-    shown: Rc<Vec<String>>,
+    shown: Rc<[String]>,
     test_files: usize,
     hidden_tests: usize,
     ignore_whitespace: bool,
@@ -379,7 +379,7 @@ impl Workspace {
         let order = diff_logic::order_files(&kept);
         let mut by_path: HashMap<String, DiffFile> = files.into_iter().map(|f| (f.path().to_string(), f)).collect();
         let ordered: Vec<DiffFile> = order.iter().filter_map(|&i| by_path.remove(&kept[i])).collect();
-        code.shown = Rc::new(order.iter().map(|&i| kept[i].clone()).collect());
+        code.shown = order.iter().map(|&i| kept[i].clone()).collect();
         code.patches = Rc::new(diff_logic::index_patch(&text).into_iter().map(|f| (f.path.clone(), f)).collect());
         let fresh: Vec<String> = code.shown.iter().filter(|p| !code.seen.contains(*p)).cloned().collect();
         code.seen.extend(fresh.iter().cloned());

@@ -32,7 +32,7 @@ use crate::timeline::{self, Row};
 pub(super) struct SideChatView {
     thread_id: String,
     state: ThreadState,
-    pub(super) rows: Rc<Vec<Row>>,
+    pub(super) rows: Rc<[Row]>,
     cache: timeline::EntryCache,
     pub(super) scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
@@ -377,7 +377,7 @@ impl Workspace {
         let was_empty = view.rows.is_empty();
         let Some((range, count)) = timeline::changed_range(&view.rows, &rows) else { return };
         let total = rows.len();
-        view.rows = Rc::new(rows);
+        view.rows = Rc::from(rows);
         view.scroller.update(cx, |scroller, cx| {
             if was_empty {
                 scroller.reset(total, cx);

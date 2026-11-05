@@ -137,7 +137,7 @@ pub struct Workspace {
     shell: ShellState,
     target: Option<Target>,
     thread: Option<OpenThread>,
-    rows: Rc<Vec<Row>>,
+    rows: Rc<[Row]>,
     /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
     expanded: HashSet<SharedString>,
     entry_cache: timeline::EntryCache,
@@ -227,9 +227,9 @@ pub struct Workspace {
     history: pages::History,
     devices: crate::device::Devices,
     /// The server's keybindings `keymap` was merged from; see [`keymap`].
-    installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    installed_keybindings: Rc<[crate::keybindings::Rule]>,
     /// The server's rules merged with the defaults, which every keystroke resolves against.
-    keymap: Rc<Vec<crate::keybindings::Rule>>,
+    keymap: Rc<[crate::keybindings::Rule]>,
     /// The keystroke whose command last ran, until a key is released: a repeat of it is held.
     held_key: Option<gpui_kit::Keystroke>,
     reload_toasts: keymap::ReloadToasts,
@@ -391,7 +391,7 @@ impl Workspace {
             history: pages::History::default(),
             devices: Default::default(),
             installed_keybindings: Rc::default(),
-            keymap: Rc::new(crate::keybindings::merge_with_defaults(&[])),
+            keymap: Rc::from(crate::keybindings::merge_with_defaults(&[])),
             held_key: None,
             reload_toasts: Default::default(),
             pending_reload: None,
@@ -748,7 +748,7 @@ impl Workspace {
         self.sync_child_approvals(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
-        self.rows = Rc::new(new_rows);
+        self.rows = Rc::from(new_rows);
         self.sync_details(cx);
         self.prune_requests();
         self.scroller.update(cx, |scroller, cx| {

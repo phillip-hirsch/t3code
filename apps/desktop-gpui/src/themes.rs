@@ -248,11 +248,11 @@ fn find_built_in(id: &str) -> Option<&'static ThemeDefinition> {
 
 /// The saved themes (`t3code:themes:v1`). Clones share the list; edits return a new library.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Library(Arc<Vec<ThemeDefinition>>);
+pub struct Library(Arc<[ThemeDefinition]>);
 
 impl Library {
     pub fn new(themes: Vec<ThemeDefinition>) -> Self {
-        Self(Arc::new(themes))
+        Self(Arc::from(themes))
     }
 
     pub fn custom(&self) -> &[ThemeDefinition] {
@@ -277,7 +277,7 @@ impl Library {
         if self.find(&theme.id).is_some() {
             return Err(format!("A theme named \"{}\" is already installed.", theme.label));
         }
-        let mut themes = (*self.0).clone();
+        let mut themes = self.0.to_vec();
         themes.push(theme);
         Ok(Self::new(themes))
     }
@@ -290,7 +290,7 @@ impl Library {
         let Some(index) = self.0.iter().position(|existing| existing.id == theme.id) else {
             return Err(format!("The theme \"{}\" is not installed.", theme.label));
         };
-        let mut themes = (*self.0).clone();
+        let mut themes = self.0.to_vec();
         themes[index] = theme;
         Ok(Self::new(themes))
     }

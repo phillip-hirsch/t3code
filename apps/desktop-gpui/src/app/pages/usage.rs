@@ -55,7 +55,7 @@ pub(in crate::app) struct UsageState {
     chart: RefCell<Option<Rc<ChartData>>>,
     /// The limit pools and what they were built from: each environment's config revision,
     /// the hidden drivers, `limits_now`.
-    pools: Option<(PoolsKey, Rc<Vec<Pool>>)>,
+    pools: Option<(PoolsKey, Rc<[Pool]>)>,
 }
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
@@ -71,7 +71,7 @@ pub(in crate::app) struct ChartData {
     ticks: Vec<f64>,
     step_x: f32,
     /// Each provider's slot, curve and total, the largest total first.
-    series: Rc<Vec<(usize, Vec<logic::Segment>, f64)>>,
+    series: Rc<[(usize, Vec<logic::Segment>, f64)]>,
 }
 
 impl ChartData {
@@ -108,7 +108,7 @@ impl ChartData {
             max,
             ticks,
             step_x,
-            series: Rc::new(series),
+            series: Rc::from(series),
         }
     }
 }
@@ -712,7 +712,7 @@ impl Workspace {
     }
 
     /// The limit pools, rebuilt only when the server config, the hidden drivers or the clock moved.
-    fn limit_pools(&mut self) -> Rc<Vec<Pool>> {
+    fn limit_pools(&mut self) -> Rc<[Pool]> {
         let environments = self.limit_environments();
         let revisions = environments.iter().map(|(id, _, info)| (id.clone(), info.revision)).collect();
         let key = (revisions, self.usage.hidden.clone(), self.usage.limits_now);
@@ -722,7 +722,7 @@ impl Workspace {
             return pools.clone();
         }
         let accounts = logic::limit_accounts(&limit_inputs(&environments), &self.usage.hidden_drivers());
-        let pools = Rc::new(logic::limit_pools(accounts, self.usage.limits_now));
+        let pools: Rc<[Pool]> = Rc::from(logic::limit_pools(accounts, self.usage.limits_now));
         self.usage.pools = Some((key, pools.clone()));
         pools
     }

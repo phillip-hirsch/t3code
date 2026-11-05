@@ -549,13 +549,13 @@ struct NewDraft {
 }
 
 struct Catalog {
-    source: Rc<Vec<Rule>>,
+    source: Rc<[Rule]>,
     rows: Vec<KeyRow>,
     commands: Vec<String>,
 }
 
 impl Catalog {
-    fn new(source: Rc<Vec<Rule>>) -> Self {
+    fn new(source: Rc<[Rule]>) -> Self {
         let merged = keybindings::merge_with_defaults(&source);
         Self { rows: build_rows(&merged, MAC), commands: command_options(&merged), source }
     }
@@ -585,7 +585,7 @@ impl KeybindingsPanel {
     fn new(
         workspace: Entity<Workspace>,
         environment: Option<SharedString>,
-        source: Rc<Vec<Rule>>,
+        source: Rc<[Rule]>,
         connected: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -658,7 +658,7 @@ impl KeybindingsPanel {
         self.when_open = None;
     }
 
-    fn set_catalog(&mut self, source: Rc<Vec<Rule>>) {
+    fn set_catalog(&mut self, source: Rc<[Rule]>) {
         self.catalog = Catalog::new(source);
         let ids: HashSet<&str> = self.catalog.rows.iter().map(|row| row.id.as_str()).collect();
         self.drafts.retain(|id, _| ids.contains(id.as_str()));
@@ -857,7 +857,7 @@ impl KeybindingsPanel {
                         if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
                                 let Some(info) = workspace.env_info_mut(&environment) else { return };
-                                info.keybindings = Rc::new(keybindings::decode_rules(rules));
+                                info.keybindings = Rc::from(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });

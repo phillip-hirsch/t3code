@@ -26,7 +26,7 @@ const LINE_HEIGHT: f32 = 20.;
 /// What the dialog shows.
 enum Body {
     /// The lines, split once, and whether the file went past the preview limit.
-    Text(Rc<Vec<SharedString>>, bool),
+    Text(Rc<[SharedString]>, bool),
     Image(Arc<Image>),
     None,
 }
@@ -57,7 +57,7 @@ impl Workspace {
         let size = super::attachments::format_size(bytes.len() as u64);
         let body = match (attachment.image(), text_lines(&bytes)) {
             (Some(image), _) => Body::Image(image),
-            (None, Some((lines, truncated))) => Body::Text(Rc::new(lines), truncated),
+            (None, Some((lines, truncated))) => Body::Text(Rc::from(lines), truncated),
             (None, None) => Body::None,
         };
         let extension = attachment.name().rsplit_once('.').map(|(_, e)| e.to_owned()).filter(|e| !e.is_empty());
