@@ -240,10 +240,10 @@ impl Workspace {
                 let title = detail.as_ref().map(|d| d.title.clone()).or_else(|| seed.as_ref().map(|s| s.title.clone()));
                 let (state, draft) = detail
                     .as_ref()
-                    .map(|d| (d.state.clone(), d.is_draft))
-                    .or_else(|| seed.as_ref().map(|s| (s.state.clone(), s.is_draft)))
-                    .unwrap_or_else(|| ("open".into(), false));
-                let (icon, color, _) = state_glyph(&state, draft, t);
+                    .map(|d| (d.state, d.is_draft))
+                    .or_else(|| seed.as_ref().map(|s| (s.state, s.is_draft)))
+                    .unwrap_or((list_logic::State::Open, false));
+                let (icon, color, _) = state_glyph(state, draft, t);
                 let label = match title {
                     Some(title) => format!("#{} {title}", reference.number),
                     None => format!("#{}", reference.number),

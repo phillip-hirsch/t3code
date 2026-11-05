@@ -34,6 +34,29 @@ pub struct Label {
     pub color: Option<String>,
 }
 
+/// A change request's state (`PullRequestState`); one a newer server adds reads as `Unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum State {
+    Open,
+    Closed,
+    Merged,
+    #[serde(other)]
+    Unknown,
+}
+
+impl State {
+    /// The wire name, as the list's state filter spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Open => "open",
+            State::Closed => "closed",
+            State::Merged => "merged",
+            State::Unknown => "unknown",
+        }
+    }
+}
+
 /// `PullRequestListEntry`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,8 +71,7 @@ pub struct Entry {
     pub author: Option<Actor>,
     pub head_branch: String,
     pub base_branch: String,
-    /// `open`, `closed` or `merged`.
-    pub state: String,
+    pub state: State,
     pub is_draft: bool,
     /// `mergeable`, `conflicting` or `unknown`.
     pub mergeability: String,
@@ -517,7 +539,7 @@ fn size_of(entry: &Entry, stats: &Stats) -> (bool, u64) {
 fn readiness_tier(entry: &Entry) -> u8 {
     if entry.mergeability == "conflicting" {
         4
-    } else if entry.state != "open" {
+    } else if entry.state != State::Open {
         3
     } else if entry.is_draft {
         2
@@ -531,7 +553,7 @@ fn readiness_tier(entry: &Entry) -> u8 {
 }
 
 fn blocked_on_author_tier(entry: &Entry) -> u8 {
-    if entry.state != "open" {
+    if entry.state != State::Open {
         6
     } else if entry.mergeability == "conflicting" {
         0
@@ -579,8 +601,9 @@ pub fn sort_groups(groups: &mut [Group], sort: &str, text: &str, involvement: &s
                     "authored" => entries.sort_by(|l, r| {
                         blocked_on_author_tier(l).cmp(&blocked_on_author_tier(r)).then_with(|| by_recency(l, r))
                     }),
-                    "reviewing" => entries
-                        .sort_by(|l, r| (l.state != "open").cmp(&(r.state != "open")).then_with(|| by_recency(l, r))),
+                    "reviewing" => entries.sort_by(|l, r| {
+                        (l.state != State::Open).cmp(&(r.state != State::Open)).then_with(|| by_recency(l, r))
+                    }),
                     _ => {}
                 }
             }
@@ -630,7 +653,7 @@ pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Grou
         .entries
         .iter()
         .filter(|entry| {
-            (view.state == "all" || entry.state == view.state)
+            (view.state == "all" || entry.state.as_str() == view.state)
                 && view.project.is_none_or(|project| entry.project_id == project)
                 && view.host.is_none_or(|host| entry.host == host)
         })
@@ -732,19 +755,19 @@ pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<Labe
     let mut authors: Vec<(String, AuthorFacet, usize)> = Vec::new();
     let mut labels: Vec<(String, LabelFacet)> = Vec::new();
     for entry in entries {
-        let in_state = state == "all" || entry.state == state;
+        let in_state = state == "all" || entry.state.as_str() == state;
         if let Some(author) = &entry.author
             && let Some(key) = normalize(&author.login)
         {
             match authors.iter_mut().find(|(k, ..)| *k == key) {
                 Some((_, facet, merged)) => {
                     facet.count += usize::from(in_state);
-                    *merged += usize::from(entry.state == "merged");
+                    *merged += usize::from(entry.state == State::Merged);
                 }
                 None => authors.push((
                     key,
                     AuthorFacet { login: author.login.clone(), count: usize::from(in_state), merged: 0 },
-                    usize::from(entry.state == "merged"),
+                    usize::from(entry.state == State::Merged),
                 )),
             }
         }
@@ -871,6 +894,12 @@ mod tests {
 
     fn numbers(group: &Group) -> Vec<u64> {
         group.entries.iter().map(|e| e.number).collect()
+    }
+
+    #[test]
+    fn a_state_a_newer_server_adds_still_decodes() {
+        let state = |s: &str| serde_json::from_value::<State>(serde_json::Value::from(s)).unwrap();
+        assert_eq!([state("open"), state("merged"), state("queued")], [State::Open, State::Merged, State::Unknown]);
     }
 
     #[test]

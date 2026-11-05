@@ -861,7 +861,7 @@ impl Workspace {
         let (checks_state, checks_stale) = panel.checks_state(detail);
         let primary = logic::primary_control(detail, checks_state);
         let method = self.pr_merge_method(panel, detail);
-        let (_, state_color, state_label) = state_glyph(&detail.state, detail.is_draft, t);
+        let (_, state_color, state_label) = state_glyph(detail.state, detail.is_draft, t);
         let hairline = Hsla { a: t.border.a * 0.6, ..t.border };
         let now = now_ms();
         let view = cx.entity();
@@ -1111,7 +1111,9 @@ impl Workspace {
         let armed_badge =
             || badge("pr-auto-merge-armed", Lucide::GitMerge, armed_label.clone(), t.info_foreground, t.info, t);
         let mut out = Vec::new();
-        if detail.state == "open" && detail.auto_merge_enabled == Some(true) && primary != Some(Primary::AutoMergeArmed)
+        if detail.state == list_logic::State::Open
+            && detail.auto_merge_enabled == Some(true)
+            && primary != Some(Primary::AutoMergeArmed)
         {
             out.push(armed_badge());
         }
@@ -1157,7 +1159,11 @@ impl Workspace {
             }
             Some(Primary::AutoMergeArmed) => out.push(armed_badge()),
             Some(Primary::Merged | Primary::Closed) => {
-                let icon = if detail.state == "merged" { Lucide::GitMerge } else { Lucide::GitPullRequestClosed };
+                let icon = if detail.state == list_logic::State::Merged {
+                    Lucide::GitMerge
+                } else {
+                    Lucide::GitPullRequestClosed
+                };
                 out.push(
                     h_flex()
                         .h(px(24.))
@@ -1303,7 +1309,7 @@ impl Workspace {
                         .label("Maintainers can push to this branch. If your fork has workflows, this can also give access to its secrets.")
                         .separator();
                 }
-                if detail.state == "open" {
+                if detail.state == list_logic::State::Open {
                     if actions.draft_toggle {
                         let (label, action, icon) = if detail.is_draft {
                             ("Ready for review", "ready", Lucide::GitPullRequestArrow)
@@ -1490,7 +1496,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
-        let approvals = if detail.state == "open" { detail.workflow_approvals_required.unwrap_or(0) } else { 0 };
+        let approvals =
+            if detail.state == list_logic::State::Open { detail.workflow_approvals_required.unwrap_or(0) } else { 0 };
         if approvals > 0 && !stale && logic::can(detail, "approve-workflows") {
             let label = match (panel.pending, panel.armed) {
                 (Some("approve-workflows"), _) => "Approving...",
@@ -2348,10 +2355,10 @@ fn diff_stat(additions: u64, deletions: u64, size: f32, t: &Tokens) -> Option<im
     })
 }
 
-fn state_glyph(state: &str, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
+fn state_glyph(state: list_logic::State, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
     match (state, draft) {
-        ("merged", _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
-        ("closed", _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
+        (list_logic::State::Merged, _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
+        (list_logic::State::Closed, _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
         (_, true) => (Lucide::GitPullRequestDraft, tone(t, 0x71717b, 0x9f9fa9, 0.8), "Draft"),
         _ => (Lucide::GitPullRequestArrow, tone(t, 0x009966, 0x5ee9b5, 0.9), "Open"),
     }

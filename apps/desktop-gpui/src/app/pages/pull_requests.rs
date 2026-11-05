@@ -1053,9 +1053,9 @@ pub(super) fn tone(t: &Tokens, light: u32, dark: u32, dark_alpha: f32) -> Hsla {
 }
 
 fn state_glyph(entry: &Entry, t: &Tokens) -> (Lucide, Hsla, &'static str) {
-    match (entry.state.as_str(), entry.is_draft) {
-        ("merged", _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
-        ("closed", _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
+    match (entry.state, entry.is_draft) {
+        (logic::State::Merged, _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
+        (logic::State::Closed, _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
         (_, true) => (Lucide::GitPullRequestDraft, tone(t, 0x71717b, 0x9f9fa9, 0.8), "Draft"),
         _ => (Lucide::GitPullRequestArrow, tone(t, 0x009966, 0x5ee9b5, 0.9), "Open"),
     }
@@ -1151,7 +1151,7 @@ fn pull_request_row(
     let key = entry.key();
     let id = |part: &str| format!("pr-{key}-{part}");
     let (state_icon, state_color, state_label) = state_glyph(entry, t);
-    let conflict = entry.state == "open" && !entry.is_draft && entry.mergeability == "conflicting";
+    let conflict = entry.state == logic::State::Open && !entry.is_draft && entry.mergeability == "conflicting";
     let conflict_label = format!("Conflicts with {}", entry.base_branch);
     let url = entry.url.clone();
     let open_label = logic::open_on_host_label(&entry.provider);

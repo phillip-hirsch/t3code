@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::inbox::parse_ms;
+use crate::pull_requests::State;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -198,7 +199,7 @@ pub struct Detail {
     pub url: String,
     #[serde(default)]
     pub author: Option<Actor>,
-    pub state: String,
+    pub state: State,
     #[serde(default)]
     pub is_draft: bool,
     #[serde(default)]
@@ -460,7 +461,7 @@ pub fn can_resolve_thread(detail: &Detail, thread: &ReviewThread) -> bool {
 
 /// `canEditPullRequestMaintainerEdits`.
 pub fn can_edit_maintainer_edits(detail: &Detail) -> bool {
-    detail.state == "open"
+    detail.state == State::Open
         && detail.capabilities.edit.and_then(|e| e.maintainer_edits) == Some(true)
         && detail.viewer_permissions.maintainer_edits == Some(true)
         && detail.maintainer_can_modify.is_some()
@@ -469,7 +470,7 @@ pub fn can_edit_maintainer_edits(detail: &Detail) -> bool {
 /// `resolveBaseFreshness`: how far an open, mergeable branch is behind its base, and the ways
 /// this reader may bring it up to date.
 pub fn base_freshness(detail: &Detail) -> Option<(Option<u64>, Vec<String>)> {
-    if detail.state != "open"
+    if detail.state != State::Open
         || detail.base_comparison.as_deref() != Some("behind")
         || detail.mergeability != "mergeable"
     {
@@ -503,7 +504,7 @@ pub struct StackLayer {
     #[serde(default)]
     pub head_sha: Option<String>,
     pub head_branch: String,
-    pub state: String,
+    pub state: State,
 }
 
 /// `PullRequestStack`.
@@ -534,10 +535,10 @@ pub struct StackPlan {
 
 pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
     let position = stack.layers.iter().position(|l| l.number == number).map_or(0, |i| i + 1);
-    let unmerged: Vec<&StackLayer> = stack.layers.iter().filter(|l| l.state != "merged").collect();
-    let merge: Vec<&StackLayer> = stack.layers[..position].iter().filter(|l| l.state != "merged").collect();
-    let selected_open = position > 0 && stack.layers[position - 1].state == "open";
-    let merge_blocked = merge.iter().any(|l| l.state != "open" || l.is_draft);
+    let unmerged: Vec<&StackLayer> = stack.layers.iter().filter(|l| l.state != State::Merged).collect();
+    let merge: Vec<&StackLayer> = stack.layers[..position].iter().filter(|l| l.state != State::Merged).collect();
+    let selected_open = position > 0 && stack.layers[position - 1].state == State::Open;
+    let merge_blocked = merge.iter().any(|l| l.state != State::Open || l.is_draft);
     StackPlan {
         position,
         merge_disabled: !selected_open
@@ -547,7 +548,7 @@ pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
         merge: merge.iter().map(|l| l.number).collect(),
         rebase_disabled: unmerged.is_empty()
             || unmerged.iter().any(|l| l.head_sha.is_none())
-            || unmerged.iter().any(|l| l.state != "open"),
+            || unmerged.iter().any(|l| l.state != State::Open),
         rebase: unmerged.iter().map(|l| l.number).collect(),
         merge_blocked,
         selected_open,
@@ -580,10 +581,10 @@ pub enum Primary {
 
 pub fn primary_control(detail: &Detail, checks_state: Option<&str>) -> Option<Primary> {
     let has_method = !allowed_merge_methods(detail).is_empty();
-    match detail.state.as_str() {
-        "merged" => return Some(Primary::Merged),
-        "closed" => return Some(Primary::Closed),
-        _ => {}
+    match detail.state {
+        State::Merged => return Some(Primary::Merged),
+        State::Closed => return Some(Primary::Closed),
+        State::Open | State::Unknown => {}
     }
     if detail.mergeability == "conflicting" {
         return Some(Primary::Resolve);
@@ -621,7 +622,7 @@ pub struct MenuActions {
 }
 
 pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
-    let open = detail.state == "open";
+    let open = detail.state == State::Open;
     let conflicting = open && detail.mergeability == "conflicting";
     let methods = allowed_merge_methods(detail).len();
     let armed = open && detail.auto_merge_enabled == Some(true);
@@ -641,9 +642,9 @@ pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
             && methods > 0,
         merge_methods: mergeable && methods > 1,
         close: open && can(detail, "close"),
-        reopen: detail.state == "closed" && can(detail, "reopen"),
-        revert: detail.state == "merged" && can(detail, "revert"),
-        delete_branch: detail.state != "open"
+        reopen: detail.state == State::Closed && can(detail, "reopen"),
+        revert: detail.state == State::Merged && can(detail, "revert"),
+        delete_branch: detail.state != State::Open
             && detail.capabilities.delete_branch == Some(true)
             && can(detail, "delete-branch"),
     }

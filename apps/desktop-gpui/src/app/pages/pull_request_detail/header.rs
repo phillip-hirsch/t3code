@@ -477,9 +477,9 @@ impl Workspace {
                         let label =
                             format!("#{number} {}", layer.title.clone().unwrap_or_else(|| layer.head_branch.clone()));
                         let reference = Reference { number, ..reference.clone() };
-                        let icon = match (layer.state.as_str(), layer.is_draft) {
-                            ("merged", _) => Lucide::GitMerge,
-                            ("closed", _) => Lucide::GitPullRequestClosed,
+                        let icon = match (layer.state, layer.is_draft) {
+                            (list_logic::State::Merged, _) => Lucide::GitMerge,
+                            (list_logic::State::Closed, _) => Lucide::GitPullRequestClosed,
                             (_, true) => Lucide::GitPullRequestDraft,
                             _ => Lucide::GitPullRequestArrow,
                         };
