@@ -887,7 +887,7 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(false, window, cx)))
             .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
-            .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
+            .on_action(cx.listener(|this, _: &UndoThreadAction, window, cx| this.undo_thread_action(window, cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .map(|el| self.on_terminal_actions(el, cx))

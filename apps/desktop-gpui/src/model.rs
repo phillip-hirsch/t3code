@@ -158,6 +158,10 @@ pub struct Provider {
     pub reports_context_window: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
