@@ -183,6 +183,14 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
     for key in UNSET_SERVER_ENV {
         command.env_remove(key);
     }
+    // Like Electron, the server learns where the `t3` launcher is so agents can run it.
+    match crate::desktop::cli::Target::from_config(&config).map(|target| crate::desktop::cli::write_launcher(&target)) {
+        Some(Ok(launcher)) => {
+            command.env("T3CODE_CLI_PATH", launcher);
+        }
+        Some(Err(error)) => log::warn!("could not install t3 launcher: {error:#}"),
+        None => {}
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("start {} {}", config.node.display(), config.server_entry.display()))?;

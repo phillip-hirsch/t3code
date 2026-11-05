@@ -3,6 +3,7 @@
 //! and app links.
 
 pub mod activation;
+pub mod cli;
 pub mod links;
 pub mod settings;
 pub mod window_state;

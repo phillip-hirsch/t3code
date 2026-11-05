@@ -42,6 +42,10 @@ pub(super) struct DesktopShell {
     pending_links: Vec<AppLink>,
     pub(super) link_page: Option<LinkPage>,
     _link_task: Option<Task<()>>,
+    /// Settings > About's `t3` command row.
+    pub(super) cli: Option<crate::desktop::cli::CliState>,
+    pub(super) cli_pending: bool,
+    pub(super) _cli_task: Option<Task<()>>,
     _launches: Option<Task<()>>,
 }
 
@@ -74,6 +78,9 @@ impl DesktopShell {
             pending_links,
             link_page: None,
             _link_task: None,
+            cli: None,
+            cli_pending: false,
+            _cli_task: None,
             _launches: launches,
         };
         (shell, subscriptions)

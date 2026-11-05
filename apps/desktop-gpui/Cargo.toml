@@ -12,6 +12,8 @@ path = "src/main.rs"
 alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
+# Decodes the user PATH the `t3` command installer reads through PowerShell.
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 env_logger = "0.11"
 futures = "0.3"
