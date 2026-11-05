@@ -30,18 +30,13 @@ use crate::theme::{self, Tokens};
 
 gpui_kit::actions!(terminal, [ToggleTerminal, SplitTerminal, SplitTerminalVertical, NewTerminal, CloseTerminal]);
 
-/// `DEFAULT_KEYBINDINGS` in `packages/shared/src/keybindings.ts`; the last four only while a terminal has focus.
-/// The window root binds Ctrl+C (copy) and Tab (focus cycling); in a terminal those keys belong to the shell.
+/// The window root binds Ctrl+C (copy) and Tab (focus cycling); in a terminal those keys belong to
+/// the shell. The `terminal.*` commands run from the keymap (`app::keymap`), so they are rebindable.
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("ctrl-c", NoAction, Some("Terminal")),
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
-        KeyBinding::new("ctrl-j", ToggleTerminal, None),
-        KeyBinding::new("ctrl-d", SplitTerminal, Some("Terminal")),
-        KeyBinding::new("ctrl-shift-d", SplitTerminalVertical, Some("Terminal")),
-        KeyBinding::new("ctrl-n", NewTerminal, Some("Terminal")),
-        KeyBinding::new("ctrl-w", CloseTerminal, Some("Terminal")),
     ]
 }
 
@@ -483,6 +478,16 @@ impl Workspace {
         }
     }
 
+    /// Focuses the open drawer's active terminal: the terminal stop of the F6 cycle.
+    pub(super) fn focus_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(thread_id) = self.shown_terminal_thread() else { return false };
+        let Some(drawer) = self.terminals.drawers.get(thread_id).filter(|d| d.open) else { return false };
+        let Some(pane) = self.terminals.panes.get(&drawer.active_id) else { return false };
+        let focus = pane.session.read(cx).focus.clone();
+        focus.focus(window, cx);
+        true
+    }
+
     /// Wires the terminal actions onto the workspace root.
     pub(super) fn on_terminal_actions(&self, root: Div, cx: &mut Context<Self>) -> Div {
         root.on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
@@ -540,7 +545,7 @@ impl Workspace {
                     Button::new("terminal-empty-new")
                         .outline()
                         .xsmall()
-                        .label("New Terminal (Ctrl+N)")
+                        .label(self.with_terminal_shortcut("New Terminal", "terminal.new"))
                         .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx))),
                 )
                 .into_any_element()
@@ -652,14 +657,14 @@ impl Workspace {
     }
 
     fn wire_split(&self, button: Stateful<Div>, split: Split, limit: bool, cx: &mut Context<Self>) -> Stateful<Div> {
-        let (name, shortcut) = match split {
-            Split::Horizontal => ("Split Terminal Horizontally", "Ctrl+D"),
-            Split::Vertical => ("Split Terminal Vertically", "Ctrl+Shift+D"),
+        let (name, command) = match split {
+            Split::Horizontal => ("Split Terminal Horizontally", "terminal.split"),
+            Split::Vertical => ("Split Terminal Vertically", "terminal.splitVertical"),
         };
         let label = if limit {
             format!("{name} (max {} per group)", layout::MAX_PER_GROUP)
         } else {
-            format!("{name} ({shortcut})")
+            self.with_terminal_shortcut(name, command)
         };
         button
             .tooltip(tooltip(label.into()))
@@ -668,13 +673,13 @@ impl Workspace {
 
     fn wire_new(&self, button: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
         button
-            .tooltip(tooltip("New Terminal (Ctrl+N)".into()))
+            .tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into()))
             .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx)))
     }
 
     fn wire_close(&self, button: Stateful<Div>, active: String, cx: &mut Context<Self>) -> Stateful<Div> {
         button
-            .tooltip(tooltip("Close Terminal (Ctrl+W)".into()))
+            .tooltip(tooltip(self.with_terminal_shortcut("Close Terminal", "terminal.close").into()))
             .on_click(cx.listener(move |this, _, window, cx| this.request_close_terminal(active.clone(), window, cx)))
     }
 
@@ -786,8 +791,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let label = self.terminals.label(thread_id, terminal_id);
-        let close_label: SharedString =
-            if active { format!("Close {label} (Ctrl+W)") } else { format!("Close {label}") }.into();
+        let close_label: SharedString = if active {
+            self.with_terminal_shortcut(&format!("Close {label}"), "terminal.close")
+        } else {
+            format!("Close {label}")
+        }
+        .into();
         let group = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_id, activate_id) = (terminal_id.to_owned(), terminal_id.to_owned());
         let glyph = |path: &'static str| {

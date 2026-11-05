@@ -75,9 +75,6 @@ fn main() {
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
-        // The defaults until the server's keybindings arrive.
-        app::keymap::install(&[], cx);
-        cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-z", app::UndoThreadAction, None)]);
         cx.bind_keys(app::terminal_key_bindings());
         let desktop = desktop::Desktop::load(launches, cx);
         let window_bounds = desktop.window_bounds(cx);

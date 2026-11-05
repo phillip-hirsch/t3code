@@ -10,8 +10,8 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Task, Window, div,
+    AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div,
 };
 use serde_json::{Value, json};
 
@@ -26,6 +26,7 @@ mod alerts;
 mod attachments;
 mod banners;
 mod chat;
+mod commands;
 mod composer;
 mod composer_menu;
 mod composer_meter;
@@ -39,7 +40,7 @@ mod git;
 mod header;
 mod inspector;
 mod keep_alive;
-pub(crate) mod keymap;
+mod keymap;
 mod layout;
 mod message_actions;
 mod minimap;
@@ -62,20 +63,8 @@ mod visits;
 
 gpui_kit::actions!(
     workspace,
-    [
-        ToggleSidebar,
-        ToggleThreadDetails,
-        ToggleRightPanel,
-        TogglePalette,
-        NewThread,
-        NewThreadInProject,
-        UndoThreadAction,
-        FindInThread,
-        ToggleFilePicker,
-        ToggleProjectSearch
-    ]
+    [ToggleSidebar, ToggleThreadDetails, ToggleRightPanel, TogglePalette, NewThread, NewThreadInProject]
 );
-pub use preview::TogglePreview;
 
 /// Runs a shell command in the thread's terminal, as a project script does.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, gpui_kit::Action)]
@@ -209,8 +198,15 @@ pub struct Workspace {
     client_settings: crate::settings::ClientSettings,
     history: pages::History,
     devices: crate::device::Devices,
-    /// The keybindings last installed into GPUI's keymap; see [`keymap`].
+    /// The server's keybindings `keymap` was merged from; see [`keymap`].
     installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    /// The server's rules merged with the defaults, which every keystroke resolves against.
+    keymap: Rc<Vec<crate::keybindings::Rule>>,
+    /// The keystroke whose command last ran, until a key is released: a repeat of it is held.
+    held_key: Option<gpui_kit::Keystroke>,
+    reload_toasts: keymap::ReloadToasts,
+    /// The keybindings reload the config batch being applied reported, toasted after it.
+    pending_reload: Option<keymap::Reload>,
     /// Settings → Keybindings, created the first time it opens.
     keybindings_panel: Option<gpui_kit::AnyView>,
     /// The command palette, while open.
@@ -259,11 +255,11 @@ impl Workspace {
             }),
             // Caret moves re-read the completion trigger.
             cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
-            // Ahead of key bindings, so the composer's menus and shortcuts see arrows, Tab and Enter.
+            // Ahead of GPUI's bindings, the terminal and text fields: the composer's menus, then the keymap.
             cx.intercept_keystrokes({
                 let this = weak;
                 move |event, window, cx| {
-                    let handled = this.update(cx, |this, cx| this.intercept_key(&event.keystroke, window, cx));
+                    let handled = this.update(cx, |this, cx| this.on_keystroke(event, window, cx));
                     if handled.unwrap_or(false) {
                         cx.stop_propagation();
                     }
@@ -349,6 +345,10 @@ impl Workspace {
             history: pages::History::default(),
             devices: Default::default(),
             installed_keybindings: Rc::default(),
+            keymap: Rc::new(crate::keybindings::merge_with_defaults(&[])),
+            held_key: None,
+            reload_toasts: Default::default(),
+            pending_reload: None,
             keybindings_panel: None,
             palette: None,
             find: None,
@@ -525,9 +525,13 @@ impl Workspace {
                 if let Err(error) = this.server_info.apply(value) {
                     log::warn!("bad server config event: {error}");
                 }
+                if let Some(reload) = this.reload_toasts.handle(value, std::time::Instant::now()) {
+                    this.pending_reload = Some(reload);
+                }
             },
             |this, window, cx| {
                 this.sync_keymap(cx);
+                this.show_reload_toast(window, cx);
                 this.notify_sidebar(cx);
                 this.check_chatgpt_welcome(window, cx);
                 // Skills arrive with provider updates.
@@ -909,7 +913,10 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
-        if window.focused(cx).is_none() {
+        // A modal page covers the composer, so the editor behind it must not keep the keys.
+        if window.focused(cx).is_none()
+            || (self.page.is_some_and(pages::Page::is_modal) && self.composer.focus_handle(cx).is_focused(window))
+        {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
@@ -930,34 +937,15 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
-            .on_action(cx.listener(|this, _: &keymap::GoBack, window, cx| this.go_back(window, cx)))
-            .on_action(cx.listener(|this, _: &keymap::GoForward, window, cx| this.go_forward(window, cx)))
-            .on_action(cx.listener(|this, _: &keymap::OpenUsage, _, cx| this.open_page(pages::Page::Usage, cx)))
             .on_action(
                 cx.listener(|this, _: &TogglePalette, window, cx| this.open_palette(palette::View::Root, window, cx)),
             )
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(false, window, cx)))
             .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
-            .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
-            .on_action(cx.listener(|this, _: &FindInThread, window, cx| {
-                // Over the palette, find closes it and says why find can't open (`CommandPalette.tsx`).
-                if this.palette.is_some() {
-                    this.close_palette(window, cx);
-                    this.open_thread_find_or_explain(window, cx);
-                } else {
-                    this.open_thread_find(window, cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .on_action(cx.listener(Self::on_steer_queued))
             .on_action(cx.listener(Self::on_edit_queued))
-            .on_action(cx.listener(|this, _: &ToggleFilePicker, window, cx| {
-                this.toggle_file_overlay(files::OverlayMode::Files, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleProjectSearch, window, cx| {
-                this.toggle_file_overlay(files::OverlayMode::Content, window, cx)
-            }))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
@@ -985,7 +973,10 @@ impl Render for Workspace {
                     cx.stop_propagation();
                 }
             }))
-            .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| this.quit_key_up(event, cx)))
+            .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| {
+                this.held_key = None;
+                this.quit_key_up(event, cx)
+            }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
                 this.quit_modifiers_changed(event, cx)
             }))

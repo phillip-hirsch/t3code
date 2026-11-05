@@ -180,6 +180,11 @@ impl Workspace {
         };
         let has_projects = !self.shell.projects.is_empty();
         let show_hint = self.groups_in_view() > 1;
+        let new_thread_label = self.with_shortcut("New thread", "chat.new");
+        let in_project_hint = format!(
+            "New thread in current project: Shift+click{}",
+            self.shortcut_label("chat.newLocal").map(|s| format!(" ({s})")).unwrap_or_default()
+        );
         let muted = tokens.muted_foreground;
         h_flex()
             .flex_none()
@@ -195,14 +200,12 @@ impl Workspace {
                 header_button("sidebar-new-thread")
                     .when(!has_projects, |el| el.opacity(0.64).cursor_default())
                     .tooltip(move |window, cx| {
+                        let (label, hint) = (new_thread_label.clone(), in_project_hint.clone());
                         gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
-                            v_flex().gap(px(2.)).child("New thread (Ctrl+N)").when(show_hint, |el| {
-                                el.child(
-                                    div()
-                                        .text_color(muted)
-                                        .child("New thread in current project: Shift+click (Ctrl+Shift+N)"),
-                                )
-                            })
+                            v_flex()
+                                .gap(px(2.))
+                                .child(label.clone())
+                                .when(show_hint, |el| el.child(div().text_color(muted).child(hint.clone())))
                         })
                         .build(window, cx)
                     })

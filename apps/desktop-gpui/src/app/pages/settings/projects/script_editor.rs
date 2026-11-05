@@ -327,6 +327,7 @@ impl ScriptEditor {
         let empty = self.keybinding.is_empty();
         div()
             .id("script-keybinding")
+            .key_context(crate::app::keymap::CAPTURE_CONTEXT)
             .track_focus(&self.keybinding_focus)
             .on_key_down(cx.listener(Self::capture_keybinding))
             .h(px(36.))

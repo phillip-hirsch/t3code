@@ -401,6 +401,26 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `rightPanel.close`: closes the tab on screen; `false` when the panel shows none.
+    pub(super) fn close_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(surface) = self.active_surface().cloned() else { return false };
+        self.close_surface(surface, window, cx);
+        true
+    }
+
+    /// `diff.toggle` (`rightPanelStore.toggle(…, "diff")`): hides the panel while it shows the
+    /// Diff, else opens the Diff tab.
+    pub(super) fn toggle_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.target, Some(Target::Thread(_))) {
+            return;
+        }
+        if self.active_surface() == Some(&Surface::Diff) {
+            self.close_right_panel(cx);
+        } else if self.diff_available() {
+            self.open_surface(Surface::Diff, window, cx);
+        }
+    }
+
     /// Keeps the thread's focused preview tab on the browser surface the panel shows.
     fn sync_active_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(Target::Thread(thread_id)), Some(Surface::Browser(tab))) =

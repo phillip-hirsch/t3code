@@ -179,6 +179,24 @@ impl Workspace {
             .map(|(_, path, branch)| (path, branch))
     }
 
+    fn pick_previous_worktree(&mut self, path: String, branch: Option<String>, cx: &mut Context<Self>) {
+        self.draft_workspace.choice = WorkspaceChoice {
+            mode: Some(EnvMode::Worktree),
+            branch: branch.clone(),
+            existing_worktree: Some((path, branch)),
+            start_from_origin: None,
+        };
+        cx.notify();
+    }
+
+    /// `composer.previousWorktree` (`BranchToolbarHandle.usePreviousWorktree`): a draft reuses the
+    /// newest worktree of its project, then the composer takes focus.
+    pub(super) fn use_previous_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, branch)) = self.previous_worktree() else { return };
+        self.pick_previous_worktree(path, branch, cx);
+        self.focus_composer(window, cx);
+    }
+
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
@@ -260,7 +278,7 @@ impl Workspace {
         .detach();
     }
 
-    fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let search = match self.draft_workspace.branch_search.clone() {
             Some(search) => search,
             None => {
@@ -496,7 +514,10 @@ impl Workspace {
         strip_button("env-mode", t)
             .child(Icon::new(icon).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label))
-            .tooltip(format!("{label} · Ctrl+Shift+X"))
+            .tooltip(match self.shortcut_label("composer.workspace") {
+                Some(keys) => format!("{label} · {keys}"),
+                None => label.to_owned(),
+            })
             .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |menu, window, _| {
                 let mut menu = menu
                     .label("Workspace")
@@ -526,13 +547,7 @@ impl Workspace {
                             .icon(Icon::new(Lucide::RotateCcwClock))
                             .checked(label == "Previous worktree")
                             .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                this.draft_workspace.choice = WorkspaceChoice {
-                                    mode: Some(EnvMode::Worktree),
-                                    branch: branch.clone(),
-                                    existing_worktree: Some((path.clone(), branch.clone())),
-                                    start_from_origin: None,
-                                };
-                                cx.notify();
+                                this.pick_previous_worktree(path.clone(), branch.clone(), cx)
                             })),
                     );
                 }
@@ -740,7 +755,12 @@ impl Workspace {
             .child(Icon::new(icon).with_size(px(if footer { 14. } else { 12. })))
             .child(div().max_w(px(240.)).truncate().child(label))
             .when(footer, |b| b.child(Icon::new(Lucide::ChevronUp).with_size(px(12.))))
-            .when(!footer, |b| b.tooltip("Permissions · Ctrl+Shift+A"));
+            .when(!footer, |b| {
+                b.tooltip(match self.shortcut_label("composer.mode") {
+                    Some(keys) => format!("Permissions · {keys}"),
+                    None => "Permissions".to_owned(),
+                })
+            });
         let view = cx.entity();
         let mut popover = Popover::new(SharedString::from(format!("{id}-popover")))
             .anchor(gpui_kit::Anchor::BottomRight)

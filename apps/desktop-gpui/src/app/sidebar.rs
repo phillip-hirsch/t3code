@@ -76,7 +76,7 @@ pub(super) struct SidebarState {
     search_highlight: Option<String>,
     messages: super::palette::MessageSearch,
     /// Keyboard navigation of the rows (`sidebarTree.ts`).
-    list_focus: FocusHandle,
+    pub(super) list_focus: FocusHandle,
     /// The keyboard row (`thread:<id>`, `shelf:<name>`, `settled:more`), and the rows in order.
     cursor: Option<SharedString>,
     nav_rows: Vec<SharedString>,
@@ -89,6 +89,16 @@ pub(super) struct SidebarState {
 }
 
 impl SidebarState {
+    /// The footer offers to undo a thread action.
+    pub(super) fn has_undo(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// The thread rows as last drawn, top to bottom (the web's `orderedThreadKeys`).
+    pub(super) fn ordered_thread_ids(&self) -> impl Iterator<Item = &str> {
+        self.nav_rows.iter().filter_map(|key| key.strip_prefix("thread:"))
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let list_focus = cx.focus_handle().tab_stop(true);

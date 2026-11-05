@@ -109,6 +109,38 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `usage.*` on the open Usage page (`UsagePage.tsx`): `None` when `command` is not one;
+    /// text fields keep their keys, and Limits has no period.
+    pub(in crate::app) fn usage_shortcut(
+        &mut self,
+        command: &str,
+        context: &crate::app::keymap::ShortcutContext,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let name = command.strip_prefix("usage.");
+        let metric = logic::METRICS.iter().map(|(value, _)| *value).find(|value| name == Some(*value));
+        let days = match command {
+            "usage.period.day" => Some(1),
+            "usage.period.week" => Some(7),
+            "usage.period.month" => Some(30),
+            "usage.period.quarter" => Some(90),
+            _ => None,
+        };
+        if metric.is_none() && days.is_none() {
+            return None;
+        }
+        if !context.usage_page_open || context.editable_focus {
+            return Some(false);
+        }
+        if let Some(metric) = metric {
+            self.select_usage_metric(metric, cx);
+        }
+        if let Some(days) = days.filter(|_| self.usage.metric != "limits") {
+            self.select_usage_window(days, cx);
+        }
+        Some(true)
+    }
+
     fn select_usage_window(&mut self, days: u32, cx: &mut Context<Self>) {
         self.usage.days = days;
         self.usage.window = UsageWindow::new(days, Timestamp::now(), &self.usage.tz);

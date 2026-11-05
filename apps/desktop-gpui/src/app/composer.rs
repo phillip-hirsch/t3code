@@ -202,21 +202,36 @@ impl Workspace {
         }
     }
 
-    /// Every keystroke, before key bindings run (the editor binds arrows, Tab and
-    /// Enter itself); `true` consumes it.
-    pub(super) fn intercept_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Keys the composer's open menus take ahead of the keymap (the editor binds
+    /// arrows, Tab and Enter itself); `true` consumes it.
+    pub(super) fn composer_menu_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
-        if self.draft_workspace_key(keystroke, window, cx) || self.composer_shortcut(keystroke, window, cx) {
-            return true;
+        self.draft_workspace_key(keystroke, window, cx)
+            || (self.composer.focus_handle(cx).is_focused(window)
+                && (self.plan_toggle_key(keystroke, window, cx) || self.menu_key(keystroke, window, cx)))
+    }
+
+    /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
+    pub(super) fn composer_key(
+        &mut self,
+        keystroke: &Keystroke,
+        context: &super::keymap::ShortcutContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.model_picker_open() {
+            return false;
         }
-        // Keys in the editor: Shift+Tab, the open menu, then prompt history, then the send shortcuts.
-        self.composer.focus_handle(cx).is_focused(window)
-            && (self.plan_toggle_key(keystroke, window, cx)
-                || self.menu_key(keystroke, window, cx)
-                || self.history_key(keystroke, window, cx)
-                || self.send_key(keystroke, window, cx))
+        self.question_option_key(keystroke, window, cx)
+            || (context.composer_focus
+                && (self.history_key(keystroke, window, cx) || self.send_key(keystroke, context, window, cx)))
     }
 
     /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
@@ -273,39 +288,26 @@ impl Workspace {
         composer_text::history_entries(messages.filter_map(|item| item.str("text")))
     }
 
-    /// Enter sends unless `sendShortcut` asks for Ctrl; Ctrl+Enter takes the alternate path.
-    fn send_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let running = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
-        let draft = matches!(self.target, Some(Target::Draft { .. }));
-        let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
-        let prompt = self.composer.read(cx).value();
-        let Some(intent) = super::send::key_intent(keystroke, shortcut, &prompt, running, draft) else { return false };
-        self.submit_with(intent, window, cx);
+    /// Enter sends unless `sendShortcut` asks for Ctrl (`composerSubmissionIntentForKey`);
+    /// the alternate sends are keybinding commands.
+    fn send_key(
+        &mut self,
+        keystroke: &Keystroke,
+        context: &super::keymap::ShortcutContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !super::send::sends_on(keystroke, context.composer_requires_modifier) {
+            return false;
+        }
+        self.submit_with(super::send::Intent::Foreground, window, cx);
         true
     }
 
-    /// Shortcuts that work wherever focus is (`keybindings.ts`): the model picker,
-    /// permissions and branch pickers, and 1-9 on an open question card.
-    fn composer_shortcut(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// 1-9 pick an option on an open question card while the editor is not focused.
+    fn question_option_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let m = keystroke.modifiers;
-        if (m.control || m.platform) && m.shift && !m.alt && self.page.is_none() && self.settings.is_none() {
-            match keystroke.key.as_str() {
-                "m" | "e" => {
-                    if self.composer_picker_open() {
-                        self.close_model_picker(window, cx);
-                    } else {
-                        self.open_model_picker(window, cx);
-                    }
-                }
-                "a" if matches!(self.target, Some(Target::Draft { .. })) => {
-                    self.draft_workspace_open_permissions(cx);
-                }
-                "a" => self.open_model_picker(window, cx),
-                _ => return false,
-            }
-            return true;
-        }
-        if m.control || m.platform || m.alt {
+        if m.control || m.platform || m.alt || self.page.is_some() || self.settings.is_some() {
             return false;
         }
         let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
@@ -756,12 +758,19 @@ impl Workspace {
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
-                let keys = if super::send::requires_modifier(shortcut, &self.composer.read(cx).value()) {
-                    "Ctrl+Shift+Enter"
-                } else {
-                    "Ctrl+Enter"
+                let context = super::keymap::ShortcutContext {
+                    composer_focus: true,
+                    turn_running: true,
+                    composer_requires_modifier: super::send::requires_modifier(
+                        shortcut,
+                        &self.composer.read(cx).value(),
+                    ),
+                    ..Default::default()
                 };
-                Some(format!("Click to {follow_up}, Ctrl-click or {keys} to {alternate}").into())
+                let keys = super::keymap::label_for(&self.keymap, "composer.sendAlternate", &context)
+                    .map(|keys| format!(" or {keys}"))
+                    .unwrap_or_default();
+                Some(format!("Click to {follow_up}, Ctrl-click{keys} to {alternate}").into())
             }
             _ => None,
         };

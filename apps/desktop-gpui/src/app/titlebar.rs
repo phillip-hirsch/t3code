@@ -11,8 +11,8 @@ use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Context, Div, FontFallbacks, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    Pixels, Stateful, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, font, hsla, px,
-    rgb, svg,
+    Pixels, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div, font,
+    hsla, px, rgb, svg,
 };
 
 use super::{ToggleRightPanel, ToggleSidebar, Workspace};
@@ -50,8 +50,9 @@ fn control(id: &'static str) -> Stateful<Div> {
     div().id(id).flex_none().size(CONTROL_SIZE).rounded(px(8.)).flex().items_center().justify_center().occlude()
 }
 
-fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
-    move |window, cx| Tooltip::new(text).build(window, cx)
+fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
+    let text = text.into();
+    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
 
 impl Workspace {
@@ -84,7 +85,7 @@ impl Workspace {
                         .text_color(color)
                         .group_hover("toggle-sidebar", |style| style.text_color(hover_color)),
                 )
-                .tooltip(tooltip("Toggle main sidebar (Ctrl+B)"))
+                .tooltip(tooltip(self.with_shortcut("Toggle main sidebar", "sidebar.toggle")))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
         )
     }
@@ -110,7 +111,7 @@ impl Workspace {
             .gap_1()
             .child(
                 toggle("toggle-thread-details", "icons/square-menu.svg", details, true)
-                    .tooltip(tooltip("Toggle thread details (Ctrl+Shift+B)"))
+                    .tooltip(tooltip(self.with_shortcut("Toggle thread details", "threadPanel.toggle")))
                     // Acts on press, like a popover trigger: the popover's outside-press
                     // dismissal runs first, so a press that already closed it must not reopen it.
                     .on_mouse_down(
@@ -126,9 +127,9 @@ impl Workspace {
                 let available = self.terminal_available();
                 toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available)
                     .tooltip(tooltip(if available {
-                        "Toggle terminal drawer (Ctrl+J)"
+                        self.with_shortcut("Toggle terminal drawer", "terminal.toggle")
                     } else {
-                        "Terminal drawer is unavailable"
+                        "Terminal drawer is unavailable".into()
                     }))
                     // On press, like the details toggle beside it.
                     .when(available, |el| {
@@ -140,7 +141,7 @@ impl Workspace {
             })
             .child(
                 toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
-                    .tooltip(tooltip("Toggle right panel (Ctrl+Alt+B)"))
+                    .tooltip(tooltip(self.with_shortcut("Toggle right panel", "rightPanel.toggle")))
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
                         window.dispatch_action(Box::new(ToggleRightPanel), cx)
                     }),

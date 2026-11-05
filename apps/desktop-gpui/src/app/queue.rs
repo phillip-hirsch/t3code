@@ -289,7 +289,7 @@ impl Workspace {
     }
 
     /// `thread.steerQueuedMessage`: sends the first queued message now.
-    fn steer_next_queued(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(super) fn steer_next_queued(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(next) = self.queue.state.queued.first().map(|q| q.run_id.clone()) else { return false };
         if !matches!(self.target, Some(Target::Thread(_))) || !self.queue.state.can_send() {
             return false;
@@ -299,7 +299,7 @@ impl Workspace {
     }
 
     /// `thread.editQueuedMessage`: opens the last queued message, from an empty caret start.
-    fn edit_latest_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn edit_latest_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(latest) = self.queue.state.queued.last().cloned() else { return false };
         let at_start = self.composer.read(cx).cursor() == 0;
         if !latest.editable
@@ -382,11 +382,16 @@ pub(super) fn queued_row(
             .children(time),
     );
     if ui.state.can_send() && !editing {
-        let tooltip = ui.state.send_tooltip();
+        // The first message's Send now names `thread.steerQueuedMessage`.
+        let first = ui.state.queued.first().is_some_and(|q| &q.run_id == id);
+        let tooltip: SharedString = match workspace.shortcut_label("thread.steerQueuedMessage").filter(|_| first) {
+            Some(shortcut) => format!("{} ({shortcut})", ui.state.send_tooltip()).into(),
+            None => ui.state.send_tooltip().into(),
+        };
         let (this, run) = (this.clone(), id.clone());
         controls = controls.child(
             text_button(format!("queued-send:{id}"), Some(IconName::ArrowUp), "Send now", busy, t)
-                .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                 .when(!busy, |el| {
                     el.on_click(move |_, _, cx| {
                         let _ = this.update(cx, |w, cx| w.send_queued(run.clone(), cx));
@@ -403,7 +408,19 @@ pub(super) fn queued_row(
         );
     } else {
         let edit_disabled = !message.editable || busy || blocked.is_some();
-        let edit_tooltip: SharedString = blocked.unwrap_or("Edit in the composer").into();
+        // The last message's edit names `thread.editQueuedMessage`, labelled as from the composer.
+        let edit_tooltip: SharedString = match blocked {
+            Some(reason) => reason.into(),
+            None => {
+                let context = super::keymap::ShortcutContext { composer_focus: true, ..Default::default() };
+                match super::keymap::label_for(&workspace.keymap, "thread.editQueuedMessage", &context)
+                    .filter(|_| ui.state.queued.last().is_some_and(|q| &q.run_id == id))
+                {
+                    Some(shortcut) => format!("Edit in the composer ({shortcut})").into(),
+                    None => "Edit in the composer".into(),
+                }
+            }
+        };
         let (edit_this, edit_message) = (this.clone(), message.clone());
         let (remove_this, run) = (this.clone(), id.clone());
         controls = controls
