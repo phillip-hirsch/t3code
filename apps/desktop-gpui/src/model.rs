@@ -407,6 +407,10 @@ pub struct AppThread {
 pub struct Run {
     pub id: String,
     pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

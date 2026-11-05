@@ -7,6 +7,22 @@ use gpui_kit::{AssetSource, Hsla, Result, SharedString, rgb};
 const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/claude.svg", include_bytes!("../assets/icons/claude.svg")),
     ("icons/app/openai.svg", include_bytes!("../assets/icons/openai.svg")),
+    ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
+    ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),
+    // Lucide icons the timeline uses beyond gpui-kit's default set.
+    ("icons/terminal.svg", include_bytes!("../assets/icons/terminal.svg")),
+    ("icons/square-pen.svg", include_bytes!("../assets/icons/square-pen.svg")),
+    ("icons/smartphone.svg", include_bytes!("../assets/icons/smartphone.svg")),
+    ("icons/git-pull-request-arrow.svg", include_bytes!("../assets/icons/git-pull-request-arrow.svg")),
+    ("icons/wrench.svg", include_bytes!("../assets/icons/wrench.svg")),
+    ("icons/hammer.svg", include_bytes!("../assets/icons/hammer.svg")),
+    ("icons/brain.svg", include_bytes!("../assets/icons/brain.svg")),
+    ("icons/zap.svg", include_bytes!("../assets/icons/zap.svg")),
+    ("icons/message-circle.svg", include_bytes!("../assets/icons/message-circle.svg")),
+    ("icons/list-todo.svg", include_bytes!("../assets/icons/list-todo.svg")),
+    ("icons/code-xml.svg", include_bytes!("../assets/icons/code-xml.svg")),
+    ("icons/minimize-2.svg", include_bytes!("../assets/icons/minimize-2.svg")),
+    ("icons/shield.svg", include_bytes!("../assets/icons/shield.svg")),
 ];
 
 pub struct Assets;

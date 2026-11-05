@@ -1,6 +1,7 @@
 //! The main window: sidebar of projects and threads, the open thread's
 //! timeline, pending approvals, and the composer.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -59,6 +60,11 @@ pub struct Workspace {
     target: Option<Target>,
     thread: Option<OpenThread>,
     rows: Rc<Vec<Row>>,
+    /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
+    expanded: HashSet<SharedString>,
+    entry_cache: timeline::EntryCache,
+    /// Repaints the "Working for …" timer once a second while a turn runs.
+    _working_tick: Option<Task<()>>,
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     sending: bool,
@@ -96,6 +102,9 @@ impl Workspace {
             target: None,
             thread: None,
             rows: Rc::default(),
+            expanded: HashSet::new(),
+            entry_cache: timeline::EntryCache::default(),
+            _working_tick: None,
             scroller,
             composer,
             sending: false,
@@ -283,10 +292,11 @@ impl Workspace {
     /// Rebuilds the timeline and tells the scroller which rows changed.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         let new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
-            Some(projection) => timeline::rows(projection),
+            Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
         let was_empty = self.rows.is_empty();
+        self.sync_working_tick(&new_rows, cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);
@@ -323,6 +333,9 @@ impl Workspace {
 
     fn reset_timeline(&mut self, cx: &mut Context<Self>) {
         self.rows = Rc::default();
+        self.expanded.clear();
+        self.entry_cache = timeline::EntryCache::default();
+        self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
     }
 
