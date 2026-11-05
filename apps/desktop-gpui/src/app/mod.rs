@@ -178,6 +178,8 @@ pub struct Workspace {
     lineage_expanded: Option<String>,
     /// The git status of the open target's workspace.
     vcs: git::VcsWatch,
+    /// Local servers, while the details card's Servers section can show.
+    servers: details::servers::ServersWatch,
     /// The editor "Open in" launches, once picked.
     preferred_editor: Option<String>,
     right_panel: right_panel::RightPanel,
@@ -311,6 +313,7 @@ impl Workspace {
             details_popover: false,
             lineage_expanded: None,
             vcs: git::VcsWatch::default(),
+            servers: Default::default(),
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
@@ -868,6 +871,7 @@ impl Render for Workspace {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
+        self.sync_servers(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);
         self.sync_preview_views(window, cx);
