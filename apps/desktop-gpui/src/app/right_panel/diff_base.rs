@@ -237,14 +237,15 @@ impl Workspace {
             .child(
                 div()
                     .id("diff-refs-head")
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(px(160.))
                     .truncate()
                     .text_xs()
                     .text_color(tokens.muted_foreground)
                     .child(format!("{head} →"))
                     .tooltip(move |window, cx| Tooltip::new(comparison.clone()).build(window, cx)),
             )
-            .child(popover)
+            .child(div().min_w_0().overflow_hidden().child(popover))
             .into_any_element()
     }
 

@@ -92,6 +92,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "download",
     "file-diff",
     "flask-conical",
+    "flask-conical-off",
     "file-braces",
     "external-link",
     "eye",

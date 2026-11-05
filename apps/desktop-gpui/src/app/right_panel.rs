@@ -5,6 +5,7 @@
 //! device surface is not native, so the launcher leaves it out.
 
 mod diff_base;
+mod diff_tree;
 
 use std::collections::{HashMap, HashSet};
 
@@ -293,6 +294,13 @@ pub(super) struct RightPanel {
     /// The branch diff's picked comparison target per thread; none is Automatic.
     base_refs: HashMap<Target, String>,
     base_picker: diff_base::BasePicker,
+    /// Every file of the loaded selection; the patch shows them less hidden test files.
+    all_diff_files: Vec<DiffFile>,
+    hide_test_files: bool,
+    tree_open: bool,
+    /// Folded tree folders (with their trailing `/`) and the file picked in the tree.
+    tree_folded: HashSet<String>,
+    tree_selected: Option<String>,
     _diff_events: Subscription,
 }
 
@@ -326,6 +334,11 @@ impl RightPanel {
             observed_pull_requests: HashMap::new(),
             base_refs: HashMap::new(),
             base_picker: Default::default(),
+            all_diff_files: Vec::new(),
+            hide_test_files: false,
+            tree_open: false,
+            tree_folded: HashSet::new(),
+            tree_selected: None,
             _diff_events: diff_events,
         }
     }
@@ -866,10 +879,12 @@ impl Workspace {
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
+                        this.right_panel.all_diff_files.clear();
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No patch available for this selection.")
                     }
                     Ok(Some(parsed)) if parsed.files.is_empty() => {
+                        this.right_panel.all_diff_files.clear();
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No net changes in this selection.")
                     }
@@ -882,8 +897,10 @@ impl Workspace {
                             this.client_settings.values.bool("diffFilesCollapsed"),
                             &paths,
                         );
+                        this.right_panel.all_diff_files = parsed.files;
+                        let shown = this.shown_diff_files();
                         diff.update(cx, |state, cx| {
-                            state.set_files(parsed.files, cx);
+                            state.set_files(shown, cx);
                             for path in &paths {
                                 state.set_file_collapsed(path, folded.contains(path), cx);
                             }
@@ -966,6 +983,7 @@ impl Workspace {
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
+        self.right_panel.all_diff_files.clear();
         self.right_panel.diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
     }
 
@@ -1632,6 +1650,9 @@ impl Workspace {
         let all_collapsed =
             !files.is_empty() && files.iter().all(|path| self.right_panel.diff.read(cx).is_file_collapsed(path));
         let (wrap, ignore_whitespace) = (self.diff_wrap(), self.diff_ignore_whitespace());
+        let (test_files, hide_tests, tree_open) =
+            (self.test_file_count(), self.right_panel.hide_test_files, self.right_panel.tree_open);
+        let has_files = !self.right_panel.all_diff_files.is_empty();
         let header = h_flex()
             .h(px(28.))
             .mb_3()
@@ -1701,6 +1722,32 @@ impl Workspace {
                                 this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
                                 cx.notify();
                             }))
+                    })
+                    .when(test_files > 0, |el| {
+                        let label: SharedString = match (hide_tests, test_files) {
+                            (true, 1) => "Show 1 hidden test file".into(),
+                            (true, count) => format!("Show {count} hidden test files").into(),
+                            (false, _) => "Hide test files".into(),
+                        };
+                        el.child(
+                            icon_toggle("diff-hide-tests", "icons/flask-conical-off.svg", hide_tests, tokens, cx)
+                                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.right_panel.hide_test_files = !hide_tests;
+                                    this.apply_diff_files(cx);
+                                })),
+                        )
+                    })
+                    .when(has_files, |el| {
+                        let label = if tree_open { "Hide file tree" } else { "Show file tree" };
+                        el.child(
+                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, cx)
+                                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.right_panel.tree_open = !tree_open;
+                                    cx.notify();
+                                })),
+                        )
                     }),
             );
         let quiet = |text: SharedString| {
@@ -1749,22 +1796,29 @@ impl Workspace {
                             .child("This preview exceeds the size limit. Changes shown are incomplete."),
                     )
                 })
-                .child({
-                    // `--diffs-font-size`, the Code font size.
-                    let diff = Diff::new(&self.right_panel.diff)
-                        .soft_wrap(wrap)
+                .child(
+                    h_flex()
                         .flex_1()
                         .min_h_0()
-                        .text_size(px(tokens.fonts.code_size));
-                    match scheme {
-                        DiffColorScheme::RedGreen => diff.into_any_element(),
-                        DiffColorScheme::BlueOrange => DiffTint {
-                            child: diff.into_any_element(),
-                            colors: (git::addition_color(tokens, scheme), git::deletion_color(tokens, scheme)),
-                        }
-                        .into_any_element(),
-                    }
-                })
+                        .items_start()
+                        .child({
+                            // `--diffs-font-size`, the Code font size.
+                            let diff = Diff::new(&self.right_panel.diff)
+                                .soft_wrap(wrap)
+                                .flex_1()
+                                .min_h_0()
+                                .text_size(px(tokens.fonts.code_size));
+                            match scheme {
+                                DiffColorScheme::RedGreen => diff.into_any_element(),
+                                DiffColorScheme::BlueOrange => DiffTint {
+                                    child: diff.into_any_element(),
+                                    colors: (git::addition_color(tokens, scheme), git::deletion_color(tokens, scheme)),
+                                }
+                                .into_any_element(),
+                            }
+                        })
+                        .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
+                )
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
