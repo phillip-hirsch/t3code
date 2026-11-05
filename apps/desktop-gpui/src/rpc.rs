@@ -163,6 +163,14 @@ impl Drop for RpcStream {
     }
 }
 
+/// Whether [`RpcClient::connect`] failed because the server rejected the credential (HTTP 401).
+pub fn is_unauthorized(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 401
+    )
+}
+
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn open_socket(options: &ConnectOptions) -> Result<Socket> {
@@ -374,6 +382,18 @@ mod tests {
         assert_eq!(join_frame_part(&mut buffer, "\u{1e}1".into()), None);
         assert_eq!(join_frame_part(&mut buffer, "}".into()).as_deref(), Some("{\"a\":1}"));
         assert_eq!(join_frame_part(&mut buffer, "{}".into()).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn a_401_upgrade_reads_as_unauthorized() {
+        use tokio_tungstenite::tungstenite::{Error, http::Response};
+        let rejected = |status: u16| {
+            let response = Response::builder().status(status).body(None).unwrap();
+            Err::<(), _>(Error::Http(Box::new(response))).context("websocket upgrade failed").unwrap_err()
+        };
+        assert!(is_unauthorized(&rejected(401)));
+        assert!(!is_unauthorized(&rejected(426)));
+        assert!(!is_unauthorized(&anyhow!("websocket open timed out")));
     }
 
     #[test]

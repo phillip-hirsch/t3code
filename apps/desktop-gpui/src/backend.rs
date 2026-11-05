@@ -2,11 +2,12 @@
 //! bearer token for it. Mirrors `apps/desktop/src/backend/DesktopBackendManager.ts`.
 
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use hmac::{Hmac, Mac as _};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
@@ -16,19 +17,50 @@ const FIRST_PORT: u16 = 3773;
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// `SERVER_EXIT_CODE_STATE_DIR_OWNED` in `packages/contracts/src/desktopBootstrap.ts`.
 const EXIT_STATE_DIR_OWNED: i32 = 78;
+/// `DESKTOP_BOOTSTRAP_TOKEN_WINDOW_MS` in `packages/shared/src/desktopBootstrapToken.ts`.
+const BOOTSTRAP_TOKEN_WINDOW_MS: u128 = 12 * 60 * 60 * 1000;
+/// `DESKTOP_BACKEND_ENV_NAMES` in `apps/desktop/src/backend/DesktopBackendConfiguration.ts`,
+/// plus `T3CODE_HOME`, which the bootstrap's `t3Home` already carries.
+const UNSET_SERVER_ENV: [&str; 10] = [
+    "T3CODE_PORT",
+    "T3CODE_MODE",
+    "T3CODE_NO_BROWSER",
+    "T3CODE_HOST",
+    "T3CODE_DESKTOP_WS_URL",
+    "T3CODE_DESKTOP_LAN_HOST",
+    "T3CODE_DESKTOP_HTTPS_ENDPOINTS",
+    "T3CODE_TAILSCALE_SERVE",
+    "T3CODE_TAILSCALE_SERVE_PORT",
+    "T3CODE_HOME",
+];
 
 /// Where to reach a server, and how to authenticate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Endpoint {
     /// `http://host:port`, no trailing slash.
     pub http_base: String,
     pub bearer_token: String,
+    /// The local server's `desktopBootstrapSecret`. `None` for `T3_SERVER_TOKEN`, which cannot be renewed.
+    bootstrap_secret: Option<String>,
 }
 
 impl Endpoint {
     pub fn ws_url(&self) -> String {
         let rest = self.http_base.strip_prefix("http").unwrap_or(&self.http_base);
         format!("ws{rest}/ws")
+    }
+
+    pub fn renewable(&self) -> bool {
+        self.bootstrap_secret.is_some()
+    }
+
+    /// Exchanges the current window's bootstrap token for a new session, like
+    /// `DesktopLocalEnvironmentAuth`. Each exchange revokes the previous desktop session,
+    /// so call it only after the server rejected ours.
+    pub async fn renew(mut self) -> Result<Self> {
+        let secret = self.bootstrap_secret.as_deref().context("this server token cannot be renewed")?;
+        self.bearer_token = exchange_token(&self.http_base, &bootstrap_token(secret, now_ms())).await?;
+        Ok(self)
     }
 }
 
@@ -73,22 +105,33 @@ pub struct LaunchConfig {
     pub node: PathBuf,
     pub server_entry: PathBuf,
     pub home: PathBuf,
+    /// The server's cwd, which is also the default provider cwd.
+    pub cwd: PathBuf,
 }
 
 impl LaunchConfig {
     /// `T3_NODE_BIN`, `T3_SERVER_ENTRY` and `T3CODE_HOME` override the defaults.
     pub fn from_env() -> Result<Self> {
         let node = std::env::var_os("T3_NODE_BIN").map(PathBuf::from).unwrap_or_else(|| "node".into());
-        let server_entry = match std::env::var_os("T3_SERVER_ENTRY") {
-            Some(path) => PathBuf::from(path),
-            None => default_server_entry()?,
+        // Electron runs the server in the user's home when packaged and in the repo root
+        // from source. The in-repo server entry is our source run.
+        let (server_entry, cwd) = match std::env::var_os("T3_SERVER_ENTRY") {
+            Some(path) => (PathBuf::from(path), user_home()?),
+            None => (default_server_entry()?, repo_root()),
         };
+        // Separate from the Electron app's `~/.t3` until this client reaches parity,
+        // so both can run at once without fighting over the state directory.
         let home = match std::env::var_os("T3CODE_HOME") {
             Some(path) => PathBuf::from(path),
-            None => default_home()?,
+            None => user_home()?.join(".t3-gpui"),
         };
-        Ok(Self { node, server_entry, home })
+        Ok(Self { node, server_entry, home, cwd })
     }
+}
+
+fn repo_root() -> PathBuf {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    crate_dir.ancestors().nth(2).unwrap_or(crate_dir).to_path_buf()
 }
 
 /// The server sources next to this crate: built bundle first, then the TS entry.
@@ -100,19 +143,18 @@ fn default_server_entry() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no server entry under {}; set T3_SERVER_ENTRY", server.display()))
 }
 
-/// Separate from the Electron app's `~/.t3` until this client reaches parity,
-/// so both can run at once without fighting over the state directory.
-fn default_home() -> Result<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")
+fn user_home() -> Result<PathBuf> {
+    std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
-        .ok_or_else(|| anyhow!("no home directory; set T3CODE_HOME"))?;
-    Ok(PathBuf::from(home).join(".t3-gpui"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("no home directory; set T3CODE_HOME"))
 }
 
 /// Uses `T3_SERVER_URL` + `T3_SERVER_TOKEN` when set, otherwise starts a local server.
 pub async fn resolve_endpoint() -> Result<(Endpoint, Option<LocalServer>)> {
     if let (Ok(url), Ok(token)) = (std::env::var("T3_SERVER_URL"), std::env::var("T3_SERVER_TOKEN")) {
-        let endpoint = Endpoint { http_base: url.trim_end_matches('/').to_owned(), bearer_token: token };
+        let endpoint =
+            Endpoint { http_base: url.trim_end_matches('/').to_owned(), bearer_token: token, bootstrap_secret: None };
         wait_ready(&endpoint.http_base, None).await?;
         return Ok((endpoint, None));
     }
@@ -123,19 +165,22 @@ pub async fn resolve_endpoint() -> Result<(Endpoint, Option<LocalServer>)> {
 pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
     std::fs::create_dir_all(&config.home).with_context(|| format!("create {}", config.home.display()))?;
     let port = pick_port()?;
-    let bootstrap_token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    // Kept in memory for the app's lifetime, like Electron's, to mint later tokens.
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|error| anyhow!("random bootstrap secret: {error}"))?;
+    let secret = hex(&secret);
 
     // Bootstrap goes over stdin (fd 0): Rust cannot hand fd 3 to a child on Windows.
     let mut command = Command::new(&config.node);
     command
         .arg(&config.server_entry)
         .args(["--bootstrap-fd", "0"])
-        .current_dir(&config.home)
+        .current_dir(&config.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-    for key in ["T3CODE_PORT", "T3CODE_MODE", "T3CODE_NO_BROWSER", "T3CODE_HOST", "T3CODE_HOME"] {
+    for key in UNSET_SERVER_ENV {
         command.env_remove(key);
     }
     let mut child = command
@@ -150,7 +195,8 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
         "port": port,
         "t3Home": config.home,
         "host": "127.0.0.1",
-        "desktopBootstrapToken": bootstrap_token,
+        "desktopBootstrapToken": bootstrap_token(&secret, now_ms()),
+        "desktopBootstrapSecret": secret,
         "tailscaleServeEnabled": false,
         "tailscaleServePort": 443,
     });
@@ -175,8 +221,8 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
             bail!("server exited before it was ready (code {code:?})");
         }
     }
-    let bearer_token = exchange_token(&http_base, &bootstrap_token).await?;
-    Ok((Endpoint { http_base, bearer_token }, server))
+    let endpoint = Endpoint { http_base, bearer_token: String::new(), bootstrap_secret: Some(secret) };
+    Ok((endpoint.renew().await?, server))
 }
 
 /// First port from 3773 that is free on loopback and the wildcard address,
@@ -223,7 +269,22 @@ struct AccessToken {
     access_token: String,
 }
 
-/// One exchange per launch: a second desktop-bootstrap exchange revokes the first session.
+/// `currentDesktopBootstrapToken` in `packages/shared/src/desktopBootstrapToken.ts`.
+fn bootstrap_token(secret: &str, now_ms: u128) -> String {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    mac.update(format!("t3-desktop-bootstrap:{}", now_ms / BOOTSTRAP_TOKEN_WINDOW_MS).as_bytes());
+    hex(&mac.finalize().into_bytes())
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A desktop-bootstrap exchange revokes the previous desktop session; see [`Endpoint::renew`].
 async fn exchange_token(http_base: &str, bootstrap_token: &str) -> Result<String> {
     let os = if cfg!(windows) {
         "windows"
@@ -264,4 +325,25 @@ fn contain(child: &Child) -> Option<win32job::Job> {
     let job = win32job::Job::create_with_limit_info(&limits).ok()?;
     job.assign_process(handle as isize).ok()?;
     Some(job)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_tokens_match_the_desktop_derivation() {
+        // Vectors from `currentDesktopBootstrapToken` in packages/shared.
+        let secret = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        assert_eq!(bootstrap_token(secret, 0), "02cec917dd14501e25f311143f0e9bdcb635cb4788eb26ea82cd06c86506b00d");
+        assert_eq!(
+            bootstrap_token(secret, 1_700_000_000_000),
+            "4eeff29552aba28ac67d872d536b45c1f020041f0cfafce12d76de5993566dea"
+        );
+        let window_start = 1_793_836_800_000;
+        let expected = "37c4b749c141c4d1bec2fe51ec7a8199cde18b4b62dbaaa7e4abb9ea35fe608a";
+        assert_eq!(bootstrap_token(secret, window_start), expected);
+        assert_eq!(bootstrap_token(secret, window_start + BOOTSTRAP_TOKEN_WINDOW_MS - 1), expected);
+        assert_ne!(bootstrap_token(secret, window_start + BOOTSTRAP_TOKEN_WINDOW_MS), expected);
+    }
 }

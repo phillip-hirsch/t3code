@@ -164,6 +164,13 @@ pub struct ServerInfo {
     pub environment_label: Option<String>,
     platform_machine: Option<String>,
     environment_icon: Option<String>,
+    /// Settings that pick a new thread's workspace; see `crate::new_thread`.
+    pub default_thread_env_mode: Option<String>,
+    pub new_worktrees_start_from_origin: Option<bool>,
+    pub project_settings_folded: bool,
+    /// `projectSettingsOverrides`, keyed by project id.
+    pub project_settings_overrides: Value,
+    pub new_projects_root: Option<String>,
 }
 
 impl ServerInfo {
@@ -178,6 +185,7 @@ impl ServerInfo {
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
+                self.new_projects_root = text("/newProjectsRoot");
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -191,6 +199,10 @@ impl ServerInfo {
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
         self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
         self.environment_icon = settings.get("environmentIcon").and_then(Value::as_str).map(str::to_owned);
+        self.default_thread_env_mode = settings.get("defaultThreadEnvMode").and_then(Value::as_str).map(str::to_owned);
+        self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
+        self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
+        self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
         Ok(())
     }
 
@@ -268,6 +280,9 @@ pub struct ProjectShell {
     pub repository_identity: Option<RepositoryIdentity>,
     #[serde(default)]
     pub default_model_selection: Option<ModelSelection>,
+    /// Legacy per-project env mode, used until settings fold it into `projectSettingsOverrides`.
+    #[serde(default)]
+    pub default_thread_env_mode: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).

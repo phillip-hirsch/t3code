@@ -4,6 +4,7 @@ mod backend;
 mod inbox;
 mod model;
 mod model_label;
+mod new_thread;
 mod requests;
 mod rpc;
 mod theme;

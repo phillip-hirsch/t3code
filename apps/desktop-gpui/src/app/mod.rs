@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, ServerHandle};
 use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
+use crate::new_thread::DraftWorkspace;
 use crate::requests::QuestionDraft;
-use crate::rpc::{ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
+use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
 
@@ -181,13 +182,41 @@ impl Workspace {
                     return;
                 }
             };
+            let mut endpoint = endpoint;
+            // Set by a renewal, so a session the server rejects again waits a beat before the next one.
+            let mut renewed = false;
             loop {
                 if this.update(cx, |this, cx| this.set_connection(Connection::Connecting, cx)).is_err() {
                     return;
                 }
                 let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
                 match RpcClient::connect(runtime().handle(), options).await {
+                    Err(error) if rpc::is_unauthorized(&error) && !endpoint.renewable() => {
+                        let message = "The server rejected T3_SERVER_TOKEN. Set a valid token and restart.";
+                        let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(message.into()), cx));
+                        return;
+                    }
+                    Err(error) if rpc::is_unauthorized(&error) && !renewed => {
+                        // The session expired or was revoked: exchange this window's bootstrap token again.
+                        log::info!("session rejected; renewing it");
+                        let message: SharedString = match runtime().spawn(endpoint.clone().renew()).await {
+                            Ok(Ok(fresh)) => {
+                                endpoint = fresh;
+                                renewed = true;
+                                continue;
+                            }
+                            Ok(Err(error)) => format!("{error:#}").into(),
+                            Err(error) => error.to_string().into(),
+                        };
+                        if this
+                            .update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Ok(client) => {
+                        renewed = false;
                         log::info!("connected");
                         if this.update_in(cx, |this, window, cx| this.on_connected(client.clone(), window, cx)).is_err()
                         {
@@ -202,6 +231,7 @@ impl Workspace {
                         }
                     }
                     Err(error) => {
+                        renewed = false;
                         let message: SharedString = format!("{error:#}").into();
                         if this
                             .update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx))
@@ -464,7 +494,7 @@ impl Workspace {
         }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
         let (declines, text_is_feedback) = self.approval_declines(&text);
-        let (method, payload, new_thread_id) = match target {
+        let (method, mut payload, new_thread_id, workspace) = match target {
             Target::Thread(thread_id) => {
                 let mut command = json!({
                     "type": "message.dispatch",
@@ -482,7 +512,7 @@ impl Workspace {
                 if let Some(model) = &self.model_override {
                     command["modelSelection"] = model.to_json();
                 }
-                ("orchestration.dispatchCommand", command, None)
+                ("orchestration.dispatchCommand", command, None, None)
             }
             Target::Draft { project_id } => {
                 let Some(model) = self.composer_model() else {
@@ -490,6 +520,10 @@ impl Workspace {
                     cx.notify();
                     return;
                 };
+                let workspace = self.shell.projects.iter().find(|p| p.id == project_id).map(|project| {
+                    let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+                    DraftWorkspace::new(&self.server_info, project, has_threads)
+                });
                 let thread_id = new_id();
                 let input = json!({
                     "commandId": new_id(),
@@ -504,7 +538,7 @@ impl Workspace {
                     "workspaceStrategy": {"type": "root"},
                     "initialMessage": {"messageId": new_id(), "text": text, "attachments": []},
                 });
-                ("orchestration.launchThread", input, Some(thread_id))
+                ("orchestration.launchThread", input, Some(thread_id), workspace)
             }
         };
         self.sending = true;
@@ -513,13 +547,21 @@ impl Workspace {
             // Declines land first; a failed one keeps the text and sends nothing more.
             let mut result = Ok(Value::Null);
             for decline in declines {
-                result = client.request("orchestration.dispatchCommand", decline).await;
+                result = client.request("orchestration.dispatchCommand", decline).await.map_err(|e| e.to_string());
                 if result.is_err() {
                     break;
                 }
             }
             if result.is_ok() && !text_is_feedback {
-                result = client.request(method, payload).await;
+                if let Some(workspace) = workspace {
+                    match workspace.strategy(&client).await {
+                        Ok(strategy) => payload["workspaceStrategy"] = strategy,
+                        Err(error) => result = Err(error),
+                    }
+                }
+                if result.is_ok() {
+                    result = client.request(method, payload).await.map_err(|e| e.to_string());
+                }
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
@@ -530,7 +572,7 @@ impl Workspace {
                         }
                     }
                     Err(error) => {
-                        this.error = Some(error.to_string().into());
+                        this.error = Some(error.into());
                         // Give the text back so a failed send loses nothing.
                         if this.composer.read(cx).value().is_empty() {
                             this.set_composer_text(text, window, cx);
