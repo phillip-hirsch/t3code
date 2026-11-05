@@ -259,6 +259,8 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 this.notify_sidebar(cx);
                 this.schedule_sidebar_clock(cx);
+                // A snooze deadline can wake the open thread with no shell event to follow.
+                this.track_visit(cx);
             });
         }));
     }

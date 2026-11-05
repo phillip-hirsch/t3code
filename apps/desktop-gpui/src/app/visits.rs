@@ -92,6 +92,8 @@ impl Workspace {
             return;
         }
         let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        // Decide only once it can be sent: deciding records the visit as sent.
+        let Some(client) = self.client() else { return };
         let now = super::sidebar::now_ms();
         let woke_at = Facts::new(shell, &Default::default()).woke_at(now);
         match decide(&mut self.visit.state, shell, woke_at, now) {
@@ -103,7 +105,6 @@ impl Workspace {
                 }));
             }
             Visit::Send { visited_at, opened } => {
-                let Some(client) = self.client() else { return };
                 let mut command = json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": visited_at});
                 if opened {
                     command["opened"] = true.into();
