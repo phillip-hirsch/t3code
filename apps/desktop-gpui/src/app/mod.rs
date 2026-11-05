@@ -32,6 +32,7 @@ mod composer_meter;
 mod composer_plan;
 mod context_strip;
 mod details;
+mod find;
 mod git;
 mod header;
 mod inspector;
@@ -42,6 +43,7 @@ mod minimap;
 mod model_picker;
 mod pages;
 mod palette;
+mod palette_actions;
 mod preview;
 mod queue;
 mod quit;
@@ -50,6 +52,7 @@ mod send;
 mod sidebar;
 mod terminal;
 mod thread_menu;
+mod thread_menu_actions;
 mod titlebar;
 mod visits;
 
@@ -62,7 +65,8 @@ gpui_kit::actions!(
         TogglePalette,
         NewThread,
         NewThreadInProject,
-        UndoThreadAction
+        UndoThreadAction,
+        FindInThread
     ]
 );
 pub use preview::TogglePreview;
@@ -205,6 +209,8 @@ pub struct Workspace {
     keybindings_panel: Option<gpui_kit::AnyView>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
+    /// The thread find bar, while open.
+    find: Option<find::ThreadFind>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
@@ -329,6 +335,7 @@ impl Workspace {
             installed_keybindings: Rc::default(),
             keybindings_panel: None,
             palette: None,
+            find: None,
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
@@ -642,6 +649,7 @@ impl Workspace {
                     return;
                 }
                 this.refresh_rows(cx);
+                this.refresh_thread_find(cx);
                 this.sync_question(window, cx);
                 this.sync_queue_edit(window, cx);
                 this.observe_proactive_panels(cx);
@@ -750,6 +758,7 @@ impl Workspace {
 
     fn reset_timeline(&mut self, cx: &mut Context<Self>) {
         self.rows = Rc::default();
+        self.find = None;
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
@@ -898,6 +907,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(false, window, cx)))
             .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
+            .on_action(cx.listener(|this, _: &FindInThread, window, cx| {
+                // Over the palette, find closes it and says why find can't open (`CommandPalette.tsx`).
+                if this.palette.is_some() {
+                    this.close_palette(window, cx);
+                    this.open_thread_find_or_explain(window, cx);
+                } else {
+                    this.open_thread_find(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .on_action(cx.listener(Self::on_steer_queued))
@@ -921,6 +939,13 @@ impl Render for Workspace {
                     return;
                 }
                 this.escape_details_popover(event, window, cx);
+            }))
+            // Escape that nothing else took closes find (`useChatShortcuts` `dismissFind`).
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.find.is_some() && this.palette.is_none() {
+                    this.close_thread_find(window, cx);
+                    cx.stop_propagation();
+                }
             }))
             .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| this.quit_key_up(event, cx)))
             .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
@@ -970,6 +995,7 @@ impl Render for Workspace {
                                                         )
                                                         .child(self.render_composer(window, cx)),
                                                 )
+                                                .children(self.render_find_bar(cx))
                                                 .children(self.render_details_card(window, cx)),
                                         }
                                     })

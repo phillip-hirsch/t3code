@@ -101,9 +101,22 @@ impl Workspace {
             if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
                 this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             }
+            this.paint_find(&row_key, cx);
         });
-        self.markdown.0.insert(key, MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        self.markdown
+            .0
+            .insert(key.clone(), MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        self.paint_find(&key, cx);
         view
+    }
+
+    /// The markdown view kept for `key` (a message's id), if it has rendered.
+    pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
+        self.markdown.0.get(key).map(|state| state.view.clone())
+    }
+
+    pub(super) fn markdown_keys(&self) -> Vec<SharedString> {
+        self.markdown.0.keys().cloned().collect()
     }
 
     fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {

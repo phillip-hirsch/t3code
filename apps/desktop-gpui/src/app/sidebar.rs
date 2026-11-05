@@ -1548,9 +1548,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_draft(&self, project: Option<&ProjectShell>, tokens: &Tokens, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_draft(&self, project: Option<&ProjectShell>, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
         div()
+            .id("sidebar-draft")
+            .context_menu(self.draft_menu(cx))
             .py(px(2.))
             .child(
                 div().rounded(px(6.)).bg(sb.row_active).child(

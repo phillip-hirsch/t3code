@@ -3,8 +3,8 @@
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
 //! with the native dialog, then `projects.mutate`).
 //!
-//! Actions this client has no surface for (file picker, content search,
-//! themes, guest sharing, PR linking, triage, scratch threads, clone) are left out.
+//! Actions this client has no surface for yet (file picker, content search, guest sharing,
+//! PR linking, new project, clone, WSL folders, the theme editor, workspace focus) are left out.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,6 +20,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::pages::Page;
+use super::palette_actions::github_repository;
 use super::{Target, Workspace, new_id, project_name};
 use crate::inbox;
 use crate::model::ProjectShell;
@@ -38,6 +39,7 @@ pub(super) struct MessageMatch {
     pub(super) thread_id: String,
     pub(super) user: bool,
     pub(super) snippet: String,
+    pub(super) message_id: Option<String>,
     pub(super) at: Option<String>,
 }
 
@@ -56,6 +58,10 @@ pub(super) enum View {
     NewThreadIn,
     AddProject,
     Browse,
+    /// "Change theme" (`theme.select`).
+    Themes,
+    /// "Change appearance".
+    Appearance,
 }
 
 #[derive(Clone)]
@@ -68,6 +74,26 @@ enum Run {
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
+    /// Find in the open thread (`chat.find`).
+    Find,
+    /// A message hit: opens its thread with find on the query, at the message.
+    FindIn {
+        thread_id: String,
+        query: String,
+        message_id: Option<String>,
+    },
+    /// "New thread without a project" (`chat.newWithoutProject`).
+    ScratchThread,
+    Triage,
+    /// The composer's prompt as a link; `true` adds the repository and model.
+    CopyPromptLink(bool),
+    /// `thread.copyReference`.
+    CopyThread,
+    RestartSession,
+    /// Pins (`true`) or unpins these projects, a group's members.
+    PinProjects(Vec<String>, bool),
+    Theme(crate::themes::CardId),
+    Appearance(crate::settings::ThemePreference),
 }
 
 enum RowIcon {
@@ -92,6 +118,8 @@ struct Row {
     shortcut: Option<SharedString>,
     chevron: bool,
     run: Run,
+    /// Keywords that match besides the title (`searchTerms`).
+    terms: &'static [&'static str],
     /// Ranking, while a query is typed.
     quality: f32,
 }
@@ -108,6 +136,7 @@ impl Row {
             shortcut: None,
             chevron: false,
             run,
+            terms: &[],
             quality: 0.,
         }
     }
@@ -139,6 +168,8 @@ pub(super) struct Palette {
     browse: Browse,
     messages: MessageSearch,
     placeholder: &'static str,
+    /// The app is dark: the theme list marks the dark appearance's theme as current.
+    dark: bool,
     _subscription: Subscription,
 }
 
@@ -204,6 +235,7 @@ impl Workspace {
             browse: Browse::default(),
             messages: MessageSearch::default(),
             placeholder: "",
+            dark: crate::theme::tokens(cx).dark,
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -370,6 +402,7 @@ impl Workspace {
                             thread_id: m["threadId"].as_str()?.to_owned(),
                             user: m["source"] == "user",
                             snippet: m["snippet"].as_str()?.to_owned(),
+                            message_id: m["messageId"].as_str().map(str::to_owned),
                             at: m["messageCreatedAt"].as_str().map(str::to_owned),
                         })
                     })
@@ -408,59 +441,184 @@ impl Workspace {
             .collect()
     }
 
+    /// The live shortcut label of `command` (`shortcutCommand`).
+    fn shortcut(&self, command: &str) -> Option<SharedString> {
+        let keybindings = self.server_info.keybindings_json();
+        super::pages::settings::code::projects::scripts::shortcut_label_for_command(keybindings, Some(command))
+            .map(Into::into)
+    }
+
+    /// Actions in `CommandPalette.tsx` order.
     fn action_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         let current =
             self.current_project().or_else(|| inbox::most_recent_project(&self.shell.projects, &self.shell.threads));
+        let lucide = |key: &'static str, icon: IconName, title: &'static str, run: Run| {
+            Row::new(key, RowIcon::Lucide(icon), title, run)
+        };
         if let Some(project) = current {
-            let mut row = Row::new(
-                "new-thread-here",
-                RowIcon::Lucide(IconName::SquarePen),
-                "New thread in",
-                Run::NewThread(project.id.clone()),
-            );
+            let mut row =
+                lucide("new-thread-here", IconName::SquarePen, "New thread in", Run::NewThread(project.id.clone()));
             row.strong = Some(project_name(project));
-            row.shortcut = Some("Ctrl+Shift+N".into());
+            row.terms = &["new thread", "chat", "create", "draft"];
+            row.shortcut = self.shortcut("chat.newLocal");
             rows.push(row);
         }
         if !self.shell.projects.is_empty() {
-            let mut row = Row::new(
-                "new-thread-in",
-                RowIcon::Lucide(IconName::SquarePen),
-                "New thread in...",
-                Run::Open(View::NewThreadIn),
-            );
+            let mut row =
+                lucide("new-thread-in", IconName::SquarePen, "New thread in...", Run::Open(View::NewThreadIn));
             row.chevron = true;
+            row.terms = &["new thread", "project", "pick", "choose", "select"];
             rows.push(row);
         }
-        rows.push(Row::new(
-            "add-project",
-            RowIcon::Lucide(IconName::FolderPlus),
-            "Add project",
-            Run::Open(View::AddProject),
-        ));
-        rows.push(Row::new(
-            "pull-requests",
-            RowIcon::Lucide(IconName::GitPullRequestArrow),
-            "Open pull requests",
-            Run::Page(Page::PullRequests),
-        ));
-        let mut usage =
-            Row::new("usage", RowIcon::Lucide(IconName::ChartNoAxesColumn), "Open usage", Run::Page(Page::Usage));
-        usage.shortcut = Some("Ctrl+U".into());
-        rows.push(usage);
-        rows.push(Row::new("settings", RowIcon::Lucide(IconName::Settings), "Open settings", Run::Settings("general")));
-        if let Some(project) = current {
-            let mut row = Row::new(
-                "project-settings",
-                RowIcon::Lucide(IconName::Folder),
-                "Project settings",
-                Run::Settings("projects"),
+        if self.server_info.scratch_workspace_root.is_some() && self.client().is_some() {
+            let mut row = lucide(
+                "new-thread-without-project",
+                IconName::MessageSquareDashed,
+                "New thread without a project",
+                Run::ScratchThread,
             );
+            row.terms = &["new thread", "no project", "without project", "none", "chat"];
+            row.shortcut = self.shortcut("chat.newWithoutProject");
+            rows.push(row);
+        }
+        if self.server_info.capability("triage") {
+            let mut row = lucide("triage", IconName::Bug, "Triage an issue", Run::Triage);
+            row.description =
+                Some(Description::Text("An agent investigates a T3 Code problem and helps file an issue".into()));
+            row.terms = &["triage", "bug", "issue", "report", "broken", "debug", "help", "support"];
+            rows.push(row);
+        }
+        let thread = match &self.target {
+            Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id),
+            _ => None,
+        };
+        if thread.is_some() && self.thread_find_available() {
+            let mut row = lucide("find-current-thread", IconName::TextSearch, "Find in current thread", Run::Find);
+            row.terms = &["find", "search", "messages", "plans"];
+            row.shortcut = self.shortcut("chat.find");
+            rows.push(row);
+        }
+        if self.target.is_some() && !self.composer_empty {
+            let mut row = lucide("copy-prompt-link", IconName::Link, "Copy prompt link", Run::CopyPromptLink(false));
+            row.terms = &["copy", "share", "prompt", "link"];
+            rows.push(row);
+            if self.current_project().and_then(|p| p.repository_identity.as_ref()).and_then(github_repository).is_some()
+            {
+                let mut row = lucide(
+                    "copy-prompt-link-with-context",
+                    IconName::Link,
+                    "Copy prompt link with repo and model",
+                    Run::CopyPromptLink(true),
+                );
+                row.terms = &["copy", "share", "prompt", "link", "repository", "model"];
+                rows.push(row);
+            }
+        }
+        if let Some(thread) = thread {
+            let mut row = lucide("copy-thread-reference", IconName::Link, "Copy thread", Run::CopyThread);
+            row.description = Some(Description::Text(thread.title.clone().into()));
+            row.terms = &["copy", "thread", "thread id", "reference"];
+            row.shortcut = self.shortcut("thread.copyReference");
+            rows.push(row);
+            let mut row =
+                lucide("restart-agent-session", IconName::RotateCcw, "Restart agent session", Run::RestartSession);
+            row.terms = &["restart", "reset", "reload", "agent", "session", "skills", "plugins", "mcp"];
+            rows.push(row);
+        }
+        let mut row = lucide("add-project", IconName::FolderPlus, "Add project", Run::Open(View::AddProject));
+        row.terms = &["add project", "folder", "directory", "browse", "environment"];
+        rows.push(row);
+        let mut row = lucide("change-theme", IconName::Palette, "Change theme", Run::Open(View::Themes));
+        row.chevron = true;
+        row.terms = &["change theme", "appearance", "colors", "palette"];
+        row.shortcut = self.shortcut("theme.select");
+        rows.push(row);
+        let mut row = lucide("change-appearance", IconName::Monitor, "Change appearance", Run::Open(View::Appearance));
+        row.chevron = true;
+        row.terms = &["change appearance", "light", "dark", "system", "mode", "toggle"];
+        row.shortcut = self.shortcut("appearance.cycle");
+        rows.push(row);
+        let mut row =
+            lucide("pull-requests", IconName::GitPullRequestArrow, "Open pull requests", Run::Page(Page::PullRequests));
+        row.terms = &["pull requests", "prs", "pr", "review", "merge", "branch"];
+        rows.push(row);
+        let mut usage = lucide("usage", IconName::ChartNoAxesColumn, "Open usage", Run::Page(Page::Usage));
+        usage.terms = &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"];
+        usage.shortcut = self.shortcut("usage.open");
+        rows.push(usage);
+        let mut row = lucide("settings", IconName::Settings, "Open settings", Run::Settings("general"));
+        row.terms = &["settings", "preferences", "configuration", "keybindings"];
+        rows.push(row);
+        let groups = self.project_groups();
+        if let Some(group) = self.current_project().and_then(|p| groups.iter().find(|g| g.contains(&p.id))) {
+            let (title, icon) =
+                if group.pinned { ("Unpin project", IconName::PinOff) } else { ("Pin project", IconName::Pin) };
+            let ids = group.members.iter().map(|m| m.project.id.clone()).collect();
+            let mut row = lucide("project-pin", icon, title, Run::PinProjects(ids, !group.pinned));
+            row.description = Some(Description::Text(group.display_name.clone().into()));
+            row.terms = &["pin", "unpin", "project", "favorite"];
+            rows.push(row);
+        }
+        if let Some(project) = current {
+            let mut row = lucide("project-settings", IconName::Folder, "Project settings", Run::Settings("projects"));
             row.description = Some(Description::Text(project_name(project)));
+            row.terms = &[
+                "project",
+                "settings",
+                "name",
+                "icon",
+                "scripts",
+                "model",
+                "workspace",
+                "grouping",
+                "checkout",
+                "remove",
+                "t3.json",
+            ];
             rows.push(row);
         }
         rows
+    }
+
+    /// "Change theme" (`useCommandPaletteThemeItems`): the standard card, then the built-in themes.
+    fn theme_rows(&self, dark: bool) -> Vec<Row> {
+        let current = self.client_settings.theme_choice().owner(dark);
+        let cards = crate::themes::built_in().iter().map(|theme| {
+            let only = theme.single_appearance().map(|dark| if dark { "For dark mode" } else { "For light mode" });
+            (Some(theme.id.clone()), theme.label.clone(), only)
+        });
+        std::iter::once((None, "T3 Code".to_owned(), None))
+            .chain(cards)
+            .map(|(card, label, only)| {
+                let key = format!("theme:{}", card.as_deref().unwrap_or("standard"));
+                let mut row = Row::new(key, RowIcon::Lucide(IconName::Palette), label, Run::Theme(card.clone()));
+                row.description = only.map(|text| Description::Text(text.into()));
+                row.terms = &["theme", "appearance"];
+                row.time = (current == card).then(|| "Current".to_owned());
+                row
+            })
+            .collect()
+    }
+
+    fn appearance_rows(&self) -> Vec<Row> {
+        use crate::settings::ThemePreference as Mode;
+        let mode = self.client_settings.theme;
+        let options = [
+            (Mode::System, "System", IconName::Monitor),
+            (Mode::Light, "Light", IconName::Sun),
+            (Mode::Dark, "Dark", IconName::Moon),
+        ];
+        options
+            .into_iter()
+            .map(|(option, label, icon)| {
+                let key = format!("appearance:{}", option.id());
+                let mut row = Row::new(key, RowIcon::Lucide(icon), label, Run::Appearance(option));
+                row.terms = &["appearance", "mode"];
+                row.time = (mode == option).then(|| "Current".to_owned());
+                row
+            })
+            .collect()
     }
 
     fn thread_row(&self, thread: &crate::model::ThreadShell, now: i64) -> Row {
@@ -500,6 +658,12 @@ impl Workspace {
             View::NewThreadIn => {
                 let rows = self.new_thread_rows();
                 return vec![Group { label: "Projects", rows: rank_rows(rows, &tokens) }];
+            }
+            View::Themes => {
+                return vec![Group { label: "Change theme", rows: rank_rows(self.theme_rows(palette.dark), &tokens) }];
+            }
+            View::Appearance => {
+                return vec![Group { label: "Change appearance", rows: rank_rows(self.appearance_rows(), &tokens) }];
             }
             View::AddProject => {
                 let mut row = Row::new(
@@ -623,6 +787,11 @@ impl Workspace {
                 let thread = self.palette_threads().find(|t| t.id == m.thread_id)?;
                 let mut row = self.thread_row(thread, now);
                 row.key = format!("message-{}-{}", m.thread_id, m.at.as_deref().unwrap_or_default()).into();
+                row.run = Run::FindIn {
+                    thread_id: m.thread_id.clone(),
+                    query: super::find::query_for_message(&m.snippet, query),
+                    message_id: m.message_id.clone(),
+                };
                 let ranges = search::token_ranges(&m.snippet, query);
                 row.description = Some(Description::Snippet(m.user, search::split_ranges(&m.snippet, &ranges)));
                 row.time = m.at.as_deref().and_then(inbox::parse_ms).map(|at| ago(now - at));
@@ -737,6 +906,26 @@ impl Workspace {
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Page(page) => self.open_page(page, cx),
+            Run::Find => self.open_thread_find_or_explain(window, cx),
+            Run::ScratchThread => self.start_scratch_thread(None, window, cx),
+            Run::Triage => self.start_triage(window, cx),
+            Run::CopyPromptLink(with_context) => self.copy_prompt_link(with_context, window, cx),
+            Run::CopyThread => self.copy_thread_reference(window, cx),
+            Run::RestartSession => self.restart_agent_session(window, cx),
+            Run::PinProjects(ids, pinned) => self.set_projects_pinned(&ids, pinned, cx),
+            Run::Theme(card) => {
+                let mut choice = self.client_settings.theme_choice();
+                choice.use_card(card);
+                self.set_theme_choice(choice, window, cx);
+            }
+            Run::Appearance(mode) => {
+                let choice = crate::themes::ThemeChoice { mode, ..self.client_settings.theme_choice() };
+                self.set_theme_choice(choice, window, cx);
+            }
+            Run::FindIn { thread_id, query, message_id } => {
+                self.select_thread(thread_id, window, cx);
+                self.open_thread_find_on(&query, message_id, window, cx);
+            }
             Run::Open(_) | Run::BrowseTo(_) => {}
         }
     }
@@ -1270,6 +1459,7 @@ fn row_clone(row: &Row) -> Row {
         shortcut: row.shortcut.clone(),
         chevron: row.chevron,
         run: row.run.clone(),
+        terms: row.terms,
         quality: row.quality,
     }
 }
@@ -1283,8 +1473,11 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
                 Some(strong) => format!("{} {strong}", row.title),
                 None => row.title.to_string(),
             };
-            let field = Field::new(&title);
-            let found = search::match_fields(tokens, &[Weighted::new(&field, 1.)], typos)?;
+            // The title names the item; its terms are keywords, the best one counts.
+            let found = std::iter::once(title.as_str())
+                .chain(row.terms.iter().copied())
+                .filter_map(|text| search::match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos))
+                .max_by(|a, b| a.quality.total_cmp(&b.quality))?;
             row.quality = found.quality;
             Some((row, found.strong))
         })

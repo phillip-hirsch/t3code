@@ -136,7 +136,7 @@ impl Workspace {
     }
 
     /// `setProjectGroupPinned`: `projects.mutate project.update {pinned}` for every member.
-    pub(super) fn set_projects_pinned(&mut self, project_ids: &[String], pinned: bool, cx: &mut Context<Self>) {
+    pub(in crate::app) fn set_projects_pinned(&mut self, project_ids: &[String], pinned: bool, cx: &mut Context<Self>) {
         for project_id in project_ids {
             let mutation =
                 json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "pinned": pinned});
