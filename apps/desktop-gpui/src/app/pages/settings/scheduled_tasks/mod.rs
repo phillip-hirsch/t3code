@@ -61,9 +61,12 @@ pub(super) fn render(
     workspace.settings_page("scheduled-tasks", &settings, [view.into_any_element()], cx)
 }
 
+/// The task list, shared so a row or the editor holds a task without copying it.
+pub(super) type Tasks = Rc<[Rc<ScheduledTask>]>;
+
 enum Load {
     Loading,
-    Loaded(Rc<Vec<ScheduledTask>>),
+    Loaded(Tasks),
     Failed(SharedString),
 }
 
@@ -123,7 +126,9 @@ impl ScheduledTasksView {
                 let ended = matches!(event, StreamEvent::End(_));
                 let applied = this.update(cx, |this, cx| {
                     match event {
-                        StreamEvent::Item(value) => this.tasks = Load::Loaded(Rc::new(decode_tasks(&value))),
+                        StreamEvent::Item(value) => {
+                            this.tasks = Load::Loaded(decode_tasks(&value).into_iter().map(Rc::new).collect())
+                        }
                         // A dropped socket shows as disconnected; the next connection resubscribes.
                         StreamEvent::End(Ok(()) | Err(RpcError::Disconnected(_))) => {
                             this.subscribed = false;
@@ -184,14 +189,14 @@ impl ScheduledTasksView {
     }
 
     /// The loaded list, for the editor's "task no longer exists" check and live webhook state.
-    fn loaded_tasks(&self) -> Option<Rc<Vec<ScheduledTask>>> {
+    fn loaded_tasks(&self) -> Option<Tasks> {
         match &self.tasks {
             Load::Loaded(tasks) => Some(tasks.clone()),
             _ => None,
         }
     }
 
-    fn render_row(&self, task: &ScheduledTask, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
+    fn render_row(&self, task: &Rc<ScheduledTask>, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
         let busy = self.busy.contains(&task.id);
         let schedule = task.schedule();
         let webhook = schedule == logic::Schedule::Webhook;
@@ -217,9 +222,13 @@ impl ScheduledTasksView {
 
         let id = task.id.clone();
         let view = cx.entity();
-        let menu_task = Rc::new(task.clone());
+        let menu_task = Rc::clone(task);
         let client = client.clone();
-        let context = self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx));
+        let context = if webhook {
+            self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx))
+        } else {
+            None
+        };
         let menu = Button::new(SharedString::from(format!("scheduled-task-actions-{id}")))
             .ghost()
             .small()
@@ -260,7 +269,7 @@ impl ScheduledTasksView {
             });
 
         let enabled = task.enabled;
-        let toggle_task = task.clone();
+        let toggle_task = Rc::clone(task);
         let control = div()
             .flex()
             .items_center()
