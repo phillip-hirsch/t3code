@@ -1223,6 +1223,7 @@ impl Workspace {
                     })),
             )
             .when(thread.is_outdated, |el| el.child("outdated"))
+            .children(self.render_pr_fix_thread(thread, t, cx))
             .children(self.render_pr_thread_actions(thread, t, cx));
         let mut body = Vec::new();
         let mut reply_box = None;

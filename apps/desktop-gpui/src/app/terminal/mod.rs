@@ -156,7 +156,7 @@ fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> AnyView {
 impl Workspace {
     /// The thread terminals belong to now: the open thread, or the id the
     /// draft's thread will launch with (created on first use).
-    fn terminal_thread(&mut self, create: bool) -> Option<String> {
+    pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
         match self.target.as_ref()? {
             Target::Thread(id) => Some(id.clone()),
             Target::Draft { project_id } => match self.terminals.draft_threads.get(project_id) {

@@ -102,6 +102,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) last_merge_method: &'static str,
     /// Unsent reviews by pull request, kept across panels (`usePullRequestReviewStore`).
     pub(super) reviews: std::collections::HashMap<String, super::pull_request_detail::write::ReviewDraft>,
+    /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
+    pub(super) last_handoff: std::collections::HashMap<String, String>,
 }
 
 impl PullRequestsState {
@@ -142,6 +144,7 @@ impl PullRequestsState {
             panel: None,
             last_merge_method: "merge",
             reviews: std::collections::HashMap::new(),
+            last_handoff: std::collections::HashMap::new(),
         }
     }
 

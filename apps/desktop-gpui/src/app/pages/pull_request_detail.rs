@@ -36,6 +36,7 @@ use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
 
 mod code;
+mod handoff;
 mod header;
 pub(in crate::app) mod write;
 
@@ -101,6 +102,8 @@ pub(in crate::app) struct Panel {
     /// A maintainer-edits choice saved and not yet read back.
     maintainer_choice: Option<bool>,
     _picker_search: Option<Subscription>,
+    /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
+    handoff: Option<String>,
 }
 
 impl Panel {
@@ -147,6 +150,7 @@ impl Panel {
             maintainer_saving: false,
             maintainer_choice: None,
             _picker_search: None,
+            handoff: None,
         }
     }
 
@@ -807,6 +811,7 @@ impl Workspace {
             .children(self.render_pr_thread_count(t, cx))
             .children(self.render_pr_stack(detail, method, t, cx))
             .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
+            .child(self.render_pr_checkout(detail, t, cx))
             .child(self.render_pr_menu(detail, primary, method, guides, &view, t))
             .child(collapse_button(t, cx));
 
@@ -1058,8 +1063,8 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
-            // Resolving conflicts hands the checkout to an agent thread, which this panel cannot do yet.
-            Some(Primary::Resolve) | None => {}
+            Some(Primary::Resolve) => out.push(self.render_pr_resolve_conflicts(detail, t, cx)),
+            None => {}
         }
         out
     }
@@ -1086,6 +1091,8 @@ impl Workspace {
         let maintainer = logic::can_edit_maintainer_edits(detail)
             .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
         let can_link = logic::parse_change_request_url(&detail.url).is_some();
+        let handoff = panel.handoff.clone();
+        let can_fix = self.shell.projects.iter().any(|p| p.id == detail.project_id);
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1106,12 +1113,59 @@ impl Workspace {
                 let on = |f: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
                     window.listener_for(&view, move |this, _, window, cx| f(this, window, cx))
                 };
+                if can_link {
+                    menu = menu.item(
+                        PopupMenuItem::new("Link to thread")
+                            .icon(Lucide::Link)
+                            .on_click(on(|this, window, cx| this.open_pr_thread_picker(window, cx))),
+                    );
+                }
                 menu = menu.item(
                     PopupMenuItem::new("Refresh")
                         .icon(Lucide::RefreshCw)
                         .disabled(refreshing)
                         .on_click(on(|this, _, cx| this.refresh_pr_from_host(cx))),
                 );
+                let two_line = |label: String, note: String, icon: Lucide| {
+                    PopupMenuItem::element(move |_, cx| {
+                        let muted = theme::tokens(cx).muted_foreground;
+                        h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.))))
+                            .child(v_flex().child(label.clone()).child(div().text_xs().text_color(muted).child(note.clone())))
+                    })
+                };
+                let busy_handoff = handoff.is_some();
+                menu = menu
+                    .item(
+                        two_line(
+                            if handoff.as_deref() == Some("ask") { "Opening..." } else { "Ask a question" }.into(),
+                            format!("Opens a thread that knows which {term} you mean."),
+                            Lucide::MessageCircleQuestionMark,
+                        )
+                        .disabled(busy_handoff)
+                        .on_click(on(|this, window, cx| this.ask_about_pr(window, cx))),
+                    )
+                    .item(
+                        two_line(
+                            if handoff.as_deref() == Some("explain") { "Opening...".into() } else { format!("Explain this {short}") },
+                            "A walk through the diff and what to read closely.".into(),
+                            Lucide::BookOpen,
+                        )
+                        .disabled(busy_handoff)
+                        .on_click(on(|this, window, cx| this.explain_pr(window, cx))),
+                    )
+                    .item(
+                        PopupMenuItem::new(if handoff.as_deref() == Some("findings") {
+                            "Preparing..."
+                        } else {
+                            "Fix findings in a thread"
+                        })
+                        .icon(Lucide::Hammer)
+                        .disabled(busy_handoff || !can_fix)
+                        .on_click(on(|this, window, cx| this.fix_pr_findings(window, cx))),
+                    );
                 if guides {
                     let label = if guide_running {
                         "Writing guide..."
@@ -1125,13 +1179,6 @@ impl Workspace {
                             .icon(Lucide::Sparkles)
                             .disabled(guide_running)
                             .on_click(on(|this, window, cx| this.write_pr_guide(window, cx))),
-                    );
-                }
-                if can_link {
-                    menu = menu.item(
-                        PopupMenuItem::new("Link to thread")
-                            .icon(Lucide::Link)
-                            .on_click(on(|this, window, cx| this.open_pr_thread_picker(window, cx))),
                     );
                 }
                 menu = menu.separator();

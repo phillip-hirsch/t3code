@@ -792,6 +792,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// "Add to agent": the drafted lines and request go to a new thread instead of the review.
+    fn send_pr_draft_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.pr_write().and_then(|w| w.draft.take()) else { return };
+        let request = text_of(&draft.input, cx);
+        let lines = match (draft.start.map(Position::anchor), draft.position.anchor()) {
+            (Some((_, from)), (_, to)) if from != to => format!("L{from}-L{to}"),
+            (_, (side, line)) => {
+                format!("L{line}{}", if side == crate::pull_request_diff::Side::Left { " (before)" } else { "" })
+            }
+        };
+        self.add_pr_selection_to_agent(draft.path, lines, request, window, cx);
+    }
+
     /// `DiffCommentAnnotation kind="draft"`.
     pub(super) fn render_pr_line_draft(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let draft = self.pull_requests.panel.as_ref()?.write.draft.as_ref()?;
@@ -828,6 +841,12 @@ impl Workspace {
                                 cx.notify();
                             },
                         )))
+                        .child(
+                            xs_outline("pr-draft-agent", t)
+                                .disabled(empty)
+                                .child("Add to agent")
+                                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx))),
+                        )
                         .child(
                             Button::new("pr-draft-add")
                                 .primary()
@@ -897,7 +916,6 @@ impl Workspace {
         resolve.then(|| {
             let (id, resolved) = (thread.id.clone(), thread.is_resolved);
             ghost_button(ElementId::Name(format!("pr-thread-resolve:{id}").into()), t)
-                .ml_auto()
                 .disabled(panel.write.thread_pending)
                 .child(if resolved { "Unresolve" } else { "Resolve" })
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -905,6 +923,30 @@ impl Workspace {
                 }))
                 .into_any_element()
         })
+    }
+
+    /// "Fix in a thread" on a review conversation (`onFixFinding`).
+    pub(super) fn render_pr_fix_thread(
+        &self,
+        thread: &crate::pull_request_detail::ReviewThread,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let detail = panel.detail.as_ref()?;
+        self.shell.projects.iter().find(|p| p.id == detail.project_id)?;
+        let key = format!("finding:thread:{}", thread.id);
+        let preparing = panel.handoff.as_deref() == Some(key.as_str());
+        let thread = thread.clone();
+        Some(
+            ghost_button(ElementId::Name(format!("pr-thread-fix:{}", thread.id).into()), t)
+                .ml_auto()
+                .disabled(panel.write.thread_pending || panel.handoff.is_some())
+                .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
+                .child(if preparing { "Preparing..." } else { "Fix in a thread" })
+                .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_thread(&thread, window, cx)))
+                .into_any_element(),
+        )
     }
 
     fn set_pr_thread_resolved(
