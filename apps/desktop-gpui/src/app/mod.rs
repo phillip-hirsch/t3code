@@ -48,6 +48,7 @@ mod quit;
 mod right_panel;
 mod send;
 mod sidebar;
+mod subagents;
 mod terminal;
 mod thread_menu;
 mod thread_now;
@@ -219,6 +220,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
     _subscriptions: Vec<Subscription>,
 }
@@ -340,6 +342,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            subagents: Default::default(),
             banners: Default::default(),
             _subscriptions: subscriptions,
         }
@@ -555,6 +558,7 @@ impl Workspace {
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
                 this.sync_now(cx);
+                this.sync_child_approvals(cx);
             },
         ));
     }
@@ -694,6 +698,8 @@ impl Workspace {
         new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
+        self.sync_subagent_tick(cx);
+        self.sync_child_approvals(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);

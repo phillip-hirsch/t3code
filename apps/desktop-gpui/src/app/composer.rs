@@ -529,6 +529,9 @@ impl Workspace {
             .on_paste(move |item, window, cx| {
                 view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
             });
+        // A provider's own subagent runs on its own: its bar stands in for the composer.
+        let subagent_bar = self.render_provider_subagent_bar(&t, cx);
+        let subagent = subagent_bar.is_some();
         let surface = v_flex()
             .w_full()
             .rounded(px(16.))
@@ -548,24 +551,28 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
-                div().relative().child(editor).when(self.composer_empty, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .font_family(t.fonts.composer)
-                            .text_size(px(t.fonts.prompt_size))
-                            .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
-                            .text_color(t.muted_foreground)
-                            .truncate()
-                            .child(placeholder),
-                    )
-                }),
-            ))
-            .child(self.render_footer(&t, cx));
+            .children(subagent_bar)
+            .when(!subagent, |surface| {
+                surface
+                    .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
+                        div().relative().child(editor).when(self.composer_empty, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .font_family(t.fonts.composer)
+                                    .text_size(px(t.fonts.prompt_size))
+                                    .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
+                                    .text_color(t.muted_foreground)
+                                    .truncate()
+                                    .child(placeholder),
+                            )
+                        }),
+                    ))
+                    .child(self.render_footer(&t, cx))
+            });
         div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
@@ -575,6 +582,7 @@ impl Workspace {
                 .children(self.render_recovery_banner(&t, cx))
                 .children(self.render_branch_banner(&t, cx))
                 .children(self.render_question(&t, cx))
+                .children(self.render_child_approvals(&t, cx))
                 .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
                 .children(self.render_context_strip(&t, cx)),
         )

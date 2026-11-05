@@ -1141,6 +1141,16 @@ pub struct ExecutionNode {
     pub parent_node_id: Option<String>,
     #[serde(default)]
     pub root_node_id: Option<String>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
