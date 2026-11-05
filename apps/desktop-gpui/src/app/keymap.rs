@@ -20,6 +20,7 @@ const COMMANDS: &[(&str, fn() -> Box<dyn Action>)] = &[
     ("commandPalette.toggle", || Box::new(super::TogglePalette)),
     ("chat.new", || Box::new(super::NewThread)),
     ("chat.newLocal", || Box::new(super::NewThreadInProject)),
+    ("preview.toggle", || Box::new(super::TogglePreview)),
 ];
 
 /// The when-clause context (`ShortcutMatchContext` in `apps/web/src/keybindings.ts`).

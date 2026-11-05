@@ -15,6 +15,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 env_logger = "0.11"
 futures = "0.3"
 getrandom = "0.3"
+# The preview browser: a native WebView2 / WKWebView child of the GPUI window.
+gpui-webview = "0.9.0"
 # Code-block highlighting in chat markdown, for the languages agents use most.
 gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-bash",
@@ -34,6 +36,7 @@ gpui-kit = { version = "0.9.0", features = [
 hmac = "0.12"
 jiff = "0.2"
 log = "0.4"
+raw-window-handle = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 serde = { version = "1", features = ["derive", "rc"] }
 # Objects keep the server's key order, e.g. provider instances in the order they were added.
@@ -51,7 +54,11 @@ tokio = { version = "1", features = [
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # Emoji and monogram graphemes in the project icon picker.
 unicode-segmentation = "1"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
+wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"
 win32job = "2"

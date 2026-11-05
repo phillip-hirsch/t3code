@@ -8,6 +8,7 @@ mod model;
 mod model_label;
 mod new_thread;
 mod pull_requests;
+mod preview;
 mod requests;
 mod rpc;
 mod settings;
@@ -35,6 +36,12 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn main() {
+    // WebView2 is a child window; GPUI's DirectComposition swap chain would cover it.
+    #[cfg(windows)]
+    // SAFETY: set before any other thread starts.
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     gpui_kit::application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
