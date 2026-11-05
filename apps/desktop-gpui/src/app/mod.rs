@@ -571,15 +571,8 @@ impl Workspace {
             self.set_primary_connection(None, None);
             self.preview.disconnect();
             if self.target_on_primary() {
-                self.setup.disconnect();
-                self.details = inspector::Details::default();
+                self.end_target_streams();
             }
-            if self.target_on_primary()
-                && let Some(thread) = &mut self.thread
-            {
-                thread._subscription = None;
-            }
-            self.side_chat.disconnect();
             self.unfollow_pull_requests();
         }
         self.connection = connection;

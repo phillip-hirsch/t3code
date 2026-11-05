@@ -259,11 +259,25 @@ impl Workspace {
         let Some(session) = self.session_mut(&environment_id) else { return };
         session._streams = streams;
         session.device_state = None;
-        // The open thread on this environment resumes on the new socket.
+        // The open target's streams on this environment resume on the new socket.
         if self.active_environment() == Some(&environment_id) {
+            self.end_target_streams();
             self.subscribe_thread(window, cx);
+            self.sync_worktree_setup(cx);
+            self.sync_details(cx);
         }
         self.subscribe_shell(environment_id, window, cx);
+    }
+
+    /// Ends the open target's own streams (thread, worktree setup, tool output, side chat)
+    /// with the socket they ran on; each guard then lets the next connection start them again.
+    pub(super) fn end_target_streams(&mut self) {
+        if let Some(thread) = &mut self.thread {
+            thread._subscription = None;
+        }
+        self.setup.disconnect();
+        self.details = super::inspector::Details::default();
+        self.side_chat.disconnect();
     }
 
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
@@ -335,6 +349,7 @@ impl Workspace {
             connections.push((id, socket, environment.endpoint()));
         }
         let mut started = Vec::new();
+        let mut closed = false;
         for (id, socket, endpoint) in connections {
             let index = match self.session_index(&id) {
                 Some(index) => index,
@@ -352,8 +367,15 @@ impl Workspace {
                     started.push(id);
                 }
                 Some(_) => {}
-                None => session.disconnect(),
+                None if session.is_connected() => {
+                    session.disconnect();
+                    closed |= self.active_environment() == Some(&id);
+                }
+                None => {}
             }
+        }
+        if closed {
+            self.end_target_streams();
         }
         let removed: Vec<SharedString> = self.sessions[PRIMARY + 1..]
             .iter()
