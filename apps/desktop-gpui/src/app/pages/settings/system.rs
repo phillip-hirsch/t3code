@@ -548,14 +548,7 @@ fn now_ms() -> i64 {
 
 /// `formatRelativeTimeLabel` (`apps/web/src/timestampFormat.ts`).
 fn relative_label(iso: &str, now_ms: i64) -> String {
-    let Some(at) = crate::inbox::parse_ms(iso) else { return String::new() };
-    let minutes = (now_ms - at).max(0) / 60_000;
-    match minutes {
-        0 => "just now".into(),
-        1..60 => format!("{minutes}m ago"),
-        60..1440 => format!("{}h ago", minutes / 60),
-        _ => format!("{}d ago", minutes / 1440),
-    }
+    crate::inbox::parse_ms(iso).map_or_else(String::new, |at| super::ago_label(now_ms - at))
 }
 
 /// `formatBytes` (`apps/web/src/lib/formatBytes.ts`).

@@ -132,7 +132,7 @@ impl ScheduledTasksView {
                         }
                         StreamEvent::End(Err(error)) => {
                             this.subscribed = false;
-                            this.tasks = Load::Failed(error_message(&error).into());
+                            this.tasks = Load::Failed(error.message().into());
                         }
                     }
                     cx.notify();
@@ -170,7 +170,7 @@ impl ScheduledTasksView {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy.remove(&id);
                 if let Err(error) = result {
-                    notify_error(window, cx, "Could not update scheduled task", error_message(&error));
+                    notify_error(window, cx, "Could not update scheduled task", error.message());
                 }
                 cx.notify();
             });
@@ -330,14 +330,6 @@ impl Render for ScheduledTasksView {
 
         let rows = body.into_iter().map(|row| row.render(&t).into_any_element());
         section_with_action("scheduled-tasks", "Scheduled tasks", Some(new_task.into_any_element()), rows, &t)
-    }
-}
-
-/// `squashAtomCommandFailure`: the server's message without its error tag.
-fn error_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(value) => value["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
     }
 }
 

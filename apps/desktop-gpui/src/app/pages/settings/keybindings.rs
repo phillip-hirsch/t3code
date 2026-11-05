@@ -842,7 +842,7 @@ impl KeybindingsPanel {
                         } else {
                             ("Unable to save keybinding", "The keybinding was not saved.")
                         };
-                        let message = error.to_string();
+                        let message = error.message();
                         let message = if message.is_empty() { fallback.to_owned() } else { message };
                         window.push_notification(Notification::error(message).title(title), cx);
                     }
@@ -1692,7 +1692,7 @@ pub(in crate::app) fn open_keybindings_file(
             if let Err(error) = client.request("shell.openInEditor", payload).await {
                 let _ = cx.update(|window, cx| {
                     window.push_notification(
-                        Notification::error(error.to_string()).title("Unable to open keybindings file"),
+                        Notification::error(error.message()).title("Unable to open keybindings file"),
                         cx,
                     )
                 });

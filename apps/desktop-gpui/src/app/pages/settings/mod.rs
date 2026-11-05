@@ -282,6 +282,14 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Agent browser access", &["enableAgentBrowserAccess"]),
 ];
 
+/// `formatRelativeTimeLabel` for a past time: "just now", "5m ago", "3h ago", "2d ago".
+fn ago_label(elapsed_ms: i64) -> String {
+    match crate::inbox::format_relative(elapsed_ms) {
+        now if now == "now" => "just now".into(),
+        label => format!("{label} ago"),
+    }
+}
+
 fn restorable(key: &str) -> bool {
     let contract = contract();
     contract.server_defaults.contains_key(key) || contract.client_defaults.contains_key(key)

@@ -461,13 +461,7 @@ pub(in crate::app) fn relative_label(value: Option<&str>, now_ms: i64) -> String
     };
     let diff_ms = at.timestamp_millis() - now_ms;
     if diff_ms <= 0 {
-        let minutes = -diff_ms / 60_000;
-        return match minutes {
-            0 => "just now".into(),
-            1..60 => format!("{minutes}m ago"),
-            60..1440 => format!("{}h ago", minutes / 60),
-            _ => format!("{}d ago", minutes / 1440),
-        };
+        return crate::app::pages::settings::ago_label(-diff_ms);
     }
     let minutes = (diff_ms + 59_999) / 60_000;
     if minutes < 2 {

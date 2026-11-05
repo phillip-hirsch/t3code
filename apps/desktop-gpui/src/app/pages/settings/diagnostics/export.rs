@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use super::super::connections::logic::SETTINGS_WRITE;
 use super::super::connections::ui::{Variant, WebButton};
 use super::super::widgets::{SettingsView, section_with_action};
-use super::{DiagnosticsState, rpc_message, success};
+use super::{DiagnosticsState, success};
 use crate::app::Workspace;
 use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
@@ -337,7 +337,7 @@ impl Workspace {
                                 match result {
                                     Ok(_) => s.export.message = Some("Saved. Restart the server to apply."),
                                     Err(error) => window.push_notification(
-                                        gpui_kit::component::notification::Notification::error(rpc_message(&error))
+                                        gpui_kit::component::notification::Notification::error(error.message())
                                             .title("Could not save settings"),
                                         cx,
                                     ),

@@ -53,6 +53,19 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+impl RpcError {
+    /// What the web shows for a failed request: a typed failure's `message` without its
+    /// tag (`squashAtomCommandFailure`), else this error's description.
+    pub fn message(&self) -> String {
+        match self {
+            RpcError::Failure(failure) => {
+                failure.get("message").and_then(Value::as_str).map_or_else(|| self.to_string(), str::to_owned)
+            }
+            _ => self.to_string(),
+        }
+    }
+}
+
 /// One stream element, or the end of the stream.
 #[derive(Debug)]
 pub enum StreamEvent {

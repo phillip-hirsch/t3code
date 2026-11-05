@@ -34,12 +34,13 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::logic::relative_label;
 use super::webhook_logic::{
     self, Encoding, FilterDraft, FilterOp, FormError, MAX_WEBHOOK_FILTERS, Tone, WebhookDraft, delivery_label,
-    delivery_tone, relative_label,
+    delivery_tone,
 };
 use crate::app::Workspace;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
 pub(super) use webhook_logic::DEFAULT_WEBHOOK_PROMPT;
@@ -294,7 +295,7 @@ impl WebhookFields {
                 this.rotating = false;
                 match result {
                     Ok(result) => this.set_task(Some(result["task"].clone()), window, cx),
-                    Err(error) => toast(window, cx, "Could not rotate webhook URL", &rpc_message(&error)),
+                    Err(error) => toast(window, cx, "Could not rotate webhook URL", &error.message()),
                 }
                 cx.notify();
             });
@@ -587,7 +588,7 @@ impl Deliveries {
                         this.list = Some(result["deliveries"].as_array().cloned().unwrap_or_default());
                         this.list_error = None;
                     }
-                    Err(error) => this.list_error = Some(rpc_message(&error).into()),
+                    Err(error) => this.list_error = Some(error.message().into()),
                 }
                 cx.notify();
             });
@@ -604,7 +605,7 @@ impl Deliveries {
                 if let Some(selected) = &mut this.selected {
                     match result {
                         Ok(result) => selected.delivery = Some(result["delivery"].clone()),
-                        Err(error) => selected.error = Some(rpc_message(&error).into()),
+                        Err(error) => selected.error = Some(error.message().into()),
                     }
                 }
                 cx.notify();
@@ -852,12 +853,4 @@ fn outline_button(id: impl Into<gpui_kit::ElementId>) -> Button {
 
 fn toast(window: &mut Window, cx: &mut App, title: &'static str, description: &str) {
     window.push_notification(Notification::error(description.to_owned()).title(title), cx);
-}
-
-/// The handler's message without its error tag, like `squashAtomCommandFailure`.
-fn rpc_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(failure) => failure["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
-    }
 }

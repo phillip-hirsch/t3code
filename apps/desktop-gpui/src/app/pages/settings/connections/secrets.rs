@@ -15,9 +15,9 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section};
-use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft, Session};
+use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{auth_request, error_toast, update_settings};
+use super::{SessionLoad, check_session, error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::RpcClient;
@@ -27,7 +27,7 @@ use crate::theme::{self, Tokens};
 #[derive(Default)]
 pub(super) struct SecretsState {
     started: bool,
-    session: Option<Session>,
+    session: SessionLoad,
     revealed: HashSet<String>,
     _session_task: Option<Task<()>>,
 }
@@ -40,18 +40,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = window.use_keyed_state("settings-secrets", cx, |_, _| SecretsState::default());
-        let endpoint = self.endpoint.clone();
-        if self.client().is_some() && !state.read(cx).started {
+        if let Some(endpoint) = self.endpoint.clone().filter(|_| self.client().is_some() && !state.read(cx).started) {
             state.update(cx, |state, cx| {
                 state.started = true;
-                state._session_task = Some(cx.spawn(async move |this, cx| {
-                    let session = auth_request(endpoint, "/api/auth/session", None).await;
-                    let _ = this.update(cx, |this, cx| {
-                        // A failed check reads as no grant, like `resolveRemoteOperateAccess`.
-                        this.session = Some(session.map(|v| Session::from_json(&v)).unwrap_or_default());
-                        cx.notify();
-                    });
-                }));
+                state._session_task = Some(check_session(endpoint, cx, |this, session, _| this.session = session));
             });
         }
         let t = *theme::tokens(cx);
@@ -74,7 +66,7 @@ impl Workspace {
     fn secret_providers(&self, state: &Entity<SecretsState>, environment: String, cx: &App, t: &Tokens) -> AnyElement {
         let s = state.read(cx);
         // Provider settings and secret providers need the same grant.
-        let read_only = !s.session.as_ref().is_some_and(|session| session.grants(PROVIDERS_MANAGE));
+        let read_only = !s.session.grants(PROVIDERS_MANAGE);
         let providers = self.server_settings()["secretProviders"].as_object().cloned().unwrap_or_default();
         let ids: Vec<String> = providers.keys().cloned().collect();
         let client = self.client();

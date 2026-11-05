@@ -24,27 +24,15 @@ use serde_json::{Value, json};
 use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
-    Session,
 };
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
-use super::{auth_request, error_toast, success_toast, update_settings};
+use super::{SessionLoad, auth_request, check_session, error_toast, success_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
 use crate::rpc::{RpcClient, StreamEvent};
 use crate::theme::{self, Tokens};
-
-const SESSION_RETRY: Duration = Duration::from_secs(5);
-
-/// The session check: pending, answered, or failed (and retrying).
-#[derive(Default)]
-enum SessionLoad {
-    #[default]
-    Pending,
-    Ready(Session),
-    Failed,
-}
 
 /// Everything the access page holds while it is open.
 #[derive(Default)]
@@ -77,30 +65,11 @@ impl AccessState {
             return;
         }
         self.started = true;
-        self._session_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let result = auth_request(Some(endpoint.clone()), "/api/auth/session", None).await;
-                let ready = result.is_ok();
-                let Ok(()) = this.update(cx, |this, cx| {
-                    match result {
-                        Ok(value) => {
-                            let session = Session::from_json(&value);
-                            if session.grants(ACCESS_READ) {
-                                this.subscribe(client.clone(), cx);
-                            }
-                            this.session = SessionLoad::Ready(session);
-                        }
-                        Err(_) => this.session = SessionLoad::Failed,
-                    }
-                    cx.notify();
-                }) else {
-                    return;
-                };
-                if ready {
-                    return;
-                }
-                cx.background_executor().timer(SESSION_RETRY).await;
+        self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
+            if session.grants(ACCESS_READ) {
+                this.subscribe(client.clone(), cx);
             }
+            this.session = session;
         }));
     }
 
@@ -162,7 +131,7 @@ impl AccessState {
     }
 
     fn grants(&self, scope: &str) -> bool {
-        matches!(&self.session, SessionLoad::Ready(session) if session.grants(scope))
+        self.session.grants(scope)
     }
 }
 
@@ -209,7 +178,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
             let result = auth_request(endpoint, path, Some(body)).await;
             let _ = cx.update(|window, cx| {
                 let _ = state.update(cx, |state, cx| {
-                    match target {
+                    match &target {
                         Revoke::Link(_) => state.revoking_link = None,
                         Revoke::Client(_) => state.revoking_session = None,
                         Revoke::Others => state.revoking_others = false,
@@ -221,7 +190,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
                     cx.notify();
                 });
                 match result {
-                    Ok(value) if path.ends_with("revoke-others") => {
+                    Ok(value) if matches!(target, Revoke::Others) => {
                         let count = value["revokedCount"].as_u64().unwrap_or(0);
                         let title = if count == 1 {
                             "Revoked 1 other client".to_owned()

@@ -16,9 +16,9 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action};
-use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone, Session};
+use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{auth_request, error_toast, success_toast};
+use super::{SessionLoad, check_session, error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
@@ -28,7 +28,7 @@ use crate::theme::{self, Tokens};
 #[derive(Default)]
 pub(super) struct EnvironmentsState {
     started: bool,
-    session: Option<Session>,
+    session: SessionLoad,
     /// `peerLinks.list`: `None` while loading.
     links: Option<Result<Vec<Value>, String>>,
     forgetting: Option<String>,
@@ -59,21 +59,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = window.use_keyed_state("settings-environments", cx, |_, _| EnvironmentsState::default());
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
-        if client.is_some() && !state.read(cx).started {
+        let started = state.read(cx).started;
+        if let (Some(client), Some(endpoint), false) = (self.client(), self.endpoint.clone(), started) {
             state.update(cx, |state, cx| {
                 state.started = true;
-                let client = client.clone();
-                state._tasks.push(cx.spawn(async move |this, cx| {
-                    let session = auth_request(endpoint, "/api/auth/session", None).await;
-                    let _ = this.update(cx, |this, cx| {
-                        let session = session.map(|v| Session::from_json(&v)).unwrap_or_default();
-                        if session.grants(ACCESS_READ) {
-                            this.load_links(client, cx);
-                        }
-                        this.session = Some(session);
-                        cx.notify();
-                    });
+                state._tasks.push(check_session(endpoint, cx, move |this, session, cx| {
+                    if session.grants(ACCESS_READ) {
+                        this.load_links(Some(client.clone()), cx);
+                    }
+                    this.session = session;
                 }));
             });
         }
@@ -81,7 +75,7 @@ impl Workspace {
         let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
         let info = &self.server_info;
         let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
-        let readable = state.read(cx).session.as_ref().is_some_and(|s| s.grants(ACCESS_READ));
+        let readable = state.read(cx).session.grants(ACCESS_READ);
         if offers_links && readable && self.client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));
         }
@@ -90,8 +84,7 @@ impl Workspace {
 
     fn linked_environments(&self, state: &Entity<EnvironmentsState>, cx: &App, t: &Tokens) -> AnyElement {
         let s = state.read(cx);
-        let session = s.session.as_ref();
-        let can_link = session.is_some_and(|s| s.grants(ACCESS_WRITE));
+        let can_link = s.session.grants(ACCESS_WRITE);
         let client = self.client();
         let action = can_link.then(|| {
             let (client, state) = (client.clone(), state.downgrade());

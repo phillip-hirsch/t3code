@@ -8,7 +8,6 @@ use serde_json::{Map, Value, json};
 
 use crate::app::Workspace;
 use crate::model::{ProjectScript, ProjectShell, ServerInfo, T3ProjectFile, T3ProjectFileScript};
-use crate::rpc::RpcError;
 
 const MAX_SCRIPT_ID_LENGTH: usize = 24;
 const MAX_KEYBINDING_LENGTH: usize = 64;
@@ -491,15 +490,6 @@ pub(super) fn importable_scripts<'a>(
         .collect()
 }
 
-/// The message a toast or form shows for a failed request (`error.message`).
-pub(super) fn rpc_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(value) => value.get("message").and_then(Value::as_str).map(str::to_owned),
-        _ => None,
-    }
-    .unwrap_or_else(|| error.to_string())
-}
-
 impl Workspace {
     fn project(&self, project_id: &str) -> Option<&ProjectShell> {
         self.shell.projects.iter().find(|project| project.id == project_id)
@@ -526,13 +516,13 @@ impl Workspace {
             let settings = client
                 .request("server.updateSettings", json!({"patch": write.patch}))
                 .await
-                .map_err(|e| rpc_message(&e))?;
+                .map_err(|e| e.message())?;
             let _ = this.update(cx, |this, cx| {
                 let _ = this.server_info.apply(&json!({"type": "settingsUpdated", "payload": {"settings": settings}}));
                 cx.notify();
             });
             for (method, input) in write.bindings {
-                let result = client.request(method, input).await.map_err(|e| rpc_message(&e))?;
+                let result = client.request(method, input).await.map_err(|e| e.message())?;
                 let _ = this.update(cx, |this, cx| {
                     let event =
                         json!({"type": "keybindingsUpdated", "payload": {"keybindings": result["keybindings"]}});

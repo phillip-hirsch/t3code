@@ -21,16 +21,15 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, px,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
+use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
 use crate::app::{Target, Workspace, new_id};
 use crate::settings::scope::ScopeKind;
@@ -65,11 +64,6 @@ impl ProjectsPanel {
             subscriptions,
         }
     }
-}
-
-pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    let text = text.into();
-    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
 
 fn toast_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString>, message: impl Into<SharedString>) {
@@ -295,7 +289,7 @@ impl Workspace {
                     command.extend(fields);
                 }
                 if let Err(error) = client.request("projects.mutate", command).await {
-                    failure = Some(error.to_string());
+                    failure = Some(error.message());
                     break;
                 }
             }
@@ -411,7 +405,7 @@ impl Workspace {
                 let result = client.request("projects.mutate", command).await;
                 let failed = this.update_in(cx, |this, window, cx| {
                     if let Err(error) = result {
-                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error.to_string());
+                        toast_error(window, cx, format!("Failed to remove \"{title}\""), error.message());
                         return true;
                     }
                     // The project's draft goes with it.

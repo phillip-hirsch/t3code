@@ -21,13 +21,66 @@ pub(super) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{AnyElement, App, Context, SharedString, Window};
+use gpui_kit::{AnyElement, App, Context, SharedString, Task, Window};
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
+
+use self::logic::Session;
+
+/// How long a failed session check waits before it asks again.
+const SESSION_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This client's `/api/auth/session` answer, as a page sees it.
+#[derive(Default)]
+pub(super) enum SessionLoad {
+    #[default]
+    Pending,
+    Ready(Session),
+    /// The check failed; it is retried.
+    Failed,
+}
+
+impl SessionLoad {
+    pub(super) fn session(&self) -> Option<&Session> {
+        match self {
+            Self::Ready(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// A failed or pending check grants nothing, like `resolveRemoteOperateAccess`.
+    pub(super) fn grants(&self, scope: &str) -> bool {
+        self.session().is_some_and(|session| session.grants(scope))
+    }
+}
+
+/// The session check every page that gates on grants uses: `apply` gets each answer, and a
+/// failure is retried every few seconds until one succeeds or the task is dropped.
+pub(super) fn check_session<T: 'static>(
+    endpoint: Endpoint,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, SessionLoad, &mut Context<T>) + 'static,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            let result = auth_request(Some(endpoint.clone()), "/api/auth/session", None).await;
+            let ready = result.is_ok();
+            let load = result.map_or(SessionLoad::Failed, |value| SessionLoad::Ready(Session::from_json(&value)));
+            let applied = this.update(cx, |this, cx| {
+                apply(this, load, cx);
+                cx.notify();
+            });
+            if ready || applied.is_err() {
+                return;
+            }
+            cx.background_executor().timer(SESSION_RETRY).await;
+        }
+    })
+}
 
 impl Workspace {
     pub(super) fn render_settings_connections(
@@ -88,10 +141,11 @@ pub(super) async fn auth_request(
             .await
             .map_err(|error| error.to_string())?;
         let status = response.status();
-        let value: Value = response.json().await.unwrap_or(Value::Null);
+        let value = response.json::<Value>().await;
         if status.is_success() {
-            Ok(value)
+            value.map_err(|error| format!("The environment sent an unreadable response to {path}: {error}"))
         } else {
+            let value = value.unwrap_or(Value::Null);
             Err(value["message"].as_str().map_or_else(|| format!("Request failed ({status})."), str::to_owned))
         }
     };

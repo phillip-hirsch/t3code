@@ -24,7 +24,7 @@ use super::logic::{
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
 use super::worktree_mode::{self, NewWorktreeMode};
-use super::{ScheduledTasksView, error_message, notify_error};
+use super::{ScheduledTasksView, notify_error};
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
 use crate::app::pages::settings::widgets::select_trigger;
@@ -390,7 +390,7 @@ impl TaskEditor {
                     Ok(_) => window.close_dialog(cx),
                     Err(error) => {
                         this.submission_pending = false;
-                        notify_error(window, cx, "Could not save scheduled task", error_message(&error));
+                        notify_error(window, cx, "Could not save scheduled task", error.message());
                     }
                 }
                 cx.notify();

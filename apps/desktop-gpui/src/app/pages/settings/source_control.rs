@@ -30,7 +30,7 @@ use super::super::model_select::{generates_text, muted, resolve_text_generation}
 use super::super::widgets::{SettingRow, SettingsView, section_with_action, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
 const MERGE_METHODS: &[(&str, &str)] =
@@ -174,13 +174,6 @@ fn some(value: &Value) -> Option<&str> {
 /// A saved credential: a non-empty (redacted) literal, or a secret reference.
 fn has_secret(value: &Value) -> bool {
     value.as_str().map_or(!value.is_null(), |text| !text.is_empty())
-}
-
-fn failure_message(error: &RpcError) -> String {
-    match error {
-        RpcError::Failure(failure) => failure["message"].as_str().map_or_else(|| error.to_string(), str::to_owned),
-        _ => error.to_string(),
-    }
 }
 
 /// `redactedPlaceholder`: the same length and punctuation, other characters scrambled stably.
@@ -340,7 +333,7 @@ impl SourceControlState {
                         this.discovery = Some(result);
                         this.error = None;
                     }
-                    Err(error) => this.error = Some(failure_message(&error)),
+                    Err(error) => this.error = Some(error.message()),
                 }
                 this.pending = false;
                 cx.notify();
@@ -1044,7 +1037,7 @@ impl Workspace {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     let _ = state.update(cx, |state, cx| {
-                        state.sign_in = SignIn::Failed(failure_message(&error));
+                        state.sign_in = SignIn::Failed(error.message());
                         cx.notify();
                     });
                     return;
@@ -1065,7 +1058,7 @@ impl Workspace {
                 if matches!(&state.sign_in, SignIn::Waiting { user_code: code, .. } if *code == user_code) {
                     state.sign_in = match &finished {
                         Ok(_) => SignIn::Idle,
-                        Err(error) => SignIn::Failed(failure_message(error)),
+                        Err(error) => SignIn::Failed(error.message()),
                     };
                     cx.notify();
                 }
