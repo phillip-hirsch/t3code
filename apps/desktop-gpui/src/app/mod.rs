@@ -76,6 +76,7 @@ pub struct Workspace {
     /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
     expanded: HashSet<SharedString>,
     entry_cache: timeline::EntryCache,
+    markdown: chat::MarkdownStates,
     /// Repaints the "Working for …" timer once a second while a turn runs.
     _working_tick: Option<Task<()>>,
     scroller: Entity<MessageScrollerState>,
@@ -149,6 +150,7 @@ impl Workspace {
             rows: Rc::default(),
             expanded: HashSet::new(),
             entry_cache: timeline::EntryCache::default(),
+            markdown: chat::MarkdownStates::default(),
             _working_tick: None,
             scroller,
             composer,
@@ -558,6 +560,7 @@ impl Workspace {
         self.rows = Rc::default();
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
+        self.markdown = chat::MarkdownStates::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
     }

@@ -2,19 +2,20 @@
 //! colors follow `apps/web/src/components/chat/MessagesTimeline.tsx`, `WorkLog.tsx`
 //! and `index.css` (`.chat-markdown`).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::message_scroller::MessageScroller;
-use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, ElementId, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, WeakEntity, Window, div, linear_color_stop, linear_gradient,
-    prelude::FluentBuilder as _, px, relative, rems,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, ElementId, Entity, FontWeight,
+    HighlightStyle, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, WeakEntity, Window, div,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rems,
 };
 
 use gpui_kit::assets::IconName;
@@ -74,6 +75,31 @@ impl Workspace {
         }
     }
 
+    /// The parsed markdown for `key`, kept across frames; see [`MarkdownStates`].
+    fn markdown_state(
+        &mut self,
+        key: SharedString,
+        text: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        if let Some(state) = self.markdown.0.get_mut(&key) {
+            if state.text != *text {
+                state.text = text.clone();
+                state.view.update(cx, |view, cx| view.set_text(text, cx));
+            }
+            return state.view.clone();
+        }
+        let view = cx.new(|cx| TextViewState::markdown(text, cx));
+        let row_key = key.clone();
+        let _changed = cx.observe(&view, move |this, _, cx| {
+            if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
+                this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+            }
+        });
+        self.markdown.0.insert(key, MarkdownState { view: view.clone(), text: text.clone(), _changed });
+        view
+    }
+
     /// Opens or closes a work group, turn fold or entry.
     fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
         if !self.expanded.remove(&key) {
@@ -98,6 +124,52 @@ impl Workspace {
                 }
             }));
         }
+    }
+}
+
+/// Each message's markdown, owned here instead of in GPUI's per-frame element
+/// state. That state drops when a row leaves the list's rendered range, and a
+/// document over 4 KiB parses on a background thread, so a row measured off
+/// screen reported a near-empty height that the list kept: the scroll extent
+/// came up short, the tail never resumed and "Scroll to end" stuck. Owned, a
+/// parse survives scrolling, and a landed parse remeasures its row.
+#[derive(Default)]
+pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>);
+
+struct MarkdownState {
+    view: Entity<TextViewState>,
+    text: SharedString,
+    _changed: Subscription,
+}
+
+/// The key a row's markdown is cached under: its message id, or `thought:{entry}`.
+fn thought_key(entry_id: &str) -> SharedString {
+    format!("thought:{entry_id}").into()
+}
+
+fn shows_markdown(row: &Row, key: &str) -> bool {
+    match row {
+        Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
+        Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought_key(&entry.id) == key,
+        Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
+            entries.iter().any(|(entry, _)| thought_key(&entry.id) == key)
+        }
+        _ => false,
+    }
+}
+
+/// `ChatMarkdown` for `text`, parsed once per `key` for as long as the thread is open.
+fn markdown(
+    this: &WeakEntity<Workspace>,
+    key: SharedString,
+    text: &SharedString,
+    streaming: bool,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    match this.update(cx, |workspace, cx| workspace.markdown_state(key, text, cx)) {
+        Ok(state) => markdown_view(&state, streaming, t).into_any_element(),
+        Err(_) => div().into_any_element(),
     }
 }
 
@@ -258,7 +330,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(alpha(t.foreground, 0.9))
-                .child(markdown(id, text, *streaming, &t));
+                .child(markdown(this, id.clone(), text, *streaming, &t, cx));
             // The finished reply's copy row (`AssistantMessageMeta`) holds its space while hidden.
             let meta = terminal.then(|| {
                 h_flex()
@@ -272,7 +344,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, _: &mut Window, cx: &mut 
                 .into_any_element()
         }
         Row::Plan { id, markdown: text } => plan_card(id, text, this, cx, &t),
-        Row::Work(work) => work_row(work, this, &t),
+        Row::Work(work) => work_row(work, this, &t, cx),
         Row::Working { started_at } => {
             let label = match started_at.as_deref().and_then(work_log::parse_iso_ms) {
                 Some(start) => format!("Working for {}", working_duration(now_ms() - start)),
@@ -432,7 +504,7 @@ fn copy_button(id: String, text: SharedString, t: &Tokens) -> impl IntoElement {
         .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
 }
 
-fn markdown(id: &SharedString, text: &SharedString, streaming: bool, t: &Tokens) -> TextView {
+fn markdown_view(state: &Entity<TextViewState>, streaming: bool, t: &Tokens) -> TextView {
     let inline_code = StyleRefinement::default()
         .bg(alpha(t.foreground, 0.1))
         .rounded(px(4.))
@@ -441,7 +513,7 @@ fn markdown(id: &SharedString, text: &SharedString, streaming: bool, t: &Tokens)
         .text_size(px(11.9));
     let label_color = alpha(t.foreground, 0.72);
     let button_hover = t.accent;
-    TextView::markdown(ElementId::Name(id.clone()), text.clone())
+    TextView::new(state)
         .style(markdown_style(t))
         .inline_code_style(inline_code)
         .selectable(true)
@@ -602,7 +674,13 @@ static PIERRE_DARK: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_them
 static PIERRE_LIGHT: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_theme(false));
 
 /// `ProposedPlanCard.tsx`.
-fn plan_card(id: &SharedString, text: &SharedString, this: &WeakEntity<Workspace>, cx: &App, t: &Tokens) -> AnyElement {
+fn plan_card(
+    id: &SharedString,
+    text: &SharedString,
+    this: &WeakEntity<Workspace>,
+    cx: &mut App,
+    t: &Tokens,
+) -> AnyElement {
     let title: SharedString = text
         .lines()
         .find_map(|line| line.trim_start().strip_prefix('#').map(|h| h.trim_start_matches('#').trim().to_owned()))
@@ -629,7 +707,7 @@ fn plan_card(id: &SharedString, text: &SharedString, this: &WeakEntity<Workspace
         .text_size(px(TEXT))
         .line_height(px(LINE))
         .text_color(alpha(t.foreground, 0.9))
-        .child(markdown(id, text, false, t));
+        .child(markdown(this, id.clone(), text, false, t, cx));
     if collapsed {
         body = body.max_h(px(416.)).overflow_hidden().child(
             div().absolute().left_0().right_0().bottom_0().h(px(96.)).bg(linear_gradient(
@@ -758,11 +836,11 @@ fn work_bottom(work: &WorkRow) -> f32 {
     }
 }
 
-fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
-        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t),
+        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
         WorkRowKind::Toggle { group, summary, icon, .. } => row
             .id(ElementId::Name(work.id.clone()))
             .cursor_pointer()
@@ -774,7 +852,9 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElem
             .max_h(px(288.))
             .overflow_y_scroll()
             .rounded(px(6.))
-            .children(entries.iter().map(|(entry, expanded)| detail_entry(entry, *expanded, this, t)))
+            .children(
+                entries.iter().map(|(entry, expanded)| detail_entry(entry, *expanded, this, t, cx)).collect::<Vec<_>>(),
+            )
             .into_any_element(),
         WorkRowKind::Live { group, entry, label, thought, expanded, .. } => {
             let failed = entry.failed();
@@ -859,7 +939,13 @@ fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-fn entry_details(entry: &Entry, label: &str, t: &Tokens) -> Option<AnyElement> {
+fn entry_details(
+    entry: &Entry,
+    label: &str,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> Option<AnyElement> {
     if entry.is_reasoning() {
         let text = entry.detail.clone()?;
         return Some(
@@ -873,7 +959,7 @@ fn entry_details(entry: &Entry, label: &str, t: &Tokens) -> Option<AnyElement> {
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(t.foreground)
-                .child(markdown(&format!("thought-md:{}", entry.id).into(), &text, false, t))
+                .child(markdown(this, thought_key(&entry.id), &text.into(), false, t, cx))
                 .into_any_element(),
         );
     }
@@ -901,6 +987,7 @@ fn single_entry(
     expanded: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
+    cx: &mut App,
 ) -> AnyElement {
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
@@ -947,7 +1034,7 @@ fn single_entry(
         label.clone()
     };
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
-    let details = expanded.then(|| entry_details(entry, label, t)).flatten();
+    let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     let expandable = if entry.is_reasoning() { entry.detail.is_some() } else { entry_body(entry, label).is_some() };
     let line = work_line(entry.icon(), color, label_text, label_color, Some(chevron(expandable, expanded, t)));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
@@ -959,14 +1046,20 @@ fn single_entry(
 }
 
 /// An entry inside an open group (`WorkEntryLogRow`): no vertical padding.
-fn detail_entry(entry: &Rc<Entry>, expanded: bool, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn detail_entry(
+    entry: &Rc<Entry>,
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
     let label: SharedString = work_log::collapse_whitespace(&work_log::display_label(entry)).into();
     let failed = entry.failed() && entry.status != Some(Status::Declined);
     let color = if failed { failed_icon_color(t) } else { icon_color(t) };
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
     let expandable = if entry.is_reasoning() { entry.detail.is_some() } else { entry_body(entry, &label).is_some() };
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
-    let details = expanded.then(|| entry_details(entry, &label, t)).flatten();
+    let details = if expanded { entry_details(entry, &label, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
         .w_full()
