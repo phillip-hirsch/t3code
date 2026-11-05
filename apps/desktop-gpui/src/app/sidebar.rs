@@ -61,7 +61,8 @@ pub(super) struct SidebarState {
     _hover_card_delay: Option<Task<()>>,
     /// A menu opened by a click rather than a right-click (the snooze menu).
     menu: Option<OpenMenu>,
-    favicons: HashMap<String, Favicon>,
+    /// By environment, workspace root, then favicon path, so a lookup needs no key built.
+    favicons: HashMap<SharedString, HashMap<String, HashMap<Option<String>, Favicon>>>,
     renaming: Option<actions::Renaming>,
     /// The row the last single click opened, for double-click rename.
     clicked: Option<String>,
@@ -69,6 +70,7 @@ pub(super) struct SidebarState {
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
     groups: RefCell<GroupsCache>,
+    search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
     collapsed_folders: HashSet<String>,
     /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
@@ -140,6 +142,7 @@ impl SidebarState {
             undo: None,
             scope: Vec::new(),
             groups: RefCell::default(),
+            search_ranking: RefCell::default(),
             collapsed_folders: HashSet::new(),
             inbox_order: Vec::new(),
             thread_order: Vec::new(),
@@ -606,16 +609,16 @@ impl Workspace {
         self.sidebar.search.read(cx).value().trim().to_lowercase()
     }
 
-    fn route_thread(&self) -> Option<&str> {
+    pub(super) fn route_thread(&self) -> Option<&str> {
         match &self.target {
             Some(Target::Thread { id, .. }) => Some(id),
             _ => None,
         }
     }
 
-    /// Wakes the sidebar after `delay` ms, keeping a pending wake that still
-    /// fits. Idle sidebars wake at most once a minute; only a duration in its
-    /// first minute ticks every second.
+    /// Wakes the sidebar after `delay` ms, replacing a pending wake for another time.
+    /// Idle sidebars wake at most once a minute; only a duration in its first
+    /// minute ticks every second.
     fn arm_sidebar_clock(&mut self, delay: Option<i64>, now: i64, cx: &mut Context<Self>) {
         let at = delay.map(|delay| now + delay.max(0) + 5);
         if at == self.sidebar.clock_at {
@@ -802,6 +805,9 @@ impl Workspace {
     /// (`Sidebar.tsx` row tooltip delay).
     fn hover_row(&mut self, thread_id: &str, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
+            if self.sidebar.hovered.as_deref() == Some(thread_id) {
+                return;
+            }
             self.sidebar.hovered = Some(thread_id.to_owned());
             self.sidebar.hover_card = None;
             let thread_id = thread_id.to_owned();
@@ -819,6 +825,8 @@ impl Workspace {
             self.sidebar.hovered = None;
             self.sidebar.hover_card = None;
             self.sidebar._hover_card_delay = None;
+        } else {
+            return;
         }
         self.notify_sidebar(cx);
     }
@@ -1172,7 +1180,8 @@ impl Workspace {
             list = list.child(self.render_empty_state(&tokens, cx));
         } else {
             for (index, item) in items.into_iter().enumerate() {
-                let key = item.nav_key();
+                // Only a focused list draws the cursor ring, so only it needs the row keys.
+                let ring = cursor.as_ref().is_some_and(|cursor| item.nav_key().as_ref() == Some(cursor));
                 let element = match item {
                     Item::Draft(row) => {
                         self.render_draft(&row, projects.get(row.project_id.as_str()).copied(), &tokens, cx)
@@ -1211,7 +1220,6 @@ impl Workspace {
                     }
                     Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
                 };
-                let ring = key.is_some() && key == cursor;
                 list = list.child(if ring { focus_ring(element, &tokens) } else { element });
             }
         }
@@ -2377,14 +2385,13 @@ pub(super) enum Favicon {
     Ready(Arc<Image>),
 }
 
-fn favicon_key(project: &ProjectShell) -> String {
-    let (environment, root) = (&project.environment_id, &project.workspace_root);
-    format!("{environment}\0{root}\0{}", project.favicon_path.as_deref().unwrap_or_default())
-}
-
 impl Workspace {
+    fn favicon_state(&self, project: &ProjectShell) -> Option<&Favicon> {
+        self.sidebar.favicons.get(&project.environment_id)?.get(&project.workspace_root)?.get(&project.favicon_path)
+    }
+
     pub(super) fn favicon(&self, project: &ProjectShell) -> Option<Arc<Image>> {
-        match self.sidebar.favicons.get(&favicon_key(project)) {
+        match self.favicon_state(project) {
             Some(Favicon::Ready(image)) => Some(image.clone()),
             _ => None,
         }
@@ -2395,8 +2402,7 @@ impl Workspace {
     /// (`createProjectFaviconUrlAtomFamily` in `client-runtime/src/state/assets.ts`).
     fn load_favicons(&mut self, cx: &mut Context<Self>) {
         for project in &self.shell.projects {
-            let key = favicon_key(project);
-            if self.sidebar.favicons.contains_key(&key) {
+            if self.favicon_state(project).is_some() {
                 continue;
             }
             let Some(session) = self.session(&project.environment_id) else { continue };
@@ -2405,7 +2411,15 @@ impl Workspace {
             else {
                 continue;
             };
-            self.sidebar.favicons.insert(key.clone(), Favicon::Loading);
+            let (environment, root, path) =
+                (project.environment_id.clone(), project.workspace_root.clone(), project.favicon_path.clone());
+            self.sidebar
+                .favicons
+                .entry(environment.clone())
+                .or_default()
+                .entry(root.clone())
+                .or_default()
+                .insert(path.clone(), Favicon::Loading);
             let mut resource = json!({"_tag": "project-favicon", "cwd": project.workspace_root});
             if let Some(path) = &project.favicon_path {
                 resource["path"] = path.as_str().into();
@@ -2436,7 +2450,8 @@ impl Workspace {
                 }
                 .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.sidebar.favicons.insert(key, image.map_or(Favicon::Missing, Favicon::Ready));
+                    let state = image.map_or(Favicon::Missing, Favicon::Ready);
+                    this.sidebar.favicons.entry(environment).or_default().entry(root).or_default().insert(path, state);
                     this.notify_sidebar(cx);
                 });
             })

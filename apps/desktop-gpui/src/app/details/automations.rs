@@ -84,10 +84,14 @@ impl Workspace {
                     }
                     cx.notify();
                 });
-                if ended || applied.is_err() {
+                if applied.is_err() {
                     return;
                 }
+                if ended {
+                    break;
+                }
             }
+            super::resubscribe_after_backoff(&this, cx, |this| this.automations.task = None).await;
         }));
     }
 

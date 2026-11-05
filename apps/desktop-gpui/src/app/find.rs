@@ -86,19 +86,28 @@ impl FindResult {
     /// The match `delta` away, when the navigation window holds it, so stepping needs no request.
     fn stepped(&self, delta: i64) -> Option<Self> {
         let next = step_index(self.active, self.total, delta);
-        let entry = self.navigation.iter().find(|e| next >= e.start && next < e.start + e.count)?;
+        let entry =
+            self.navigation.iter().find(|e| next.checked_sub(e.start).is_some_and(|offset| offset < e.count))?;
         let matched = FindMatch { entry_id: entry.entry_id.clone(), occurrence: next - entry.start };
         Some(Self { active: next, matched: Some(matched), ..self.clone() })
     }
 }
 
 /// `stepThreadFindIndex`: wraps around both ends.
+/// The counts come from the server, so no step may overflow.
 fn step_index(index: usize, total: usize, delta: i64) -> usize {
     if total == 0 {
         return 0;
     }
-    let total = total as i64;
-    ((index.min(total as usize - 1) as i64 + delta).rem_euclid(total)) as usize
+    let index = index.min(total - 1);
+    let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX) % total;
+    let room = total - index;
+    match (delta >= 0, step) {
+        (true, step) if step < room => index + step,
+        (true, step) => step - room,
+        (false, step) if step <= index => index - step,
+        (false, step) => total - (step - index),
+    }
 }
 
 /// `formatThreadFindCount`: "3/12", or "0/0".
@@ -486,7 +495,7 @@ impl Workspace {
             if opened {
                 self.refresh_rows(cx);
             }
-            let index = self.rows.iter().position(|row| searchable_row(row) == Some(&SharedString::from(item_id)));
+            let index = self.rows.iter().position(|row| searchable_row(row).is_some_and(|id| **id == *item_id));
             let moved = self.find.as_ref().is_some_and(|f| f.revealed.as_ref() != Some(item_id));
             if let (Some(index), true) = (index, moved) {
                 self.scroller.update(cx, |scroller, cx| scroller.scroll_to_item(index, cx));
@@ -518,8 +527,11 @@ impl Workspace {
     /// Paints the find's matches in the markdown view under `key`; a no-op when nothing changed,
     /// so the view's own notifications don't repaint it.
     pub(super) fn paint_find(&mut self, key: &SharedString, cx: &mut Context<Self>) {
-        let Some(view) = self.markdown_view(key) else { return };
         let open = self.open_find().is_some();
+        if !open {
+            return;
+        }
+        let Some(view) = self.markdown_view(key) else { return };
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let entry = projection.and_then(|p| item_entry(p, key));
         let dark = crate::theme::tokens(cx).dark;
@@ -675,6 +687,13 @@ mod tests {
         assert_eq!(step_index(2, 3, 1), 0);
         assert_eq!(step_index(9, 3, 1), 0, "an index past the end clamps first");
         assert_eq!(step_index(0, 0, 1), 0);
+        // Server counts near the top of the range used to overflow.
+        assert_eq!(step_index(usize::MAX - 1, usize::MAX, 1), 0);
+        assert_eq!(step_index(usize::MAX - 2, usize::MAX, i64::MIN), (usize::MAX - 2) - (1usize << 63));
+        assert_eq!(step_index(1, 3, i64::MIN), 2);
+        let wide = json!({"totalMatches": 5, "navigation": [{"entryId": "a", "startIndex": 1, "count": u64::MAX}]});
+        let stepped = FindResult::parse(&wide).and_then(|result| result.stepped(1));
+        assert_eq!(stepped.and_then(|result| result.matched).map(|m| m.occurrence), Some(0));
         assert_eq!(count_label(1, 12), "2/12");
         assert_eq!(count_label(0, 0), "0/0");
         assert_eq!(count_label(20, 3), "3/3");

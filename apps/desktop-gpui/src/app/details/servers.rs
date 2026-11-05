@@ -93,9 +93,20 @@ impl Workspace {
         let stream = client.stream("subscribeDiscoveredLocalServers", json!({}));
         self.servers.task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = stream.next().await {
-                let StreamEvent::Item(value) = event else { break };
-                let Ok(servers) = serde_json::from_value::<Vec<LocalServer>>(value["servers"].clone()) else {
-                    continue;
+                let value = match event {
+                    StreamEvent::Item(value) => value,
+                    StreamEvent::End(Err(error)) => {
+                        log::warn!("subscribeDiscoveredLocalServers: {error}");
+                        break;
+                    }
+                    StreamEvent::End(Ok(())) => break,
+                };
+                let servers = match Vec::<LocalServer>::deserialize(&value["servers"]) {
+                    Ok(servers) => servers,
+                    Err(error) => {
+                        log::warn!("subscribeDiscoveredLocalServers: {error}");
+                        continue;
+                    }
                 };
                 let updated = this.update(cx, |this, cx| {
                     if *this.servers.servers != servers {
@@ -104,9 +115,10 @@ impl Workspace {
                     }
                 });
                 if updated.is_err() {
-                    break;
+                    return;
                 }
             }
+            super::resubscribe_after_backoff(&this, cx, |this| this.servers.task = None).await;
         }));
     }
 

@@ -570,13 +570,16 @@ impl Workspace {
             self._stream_tasks.clear();
             self.set_primary_connection(None, None);
             self.preview.disconnect();
+            if self.target_on_primary() {
+                self.setup.disconnect();
+                self.details = inspector::Details::default();
+            }
             if self.target_on_primary()
                 && let Some(thread) = &mut self.thread
             {
                 thread._subscription = None;
             }
             self.side_chat.disconnect();
-            self.setup = Default::default();
             self.unfollow_pull_requests();
         }
         self.connection = connection;
@@ -602,6 +605,9 @@ impl Workspace {
         self._stream_tasks = vec![self.subscribe_device_state(window, cx)];
         self.subscribe_terminal_metadata(&client, window, cx);
         self.subscribe_previews(window, cx);
+        // Rows that come back unchanged would not resync these.
+        self.sync_worktree_setup(cx);
+        self.sync_details(cx);
         cx.notify();
     }
 
@@ -751,6 +757,7 @@ impl Workspace {
         let total = new_rows.len();
         self.rows = Rc::new(new_rows);
         self.sync_details(cx);
+        self.prune_requests();
         self.scroller.update(cx, |scroller, cx| {
             if was_empty {
                 scroller.reset(total, cx);
@@ -829,6 +836,7 @@ impl Workspace {
         self.expanded.clear();
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
+        self.markdown_images = markdown_images::ImageCache::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));

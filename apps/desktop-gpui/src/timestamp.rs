@@ -66,12 +66,6 @@ pub fn tooltip(iso: &str, zone: &TimeZone, hour12: bool) -> Option<String> {
     Some(format!("{}, {day}{suffix} {} {}", clock(&time, hour12), time.strftime("%B"), time.year()))
 }
 
-/// The day-aware text and its tooltip, in the system time zone.
-pub fn now_local(iso: &str, hour12: bool) -> Option<(String, String)> {
-    let now = Zoned::now();
-    Some((day_aware(iso, &now, hour12)?, tooltip(iso, now.time_zone(), hour12)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

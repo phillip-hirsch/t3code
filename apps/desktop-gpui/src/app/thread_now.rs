@@ -365,9 +365,10 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
                         open(id.clone()),
                     )
                 }));
-            let first = children[0].0.clone();
             let label = if *approvals { "Open approval" } else { "Open question" };
-            actions.push(inline_button("now-open-child", label, fg, fg, false, open(first)));
+            if let Some((first, _)) = children.first() {
+                actions.push(inline_button("now-open-child", label, fg, fg, false, open(first.clone())));
+            }
             let icon = if *approvals { IconName::ShieldQuestionMark } else { IconName::MessageCircle };
             (icon, t.info_foreground, title.clone(), Some(names.into_any_element()))
         }

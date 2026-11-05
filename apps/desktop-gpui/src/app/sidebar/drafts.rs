@@ -39,8 +39,10 @@ fn has_content(draft: &ComposerDraft) -> bool {
 /// The row's text: the prompt's first line with context links as their labels, else
 /// "N attachments" (`SidebarDraftRow`).
 fn preview(prompt: &str, attachments: usize) -> String {
-    let mut text = prompt.to_owned();
-    for (range, chip) in crate::composer_text::chips(prompt, |_| false).into_iter().rev() {
+    // Only the first line shows, so chips past it are never looked at.
+    let first = prompt.trim_start().split('\n').next().unwrap_or_default();
+    let mut text = first.to_owned();
+    for (range, chip) in crate::composer_text::chips(first, |_| false).into_iter().rev() {
         if let crate::composer_text::Chip::Context { label, .. } = chip {
             text.replace_range(range, &label);
         }
@@ -102,7 +104,10 @@ impl Workspace {
 
     /// `useThreadHasUnsentDraft`, for a thread that is not on screen.
     pub(super) fn has_unsent_draft(&self, thread_id: &str) -> bool {
-        self.thread_target(thread_id).and_then(|target| self.composer_drafts.get(&target)).is_some_and(has_content)
+        // Drafts are few; scanning them saves building a key per sidebar row.
+        self.composer_drafts
+            .iter()
+            .any(|(target, draft)| matches!(target, Target::Thread { id, .. } if id == thread_id) && has_content(draft))
     }
 
     /// `discardComposerDraft`: clears the draft and offers to undo it.

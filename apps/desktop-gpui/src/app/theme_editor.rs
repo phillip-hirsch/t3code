@@ -374,16 +374,12 @@ impl ThemeEditor {
         editor
     }
 
-    fn library(&self, _: &App) -> Library {
-        self.library.clone()
-    }
-
     fn name(&self, cx: &App) -> String {
         self.name.read(cx).value().to_string()
     }
 
     /// A saved theme that already has this name: the draft adds its missing palette to it.
-    fn merge_target(&self, cx: &App) -> Option<ThemeDefinition> {
+    fn merge_target(&self, cx: &App) -> Option<&ThemeDefinition> {
         let name = self.name(cx);
         let normalized = name.trim().to_lowercase();
         if normalized.is_empty() {
@@ -391,28 +387,22 @@ impl ThemeEditor {
         }
         let id = theme_id_from_name(&name);
         let editing = self.editing.as_ref().map(|theme| theme.id.as_str());
-        self.library(cx)
-            .custom()
-            .iter()
-            .find(|theme| {
-                Some(theme.id.as_str()) != editing
-                    && (theme.id == id || theme.label.trim().to_lowercase() == normalized)
-            })
-            .cloned()
+        self.library.custom().iter().find(|theme| {
+            Some(theme.id.as_str()) != editing && (theme.id == id || theme.label.trim().to_lowercase() == normalized)
+        })
     }
 
     /// Moves the draft off an appearance the merge target already has.
     fn follow_merge_target(&mut self, cx: &mut Context<Self>) {
         let target = self.merge_target(cx).filter(|_| self.editing.is_none());
-        let key = target.as_ref().map(|t| format!("{}:{:?}", t.id, t.modes()));
+        let key = target.map(|t| format!("{}:{:?}", t.id, t.modes()));
+        let only_this_mode = target.is_some_and(|t| t.modes() == [self.dark]);
         if key == self.merge_key {
             return;
         }
         self.merge_key = key;
-        if let Some(target) = target {
-            if target.modes() == [self.dark] {
-                self.dark = !self.dark;
-            }
+        if only_this_mode {
+            self.dark = !self.dark;
         }
     }
 
@@ -653,7 +643,7 @@ impl ThemeEditor {
     }
 
     fn save(&self, name: &str, cx: &App) -> Result<(Library, ThemeDefinition, Saved), String> {
-        let library = self.library(cx);
+        let library = self.library.clone();
         let colors: [Roles; 2] = if self.advanced {
             self.colors.clone()
         } else {
@@ -689,7 +679,7 @@ impl ThemeEditor {
             }
             map
         };
-        let target = self.merge_target(cx);
+        let target = self.merge_target(cx).cloned();
         let keep = |theme: ThemeDefinition, collection: &Option<themes::Collection>| ThemeDefinition {
             collection: collection.clone(),
             ..theme

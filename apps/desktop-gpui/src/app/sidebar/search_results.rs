@@ -1,6 +1,9 @@
 //! Sidebar search: title and branch matches first, then message hits from
 //! `orchestration.searchThreads` (`Sidebar.tsx` search, `SidebarSearchResultRow`).
 
+use std::cell::OnceCell;
+use std::rc::Rc;
+
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
@@ -14,6 +17,22 @@ use crate::inbox;
 use crate::model::ThreadShell;
 use crate::search::{self, Field, Weighted};
 use crate::theme::Tokens;
+
+/// The title and branch matches for a query, as indexes into `shell.threads`, ranked once
+/// per query, shell change, scope and minute instead of on every render, key and hover.
+pub(super) struct Ranking {
+    key: RankingKey,
+    threads: Rc<[usize]>,
+}
+
+#[derive(PartialEq)]
+struct RankingKey {
+    query: String,
+    revision: u64,
+    scope: Vec<String>,
+    /// Recency boosts the score.
+    minute: i64,
+}
 
 /// One search result: a title match, or a message hit with its snippet.
 pub(super) struct SearchResult<'a> {
@@ -36,19 +55,52 @@ impl Workspace {
 
     /// `searchSidebarThreads` over the scoped threads, then the message-only hits.
     pub(super) fn search_results(&self, query: &str, now: i64) -> Vec<SearchResult<'_>> {
+        // Built only when a cache miss or a message hit needs it.
+        let scope = OnceCell::new();
+        let visible = |t: &ThreadShell| {
+            t.is_listed()
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+                && scope
+                    .get_or_init(|| self.scoped_project_ids())
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&t.project_id))
+        };
+        let threads = self.ranked_search(query, now, &visible);
+        let mut results: Vec<SearchResult> =
+            threads.iter().map(|&at| SearchResult { thread: &self.shell.threads[at], snippet: None }).collect();
+        for hit in &self.sidebar.messages.matches {
+            if results.iter().any(|r| r.thread.id == hit.thread_id) {
+                continue;
+            }
+            let Some(thread) = self.shell.threads.iter().find(|t| t.id == hit.thread_id && visible(t)) else {
+                continue;
+            };
+            let ranges = search::token_ranges(&hit.snippet, query);
+            results
+                .push(SearchResult { thread, snippet: Some((hit.user, search::split_ranges(&hit.snippet, &ranges))) });
+        }
+        results
+    }
+
+    /// `searchSidebarThreads`' ranking of the visible threads, cached in [`Ranking`].
+    fn ranked_search(&self, query: &str, now: i64, visible: &dyn Fn(&ThreadShell) -> bool) -> Rc<[usize]> {
+        let key = RankingKey {
+            query: query.to_owned(),
+            revision: self.shell.revision,
+            scope: self.sidebar.scope.clone(),
+            minute: now / 60_000,
+        };
+        if let Some(ranking) = self.sidebar.search_ranking.borrow().as_ref().filter(|r| r.key == key) {
+            return ranking.threads.clone();
+        }
         let tokens = search::fold_query(query);
-        let scope = self.scoped_project_ids();
-        let visible: Vec<&ThreadShell> = self
-            .shell
-            .threads
-            .iter()
-            .filter(|t| t.is_listed() && t.archived_at.is_none() && t.deleted_at.is_none())
-            .filter(|t| scope.as_ref().is_none_or(|ids| ids.contains(&t.project_id)))
-            .collect();
+        let candidates: Vec<(usize, &ThreadShell)> =
+            self.shell.threads.iter().enumerate().filter(|(_, t)| visible(t)).collect();
         let score = |typos: bool| {
-            let mut found: Vec<(&ThreadShell, f32, bool)> = visible
+            let mut found: Vec<(usize, f32, bool)> = candidates
                 .iter()
-                .filter_map(|thread| {
+                .filter_map(|&(at, thread)| {
                     let title = Field::new(&thread.title);
                     let branch = thread.branch.as_deref().unwrap_or_default();
                     let branch = Field::new(branch.trim_start_matches("t3code/").trim_start_matches("t3/"));
@@ -58,14 +110,13 @@ impl Workspace {
                     let used = inbox::parse_ms(
                         thread
                             .latest_user_authored_message_at
-                            .clone()
-                            .flatten()
-                            .as_deref()
+                            .as_ref()
+                            .and_then(Option::as_deref)
                             .or(thread.latest_user_message_at.as_deref())
                             .unwrap_or(&thread.updated_at),
                     )
                     .unwrap_or(0);
-                    Some((*thread, found.quality * search::usage_boost(now - used), found.strong))
+                    Some((at, found.quality * search::usage_boost(now - used), found.strong))
                 })
                 .collect();
             found.sort_by(|a, b| {
@@ -78,18 +129,9 @@ impl Workspace {
         if !found.iter().any(|(_, _, strong)| *strong) {
             found = score(true);
         }
-        let mut results: Vec<SearchResult> =
-            found.into_iter().map(|(thread, ..)| SearchResult { thread, snippet: None }).collect();
-        for hit in &self.sidebar.messages.matches {
-            if results.iter().any(|r| r.thread.id == hit.thread_id) {
-                continue;
-            }
-            let Some(thread) = visible.iter().find(|t| t.id == hit.thread_id) else { continue };
-            let ranges = search::token_ranges(&hit.snippet, query);
-            results
-                .push(SearchResult { thread, snippet: Some((hit.user, search::split_ranges(&hit.snippet, &ranges))) });
-        }
-        results
+        let threads: Rc<[usize]> = found.into_iter().map(|(at, ..)| at).collect();
+        *self.sidebar.search_ranking.borrow_mut() = Some(Ranking { key, threads: threads.clone() });
+        threads
     }
 
     /// Up/Down wrap through the results, Enter opens one, Escape clears.

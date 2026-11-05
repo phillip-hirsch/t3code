@@ -222,11 +222,10 @@ fn without_position(target: &str) -> &str {
 
 /// `workspaceRelativeFilePath`: `target` under `cwd`, with forward slashes; `None` outside it.
 pub(super) fn workspace_relative(target: &str, cwd: Option<&str>) -> Option<String> {
-    let root = cwd?.trim_end_matches(['/', '\\']);
-    let normalize = |p: &str| p.replace('\\', "/").to_lowercase();
-    let (target_norm, root_norm) = (normalize(target), normalize(root));
-    let rest = target_norm.strip_prefix(&root_norm)?;
-    rest.starts_with('/').then(|| target.replace('\\', "/")[root.len() + 1..].to_owned())
+    let root = cwd?.trim_end_matches(['/', '\\']).replace('\\', "/");
+    let target = target.replace('\\', "/");
+    let rest = target.get(root.len()..)?.strip_prefix('/')?;
+    target[..root.len()].eq_ignore_ascii_case(&root).then(|| rest.to_owned())
 }
 
 impl Workspace {
@@ -344,6 +343,7 @@ fn is_web_link(url: &str) -> bool {
 /// `matchInlineSkills` over prose: each `$name` of a known skill, outside code, becomes
 /// `[Label](t3-skill:name)` for [`SkillChips`] to draw.
 pub(super) fn skill_links(text: &str, skills: &[InlineSkill]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     let mut fenced = false;
     for line in text.split_inclusive('\n') {
@@ -373,7 +373,7 @@ pub(super) fn skill_links(text: &str, skills: &[InlineSkill]) -> String {
                 let crate::composer_text::Chip::Skill { name } = chip else { continue };
                 let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
                 out.push_str(&part[last..range.start]);
-                out.push_str(&format!("[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name));
+                let _ = write!(out, "[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name);
                 last = range.end;
             }
             out.push_str(&part[last..]);
@@ -513,7 +513,8 @@ pub(super) fn table_actions(
 ) -> AnyElement {
     let id: SharedString = format!("table:{key}:{}", table.span.as_ref().map_or(0, |s| s.start)).into();
     let copied = this.upgrade().is_some_and(|w| w.read(cx).copy_feedback.id.as_ref() == Some(&id));
-    let (markdown, csv) = (table.markdown.trim().to_owned(), table_csv(&table.headers, &table.rows));
+    // Serialized when the menu opens, not on every frame.
+    let (headers, rows, markdown) = (table.headers.clone(), table.rows.clone(), table.markdown.trim().to_owned());
     let this = this.clone();
     let muted = t.muted_foreground;
     h_flex()
@@ -540,7 +541,7 @@ pub(super) fn table_actions(
                         id.clone(),
                     )))
                     .item(PopupMenuItem::new("Copy as CSV").on_click(copy(
-                        csv.clone(),
+                        table_csv(&headers, &rows),
                         this.clone(),
                         id.clone(),
                     )))
@@ -587,6 +588,8 @@ mod tests {
         assert_eq!(workspace_relative("/repo/src/a.rs", Some("/repo")).as_deref(), Some("src/a.rs"));
         assert_eq!(workspace_relative("C:\\Repo\\a.rs", Some("c:\\repo")).as_deref(), Some("a.rs"));
         assert_eq!(workspace_relative("/other/a.rs", Some("/repo")), None);
+        // Lowercasing the Kelvin sign changes its byte length; this sliced inside it.
+        assert_eq!(workspace_relative("/repo/\u{212A}/a.rs", Some("/repo/k")), None);
     }
 
     #[test]

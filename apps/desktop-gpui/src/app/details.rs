@@ -154,6 +154,23 @@ fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
     }
 }
 
+/// How long a card stream that ended while still wanted waits before it subscribes again.
+const RESUBSCRIBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clears an ended stream's task after [`RESUBSCRIBE_AFTER`], so the next render subscribes
+/// again without looping on a server that keeps failing.
+async fn resubscribe_after_backoff(
+    this: &WeakEntity<Workspace>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+    clear: impl FnOnce(&mut Workspace),
+) {
+    cx.background_executor().timer(RESUBSCRIBE_AFTER).await;
+    let _ = this.update(cx, |this, cx| {
+        clear(this);
+        cx.notify();
+    });
+}
+
 impl Workspace {
     /// Whether the card is on screen, inline or as the popover.
     pub(super) fn details_shown(&self, window: &Window) -> bool {
@@ -191,7 +208,9 @@ impl Workspace {
         } else {
             f32::from(viewport.height) - 104.
         };
-        let sections: Vec<Section> = [
+        // Built once at full density; when the card must shrink, only the two sections
+        // whose rows depend on density are built again.
+        let mut sections: [Option<Section>; 7] = [
             self.workspace_section(&tokens, &colors, cx),
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
@@ -199,41 +218,32 @@ impl Workspace {
             self.lineage_section(&tokens, &colors, cx).filter(|_| self.lineage_shown()),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        ];
         let height_at = |density: Density| {
-            let heights = sections.iter().filter(|s| s.min_density <= density).map(|s| s.height + SECTION_PADDING);
-            heights.sum::<f32>() + 2.
+            let shown = sections.iter().flatten().filter(|s| s.min_density <= density);
+            shown.map(|s| s.height + SECTION_PADDING).sum::<f32>() + 2.
         };
         let density = resolve_density(available, height_at(Density::Full), height_at(Density::Compact));
-        // Re-rendered at the chosen density, so hidden rows never build.
-        let sections: Vec<AnyElement> = [
-            self.workspace_section_at(density, &tokens, &colors, cx),
-            self.version_control_section_at(density, &tokens, &colors, cx),
-            (density == Density::Full).then(|| self.servers_section(&tokens, &colors, cx)).flatten(),
-            (density == Density::Full).then(|| self.automations_section(&tokens, &colors, cx)).flatten(),
-            (density == Density::Full && self.lineage_shown())
-                .then(|| self.lineage_section(&tokens, &colors, cx))
-                .flatten(),
-            self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
-            self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|section| section.element)
-        .enumerate()
-        .map(|(index, section)| {
-            v_flex()
-                .px_2()
-                .pt_2()
-                .pb(px(10.))
-                .when(index > 0, |el| el.border_t_1().border_color(colors.divider))
-                .child(section)
-                .into_any_element()
-        })
-        .collect();
+        if density != Density::Full {
+            sections[0] = self.workspace_section_at(density, &tokens, &colors, cx);
+            sections[1] = self.version_control_section_at(density, &tokens, &colors, cx);
+        }
+        let sections: Vec<AnyElement> = sections
+            .into_iter()
+            .flatten()
+            .filter(|section| section.min_density <= density)
+            .map(|section| section.element)
+            .enumerate()
+            .map(|(index, section)| {
+                v_flex()
+                    .px_2()
+                    .pt_2()
+                    .pb(px(10.))
+                    .when(index > 0, |el| el.border_t_1().border_color(colors.divider))
+                    .child(section)
+                    .into_any_element()
+            })
+            .collect();
         // Shown only when no section has content, so an emptied card can be refilled.
         let choose = sections.is_empty().then(|| {
             div().p_2().child(
@@ -1091,7 +1101,6 @@ impl Workspace {
     }
 }
 
-/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 /// `ThreadDetailsItemsMenuItems`: the card's context menu, its empty state and Settings share it.
 pub(in crate::app) fn thread_details_items_menu(
     workspace: WeakEntity<Workspace>,
@@ -1115,6 +1124,7 @@ pub(in crate::app) fn thread_details_items_menu(
     }
 }
 
+/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
 fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
     discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
         let auth = &provider["auth"];

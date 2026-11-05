@@ -24,6 +24,14 @@ pub(super) struct SetupWatch {
     _task: Option<Task<()>>,
 }
 
+impl SetupWatch {
+    /// Drops the stream with its socket, keeping the card, so the next sync resubscribes.
+    pub(super) fn disconnect(&mut self) {
+        self.thread_id = None;
+        self._task = None;
+    }
+}
+
 impl Workspace {
     /// Keeps one `subscribeWorktreeSetup` stream on an open thread that has or is preparing a worktree.
     pub(super) fn sync_worktree_setup(&mut self, cx: &mut Context<Self>) {
@@ -39,7 +47,9 @@ impl Workspace {
         if wanted == self.setup.thread_id {
             return;
         }
-        self.setup = SetupWatch { thread_id: wanted.clone(), ..Default::default() };
+        // A resubscribe after a reconnect keeps the card up until the stream resends it.
+        let snapshot = self.setup.snapshot.take().filter(|s| wanted.as_ref() == Some(&s.thread_id));
+        self.setup = SetupWatch { thread_id: wanted.clone(), snapshot, ..Default::default() };
         let Some(thread_id) = wanted else { return };
         let stream = client.stream("subscribeWorktreeSetup", json!({"threadId": thread_id}));
         self.setup._task = Some(cx.spawn(async move |this, cx| {

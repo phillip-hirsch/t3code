@@ -25,16 +25,6 @@ pub(super) fn github_repository(identity: &RepositoryIdentity) -> Option<(String
 }
 
 /// `URLSearchParams` encoding of one value.
-fn form_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => (byte as char).to_string(),
-            b' ' => "+".into(),
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
 
 /// `buildNewThreadLink` with its context: the repository, and the model once a provider is known.
 pub(super) fn prompt_link_with(
@@ -43,14 +33,18 @@ pub(super) fn prompt_link_with(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Option<String> {
+    use super::message_actions::form_encode_into;
     let mut link = super::message_actions::prompt_link(prompt)?;
     if let Some((owner, name)) = repository {
-        link.push_str(&format!("&repo={}", form_encode(&format!("{owner}/{name}"))));
+        link.push_str("&repo=");
+        form_encode_into(&mut link, &format!("{owner}/{name}"));
     }
     if let Some(provider) = provider {
-        link.push_str(&format!("&provider={}", form_encode(provider)));
+        link.push_str("&provider=");
+        form_encode_into(&mut link, provider);
         if let Some(model) = model {
-            link.push_str(&format!("&model={}", form_encode(model)));
+            link.push_str("&model=");
+            form_encode_into(&mut link, model);
         }
     }
     Some(link)

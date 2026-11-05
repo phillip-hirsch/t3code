@@ -82,16 +82,25 @@ impl Workspace {
             }
             let Some(client) = self.client() else { return };
             let input = json!({"threadId": thread_id});
+            let parent = parent.clone();
             self.subagents._fetches.push(cx.spawn(async move |this, cx| {
                 let result = client.request("orchestration.getThreadProjection", input).await;
                 let _ = this.update(cx, |this, cx| {
                     this.subagents.fetching.remove(&key);
-                    let Ok(projection) = result
+                    let projection = match result
                         .map_err(|e| e.to_string())
                         .and_then(|value| serde_json::from_value::<ThreadProjection>(value).map_err(|e| e.to_string()))
-                    else {
-                        return;
+                    {
+                        Ok(projection) => projection,
+                        Err(error) => {
+                            log::warn!("child approvals for {thread_id}: {error}");
+                            return;
+                        }
                     };
+                    // The user moved to another thread while this read ran.
+                    if this.open_thread_id() != Some(parent.as_str()) {
+                        return;
+                    }
                     let requests: Vec<(RuntimeRequest, Option<TurnItem>)> = projection
                         .pending_approvals()
                         .into_iter()
@@ -437,7 +446,7 @@ impl gpui_kit::Render for NativeWork {
             None => note("Loading…".into(), t.muted_foreground).into_any_element(),
             Some(Err(error)) => note(error.to_string(), t.error_foreground).into_any_element(),
             Some(Ok(value)) => {
-                let children = value["children"].as_array().cloned().unwrap_or_default();
+                let children = value["children"].as_array().map(Vec::as_slice).unwrap_or_default();
                 if children.is_empty() {
                     note("The provider has no record of which subagents this call started.".into(), t.muted_foreground)
                         .into_any_element()
