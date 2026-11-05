@@ -113,6 +113,8 @@ pub(super) enum Surface {
     PullRequest(crate::pull_request_detail::Reference),
     /// The thread's linked pull requests.
     PullRequests,
+    /// A group of the thread's terminals, by its surface id.
+    Terminal(String),
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -397,8 +399,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes a tab; a browser tab's session closes with it.
+    /// Removes a tab without the side effects of closing it (its terminals already closed).
+    pub(super) fn drop_surface(&mut self, target: &Target, surface: &Surface) {
+        if let Some(panel) = self.right_panel.panels.get_mut(target) {
+            panel.close(surface);
+        }
+    }
+
+    /// Closes a tab; a browser tab's session closes with it, a terminal tab's after confirming.
     pub(super) fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        if let Surface::Terminal(id) = surface {
+            return self.request_close_terminal_surface(id, window, cx);
+        }
         if let Some(panel) = self.user_panel_state() {
             panel.close(&surface);
         }
@@ -935,6 +947,7 @@ impl Workspace {
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
             (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
+            (Some(Surface::Terminal(id)), _) => self.render_terminal_surface(&id.clone(), window, cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -1004,6 +1017,7 @@ impl Workspace {
         let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
         let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
         let profiles = self.browser_profiles();
+        let terminal = self.terminal_available();
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -1057,6 +1071,14 @@ impl Workspace {
                             menu.item(PopupMenuItem::new("Browser").icon(Icon::new(IconName::Globe)).disabled(true))
                         };
                         let menu = menu
+                            .item(
+                                PopupMenuItem::new("Terminal")
+                                    .icon(icon("icons/square-terminal.svg"))
+                                    .disabled(!terminal)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.add_terminal_surface(window, cx)
+                                    })),
+                            )
                             .item(
                                 PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
                                     window.listener_for(&view, |this, _, window, cx| {
@@ -1157,6 +1179,11 @@ impl Workspace {
                 "pull-requests".into(),
                 "Pull requests".into(),
                 Icon::new(IconName::Link).size(px(12.)).into_any_element(),
+            ),
+            Surface::Terminal(id) => (
+                format!("terminal:{id}").into(),
+                self.terminal_surface_title(id),
+                icon("icons/square-terminal.svg").with_size(px(12.)).into_any_element(),
             ),
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
@@ -1297,6 +1324,18 @@ impl Workspace {
             }
             false => div().child(browser),
         };
+        let terminal_available = self.terminal_available();
+        let terminal = row(
+            "right-panel-open-terminal",
+            icon("icons/square-terminal.svg").with_size(px(16.)).into_any_element(),
+            "Terminal",
+            "T",
+            terminal_available,
+            "Available when a project is open.",
+        )
+        .when(terminal_available, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.add_terminal_surface(window, cx)))
+        });
         let files_available = self.project_target().is_some();
         let files = row(
             "right-panel-open-files",
@@ -1385,6 +1424,7 @@ impl Workspace {
                         v_flex()
                             .gap(px(2.))
                             .child(browser)
+                            .child(terminal)
                             .child(files)
                             .child(diff)
                             .child(pull_request)

@@ -7,6 +7,7 @@ mod keys;
 mod layout;
 mod links;
 mod mouse;
+mod panel;
 mod session;
 
 use std::collections::HashMap;
@@ -95,6 +96,8 @@ pub(super) struct Terminals {
     focus_pending: Option<String>,
     /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
     pub(super) contexts: HashMap<String, Value>,
+    /// Right-panel terminal tabs, by surface id.
+    panel: HashMap<String, panel::PanelGroup>,
     _metadata: Option<Task<()>>,
 }
 
@@ -280,7 +283,20 @@ impl Workspace {
             if !drawer.open && shown.as_ref() != Some(thread_id) {
                 continue;
             }
-            let ids: Vec<String> = all.get(thread_id).into_iter().flatten().map(|s| s.terminal_id.clone()).collect();
+            // A panel tab's terminals stay out of the drawer.
+            let in_panel = |id: &str| {
+                self.terminals
+                    .panel
+                    .values()
+                    .any(|g| g.thread_id == *thread_id && g.terminal_ids.iter().any(|t| t == id))
+            };
+            let ids: Vec<String> = all
+                .get(thread_id)
+                .into_iter()
+                .flatten()
+                .filter(|s| !in_panel(&s.terminal_id))
+                .map(|s| s.terminal_id.clone())
+                .collect();
             drawer.reconcile(&ids);
         }
     }
@@ -380,15 +396,36 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
-        let drawer_ids = self.terminals.drawers.get(&thread_id).map(|d| d.terminal_ids.clone()).unwrap_or_default();
-        let known = self.terminals.summaries(&thread_id).iter().map(|s| s.terminal_id.as_str());
-        let suffix = self.terminals.summaries.is_none().then(super::new_id);
-        let terminal_id =
-            layout::next_terminal_id(known.chain(drawer_ids.iter().map(String::as_str)), suffix.as_deref());
+        if self.client().is_none() {
+            return;
+        }
+        let terminal_id = self.next_terminal_id(&thread_id);
         if !self.terminals.drawers.entry(thread_id.clone()).or_default().place(&terminal_id, place) {
             return;
         }
+        self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx);
+    }
+
+    /// A terminal id no drawer, panel tab or server session of the thread uses yet.
+    fn next_terminal_id(&self, thread_id: &str) -> String {
+        let drawer_ids = self.terminals.drawers.get(thread_id).map(|d| d.terminal_ids.clone()).unwrap_or_default();
+        let panel_ids = self.terminals.panel_ids(thread_id);
+        let known = self.terminals.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
+        let suffix = self.terminals.summaries.is_none().then(super::new_id);
+        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
+        layout::next_terminal_id(taken, suffix.as_deref())
+    }
+
+    /// `terminal.open` (then an optional write) for a terminal already placed.
+    fn open_terminal_session(
+        &mut self,
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        then_write: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client() else { return };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
@@ -445,6 +482,7 @@ impl Workspace {
 
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+        self.close_panel_terminal(thread_id, terminal_id);
         if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
             drawer.close(terminal_id);
             if drawer.open {
@@ -477,7 +515,10 @@ impl Workspace {
                 .filter(|d| d.open)
                 .and_then(|d| d.active_group())
                 .map(|group| group.terminal_ids.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .chain(self.shown_panel_terminals(thread_id))
+                .collect(),
             _ => Vec::new(),
         };
         let thread_id = thread_id.unwrap_or_default();
@@ -530,6 +571,7 @@ impl Workspace {
         match event {
             SessionEvent::Exited => self.close_terminal(thread_id, terminal_id, cx),
             SessionEvent::Activated => {
+                self.activate_panel_terminal(thread_id, terminal_id, cx);
                 if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
                     if drawer.active_id != terminal_id {
                         drawer.set_active(terminal_id);
@@ -708,7 +750,7 @@ impl Workspace {
                 }))
                 .child(body)
                 .when(!has_sidebar && !drawer.terminal_ids.is_empty(), |el| {
-                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, &tokens, cx))
+                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, cx))
                 })
                 .child(handle)
                 .into_any_element(),
@@ -719,9 +761,14 @@ impl Workspace {
         let group = drawer.active_group();
         let vertical = group.is_some_and(|g| g.split == Split::Vertical);
         let ids = group.map(|g| g.terminal_ids.as_slice()).unwrap_or_default();
+        self.render_pane_group(ids, &drawer.active_id, vertical, tokens)
+    }
+
+    /// A group's mounted panes side by side, or stacked when split vertically.
+    fn render_pane_group(&self, ids: &[String], active: &str, vertical: bool, tokens: &Tokens) -> Div {
         let panes = ids.iter().enumerate().filter_map(|(index, id)| {
             let pane = self.terminals.panes.get(id)?;
-            let color = if *id == drawer.active_id { tokens.border } else { tokens.border.opacity(0.7) };
+            let color = if *id == active { tokens.border } else { tokens.border.opacity(0.7) };
             let view = AnyView::from(pane.session.clone()).cached(StyleRefinement::default().size_full());
             Some(
                 div()
@@ -739,10 +786,11 @@ impl Workspace {
     }
 
     /// The split/new/close buttons over a lone terminal's top-right corner.
-    fn render_floating_actions(
+    pub(super) fn render_floating_actions(
         &self,
         active: String,
         limit: bool,
+        panel: Option<String>,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -766,6 +814,7 @@ impl Workspace {
                     button("terminal-split", "icons/square-split-horizontal.svg", limit),
                     Split::Horizontal,
                     limit,
+                    panel.clone(),
                     cx,
                 ))
                 .child(separator())
@@ -773,16 +822,24 @@ impl Workspace {
                     button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
                     Split::Vertical,
                     limit,
+                    panel.clone(),
                     cx,
                 ))
                 .child(separator())
-                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), cx))
+                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, cx))
                 .child(separator())
                 .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, cx)),
         )
     }
 
-    fn wire_split(&self, button: Stateful<Div>, split: Split, limit: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn wire_split(
+        &self,
+        button: Stateful<Div>,
+        split: Split,
+        limit: bool,
+        panel: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let (name, shortcut) = match split {
             Split::Horizontal => ("Split Terminal Horizontally", "Ctrl+D"),
             Split::Vertical => ("Split Terminal Vertically", "Ctrl+Shift+D"),
@@ -792,15 +849,21 @@ impl Workspace {
         } else {
             format!("{name} ({shortcut})")
         };
-        button
-            .tooltip(tooltip(label.into()))
-            .when(!limit, |el| el.on_click(cx.listener(move |this, _, _, cx| this.split_terminal(split, cx))))
+        button.tooltip(tooltip(label.into())).when(!limit, |el| {
+            el.on_click(cx.listener(move |this, _, window, cx| match &panel {
+                Some(surface) => this.split_panel_terminal(surface, split, window, cx),
+                None => this.split_terminal(split, cx),
+            }))
+        })
     }
 
-    fn wire_new(&self, button: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
-        button
-            .tooltip(tooltip("New Terminal (Ctrl+N)".into()))
-            .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx)))
+    fn wire_new(&self, button: Stateful<Div>, panel: Option<String>, cx: &mut Context<Self>) -> Stateful<Div> {
+        button.tooltip(tooltip("New Terminal (Ctrl+N)".into())).on_click(cx.listener(move |this, _, window, cx| {
+            match panel {
+                Some(_) => this.add_terminal_surface(window, cx),
+                None => this.new_terminal(cx),
+            }
+        }))
     }
 
     fn wire_close(&self, button: Stateful<Div>, active: String, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -834,15 +897,17 @@ impl Workspace {
                     header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
                     Split::Horizontal,
                     limit,
+                    None,
                     cx,
                 ))
                 .child(self.wire_split(
                     header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
                     Split::Vertical,
                     limit,
+                    None,
                     cx,
                 ))
-                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), cx))
+                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, cx))
                 .child(self.wire_close(header_button("terminal-close", "icons/trash-2.svg", false, false), active, cx)),
         );
         let groups = drawer.sorted_groups();
