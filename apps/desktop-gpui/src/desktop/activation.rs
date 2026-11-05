@@ -13,7 +13,8 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Instance {
     /// This process is the app; other launches' arguments arrive on the sender given to [`claim`].
-    Primary,
+    /// `socket` is the Unix socket it listens on, for [`remove_socket`] at quit.
+    Primary { socket: Option<PathBuf> },
     /// The running app took the arguments.
     Forwarded,
 }
@@ -31,13 +32,20 @@ pub fn claim(
         return Instance::Forwarded;
     }
     match listen(&address, launches, runtime) {
-        Ok(()) => Instance::Primary,
+        Ok(()) => Instance::Primary { socket: cfg!(unix).then(|| PathBuf::from(&address)) },
         // Another launch started listening between our attempts.
         Err(_) if forward(&address, args).is_ok() => Instance::Forwarded,
         Err(error) => {
             log::warn!("could not take the single-instance channel {address}: {error}");
-            Instance::Primary
+            Instance::Primary { socket: None }
         }
+    }
+}
+
+/// Removes the socket this app listened on, so a clean quit leaves nothing in the temp folder.
+pub fn remove_socket(socket: &Path) {
+    if let Err(error) = std::fs::remove_file(socket) {
+        log::warn!("could not remove the single-instance socket {}: {error}", socket.display());
     }
 }
 
@@ -184,11 +192,17 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let home = std::env::temp_dir().join(format!("t3-activation-test-{}", std::process::id()));
         let (sender, receiver) = async_channel::unbounded();
-        assert_eq!(claim(&home, &["first".into()], sender, runtime.handle()), Instance::Primary);
+        let Instance::Primary { socket } = claim(&home, &["first".into()], sender, runtime.handle()) else {
+            panic!("the first launch is the app");
+        };
         let args = vec!["second".to_owned(), "t3code://new?prompt=x".to_owned()];
         let (unused, _) = async_channel::unbounded();
         assert_eq!(claim(&home, &args, unused, runtime.handle()), Instance::Forwarded);
         assert_eq!(runtime.block_on(receiver.recv()).unwrap(), args);
+        if let Some(socket) = socket {
+            remove_socket(&socket);
+            assert!(!socket.exists(), "a clean quit removes the socket");
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 }

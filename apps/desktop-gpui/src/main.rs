@@ -74,14 +74,15 @@ fn main() {
     gpui_windows::disable_direct_composition();
     // A second launch hands its command line to the running app and exits.
     let (links, launches) = async_channel::unbounded();
-    if let Some(home) = settings::t3_home() {
-        let args = desktop::launch_args();
-        if desktop::activation::claim(&home, &args, links.clone(), runtime().handle())
-            == desktop::activation::Instance::Forwarded
-        {
-            return;
+    let socket = match settings::t3_home() {
+        Some(home) => {
+            match desktop::activation::claim(&home, &desktop::launch_args(), links.clone(), runtime().handle()) {
+                desktop::activation::Instance::Forwarded => return,
+                desktop::activation::Instance::Primary { socket } => socket,
+            }
         }
-    }
+        None => None,
+    };
     let app = gpui_kit::application().with_assets(assets::Assets);
     // macOS hands `t3code://` links to the running app as URLs (Electron's `open-url`).
     app.on_open_urls(move |urls| {
@@ -96,7 +97,7 @@ fn main() {
             cx.activate(true);
         }
     });
-    app.run(|cx| {
+    app.run(move |cx| {
         gpui_kit::init(cx);
         // Windows shows OS notifications under this identity.
         cx.set_app_identity("com.t3tools.t3code.gpui", "T3 Code");
@@ -105,6 +106,13 @@ fn main() {
             .expect("bundled fonts");
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
+        if let Some(socket) = socket {
+            cx.on_app_quit(move |_| {
+                desktop::activation::remove_socket(&socket);
+                async {}
+            })
+            .detach();
+        }
         #[cfg(all(unix, not(target_os = "macos")))]
         desktop::linux_url_handler::register();
         cx.set_global(desktop::Desktop::load(launches, cx));
