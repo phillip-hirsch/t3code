@@ -104,6 +104,10 @@ pub(super) enum Surface {
     Browser(String),
     /// A side chat's tab, by its thread id.
     SideChat(String),
+    /// A pull request in the detail panel.
+    PullRequest(crate::pull_request_detail::Reference),
+    /// The thread's linked pull requests.
+    PullRequests,
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -723,6 +727,8 @@ impl Workspace {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
+            (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
+            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -784,6 +790,7 @@ impl Workspace {
         let view = cx.entity();
         let (diff, browser) = (self.diff_available(), self.browser_available());
         let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
+        let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -836,6 +843,24 @@ impl Workspace {
                                 PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
                                     window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
                                 ),
+                            )
+                            .item(
+                                PopupMenuItem::new("Pull request")
+                                    .icon(Icon::new(IconName::GitPullRequest))
+                                    .disabled(pull_request.is_none())
+                                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                                        if let Some(reference) = this.thread_pull_request_target() {
+                                            this.open_surface(Surface::PullRequest(reference), window, cx);
+                                        }
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new("Linked pull requests")
+                                    .icon(Icon::new(IconName::Link))
+                                    .disabled(!linked)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.open_surface(Surface::PullRequests, window, cx)
+                                    })),
                             );
                         match side_chat {
                             Some(available) => menu.item(
@@ -890,6 +915,16 @@ impl Workspace {
                     .into_any_element();
                 (format!("side-chat:{thread_id}").into(), title, glyph)
             }
+            Surface::PullRequest(reference) => (
+                format!("pull-request:{}:{}#{}", reference.project_id, reference.repository, reference.number).into(),
+                format!("#{}", reference.number).into(),
+                Icon::new(IconName::GitPullRequest).size(px(12.)).into_any_element(),
+            ),
+            Surface::PullRequests => (
+                "pull-requests".into(),
+                "Pull requests".into(),
+                Icon::new(IconName::Link).size(px(12.)).into_any_element(),
+            ),
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
         let tooltip: SharedString = format!("Close {title}").into();
@@ -1000,6 +1035,32 @@ impl Workspace {
             "Available for Git repositories.",
         )
         .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
+        let target = self.thread_pull_request_target();
+        let pull_request = row(
+            "right-panel-open-pull-request",
+            Icon::new(IconName::GitPullRequest).size(px(16.)).into_any_element(),
+            "Pull request",
+            "P",
+            target.is_some(),
+            "No pull request on this branch yet.",
+        )
+        .when_some(target, |el, reference| {
+            el.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_surface(Surface::PullRequest(reference.clone()), window, cx)
+            }))
+        });
+        let linked = self.thread_links_pull_requests();
+        let linked_pull_requests = row(
+            "right-panel-open-pull-requests",
+            Icon::new(IconName::Link).size(px(16.)).into_any_element(),
+            "Linked pull requests",
+            "L",
+            linked,
+            "No linked pull requests available.",
+        )
+        .when(linked, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::PullRequests, window, cx)))
+        });
         let side_chat = self.side_chats_offered().then(|| {
             let reason = self.side_chat_disabled_reason();
             row(
@@ -1036,7 +1097,15 @@ impl Workspace {
                             .text_color(tokens.foreground)
                             .child("Open a surface"),
                     )
-                    .child(v_flex().gap(px(2.)).child(browser).child(diff).children(side_chat)),
+                    .child(
+                        v_flex()
+                            .gap(px(2.))
+                            .child(browser)
+                            .child(diff)
+                            .child(pull_request)
+                            .child(linked_pull_requests)
+                            .children(side_chat),
+                    ),
             )
             .into_any_element()
     }
