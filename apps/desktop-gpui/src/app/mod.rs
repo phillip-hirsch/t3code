@@ -68,6 +68,8 @@ struct OpenThread {
 pub struct Workspace {
     connection: Connection,
     server: Option<ServerHandle>,
+    /// The connected server's HTTP origin and session, for HTTP-only routes.
+    endpoint: Option<backend::Endpoint>,
     server_info: ServerInfo,
     shell: ShellState,
     target: Option<Target>,
@@ -142,6 +144,7 @@ impl Workspace {
         Self {
             connection: Connection::Starting,
             server: None,
+            endpoint: None,
             server_info: ServerInfo::default(),
             shell: ShellState::default(),
             target: None,
@@ -247,7 +250,13 @@ impl Workspace {
                     Ok(client) => {
                         renewed = false;
                         log::info!("connected");
-                        if this.update_in(cx, |this, window, cx| this.on_connected(client.clone(), window, cx)).is_err()
+                        let connected = endpoint.clone();
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.endpoint = Some(connected);
+                                this.on_connected(client.clone(), window, cx)
+                            })
+                            .is_err()
                         {
                             return;
                         }

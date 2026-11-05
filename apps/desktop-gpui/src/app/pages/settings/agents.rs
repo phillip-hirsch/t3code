@@ -21,7 +21,12 @@ impl Workspace {
         div().child("Devices").into_any_element()
     }
 
-    pub(super) fn render_settings_scheduled_tasks(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Scheduled tasks").into_any_element()
+    pub(super) fn render_settings_scheduled_tasks(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // HARNESS ONLY (webhook/worktree agent); the task-list agent replaces this.
+        self.render_scheduled_tasks_harness(window, cx)
     }
 }

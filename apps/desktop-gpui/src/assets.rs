@@ -69,6 +69,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "square-menu",
     "square-pen",
     "terminal",
+    "trash",
     "user-round",
     "wrench",
     "x",

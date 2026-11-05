@@ -5,6 +5,7 @@ mod agents;
 mod code;
 mod connections;
 mod general;
+mod scheduled_tasks;
 mod system;
 
 use gpui_kit::{
