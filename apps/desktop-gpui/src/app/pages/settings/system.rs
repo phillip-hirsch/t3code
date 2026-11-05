@@ -77,7 +77,7 @@ impl Workspace {
     pub(super) fn render_settings_maintenance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         let background = self.render_background_row(cx);
         let storage = self.render_storage_sections(window, cx);
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
@@ -103,10 +103,10 @@ impl Workspace {
             settings_section("background-activity", "Background activity", [background], &t),
         ];
         sections.extend(storage);
-        let environment_id = view.environment().id.to_owned();
+        let environment_id = view.environment().map(|e| e.id.to_owned());
         let view_diagnostics = Button::new("view-diagnostics").outline().small().label("View diagnostics").on_click(
             cx.listener(move |this, _, _, cx| {
-                this.settings_ui.scope = this.settings_ui.scope.with_machine(Some(environment_id.clone()));
+                this.settings_ui.scope = this.settings_ui.scope.with_machine(environment_id.clone());
                 this.select_settings_section("diagnostics", cx);
             }),
         );
@@ -202,7 +202,7 @@ impl Workspace {
     pub(super) fn render_settings_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let cli_row = self.about_cli_row(&t, window, cx);
-        let policy = &self.server_info.managed_policy;
+        let policy = &self.settings_info().managed_policy;
         let organization = policy["organization"].as_str().map(str::to_owned);
         let mut app = Vec::new();
         if let Some(organization) = &organization {
@@ -276,7 +276,7 @@ impl Workspace {
     }
 
     fn settings_json(&self) -> &Value {
-        &self.server_info.settings
+        &self.settings_info().settings
     }
 
     /// `BackgroundActivitySettingsRow`; this client is one environment, so Advanced is always offered.
@@ -352,7 +352,7 @@ impl Workspace {
 
     /// `BackgroundActivityAdvancedDialog`.
     fn open_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.client().is_none() {
+        if self.settings_client().is_none() {
             return;
         }
         let view = cx.entity();

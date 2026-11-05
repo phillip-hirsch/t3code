@@ -262,7 +262,7 @@ impl Workspace {
             .filter(|p| p.kind != ProfileKind::Incognito)
             .collect();
         // Clearing reaches the server's browser too, so it waits for a connection, as the web does.
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         let workspace = cx.entity();
         let add = Button::new("browser-add-profile")
             .outline()
@@ -359,7 +359,7 @@ impl Workspace {
 
     /// Clears now, or asks first when the server's browser has tabs to close.
     fn confirm_clear_browser_profile(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.server_info.capability("serverBrowser") {
+        if !self.settings_info().capability("serverBrowser") {
             return self.clear_browser_profile_data(profile, window, cx);
         }
         let workspace = cx.entity();

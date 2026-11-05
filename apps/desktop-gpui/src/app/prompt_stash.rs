@@ -690,7 +690,7 @@ impl Workspace {
 
     /// The last `composer.stash` rule's shortcut.
     fn stash_shortcut_label(&self) -> Option<String> {
-        let rules = keybindings::merge_with_defaults(&self.server_info.keybindings);
+        let rules = keybindings::merge_with_defaults(&self.server_info().keybindings);
         rules.iter().rev().find(|rule| rule.command == "composer.stash").map(|rule| shortcut_label(&rule.shortcut))
     }
 }

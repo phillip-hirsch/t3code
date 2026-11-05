@@ -243,14 +243,14 @@ pub(crate) fn recovery(thread: &ThreadShell, now_ms: i64) -> Option<Recovery> {
 
 impl Workspace {
     fn open_shell_thread(&self) -> Option<&ThreadShell> {
-        let Some(Target::Thread(id)) = &self.target else { return None };
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
         self.shell.threads.iter().find(|thread| &thread.id == id)
     }
 
     fn thread_key(&self) -> String {
         match &self.target {
-            Some(Target::Thread(id)) => id.clone(),
-            Some(Target::Draft { project_id }) => format!("draft:{project_id}"),
+            Some(Target::Thread { id, .. }) => id.clone(),
+            Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
             None => String::new(),
         }
     }
@@ -275,7 +275,7 @@ impl Workspace {
 
     fn active_provider(&self) -> Option<&Provider> {
         let selection = self.composer_model()?;
-        self.server_info.provider(&selection.instance_id)
+        self.server_info().provider(&selection.instance_id)
     }
 
     /// The banners over the timeline; only this client's error shows over a page.
@@ -450,7 +450,7 @@ impl Workspace {
                 this.banners.refreshing_provider = false;
                 match result {
                     Ok(reply) => {
-                        let _ = this.server_info.apply(&json!({"type": "providerStatuses", "payload": reply}));
+                        let _ = this.server_info_mut().apply(&json!({"type": "providerStatuses", "payload": reply}));
                     }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
@@ -468,7 +468,7 @@ impl Workspace {
     /// Tracks drops after a first connection, holding the warning back for the grace period.
     pub(super) fn sync_connection_banner(&mut self, cx: &mut Context<Self>) {
         match &self.connection {
-            Connection::Connected(_) => {
+            Connection::Connected => {
                 self.banners.was_connected = true;
                 self.banners.reconnect_warning = false;
                 self.banners._grace = None;
@@ -500,7 +500,7 @@ impl Workspace {
         if !self.banners.was_connected || (reconnecting && !self.banners.reconnect_warning) {
             return None;
         }
-        let label = self.server_info.environment_label.clone().unwrap_or_else(|| "Server".into());
+        let label = self.server_info().environment_label.clone().unwrap_or_else(|| "Server".into());
         let title = format!("{label} is {}", if reconnecting { "reconnecting" } else { "offline" });
         let actions = (!reconnecting).then(|| {
             Button::new("reconnect-server")

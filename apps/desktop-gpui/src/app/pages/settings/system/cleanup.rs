@@ -187,9 +187,9 @@ fn group_digits(value: u64) -> String {
 impl Workspace {
     pub(super) fn render_storage_sections(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
-        let client = self.client();
+        let client = self.settings_client();
         let state = window.use_keyed_state("settings-storage", cx, |_, cx| StorageState::new(client, cx));
-        let info = &self.server_info;
+        let info = &self.settings_info();
         let (cleanup, cleanup_run, database) = (
             info.capability("storageCleanup"),
             info.capability("storageCleanupRun"),
@@ -253,7 +253,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = cx.entity();
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         h_flex()
             .gap_3()
             .child(match input {
@@ -301,8 +301,8 @@ impl Workspace {
         let running = storage.running;
         let last_run_open = storage.last_run_open;
         let label: SharedString =
-            self.server_info.environment_label.clone().unwrap_or_else(|| "this machine".into()).into();
-        let client = self.client();
+            self.settings_info().environment_label.clone().unwrap_or_else(|| "this machine".into()).into();
+        let client = self.settings_client();
         let run_state = state.clone();
         let run_label = label.clone();
         let delete_now = Button::new("storage-delete-now")
@@ -359,7 +359,7 @@ impl Workspace {
             return None;
         }
         let command = status["compactCommand"].as_str().unwrap_or_default().to_owned();
-        let label = self.server_info.environment_label.clone().unwrap_or_default();
+        let label = self.settings_info().environment_label.clone().unwrap_or_default();
         let dismiss = state.downgrade();
         let copied = command.clone();
         let controls = h_flex()

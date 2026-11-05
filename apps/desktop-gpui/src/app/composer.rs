@@ -162,7 +162,7 @@ impl Workspace {
 
     /// The user-invocable skills of the composer's provider, by name.
     fn skill_names(&self) -> Vec<String> {
-        let Some(provider) = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id)) else {
+        let Some(provider) = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id)) else {
             return Vec::new();
         };
         let cwd = self.composer_cwd();
@@ -544,13 +544,13 @@ impl Workspace {
 
     /// `defaultRuntimeMode` for the open thread's or draft's project (`ChatView.tsx`).
     pub(super) fn default_runtime_mode(&self) -> String {
-        let mode = self.server_info.project_setting(self.target_project(), "defaultRuntimeMode");
+        let mode = self.server_info().project_setting(self.target_project(), "defaultRuntimeMode");
         mode.as_str().unwrap_or(DEFAULT_RUNTIME_MODE).to_owned()
     }
 
     pub(super) fn runtime_mode(&self) -> String {
         let mode = match &self.target {
-            Some(Target::Thread(_)) => self
+            Some(Target::Thread { .. }) => self
                 .thread
                 .as_ref()
                 .and_then(|t| t.state.projection.as_ref())
@@ -562,7 +562,7 @@ impl Workspace {
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
-            Some(Target::Thread(thread_id)) => {
+            Some(Target::Thread { id: thread_id, .. }) => {
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
                 self.dispatch(command, cx);
             }
@@ -590,7 +590,7 @@ impl Workspace {
         if self.target.is_none() {
             return "Choose a project above to start a thread";
         }
-        if self.server_info.model_choices().is_empty() {
+        if self.server_info().model_choices().is_empty() {
             return "Enable a provider in Settings to send a message";
         }
         DEFAULT_PLACEHOLDER
@@ -1094,11 +1094,11 @@ impl Workspace {
     /// A draft's model moved to `fallbackModelSelection` while the default's provider
     /// is out of usage (`resolveNewThreadModelSelection`); an explicit pick wins.
     pub(super) fn draft_usage_fallback(&self, default: &ModelSelection) -> Option<UsageFallback> {
-        let Some(Target::Draft { project_id }) = &self.target else { return None };
-        if self.model_override.is_some() || self.server_info.settings.get("fallbackModelSelection").is_null() {
+        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
+        if self.model_override.is_some() || self.server_info().settings.get("fallbackModelSelection").is_null() {
             return None;
         }
-        crate::new_thread::usage_fallback(&self.server_info, default, Some(project_id), jiff::Timestamp::now())
+        crate::new_thread::usage_fallback(self.server_info(), default, Some(project_id), jiff::Timestamp::now())
     }
 
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
@@ -1128,22 +1128,22 @@ impl Workspace {
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Draft { project_id }) = &self.target else { return None };
+        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
         let project = self.shell.projects.iter().find(|p| &p.id == project_id);
-        let default = self.server_info.new_thread_model(project)?;
+        let default = self.server_info().new_thread_model(project)?;
         let fallback = self.draft_usage_fallback(&default)?;
         let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
         if self.composer_ui.dismissed_fallback.as_ref() == Some(&window) {
             return None;
         }
         let model_name = |selection: &ModelSelection| {
-            self.server_info
+            self.server_info()
                 .provider(&selection.instance_id)
                 .and_then(|p| p.models.iter().find(|m| m.slug == selection.model))
                 .and_then(|m| m.name.clone())
                 .unwrap_or_else(|| selection.model.clone())
         };
-        let exhausted = self.server_info.provider(&fallback.exhausted_instance)?;
+        let exhausted = self.server_info().provider(&fallback.exhausted_instance)?;
         let provider_name = exhausted.display_name.clone().unwrap_or_else(|| exhausted.driver.clone());
         let hour12 =
             crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));

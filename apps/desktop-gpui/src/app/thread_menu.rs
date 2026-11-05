@@ -42,7 +42,7 @@ pub(super) fn hosted_thread_link(environment_id: &str, thread_id: &str) -> Strin
 
 impl Workspace {
     fn title_thread_id(&self) -> Option<String> {
-        let Some(Target::Thread(id)) = &self.target else { return None };
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
         Some(id.clone())
     }
 

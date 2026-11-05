@@ -78,8 +78,8 @@ impl Workspace {
         cx: &App,
     ) -> Button {
         let t = *tokens(cx);
-        let provider = selection.and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = selection.and_then(|s| self.server_info.model(s));
+        let provider = selection.and_then(|s| self.settings_info().provider(&s.instance_id));
+        let model = selection.and_then(|s| self.settings_info().model(s));
         let name: SharedString = match (label, provider.zip(model), selection) {
             (Some(label), ..) => label.to_owned().into(),
             (None, Some((provider, model)), _) => model_label::trigger_model_name(model, &provider.driver).into(),
@@ -105,7 +105,7 @@ impl Workspace {
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> Option<AnyElement> {
         let t = *tokens(cx);
-        let descriptors = self.server_info.model(selection)?.capabilities.as_ref()?.option_descriptors.clone();
+        let descriptors = self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors.clone();
         let effort = model_label::reasoning(&descriptors).filter(|d| d.kind == "select").cloned();
         let toggles: Vec<_> = descriptors.iter().filter(|d| d.kind == "boolean").cloned().collect();
         if effort.is_none() && toggles.is_empty() {

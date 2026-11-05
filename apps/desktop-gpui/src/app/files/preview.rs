@@ -153,7 +153,7 @@ impl Workspace {
         } else if fresh || (changed && !dirty) {
             self.read_file(key.clone(), window, cx);
         }
-        let draft = !matches!(self.target, Some(Target::Thread(_)));
+        let draft = !matches!(self.target, Some(Target::Thread { .. }));
         let Some(state) = self.files.previews.get_mut(key) else { return };
         if matches!(state.load, Load::Text { truncated: true, .. })
             && state.full.is_none()
@@ -252,14 +252,14 @@ impl Workspace {
 
     /// The `media-file` resource for a workspace file of the open thread.
     fn media_resource(&self, key: &Key) -> Option<Value> {
-        let Some(Target::Thread(thread_id)) = &self.target else { return None };
+        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return None };
         let path = logic::absolute_path(&key.0, &key.1);
         Some(json!({"_tag": "media-file", "threadId": thread_id, "path": path, "disposition": "attachment"}))
     }
 
     fn load_full_file(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint.clone(), self.media_resource(&key))
+            (self.client(), self.endpoint().cloned(), self.media_resource(&key))
         else {
             return;
         };
@@ -289,7 +289,7 @@ impl Workspace {
     /// Save file: fetches the file again and writes it where the user picks.
     fn save_full_file(&mut self, key: &Key, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(endpoint), Some(resource)) =
-            (self.client(), self.endpoint.clone(), self.media_resource(key))
+            (self.client(), self.endpoint().cloned(), self.media_resource(key))
         else {
             return;
         };
@@ -376,7 +376,7 @@ impl Workspace {
         let reveal = self.files.reveals.get(&key).map_or(0, |(_, request)| *request);
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
         let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
-        let draft = !matches!(self.target, Some(Target::Thread(_)));
+        let draft = !matches!(self.target, Some(Target::Thread { .. }));
         let notice = self.files.previews.get(&key).and_then(|state| match state.load {
             Load::Text { truncated: true, byte_length } if !logic::loads_full_file(&path, draft) => Some(
                 div()
@@ -751,17 +751,19 @@ impl Workspace {
     fn workspace_image(&mut self, key: &Key, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
         let absolute = logic::absolute_path(&key.0, &key.1);
         let resource = match &self.target {
-            Some(Target::Thread(thread_id)) => json!({"_tag": "media-file", "threadId": thread_id, "path": absolute}),
+            Some(Target::Thread { id: thread_id, .. }) => {
+                json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
+            }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.0, "path": absolute}),
         };
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.client(), self.endpoint().cloned());
         let images = self.files.images.get_or_insert_with(|| cx.new(|_| Default::default())).clone();
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
     }
 
     /// The editor the details card's Open in launches.
     pub(in crate::app) fn preferred_editor_id(&self) -> Option<String> {
-        let available = &self.server_info.available_editors;
+        let available = &self.server_info().available_editors;
         self.preferred_editor.clone().filter(|editor| available.contains(editor)).or_else(|| available.first().cloned())
     }
 }

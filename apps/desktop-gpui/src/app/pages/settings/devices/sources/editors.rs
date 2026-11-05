@@ -160,7 +160,7 @@ fn save_patch<E: Editor>(
 fn context(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<(RpcClient, Value, String)> {
     let workspace = workspace.upgrade()?;
     let workspace = workspace.read(cx);
-    Some((workspace.client()?, (*workspace.server_info.settings).clone(), workspace.environment_name()))
+    Some((workspace.client()?, (*workspace.settings_info().settings).clone(), workspace.environment_name()))
 }
 
 fn token_placeholder(configured: bool, otherwise: &'static str) -> &'static str {
@@ -187,7 +187,7 @@ impl Workspace {
 
     pub(super) fn open_eas_editor(&mut self, host: Option<EasHost>, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
-        let client = self.client();
+        let client = self.settings_client();
         let editor = cx.new(|cx| EasEditor::new(workspace, client, host, window, cx));
         open_editor(editor, window, cx);
     }
@@ -199,7 +199,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workspace = cx.weak_entity();
-        let client = self.client();
+        let client = self.settings_client();
         let editor = cx.new(|cx| SimlockEditor::new(workspace, client, host, window, cx));
         open_editor(editor, window, cx);
     }

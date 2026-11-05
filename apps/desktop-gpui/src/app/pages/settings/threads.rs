@@ -88,7 +88,7 @@ impl Workspace {
     pub(super) fn render_threads_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
         let view = self.settings_view();
-        let connected = self.client().is_some();
+        let connected = self.settings_client().is_some();
         let base = self.add_project_field(&view, window, cx);
         let new_threads = self.new_threads_section(&view, true, window, cx);
         let snooze = (!view.scope.is_project()).then(|| self.snooze_row(&view, window, cx));
@@ -174,8 +174,8 @@ impl Workspace {
         };
         let stored: Option<ModelSelection> = serde_json::from_value(view.value("defaultModelSelection").clone()).ok();
         let selection = stored
-            .filter(|s| self.server_info.provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
-            .or_else(|| self.server_info.automatic_model());
+            .filter(|s| self.settings_info().provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
+            .or_else(|| self.settings_info().automatic_model());
         let model: AnyElement = match &selection {
             Some(selection) => h_flex()
                 .gap(px(6.))
@@ -381,7 +381,7 @@ impl Workspace {
                 });
             div().w(px(96.)).child(NumberInput::new(&field).small())
         });
-        let keep = self.server_info.capability("threadAutoSettlementScope");
+        let keep = self.settings_info().capability("threadAutoSettlementScope");
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let mut rows = vec![
             row(
@@ -430,10 +430,10 @@ impl Workspace {
         let t = *tokens(cx);
         let stored: Option<ModelSelection> =
             serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
-        let selection = resolve_text_generation(stored.as_ref(), &self.server_info.providers);
-        let connected = self.client().is_some();
+        let selection = resolve_text_generation(stored.as_ref(), &self.settings_info().providers);
+        let connected = self.settings_client().is_some();
         let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-            let resolved = resolve_text_generation(Some(&pick), &this.server_info.providers).unwrap_or(pick);
+            let resolved = resolve_text_generation(Some(&pick), &this.settings_info().providers).unwrap_or(pick);
             this.update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), window, cx)
         };
         let control: AnyElement = match (&selection, connected) {

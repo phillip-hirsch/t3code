@@ -8,7 +8,7 @@ use std::time::Duration;
 use gpui_kit::{Context, Task};
 use serde_json::json;
 
-use super::{Target, Workspace, new_id};
+use super::{Workspace, new_id};
 use crate::inbox::{self, Facts};
 use crate::model::ThreadShell;
 
@@ -105,7 +105,7 @@ impl Workspace {
     pub(super) fn track_visit(&mut self, cx: &mut Context<Self>) {
         self.visit._timer = None;
         let Some(thread_id) = self.visit.thread_id.clone() else { return };
-        if self.target.as_ref() != Some(&Target::Thread(thread_id.clone())) {
+        if self.open_thread_id() != Some(&*thread_id) {
             return;
         }
         let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };

@@ -246,19 +246,20 @@ pub(super) struct ThreadFind {
 impl Workspace {
     /// The server can search threads (`serverConfig.threadFind`) and a thread is open.
     pub(super) fn thread_find_available(&self) -> bool {
-        matches!(self.target, Some(Target::Thread(_))) && self.server_info.config["threadFind"] == true
+        matches!(self.target, Some(Target::Thread { .. })) && self.server_info().config["threadFind"] == true
     }
 
     /// The open find, while it belongs to the thread on screen.
     fn open_find(&self) -> Option<&ThreadFind> {
         let find = self.find.as_ref()?;
-        (self.target.as_ref() == Some(&Target::Thread(find.thread_id.clone()))).then_some(find)
+        (self.open_thread_id() == Some(&*find.thread_id)).then_some(find)
     }
 
     /// `chat.find`: opens find, or refocuses it and restarts its search from the viewport.
     /// Returns false when this thread can't be searched.
     pub(super) fn open_thread_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(Target::Thread(thread_id)) = self.target.clone().filter(|_| self.thread_find_available()) else {
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone().filter(|_| self.thread_find_available())
+        else {
             return false;
         };
         if self.open_find().is_none() {
@@ -282,7 +283,7 @@ impl Workspace {
 
     /// The palette's `chat.find` path: a toast says why find can't open (`CommandPalette.tsx`).
     pub(super) fn open_thread_find_or_explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.open_thread_find(window, cx) && matches!(self.target, Some(Target::Thread(_))) {
+        if !self.open_thread_find(window, cx) && matches!(self.target, Some(Target::Thread { .. })) {
             let note = Notification::new()
                 .title("Thread search is unavailable on this server.")
                 .message("Update the server to enable it.");

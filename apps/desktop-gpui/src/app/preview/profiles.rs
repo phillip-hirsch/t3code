@@ -54,7 +54,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let server = self.client().filter(|_| self.server_info.capability("serverBrowser"));
+        let server = self.client().filter(|_| self.server_info().capability("serverBrowser"));
         let parent = window.window_handle().map(|handle| ParentWindow(handle.as_raw()));
         let storage = Storage::of(Some(&profile_id));
         cx.spawn_in(window, async move |_, _| {
@@ -72,7 +72,7 @@ impl Workspace {
     /// Reports this client's profiles, default profile and recording frame rate to the server's
     /// browser once per connection and again on each change. Agents' tabs use them.
     pub(in crate::app) fn report_browser_profiles(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client().filter(|_| self.server_info.capability("serverBrowser")) else { return };
+        let Some(client) = self.client().filter(|_| self.server_info().capability("serverBrowser")) else { return };
         let report = preview::profile_report(&self.client_settings.values);
         if self.preview.reported_profiles.as_ref() == Some(&report) {
             return;

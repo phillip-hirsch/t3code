@@ -44,7 +44,7 @@ impl Workspace {
     /// The checkout a thread or draft works in: its worktree, else the project root.
     pub(super) fn composer_cwd(&self) -> Option<String> {
         let worktree = match &self.target {
-            Some(Target::Thread(_)) => {
+            Some(Target::Thread { .. }) => {
                 self.thread.as_ref()?.state.projection.as_ref().and_then(|p| p.thread.worktree_path.clone())
             }
             _ => None,
@@ -100,7 +100,7 @@ impl Workspace {
             return;
         }
         self.menu._search = None;
-        let provider = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id).cloned());
+        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id).cloned());
         let Some(provider) = provider else {
             self.menu.items = Rc::default();
             self.menu.loading = false;

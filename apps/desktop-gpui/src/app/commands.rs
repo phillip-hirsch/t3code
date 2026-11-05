@@ -139,7 +139,7 @@ impl Workspace {
                 }
             }
             "thread.settle" if chat => {
-                let Some(Target::Thread(id)) = self.target.clone() else { return false };
+                let Some(Target::Thread { id, .. }) = self.target.clone() else { return false };
                 let Some(thread) = self.shell.threads.iter().find(|t| t.id == id) else { return true };
                 if thread.settled_override.as_deref() == Some("settled") {
                     self.unsettle_thread(&id, cx);
@@ -148,7 +148,7 @@ impl Workspace {
                 }
             }
             "thread.pin" if chat => {
-                let Some(Target::Thread(id)) = self.target.clone() else { return false };
+                let Some(Target::Thread { id, .. }) = self.target.clone() else { return false };
                 let Some(thread) = self.shell.threads.iter().find(|t| t.id == id) else { return true };
                 if thread.pinned_at.is_some() {
                     self.unpin_thread(&id, window, cx);
@@ -241,7 +241,7 @@ impl Workspace {
     /// `thread.previous` / `thread.next` along the sidebar's order (`resolveAdjacentThreadId`).
     fn go_to_adjacent_thread(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let current = match &self.target {
-            Some(Target::Thread(id)) => Some(id.as_str()),
+            Some(Target::Thread { id, .. }) => Some(id.as_str()),
             _ => None,
         };
         let order: Vec<&str> = self.sidebar.ordered_thread_ids().collect();
@@ -260,7 +260,7 @@ impl Workspace {
     fn run_script_shortcut(&mut self, script_id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(project) = self.target_project() else { return false };
         let scripts = super::pages::settings::code::projects::scripts::resolve_project_scripts(
-            &self.server_info.settings,
+            &self.server_info().settings,
             project,
         );
         let (Some(script), Some(cwd)) = (scripts.into_iter().find(|s| s.id == script_id), self.git_cwd()) else {
@@ -320,7 +320,7 @@ impl Workspace {
         let chat = self.page.is_none() && self.target.is_some();
         let shown: Vec<Area> = [
             (Area::Sidebar, self.sidebar_open),
-            (Area::Conversation, chat && matches!(self.target, Some(Target::Thread(_)))),
+            (Area::Conversation, chat && matches!(self.target, Some(Target::Thread { .. }))),
             (Area::Composer, chat),
             (Area::Panel, matches!(self.active_surface(), Some(super::right_panel::Surface::Browser(_)))),
             (Area::Terminal, self.terminal_open()),

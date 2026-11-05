@@ -42,7 +42,7 @@ impl Workspace {
     pub(super) fn render_worktrees_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
         let view = self.settings_view();
-        let directory = self.server_info.capability("worktreesDirectory").then(|| {
+        let directory = self.settings_info().capability("worktreesDirectory").then(|| {
             let saved = view.str("worktreesDirectory").to_owned();
             self.text_field(
                 "worktrees-directory",
@@ -135,7 +135,7 @@ impl Workspace {
     /// when custom, the project's rules.
     fn cleanup_rows(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
-        let info = &self.server_info;
+        let info = &self.settings_info();
         let project_scope = view.scope.is_project();
         if project_scope && !info.capability("projectWorktreeCleanup") {
             return vec![note("Update the selected machines to configure project worktree cleanup.", &t)];

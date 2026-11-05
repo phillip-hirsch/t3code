@@ -291,7 +291,7 @@ impl Workspace {
     /// `thread.steerQueuedMessage`: sends the first queued message now.
     pub(super) fn steer_next_queued(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(next) = self.queue.state.queued.first().map(|q| q.run_id.clone()) else { return false };
-        if !matches!(self.target, Some(Target::Thread(_))) || !self.queue.state.can_send() {
+        if !matches!(self.target, Some(Target::Thread { .. })) || !self.queue.state.can_send() {
             return false;
         }
         self.send_queued(next, cx);

@@ -53,7 +53,7 @@ impl EnvironmentsState {
 impl Workspace {
     pub(super) fn render_environments(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = window.use_keyed_state("settings-environments", cx, |_, _| EnvironmentsState::default());
-        let (client, endpoint) = (self.client(), self.endpoint.clone());
+        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         if client.is_some() && !state.read(cx).started {
             state.update(cx, |state, cx| {
                 state.started = true;
@@ -73,10 +73,10 @@ impl Workspace {
         }
         let t = *theme::tokens(cx);
         let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
-        let info = &self.server_info;
+        let info = &self.settings_info();
         let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
         let readable = state.read(cx).session.as_ref().is_some_and(|s| s.grants(ACCESS_READ));
-        if offers_links && readable && self.client().is_some() {
+        if offers_links && readable && self.settings_client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));
         }
         let view = self.settings_view();
@@ -87,7 +87,7 @@ impl Workspace {
         let s = state.read(cx);
         let session = s.session.as_ref();
         let can_link = session.is_some_and(|s| s.grants(ACCESS_WRITE));
-        let client = self.client();
+        let client = self.settings_client();
         let action = can_link.then(|| {
             let (client, state) = (client.clone(), state.downgrade());
             WebButton::new("link-environment", "Link")

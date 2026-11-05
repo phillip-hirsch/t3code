@@ -226,7 +226,7 @@ pub(super) fn pill_view(
 impl Workspace {
     /// The pill's view now, starting the success timer the first time a success shows.
     fn provider_pill_view(&mut self, cx: &mut Context<Self>) -> Option<PillView> {
-        let providers = &self.server_info.providers;
+        let providers = &self.sessions[self.active_index()].server_info.providers;
         let state = &mut self.sidebar.provider_pill;
         // Outcomes from before this window opened don't show (`visibleAfterIso`).
         if state.visible_after.is_none() {

@@ -340,8 +340,8 @@ impl Workspace {
 
     /// The environment row: machine icon, environment label, workspace kind at the far right.
     fn environment_row(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
-        let label = self.server_info.environment_label.clone()?;
-        let machine = match self.server_info.machine_kind() {
+        let label = self.server_info().environment_label.clone()?;
+        let machine = match self.server_info().machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => "icons/monitor.svg",
             "laptop" => "icons/laptop.svg",
             "cloud" => "icons/cloud.svg",
@@ -375,7 +375,7 @@ impl Workspace {
 
     /// The editor the Open in row launches: the last one picked, else the first available (`usePreferredEditor`).
     pub(super) fn preferred_editor(&self) -> Option<&str> {
-        let available = &self.server_info.available_editors;
+        let available = &self.server_info().available_editors;
         self.preferred_editor
             .as_deref()
             .filter(|editor| available.iter().any(|id| id == editor))
@@ -401,7 +401,7 @@ impl Workspace {
                 .into_any_element(),
         };
         let view = cx.entity();
-        let editors = self.server_info.available_editors.clone();
+        let editors = self.server_info().available_editors.clone();
         let current = preferred.clone();
         let menu_tokens = *tokens;
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
@@ -483,7 +483,7 @@ impl Workspace {
         let project_id = project.id.clone();
         let scripts: Vec<(SharedString, SharedString)> =
             super::pages::settings::code::projects::scripts::resolve_project_scripts(
-                &self.server_info.settings,
+                &self.server_info().settings,
                 project,
             )
             .into_iter()
@@ -900,7 +900,7 @@ impl Workspace {
     /// `ThreadRelationshipsPanel` from the shell: the parent thread, running
     /// subagents, and settled ones folded under "Previous agents".
     fn lineage_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
-        let Some(Target::Thread(id)) = &self.target else { return None };
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
         let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
         let parent = thread.lineage.parent_thread_id.as_ref().and_then(|parent| self.thread_shell(parent));
         let (previous, active): (Vec<&ThreadShell>, Vec<&ThreadShell>) = self
@@ -1057,7 +1057,7 @@ impl Workspace {
     /// The selected provider's limit windows; each bar reads as room left.
     fn usage_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<Section> {
         let selection = self.composer_model()?;
-        let limits = self.server_info.provider(&selection.instance_id)?.usage_limits.as_ref()?;
+        let limits = self.server_info().provider(&selection.instance_id)?.usage_limits.as_ref()?;
         let meters = limit_meters(limits, tokens);
         Some(Section {
             height: meters.len() as f32 * METER_ROW_HEIGHT,
@@ -1077,15 +1077,15 @@ impl Workspace {
 
     pub(super) fn open_projection(&self) -> Option<&crate::model::ThreadProjection> {
         match &self.target {
-            Some(Target::Thread(_)) => self.thread.as_ref()?.state.projection.as_ref(),
+            Some(Target::Thread { .. }) => self.thread.as_ref()?.state.projection.as_ref(),
             _ => None,
         }
     }
 
     pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
         let project_id = match self.target.as_ref()? {
-            Target::Thread(id) => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
-            Target::Draft { project_id } => project_id,
+            Target::Thread { id, .. } => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
+            Target::Draft { project_id, .. } => project_id,
         };
         self.shell.projects.iter().find(|project| &project.id == project_id)
     }

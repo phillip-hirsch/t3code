@@ -32,7 +32,7 @@ impl Workspace {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
         let (project, title, parent) = match &self.target {
-            Some(Target::Thread(id)) => {
+            Some(Target::Thread { id, .. }) => {
                 let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let title: SharedString = shell
@@ -46,7 +46,7 @@ impl Workspace {
                     .and_then(|parent| self.shell.threads.iter().find(|thread| &thread.id == parent));
                 (project, title, parent)
             }
-            Some(Target::Draft { project_id }) => {
+            Some(Target::Draft { project_id, .. }) => {
                 (self.shell.projects.iter().find(|p| &p.id == project_id), "New thread".into(), None)
             }
             // `NoActiveThreadState`: a bordered header with a quiet label.
@@ -104,7 +104,7 @@ impl Workspace {
                 .child(separator());
         }
         let title = match (&self.target, &self.title.rename) {
-            (Some(Target::Thread(_)), Some(rename)) => div()
+            (Some(Target::Thread { .. }), Some(rename)) => div()
                 .min_w(px(40.))
                 .flex_1()
                 .occlude()
@@ -116,7 +116,7 @@ impl Workspace {
                 }))
                 .child(Input::new(&rename.input).small().text_color(tokens.foreground))
                 .into_any_element(),
-            (Some(Target::Thread(_)), None) => self.render_title_button(title, &tokens, cx),
+            (Some(Target::Thread { .. }), None) => self.render_title_button(title, &tokens, cx),
             _ => div().min_w(px(40.)).flex_1().truncate().text_color(tokens.foreground).child(title).into_any_element(),
         };
         header.child(breadcrumb.child(title)).children(self.render_title_menu())

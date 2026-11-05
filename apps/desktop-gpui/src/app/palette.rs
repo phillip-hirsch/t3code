@@ -282,7 +282,7 @@ impl Workspace {
         let start = match view {
             View::Browse => {
                 let base = self
-                    .server_info
+                    .server_info()
                     .settings
                     .get("addProjectBaseDirectory")
                     .as_str()
@@ -424,8 +424,8 @@ impl Workspace {
     /// The project of the open thread or draft.
     fn current_project(&self) -> Option<&ProjectShell> {
         let id = match &self.target {
-            Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id),
-            Some(Target::Draft { project_id }) => Some(project_id),
+            Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id),
+            Some(Target::Draft { project_id, .. }) => Some(project_id),
             None => None,
         }?;
         self.shell.projects.iter().find(|p| &p.id == id)
@@ -451,7 +451,7 @@ impl Workspace {
 
     /// The live shortcut label of `command` (`shortcutCommand`).
     fn shortcut(&self, command: &str) -> Option<SharedString> {
-        let keybindings = self.server_info.keybindings_json();
+        let keybindings = self.server_info().keybindings_json();
         super::pages::settings::code::projects::scripts::shortcut_label_for_command(keybindings, Some(command))
             .map(Into::into)
     }
@@ -479,7 +479,7 @@ impl Workspace {
             row.terms = &["new thread", "project", "pick", "choose", "select"];
             rows.push(row);
         }
-        if self.server_info.scratch_workspace_root.is_some() && self.client().is_some() {
+        if self.server_info().scratch_workspace_root.is_some() && self.client().is_some() {
             let mut row = lucide(
                 "new-thread-without-project",
                 IconName::MessageSquareDashed,
@@ -490,7 +490,7 @@ impl Workspace {
             row.shortcut = self.shortcut("chat.newWithoutProject");
             rows.push(row);
         }
-        if self.server_info.capability("triage") {
+        if self.server_info().capability("triage") {
             let mut row = lucide("triage", IconName::Bug, "Triage an issue", Run::Triage);
             row.description =
                 Some(Description::Text("An agent investigates a T3 Code problem and helps file an issue".into()));
@@ -498,7 +498,7 @@ impl Workspace {
             rows.push(row);
         }
         let thread = match &self.target {
-            Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id),
+            Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id),
             _ => None,
         };
         if thread.is_some() && self.thread_find_available() {
@@ -657,7 +657,7 @@ impl Workspace {
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let mut parts: Vec<String> = project.map(|p| p.title.clone()).into_iter().collect();
         parts.extend(thread.branch.clone());
-        if self.target.as_ref() == Some(&Target::Thread(thread.id.clone())) {
+        if self.open_thread_id() == Some(&*thread.id) {
             parts.push("Current thread".into());
         }
         row.description = Some(Description::Text(parts.join(" · ").into()));
@@ -704,10 +704,7 @@ impl Workspace {
             _ => {}
         }
         if tokens.is_empty() {
-            let mut recent: Vec<_> = self
-                .palette_threads()
-                .filter(|t| self.target.as_ref() != Some(&Target::Thread(t.id.clone())))
-                .collect();
+            let mut recent: Vec<_> = self.palette_threads().filter(|t| self.open_thread_id() != Some(&*t.id)).collect();
             recent.sort_by_key(|t| std::cmp::Reverse(used_at(t)));
             let recent = recent.into_iter().take(RECENT_LIMIT).map(|t| self.thread_row(t, now)).collect();
             return vec![
@@ -859,7 +856,7 @@ impl Workspace {
                     search::match_fields(tokens, &[title_field, Weighted::new(&branch, 0.6), project_field], typos)?;
                 let age = now - used_at(thread);
                 row.quality = found.quality;
-                let current = self.target.as_ref() == Some(&Target::Thread(thread.id.clone()));
+                let current = self.open_thread_id() == Some(&*thread.id);
                 Some((row, found.strong, if current { -1. } else { found.quality * search::usage_boost(age) }))
             })
             .collect();
@@ -985,7 +982,13 @@ impl Workspace {
     pub(super) fn add_project(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         self.close_palette(window, cx);
-        if let Some(existing) = self.shell.projects.iter().find(|p| same_path(&p.workspace_root, &path)) {
+        let environment = self.active_environment().cloned();
+        let existing = self
+            .shell
+            .projects
+            .iter()
+            .find(|p| Some(&p.environment_id) == environment.as_ref() && same_path(&p.workspace_root, &path));
+        if let Some(existing) = existing {
             let project_id = existing.id.clone();
             if existing.archived_at.is_some() {
                 let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "archived": false});
@@ -1018,7 +1021,7 @@ impl Workspace {
     }
 
     pub(super) fn mutate_project(&mut self, mutation: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.command_client(&mutation) else { return };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("projects.mutate", mutation).await {
                 let _ = this.update(cx, |this, cx| {

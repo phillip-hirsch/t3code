@@ -61,11 +61,11 @@ impl Workspace {
     /// The meter, a 28px placeholder while the thread loads, or nothing.
     pub(super) fn render_context_meter(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.client_settings.values.bool("contextWindowMeterEnabled")
-            || !matches!(self.target, Some(Target::Thread(_)))
+            || !matches!(self.target, Some(Target::Thread { .. }))
         {
             return None;
         }
-        let provider = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id));
+        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id));
         let Some(projection) = self.open_projection() else {
             // `shouldReserveContextWindowMeter`: keep the slot while the thread loads.
             let reserve = provider.is_none_or(|p| p.reports_context_window != Some(false));
@@ -82,7 +82,7 @@ impl Workspace {
             .model_selection
             .as_ref()
             .and_then(|s| {
-                let provider = self.server_info.provider(&s.instance_id)?;
+                let provider = self.server_info().provider(&s.instance_id)?;
                 let model = provider.models.iter().find(|m| m.slug == s.model)?;
                 Some(crate::model_label::display_model_name(model))
             })
@@ -214,7 +214,7 @@ impl Workspace {
 
     /// `sendStandaloneCommand("/compact")`, after the thread takes the composer's mode.
     fn compact_context(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Thread(thread_id)) = self.target.clone() else { return };
+        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let (_, mode) = self.interaction_mode();
         let mut commands: Vec<_> = self.interaction_mode_command(&thread_id, mode).into_iter().collect();
         let mut message = json!({

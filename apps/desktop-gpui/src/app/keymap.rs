@@ -290,7 +290,7 @@ impl super::Workspace {
                         move |_, window, cx| {
                             let Some(workspace) = workspace.upgrade() else { return };
                             let workspace = workspace.read(cx);
-                            let info = &workspace.server_info;
+                            let info = &workspace.primary_info();
                             let (client, path, editors) = (
                                 workspace.client(),
                                 info.keybindings_config_path.clone(),
@@ -309,8 +309,8 @@ impl super::Workspace {
 
     /// Recomputes the merged rules when the server's keybindings changed.
     pub(super) fn sync_keymap(&mut self, _cx: &mut Context<Self>) {
-        if *self.installed_keybindings != *self.server_info.keybindings {
-            self.installed_keybindings = self.server_info.keybindings.clone();
+        if *self.installed_keybindings != *self.primary_info().keybindings {
+            self.installed_keybindings = self.primary_info().keybindings.clone();
             self.keymap = Rc::new(keybindings::merge_with_defaults(&self.installed_keybindings));
         }
     }

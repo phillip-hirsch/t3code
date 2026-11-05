@@ -237,7 +237,7 @@ impl Workspace {
             return;
         }
         self.read_pr_detail(cx);
-        if self.server_info.settings.bool("reviewGuidesEnabled") {
+        if self.server_info().settings.bool("reviewGuidesEnabled") {
             self.read_pr_guide(cx);
         }
         cx.notify();
@@ -646,7 +646,7 @@ impl Workspace {
     /// The merge method the header and menu use (`resolvePullRequestMergeMethod`).
     fn pr_merge_method(&self, panel: &Panel, detail: &Detail) -> &'static str {
         let project = self.shell.projects.iter().find(|p| p.id == detail.project_id);
-        let project_default = self.server_info.project_setting(project, "pullRequestMergeMethod");
+        let project_default = self.server_info().project_setting(project, "pullRequestMergeMethod");
         logic::resolve_merge_method(
             &logic::allowed_merge_methods(detail),
             panel.merge_method.or(detail.auto_merge_method.as_deref().and_then(known_method)),
@@ -668,7 +668,7 @@ impl Workspace {
             };
             return frame.child(self.render_pr_seed_header(&t, cx)).child(body).into_any_element();
         };
-        let guides = self.server_info.settings.bool("reviewGuidesEnabled");
+        let guides = self.server_info().settings.bool("reviewGuidesEnabled");
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
         let tab = match panel.tab {
             Tab::Guide if !guides => Tab::Summary,
