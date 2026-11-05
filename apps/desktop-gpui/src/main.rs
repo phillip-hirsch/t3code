@@ -21,6 +21,7 @@ mod rpc;
 mod search;
 mod settings;
 mod terminal_text;
+mod tex;
 mod theme;
 mod themes;
 mod thread_details;

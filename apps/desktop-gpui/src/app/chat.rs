@@ -226,10 +226,12 @@ fn markdown_with(
     let key_for_view = key.clone();
     match this.update(cx, |workspace, cx| {
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
-        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone())
+        let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
+        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone(), math)
     }) {
-        Ok((state, wrap, images)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t)
+        Ok((state, wrap, images, math)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t)
             .image_source(images.resolver())
+            .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
             .into_any_element(),
         Err(_) => div().into_any_element(),
     }

@@ -429,6 +429,62 @@ impl MarkdownPlugin for SkillChips {
     }
 }
 
+/// `$…$` math when Render math is on (`MarkdownMath`), as its Unicode form; copying keeps the TeX.
+pub(super) struct InlineMath;
+
+impl MarkdownPlugin for InlineMath {
+    fn name(&self) -> &str {
+        "t3-inline-math"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        _: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::InlineMath(math) = node else { return None };
+        Some(
+            MarkdownNode::new("t3-inline-math", ())
+                .text(crate::tex::to_unicode(&math.value))
+                .markdown(format!("\\({}\\)", math.value.trim())),
+        )
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div().px(px(2.)).italic().whitespace_nowrap().child(node.as_text().to_owned())
+    }
+}
+
+/// `$$…$$` display math when Render math is on: its own centered line.
+pub(super) struct DisplayMath;
+
+impl MarkdownPlugin for DisplayMath {
+    fn is_block(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        "t3-display-math"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        _: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Math(math) = node else { return None };
+        Some(
+            MarkdownNode::new("t3-display-math", ())
+                .text(crate::tex::to_unicode(&math.value))
+                .markdown(format!("\\[\n{}\n\\]", math.value.trim())),
+        )
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div().w_full().my(gpui_kit::rems(0.65)).flex().justify_center().italic().child(node.as_text().to_owned())
+    }
+}
+
 /// `serializeTableElementToCsv`: cells with commas, quotes or newlines are quoted.
 pub(super) fn table_csv(headers: &[String], rows: &[Vec<String>]) -> String {
     let cell = |value: &str| {
