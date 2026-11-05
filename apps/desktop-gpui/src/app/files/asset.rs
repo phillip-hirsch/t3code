@@ -183,7 +183,10 @@ impl Workspace {
             let Ok(Ok(Some(path))) = picked.await else { return };
             let written = match document::mint_asset_url(client, endpoint.http_base, resource).await {
                 Ok((url, _)) => match fetch_bounded(url, u64::MAX, "").await {
-                    Ok(bytes) => std::fs::write(&path, bytes).map_err(|error| error.to_string()),
+                    Ok(bytes) => {
+                        let write = async move { std::fs::write(&path, bytes).map_err(|error| error.to_string()) };
+                        cx.background_executor().spawn(write).await
+                    }
                     Err(error) => Err(error),
                 },
                 Err(_) => Err("Reconnect to the environment and try again.".to_owned()),
