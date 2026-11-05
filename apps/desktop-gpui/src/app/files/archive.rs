@@ -550,7 +550,13 @@ fn archive_row(
                         .flex_none()
                         .text_color(muted),
                 )
-                .child(div().min_w_0().truncate().child(child.path[folder.len().min(child.path.len())..].to_owned())),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(child.path[folder.len().min(child.path.len())..].to_owned()),
+                ),
         )
         .child(div().w(px(80.)).flex_none().px(px(12.)).text_right().text_color(muted).child(format_size(child.size)))
         .child(

@@ -100,6 +100,11 @@ fn attr<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
     node.attributes().find(|a| a.name() == name).map(|a| a.value())
 }
 
+/// A part's relationship id (`r:id`), not a plain `id` beside it as on `p:sldId`.
+fn rel_id<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+    node.attributes().find(|a| a.name() == "id" && a.namespace().is_some()).map(|a| a.value())
+}
+
 /// A Word paragraph's text: runs' text, tabs and breaks.
 fn word_text(paragraph: Node) -> String {
     let mut text = String::new();
@@ -184,7 +189,7 @@ fn open_workbook(package: &Package) -> Result<OfficeData, String> {
     let mut sheets = Vec::new();
     for sheet in doc.descendants().filter(|n| n.tag_name().name() == "sheet") {
         let name = attr(sheet, "name").unwrap_or("Sheet").to_owned();
-        let Some(target) = attr(sheet, "id").and_then(|id| targets.get(id)) else { continue };
+        let Some(target) = rel_id(sheet).and_then(|id| targets.get(id)) else { continue };
         let Some(sheet_xml) = package.text(target) else { continue };
         let Ok(sheet_doc) = Document::parse(sheet_xml) else { continue };
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -245,7 +250,7 @@ fn open_deck(package: &Package) -> Result<OfficeData, String> {
     let targets = package.relationships("ppt/presentation.xml");
     let mut slides = Vec::new();
     for id in doc.descendants().filter(|n| n.tag_name().name() == "sldId") {
-        let Some(target) = attr(id, "id").and_then(|id| targets.get(id)) else { continue };
+        let Some(target) = rel_id(id).and_then(|id| targets.get(id)) else { continue };
         let Some(slide_xml) = package.text(target) else { continue };
         let Ok(slide) = Document::parse(slide_xml) else { continue };
         let notes = package
@@ -383,13 +388,13 @@ impl Workspace {
                             .min_h_0()
                             .overflow_y_scroll()
                             .bg(tokens.muted.opacity(0.4))
-                            .p(px(20.))
+                            .p(px((width * 0.04).clamp(8., 20.)))
                             .child(
                                 v_flex()
                                     .w_full()
                                     .max_w(px(816.))
                                     .mx_auto()
-                                    .p(px(56.))
+                                    .p(px((width * 0.07).clamp(16., 56.)))
                                     .gap(px(6.))
                                     .bg(rgb(PAPER))
                                     .text_color(rgb(INK))
@@ -615,7 +620,7 @@ mod tests {
     #[test]
     fn decks_list_slide_text_and_notes() {
         let a = "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"";
-        let presentation = "<p:presentation xmlns:p=\"p\" xmlns:r=\"r\"><p:sldIdLst><p:sldId r:id=\"rId2\"/></p:sldIdLst></p:presentation>";
+        let presentation = "<p:presentation xmlns:p=\"p\" xmlns:r=\"r\"><p:sldIdLst><p:sldId id=\"256\" r:id=\"rId2\"/></p:sldIdLst></p:presentation>";
         let rels = "<Relationships><Relationship Id=\"rId2\" Target=\"slides/slide1.xml\"/></Relationships>";
         let slide = format!("<p:sld xmlns:p=\"p\" {a} show=\"0\"><a:p><a:r><a:t>Title</a:t></a:r></a:p><a:p/></p:sld>");
         let slide_rels =

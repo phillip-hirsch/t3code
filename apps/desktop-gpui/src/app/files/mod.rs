@@ -5,10 +5,12 @@
 mod archive;
 mod asset;
 mod chrome;
+mod crumbs;
 mod document;
 mod logic;
 mod notebook;
 mod office;
+mod open_in;
 mod overlay;
 mod preview;
 mod table;

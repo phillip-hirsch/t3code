@@ -387,7 +387,7 @@ pub(super) fn parent_of(path: &str) -> &str {
 }
 
 /// Folders before files, then by name, case-insensitively (the tree's sort).
-fn sort_entries(entries: &mut [&Entry]) {
+pub(super) fn sort_entries(entries: &mut [&Entry]) {
     entries.sort_by(|a, b| {
         (a.kind == EntryKind::File)
             .cmp(&(b.kind == EntryKind::File))
@@ -456,6 +456,12 @@ fn walk(
             walk(children, &node.path, depth + 1, expanded, filter, rows);
         }
     }
+}
+
+/// The row holding the folder above `rows[at]`: the nearest earlier row one level up.
+pub(super) fn parent_row(rows: &[TreeRow], at: usize) -> Option<usize> {
+    let depth = rows[at].depth.checked_sub(1)?;
+    rows[..at].iter().rposition(|row| row.depth == depth)
 }
 
 /// The paths a tree search shows: each match and every folder above it.
@@ -637,6 +643,7 @@ mod tests {
         let labels: Vec<(&str, bool)> = rows.iter().map(|r| (r.label.as_str(), r.expanded)).collect();
         assert_eq!(labels, [("src/app", true), ("files.rs", false)]);
         assert!(tree_search_matches(&merged, "rail").is_empty());
+        assert_eq!((parent_row(&rows, 1), parent_row(&rows, 0)), (Some(0), None), "left goes to the folder row");
         assert_eq!(ancestors("a/b/c.rs"), ["a", "a/b"]);
     }
 

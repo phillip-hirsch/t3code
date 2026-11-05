@@ -476,9 +476,11 @@ impl Workspace {
         } else {
             let max = EXPLORER_MAX.min(width - CONTENT_MIN).max(EXPLORER_MIN);
             let explorer_width = self.files.explorer_width.unwrap_or(EXPLORER_WIDTH).clamp(EXPLORER_MIN, max);
-            let content_width = if self.files.explorer_hidden { width } else { width - explorer_width };
+            // `shouldShowFileExplorer`: a host file outside the workspace shows alone.
+            let explorer_shown = !self.files.explorer_hidden && !logic::is_host_path(&path);
+            let content_width = if explorer_shown { width - explorer_width } else { width };
             let content = self.render_file_content(&key, &tokens, content_width, window, cx);
-            let explorer = (!self.files.explorer_hidden).then(|| {
+            let explorer = explorer_shown.then(|| {
                 let tree = self.render_tree(&cwd, Some(&path), reveal, window, cx);
                 div()
                     .id("file-explorer")
@@ -539,23 +541,33 @@ impl Workspace {
         let source = Surface::File(path.clone());
         let crumbs = logic::breadcrumbs(&path, project_name);
         let last = crumbs.len() - 1;
-        let mut trail = h_flex().min_w_0().flex_1().overflow_hidden().text_xs();
+        // Crumbs keep their width and the deepest stay in view, as the web scrolls them to the end.
+        let mut trail = h_flex().flex_none().min_w_full().text_xs();
+        let host = logic::is_host_path(&path);
+        let mut parent = String::new();
         for (index, (label, crumb)) in crumbs.into_iter().enumerate() {
             let current = index == last;
             if index > 0 {
-                trail = trail.child(
+                // Host paths outside the workspace have no contents menus.
+                trail = trail.child(if host {
                     Icon::new(IconName::ChevronRight)
-                        .size(px(12.))
+                        .size(px(14.))
+                        .mx(px(4.))
                         .flex_none()
-                        .text_color(tokens.muted_foreground.opacity(0.6)),
-                );
+                        .text_color(tokens.muted_foreground.opacity(0.6))
+                        .into_any_element()
+                } else {
+                    self.crumb_menu(&key.0, &parent, &path, tokens, cx)
+                });
             }
+            parent = crumb.clone();
             let tooltip: SharedString = if crumb.is_empty() { project_name.clone() } else { crumb.clone().into() };
             let source = source.clone();
             let keep = !folder;
             trail = trail.child(
                 div()
                     .id(ElementId::Name(format!("crumb:{crumb}").into()))
+                    .flex_none()
                     .max_w(px(160.))
                     .truncate()
                     .px(px(2.))
@@ -600,24 +612,20 @@ impl Workspace {
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
         let wrap = state.and_then(|s| s.wrap).unwrap_or_else(|| self.client_settings.values.bool("wordWrap"));
-        let editor = self.preferred_editor_id();
         let absolute = logic::absolute_path(&key.0, &path);
+        // `revealsInFileManager`: a read file (not a folder) reveals in the file manager.
+        let reveal = !folder
+            && state.is_some_and(|s| !matches!(s.load, Load::Loading))
+            && self.server_info.config["shellRevealInFileManager"] == true;
+        let open_in = self.render_file_open_in(absolute, reveal, tokens, cx);
         h_flex()
             .flex_none()
             .h(px(28.))
             .mb(px(12.))
             .gap(px(8.))
             .px(px(12.))
-            .child(trail)
-            .when_some(editor, |el, editor| {
-                let label: SharedString = format!("Open in {}", crate::app::details::editor_label(&editor)).into();
-                let title = format!("Could not open in {}", crate::app::details::editor_label(&editor));
-                el.child(action("file-open-in", IconName::SquareArrowOutUpRight, label, false).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.open_path_in_editor(absolute.clone(), editor.clone(), false, title.clone(), window, cx)
-                    },
-                )))
-            })
+            .child(h_flex().min_w_0().flex_1().justify_end().overflow_hidden().child(trail))
+            .child(open_in)
             .when_some(mode, |el, mode| {
                 let icon = match (rendered, mode) {
                     (true, _) => IconName::CodeXml,
@@ -650,7 +658,7 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, window, cx| this.open_file_in_browser(&key, window, cx))),
                 )
             })
-            .when(!folder, |el| {
+            .when(!folder && !logic::is_host_path(&path), |el| {
                 let open = !self.files.explorer_hidden;
                 let label = if open { "Hide file explorer" } else { "Show file explorer" };
                 el.child(action("file-explorer-toggle", IconName::FolderTree, label.into(), open).on_click(
@@ -673,6 +681,7 @@ impl Workspace {
     ) -> AnyElement {
         let render_markdown = self.files.render_markdown;
         let delimiter = logic::table_delimiter(&key.1).filter(|_| self.files.shows_rendered(Rendered::Table));
+        let render_mermaid = self.files.shows_rendered(Rendered::Mermaid);
         let kind = self.files.previews.get(key).map_or(logic::FileKind::Text, |s| s.kind);
         match self.files.previews.get(key).map(|s| &s.load) {
             Some(Load::Asset) => {
@@ -740,6 +749,10 @@ impl Workspace {
                         FullFile::Failed => Some(Err(())),
                     };
                     return self.render_full_file(key, full, tokens, cx);
+                }
+                if logic::is_mermaid(&key.1) && render_mermaid {
+                    let saved = state.saved.clone();
+                    return self.render_mermaid(key, &saved, window, cx);
                 }
                 if let Some(delimiter) = delimiter {
                     let saved = &state.saved;
@@ -869,7 +882,7 @@ impl Workspace {
     }
 
     /// The editor the details card's Open in launches.
-    fn preferred_editor_id(&self) -> Option<String> {
+    pub(super) fn preferred_editor_id(&self) -> Option<String> {
         let available = &self.server_info.available_editors;
         self.preferred_editor.clone().filter(|editor| available.contains(editor)).or_else(|| available.first().cloned())
     }

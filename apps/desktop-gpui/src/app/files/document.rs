@@ -44,11 +44,12 @@ pub(super) struct Documents {
     frame: u64,
 }
 
-/// A colour as CSS `#rrggbb`.
+/// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
 fn css_hex(color: Hsla) -> String {
     let rgba = gpui_kit::Rgba::from(color);
     let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", byte(rgba.r), byte(rgba.g), byte(rgba.b))
+    let (r, g, b) = (byte(rgba.r), byte(rgba.g), byte(rgba.b));
+    if rgba.a < 1. { format!("rgba({r},{g},{b},{:.3})", rgba.a) } else { format!("#{r:02x}{g:02x}{b:02x}") }
 }
 
 fn escape_attribute(value: &str) -> String {
@@ -94,6 +95,63 @@ fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Pag
             ),
         ),
     }
+}
+
+/// `pele` 1.8.0's global build (MIT, `assets/vendor/pele-LICENSE`), the web's Mermaid renderer.
+const PELE_GZ: &[u8] = include_bytes!("../../../assets/vendor/pele-1.8.0.global.js.gz");
+const MERMAID_SCHEME: &str = "t3mermaid";
+#[cfg(windows)]
+const MERMAID_PAGE_URL: &str = "http://t3mermaid.localhost/";
+#[cfg(not(windows))]
+const MERMAID_PAGE_URL: &str = "t3mermaid://localhost/";
+
+fn pele_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(PELE_GZ), &mut out);
+        out
+    })
+}
+
+/// The colours pele reads (`.pele` in the web's CSS).
+pub(super) struct DiagramColors {
+    pub background: String,
+    pub foreground: String,
+    pub muted: String,
+    pub surface: String,
+    pub surface_alt: String,
+    pub accent: String,
+    pub critical: String,
+    pub dark: bool,
+}
+
+/// `MermaidViewer`: the diagram, or the web's refusal for sources that could load resources.
+/// The page may run only its own script and load nothing else.
+fn mermaid_page(source: &str, colors: &DiagramColors) -> String {
+    // JSON is valid JavaScript; `<` is escaped so the source cannot close the script.
+    let source = serde_json::to_string(source).unwrap_or_default().replace('<', "\\u003c");
+    let DiagramColors { background, foreground, muted, surface, surface_alt, accent, critical, dark } = colors;
+    let scheme = if *dark { "dark" } else { "light" };
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
+         content=\"default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:\">\
+         <style>html{{color-scheme:{scheme};background:{background};color:{foreground}}}\
+         body{{margin:0;padding:24px;font:12px system-ui,sans-serif}}#d{{display:flex;justify-content:center}}\
+         #d svg{{max-width:100%;height:auto}}.note{{color:{muted};line-height:1.6}}.error{{color:{critical}}}\
+         .pele{{--pele-bg:{background};--pele-fg:{foreground};--pele-muted:{muted};--pele-line:{muted};\
+         --pele-surface:{surface};--pele-surface-alt:{surface_alt};\
+         --pele-border:color-mix(in srgb,{foreground} 28%,transparent);--pele-accent:{accent};--pele-critical:{critical}}}\
+         </style><script src=\"/pele.js\"></script></head><body><div id=\"d\" class=\"pele\"></div><script>\
+         const source = {source}; const root = document.getElementById('d');\
+         const note = (text, cls) => {{ const p = document.createElement('p'); p.className = cls; p.textContent = text; root.replaceChildren(p); }};\
+         if (/%%\\s*\\{{|^\\s*---|<\\/?[A-Za-z]|<[!?]|@\\s*\\{{|\\b(?:img|image)\\s*:|url\\s*\\(|@import|(?:https?|data|blob|file):/im.test(source)) {{\
+           note('This diagram contains resource URLs, markup, node metadata, or custom configuration. Show Mermaid source to inspect it safely.', 'note');\
+         }} else {{ try {{ pele.mount(root, source.trim(), {{ links: false, images: false, zoom: false, autoDirection: false,\
+           onError: (e) => note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error') }}); }}\
+           catch (e) {{ note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error'); }} }}\
+         </script></body></html>"
+    )
 }
 
 const FONT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -342,6 +400,92 @@ impl Workspace {
         }
     }
 
+    /// A Mermaid file's diagram (`MermaidViewer`), rebuilt when its source changes.
+    pub(super) fn render_mermaid(
+        &mut self,
+        key: &Key,
+        source: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = *crate::theme::tokens(cx);
+        let revision = Some(format!("{:x}", source_digest(source)));
+        let dark = self.dark_theme(cx);
+        let mutation = self.files.mutation.clone();
+        let documents = &mut self.files.documents;
+        documents.drawn = Some(key.clone());
+        if documents.views.get(key).is_some_and(|doc| doc.revision != revision) {
+            documents.views.remove(key);
+        }
+        if !documents.views.contains_key(key) {
+            let colors = DiagramColors {
+                background: css_hex(tokens.background),
+                foreground: css_hex(tokens.foreground),
+                muted: css_hex(tokens.muted_foreground),
+                surface: css_hex(tokens.secondary),
+                surface_alt: css_hex(tokens.accent),
+                accent: css_hex(tokens.primary),
+                critical: css_hex(tokens.error),
+                dark,
+            };
+            let page = mermaid_page(source, &colors);
+            let Ok(handle) = window.window_handle() else { return div().into_any_element() };
+            let parent = ParentWindow(handle.as_raw());
+            let request_key = key.clone();
+            let task = cx.spawn_in(window, async move |this, cx| {
+                let built = wry::WebViewBuilder::new()
+                    .with_custom_protocol(MERMAID_SCHEME.into(), move |_, request| {
+                        let (body, content_type): (Vec<u8>, &str) = if request.uri().path() == "/pele.js" {
+                            (pele_script().to_vec(), "text/javascript")
+                        } else {
+                            (page.clone().into_bytes(), "text/html")
+                        };
+                        wry::http::Response::builder()
+                            .header("content-type", content_type)
+                            .body(std::borrow::Cow::Owned(body))
+                            .unwrap_or_default()
+                    })
+                    .with_url(MERMAID_PAGE_URL)
+                    .build_as_child_async(&parent)
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let Some(state) = this.files.documents.views.get_mut(&request_key) else { return };
+                    state._task = None;
+                    match built {
+                        Ok(webview) => {
+                            let webview = WebView::new(webview, window, cx);
+                            let _ = webview.set_visible(false);
+                            state.view = Some(cx.new(|_| webview));
+                            state.shown = false;
+                        }
+                        Err(error) => state.failed = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            });
+            documents.views.insert(
+                key.clone(),
+                DocView {
+                    view: None,
+                    failed: None,
+                    mutation,
+                    revision,
+                    shown: false,
+                    used: 0,
+                    _task: Some(task),
+                    _links: None,
+                },
+            );
+        }
+        match self.files.documents.views.get(key).map(|doc| (&doc.view, &doc.failed)) {
+            Some((Some(view), _)) => div().flex_1().min_h_0().size_full().child(view.clone()).into_any_element(),
+            Some((None, Some(error))) => {
+                super::chrome::failure(format!("Unable to render diagram: {error}"), None, &tokens)
+            }
+            _ => super::chrome::loading(&tokens),
+        }
+    }
+
     /// Mints the URL again after a workspace mutation; a new `fileRevision` (or, for HTML on
     /// servers without one, any mutation) reloads the page.
     fn refresh_document(&mut self, key: Key, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -431,6 +575,13 @@ impl Workspace {
     }
 }
 
+/// A digest of a diagram's source, so an edit rebuilds its page.
+fn source_digest(source: &str) -> u64 {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(source.as_bytes());
+    u64::from_le_bytes(digest[..8].try_into().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,9 +599,24 @@ mod tests {
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
         assert_eq!(css_hex(gpui_kit::rgb(0x0a0b0c).into()), "#0a0b0c");
+        assert_eq!(css_hex(gpui_kit::rgba(0xffffff80).into()), "rgba(255,255,255,0.502)");
         assert_eq!(font_mime(b"wOF2...."), Some("font/woff2"));
         assert_eq!(font_mime(&[0, 1, 0, 0, 9]), Some("font/ttf"));
         assert_eq!(font_mime(b"PK\x03\x04"), None);
         assert!(font_specimen("#000", "#fff", true).contains("src:url('/font')"));
+        let colors = DiagramColors {
+            background: "#000".into(),
+            foreground: "#fff".into(),
+            muted: "#888".into(),
+            surface: "#111".into(),
+            surface_alt: "#222".into(),
+            accent: "#00f".into(),
+            critical: "#f00".into(),
+            dark: true,
+        };
+        let page = mermaid_page("graph TD\n A</script><b>x</b>", &colors);
+        assert!(page.contains("const source = \"graph TD\\n A\\u003c/script>\\u003cb>x\\u003c/b>\";"));
+        assert!(page.contains("default-src 'none'") && page.contains("--pele-bg:#000"));
+        assert!(pele_script().starts_with(b"/*! Pele 1.8.0"), "the vendored renderer decompresses");
     }
 }

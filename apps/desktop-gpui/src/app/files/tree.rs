@@ -13,9 +13,9 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, ElementId, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, AppContext as _, ClipboardItem, Context, ElementId, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 use serde_json::json;
 
@@ -66,6 +66,9 @@ pub(super) struct TreeState {
     all_open: bool,
     has_folders: bool,
     scroll: UniformListScrollHandle,
+    /// Keyboard focus and the row it is on (the web tree's roving focus).
+    focus: FocusHandle,
+    focused: Option<String>,
     /// The selection last revealed, with its request.
     revealed: Option<(String, u64)>,
     mutation: Option<(Option<String>, Option<String>)>,
@@ -118,13 +121,28 @@ impl TreeState {
     }
 }
 
+impl TreeState {
+    /// A folder's listed entries, or its load error.
+    pub(super) fn folder(&self, folder: &str) -> Result<Option<&[Entry]>, &str> {
+        match (self.listed.get(folder), self.errors.get(folder)) {
+            (Some(entries), _) => Ok(Some(entries)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 impl Workspace {
+    pub(super) fn tree_state(&self, cwd: &str) -> Option<&TreeState> {
+        self.files.trees.get(cwd)
+    }
+
     fn tree(&mut self, cwd: &str) -> Option<&mut TreeState> {
         self.files.trees.get_mut(cwd)
     }
 
     /// The tree for `cwd`, created (and its root listed) on first use.
-    fn ensure_tree(&mut self, cwd: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_tree(&mut self, cwd: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.files.trees.contains_key(cwd) {
             return;
         }
@@ -155,6 +173,8 @@ impl Workspace {
                 all_open: false,
                 has_folders: false,
                 scroll: UniformListScrollHandle::new(),
+                focus: cx.focus_handle(),
+                focused: None,
                 revealed: None,
                 mutation: None,
                 _subscription: subscription,
@@ -164,7 +184,7 @@ impl Workspace {
     }
 
     /// Lists `folder` once (or again with `refresh`), at most four at a time.
-    fn load_folder(&mut self, cwd: &str, folder: String, refresh: bool, cx: &mut Context<Self>) {
+    pub(super) fn load_folder(&mut self, cwd: &str, folder: String, refresh: bool, cx: &mut Context<Self>) {
         let Some(tree) = self.tree(cwd) else { return };
         if tree.loading.contains(&folder) || (!refresh && tree.listed.contains_key(&folder)) {
             return;
@@ -485,6 +505,7 @@ impl Workspace {
                 .into_any_element()
         } else {
             let selected = selected.map(str::to_owned);
+            let focused = tree.focused.clone().filter(|_| tree.focus.is_focused(window));
             let list_key = key.clone();
             uniform_list(
                 ElementId::Name(format!("files-tree:{cwd}").into()),
@@ -499,6 +520,7 @@ impl Workspace {
                                 &list_key,
                                 row,
                                 selected.as_deref() == Some(row.path.as_str()),
+                                focused.as_deref() == Some(row.path.as_str()),
                                 loading,
                                 &tokens,
                                 cx,
@@ -513,6 +535,8 @@ impl Workspace {
             .pb(px(8.))
             .into_any_element()
         };
+        let focus = tree.focus.clone();
+        let keys_key = key.clone();
         v_flex()
             .size_full()
             .min_h_0()
@@ -542,8 +566,76 @@ impl Workspace {
             .when(loading_line, |el| {
                 el.child(div().px(px(12.)).py(px(4.)).text_xs().text_color(muted).child("Loading files…"))
             })
-            .child(list)
+            .child(
+                div()
+                    .id(ElementId::Name(format!("files-tree-keys:{cwd}").into()))
+                    .track_focus(&focus)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let keystroke = &event.keystroke;
+                        if keystroke.modifiers.modified() {
+                            return;
+                        }
+                        if this.tree_key(&keys_key, &keystroke.key, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(list),
+            )
             .into_any_element()
+    }
+
+    /// The web tree's keys: arrows move or open and close folders, Home and End jump,
+    /// Enter and Space open the row.
+    fn tree_key(&mut self, cwd: &str, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(tree) = self.tree(cwd) else { return false };
+        let rows = tree.rows.clone();
+        if rows.is_empty() {
+            return false;
+        }
+        let at = tree.focused.as_ref().and_then(|path| rows.iter().position(|r| &r.path == path));
+        let row = at.map(|at| rows[at].clone());
+        let folder = row.clone().filter(|r| r.kind == EntryKind::Directory);
+        let next = match (key, at) {
+            ("down", None) | ("home", _) => Some(0),
+            ("up", None) | ("end", _) => Some(rows.len() - 1),
+            ("down", Some(at)) => Some((at + 1).min(rows.len() - 1)),
+            ("up", Some(at)) => Some(at.saturating_sub(1)),
+            ("right", Some(at)) => match folder {
+                Some(row) if !row.expanded => {
+                    self.toggle_tree_folder(cwd, &row, cx);
+                    None
+                }
+                _ => Some((at + 1).min(rows.len() - 1)),
+            },
+            ("left", Some(at)) => match folder {
+                Some(row) if row.expanded => {
+                    self.toggle_tree_folder(cwd, &row, cx);
+                    None
+                }
+                _ => logic::parent_row(&rows, at),
+            },
+            ("enter" | "space", Some(_)) => {
+                if let Some(row) = row {
+                    if row.kind == EntryKind::Directory {
+                        self.toggle_tree_folder(cwd, &row, cx);
+                    } else {
+                        self.open_file(&row.path, None, window, cx);
+                    }
+                }
+                None
+            }
+            _ => return false,
+        };
+        if let (Some(next), Some(tree)) = (next, self.tree(cwd)) {
+            tree.focused = Some(rows[next].path.clone());
+            tree.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+        true
     }
 
     fn tree_row(
@@ -551,6 +643,7 @@ impl Workspace {
         cwd: &str,
         row: &TreeRow,
         selected: bool,
+        focused: bool,
         loading: bool,
         tokens: &Tokens,
         cx: &mut Context<Self>,
@@ -577,12 +670,19 @@ impl Workspace {
             .pl(px(6. + row.depth as f32 * 16.))
             .pr(px(6.))
             .rounded(px(6.))
+            .border_1()
+            .border_color(if focused { tokens.ring } else { gpui_kit::transparent_black() })
             .cursor_pointer()
             .text_xs()
             .text_color(if row.ignored { tokens.muted_foreground } else { fg })
             .when(selected, |el| el.bg(fg.opacity(0.12)))
             .when(!selected, |el| el.hover(move |s| s.bg(fg.opacity(0.07))))
             .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(tree) = this.tree(&click_key) {
+                    tree.focused = Some(click_row.path.clone());
+                    let focus = tree.focus.clone();
+                    window.focus(&focus, cx);
+                }
                 if click_row.kind == EntryKind::Directory {
                     this.toggle_tree_folder(&click_key, &click_row, cx);
                 } else {
