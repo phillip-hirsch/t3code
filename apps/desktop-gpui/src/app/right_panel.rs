@@ -4,6 +4,8 @@
 //! The Files and file surfaces render in `files/`. The web's other surfaces (terminal, pull
 //! requests, devices, side chats) are not native yet, so the launcher offers Browser, Files and Diff.
 
+mod diff_base;
+
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
@@ -15,10 +17,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, Context, DragMoveEvent, Element, ElementId, Empty, Entity,
-    GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
-    ParentElement as _, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Task, Window, WindowControlArea, deferred, div, px,
+    AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
+    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
+    MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, WindowControlArea, deferred, div, px,
 };
 use serde_json::{Value, json};
 
@@ -223,6 +225,7 @@ struct DiffKey {
     target: Target,
     cwd: Option<String>,
     scope: DiffScope,
+    base_ref: Option<String>,
     ignore_whitespace: bool,
     /// The turn count, or the git status totals, so new work refetches.
     version: (u64, u64, u64),
@@ -250,6 +253,8 @@ pub(super) struct RightPanel {
     width: f32,
     /// The "+" menu is open; a native browser view must not cover it.
     pub(super) add_menu_open: bool,
+    /// A tab's right-click menu, at its window position.
+    tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     diff: Entity<DiffState>,
     loaded: Option<DiffKey>,
     load: DiffLoad,
@@ -269,6 +274,9 @@ pub(super) struct RightPanel {
     tabs_scroll: ScrollHandle,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
+    /// The branch diff's picked comparison target per thread; none is Automatic.
+    base_refs: HashMap<Target, String>,
+    base_picker: diff_base::BasePicker,
     _diff_events: Subscription,
 }
 
@@ -284,6 +292,7 @@ impl RightPanel {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
             add_menu_open: false,
+            tab_menu: None,
             diff,
             loaded: None,
             load: DiffLoad::Idle,
@@ -298,6 +307,8 @@ impl RightPanel {
             tabs_scroll: ScrollHandle::new(),
             revealed_tab: None,
             observation: None,
+            base_refs: HashMap::new(),
+            base_picker: Default::default(),
             _diff_events: diff_events,
         }
     }
@@ -399,6 +410,111 @@ impl Workspace {
         }
         self.sync_active_browser(window, cx);
         cx.notify();
+    }
+
+    /// The tab menu's Close others / Close to the right / Close all (`closeOtherSurfaces` and
+    /// friends): each tab closes as its own close would, then `keep` stays active.
+    fn close_surfaces(
+        &mut self,
+        close: Vec<Surface>,
+        keep: Option<Surface>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.panel_state().and_then(|panel| panel.active.clone());
+        for surface in close {
+            self.close_surface(surface, window, cx);
+        }
+        if let Some(panel) = self.panel_state_mut().filter(|panel| !panel.surfaces.is_empty()) {
+            panel.open = true;
+            panel.active = active.filter(|active| panel.surfaces.contains(active)).or(keep);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// Opens a tab's menu at `position`; the browser view hides while it is open.
+    fn open_tab_menu(
+        &mut self,
+        surface: &Surface,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let build = self.tab_menu(surface, cx);
+        let view = PopupMenu::build(window, cx, move |menu, window, cx| build(menu.min_w(px(180.)), window, cx));
+        let previous = window.focused(cx);
+        view.focus_handle(cx).focus(window, cx);
+        let dismiss = cx.subscribe_in(&view, window, move |this, _, _: &DismissEvent, window, cx| {
+            this.right_panel.tab_menu = None;
+            if let Some(previous) = &previous {
+                previous.focus(window, cx);
+            }
+            cx.notify();
+        });
+        self.right_panel.tab_menu = Some((view, position, dismiss));
+        cx.notify();
+    }
+
+    pub(super) fn tab_menu_open(&self) -> bool {
+        self.right_panel.tab_menu.is_some()
+    }
+
+    /// The right-click menu on a tab (`handleTabContextMenu`).
+    fn tab_menu(
+        &self,
+        surface: &Surface,
+        cx: &mut Context<Self>,
+    ) -> impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity();
+        let surfaces = self.panel_state().map(|panel| panel.surfaces.clone()).unwrap_or_default();
+        let index = surfaces.iter().position(|s| s == surface).unwrap_or(0);
+        let surface = surface.clone();
+        let copy_path = match &surface {
+            Surface::File(path) => {
+                let host = self.git_cwd().or_else(|| self.target_project().map(|p| p.workspace_root.clone()));
+                let windows =
+                    host.as_deref().is_some_and(|h| h.as_bytes().get(1) == Some(&b':') || h.starts_with("\\\\"));
+                Some(if windows { path.replace('/', "\\") } else { path.clone() })
+            }
+            _ => None,
+        };
+        move |mut menu, window, _| {
+            if let Some(path) = copy_path.clone() {
+                menu = menu.item(PopupMenuItem::new("Copy path").on_click(move |_, window, cx| {
+                    use gpui_kit::component::WindowExt as _;
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path.clone()));
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::success(path.clone()).title("Path copied"),
+                        cx,
+                    );
+                }));
+            }
+            let others: Vec<Surface> = surfaces.iter().filter(|s| **s != surface).cloned().collect();
+            let right: Vec<Surface> = surfaces.iter().skip(index + 1).cloned().collect();
+            let all = surfaces.clone();
+            let (close, keep, keep_right) = (surface.clone(), surface.clone(), surface.clone());
+            menu.item(PopupMenuItem::new("Close").on_click(
+                window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
+            ))
+            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx)
+                }),
+            ))
+            .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx)
+                }),
+            ))
+            .item(
+                PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
+                    window.listener_for(&view, move |this, _, window, cx| {
+                        this.close_surfaces(all.clone(), None, window, cx)
+                    }),
+                ),
+            )
+        }
     }
 
     /// Keeps the thread's focused preview tab on the browser surface the panel shows.
@@ -583,10 +699,13 @@ impl Workspace {
                 .unwrap_or_default(),
         };
         let ignore_whitespace = self.diff_ignore_whitespace();
+        let remembered_base = self.diff_base_ref().map(str::to_owned);
+        let base_ref = remembered_base.clone().filter(|_| matches!(scope, DiffScope::Branch | DiffScope::Commit(_)));
         let key = DiffKey {
             target: target.clone(),
             cwd: cwd.clone(),
             scope: scope.clone(),
+            base_ref: base_ref.clone(),
             ignore_whitespace,
             version,
             mutation,
@@ -611,19 +730,22 @@ impl Workspace {
                     self.clear_diff(cx);
                     return;
                 };
-                (
-                    "orchestration.getTurnDiff",
-                    json!({
-                        "threadId": thread_id,
-                        "fromTurnCount": turn.turn_count.saturating_sub(1),
-                        "toTurnCount": turn.turn_count,
-                        "ignoreWhitespace": ignore_whitespace,
-                    }),
-                )
+                // `useCheckpointDiff`: a range from the start is the full thread diff.
+                let from = turn.turn_count.saturating_sub(1);
+                let mut input = json!({"threadId": thread_id, "toTurnCount": turn.turn_count, "ignoreWhitespace": ignore_whitespace});
+                if from == 0 {
+                    ("orchestration.getFullThreadDiff", input)
+                } else {
+                    input["fromTurnCount"] = from.into();
+                    ("orchestration.getTurnDiff", input)
+                }
             }
             scope => {
                 let Some(cwd) = cwd.clone() else { return };
                 let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace});
+                if let Some(base) = &base_ref {
+                    input["baseRef"] = base.clone().into();
+                }
                 match scope {
                     DiffScope::Unstaged => input["sourceKind"] = "working-tree".into(),
                     DiffScope::Commit(sha) => input["commitSha"] = sha.clone().into(),
@@ -638,7 +760,13 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| json!({"cwd": cwd}));
+        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| {
+            let mut input = json!({"cwd": cwd});
+            if let Some(base) = remembered_base {
+                input["baseRef"] = base.into();
+            }
+            input
+        });
         self.right_panel.load = DiffLoad::Loading;
         let diff = self.right_panel.diff.clone();
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -856,6 +984,12 @@ impl Workspace {
                 .child(self.render_tab_bar(&panel, &tokens, cx))
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
                 .child(deferred(handle).with_priority(1))
+                .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
+                    deferred(
+                        gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
+                    )
+                    .with_priority(3)
+                }))
                 .into_any_element(),
         )
     }
@@ -1021,7 +1155,8 @@ impl Workspace {
         let group: SharedString = format!("right-panel-tab:{key}").into();
         let tooltip: SharedString = format!("Close {title}").into();
         let (accent, foreground, muted) = (tokens.accent, tokens.foreground, tokens.muted);
-        let (close, activate, middle) = (surface.clone(), surface.clone(), surface.clone());
+        let (close, activate, middle, menu_surface) =
+            (surface.clone(), surface.clone(), surface.clone(), surface.clone());
         h_flex()
             .id(ElementId::Name(group.clone()))
             .group(group.clone())
@@ -1074,6 +1209,13 @@ impl Workspace {
                 cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.activate_surface(activate.clone(), window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_menu(&menu_surface, event.position, window, cx)
+                }),
+            )
             .into_any_element()
     }
 
@@ -1323,15 +1465,22 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (refs, stats, truncated) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, head, base, truncated } => {
-                let refs = matches!(scope, DiffScope::Branch).then(|| {
-                    format!("{} → {}", head.as_deref().unwrap_or("HEAD"), base.as_deref().unwrap_or("Automatic"))
-                });
-                (refs, Some((*additions, *deletions)), *truncated)
-            }
-            _ => (None, None, false),
+        let (stats, truncated) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, .. } => (Some((*additions, *deletions)), *truncated),
+            _ => (None, false),
         };
+        // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
+        let refs = matches!(scope, DiffScope::Branch).then(|| {
+            let (head, base) = match &self.right_panel.load {
+                DiffLoad::Ready { head, base, .. } => (head.clone(), base.clone()),
+                _ => (None, None),
+            };
+            let head = head
+                .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()))
+                .unwrap_or_else(|| "HEAD".into());
+            let base = base.or_else(|| self.diff_base_ref().map(str::to_owned)).unwrap_or_else(|| "Automatic".into());
+            self.render_base_ref_picker(&head, &base, tokens, cx)
+        });
         let can_refresh = !matches!(scope, DiffScope::Turn(_));
         let files: Vec<SharedString> = match self.right_panel.load {
             DiffLoad::Ready { .. } => {
@@ -1348,9 +1497,7 @@ impl Workspace {
             .px_2()
             .gap_2()
             .justify_between()
-            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(
-                refs.map(|refs| div().min_w_0().truncate().text_xs().text_color(tokens.muted_foreground).child(refs)),
-            ))
+            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(refs))
             .child(
                 h_flex()
                     .flex_none()

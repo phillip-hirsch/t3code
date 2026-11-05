@@ -249,6 +249,7 @@ impl Workspace {
             || self.palette.is_some()
             || self.preview.menu_open
             || self.right_panel.add_menu_open
+            || self.tab_menu_open()
             || window.has_active_dialog(cx)
     }
 
