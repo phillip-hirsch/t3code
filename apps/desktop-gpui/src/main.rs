@@ -2,6 +2,8 @@ mod app;
 mod assets;
 mod backend;
 mod device;
+mod composer_search;
+mod composer_text;
 mod inbox;
 mod keybindings;
 mod model;

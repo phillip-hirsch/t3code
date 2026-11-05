@@ -58,6 +58,9 @@ pub struct ProviderModel {
     pub sub_provider: Option<String>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+    /// `"new"` shows a NEW badge in the model picker.
+    #[serde(default)]
+    pub badge: Option<String>,
     #[serde(default)]
     pub is_legacy: bool,
 }
@@ -139,6 +142,17 @@ pub struct Provider {
     pub configurable_providers: bool,
     #[serde(default)]
     pub supports_conversation_rollback: Option<bool>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    /// Empty means every runtime mode.
+    #[serde(default)]
+    pub supported_runtime_modes: Vec<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
@@ -192,6 +206,49 @@ pub struct NativeSessions {
     pub can_resume: bool,
     #[serde(default)]
     pub can_delete: bool,
+}
+
+/// `ServerProviderSkill` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+/// `ServerProviderSlashCommand`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+/// `ServerProviderWorkspaceSnapshot`: skills and commands as seen from one checkout.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub cwd: String,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -308,6 +365,12 @@ pub struct ServerInfo {
     pub keybindings_json: Value,
     /// `environment.capabilities.projectSettingsOverrides`; older servers keep scripts in `projectScriptOverrides`.
     pub project_settings_overrides_capability: bool,
+    /// Model picker favorites as `(instanceId, model)`.
+    pub favorites: Vec<(String, String)>,
+    /// `providerModelPreferences`, keyed by instance id.
+    pub model_preferences: Value,
+    /// `environment.capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
+    pub file_upload_limit: Option<u64>,
 }
 
 impl ServerInfo {
@@ -348,6 +411,8 @@ impl ServerInfo {
                 self.project_settings_overrides_capability =
                     config.pointer("/environment/capabilities/projectSettingsOverrides").and_then(Value::as_bool)
                         == Some(true);
+                self.file_upload_limit =
+                    config.pointer("/environment/capabilities/fileAttachments/maxUploadBytes").and_then(Value::as_u64);
             }
             "keybindingsUpdated" => {
                 self.keybindings = Rc::new(crate::keybindings::decode_rules(&event["payload"]["keybindings"]));
@@ -386,6 +451,14 @@ impl ServerInfo {
         self.add_project_base_directory =
             settings.get("addProjectBaseDirectory").and_then(Value::as_str).unwrap_or_default().to_owned();
         self.provider_instances = settings.get("providerInstances").cloned().unwrap_or_default();
+        self.favorites = settings
+            .get("favorites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f.get("provider")?.as_str()?.to_owned(), f.get("model")?.as_str()?.to_owned())))
+            .collect();
+        self.model_preferences = settings.get("providerModelPreferences").cloned().unwrap_or_default();
         Ok(())
     }
 

@@ -17,14 +17,16 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, ServerHandle};
 use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
-use crate::new_thread::DraftWorkspace;
 use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
 
+mod attachments;
 mod chat;
 mod composer;
+mod composer_menu;
+mod context_strip;
 mod details;
 mod header;
 pub(crate) mod keymap;
@@ -32,9 +34,11 @@ mod inspector;
 mod layout;
 mod message_actions;
 mod minimap;
+mod model_picker;
 mod pages;
 mod palette;
 mod preview;
+mod send;
 mod sidebar;
 mod titlebar;
 mod visits;
@@ -113,6 +117,22 @@ pub struct Workspace {
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The request whose response is in flight.
     responding: Option<String>,
+    /// The `@` / `$` / `/` menu.
+    menu: composer_menu::MenuState,
+    picker: model_picker::PickerState,
+    /// A draft's workspace mode, branch and permissions controls.
+    draft_workspace: context_strip::DraftWorkspaceState,
+    attachments: Vec<attachments::Attachment>,
+    /// Where Up/Down prompt history stands.
+    prompt_history: Option<crate::composer_text::HistoryPosition>,
+    /// The editor's chip ids after the last edit, to notice deleted attachment chips.
+    chip_ids: Vec<String>,
+    /// Ctrl (Cmd) is down, which turns steer into queue.
+    ctrl_held: bool,
+    /// Connected through `T3_SERVER_URL` rather than to this app's own server.
+    environment_remote: bool,
+    /// Files from the OS are being dragged over the chat canvas.
+    dragging_files: bool,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
     sidebar_view: Entity<sidebar::SidebarView>,
@@ -171,11 +191,24 @@ impl Workspace {
             state
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        let weak = cx.weak_entity();
         let subscriptions = vec![
-            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
-                InputEvent::Change => this.on_composer_change(cx),
-                _ => {}
+            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    this.on_composer_change(cx);
+                }
+            }),
+            // Caret moves re-read the completion trigger.
+            cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
+            // Ahead of key bindings, so the composer's menus and shortcuts see arrows, Tab and Enter.
+            cx.intercept_keystrokes({
+                let this = weak;
+                move |event, window, cx| {
+                    let handled = this.update(cx, |this, cx| this.intercept_key(&event.keystroke, window, cx));
+                    if handled.unwrap_or(false) {
+                        cx.stop_propagation();
+                    }
+                }
             }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
@@ -208,6 +241,15 @@ impl Workspace {
             question: None,
             composer_drafts: HashMap::new(),
             responding: None,
+            menu: Default::default(),
+            picker: Default::default(),
+            draft_workspace: Default::default(),
+            attachments: Vec::new(),
+            prompt_history: None,
+            chip_ids: Vec::new(),
+            ctrl_held: false,
+            environment_remote: false,
+            dragging_files: false,
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
             visit: visits::VisitTracker::default(),
@@ -310,9 +352,11 @@ impl Workspace {
                         renewed = false;
                         log::info!("connected");
                         let current = endpoint.clone();
+                        let remote = !current.renewable();
                         if this
                             .update_in(cx, |this, window, cx| {
                                 this.http_base = Some(current.http_base.clone());
+                                this.environment_remote = remote;
                                 this.endpoint = Some(current);
                                 this.on_connected(client.clone(), window, cx)
                             })
@@ -399,6 +443,8 @@ impl Workspace {
                 this.sync_keymap(cx);
                 this.notify_sidebar(cx);
                 this.check_chatgpt_welcome(window, cx);
+                // Skills arrive with provider updates.
+                this.refresh_menu_items(cx);
             },
         )];
         let devices = self.subscribe_device_state(window, cx);
@@ -561,6 +607,7 @@ impl Workspace {
         if let Some(target) = self.target.take() {
             self.composer_drafts.remove(&target);
         }
+        self.attachments.clear();
         self.set_composer_text("", window, cx);
         self.thread = None;
         self.model_override = None;
@@ -661,108 +708,6 @@ impl Workspace {
             }
             None => None,
         }
-    }
-
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.question.is_some() {
-            self.advance_question(window, cx);
-            return;
-        }
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() || self.sending {
-            return;
-        }
-        let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
-        let origin = target.clone();
-        let (declines, text_is_feedback) = self.approval_declines(&text);
-        let (method, mut payload, new_thread_id, workspace) = match target {
-            Target::Thread(thread_id) => {
-                let mut command = json!({
-                    "type": "message.dispatch",
-                    "commandId": new_id(),
-                    "createdBy": "user",
-                    "creationSource": "web",
-                    "threadId": thread_id,
-                    "messageId": new_id(),
-                    "text": text,
-                    "attachments": [],
-                    "deliveryIntent": "auto",
-                    "dispatchMode": {"type": "start_immediately"},
-                });
-                // Omitted, the server keeps the thread's own model.
-                if let Some(model) = &self.model_override {
-                    command["modelSelection"] = model.to_json();
-                }
-                ("orchestration.dispatchCommand", command, None, None)
-            }
-            Target::Draft { project_id } => {
-                let Some(model) = self.composer_model() else {
-                    self.error = Some("No provider is ready. Set one up in the T3 server first.".into());
-                    cx.notify();
-                    return;
-                };
-                let workspace = self.shell.projects.iter().find(|p| p.id == project_id).map(|project| {
-                    let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
-                    DraftWorkspace::new(&self.server_info, project, has_threads)
-                });
-                let thread_id = new_id();
-                let input = json!({
-                    "commandId": new_id(),
-                    "creationSource": "web",
-                    "threadId": thread_id,
-                    "projectId": project_id,
-                    "title": draft_title(&text),
-                    "generateTitle": true,
-                    "modelSelection": model.to_json(),
-                    "runtimeMode": self.runtime_mode(),
-                    "interactionMode": "default",
-                    "workspaceStrategy": {"type": "root"},
-                    "initialMessage": {"messageId": new_id(), "text": text, "attachments": []},
-                });
-                ("orchestration.launchThread", input, Some(thread_id), workspace)
-            }
-        };
-        self.sending = true;
-        self.set_composer_text("", window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            // Declines land first; a failed one keeps the text and sends nothing more.
-            let mut result = Ok(Value::Null);
-            for decline in declines {
-                result = client.request("orchestration.dispatchCommand", decline).await.map_err(|e| e.to_string());
-                if result.is_err() {
-                    break;
-                }
-            }
-            if result.is_ok() && !text_is_feedback {
-                if let Some(workspace) = workspace {
-                    match workspace.strategy(&client).await {
-                        Ok(strategy) => payload["workspaceStrategy"] = strategy,
-                        Err(error) => result = Err(error),
-                    }
-                }
-                if result.is_ok() {
-                    result = client.request(method, payload).await.map_err(|e| e.to_string());
-                }
-            }
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
-                match result {
-                    Ok(_) => {
-                        // Follow the new thread only from the draft that launched it.
-                        if let Some(thread_id) = new_thread_id.filter(|_| this.target.as_ref() == Some(&origin)) {
-                            this.select_thread(thread_id, window, cx);
-                        }
-                    }
-                    Err(error) => {
-                        this.error = Some(error.into());
-                        this.give_back_prompt(&origin, text, window, cx);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -913,6 +858,8 @@ impl Render for Workspace {
                             .children(self.render_error(cx))
                             .child(
                                 div()
+                                    .id("chat-canvas")
+                                    .group("chat-canvas")
                                     .relative()
                                     .flex_1()
                                     .min_h_0()
@@ -928,13 +875,31 @@ impl Render for Workspace {
                                                 .child(
                                                     v_flex()
                                                         .size_full()
-                                                        .child(self.render_body(window, cx))
+                                                        .child(
+                                                            // A click on the timeline leaves the editor, as in a
+                                                            // browser, so a question card's 1-9 keys reach it.
+                                                            v_flex()
+                                                                .flex_1()
+                                                                .min_h_0()
+                                                                .on_mouse_down(
+                                                                    gpui_kit::MouseButton::Left,
+                                                                    |_, window, cx| window.blur(cx),
+                                                                )
+                                                                .child(self.render_body(window, cx)),
+                                                        )
                                                         .child(self.render_composer(window, cx)),
                                                 )
                                                 .children(self.render_details_card(window, cx)),
                                         }
                                     })
-                                    .children(mini_player),
+                                    .children(mini_player)
+                                    .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                                        this.drop_paths(paths, window, cx)
+                                    }))
+                                    .on_drag_move(cx.listener(Self::on_file_drag_move))
+                                    .when(self.dragging_files && cx.has_active_drag(), |el| {
+                                        el.child(self.render_drop_overlay(crate::theme::tokens(cx)))
+                                    }),
                             ),
                     )
                     .children(panel),

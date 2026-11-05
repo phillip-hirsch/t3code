@@ -191,9 +191,98 @@ pub fn with_option(selection: &ModelSelection, id: &str, value: Value) -> ModelS
     ModelSelection { options: Some(options), ..selection.clone() }
 }
 
+/// `getDisplayModelName`: the model's full name without its sub-provider prefix.
+pub fn display_model_name(model: &ProviderModel) -> String {
+    strip_qualifier(model.name.as_deref().unwrap_or(&model.slug), model.sub_provider.as_deref())
+}
+
+/// `scoreModelPickerSearch` (`modelPickerSearch.ts`): every whitespace token must
+/// match a field (name, short name, sub-provider, driver, provider, all joined);
+/// lower is better, favorites rank 24 higher.
+pub fn search_score(
+    model: &ProviderModel,
+    driver: &str,
+    provider_name: &str,
+    favorite: bool,
+    query: &str,
+) -> Option<i64> {
+    let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if tokens.is_empty() {
+        return Some(0);
+    }
+    let name = model.name.as_deref().unwrap_or(&model.slug).to_lowercase();
+    let short = model.short_name.as_deref().map(str::to_lowercase);
+    let joined = tokens.join(" ");
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined == squash(&name) || short.as_deref().is_some_and(|s| joined == squash(s)) {
+        return Some(-1000);
+    }
+    let mut fields: Vec<String> = vec![name];
+    fields.extend(short);
+    fields.extend(model.sub_provider.as_deref().map(str::to_lowercase));
+    fields.push(driver.to_lowercase());
+    fields.push(provider_name.to_lowercase());
+    fields.push(fields.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" "));
+    let mut total = 0;
+    for token in &tokens {
+        total += fields.iter().enumerate().filter_map(|(i, f)| token_score(f, token, i as i64 * 10)).min()?;
+    }
+    Some(if favorite { total - 24 } else { total })
+}
+
+/// `scoreQueryMatch` with `ignorePosition`.
+fn token_score(value: &str, token: &str, base: i64) -> Option<i64> {
+    if value.is_empty() {
+        return None;
+    }
+    if value == token {
+        return Some(base);
+    }
+    if value.starts_with(token) {
+        return Some(base + 2);
+    }
+    if [' ', '-', '_', '/'].iter().any(|m| value.contains(&format!("{m}{token}"))) {
+        return Some(base + 4);
+    }
+    if value.contains(token) {
+        return Some(base + 6);
+    }
+    if token.chars().count() < 3 {
+        return None;
+    }
+    let token: Vec<char> = token.chars().collect();
+    let (mut matched, mut first, mut previous, mut gaps) = (0, None, 0usize, 0usize);
+    for (index, c) in value.chars().enumerate() {
+        if c != token[matched] {
+            continue;
+        }
+        if first.is_some() {
+            gaps += index - previous - 1;
+        }
+        let start = *first.get_or_insert(index);
+        previous = index;
+        matched += 1;
+        if matched == token.len() {
+            return Some(base + 100 + (gaps * 3 + index - start + 1 - token.len()) as i64);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_search_needs_every_token_and_prefers_names() {
+        let opus = model("Claude Opus 5.5");
+        assert_eq!(search_score(&opus, "claudeAgent", "Claude", false, "claude opus 5.5"), Some(-1000));
+        assert_eq!(search_score(&opus, "claudeAgent", "Claude", false, "opus"), Some(4));
+        assert_eq!(search_score(&opus, "claudeAgent", "Claude", true, "opus"), Some(-20));
+        assert_eq!(search_score(&opus, "claudeAgent", "Claude", false, "opus gpt"), None);
+        assert!(search_score(&opus, "claudeAgent", "Claude", false, "cop").is_some(), "fuzzy from 3 letters");
+        assert_eq!(search_score(&opus, "claudeAgent", "Claude", false, "zz"), None);
+    }
 
     fn model(name: &str) -> ProviderModel {
         serde_json::from_value(json!({"slug": "s", "name": name})).unwrap()

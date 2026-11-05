@@ -320,7 +320,7 @@ impl Workspace {
         }
     }
 
-    fn target_project(&self) -> Option<&crate::model::ProjectShell> {
+    pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
         let project_id = match self.target.as_ref()? {
             Target::Thread(id) => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
             Target::Draft { project_id } => project_id,

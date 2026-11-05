@@ -7,22 +7,24 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::Textarea;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, Textarea};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, BoxShadow, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px, svg,
+    AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::{Value, json};
 
+use super::attachments::Attachment;
+use super::send::Intent;
 use super::{Target, Workspace, new_id};
+use crate::composer_text::{self, Chip};
 use crate::model::{RuntimeRequest, TurnItem};
-use crate::model_label;
 use crate::requests::{self, Question, QuestionDraft};
 use crate::theme::{FONT_MONO, Tokens, tokens};
 
@@ -35,7 +37,7 @@ const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
 const AUTO_ADVANCE: Duration = Duration::from_millis(200);
 
 /// `runtimeModeConfig.ts`.
-fn runtime_modes() -> [(&'static str, &'static str, Lucide); 4] {
+pub(super) fn runtime_modes() -> [(&'static str, &'static str, Lucide); 4] {
     [
         ("approval-required", "Supervised", Lucide::Lock),
         ("auto-accept-edits", "Auto-accept edits", Lucide::PenLine),
@@ -63,7 +65,7 @@ fn merge_prompt(failed: String, newer: &str) -> String {
 /// What a target keeps of the composer while another one is on screen, like
 /// the web's `composerDraftStore` (in memory only).
 pub(super) enum ComposerDraft {
-    Prompt(String),
+    Prompt(String, Vec<Attachment>),
     /// An open question card; its prompt is the one it set aside.
     Question(QuestionDraft),
 }
@@ -74,9 +76,17 @@ impl Workspace {
     pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
         self.save_custom_answer(cx);
         self.sync_composer_empty(cx);
+        let state = self.composer.read(cx);
+        if self.prompt_history.as_ref().is_some_and(|h| *h.recalled != *state.value()) {
+            self.prompt_history = None;
+        }
+        let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        let previous = std::mem::replace(&mut self.chip_ids, chips);
+        self.sync_attachment_chips(&previous, cx);
+        self.sync_trigger(cx);
     }
 
-    fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
         if empty != self.composer_empty {
             self.composer_empty = empty;
@@ -85,25 +95,51 @@ impl Workspace {
     }
 
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.
+    /// File links, known skills and context links in `text` come back as chips.
     pub(super) fn set_composer_text(
         &mut self,
         text: impl Into<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = text.into();
-        self.composer.update(cx, |composer, cx| composer.set_value(text, window, cx));
+        let text: SharedString = text.into();
+        let skills = self.skill_names();
+        let mut content = InputContent::new(text.clone());
+        for (range, chip) in composer_text::chips(&text, |name| skills.iter().any(|s| s == name)) {
+            let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+            content = match content.clone().with_token(range, token) {
+                Ok(next) => next,
+                Err(_) => content,
+            };
+        }
+        self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
+        self.sync_trigger(cx);
+    }
+
+    /// The user-invocable skills of the composer's provider, by name.
+    fn skill_names(&self) -> Vec<String> {
+        let Some(provider) = self.composer_model().and_then(|s| self.server_info.provider(&s.instance_id)) else {
+            return Vec::new();
+        };
+        let cwd = self.composer_cwd();
+        let (skills, _) = crate::composer_search::provider_lists(provider, cwd.as_deref());
+        crate::composer_search::invocable(skills).into_iter().map(|s| s.name.clone()).collect()
     }
 
     /// Keeps the leaving target's composer; call before the target changes.
     pub(super) fn stash_composer(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
+        let attachments = std::mem::take(&mut self.attachments);
         let draft = match self.question.take() {
             Some(question) => ComposerDraft::Question(question),
-            None => ComposerDraft::Prompt(self.composer.read(cx).value().to_string()),
+            None => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
         };
-        if matches!(&draft, ComposerDraft::Prompt(prompt) if prompt.is_empty()) {
+        self.prompt_history = None;
+        self.menu = Default::default();
+        self.picker.open = false;
+        if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
             self.composer_drafts.remove(&target);
         } else {
             self.composer_drafts.insert(target, draft);
@@ -130,10 +166,10 @@ impl Workspace {
             return;
         }
         let slot = match self.composer_drafts.get_mut(origin) {
-            Some(ComposerDraft::Prompt(prompt)) => prompt,
+            Some(ComposerDraft::Prompt(prompt, _)) => prompt,
             Some(ComposerDraft::Question(question)) => &mut question.prompt,
             None => {
-                self.composer_drafts.insert(origin.clone(), ComposerDraft::Prompt(text));
+                self.composer_drafts.insert(origin.clone(), ComposerDraft::Prompt(text, Vec::new()));
                 return;
             }
         };
@@ -143,13 +179,15 @@ impl Workspace {
     /// Brings back the new target's composer; call after the target changes.
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_draft_workspace(cx);
         match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
             Some(ComposerDraft::Question(question)) => {
                 self.question = Some(question);
                 self.load_custom_answer(window, cx);
             }
-            Some(ComposerDraft::Prompt(prompt)) => {
+            Some(ComposerDraft::Prompt(prompt, attachments)) => {
                 self.question = None;
+                self.attachments = attachments;
                 self.set_composer_text(prompt, window, cx);
             }
             None => {
@@ -157,6 +195,121 @@ impl Workspace {
                 self.set_composer_text("", window, cx);
             }
         }
+    }
+
+    /// Every keystroke, before key bindings run (the editor binds arrows, Tab and
+    /// Enter itself); `true` consumes it.
+    pub(super) fn intercept_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.picker.open {
+            return self.picker_key(keystroke, window, cx);
+        }
+        if self.draft_workspace_key(keystroke, window, cx) || self.composer_shortcut(keystroke, window, cx) {
+            return true;
+        }
+        // Keys in the editor: the open menu first, then prompt history, then the send shortcuts.
+        self.composer.focus_handle(cx).is_focused(window)
+            && (self.menu_key(keystroke, window, cx)
+                || self.history_key(keystroke, window, cx)
+                || self.send_key(keystroke, window, cx))
+    }
+
+    /// Up/Down recall this thread's earlier messages (`composerCommandKey.ts`).
+    fn history_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let back = match keystroke.key.as_str() {
+            "up" => true,
+            "down" => false,
+            _ => return false,
+        };
+        let m = keystroke.modifiers;
+        if m.shift || m.alt || m.control || m.platform || self.question.is_some() || self.has_attachments() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let text = state.value();
+        let cursor = state.cursor().min(text.len());
+        let on_edge = if back { !text[..cursor].contains('\n') } else { !text[cursor..].contains('\n') };
+        if !on_edge || (self.prompt_history.is_none() && !text.is_empty()) {
+            return false;
+        }
+        let entries = self.history_entries();
+        let Some((prompt, position)) = composer_text::history_step(&entries, self.prompt_history.as_ref(), &text, back)
+        else {
+            return false;
+        };
+        self.set_composer_text(prompt, window, cx);
+        self.composer.update(cx, |state, cx| {
+            let end = state.value().len();
+            state.set_selected_range(end..end, cx);
+        });
+        self.prompt_history = position;
+        self.hide_menu(cx);
+        true
+    }
+
+    fn history_entries(&self) -> Vec<String> {
+        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
+            return Vec::new();
+        };
+        let messages =
+            projection.visible_turn_items.iter().map(|row| &row.item).filter(|item| {
+                item.item_type == "user_message" && item.raw.get("attribution").is_none_or(Value::is_null)
+            });
+        composer_text::history_entries(messages.filter_map(|item| item.str("text")))
+    }
+
+    /// Enter sends; Ctrl+Enter takes the alternate path; Shift/Alt+Enter add a line.
+    fn send_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if keystroke.key != "enter" || m.shift || (m.alt && !(m.control || m.platform)) {
+            return false;
+        }
+        let intent = match (m.control || m.platform, m.alt) {
+            (false, _) => Intent::Foreground,
+            (true, false) => Intent::Alternate,
+            (true, true) => Intent::AndNewThread,
+        };
+        self.submit_with(intent, window, cx);
+        true
+    }
+
+    /// Shortcuts that work wherever focus is (`keybindings.ts`): the model picker,
+    /// permissions and branch pickers, and 1-9 on an open question card.
+    fn composer_shortcut(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if (m.control || m.platform) && m.shift && !m.alt && self.page.is_none() && self.settings.is_none() {
+            match keystroke.key.as_str() {
+                "m" | "e" => {
+                    if self.picker.open {
+                        self.close_model_picker(window, cx);
+                    } else {
+                        self.open_model_picker(window, cx);
+                    }
+                }
+                "a" if matches!(self.target, Some(Target::Draft { .. })) => {
+                    self.draft_workspace_open_permissions(cx);
+                }
+                "a" => self.open_model_picker(window, cx),
+                _ => return false,
+            }
+            return true;
+        }
+        if m.control || m.platform || m.alt {
+            return false;
+        }
+        let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
+        if self.composer.focus_handle(cx).is_focused(window) {
+            return false;
+        }
+        let Some(draft) = &self.question else { return false };
+        if draft.collapsed
+            || self.pending_question_request().is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
+        {
+            return false;
+        }
+        let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
+        let value = option.value().to_owned();
+        self.pick_option(value, window, cx);
+        true
     }
 
     /// Opens a fresh draft when the first pending question changes. The editor
@@ -288,7 +441,7 @@ impl Workspace {
         }
     }
 
-    fn default_runtime_mode(&self) -> &str {
+    pub(super) fn default_runtime_mode(&self) -> &str {
         self.server_info.default_runtime_mode.as_deref().unwrap_or(DEFAULT_RUNTIME_MODE)
     }
 
@@ -304,7 +457,7 @@ impl Workspace {
         mode.unwrap_or_else(|| self.default_runtime_mode().to_owned())
     }
 
-    fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+    pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
             Some(Target::Thread(thread_id)) => {
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
@@ -348,6 +501,18 @@ impl Workspace {
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
         let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let view = cx.weak_entity();
+        let editor = Textarea::new(&self.composer)
+            .appearance(false)
+            .xsmall()
+            .text_size(px(14.))
+            .line_height(px(LINE_HEIGHT))
+            .mx(px(-4.))
+            .disabled(self.target.is_none())
+            .token(move |token, _, _| render_chip(token, &t))
+            .on_paste(move |item, window, cx| {
+                view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
+            });
         let surface = v_flex()
             .w_full()
             .rounded(px(16.))
@@ -360,66 +525,73 @@ impl Workspace {
             } else {
                 vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
             })
-            .child(
-                div()
-                    .relative()
-                    .px(px(16.))
-                    .pt(px(16.))
-                    .pb(px(8.))
-                    .child(
-                        // xsmall pads the editor 4px a side, the web's `-m-1 p-1`.
-                        Textarea::new(&self.composer)
-                            .appearance(false)
-                            .xsmall()
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                let held = event.modifiers.control || event.modifiers.platform;
+                if held != this.ctrl_held {
+                    this.ctrl_held = held;
+                    cx.notify();
+                }
+            }))
+            .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
+                div().relative().child(editor).when(self.composer_empty, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
                             .text_size(px(14.))
                             .line_height(px(LINE_HEIGHT))
-                            .mx(px(-4.))
-                            .disabled(self.target.is_none()),
+                            .text_color(t.muted_foreground)
+                            .truncate()
+                            .child(placeholder),
                     )
-                    .when(self.composer_empty, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top(px(16.))
-                                .left(px(16.))
-                                .right(px(16.))
-                                .text_size(px(14.))
-                                .line_height(px(LINE_HEIGHT))
-                                .text_color(t.muted_foreground)
-                                .truncate()
-                                .child(placeholder),
-                        )
-                    }),
-            )
-            .child(self.render_footer(&t, cx));
+                }),
+            ))
+            .child(self.render_footer(&t, window, cx));
         div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
                 .children(self.render_question(&t, cx))
-                .child(surface),
+                .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
+                .children(self.render_context_strip(&t, cx)),
         )
     }
 
-    fn render_footer(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let attach = div()
-            .id("attach")
-            .size(px(28.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.))
-            .opacity(0.64)
-            .child(Icon::new(Lucide::Paperclip).with_size(px(16.)).text_color(t.muted_foreground).mt(px(1.)))
-            .tooltip(|window, cx| Tooltip::new("Attach files").build(window, cx));
+    fn render_footer(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.runtime_mode();
+        // Drafts name their permissions in the row under the composer instead.
+        let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
         h_flex()
             .items_center()
             .px(px(8.))
             .pb(px(8.))
             .when(self.question.is_some(), |el| el.pt(px(8.)))
-            .child(div().mr(px(8.)).child(attach))
+            .when(self.can_attach(), |el| {
+                el.child(
+                    div().mr(px(8.)).child(
+                        div()
+                            .id("attach")
+                            .size(px(28.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.accent))
+                            .child(
+                                Icon::new(Lucide::Paperclip)
+                                    .with_size(px(16.))
+                                    .text_color(t.muted_foreground)
+                                    .mt(px(1.)),
+                            )
+                            .tooltip(|window, cx| Tooltip::new("Attach files").build(window, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.pick_attachments(window, cx))),
+                    ),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()
@@ -432,111 +604,24 @@ impl Workspace {
                             .min_w_0()
                             .justify_end()
                             .gap(px(2.))
-                            .when(mode != self.default_runtime_mode(), |el| {
-                                el.child(self.render_mode_chip(&mode, t, cx))
+                            .when(!strip_owns_mode && mode != self.default_runtime_mode(), |el| {
+                                let (_, label, icon) = runtime_modes()
+                                    .into_iter()
+                                    .find(|(id, ..)| *id == mode)
+                                    .unwrap_or(runtime_modes()[3]);
+                                el.child(self.render_permissions_control(
+                                    "footer-permissions",
+                                    icon,
+                                    label,
+                                    false,
+                                    t,
+                                    cx,
+                                ))
                             })
-                            .child(self.render_model_picker(t, cx)),
+                            .child(self.render_model_picker(t, window, cx)),
                     )
                     .child(self.render_primary_action(t, cx)),
             )
-    }
-
-    fn render_mode_chip(&self, mode: &str, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
-        let view = cx.entity();
-        let current = mode.to_owned();
-        control_button("runtime-mode", t)
-            .pl(px(6.))
-            .child(Icon::new(icon).with_size(px(16.)).text_color(t.muted_foreground))
-            .child(div().text_color(t.foreground.opacity(0.8)).child(label))
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomRight, move |menu, window, _| {
-                permission_items(menu, &current, &view, window)
-            })
-    }
-
-    fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.composer_model();
-        let provider = current.as_ref().and_then(|s| self.server_info.provider(&s.instance_id));
-        let model = current.as_ref().and_then(|s| self.server_info.model(s));
-        let driver = provider.map(|p| p.driver.as_str()).unwrap_or_default();
-        let name: SharedString = match (&current, model) {
-            (_, Some(model)) => model_label::trigger_model_name(model, driver).into(),
-            (Some(selection), None) => selection.model.clone().into(),
-            (None, None) => "Pick a model".into(),
-        };
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or(&[]);
-        let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
-        // Effort levels the picker offers for the current model.
-        let levels: Option<(String, Vec<(String, String)>, Option<String>)> =
-            model_label::reasoning(descriptors).filter(|d| d.kind == "select").map(|d| {
-                let choices = d
-                    .options
-                    .iter()
-                    .filter(|o| !d.prompt_injected_values.contains(&o.id))
-                    .map(|o| (o.id.clone(), o.label.clone()))
-                    .collect();
-                let value = current
-                    .as_ref()
-                    .and_then(|s| model_label::current_value(d, s))
-                    .and_then(|v| v.as_str().map(str::to_owned));
-                (d.id.clone(), choices, value)
-            });
-        let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
-        let choices = Rc::new(self.server_info.model_choices());
-        let mode = self.runtime_mode();
-        let view = cx.entity();
-        let disabled = self.target.is_none() || choices.is_empty();
-        control_button("model-picker", t)
-            .min_w(px(52.))
-            .disabled(disabled)
-            .children(icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.foreground))
-            }))
-            .child(div().max_w(px(224.)).truncate().text_color(t.foreground.opacity(0.8)).child(name))
-            .children(
-                effort.map(|effort| {
-                    div().ml(px(-2.)).max_w(px(96.)).truncate().text_color(t.muted_foreground).child(effort)
-                }),
-            )
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomRight, move |mut menu, window, _| {
-                let mut provider_name: Option<&str> = None;
-                for (label, selection) in choices.iter() {
-                    let (group, model) = label.split_once(" · ").unwrap_or(("", label.as_ref()));
-                    if provider_name != Some(group) {
-                        if provider_name.is_some() {
-                            menu = menu.separator();
-                        }
-                        menu = menu.label(group.to_owned());
-                        provider_name = Some(group);
-                    }
-                    let picked = selection.clone();
-                    let checked = current
-                        .as_ref()
-                        .is_some_and(|c| c.instance_id == picked.instance_id && c.model == picked.model);
-                    menu = menu.item(PopupMenuItem::new(model.to_owned()).checked(checked).on_click(
-                        window.listener_for(&view, move |this, _, _, cx| {
-                            this.model_override = Some(picked.clone());
-                            cx.notify();
-                        }),
-                    ));
-                }
-                if let (Some((id, levels, value)), Some(selection)) = (&levels, &current) {
-                    menu = menu.separator().label("Effort");
-                    for (level, label) in levels {
-                        let picked = model_label::with_option(selection, id, Value::String(level.clone()));
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone()).checked(value.as_ref() == Some(level)).on_click(
-                                window.listener_for(&view, move |this, _, _, cx| {
-                                    this.model_override = Some(picked.clone());
-                                    cx.notify();
-                                }),
-                            ),
-                        );
-                    }
-                }
-                permission_items(menu.separator(), &mode, &view, window).max_h(px(420.)).scrollable(true)
-            })
     }
 
     fn render_primary_action(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
@@ -605,31 +690,49 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        if running && self.composer_empty {
+        let sendable = !self.composer_empty || self.has_attachments();
+        if running && !sendable {
             return stop().into_any_element();
         }
-        let can_send = !self.composer_empty && self.target.is_some() && self.client().is_some();
+        let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
+        let can_send = sendable && self.target.is_some() && self.client().is_some() && disabled_reason.is_none();
         let (fill, icon) = if can_send || self.sending {
             (t.primary, t.primary_foreground)
         } else {
             (t.foreground.opacity(0.12), t.muted_foreground)
         };
+        // `resolveComposerDispatchMode`: steer by default, Ctrl flips it to queue.
+        let queue = running && self.ctrl_held;
         let content: AnyElement = if self.sending {
             Spinner::new().small().color(icon).into_any_element()
         } else if running {
-            Icon::new(Lucide::CornerUpRight).with_size(px(16.)).text_color(icon).into_any_element()
+            let glyph = if queue { Lucide::ListPlus } else { Lucide::CornerUpRight };
+            Icon::new(glyph).with_size(px(16.)).text_color(icon).into_any_element()
         } else {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
+        };
+        let tooltip: Option<&'static str> = match (disabled_reason, running && can_send) {
+            (Some(reason), _) => Some(reason),
+            (None, true) => Some("Click to steer, Ctrl-click or Ctrl+Enter to queue"),
+            _ => None,
         };
         round_button("send", fill, t.primary)
             .child(content)
             .when(!can_send, |el| el.shadow(Vec::new()))
             .when(can_send, |el| {
-                el.cursor_pointer()
-                    .hover(|s| s.bg(t.primary_hover))
-                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                el.cursor_pointer().hover(|s| s.bg(t.primary_hover)).on_click(cx.listener(
+                    |this, event: &ClickEvent, window, cx| {
+                        let modifiers = event.modifiers();
+                        let intent = if modifiers.control || modifiers.platform {
+                            Intent::Alternate
+                        } else {
+                            Intent::Foreground
+                        };
+                        this.submit_with(intent, window, cx)
+                    },
+                ))
             })
-            .when(running && can_send, |el| el.tooltip(|window, cx| Tooltip::new("Click to steer").build(window, cx)))
+            .when_some(tooltip, |el, tooltip| el.tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx)))
             .into_any_element()
     }
 
@@ -1017,8 +1120,30 @@ fn render_option(
         })
 }
 
+/// A chip in the editor (`ContextChip`): icon and label in the kind's accent ink.
+fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
+    let id = token.token().id();
+    let (accent, icon) = match Chip::from_id(id) {
+        Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
+        Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
+        Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
+        _ => (rgb(0x0096af), Lucide::File),
+    };
+    h_flex()
+        .h(token.line_height())
+        .max_w(token.available_width())
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(accent)
+        .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
+        .child(Icon::new(icon).with_size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .into_any_element()
+}
+
 /// `ComposerControl size="sm"`: 28px tall, 8px padding, 6px gap, text-sm medium.
-fn control_button(id: &'static str, t: &Tokens) -> Button {
+pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .small()
@@ -1054,18 +1179,6 @@ fn action_shadow(tint: Hsla) -> Vec<BoxShadow> {
 
 fn icon_box(t: &Tokens) -> gpui_kit::Div {
     div().size(px(24.)).flex().items_center().justify_center().rounded(px(8.)).text_color(t.foreground)
-}
-
-fn permission_items(menu: PopupMenu, current: &str, view: &Entity<Workspace>, window: &mut Window) -> PopupMenu {
-    let mut menu = menu.label("Permissions");
-    for (mode, label, _) in runtime_modes() {
-        menu = menu.item(
-            PopupMenuItem::new(label)
-                .checked(mode == current)
-                .on_click(window.listener_for(view, move |this, _, _, cx| this.set_runtime_mode(mode, cx))),
-        );
-    }
-    menu
 }
 
 fn white(alpha: f32) -> Hsla {
