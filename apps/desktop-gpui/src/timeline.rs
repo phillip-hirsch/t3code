@@ -567,12 +567,41 @@ pub fn entry_key(entry_id: &str) -> SharedString {
     format!("entry:{entry_id}").into()
 }
 
+/// `isCompactionCommandMessage` and `idleCompactionOf`: a bare `/compact`, and why the
+/// server sent it on its own (`Some("beforeCacheExpires" | "onReturn")`).
+fn compaction_command(item: &TurnItem) -> Option<Option<&'static str>> {
+    let bare = item.str("text").is_some_and(|text| text.trim().eq_ignore_ascii_case("/compact"))
+        && item.raw.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty);
+    if !bare {
+        return None;
+    }
+    Some(match item.str("idleCompaction") {
+        Some("onReturn") => Some("onReturn"),
+        Some("beforeCacheExpires") => Some("beforeCacheExpires"),
+        _ if item.str("createdBy") == Some("agent") && item.str("creationSource") == Some("server") => {
+            Some("beforeCacheExpires")
+        }
+        _ => None,
+    })
+}
+
+/// `IDLE_COMPACTING_LABELS`.
+fn compacting_label(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("beforeCacheExpires") => "Compacting before the cache expires…",
+        Some("onReturn") => "Compacting…",
+        _ => "Compacting context",
+    }
+}
+
 enum Kind {
     /// `revertible`: a turn start or queued turn, which "Edit from here" can rewind.
     User {
         text: SharedString,
         steer: Option<Steer>,
         revertible: bool,
+        /// A bare `/compact` turn, which its compaction row stands in for.
+        compaction: Option<Option<&'static str>>,
         sent_by_t3code: bool,
     },
     Assistant {
@@ -719,7 +748,13 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 _ => None,
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
-            Kind::User { text: text("text"), steer, revertible, sent_by_t3code: crate::queue::sent_by_t3code(item) }
+            Kind::User {
+                text: text("text"),
+                steer,
+                revertible,
+                sent_by_t3code: crate::queue::sent_by_t3code(item),
+                compaction: compaction_command(item),
+            }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
         "proposed_plan" => Kind::Plan { markdown: text("markdown") },
@@ -1332,10 +1367,37 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
 
     let mut rows: Vec<Row> = Vec::new();
     let mut has_activity = false;
+    // A bare `/compact` turn is the compaction itself: one row stands in for its prompt and
+    // its working indicator (`compactionRuns` in `deriveMessagesTimelineRows`).
+    let compaction_runs: HashMap<&SharedString, Option<&'static str>> = entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::User { compaction: Some(reason), .. } => Some((e.run_id.as_ref()?, *reason)),
+            _ => None,
+        })
+        .collect();
+    let compacted_runs: HashSet<&SharedString> =
+        entries.iter().filter(|e| e.is_compaction()).filter_map(|e| e.run_id.as_ref()).collect();
+    let compaction_active = |e: &TimelineEntry| e.is_compaction() && e.work().is_some_and(|w| in_active_run(w));
+    let active_compaction = unsettled.as_ref().filter(|run| is_working && compaction_runs.contains_key(run));
+    let compaction_finished = active_compaction
+        .is_some_and(|run| compacted_runs.contains(run) && !entries.iter().any(|e| compaction_active(e)));
+    let compaction_only_finished = compaction_finished
+        && active_compaction.is_some_and(|run| {
+            !entries.iter().any(|e| {
+                e.run_id.as_ref() == Some(run)
+                    && !e.is_compaction()
+                    && !matches!(e.kind, Kind::User { compaction: Some(_), .. })
+            })
+        });
+    let running_compaction = active_compaction.filter(|_| !compaction_finished);
+    // A running compaction shows only its live divider; a finished compaction-only run, nothing more.
+    let hide_working = compaction_only_finished || running_compaction.is_some();
+    let show_working = is_working && !hide_working;
     let mut index = 0;
     while index < entries.len() {
         let entry = &entries[index];
-        if is_working && index == active_header {
+        if show_working && index == active_header {
             rows.push(Row::Working { started_at: latest_run.and_then(|r| r.started_at.clone()).map(Into::into) });
         }
         if Some(index) == latest_visible {
@@ -1367,7 +1429,11 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         match &entry.kind {
             Kind::Work(work) if entry.is_compaction() => rows.push(Row::Divider {
                 id: entry.id.clone(),
-                label: work.label.clone(),
+                // A live server-started compaction says why it runs (`IDLE_COMPACTING_LABELS`).
+                label: match work.run_id.as_ref().and_then(|run| compaction_runs.get(run)).copied().flatten() {
+                    Some(reason) if in_active_run(work) => compacting_label(Some(reason)).into(),
+                    _ => work.label.clone(),
+                },
                 failed: work.status == Some(Status::Failed),
                 failure: work
                     .detail
@@ -1467,6 +1533,19 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Request(card) => rows.push(Row::Request(card.clone())),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
+            Kind::User { compaction: Some(_), .. } if entry.run_id.is_some() => {
+                let run = entry.run_id.as_ref().expect("a run");
+                if !compacted_runs.contains(run) {
+                    let pending = running_compaction == Some(run);
+                    rows.push(Row::Divider {
+                        id: format!("compaction:{run}").into(),
+                        label: if pending { compacting_label(compaction_runs[run]) } else { "Context compaction" }
+                            .into(),
+                        failed: false,
+                        failure: None,
+                    });
+                }
+            }
             Kind::User { text, steer, sent_by_t3code, .. } => rows.push(Row::User {
                 id: entry.id.clone(),
                 text: text.clone(),
@@ -1497,10 +1576,11 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         index += 1;
     }
 
-    if is_working && !rows.iter().any(|row| matches!(row, Row::Working { .. })) && active_header == entries.len() {
+    if show_working && !rows.iter().any(|row| matches!(row, Row::Working { .. })) && active_header == entries.len() {
         rows.push(Row::Working { started_at: latest_run.and_then(|r| r.started_at.clone()).map(Into::into) });
     }
-    if is_working && (latest_failed || (!has_activity && pending.is_empty())) {
+    let compacting = hide_working || entries.iter().any(|e| compaction_active(e));
+    if is_working && !compacting && (latest_failed || (!has_activity && pending.is_empty())) {
         let group = anchor.as_ref().filter(|_| latest_failed).map(|anchor| group_key(anchor));
         let open = group.as_ref().is_some_and(|group| expanded.contains(group));
         rows.push(Row::Work(WorkRow {
@@ -1764,6 +1844,25 @@ mod tests {
         let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
         assert!(described[reply + 1].starts_with("work"), "{described:?}");
         assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
+    }
+
+    #[test]
+    fn a_compact_turn_is_its_compaction_row() {
+        let compact = item(
+            "c-u",
+            "user_message",
+            "c1",
+            "2026-11-04T10:00:00.000Z",
+            json!({"text": "/compact", "inputIntent": "turn_start"}),
+        );
+        let running = projection(vec![compact.clone()], json!([{"id": "c1", "status": "running", "ordinal": 1}]));
+        let described = describe(&rows(&running, &HashSet::new(), &mut EntryCache::default()));
+        assert_eq!(described, vec!["divider Compacting context"]);
+        let done = item("c-x", "compaction", "c1", "2026-11-04T10:00:05.000Z", json!({"status": "completed"}));
+        let finished = projection(vec![compact, done], json!([{"id": "c1", "status": "completed", "ordinal": 1}]));
+        let described = describe(&rows(&finished, &HashSet::new(), &mut EntryCache::default()));
+        assert!(described.iter().all(|row| !row.starts_with("user")), "{described:?}");
+        assert_eq!(described.iter().filter(|row| row.starts_with("divider")).count(), 1, "{described:?}");
     }
 
     #[test]
