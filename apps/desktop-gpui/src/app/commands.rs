@@ -2,8 +2,8 @@
 //! (`AppSidebarLayout.tsx`, `chatRouteCommands.ts`, `commandPaletteCommands.ts`,
 //! `useChatShortcuts.ts` and its groups, `Sidebar.tsx`, `UsagePage.tsx`,
 //! `ModelPickerContent.tsx`). A handler returns `false` to leave the key to whatever
-//! is focused, as the web's handlers do. Commands this client has no surface for
-//! (`composer.stash`, `composer.host`, …) fall through the same way.
+//! is focused, as the web's handlers do. Commands this client has no surface for fall
+//! through the same way.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -180,6 +180,16 @@ impl Workspace {
             "modelPicker.previousProvider" | "modelPicker.nextProvider" => {
                 let step = if command == "modelPicker.nextProvider" { 1 } else { -1 };
                 return self.model_picker_step_provider(step, window, cx);
+            }
+            "composer.host" if chat => {
+                if !held {
+                    return self.open_host_picker(cx);
+                }
+            }
+            "composer.cycleHost" if chat => {
+                if !held {
+                    return self.cycle_host(window, cx);
+                }
             }
             "composer.branch" if chat => {
                 if !held {

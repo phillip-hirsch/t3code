@@ -14,6 +14,7 @@
 mod access;
 mod environments;
 mod exposure;
+mod load_balancing;
 pub(super) mod logic;
 mod saved;
 mod secrets;

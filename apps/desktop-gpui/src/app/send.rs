@@ -262,7 +262,9 @@ impl Workspace {
                             (Some(thread_id), false) if here => {
                                 // The draft is used up; the project's next draft starts fresh.
                                 this.draft_workspace = Default::default();
-                                this.select_thread(thread_id, window, cx);
+                                // It launched on the draft's environment; the shell may not list it yet.
+                                let environment = origin.environment().clone();
+                                this.select_thread_in(environment, thread_id, window, cx);
                             }
                             _ if new_draft_after && here => {
                                 if let Some(project_id) = project_id {

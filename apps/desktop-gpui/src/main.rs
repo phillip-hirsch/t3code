@@ -10,6 +10,7 @@ mod device;
 mod environments;
 mod inbox;
 mod keybindings;
+mod load_balancing;
 mod model;
 mod model_label;
 mod new_thread;

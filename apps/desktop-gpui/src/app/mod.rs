@@ -40,6 +40,7 @@ mod files;
 mod find;
 mod git;
 mod header;
+mod host_picker;
 mod inspector;
 mod keep_alive;
 mod keymap;
@@ -206,6 +207,8 @@ pub struct Workspace {
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
+    /// The composer's "Run on" picker and each draft's machine choice.
+    host: host_picker::HostUi,
     _connection_task: Task<()>,
     /// The launch landing ran (once, after the first shell snapshot).
     landed: bool,
@@ -373,6 +376,7 @@ impl Workspace {
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
+            host: Default::default(),
             _connection_task: Self::connect(window, cx),
             landed: false,
             page: None,
@@ -947,6 +951,7 @@ impl Render for Workspace {
         }
         self.sync_vcs(window, cx);
         self.sync_servers(window, cx);
+        self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);
