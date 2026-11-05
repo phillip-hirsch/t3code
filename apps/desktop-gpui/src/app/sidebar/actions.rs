@@ -450,9 +450,16 @@ impl Workspace {
             let label = if scoped { "Show all projects".to_owned() } else { format!("Filter by {}", g.display_name) };
             (label, if scoped { Vec::new() } else { vec![g.key.clone()] })
         });
+        let scratch_root = info.scratch_workspace_root.as_deref().map(crate::project_groups::normalize_path);
+        let scratch = project.is_some_and(|p| {
+            scratch_root.as_deref() == Some(crate::project_groups::normalize_path(&p.workspace_root).as_str())
+        });
         Some(ThreadMenu {
             thread_id: thread.id.clone(),
             origin,
+            // Only the chat title finds in its thread (`onFindInThread`).
+            find: origin == MenuOrigin::Title && self.thread_find_available(),
+            turn_into_project: thread.worktree_path.is_some() && info.capability("threadProjectFromScratch") && scratch,
             // The web offers these once the environment's config has loaded.
             loaded: info.environment_id.is_some(),
             pinned: thread.pinned_at.is_some(),
@@ -601,6 +608,9 @@ pub(in crate::app) struct ThreadMenu {
     branch: Option<String>,
     link: Option<String>,
     running: bool,
+    find: bool,
+    /// A No project thread with its own folder, on a server that can promote it.
+    turn_into_project: bool,
 }
 
 impl ThreadMenu {
@@ -627,6 +637,17 @@ impl ThreadMenu {
         let command = |label: &str, icon: Lucide, kind: &'static str, fields: Value| {
             act!(item(label, icon), |this, _w, cx, id| this.thread_command(kind, &id, fields.clone(), cx))
         };
+        if self.find {
+            menu = menu.item(act!(item("Find in thread", Lucide::TextSearch), |this, window, cx, _id| {
+                this.open_thread_find(window, cx);
+            }));
+        }
+        if let Some(branch) = &self.branch {
+            menu = menu.item(act!(
+                item(&format!("New thread on {branch}"), Lucide::MessageSquarePlus),
+                |this, window, cx, id| this.new_thread_on_branch(&id, window, cx)
+            ));
+        }
         if self.loaded {
             menu = menu.item(if self.pinned {
                 act!(item("Unpin thread", Lucide::PinOff), |this, window, cx, id| this.unpin_thread(&id, window, cx))
@@ -673,6 +694,13 @@ impl ThreadMenu {
             menu = menu.item(item(&label, Lucide::FolderTree).on_click(move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| this.set_scope(scope.clone(), cx));
             }));
+        }
+        if self.turn_into_project {
+            menu = menu.item(
+                act!(item("Turn into project", Lucide::FolderPlus), |this, window, cx, id| this
+                    .turn_thread_into_project(&id, window, cx))
+                .disabled(self.running),
+            );
         }
         if let Some(enabled) = self.auto_settle {
             let (view, id) = (view.clone(), self.thread_id.clone());

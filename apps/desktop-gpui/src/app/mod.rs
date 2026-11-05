@@ -50,6 +50,7 @@ mod send;
 mod sidebar;
 mod terminal;
 mod thread_menu;
+mod thread_menu_actions;
 mod titlebar;
 mod visits;
 
