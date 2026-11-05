@@ -159,8 +159,9 @@ export default defineConfig({
     ignorePatterns: [
       ".repos/**",
       "infra/task-cache/vendor/**",
-      // A crates.io copy kept byte-identical apart from its patch.
+      // crates.io copies kept byte-identical apart from their patches.
       "apps/desktop-gpui/vendor/gpui-base/**",
+      "apps/desktop-gpui/vendor/gpui-pre-windows/**",
       // Macroscope requires one glob per line; Markdown formatting corrupts it.
       ".macroscope/ignore.md",
       ".alchemy",

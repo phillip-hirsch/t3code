@@ -90,6 +90,9 @@ win32job = "2"
 # The taskbar badge's overlay icon is drawn with resvg; gpui already builds it with these features.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
 
-# gpui-base 0.9.0 plus one patch (text decorations on the textarea); see vendor/README.md.
+# Vendored crates.io copies with small patches; see vendor/README.md.
 [patch.crates-io]
+# gpui-base 0.9.0: text decorations on the textarea.
 gpui-base = { path = "vendor/gpui-base" }
+# gpui-pre-windows 0.3.11 (GPUI's Windows platform, through gpui-kit).
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
