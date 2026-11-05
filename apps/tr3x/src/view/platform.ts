@@ -1,5 +1,4 @@
-// @effect-diagnostics effectFnOpportunity:off globalFetch:off nodeBuiltinImport:off -- Thin stubs over client-runtime services for a Bun CLI.
-import * as NodeCrypto from "node:crypto";
+// @effect-diagnostics effectFnOpportunity:off globalFetch:off -- Thin stubs over client-runtime services for a Bun CLI.
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
@@ -26,7 +25,8 @@ import { layerRemoteHttpClient } from "@t3tools/client-runtime/rpc";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { RelayWebClientId } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -217,25 +217,8 @@ const layerRelay = ManagedRelay.layer({
   clientId: RelayWebClientId,
 }).pipe(Layer.provide(Layer.mergeAll(layerHttpClient, layerRelayDpopSigner)));
 
-const DIGEST_ALGORITHMS: Record<Crypto.DigestAlgorithm, string> = {
-  "SHA-1": "sha1",
-  "SHA-256": "sha256",
-  "SHA-384": "sha384",
-  "SHA-512": "sha512",
-};
-
-// Commands mint ids and receipts with effect/Crypto, as mobile's expo-crypto layer does.
-const layerCrypto = Layer.succeed(
-  Crypto.Crypto,
-  Crypto.make({
-    randomBytes: (size) => new Uint8Array(NodeCrypto.randomBytes(size)),
-    digest: (algorithm, data) =>
-      Effect.sync(
-        () =>
-          new Uint8Array(NodeCrypto.createHash(DIGEST_ALGORITHMS[algorithm]).update(data).digest()),
-      ),
-  }),
-);
+// Commands mint ids and receipts with effect/crypto; Bun and Node both have Web Crypto.
+const layerCrypto = Layer.mergeAll(SecureRandom.layerWebCrypto, Digest.layerWebCrypto);
 
 const layerConnectivity = Connectivity.layer({
   status: Effect.succeed("online"),
