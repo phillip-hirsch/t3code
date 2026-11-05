@@ -7,6 +7,9 @@ mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
+pub(super) use pull_requests::PullRequestsState;
+pub(super) use usage::UsageState;
+
 use super::{Target, Workspace};
 
 /// A page that replaces the chat in the main column (`/_chat/pull-requests`, `/_chat/usage`).
@@ -22,6 +25,11 @@ impl Page {
             Page::PullRequests => "Pull requests",
             Page::Usage => "Usage",
         }
+    }
+
+    /// Usage opens as a modal over the last main view (`AppRouteModal`), as Settings does.
+    pub(super) fn is_modal(self) -> bool {
+        self == Page::Usage
     }
 }
 
@@ -92,8 +100,18 @@ impl Workspace {
         self.settings = None;
         self.page = Some(page);
         self.record_location();
+        self.page_opened(cx);
         self.notify_sidebar(cx);
         cx.notify();
+    }
+
+    /// Starts the open page's reads.
+    pub(super) fn page_opened(&mut self, cx: &mut Context<Self>) {
+        match self.page {
+            Some(Page::PullRequests) => self.pull_requests_opened(cx),
+            Some(Page::Usage) => self.usage_opened(cx),
+            None => {}
+        }
     }
 
     /// Leaves a page for the chat it covered.
@@ -138,19 +156,27 @@ impl Workspace {
             Location::Chat(Some(Target::Thread(thread_id))) => self.select_thread(thread_id, window, cx),
             Location::Chat(Some(Target::Draft { project_id })) => self.start_draft(project_id, window, cx),
             Location::Chat(None) => {}
-            Location::Page(page) => self.page = Some(page),
+            Location::Page(page) => {
+                self.page = Some(page);
+                self.page_opened(cx);
+            }
             Location::Settings(section) => self.settings = Some(section),
         }
         self.notify_sidebar(cx);
         cx.notify();
     }
 
-    /// The main column while a page is open.
-    pub(super) fn render_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        match page {
-            Page::PullRequests => self.render_pull_requests(window, cx),
-            Page::Usage => self.render_usage(window, cx),
+    /// The main column while a page covers the chat.
+    pub(super) fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match self.page? {
+            Page::PullRequests => Some(self.render_pull_requests(window, cx)),
+            Page::Usage => None,
         }
+    }
+
+    /// The modal layer of a page that opens over the main view.
+    pub(super) fn render_page_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.page.filter(|page| page.is_modal()).map(|_| self.render_usage_modal(window, cx))
     }
 }
 

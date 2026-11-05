@@ -5,10 +5,12 @@ mod inbox;
 mod model;
 mod model_label;
 mod new_thread;
+mod pull_requests;
 mod requests;
 mod rpc;
 mod theme;
 mod timeline;
+mod usage;
 mod work_log;
 
 use std::sync::OnceLock;

@@ -114,6 +114,8 @@ pub struct Workspace {
     landed: bool,
     /// A page covering the chat in the main column.
     page: Option<pages::Page>,
+    pull_requests: pages::PullRequestsState,
+    usage: pages::UsageState,
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
@@ -177,6 +179,8 @@ impl Workspace {
             shell_retried: false,
             landed: false,
             page: None,
+            pull_requests: pages::PullRequestsState::new(window, cx),
+            usage: pages::UsageState::default(),
             settings: None,
             history: pages::History::default(),
             _subscriptions: subscriptions,
@@ -313,6 +317,8 @@ impl Workspace {
 
     fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
         self.connection = Connection::Connected(client.clone());
+        // A page opened while the socket was down reads now.
+        self.page_opened(cx);
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
         self._stream_tasks = vec![Self::pump(
             config,
@@ -791,6 +797,11 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
+                if this.page.is_some_and(pages::Page::is_modal) && event.keystroke.key == "escape" {
+                    this.close_page(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 this.escape_details_popover(event, window, cx);
             }))
             .child(
@@ -803,12 +814,14 @@ impl Render for Workspace {
                         .child(self.render_header(cx))
                         .children(self.render_error(cx))
                         .child(div().relative().flex_1().min_h_0().map(|el| {
-                            match (self.page, self.target.clone()) {
-                                (Some(page), _) => el.child(self.render_page(page, window, cx)),
-                                (None, Some(Target::Draft { project_id })) => el
+                            if let Some(page) = self.render_page(window, cx) {
+                                return el.child(page);
+                            }
+                            match self.target.clone() {
+                                Some(Target::Draft { project_id }) => el
                                     .child(self.render_draft_stage(&project_id, window, cx))
                                     .children(self.render_details_card(window, cx)),
-                                (None, _) => el
+                                _ => el
                                     .child(
                                         v_flex()
                                             .size_full()
@@ -821,6 +834,7 @@ impl Render for Workspace {
                 ),
             )
             .child(self.render_titlebar_overlay(window, cx))
+            .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
     }
 }

@@ -112,6 +112,27 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub installed: Option<bool>,
+    #[serde(default)]
+    pub auth: Option<ProviderAuth>,
+    #[serde(default)]
+    pub accent_color: Option<String>,
+}
+
+/// `ServerProviderAuth`: who the provider is signed in as.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The plan, e.g. "Claude Max".
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -122,6 +143,19 @@ pub struct UsageLimits {
     pub windows: Vec<UsageWindow>,
     #[serde(default)]
     pub unavailable: Option<Value>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+    #[serde(default)]
+    pub credential_fingerprint: Option<String>,
+    #[serde(default)]
+    pub external_usage: Option<ExternalUsage>,
+}
+
+/// A host that shows usage on its own site instead of reporting windows.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExternalUsage {
+    pub label: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -130,6 +164,13 @@ pub struct UsageWindow {
     pub id: String,
     pub label: String,
     pub used_percent: f64,
+    /// `session`, `weekly`, `monthly` or `other`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub window_duration_mins: Option<f64>,
 }
 
 impl UsageWindow {

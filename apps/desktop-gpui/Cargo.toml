@@ -31,6 +31,7 @@ gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-yaml",
 ] }
 hmac = "0.12"
+jiff = "0.2"
 log = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 serde = { version = "1", features = ["derive", "rc"] }
