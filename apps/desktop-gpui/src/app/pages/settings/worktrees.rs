@@ -2,8 +2,8 @@
 //! `BranchNamingSettings.tsx`, and `WorktreesDirectoryRow`, `WorktreeCleanupSection` from
 //! `StorageSettings.tsx`).
 //!
-//! Every row writes through the settings scope. Cleanup edits the environment's
-//! `storageCleanup`; the web's project-scope Inherit/Off/Custom cleanup mode is not ported.
+//! Every row writes through the settings scope. Cleanup edits the environment's `storageCleanup`,
+//! or at project scope the project's `worktreeCleanup` mode and custom rules.
 
 use gpui_kit::component::input::NumberInput;
 use gpui_kit::component::{Sizable as _, h_flex};
@@ -15,20 +15,27 @@ use serde_json::{Value, json};
 use super::super::fields::resolve_pasted_path;
 use super::super::widgets::{SettingRow, SettingsView, note, settings_section, switch};
 use crate::app::Workspace;
+use crate::settings::scope::{self, Source};
 use crate::theme::tokens;
 
 const SUBMODULES: &[(&str, &str)] = &[("recursive", "Recursive"), ("top-level", "Top level only"), ("none", "Skip")];
 const NAMING: &[(&str, &str)] =
     &[("static", "Static prefix"), ("semantic", "Semantic prefix"), ("custom", "Custom instructions")];
+const CLEANUP_MODES: &[(&str, &str)] = &[("inherit", "Inherit"), ("off", "Off"), ("custom", "Custom")];
 const KEEP_WHEN: &[(&str, &str)] = &[
     ("any-local-files", "Any local files"),
     ("uncommitted-changes", "Uncommitted changes"),
     ("tracked-changes", "Edited tracked files"),
 ];
 
-/// A `storageCleanup` field's patch; the server merges it into the stored object.
-fn cleanup_patch(field: &str, value: Value) -> Value {
-    json!({ "storageCleanup": { field: value } })
+/// One worktree rule's patch (`updateWorktree`): the environment's `storageCleanup`, which the server
+/// merges into the stored object, or at project scope the project's custom rules.
+fn cleanup_patch(project_scope: bool, field: &str, value: Value) -> Value {
+    if project_scope {
+        json!({ "worktreeCleanup": { "mode": "custom", "rules": { field: value } } })
+    } else {
+        json!({ "storageCleanup": { field: value } })
+    }
 }
 
 impl Workspace {
@@ -124,10 +131,15 @@ impl Workspace {
         self.settings_page("worktrees", &view, sections, cx)
     }
 
-    /// `WorktreeCleanupSection` at environment scope.
+    /// `WorktreeCleanupSection`: the environment's rules, or at project scope its cleanup mode and,
+    /// when custom, the project's rules.
     fn cleanup_rows(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let info = &self.server_info;
+        let project_scope = view.scope.project_id().is_some();
+        if project_scope && !info.capability("projectWorktreeCleanup") {
+            return vec![note("Update the selected machines to configure project worktree cleanup.", &t)];
+        }
         if !info.capability("storageCleanup") {
             return vec![note(
                 "Update the selected environments to use storage cleanup, or choose a machine that supports it.",
@@ -135,31 +147,74 @@ impl Workspace {
             )];
         }
         let (settled, run) = (info.capability("settledWorktreeCleanup"), info.capability("storageCleanupRun"));
-        let cleanup = view.value("storageCleanup").clone();
+        let target = view.targets.first();
+        let mode = target
+            .filter(|target| target.source("worktreeCleanup") == Source::Project)
+            .and_then(|target| target.settings.get("worktreeCleanup")["mode"].as_str())
+            .unwrap_or("inherit");
+        let mut cleanup = view.value("storageCleanup").clone();
+        if let (Some(cleanup), Some(target)) = (cleanup.as_object_mut(), target) {
+            cleanup.extend(scope::worktree_cleanup_rules(&target.settings, None));
+        }
+        let mut rows = Vec::new();
+        if project_scope {
+            let options = CLEANUP_MODES.iter().map(|(id, label)| (*id, (*label).into(), *id == mode)).collect();
+            let label = CLEANUP_MODES.iter().find(|(id, _)| *id == mode).map_or("", |(_, label)| label);
+            let select =
+                self.menu_select("worktree-cleanup-mode", options, label, 0., cx, |this, mode: &str, window, cx| {
+                    match mode {
+                        "inherit" => this.clear_setting_overrides(&["worktreeCleanup"], window, cx),
+                        "off" => this.update_settings(json!({ "worktreeCleanup": { "mode": "off" } }), window, cx),
+                        _ => this.update_settings(
+                            json!({ "worktreeCleanup": { "mode": "custom", "rules": {} } }),
+                            window,
+                            cx,
+                        ),
+                    }
+                });
+            rows.push(
+                self.setting_row(
+                    view,
+                    SettingRow::titled("automatic-worktree-cleanup", "Automatic worktree cleanup")
+                        .description(match mode {
+                            "off" => "Keep this project's worktrees until you delete them manually.",
+                            "custom" => "Use these rules for this project.",
+                            _ => "Use each machine's worktree cleanup settings.",
+                        })
+                        .setting("worktreeCleanup")
+                        .control(select),
+                    window,
+                    cx,
+                ),
+            );
+            if mode != "custom" {
+                return rows;
+            }
+        }
         let toggle = |field: &'static str, cx: &mut Context<Self>| {
             let on = cleanup[field] == true;
             switch(&field.into(), on, false, &t)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.update_settings(cleanup_patch(field, json!(!on)), window, cx)
+                    this.update_settings(cleanup_patch(project_scope, field, json!(!on)), window, cx)
                 }))
                 .into_any_element()
         };
         let on_delete = toggle("worktreeOnDelete", cx);
         let on_merge = toggle("worktreeOnMerge", cx);
         let unchanged = toggle("worktreeUnchanged", cx);
-        let after = self.worktree_retention(&cleanup, "worktreeAfterDays", 1, window, cx);
-        let settled_after =
-            settled.then(|| self.worktree_retention(&cleanup, "worktreeSettledAfterDays", 0, window, cx));
+        let after = self.worktree_retention(&cleanup, project_scope, "worktreeAfterDays", 1, window, cx);
+        let settled_after = settled
+            .then(|| self.worktree_retention(&cleanup, project_scope, "worktreeSettledAfterDays", 0, window, cx));
         let keep = cleanup["worktreeKeepWhen"].as_str().unwrap_or("uncommitted-changes").to_owned();
         let keep_select = run.then(|| {
             let options = KEEP_WHEN.iter().map(|(id, label)| (*id, (*label).into(), *id == keep)).collect();
             let label = KEEP_WHEN.iter().find(|(id, _)| *id == keep).map_or("", |(_, label)| label);
-            self.menu_select("keep-when", options, label, 208., cx, |this, value: &str, window, cx| {
-                this.update_settings(cleanup_patch("worktreeKeepWhen", json!(value)), window, cx)
+            self.menu_select("keep-when", options, label, 208., cx, move |this, value: &str, window, cx| {
+                this.update_settings(cleanup_patch(project_scope, "worktreeKeepWhen", json!(value)), window, cx)
             })
         });
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
-        let mut rows = vec![
+        rows.extend([
             row(
                 self,
                 SettingRow::titled("worktree-on-delete", "Delete worktrees with deleted threads")
@@ -178,7 +233,7 @@ impl Workspace {
                     .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
                     .control(after),
             ),
-        ];
+        ]);
         let mut folded = Vec::new();
         if let Some(settled_after) = settled_after {
             folded.push(row(
@@ -214,6 +269,7 @@ impl Workspace {
     fn worktree_retention(
         &mut self,
         cleanup: &Value,
+        project_scope: bool,
         field: &'static str,
         minimum: i64,
         window: &mut Window,
@@ -225,7 +281,7 @@ impl Workspace {
             Some(days) => {
                 let input =
                     self.number_field(field, days, (minimum, 3650, 1), window, cx, move |this, days, window, cx| {
-                        this.update_settings(cleanup_patch(field, json!(days)), window, cx)
+                        this.update_settings(cleanup_patch(project_scope, field, json!(days)), window, cx)
                     });
                 div()
                     .w(px(128.))
@@ -243,7 +299,8 @@ impl Workspace {
             .gap(px(12.))
             .child(value)
             .child(switch(&field.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
-                this.update_settings(cleanup_patch(field, if on { Value::Null } else { json!(8) }), window, cx)
+                let days = if on { Value::Null } else { json!(8) };
+                this.update_settings(cleanup_patch(project_scope, field, days), window, cx)
             })))
             .into_any_element()
     }

@@ -559,7 +559,12 @@ impl Workspace {
     }
 
     /// Resets the selected project's overrides of `keys` (`useClearScopedSettings`).
-    fn clear_setting_overrides(&mut self, keys: &[&str], window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn clear_setting_overrides(
+        &mut self,
+        keys: &[&str],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let view = self.settings_view();
         let plan = scope::plan_clear(&view.scope, &view.environment(), keys);
         self.run_settings_plan(plan, window, cx, |_, _, _| {});

@@ -533,7 +533,8 @@ fn for_destination(previous: &Settings, mut patch: Map<String, Value>) -> Map<St
 }
 
 /// `resolveWorktreeCleanup`.
-fn worktree_cleanup_rules(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
+/// `resolveWorktreeCleanup`: the worktree rules a project's cleanup mode resolves to.
+pub fn worktree_cleanup_rules(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
     const RULES: [&str; 6] = [
         "worktreeKeepWhen",
         "worktreeAfterDays",
@@ -779,6 +780,16 @@ mod tests {
         assert_eq!(clear.server_patch, json!({"projectSettingsOverrides": {"p1": null}}).as_object().cloned());
         assert_eq!(overriding_projects(&s, &["defaultRuntimeMode"]), ["p1"]);
         assert!(overriding_projects(&s, &["enableDeviceSupport"]).is_empty());
+
+        // A project's first custom worktree rule starts from the rules it inherited.
+        let s = settings(json!({"storageCleanup": {"worktreeOnDelete": true, "worktreeAfterDays": 14}}));
+        let e = env(&s);
+        let scope = resolve(&search(Some("p1"), None), &projects, &e);
+        let rule = json!({"worktreeCleanup": {"mode": "custom", "rules": {"worktreeOnMerge": true}}});
+        let plan = plan_patch(&scope, &projects, &e, rule.as_object().unwrap());
+        let rules = &plan.server_patch.unwrap()["projectSettingsOverrides"]["p1"]["worktreeCleanup"]["rules"];
+        assert_eq!((&rules["worktreeOnDelete"], &rules["worktreeAfterDays"]), (&json!(true), &json!(14)));
+        assert_eq!(rules["worktreeOnMerge"], true);
     }
 
     #[test]
