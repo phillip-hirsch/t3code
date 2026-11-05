@@ -40,6 +40,10 @@ const MINI_HEADER: f32 = 28.;
 /// The inline chrome row: `h-7` plus its `mb-3`.
 const CHROME_ROW: f32 = 28. + 12.;
 
+/// How long after the window opens [`PreviewState::warm_up`] starts WebView2.
+#[cfg(windows)]
+const WARM_UP_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What a native WebView tells the panel, in the order it happened.
 pub(super) enum PageEvent {
     Started(String),
@@ -108,6 +112,10 @@ pub(super) struct PreviewState {
     discovery: empty::Discovery,
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<String>,
+    /// A hidden view that keeps WebView2's browser process running, so tabs and file previews
+    /// start without its startup cost.
+    #[cfg(windows)]
+    _warm: Option<WebView>,
     _subscription: Subscription,
 }
 
@@ -143,8 +151,32 @@ impl PreviewState {
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
             unreachable_details: HashSet::new(),
+            #[cfg(windows)]
+            _warm: None,
             _subscription: subscription,
         }
+    }
+
+    /// Starts WebView2 once the window has drawn and loaded, in a hidden view kept for the
+    /// session: the view build blocks the UI thread, and the first one also starts WebView2's
+    /// browser process (several times longer). Dropping the view would end that process.
+    #[cfg(windows)]
+    pub(super) fn warm_up(window: &mut Window, cx: &mut Context<Workspace>) {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(WARM_UP_DELAY).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let builder = wry::WebViewBuilder::new()
+                    .with_visible(false)
+                    // A focused view would take the keyboard focus from the window.
+                    .with_focused(false)
+                    .with_url("about:blank");
+                match build_view(builder, window, cx) {
+                    Ok(view) => this.preview._warm = Some(view),
+                    Err(error) => log::warn!("could not start WebView2 early: {error}"),
+                }
+            });
+        })
+        .detach();
     }
 }
 

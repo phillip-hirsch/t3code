@@ -66,41 +66,11 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Set for the whole process: WebView2 is a child window, and GPUI's DirectComposition swap chain would cover it.
-#[cfg(windows)]
-const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
-
-/// GPUI reads [`DISABLE_DIRECT_COMPOSITION`] only from the environment it starts with, so a launch
-/// without it starts this executable again with it set, hands that process the foreground, and exits.
-#[cfg(windows)]
-fn relaunched_with_composition_disabled() -> bool {
-    if std::env::var_os(DISABLE_DIRECT_COMPOSITION).is_some() {
-        return false;
-    }
-    let child = std::env::current_exe().and_then(|exe| {
-        std::process::Command::new(exe)
-            .args(std::env::args_os().skip(1))
-            .env(DISABLE_DIRECT_COMPOSITION, "true")
-            .spawn()
-    });
-    match child {
-        Ok(child) => {
-            let _ = winsafe::AllowSetForegroundWindow(Some(child.id()));
-            true
-        }
-        Err(error) => {
-            log::warn!("could not restart with {DISABLE_DIRECT_COMPOSITION} set: {error}");
-            false
-        }
-    }
-}
-
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // WebView2 is a child window, and GPUI's DirectComposition swap chain would cover it.
     #[cfg(windows)]
-    if relaunched_with_composition_disabled() {
-        return;
-    }
+    gpui_windows::disable_direct_composition();
     // A second launch hands its command line to the running app and exits.
     let launches = match settings::t3_home() {
         Some(home) => {
