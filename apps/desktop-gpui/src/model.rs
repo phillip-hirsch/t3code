@@ -37,6 +37,46 @@ pub struct ProviderModel {
     pub is_custom: bool,
     #[serde(default)]
     pub is_default: Option<bool>,
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub sub_provider: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilities>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub option_descriptors: Vec<OptionDescriptor>,
+}
+
+/// A model option such as reasoning effort (`ProviderOptionDescriptor`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionDescriptor {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub options: Vec<OptionChoice>,
+    #[serde(default)]
+    pub current_value: Option<Value>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub prompt_injected_values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -78,6 +118,7 @@ impl Provider {
 pub struct ServerInfo {
     pub providers: Vec<Provider>,
     pub default_model_selection: Option<ModelSelection>,
+    pub default_runtime_mode: Option<String>,
     pub thread_stop: bool,
 }
 
@@ -101,6 +142,7 @@ impl ServerInfo {
     fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
+        self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
         Ok(())
     }
 
@@ -124,9 +166,8 @@ impl ServerInfo {
             .collect()
     }
 
-    pub fn model_name(&self, selection: &ModelSelection) -> Option<&str> {
-        let provider = self.provider(&selection.instance_id)?;
-        provider.models.iter().find(|m| m.slug == selection.model)?.name.as_deref()
+    pub fn model(&self, selection: &ModelSelection) -> Option<&ProviderModel> {
+        self.provider(&selection.instance_id)?.models.iter().find(|m| m.slug == selection.model)
     }
 
     pub fn provider(&self, instance_id: &str) -> Option<&Provider> {
@@ -400,6 +441,8 @@ pub struct AppThread {
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -431,7 +474,15 @@ pub struct RuntimeRequest {
 
 impl RuntimeRequest {
     pub fn is_live(&self) -> bool {
-        self.response_capability.get("type").and_then(Value::as_str) == Some("live")
+        self.capability() == Some("live")
+    }
+
+    pub fn capability(&self) -> Option<&str> {
+        self.response_capability.get("type").and_then(Value::as_str)
+    }
+
+    pub fn supports_feedback(&self) -> bool {
+        self.is_live() && self.response_capability.get("supportsFeedback").and_then(Value::as_bool) == Some(true)
     }
 }
 
@@ -521,6 +572,15 @@ impl ThreadProjection {
             |kind| !matches!(kind, "user_input" | "auth_refresh" | "dynamic_tool_call"),
             "approval_request",
         )
+    }
+
+    /// Pending questions joined to their `user_input_request` item; requests
+    /// whose item has not arrived yet are skipped, as `derivePendingThreadRequests` does.
+    pub fn pending_user_inputs(&self) -> Vec<(&RuntimeRequest, &TurnItem)> {
+        self.pending_requests(|kind| kind == "user_input", "user_input_request")
+            .into_iter()
+            .filter_map(|(request, item)| Some((request, item?)))
+            .collect()
     }
 
     fn pending_requests(

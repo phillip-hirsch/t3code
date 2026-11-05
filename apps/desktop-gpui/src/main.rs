@@ -2,6 +2,8 @@ mod app;
 mod assets;
 mod backend;
 mod model;
+mod model_label;
+mod requests;
 mod rpc;
 mod theme;
 mod timeline;

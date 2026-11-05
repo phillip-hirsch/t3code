@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, ServerHandle};
 use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
+use crate::requests::QuestionDraft;
 use crate::rpc::{ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
@@ -64,6 +65,14 @@ pub struct Workspace {
     sending: bool,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
+    /// Runtime mode a new thread launches with; open threads keep theirs on the server.
+    runtime_mode_override: Option<String>,
+    /// Tracked so typing only re-renders when the send button's state flips.
+    composer_empty: bool,
+    /// The question card's drafts, for the first pending question.
+    question: Option<QuestionDraft>,
+    /// The request whose response is in flight.
+    responding: Option<String>,
     error: Option<SharedString>,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
@@ -73,17 +82,18 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 12)
-                .submit_on_enter(true)
-                .placeholder("Ask anything. Enter to send, Shift+Enter for a new line")
+            // The composer paints its own contextual placeholder.
+            let mut state =
+                TextareaState::new(window, cx).auto_grow(2, composer::EDITOR_MAX_ROWS).submit_on_enter(true);
+            state.set_scrollbar_renderer(Some(composer::editor_scrollbar()));
+            state
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let subscriptions = vec![
-            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = event {
-                    this.submit(window, cx);
-                }
+            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                InputEvent::Change => this.on_composer_change(cx),
+                _ => {}
             }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
@@ -100,6 +110,10 @@ impl Workspace {
             composer,
             sending: false,
             model_override: None,
+            runtime_mode_override: None,
+            composer_empty: true,
+            question: None,
+            responding: None,
             error: None,
             _connection_task: Self::connect(cx),
             _stream_tasks: Vec::new(),
@@ -277,6 +291,7 @@ impl Workspace {
                 log::warn!("bad thread event: {error}");
             }
             this.refresh_rows(cx);
+            this.sync_question();
         }));
     }
 
@@ -306,6 +321,7 @@ impl Workspace {
         self.target = Some(Target::Thread(thread_id.clone()));
         self.thread = Some(OpenThread { id: thread_id, state: ThreadState::default(), _subscription: None });
         self.model_override = None;
+        self.question = None;
         self.reset_timeline(cx);
         self.subscribe_thread(cx);
         self.focus_composer(window, cx);
@@ -316,6 +332,8 @@ impl Workspace {
         self.target = Some(Target::Draft { project_id });
         self.thread = None;
         self.model_override = None;
+        self.runtime_mode_override = None;
+        self.question = None;
         self.reset_timeline(cx);
         self.focus_composer(window, cx);
         cx.notify();
@@ -345,8 +363,15 @@ impl Workspace {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.question.is_some() {
+            self.advance_question(window, cx);
+            return;
+        }
         let text = self.composer.read(cx).value().trim().to_owned();
         if text.is_empty() || self.sending {
+            return;
+        }
+        if self.answer_approvals_with(&text, window, cx) {
             return;
         }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
@@ -385,7 +410,7 @@ impl Workspace {
                     "title": draft_title(&text),
                     "generateTitle": true,
                     "modelSelection": model.to_json(),
-                    "runtimeMode": "full-access",
+                    "runtimeMode": self.runtime_mode(),
                     "interactionMode": "default",
                     "workspaceStrategy": {"type": "root"},
                     "initialMessage": {"messageId": new_id(), "text": text, "attachments": []},
@@ -394,7 +419,7 @@ impl Workspace {
             }
         };
         self.sending = true;
-        self.composer.update(cx, |composer, cx| composer.set_value("", window, cx));
+        self.set_composer_text("", window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -409,7 +434,7 @@ impl Workspace {
                         this.error = Some(error.to_string().into());
                         // Give the text back so a failed send loses nothing.
                         if this.composer.read(cx).value().is_empty() {
-                            this.composer.update(cx, |composer, cx| composer.set_value(text, window, cx));
+                            this.set_composer_text(text, window, cx);
                         }
                     }
                 }
@@ -432,16 +457,33 @@ impl Workspace {
         self.dispatch(command, cx);
     }
 
-    fn respond(&mut self, request_id: String, decision: String, cx: &mut Context<Self>) {
-        let Some(thread) = &self.thread else { return };
-        let command = json!({
+    /// Answers a runtime request; `response` holds `decision`, `feedback` or `answers`.
+    fn respond(&mut self, request_id: String, response: Value, cx: &mut Context<Self>) {
+        let (Some(thread), Some(client)) = (&self.thread, self.client()) else { return };
+        let mut command = json!({
             "type": "runtime-request.respond",
             "commandId": new_id(),
             "threadId": thread.id,
             "requestId": request_id,
-            "decision": decision,
         });
-        self.dispatch(command, cx);
+        if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
+            command.extend(fields);
+        }
+        self.responding = Some(request_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = client.request("orchestration.dispatchCommand", command).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.responding.as_ref() == Some(&request_id) {
+                    this.responding = None;
+                }
+                if let Err(error) = result {
+                    this.error = Some(error.to_string().into());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
@@ -496,7 +538,6 @@ impl Render for Workspace {
                     .child(self.render_header(cx))
                     .children(self.render_error(cx))
                     .child(self.render_body(window, cx))
-                    .children(self.render_approvals(cx))
                     .child(self.render_composer(cx)),
             )
     }
