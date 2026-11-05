@@ -224,7 +224,7 @@ pub(super) fn monogram(text: &str, color: &str, size: f32, tokens: &Tokens) -> A
 }
 
 /// `ProjectFavicon` at `size`: the custom icon, else the project's favicon, else its monogram.
-pub(super) fn project_icon(
+pub(in crate::app) fn project_icon(
     icon: Option<&Value>,
     title: &str,
     favicon: Option<Arc<Image>>,

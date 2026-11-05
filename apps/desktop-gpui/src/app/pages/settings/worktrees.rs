@@ -136,7 +136,7 @@ impl Workspace {
     fn cleanup_rows(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let info = &self.server_info;
-        let project_scope = view.scope.project_id().is_some();
+        let project_scope = view.scope.is_project();
         if project_scope && !info.capability("projectWorktreeCleanup") {
             return vec![note("Update the selected machines to configure project worktree cleanup.", &t)];
         }
