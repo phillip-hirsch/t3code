@@ -3,8 +3,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::mpsc::{Sender, channel};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const MAX_ENTRIES_PER_PROJECT: usize = 50;
 const MAX_PROJECTS: usize = 20;
@@ -85,17 +88,31 @@ impl BrowserHistory {
             .unwrap_or_default()
     }
 
-    /// Writes the history off the UI thread; a failed write only loses recent visits.
+    /// Writes the history off the UI thread, atomically and in order: one writer thread
+    /// saves the newest snapshot. A failed write only loses recent visits.
     pub fn save_in_background(&self) {
-        let (Some(path), Ok(bytes)) = (Self::path(), serde_json::to_vec(self)) else { return };
-        std::thread::spawn(move || {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(error) = std::fs::write(&path, bytes) {
-                log::warn!("browser history not saved: {error}");
-            }
+        static WRITER: OnceLock<Option<Sender<(PathBuf, Value)>>> = OnceLock::new();
+        let (Some(path), Ok(document)) = (Self::path(), serde_json::to_value(self)) else { return };
+        let writer = WRITER.get_or_init(|| {
+            let (sender, receiver) = channel::<(PathBuf, Value)>();
+            let spawned = std::thread::Builder::new().name("browser-history".into()).spawn(move || {
+                while let Ok(mut latest) = receiver.recv() {
+                    while let Ok(newer) = receiver.try_recv() {
+                        latest = newer;
+                    }
+                    if let Err(error) = crate::settings::write_atomically(&latest.0, &latest.1) {
+                        log::warn!("browser history not saved: {error}");
+                    }
+                }
+            });
+            spawned
+                .inspect_err(|error| log::warn!("browser history writer did not start: {error}"))
+                .ok()
+                .map(|_| sender)
         });
+        if let Some(sender) = writer {
+            let _ = sender.send((path, document));
+        }
     }
 
     pub fn recent(&self, project_key: &str, limit: usize) -> &[Entry] {

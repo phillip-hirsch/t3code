@@ -138,21 +138,26 @@ fn set_badge(window: &Window, count: usize) {
 
 /// Plays an alert's sound off the UI thread; while one plays, the same sound again is dropped.
 fn play_sound(kind: Kind) {
+    // Two independent timestamps, so a poisoned lock holds nothing half-updated.
     static PLAYING_UNTIL: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
+    let playing_until = || PLAYING_UNTIL.lock().unwrap_or_else(PoisonError::into_inner);
     let (slot, bytes): (usize, &'static [u8]) = match kind {
         Kind::Completion => (0, include_bytes!("../../assets/sounds/notification-completion.mp3")),
         Kind::Input => (1, include_bytes!("../../assets/sounds/notification-input.mp3")),
     };
+    let now = Instant::now();
+    {
+        let mut playing_until = playing_until();
+        if playing_until[slot].is_some_and(|until| now < until) {
+            return;
+        }
+        // Held for a second until the decoded length is known.
+        playing_until[slot] = Some(now + Duration::from_secs(1));
+    }
     std::thread::spawn(move || {
         let Ok(source) = rodio::Decoder::try_from(Cursor::new(bytes)) else { return };
-        let length = source.total_duration().unwrap_or(Duration::from_secs(1));
-        {
-            let mut playing_until = PLAYING_UNTIL.lock().unwrap_or_else(PoisonError::into_inner);
-            let now = Instant::now();
-            if playing_until[slot].is_some_and(|until| now < until) {
-                return;
-            }
-            playing_until[slot] = Some(now + length);
+        if let Some(length) = source.total_duration() {
+            playing_until()[slot] = Some(now + length);
         }
         match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(mut sink) => {

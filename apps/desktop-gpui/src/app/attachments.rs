@@ -4,8 +4,12 @@
 //! POST of the raw bytes to the signed URL) and sent by their server ids.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use bytes::Bytes;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::input::InlineToken;
@@ -27,6 +31,10 @@ use crate::theme::Tokens;
 pub(super) const MAX_ATTACHMENTS: usize = 100;
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+/// How long one upload POST may take before the attachment shows as failed.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+static UPLOADS: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 pub(super) use crate::composer_text::ATTACHMENT_ONLY_PROMPT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +64,7 @@ pub(super) struct Attachment {
     kind: Kind,
     name: String,
     mime: String,
-    bytes: Arc<Vec<u8>>,
+    bytes: Bytes,
     image: Option<Arc<Image>>,
     upload: Upload,
     /// A SnapShot's source, sent with the image.
@@ -75,7 +83,7 @@ impl Attachment {
         let image = image_format(&mime)
             .filter(|_| kind == Kind::Image)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        Self { local_id, kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading, source: None }
+        Self { local_id, kind, name, mime, bytes: Bytes::from(bytes), image, upload: Upload::Uploading, source: None }
     }
 
     pub(super) fn local_id(&self) -> &str {
@@ -94,7 +102,7 @@ impl Attachment {
         &self.mime
     }
 
-    pub(super) fn bytes(&self) -> &Arc<Vec<u8>> {
+    pub(super) fn bytes(&self) -> &Bytes {
         &self.bytes
     }
 
@@ -113,6 +121,29 @@ impl Attachment {
     fn context_id(&self) -> String {
         format!("{}_{}", self.kind.as_str(), self.local_id)
     }
+
+    /// The id of its inline chip, as [`composer_text::Chip::id`] spells it.
+    fn chip_id(&self) -> String {
+        composer_text::Chip::Context { kind: self.kind.as_str().into(), id: self.context_id(), label: String::new() }
+            .id()
+    }
+
+    /// The message's attachment entry for the upload `id`, plus its `context.records` entry
+    /// when `text` links its chip.
+    fn wire(&self, id: &str, text: &str) -> (Value, Option<Value>) {
+        let (kind, context_id, size) = (self.kind.as_str(), self.context_id(), self.bytes.len());
+        let mut sent = json!({"type": kind, "id": id, "name": self.name, "mimeType": self.mime, "sizeBytes": size});
+        if let Some(source) = &self.source {
+            sent["source"] = source.value.clone();
+        }
+        let record = text.contains(&format!("/{kind}/{context_id})")).then(|| {
+            json!({
+                "version": 1, "kind": kind, "contextId": context_id, "label": self.name, "attachmentId": id,
+                "name": self.name, "mimeType": self.mime, "sizeBytes": size,
+            })
+        });
+        (sent, record)
+    }
 }
 
 /// An attachment in the composer on screen or in the draft it was stashed with.
@@ -126,6 +157,28 @@ fn find_attachment<'a>(
         ComposerDraft::Question(_) => None,
     });
     std::iter::once(active).chain(stashed).flatten().find(|a| a.local_id == local_id)
+}
+
+/// A dropped file's bytes, or its size when it is over the limit and was not read.
+#[derive(Debug, PartialEq)]
+enum Read {
+    Bytes(Vec<u8>),
+    TooLarge(u64),
+}
+
+/// Reads at most `limit` bytes, so a huge file is refused without loading it.
+fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Read> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > limit {
+        return Ok(Read::TooLarge(size));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    match u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+        read if read > limit => Ok(Read::TooLarge(read)),
+        _ => Ok(Read::Bytes(bytes)),
+    }
 }
 
 /// `classifyComposerAttachmentFile` by extension: GIF, JPEG, PNG and WebP are
@@ -282,7 +335,7 @@ impl Workspace {
         let state = self.composer.read(cx);
         let selected = state.selected_range();
         let value = state.value();
-        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected.clone()]);
+        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected]);
         let would_exceed = kept + composer_text::js_length(text) > composer_text::MAX_INPUT_CHARS;
         if !composer_text::paste_folds(text, would_exceed) {
             return false;
@@ -328,26 +381,54 @@ impl Workspace {
                 .map(|path| {
                     let name =
                         path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-                    let bytes = std::fs::read(&path).ok();
-                    (name, bytes)
+                    let read = read_at_most(&path, MAX_FILE_BYTES);
+                    (name, read)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let files = read.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                for (name, bytes) in files {
-                    let classified = classify(&name);
-                    match (bytes.filter(|b| !b.is_empty()), classified) {
-                        (None, _) => this.error = Some(format!("'{name}' is empty or could not be read.").into()),
-                        (_, Err(error)) => this.error = Some(error.into()),
-                        (Some(bytes), Ok((kind, mime))) => this.add_attachment(name, kind, mime, bytes, window, cx),
+                for (name, read) in files {
+                    let (kind, mime) = match classify(&name) {
+                        Ok(classified) => classified,
+                        Err(error) => {
+                            this.error = Some(error.into());
+                            continue;
+                        }
+                    };
+                    match read {
+                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => {
+                            this.add_attachment(name, kind, mime, bytes, window, cx);
+                        }
+                        Ok(Read::TooLarge(size)) => {
+                            this.error = this.attachment_error(&name, kind, size).map(Into::into)
+                        }
+                        Ok(Read::Bytes(_)) => {
+                            this.error = Some(format!("'{name}' is empty or could not be read.").into())
+                        }
+                        Err(error) => {
+                            log::warn!("could not read {name:?}: {error}");
+                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
+                        }
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Why an attachment of `size` bytes can't join the composer, or `None` when it can.
+    fn attachment_error(&self, name: &str, kind: Kind, size: u64) -> Option<String> {
+        let file_limit = self.server_info().file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
+        if kind == Kind::Image && size > MAX_IMAGE_BYTES {
+            Some(format!("'{name}' is too large to attach, even after compression."))
+        } else if size > file_limit {
+            Some(format!("'{name}' exceeds the {} MB attachment limit.", file_limit / 1024 / 1024))
+        } else {
+            None
+        }
     }
 
     fn add_attachment(
@@ -359,16 +440,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let size = bytes.len() as u64;
-        let file_limit = self.server_info().file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
         let error = if self.attachments.len() >= MAX_ATTACHMENTS {
             Some(format!("You can attach up to {MAX_ATTACHMENTS} files per message."))
-        } else if kind == Kind::Image && size > MAX_IMAGE_BYTES {
-            Some(format!("'{name}' is too large to attach, even after compression."))
-        } else if size > file_limit {
-            Some(format!("'{name}' exceeds the {} MB attachment limit.", file_limit / 1024 / 1024))
         } else {
-            None
+            self.attachment_error(&name, kind, bytes.len() as u64)
         };
         if let Some(error) = error {
             self.error = Some(error.into());
@@ -383,7 +458,7 @@ impl Workspace {
             kind,
             name,
             mime: mime.to_owned(),
-            bytes: Arc::new(bytes),
+            bytes: Bytes::from(bytes),
             image,
             upload: Upload::Uploading,
             source: None,
@@ -434,7 +509,7 @@ impl Workspace {
     }
 
     /// A SnapShot capture into `target`'s set-aside draft, which the user left while it was
-    /// taken; `false` when that draft has no room for it.
+    /// taken; `false` with the reason when that draft can't take it.
     pub(super) fn stash_snap_shot(
         &mut self,
         target: Target,
@@ -443,19 +518,23 @@ impl Workspace {
         bytes: Vec<u8>,
         source: SnapShotSource,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Result<(), String> {
+        if let Some(error) = self.attachment_error(&name, Kind::Image, bytes.len() as u64) {
+            return Err(error);
+        }
         let draft =
             self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
-        let ComposerDraft::Prompt(_, kept) = draft else { return false };
+        let full = || "Remove an attachment, then try this capture again.".to_owned();
+        let ComposerDraft::Prompt(_, kept) = draft else { return Err(full()) };
         if kept.len() >= MAX_ATTACHMENTS {
-            return false;
+            return Err(full());
         }
         let mut attachment = Attachment::restored(Kind::Image.as_str(), name, mime.to_owned(), bytes);
         attachment.source = Some(source);
         let local_id = attachment.local_id.clone();
         kept.push(attachment);
         self.upload(local_id, cx);
-        true
+        Ok(())
     }
 
     /// Mints a signed upload URL, then POSTs the bytes to it.
@@ -477,18 +556,19 @@ impl Workspace {
         let (bytes, mime) = (attachment.bytes.clone(), attachment.mime.clone());
         cx.spawn(async move |this, cx| {
             let result = async {
-                let minted = client
-                    .request("attachments.createUploadUrl", input)
-                    .await
-                    .map_err(|_| "Upload could not start".to_owned())?;
+                let minted = client.request("attachments.createUploadUrl", input).await.map_err(|error| {
+                    log::warn!("attachments.createUploadUrl failed: {error}");
+                    "Upload could not start".to_owned()
+                })?;
                 let id = minted["attachmentId"].as_str().ok_or("Upload could not start")?.to_owned();
                 let url = format!("{http_base}{}", minted["relativeUrl"].as_str().ok_or("Upload could not start")?);
                 let sent = crate::runtime()
                     .spawn(async move {
-                        reqwest::Client::new()
+                        UPLOADS
                             .post(url)
                             .header(reqwest::header::CONTENT_TYPE, mime)
-                            .body(bytes.as_ref().clone())
+                            .body(bytes)
+                            .timeout(UPLOAD_TIMEOUT)
                             .send()
                             .await
                             .map(|response| response.status())
@@ -497,7 +577,14 @@ impl Workspace {
                 match sent {
                     Ok(Ok(status)) if status.is_success() => Ok(id),
                     Ok(Ok(status)) => Err(format!("Upload rejected ({})", status.as_u16())),
-                    _ => Err("Upload failed".to_owned()),
+                    Ok(Err(error)) => {
+                        log::warn!("attachment upload failed: {error}");
+                        Err("Upload failed".to_owned())
+                    }
+                    Err(error) => {
+                        log::warn!("attachment upload task failed: {error}");
+                        Err("Upload failed".to_owned())
+                    }
                 }
             }
             .await;
@@ -525,12 +612,7 @@ impl Workspace {
             let input = json!({"attachmentId": id});
             cx.spawn(async move |_, _| client.request("attachments.delete", input).await).detach();
         }
-        let chip_id = composer_text::Chip::Context {
-            kind: attachment.kind.as_str().into(),
-            id: attachment.context_id(),
-            label: String::new(),
-        }
-        .id();
+        let chip_id = attachment.chip_id();
         self.composer.update(cx, |state, cx| {
             if let Some(span) = state.tokens().iter().find(|s| s.token().id().as_ref() == chip_id).map(|s| s.range()) {
                 state.set_selected_range(span, cx);
@@ -549,7 +631,7 @@ impl Workspace {
             .attachments
             .iter()
             .filter(|a| {
-                let id = format!("context:{}/{}", a.kind.as_str(), a.context_id());
+                let id = a.chip_id();
                 previous_chips.contains(&id) && !live.contains(&id)
             })
             .map(|a| a.local_id.clone())
@@ -573,22 +655,9 @@ impl Workspace {
         let mut records = self.terminal_context_records(text);
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
-            let size = attachment.bytes.len();
-            let mut sent = json!({
-                "type": attachment.kind.as_str(), "id": id, "name": attachment.name,
-                "mimeType": attachment.mime, "sizeBytes": size,
-            });
-            if let Some(source) = &attachment.source {
-                sent["source"] = source.value.clone();
-            }
+            let (sent, record) = attachment.wire(id, text);
             attachments.push(sent);
-            if text.contains(&format!("/{}/{})", attachment.kind.as_str(), attachment.context_id())) {
-                records.push(json!({
-                    "version": 1, "kind": attachment.kind.as_str(), "contextId": attachment.context_id(),
-                    "label": attachment.name, "attachmentId": id, "name": attachment.name,
-                    "mimeType": attachment.mime, "sizeBytes": size,
-                }));
-            }
+            records.extend(record);
         }
         let context = (!records.is_empty()).then(|| json!({"version": 1, "records": records}));
         Ok((attachments, context))
@@ -600,7 +669,7 @@ impl Workspace {
             return None;
         }
         let chips: Vec<String> = self.composer.read(cx).tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let inline = |a: &Attachment| chips.contains(&format!("context:{}/{}", a.kind.as_str(), a.context_id()));
+        let inline = |a: &Attachment| chips.contains(&a.chip_id());
         let images: Vec<&Attachment> =
             self.attachments.iter().filter(|a| a.kind == Kind::Image && !inline(a)).collect();
         let files: Vec<&Attachment> = self.attachments.iter().filter(|a| a.kind == Kind::File && !inline(a)).collect();
@@ -822,13 +891,43 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_is_sent_with_a_context_record_only_when_the_prompt_links_its_chip() {
+        let file = Attachment::restored_as("l1".into(), "file", "notes.txt".into(), "text/plain".into(), vec![1, 2, 3]);
+        let link = composer_text::context_link("file", &file.context_id(), "notes.txt");
+        let (sent, record) = file.wire("up1", &format!("see {link}"));
+        assert_eq!(
+            sent,
+            json!({"type": "file", "id": "up1", "name": "notes.txt", "mimeType": "text/plain", "sizeBytes": 3})
+        );
+        assert_eq!(
+            record,
+            Some(json!({
+                "version": 1, "kind": "file", "contextId": "file_l1", "label": "notes.txt", "attachmentId": "up1",
+                "name": "notes.txt", "mimeType": "text/plain", "sizeBytes": 3,
+            }))
+        );
+        assert_eq!(file.wire("up1", "no chip here").1, None);
+        assert_eq!(file.chip_id(), "context:file/file_l1");
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_refused_without_reading_it() {
+        let path = std::env::temp_dir().join(format!("t3-gpui-attachment-{}.bin", std::process::id()));
+        std::fs::write(&path, [7u8; 11]).unwrap();
+        assert_eq!(read_at_most(&path, 10).unwrap(), Read::TooLarge(11));
+        assert_eq!(read_at_most(&path, 11).unwrap(), Read::Bytes(vec![7; 11]));
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_at_most(&path, 11).is_err(), "a missing file is an error, not an empty file");
+    }
+
+    #[test]
     fn an_upload_finds_its_attachment_in_the_draft_it_was_stashed_with() {
         let attachment = |id: &str| Attachment {
             local_id: id.into(),
             kind: Kind::File,
             name: "a.txt".into(),
             mime: "text/plain".into(),
-            bytes: Arc::default(),
+            bytes: Bytes::new(),
             image: None,
             upload: Upload::Uploading,
             source: None,

@@ -1,9 +1,11 @@
 //! Starts the local T3 server the way the Electron desktop does, then gets a
 //! bearer token for it. Mirrors `apps/desktop/src/backend/DesktopBackendManager.ts`.
 
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -124,12 +126,7 @@ impl LaunchConfig {
             Some(path) => (PathBuf::from(path), user_home()?),
             None => (default_server_entry()?, repo_root()),
         };
-        // Separate from the Electron app's `~/.t3` until this client reaches parity,
-        // so both can run at once without fighting over the state directory.
-        let home = match std::env::var_os("T3CODE_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => user_home()?.join(".t3-gpui"),
-        };
+        let home = crate::settings::t3_home().context("no home directory; set T3CODE_HOME")?;
         Ok(Self { node, server_entry, home, cwd })
     }
 }
@@ -260,20 +257,26 @@ struct EnvironmentDescriptor {
     orchestration_protocol_version: Option<u32>,
 }
 
+/// The one client for T3 servers' HTTP routes (descriptor, token exchange, pairing); callers
+/// set each request's timeout. Use it on the tokio runtime.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+    &CLIENT
+}
+
 async fn wait_ready(http_base: &str, timeout: Option<Duration>) -> Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(1)).build()?;
     let url = format!("{http_base}/.well-known/t3/environment");
     let deadline = tokio::time::Instant::now() + timeout.unwrap_or(Duration::from_secs(15));
     loop {
-        if let Ok(response) = client.get(&url).send().await {
-            if response.status().is_success() {
-                let descriptor: EnvironmentDescriptor = response.json().await.context("environment descriptor")?;
-                let version = descriptor.orchestration_protocol_version.unwrap_or(1);
-                if version != 2 {
-                    bail!("server speaks orchestration protocol {version}; this client needs 2");
-                }
-                return Ok(());
+        if let Ok(response) = http_client().get(&url).timeout(Duration::from_secs(1)).send().await
+            && response.status().is_success()
+        {
+            let descriptor: EnvironmentDescriptor = response.json().await.context("environment descriptor")?;
+            let version = descriptor.orchestration_protocol_version.unwrap_or(1);
+            if version != 2 {
+                bail!("server speaks orchestration protocol {version}; this client needs 2");
             }
+            return Ok(());
         }
         if tokio::time::Instant::now() > deadline {
             bail!("server at {http_base} did not become ready");
@@ -298,8 +301,11 @@ fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 /// A desktop-bootstrap exchange revokes the previous desktop session; see [`Endpoint::renew`].
@@ -320,7 +326,7 @@ async fn exchange_token(http_base: &str, bootstrap_token: &str) -> Result<String
         ("client_device_type", "desktop"),
         ("client_os", os),
     ];
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(format!("{http_base}/oauth/token"))
         .form(&form)
         .send()

@@ -158,7 +158,7 @@ impl Workspace {
 
     fn open_app_link(&mut self, link: AppLink, window: &mut Window, cx: &mut Context<Self>) {
         match link {
-            // Saved remote environments are not part of this single-environment client.
+            // Not wired to saved environments yet; Settings › Connections pairs by host and code.
             AppLink::Pair { .. } => toast_error(window, cx, "Could not add backend", "Failed to add backend."),
             AppLink::Thread { environment_id, thread_id, query } => {
                 let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);

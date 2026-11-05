@@ -9,6 +9,7 @@ use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::composer::ComposerDraft;
 use super::composer_plan;
 use super::{Target, Workspace, draft_title, new_id};
+use crate::model::ModelSelection;
 use crate::new_thread::{self, DraftWorkspace};
 
 /// What a send shortcut asks for (`composer-logic.ts`).
@@ -48,6 +49,50 @@ fn dispatch_fields(running: bool, follow_up: &str, intent: Intent) -> (Value, Op
         (false, _) => (json!({"type": "start_immediately"}), Some("auto")),
         (true, true) => (json!({"type": "queue_after_active"}), None),
         (true, false) => (json!({"type": "start_immediately"}), Some("steer")),
+    }
+}
+
+/// A started thread's `message.dispatch` (`startThreadTurn`).
+struct ThreadMessage<'a> {
+    thread_id: &'a str,
+    text: String,
+    attachments: Vec<Value>,
+    context: Option<Value>,
+    /// [`dispatch_fields`].
+    dispatch: (Value, Option<&'static str>),
+    /// Omitted, the server keeps the thread's own model.
+    model: Option<&'a ModelSelection>,
+    /// The plan a build-mode follow-up implements.
+    source_plan: Option<&'a str>,
+}
+
+impl ThreadMessage<'_> {
+    fn command(self) -> Value {
+        let (dispatch_mode, delivery) = self.dispatch;
+        let mut command = json!({
+            "type": "message.dispatch",
+            "commandId": new_id(),
+            "createdBy": "user",
+            "creationSource": "web",
+            "threadId": self.thread_id,
+            "messageId": new_id(),
+            "text": self.text,
+            "attachments": self.attachments,
+            "dispatchMode": dispatch_mode,
+        });
+        if let Some(delivery) = delivery {
+            command["deliveryIntent"] = delivery.into();
+        }
+        if let Some(model) = self.model {
+            command["modelSelection"] = model.to_json();
+        }
+        if let Some(context) = self.context {
+            command["context"] = context;
+        }
+        if let Some(plan_id) = self.source_plan {
+            command["sourcePlanRef"] = json!({"threadId": self.thread_id, "planId": plan_id});
+        }
+        command
     }
 }
 
@@ -131,31 +176,19 @@ impl Workspace {
                 sent_mode = Some(interaction_mode);
                 let running =
                     self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
-                let (dispatch_mode, delivery) = dispatch_fields(running, self.follow_up_behavior(), intent);
-                let mut command = json!({
-                    "type": "message.dispatch",
-                    "commandId": new_id(),
-                    "createdBy": "user",
-                    "creationSource": "web",
-                    "threadId": thread_id,
-                    "messageId": new_id(),
-                    "text": message_text,
-                    "attachments": attachments,
-                    "dispatchMode": dispatch_mode,
-                });
-                if let Some(delivery) = delivery {
-                    command["deliveryIntent"] = delivery.into();
+                let command = ThreadMessage {
+                    thread_id: &thread_id,
+                    text: message_text,
+                    attachments,
+                    context,
+                    dispatch: dispatch_fields(running, self.follow_up_behavior(), intent),
+                    model: self.model_override.as_ref(),
+                    source_plan: follow_up
+                        .as_ref()
+                        .filter(|_| interaction_mode == "default")
+                        .map(|(plan_id, _)| plan_id.as_str()),
                 }
-                // Omitted, the server keeps the thread's own model.
-                if let Some(model) = &self.model_override {
-                    command["modelSelection"] = model.to_json();
-                }
-                if let Some(context) = context.clone() {
-                    command["context"] = context;
-                }
-                if let Some((plan_id, _)) = follow_up.as_ref().filter(|_| interaction_mode == "default") {
-                    command["sourcePlanRef"] = json!({"threadId": thread_id, "planId": plan_id});
-                }
+                .command();
                 ("orchestration.dispatchCommand", command, None, None)
             }
             Target::Draft { project_id, .. } => {
@@ -184,7 +217,7 @@ impl Workspace {
                 });
                 let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
                 let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
-                if let Some(context) = context.clone() {
+                if let Some(context) = context {
                     initial["context"] = context;
                 }
                 let input = json!({
@@ -378,6 +411,42 @@ mod tests {
         assert_eq!(dispatch_fields(true, "steer", Intent::AndNewThread), steer);
         assert_eq!(dispatch_fields(true, "queue", Intent::Foreground), queue);
         assert_eq!(dispatch_fields(true, "queue", Intent::Alternate), steer);
+    }
+
+    #[test]
+    fn a_thread_message_carries_what_the_server_reads() {
+        let without_ids = |mut command: Value| {
+            let object = command.as_object_mut().unwrap();
+            assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
+            assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
+            command
+        };
+        fn message<'a>(model: Option<&'a ModelSelection>, source_plan: Option<&'a str>) -> ThreadMessage<'a> {
+            ThreadMessage {
+                thread_id: "t1",
+                text: "hi".into(),
+                attachments: vec![json!({"id": "a1"})],
+                context: Some(json!({"version": 1, "records": []})),
+                dispatch: dispatch_fields(true, "steer", Intent::Foreground),
+                model,
+                source_plan,
+            }
+        }
+        assert_eq!(
+            without_ids(message(None, None).command()),
+            json!({
+                "type": "message.dispatch", "createdBy": "user", "creationSource": "web", "threadId": "t1",
+                "text": "hi", "attachments": [{"id": "a1"}], "dispatchMode": {"type": "start_immediately"},
+                "deliveryIntent": "steer", "context": {"version": 1, "records": []},
+            })
+        );
+        let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
+        let command = message(Some(&model), Some("p1")).command();
+        assert_eq!(command["modelSelection"], model.to_json());
+        assert_eq!(command["sourcePlanRef"], json!({"threadId": "t1", "planId": "p1"}));
+        let queued =
+            ThreadMessage { dispatch: dispatch_fields(true, "queue", Intent::Foreground), ..message(None, None) };
+        assert!(queued.command().get("deliveryIntent").is_none(), "a queued message has no delivery intent");
     }
 
     #[test]

@@ -94,7 +94,7 @@ impl Workspace {
 
     /// Whether the Build/Plan toggle shows, and the interaction mode the next send uses.
     pub(super) fn interaction_mode(&self) -> (bool, &'static str) {
-        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id));
+        let provider = self.composer_provider();
         resolve_interaction_mode(
             self.client_settings.values.bool("planModeEnabled"),
             provider,
@@ -138,6 +138,15 @@ impl Workspace {
     /// `shouldShowPlanFollowUpPrompt` and `findLatestProposedPlan`: the plan the
     /// next send follows up on, as (plan id, markdown).
     pub(super) fn plan_follow_up_target(&self) -> Option<(String, String)> {
+        self.active_plan_follow_up().map(|(id, markdown)| (id.to_owned(), markdown.to_owned()))
+    }
+
+    /// Whether the next send follows up on a plan; for render, without copying the plan.
+    pub(super) fn has_plan_follow_up(&self) -> bool {
+        self.active_plan_follow_up().is_some()
+    }
+
+    fn active_plan_follow_up(&self) -> Option<(&str, &str)> {
         let projection = self.open_projection()?;
         let (enabled, mode) = self.interaction_mode();
         if !enabled
@@ -149,7 +158,7 @@ impl Workspace {
             return None;
         }
         let (plan, markdown) = projection.latest_proposed_plan()?;
-        (plan.status == "active").then(|| (plan.id.clone(), markdown.to_owned()))
+        (plan.status == "active").then_some((plan.id.as_str(), markdown))
     }
 
     /// `useImplementPlanInNewThread`: a fresh default-mode thread that implements

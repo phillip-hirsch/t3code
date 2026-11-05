@@ -203,15 +203,6 @@ pub fn resolve_project_settings(environment_id: &str, settings: &Settings, proje
     }
 }
 
-/// [`resolve_project_settings`]'s settings alone.
-fn effective_settings(settings: &Settings, project: Option<&Project>) -> Settings {
-    let mut effective = settings.clone();
-    for (key, value) in project_overrides(settings, project) {
-        effective.set(key, value);
-    }
-    effective
-}
-
 /// One key of `resolve_project_settings`, without copying the whole document.
 pub fn resolve_project_setting(settings: &Settings, project: Option<&Project>, key: &str) -> Value {
     project_overrides(settings, project).remove(key).unwrap_or_else(|| settings.get(key).clone())
@@ -633,7 +624,6 @@ fn override_patch(settings: &Settings, members: &[&Project], patch: &Map<String,
 /// partial object patch is completed from the project's effective value.
 fn override_entry(settings: &Settings, project: &Project, patch: &Map<String, Value>) -> Value {
     let contract = contract();
-    let effective = effective_settings(settings, Some(project));
     let mut next = settings
         .get("projectSettingsOverrides")
         .get(&project.id)
@@ -641,7 +631,7 @@ fn override_entry(settings: &Settings, project: &Project, patch: &Map<String, Va
         .cloned()
         .unwrap_or_default();
     for (key, value) in patch {
-        let base = effective.get(key);
+        let base = resolve_project_setting(settings, Some(project), key);
         if key == "worktreeCleanup" && value.get("mode").and_then(Value::as_str) == Some("custom") {
             let mut rules = worktree_cleanup_rules(settings, Some(project));
             merge_into(&mut rules, value.get("rules"));
@@ -718,7 +708,7 @@ pub fn worktree_cleanup_rules(settings: &Settings, project: Option<&Project>) ->
         "worktreeOnDelete",
         "worktreeUnchanged",
     ];
-    let policy = effective_settings(settings, project).get("worktreeCleanup").clone();
+    let policy = resolve_project_setting(settings, project, "worktreeCleanup");
     let storage = settings.get("storageCleanup");
     match policy.get("mode").and_then(Value::as_str) {
         Some("custom") => policy.get("rules").and_then(Value::as_object).cloned().unwrap_or_default(),

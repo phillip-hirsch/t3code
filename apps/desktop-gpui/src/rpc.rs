@@ -3,6 +3,7 @@
 //! The socket runs on the shared tokio runtime. Callers get runtime-agnostic
 //! futures and channels, so GPUI tasks can await them directly.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,8 @@ const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Server prefixes every split frame part except the last with U+001E.
 const FRAME_PART_PREFIX: char = '\u{1e}';
+/// The most a split frame may join to, like the socket's per-message cap.
+const MAX_JOINED_FRAME: usize = 256 << 20;
 
 #[derive(Debug, Clone)]
 pub enum RpcError {
@@ -192,10 +195,10 @@ async fn open_socket(options: &ConnectOptions) -> Result<Socket> {
         options.ws_url
     );
     let mut request = url.as_str().into_client_request().context("invalid websocket url")?;
-    request.headers_mut().insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Bearer {}", options.bearer_token)).context("invalid token")?,
-    );
+    let mut authorization =
+        HeaderValue::from_str(&format!("Bearer {}", options.bearer_token)).context("invalid token")?;
+    authorization.set_sensitive(true);
+    request.headers_mut().insert("Authorization", authorization);
     let config = WebSocketConfig::default().max_message_size(Some(256 << 20)).max_frame_size(Some(256 << 20));
     let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
     let (socket, _) = tokio::time::timeout(OPEN_TIMEOUT, connect)
@@ -234,8 +237,8 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
             }
             frame = source.next() => {
                 let text = match frame {
-                    Some(Ok(Message::Text(text))) => text.to_string(),
-                    Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Binary(bytes))) => Utf8Bytes::from(String::from_utf8_lossy(&bytes).into_owned()),
                     Some(Ok(Message::Close(frame))) => {
                         break frame.map(|f| format!("closed by server: {} {}", f.code, f.reason)).unwrap_or_else(|| "closed by server".into())
                     }
@@ -244,7 +247,7 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
                     None => break "socket ended".to_owned(),
                 };
                 last_inbound = Instant::now();
-                let Some(text) = join_frame_part(&mut frame_parts, text) else { continue };
+                let Some(text) = join_frame_part(&mut frame_parts, text.as_str(), MAX_JOINED_FRAME) else { continue };
                 let messages = match serde_json::from_str::<Value>(&text) {
                     Ok(Value::Array(items)) => items,
                     Ok(item) => vec![item],
@@ -282,23 +285,29 @@ fn close(pending: &mut HashMap<u64, Pending>, reason: String) -> String {
     reason
 }
 
-/// Returns the joined frame once its last part arrives.
-fn join_frame_part(buffer: &mut String, text: String) -> Option<String> {
-    match text.strip_prefix(FRAME_PART_PREFIX) {
-        Some(part) => {
-            buffer.push_str(part);
-            None
-        }
-        None if buffer.is_empty() => Some(text),
-        None => {
-            buffer.push_str(&text);
-            Some(std::mem::take(buffer))
-        }
+/// Returns the joined frame once its last part arrives. A frame that would join past
+/// `limit` bytes is dropped, so a misbehaving server can't grow the buffer without bound.
+fn join_frame_part<'a>(buffer: &mut String, text: &'a str, limit: usize) -> Option<Cow<'a, str>> {
+    let (part, last) = match text.strip_prefix(FRAME_PART_PREFIX) {
+        Some(part) => (part, false),
+        None if buffer.is_empty() => return Some(Cow::Borrowed(text)),
+        None => (text, true),
+    };
+    if buffer.len().saturating_add(part.len()) > limit {
+        log::warn!("dropped an rpc frame over {limit} bytes");
+        *buffer = String::new();
+        return None;
     }
+    buffer.push_str(part);
+    last.then(|| Cow::Owned(std::mem::take(buffer)))
 }
 
 /// Routes one server message. Returns a reason when the whole connection failed.
-fn handle_server_message(message: Value, pending: &mut HashMap<u64, Pending>, acks: &mut Vec<u64>) -> Option<String> {
+fn handle_server_message(
+    mut message: Value,
+    pending: &mut HashMap<u64, Pending>,
+    acks: &mut Vec<u64>,
+) -> Option<String> {
     let tag = message.get("_tag").and_then(Value::as_str).unwrap_or_default();
     let request_id = message.get("requestId").and_then(request_id);
     match (tag, request_id) {
@@ -306,9 +315,9 @@ fn handle_server_message(message: Value, pending: &mut HashMap<u64, Pending>, ac
             // Ack even for streams we already dropped, so the server's writer never stalls.
             acks.push(id);
             if let Some(Pending::Stream(tx)) = pending.get(&id) {
-                if let Some(Value::Array(values)) = message.get("values") {
+                if let Value::Array(values) = message["values"].take() {
                     for value in values {
-                        let _ = tx.try_send(StreamEvent::Item(value.clone()));
+                        let _ = tx.try_send(StreamEvent::Item(value));
                     }
                 }
             }
@@ -391,10 +400,19 @@ mod tests {
     #[test]
     fn joins_split_frames() {
         let mut buffer = String::new();
-        assert_eq!(join_frame_part(&mut buffer, "\u{1e}{\"a\":".into()), None);
-        assert_eq!(join_frame_part(&mut buffer, "\u{1e}1".into()), None);
-        assert_eq!(join_frame_part(&mut buffer, "}".into()).as_deref(), Some("{\"a\":1}"));
-        assert_eq!(join_frame_part(&mut buffer, "{}".into()).as_deref(), Some("{}"));
+        assert_eq!(join_frame_part(&mut buffer, "\u{1e}{\"a\":", 64), None);
+        assert_eq!(join_frame_part(&mut buffer, "\u{1e}1", 64), None);
+        assert_eq!(join_frame_part(&mut buffer, "}", 64).as_deref(), Some("{\"a\":1}"));
+        assert_eq!(join_frame_part(&mut buffer, "{}", 64).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn split_frames_stop_growing_at_the_limit() {
+        let mut buffer = String::new();
+        assert_eq!(join_frame_part(&mut buffer, "\u{1e}12345", 8), None);
+        assert_eq!(join_frame_part(&mut buffer, "\u{1e}6789", 8), None);
+        assert!(buffer.is_empty(), "the oversized frame is dropped");
+        assert_eq!(join_frame_part(&mut buffer, "{}", 8).as_deref(), Some("{}"));
     }
 
     #[test]

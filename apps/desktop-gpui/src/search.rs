@@ -13,6 +13,9 @@ pub struct Field {
 }
 
 fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
     let mut lower = c.to_lowercase();
     match (lower.next(), lower.next()) {
         (Some('ς'), None) => 'σ',
@@ -26,7 +29,7 @@ fn fold_char(c: char) -> char {
 fn strip_accent(c: char) -> char {
     const FROM: &str = "àáâãäåāăąçćĉċčďđèéêëēĕėęěĝğġģĥħìíîïĩīĭįıĵķĺļľŀłñńņňòóôõöøōŏőŕŗřśŝşšţťŧùúûüũūŭůűųŵýÿŷźżž";
     const TO: &str = "aaaaaaaaacccccddeeeeeeeeegggghhiiiiiiiiijklllllnnnnooooooooorrrssssttttuuuuuuuuuuwyyyzzz";
-    FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c)
+    FROM.chars().zip(TO.chars()).find(|&(from, _)| from == c).map_or(c, |(_, to)| to)
 }
 
 fn is_cjk(c: char) -> bool {

@@ -98,11 +98,13 @@ impl Workspace {
         if self.draft_workspace.project_id.as_ref() == Some(&project_id) {
             return;
         }
+        // Reset first, so nothing from the previous project survives; send.rs resolves the
+        // workspace itself when this never loads.
+        self.draft_workspace = DraftWorkspaceState { project_id: Some(project_id.clone()), ..Default::default() };
         let (Some(client), Some(project)) = (self.client(), self.shell.projects.iter().find(|p| p.id == project_id))
         else {
             return;
         };
-        self.draft_workspace = DraftWorkspaceState { project_id: Some(project_id.clone()), ..Default::default() };
         let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
         let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
@@ -148,16 +150,25 @@ impl Workspace {
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let thread = matches!(self.target, Some(Target::Thread { .. }));
+        let project_id = self.draft_workspace.project_id.clone();
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(refs) = refs {
-                    match thread {
-                        true => this.draft_workspace.thread_refs = Some((cwd, refs)),
-                        false => this.draft_workspace.refs = Some(refs),
+                let refs = match refs {
+                    Ok(refs) => refs,
+                    Err(error) => {
+                        log::warn!("could not list refs: {error}");
+                        return;
                     }
-                    cx.notify();
+                };
+                if thread {
+                    this.draft_workspace.thread_refs = Some((cwd, refs));
+                } else if this.draft_workspace.project_id == project_id {
+                    this.draft_workspace.refs = Some(refs);
+                } else {
+                    return;
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -423,9 +434,7 @@ impl Workspace {
             "branch": branch,
             "worktreePath": worktree,
         }));
-        for command in commands {
-            self.dispatch(command, cx);
-        }
+        self.dispatch_in_order(commands, cx);
     }
 
     /// `shouldShowComposerContextStrip`: always under a draft; under a started thread
@@ -648,7 +657,7 @@ impl Workspace {
         let refs: Vec<&Value> = self
             .ref_list()
             .iter()
-            .filter(|r| r["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&query)))
+            .filter(|r| query.is_empty() || r["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&query)))
             .collect();
         let exact =
             self.ref_list().iter().any(|r| r["name"].as_str() == Some(self.draft_workspace.branch_query.as_str()));

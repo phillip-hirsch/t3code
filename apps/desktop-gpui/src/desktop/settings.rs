@@ -33,10 +33,11 @@ impl WindowRect {
 
     /// `windowFitsWithinDisplay`.
     pub fn fits_within(&self, display: &WindowRect) -> bool {
+        let end = |at: i32, len: i32| i64::from(at) + i64::from(len);
         self.x >= display.x
             && self.y >= display.y
-            && self.x + self.width <= display.x + display.width
-            && self.y + self.height <= display.y + display.height
+            && end(self.x, self.width) <= end(display.x, display.width)
+            && end(self.y, self.height) <= end(display.y, display.height)
     }
 }
 
@@ -223,6 +224,15 @@ pub fn valid_distro_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_saved_bounds_do_not_overflow_or_fit() {
+        let saved = WindowRect::parse(&json!({"x": 2e9, "y": 0, "width": 2e9, "height": 900})).unwrap();
+        let display = WindowRect { x: 2_000_000_000, y: 0, width: 1920, height: 1080 };
+        assert!(!saved.fits_within(&display));
+        let display = WindowRect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert!(WindowRect { x: 100, y: 100, width: 800, height: 600 }.fits_within(&display));
+    }
 
     #[test]
     fn documents_round_trip_and_write_only_changed_values() {

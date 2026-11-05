@@ -212,8 +212,8 @@ impl Workspace {
         };
         let pinned = pinned.filter(|pinned| Some(pinned) != self.target.as_ref() && self.target_exists(pinned));
         if let Some(pinned) = pinned {
-            if !self.stash_snap_shot(pinned, name, capture.mime, capture.bytes, source, cx) {
-                fail("Remove an attachment, then try this capture again.", window, cx);
+            if let Err(reason) = self.stash_snap_shot(pinned, name, capture.mime, capture.bytes, source, cx) {
+                fail(&reason, window, cx);
             }
             return cx.notify();
         }

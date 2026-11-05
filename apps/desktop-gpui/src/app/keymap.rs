@@ -161,17 +161,16 @@ pub(super) fn resolve<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &Sh
 
 /// `effectiveShortcutsForCommand(…)[0]`: the command's newest shortcut no later rule claims.
 fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<Shortcut> {
-    let mut claimed: Vec<Shortcut> = Vec::new();
+    let normalize =
+        |s: &Shortcut| (s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key);
+    let mut claimed: Vec<std::borrow::Cow<'_, Shortcut>> = Vec::new();
     for rule in rules.iter().rev().filter(|rule| context.admits(rule)) {
-        let shortcut = shortcut_for_context(rule, context).into_owned();
-        let normalize = |s: &Shortcut| {
-            (s.key.clone(), s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key)
-        };
-        if claimed.iter().any(|seen| normalize(seen) == normalize(&shortcut)) {
+        let shortcut = shortcut_for_context(rule, context);
+        if claimed.iter().any(|seen| seen.key == shortcut.key && normalize(seen) == normalize(&shortcut)) {
             continue;
         }
         if rule.command == command {
-            return Some(shortcut);
+            return Some(shortcut.into_owned());
         }
         claimed.push(shortcut);
     }

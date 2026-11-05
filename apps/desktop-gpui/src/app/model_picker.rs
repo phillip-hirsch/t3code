@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use super::Workspace;
 use super::composer::{control_button, runtime_modes};
-use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel};
+use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel, ServerInfo};
 use crate::model_label;
 use crate::theme::{self, Tokens};
 
@@ -181,21 +181,20 @@ impl Workspace {
     }
 
     fn toggle_favorite(&mut self, selection: &ModelSelection, cx: &mut Context<Self>) {
+        let (Some(client), Some(environment)) = (self.client(), self.active_environment().cloned()) else { return };
         let key = (selection.instance_id.clone(), selection.model.clone());
         let favorite = !self.server_info().favorites.contains(&key);
-        if favorite {
-            self.server_info_mut().favorites.push(key);
-        } else {
-            self.server_info_mut().favorites.retain(|f| f != &key);
-        }
+        set_favorite(self.server_info_mut(), &key, favorite);
         cx.notify();
-        let Some(client) = self.client() else { return };
         let patch = json!({"patch": {"setModelFavorites": [
             {"provider": selection.instance_id, "model": selection.model, "favorite": favorite}
         ]}});
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("server.updateSettings", patch).await {
                 let _ = this.update(cx, |this, cx| {
+                    if let Some(info) = this.env_info_mut(&environment) {
+                        set_favorite(info, &key, !favorite);
+                    }
                     this.error = Some(error.to_string().into());
                     cx.notify();
                 });
@@ -216,8 +215,9 @@ impl Workspace {
         let ready =
             |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
         let favorites = &self.server_info().favorites;
-        let is_favorite =
-            |p: &Provider, m: &ProviderModel| favorites.contains(&(p.instance_id.clone(), m.slug.clone()));
+        let is_favorite = |p: &Provider, m: &ProviderModel| {
+            favorites.iter().any(|(instance_id, slug)| *instance_id == p.instance_id && *slug == m.slug)
+        };
         let row = |p: &Provider, m: &ProviderModel| Row {
             selection: ModelSelection { instance_id: p.instance_id.clone(), model: m.slug.clone(), options: None },
             name: model_label::display_model_name(m),
@@ -1021,6 +1021,13 @@ fn step_tab(tabs: &[Tab], current: &Tab, step: isize) -> Tab {
 
 fn initials(name: &str) -> String {
     name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase()
+}
+
+fn set_favorite(info: &mut ServerInfo, key: &(String, String), favorite: bool) {
+    info.favorites.retain(|f| f != key);
+    if favorite {
+        info.favorites.push(key.clone());
+    }
 }
 
 #[cfg(test)]

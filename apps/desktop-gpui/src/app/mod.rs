@@ -863,6 +863,21 @@ impl Workspace {
         }
     }
 
+    /// The composer model's provider, borrowing the selection where one is stored.
+    fn composer_provider(&self) -> Option<&crate::model::Provider> {
+        let stored = match (&self.model_override, &self.target) {
+            (Some(selection), _) => Some(selection),
+            (None, Some(Target::Thread { .. })) => {
+                self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.as_ref()
+            }
+            _ => None,
+        };
+        match stored {
+            Some(selection) => self.server_info().provider(&selection.instance_id),
+            None => self.server_info().provider(&self.composer_model()?.instance_id),
+        }
+    }
+
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let thread_id = projection.thread.id.clone();
@@ -913,13 +928,21 @@ impl Workspace {
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.command_client(&command) else { return };
+        self.dispatch_in_order(vec![command], cx);
+    }
+
+    /// Dispatches dependent commands one after another, stopping at the first failure.
+    fn dispatch_in_order(&mut self, commands: Vec<Value>, cx: &mut Context<Self>) {
+        let Some(client) = commands.first().and_then(|command| self.command_client(command)) else { return };
         cx.spawn(async move |this, cx| {
-            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(error.to_string().into());
-                    cx.notify();
-                });
+            for command in commands {
+                if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.error = Some(error.to_string().into());
+                        cx.notify();
+                    });
+                    return;
+                }
             }
         })
         .detach();

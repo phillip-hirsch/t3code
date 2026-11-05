@@ -71,7 +71,10 @@ impl SavedEnvironments {
     }
 
     fn save(&self) -> Result<(), String> {
-        self.catalog.save().map_err(|error| format!("Could not save environments: {error}"))
+        self.catalog.save().map_err(|error| {
+            log::warn!("could not save environments: {error:#}");
+            format!("Could not save environments: {error:#}")
+        })
     }
 
     /// Saves a paired environment and connects it (`registerPairingConnection`).
@@ -104,11 +107,10 @@ impl SavedEnvironments {
 
     /// Forgets the pairing and credential here; the session on that machine stays until revoked there.
     pub fn remove(&mut self, environment_id: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        self.catalog.environments.retain(|environment| environment.environment_id != environment_id);
-        self.save()?;
         self.sessions.remove(environment_id);
+        self.catalog.environments.retain(|environment| environment.environment_id != environment_id);
         cx.notify();
-        Ok(())
+        self.save()
     }
 
     pub fn set_local_environment_enabled(&mut self, enabled: bool) -> Result<(), String> {
@@ -178,22 +180,29 @@ impl SavedEnvironments {
                             return;
                         }
                         let reason = client.closed().await;
+                        // A remote that accepts and then drops the socket must not be redialed in a loop.
+                        let delay = environments::retry_delay_ms(0, jitter());
                         let dropped = this.update(cx, |this, cx| {
                             this.update_session(&id, cx, |s| {
                                 s.client = None;
-                                s.state.last_failure = Some(Failure::transport(reason));
+                                s.state = ConnectionState {
+                                    phase: Phase::Backoff,
+                                    attempt,
+                                    retry_at: Some(retry_at(delay)),
+                                    last_failure: Some(Failure::transport(reason)),
+                                };
                             })
                         });
                         if dropped.is_err() {
                             return;
                         }
+                        cx.background_executor().timer(Duration::from_millis(delay)).await;
                     }
                     Err((failure, descriptor)) => {
                         let blocks = failure.reason.blocks();
                         let delay = (!blocks).then(|| {
                             failures += 1;
-                            let random = getrandom::u32().unwrap_or(0) as f64 / u32::MAX as f64;
-                            environments::retry_delay_ms(failures - 1, random)
+                            environments::retry_delay_ms(failures - 1, jitter())
                         });
                         let failed = this.update(cx, |this, cx| {
                             this.update_session(&id, cx, |s| {
@@ -204,7 +213,7 @@ impl SavedEnvironments {
                                 s.state = ConnectionState {
                                     phase: if blocks { Phase::Blocked } else { Phase::Backoff },
                                     attempt,
-                                    retry_at: delay.map(|delay| crate::app::sidebar::now_ms() + delay as i64),
+                                    retry_at: delay.map(retry_at),
                                     last_failure: Some(failure),
                                 };
                             })
@@ -219,6 +228,16 @@ impl SavedEnvironments {
             }
         })
     }
+}
+
+/// A uniform random number in 0..=1 for [`environments::retry_delay_ms`].
+fn jitter() -> f64 {
+    f64::from(getrandom::u32().unwrap_or(0)) / f64::from(u32::MAX)
+}
+
+/// When a retry `delay_ms` from now happens, in epoch ms.
+fn retry_at(delay_ms: u64) -> i64 {
+    crate::app::sidebar::now_ms().saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX))
 }
 
 /// One attempt: the descriptor (identity and protocol), then the socket. Runs on the tokio runtime.

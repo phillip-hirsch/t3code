@@ -159,7 +159,7 @@ const RESUBSCRIBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// Clears an ended stream's task after [`RESUBSCRIBE_AFTER`], so the next render subscribes
 /// again without looping on a server that keeps failing.
-async fn resubscribe_after_backoff(
+pub(super) async fn resubscribe_after_backoff(
     this: &WeakEntity<Workspace>,
     cx: &mut gpui_kit::AsyncWindowContext,
     clear: impl FnOnce(&mut Workspace),

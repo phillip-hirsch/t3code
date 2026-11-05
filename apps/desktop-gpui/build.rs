@@ -5,7 +5,7 @@
 //! Output: `{"texts": [notice, …], "entries": [{name, version, license, sourceUrl, text, bundle}]}`,
 //! where `text` indexes `texts` so crates sharing a notice store it once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
 
@@ -56,7 +56,8 @@ fn collect() -> Result<Value, String> {
     let root = metadata["resolve"]["root"].as_str().ok_or("no root package")?;
 
     // Normal dependencies only: build scripts and dev-dependencies do not ship in the binary.
-    let mut linked = HashSet::new();
+    // Ordered, so the manifest (and the binary) is the same on every build.
+    let mut linked = BTreeSet::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         for dep in nodes.get(id).and_then(|n| n["deps"].as_array()).into_iter().flatten() {

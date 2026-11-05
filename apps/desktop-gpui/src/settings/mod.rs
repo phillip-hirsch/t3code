@@ -282,7 +282,8 @@ pub(crate) fn write_atomically(path: &Path, document: &Value) -> std::io::Result
     std::fs::rename(&temp, path)
 }
 
-/// The T3 home rule of `backend::LaunchConfig::from_env`: `T3CODE_HOME`, else `~/.t3-gpui`.
+/// The T3 home: `T3CODE_HOME`, else `~/.t3-gpui`, apart from the Electron app's `~/.t3` until
+/// this client reaches parity, so both can run at once without fighting over the state directory.
 pub(crate) fn t3_home() -> Option<PathBuf> {
     std::env::var_os("T3CODE_HOME").map(PathBuf::from).or_else(|| {
         std::env::var_os("USERPROFILE")

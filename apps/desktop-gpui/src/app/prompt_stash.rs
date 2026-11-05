@@ -19,11 +19,11 @@ use gpui_kit::{
     StyledImage as _, Window, div, img, px, relative,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use super::attachments::{Attachment, MAX_ATTACHMENTS};
 use super::{Workspace, new_id};
-use crate::keybindings::{self, Shortcut};
+
 use crate::theme::Tokens;
 
 pub(super) const MAX_STASH_ENTRIES: usize = 20;
@@ -41,6 +41,8 @@ pub(super) struct StashedAttachment {
     kind: String,
     name: String,
     mime_type: String,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub(super) struct StashEntry {
     pub prompt: String,
     #[serde(default)]
     attachments: Vec<StashedAttachment>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 impl StashEntry {
@@ -72,10 +76,81 @@ pub(super) struct TakenAttachment {
     pub bytes: Option<Vec<u8>>,
 }
 
-/// The stash on disk; `dir` is `None` only when there is no home directory.
+/// A new entry whose attachment bytes still have to be written, off the UI thread, before
+/// [`Store::commit`] saves it.
+pub(super) struct PendingStash {
+    dir: PathBuf,
+    entry: StashEntry,
+    blobs: Vec<(PathBuf, bytes::Bytes)>,
+}
+
+impl PendingStash {
+    pub(super) fn prompt(&self) -> &str {
+        &self.entry.prompt
+    }
+
+    pub(super) fn write_blobs(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        self.blobs.iter().try_for_each(|(path, bytes)| std::fs::write(path, bytes))
+    }
+}
+
+/// Reads each attachment file, `None` for one that could not be read; for a background thread.
+pub(super) fn read_blobs(paths: Vec<PathBuf>) -> Vec<Option<Vec<u8>>> {
+    paths
+        .into_iter()
+        .map(|path| std::fs::read(&path).inspect_err(|error| log::warn!("stash file {path:?}: {error}")).ok())
+        .collect()
+}
+
+/// `stash.json` as read. Unknown fields and entries this build cannot read are kept and
+/// written back, so a newer or partly damaged file loses nothing.
+#[derive(Debug, Default, PartialEq)]
+struct StashFile {
+    entries: Vec<StashEntry>,
+    unreadable: Vec<Value>,
+    extra: Map<String, Value>,
+}
+
+impl StashFile {
+    fn parse(raw: &str) -> serde_json::Result<Self> {
+        let mut extra: Map<String, Value> = serde_json::from_str(raw)?;
+        extra.remove("version");
+        let mut file = Self::default();
+        match extra.remove("entries") {
+            None => {}
+            Some(Value::Array(entries)) => {
+                for value in entries {
+                    match StashEntry::deserialize(&value) {
+                        Ok(entry) => file.entries.push(entry),
+                        Err(error) => {
+                            log::warn!("kept a stash entry this build cannot read: {error}");
+                            file.unreadable.push(value);
+                        }
+                    }
+                }
+            }
+            Some(_) => return Err(serde::de::Error::custom("`entries` is not a list")),
+        }
+        file.extra = extra;
+        Ok(file)
+    }
+
+    fn document(&self, entries: &[StashEntry]) -> serde_json::Result<Value> {
+        let mut list: Vec<Value> = entries.iter().map(serde_json::to_value).collect::<Result<_, _>>()?;
+        list.extend(self.unreadable.iter().cloned());
+        let mut document = self.extra.clone();
+        document.insert("version".into(), STORE_VERSION.into());
+        document.insert("entries".into(), Value::Array(list));
+        Ok(Value::Object(document))
+    }
+}
+
+/// The stash on disk; `dir` is `None` when there is no home directory, or when `stash.json`
+/// exists but could not be read, so a write never replaces it.
 pub(super) struct Store {
     dir: Option<PathBuf>,
-    entries: Vec<StashEntry>,
+    file: StashFile,
 }
 
 impl Store {
@@ -84,17 +159,32 @@ impl Store {
     }
 
     fn open(dir: Option<PathBuf>) -> Self {
-        let entries = dir
-            .as_deref()
-            .and_then(|dir| std::fs::read_to_string(dir.join("stash.json")).ok())
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|document| serde_json::from_value(document["entries"].clone()).ok())
-            .unwrap_or_default();
-        Self { dir, entries }
+        let closed = || Self { dir: None, file: StashFile::default() };
+        let Some(dir) = dir else { return closed() };
+        let path = dir.join("stash.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self { dir: Some(dir), file: StashFile::default() };
+            }
+            Err(error) => {
+                log::warn!("prompt stash {path:?} could not be read, so stashing is off: {error}");
+                return closed();
+            }
+        };
+        let file = StashFile::parse(&raw).unwrap_or_else(|error| {
+            let aside = dir.join(format!("stash.corrupt-{}.json", crate::timestamp::now_ms()));
+            log::warn!("prompt stash {path:?} is damaged ({error}); moved it to {aside:?}");
+            if let Err(error) = std::fs::rename(&path, &aside) {
+                log::warn!("could not move the damaged prompt stash aside: {error}");
+            }
+            StashFile::default()
+        });
+        Self { dir: Some(dir), file }
     }
 
     pub(super) fn entries(&self) -> &[StashEntry] {
-        &self.entries
+        &self.file.entries
     }
 
     fn blob_path(dir: &Path, entry_id: &str, attachment: &StashedAttachment) -> PathBuf {
@@ -104,8 +194,7 @@ impl Store {
 
     fn persist(&self, entries: &[StashEntry]) -> std::io::Result<()> {
         let Some(dir) = &self.dir else { return Err(std::io::ErrorKind::NotFound.into()) };
-        let document = json!({ "version": STORE_VERSION, "entries": entries });
-        crate::settings::write_atomically(&dir.join("stash.json"), &document)
+        crate::settings::write_atomically(&dir.join("stash.json"), &self.file.document(entries)?)
     }
 
     fn remove_blobs(&self, entry: &StashEntry) {
@@ -115,14 +204,13 @@ impl Store {
         }
     }
 
-    /// Writes the entry and its attachments ahead of the rest, evicting the oldest past
-    /// [`MAX_STASH_ENTRIES`]. On failure nothing is kept.
-    pub(super) fn stash(
-        &mut self,
+    /// The entry for `prompt` and `attachments`, not saved yet.
+    pub(super) fn prepare(
+        &self,
         prompt: String,
-        attachments: &[&Attachment],
+        attachments: &[Attachment],
         created_at: String,
-    ) -> std::io::Result<Option<StashEntry>> {
+    ) -> std::io::Result<PendingStash> {
         let Some(dir) = self.dir.clone() else { return Err(std::io::ErrorKind::NotFound.into()) };
         let entry = StashEntry {
             id: new_id(),
@@ -135,42 +223,68 @@ impl Store {
                     kind: a.kind_str().to_owned(),
                     name: a.name().to_owned(),
                     mime_type: a.mime().to_owned(),
+                    extra: Map::new(),
                 })
                 .collect(),
+            extra: Map::new(),
         };
-        let written = std::fs::create_dir_all(&dir).and_then(|()| {
-            entry.attachments.iter().zip(attachments).try_for_each(|(stashed, attachment)| {
-                std::fs::write(Self::blob_path(&dir, &entry.id, stashed), attachment.bytes().as_slice())
-            })
-        });
-        let mut next = Vec::with_capacity(self.entries.len() + 1);
+        let blobs = entry
+            .attachments
+            .iter()
+            .zip(attachments)
+            .map(|(stashed, attachment)| (Self::blob_path(&dir, &entry.id, stashed), attachment.bytes().clone()))
+            .collect();
+        Ok(PendingStash { dir, entry, blobs })
+    }
+
+    /// Saves the entry ahead of the rest once its bytes were `written`, evicting the oldest
+    /// past [`MAX_STASH_ENTRIES`]. On failure nothing is kept.
+    pub(super) fn commit(
+        &mut self,
+        pending: PendingStash,
+        written: std::io::Result<()>,
+    ) -> std::io::Result<Option<StashEntry>> {
+        let entry = pending.entry;
+        let mut next = Vec::with_capacity(self.file.entries.len() + 1);
         next.push(entry.clone());
-        next.extend(self.entries.iter().cloned());
+        next.extend(self.file.entries.iter().cloned());
         let evicted = (next.len() > MAX_STASH_ENTRIES).then(|| next.pop()).flatten();
         if let Err(error) = written.and_then(|()| self.persist(&next)) {
             self.remove_blobs(&entry);
             return Err(error);
         }
-        self.entries = next;
+        self.file.entries = next;
         if let Some(evicted) = &evicted {
             self.remove_blobs(evicted);
         }
         Ok(evicted)
     }
 
-    /// Removes an entry and hands back its contents; `false` when the removal could not be
-    /// saved, so the entry would come back on the next launch.
-    pub(super) fn take(&mut self, id: &str) -> Option<(StashEntry, Vec<TakenAttachment>, bool)> {
-        let entry = self.entries.iter().find(|e| e.id == id)?.clone();
+    /// The entry's attachment files, for [`read_blobs`] before [`Store::take`].
+    pub(super) fn blob_paths(&self, id: &str) -> Option<Vec<PathBuf>> {
+        let dir = self.dir.as_deref()?;
+        let entry = self.file.entries.iter().find(|e| e.id == id)?;
+        Some(entry.attachments.iter().map(|a| Self::blob_path(dir, &entry.id, a)).collect())
+    }
+
+    /// Removes an entry and hands back its contents with the `bytes` read for it; `false`
+    /// when the removal could not be saved, so the entry would come back on the next launch.
+    pub(super) fn take(
+        &mut self,
+        id: &str,
+        bytes: Vec<Option<Vec<u8>>>,
+    ) -> Option<(StashEntry, Vec<TakenAttachment>, bool)> {
+        let entry = self.file.entries.iter().find(|e| e.id == id)?.clone();
         let taken = entry
             .attachments
             .iter()
-            .map(|a| TakenAttachment {
+            .zip(bytes.into_iter().chain(std::iter::repeat_with(|| None)))
+            .map(|(a, bytes)| TakenAttachment {
                 local_id: a.local_id.clone(),
                 kind: a.kind.clone(),
                 name: a.name.clone(),
                 mime: a.mime_type.clone(),
-                bytes: self.dir.as_deref().and_then(|dir| std::fs::read(Self::blob_path(dir, &entry.id, a)).ok()),
+                bytes,
             })
             .collect();
         let durable = self.delete(id);
@@ -179,10 +293,10 @@ impl Store {
 
     /// `false` when the removal could not be saved.
     pub(super) fn delete(&mut self, id: &str) -> bool {
-        let Some(index) = self.entries.iter().position(|e| e.id == id) else { return true };
-        let next: Vec<StashEntry> = self.entries.iter().filter(|e| e.id != id).cloned().collect();
+        let Some(index) = self.file.entries.iter().position(|e| e.id == id) else { return true };
+        let next: Vec<StashEntry> = self.file.entries.iter().filter(|e| e.id != id).cloned().collect();
         let durable = self.persist(&next).is_ok();
-        let removed = self.entries.remove(index);
+        let removed = self.file.entries.remove(index);
         if durable {
             self.remove_blobs(&removed);
         }
@@ -242,49 +356,18 @@ fn relative_time(elapsed_ms: i64) -> String {
     }
 }
 
-/// `formatShortcutLabel` for this platform.
-fn shortcut_label(shortcut: &Shortcut) -> String {
-    let key = match shortcut.key.as_str() {
-        " " | "space" => "Space".to_owned(),
-        key if key.chars().count() == 1 => key.to_uppercase(),
-        key => {
-            let mut chars = key.chars();
-            chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
-        }
-    };
-    let mac = cfg!(target_os = "macos");
-    let meta = shortcut.meta_key || (shortcut.mod_key && mac);
-    let ctrl = shortcut.ctrl_key || (shortcut.mod_key && !mac);
-    if mac {
-        let glyph = |on: bool, glyph: &'static str| if on { glyph } else { "" };
-        return format!(
-            "{}{}{}{}{key}",
-            glyph(ctrl, "⌃"),
-            glyph(shortcut.alt_key, "⌥"),
-            glyph(shortcut.shift_key, "⇧"),
-            glyph(meta, "⌘")
-        );
-    }
-    let mut parts: Vec<String> =
-        [(ctrl, "Ctrl"), (shortcut.alt_key, "Alt"), (shortcut.shift_key, "Shift"), (meta, "Meta")]
-            .into_iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, label)| label.to_owned())
-            .collect();
-    parts.push(key);
-    parts.join("+")
-}
-
 /// The stash and its drawer.
 pub(super) struct PromptStash {
     store: Store,
     pub open: bool,
     highlighted: Option<String>,
+    /// A stash or restore is reading or writing attachment files.
+    busy: bool,
 }
 
 impl Default for PromptStash {
     fn default() -> Self {
-        Self { store: Store::load(), open: false, highlighted: None }
+        Self { store: Store::load(), open: false, highlighted: None, busy: false }
     }
 }
 
@@ -292,9 +375,14 @@ fn toast(window: &mut Window, cx: &mut Context<Workspace>, notification: Notific
     window.push_notification(notification, cx);
 }
 
+fn stash_failed(error: &std::io::Error, window: &mut Window, cx: &mut Context<Workspace>) {
+    log::warn!("could not stash the prompt: {error}");
+    let message = "The stash could not be saved, so the composer was left as-is.";
+    toast(window, cx, Notification::error(message).title("Could not stash this prompt"));
+}
+
 impl Workspace {
-    /// `handleStashShortcut`.
-    /// The `composer.stash` command (Mod+S).
+    /// `handleStashShortcut`: the `composer.stash` command (Mod+S).
     pub(super) fn stash_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() || self.page.is_some() || self.settings.is_some() {
             return;
@@ -325,21 +413,62 @@ impl Workspace {
             }
             return;
         }
-        let attachments: Vec<&Attachment> = self.attachments.iter().collect();
-        let stashed = self.prompt_stash.store.stash(
-            prompt,
-            &attachments,
-            crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default(),
-        );
-        let evicted = match stashed {
-            Ok(evicted) => evicted,
-            Err(error) => {
-                log::warn!("could not stash the prompt: {error}");
-                let message = "The stash could not be saved, so the composer was left as-is.";
-                toast(window, cx, Notification::error(message).title("Could not stash this prompt"));
-                return;
-            }
+        if self.prompt_stash.busy {
+            return;
+        }
+        let created_at = crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default();
+        let pending = match self.prompt_stash.store.prepare(prompt, &self.attachments, created_at) {
+            Ok(pending) => pending,
+            Err(error) => return stash_failed(&error, window, cx),
         };
+        self.prompt_stash.busy = true;
+        let origin = self.target.clone();
+        let local_ids: Vec<String> = self.attachments.iter().map(|a| a.local_id().to_owned()).collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let (pending, written) = cx
+                .background_executor()
+                .spawn(async move {
+                    let written = pending.write_blobs();
+                    (pending, written)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.prompt_stash.busy = false;
+                let prompt = pending.prompt().to_owned();
+                match this.prompt_stash.store.commit(pending, written) {
+                    Ok(evicted) => {
+                        if this.target == origin {
+                            this.clear_stashed_prompt(&prompt, &local_ids, window, cx);
+                        }
+                        if evicted.is_some() {
+                            let message = format!(
+                                "The stash holds {MAX_STASH_ENTRIES} prompts; the oldest was removed to make room."
+                            );
+                            toast(window, cx, Notification::warning(message).title("Oldest stashed prompt discarded"));
+                        }
+                    }
+                    Err(error) => stash_failed(&error, window, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Empties the composer once its prompt is stashed, unless it changed while the stash
+    /// was being written; then it stays, since the stash already holds the stashed part.
+    fn clear_stashed_prompt(
+        &mut self,
+        prompt: &str,
+        local_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self.composer.read(cx).value().trim() == prompt
+            && self.attachments.iter().map(Attachment::local_id).eq(local_ids.iter().map(String::as_str));
+        if !unchanged {
+            return;
+        }
         // The bytes are on disk; a restore uploads them again.
         if let Some(client) = self.client() {
             for id in self.attachments.iter().filter_map(Attachment::uploaded_id) {
@@ -350,11 +479,6 @@ impl Workspace {
         self.attachments.clear();
         self.set_composer_text("", window, cx);
         self.prompt_history = None;
-        if evicted.is_some() {
-            let message = format!("The stash holds {MAX_STASH_ENTRIES} prompts; the oldest was removed to make room.");
-            toast(window, cx, Notification::warning(message).title("Oldest stashed prompt discarded"));
-        }
-        cx.notify();
     }
 
     pub(super) fn toggle_stash_menu(&mut self, cx: &mut Context<Self>) {
@@ -376,8 +500,33 @@ impl Workspace {
         if self.target.is_none() || self.thread.as_ref().is_some_and(|t| self.rewinding.contains(&t.id)) {
             return;
         }
+        if self.prompt_stash.busy {
+            return;
+        }
         self.prompt_stash.open = false;
-        let Some((entry, taken, durable)) = self.prompt_stash.store.take(id) else { return };
+        let Some(paths) = self.prompt_stash.store.blob_paths(id) else { return };
+        if paths.is_empty() {
+            return self.finish_restore(id, Vec::new(), window, cx);
+        }
+        self.prompt_stash.busy = true;
+        cx.notify();
+        let (id, origin) = (id.to_owned(), self.target.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let bytes = cx.background_executor().spawn(async move { read_blobs(paths) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.prompt_stash.busy = false;
+                // Moved on meanwhile: the entry stays in the stash.
+                if this.target == origin {
+                    this.finish_restore(&id, bytes, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_restore(&mut self, id: &str, bytes: Vec<Option<Vec<u8>>>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((entry, taken, durable)) = self.prompt_stash.store.take(id, bytes) else { return };
         if !durable {
             let message = "The stash file could not be updated, so this entry could still be there after a restart.";
             toast(window, cx, Notification::warning(message).title("Restored prompt may reappear in the stash"));
@@ -690,8 +839,8 @@ impl Workspace {
 
     /// The last `composer.stash` rule's shortcut.
     fn stash_shortcut_label(&self) -> Option<String> {
-        let rules = keybindings::merge_with_defaults(&self.primary_info().keybindings);
-        rules.iter().rev().find(|rule| rule.command == "composer.stash").map(|rule| shortcut_label(&rule.shortcut))
+        let rule = self.keymap.iter().rev().find(|rule| rule.command == "composer.stash")?;
+        Some(super::keymap::format_label(&rule.shortcut, super::keymap::MAC))
     }
 }
 
@@ -737,9 +886,23 @@ mod tests {
                     kind: (*kind).into(),
                     name: format!("a{i}"),
                     mime_type: "image/png".into(),
+                    extra: Map::new(),
                 })
                 .collect(),
+            extra: Map::new(),
         }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-prompt-stash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn stash(store: &mut Store, prompt: &str, attachments: &[Attachment]) -> Option<StashEntry> {
+        let pending = store.prepare(prompt.into(), attachments, String::new()).unwrap();
+        let written = pending.write_blobs();
+        store.commit(pending, written).unwrap()
     }
 
     #[test]
@@ -763,16 +926,16 @@ mod tests {
 
     #[test]
     fn the_store_keeps_twenty_entries_on_disk_and_takes_one_back_with_its_bytes() {
-        let dir = std::env::temp_dir().join(format!("t3-gpui-prompt-stash-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir("limit");
         let mut store = Store::open(Some(dir.clone()));
-        let image = Attachment::restored_as("img1".into(), "image", "shot.png".into(), "image/png".into(), vec![1, 2]);
-        store.stash("first".into(), &[&image], "2026-01-01T00:00:00Z".into()).unwrap();
+        let image =
+            || Attachment::restored_as("img1".into(), "image", "shot.png".into(), "image/png".into(), vec![1, 2]);
+        stash(&mut store, "first", &[image()]);
         let first = store.entries()[0].id.clone();
         for i in 1..MAX_STASH_ENTRIES {
-            assert_eq!(store.stash(format!("p{i}"), &[], String::new()).unwrap(), None);
+            assert_eq!(stash(&mut store, &format!("p{i}"), &[]), None);
         }
-        let evicted = store.stash("newest".into(), &[], String::new()).unwrap();
+        let evicted = stash(&mut store, "newest", &[]);
         assert_eq!(evicted.map(|e| e.id), Some(first.clone()), "the oldest goes first");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "its bytes went with it");
 
@@ -780,14 +943,65 @@ mod tests {
         assert_eq!(reloaded.entries(), store.entries());
         assert_eq!(reloaded.entries()[0].prompt, "newest");
 
-        store.stash("with image".into(), &[&image], String::new()).unwrap();
+        stash(&mut store, "with image", &[image()]);
         let id = store.entries()[0].id.clone();
-        let (taken, attachments, durable) = store.take(&id).unwrap();
+        let bytes = read_blobs(store.blob_paths(&id).unwrap());
+        let (taken, attachments, durable) = store.take(&id, bytes).unwrap();
         assert!(durable);
         assert_eq!(taken.prompt, "with image");
         assert_eq!((attachments[0].local_id.as_str(), attachments[0].bytes.as_deref()), ("img1", Some(&[1u8, 2][..])));
-        assert!(store.take(&id).is_none());
+        assert!(store.take(&id, Vec::new()).is_none());
         assert_eq!(Store::open(Some(dir.clone())).entries().len(), MAX_STASH_ENTRIES - 1, "the take was saved");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stash_write_keeps_unreadable_entries_and_unknown_fields() {
+        let dir = scratch_dir("lenient");
+        std::fs::create_dir_all(&dir).unwrap();
+        let future = json!({"id": "future", "prompt": 7});
+        let original = json!({
+            "version": 1,
+            "sync": {"device": "a"},
+            "entries": [
+                {"id": "old", "createdAt": "", "prompt": "kept", "pinned": true,
+                 "attachments": [{"localId": "1", "kind": "file", "name": "a", "mimeType": "text/plain", "hash": "x"}]},
+                future,
+            ],
+        });
+        std::fs::write(dir.join("stash.json"), original.to_string()).unwrap();
+
+        let mut store = Store::open(Some(dir.clone()));
+        assert_eq!(store.entries().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["old"]);
+        stash(&mut store, "new", &[]);
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("stash.json")).unwrap()).unwrap();
+        assert_eq!(saved["sync"], original["sync"]);
+        let entries = saved["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "{saved}");
+        assert_eq!(entries[0]["prompt"], "new");
+        assert_eq!(entries[1], original["entries"][0], "the readable entry round-trips with its unknown fields");
+        assert_eq!(entries[2], future, "the unreadable entry is written back as it was");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_stash_file_is_moved_aside_rather_than_overwritten() {
+        let dir = scratch_dir("damaged");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stash.json"), "{\"entries\": [").unwrap();
+
+        let mut store = Store::open(Some(dir.clone()));
+        assert!(store.entries().is_empty());
+        stash(&mut store, "new", &[]);
+
+        let aside: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("stash.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(dir.join(&aside[0])).unwrap(), "{\"entries\": [");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

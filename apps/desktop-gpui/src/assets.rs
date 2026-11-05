@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use gpui_kit::{AssetSource, Hsla, Result, SharedString, rgb};
 
@@ -147,7 +147,6 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "paperclip",
     "pencil",
     "pen-line",
-    "pencil",
     "pilcrow",
     "pin",
     "rotate-ccw",
@@ -197,10 +196,12 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
 ];
 
 /// Images fetched at runtime (e.g. ACP Registry icons), served under `remote/…` so `svg()` can tint them.
-static REMOTE: Mutex<Option<HashMap<String, Arc<[u8]>>>> = Mutex::new(None);
+/// A panic while it is held can't leave it half-updated (one insert), so poisoning is ignored
+/// rather than failing every icon load after it.
+static REMOTE: RwLock<Option<HashMap<String, Arc<[u8]>>>> = RwLock::new(None);
 
 pub fn put_remote(path: &str, bytes: Arc<[u8]>) {
-    REMOTE.lock().unwrap().get_or_insert_default().insert(path.to_owned(), bytes);
+    REMOTE.write().unwrap_or_else(PoisonError::into_inner).get_or_insert_default().insert(path.to_owned(), bytes);
 }
 
 pub struct Assets;
@@ -212,7 +213,7 @@ impl AssetSource for Assets {
         {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        if let Some(bytes) = REMOTE.lock().unwrap().as_ref().and_then(|remote| remote.get(path)) {
+        if let Some(bytes) = REMOTE.read().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(|r| r.get(path)) {
             return Ok(Some(Cow::Owned(bytes.to_vec())));
         }
         // The full catalog: a project icon can be any Lucide icon (`ProjectIconPickerDialog`).

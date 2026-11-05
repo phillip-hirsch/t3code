@@ -100,18 +100,19 @@ impl Workspace {
             return;
         }
         self.menu._search = None;
-        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id).cloned());
-        let Some(provider) = provider else {
+        let Some(provider) = self.composer_provider() else {
             self.menu.items = Rc::default();
             self.menu.loading = false;
             return;
         };
         let has_snapshot = provider.workspace_snapshots.iter().any(|s| Some(&s.cwd) == cwd.as_ref());
         if let (false, Some(cwd)) = (has_snapshot, &cwd) {
-            self.request_workspace_snapshot(&provider.instance_id, cwd, cx);
+            let instance_id = provider.instance_id.clone();
+            self.request_workspace_snapshot(&instance_id, cwd, cx);
         }
         self.menu.loading = !has_snapshot && cwd.is_some();
-        let (skills, commands) = composer_search::provider_lists(&provider, cwd.as_deref());
+        let Some(provider) = self.composer_provider() else { return };
+        let (skills, commands) = composer_search::provider_lists(provider, cwd.as_deref());
         let (plan_mode, _) = self.interaction_mode();
         let at_start = trigger.range.start == 0;
         let items = match trigger.kind {
@@ -188,12 +189,13 @@ impl Workspace {
 
     /// Arrows, Enter/Tab and Escape while the menu is open; `true` when handled.
     pub(super) fn menu_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(trigger) = &self.menu.trigger else { return false };
+        if self.menu.trigger.is_none() {
+            return false;
+        }
         let modifiers = keystroke.modifiers;
         let count = self.menu.items.len();
         match keystroke.key.as_str() {
             "escape" => {
-                let _ = trigger;
                 self.hide_menu(cx);
                 true
             }

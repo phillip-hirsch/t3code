@@ -101,7 +101,8 @@ impl Workspace {
                     window
                         .spawn(cx, async move |cx| {
                             let Ok(Ok(Some(path))) = picked.await else { return };
-                            if let Err(error) = std::fs::write(&path, bytes.as_slice()) {
+                            let write = async move { std::fs::write(path, bytes) };
+                            if let Err(error) = cx.background_executor().spawn(write).await {
                                 let _ = cx.update(|window, cx| {
                                     let toast = Notification::error(error.to_string()).title("Could not save file");
                                     window.push_notification(toast, cx);

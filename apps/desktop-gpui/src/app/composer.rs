@@ -162,7 +162,7 @@ impl Workspace {
 
     /// The user-invocable skills of the composer's provider, by name.
     fn skill_names(&self) -> Vec<String> {
-        let Some(provider) = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id)) else {
+        let Some(provider) = self.composer_provider() else {
             return Vec::new();
         };
         let cwd = self.composer_cwd();
@@ -827,7 +827,7 @@ impl Workspace {
         }
         let sendable = !self.composer_empty || self.has_attachments();
         let can_resume = self.can_resume();
-        if self.plan_follow_up_target().is_some() && (!self.composer_empty || !can_resume) {
+        if self.has_plan_follow_up() && (!self.composer_empty || !can_resume) {
             return self.render_plan_follow_up_action(t, cx);
         }
         let editing = self.editing_queued();
