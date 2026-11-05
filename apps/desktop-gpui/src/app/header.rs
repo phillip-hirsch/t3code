@@ -6,8 +6,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::{
-    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WindowControlArea, canvas, div, px, rgb,
+    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, WindowControlArea, canvas, div, px, rgb,
 };
 
 use super::titlebar::{CAPTION_BUTTONS_WIDTH, COLLAPSED_CONTENT_LEFT, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
@@ -144,17 +144,24 @@ impl Workspace {
                     .invisible()
                     .group_hover("thread-title", |style| style.visible())
                     .child(icon("icons/chevron-down.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.click_title(1, true, window, cx);
-                    })),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.click_title(1, true, window, cx);
+                        }),
+                    ),
             )
             .child(
                 canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, _, _, _| {}).absolute().size_full(),
             )
-            .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
-                this.click_title(event.click_count(), false, window, cx)
-            }))
+            // Mouse-down, like the panel toggles: the drag region swallows the release.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                    this.click_title(event.click_count, false, window, cx)
+                }),
+            )
             .into_any_element()
     }
 

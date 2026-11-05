@@ -129,7 +129,9 @@ impl Workspace {
             .child(
                 toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
                     .tooltip(tooltip("Toggle right panel (Ctrl+Alt+B)"))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleRightPanel), cx)),
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleRightPanel), cx)
+                    }),
             )
     }
 }

@@ -523,7 +523,7 @@ impl Workspace {
                         .child(field("Name", Input::new(&name)))
                         .child(field("Command", Input::new(&command))),
                 )
-                .button_props(gpui_kit::component::dialog::DialogButtonProps::default().ok_text("Save action"))
+                .footer(dialog_footer("add-script-save", "Save action"))
                 .on_ok(move |_, _, cx: &mut App| {
                     let name = name.read(cx).value().trim().to_owned();
                     let command = command.read(cx).value().trim().to_owned();
@@ -657,7 +657,10 @@ impl Workspace {
         };
         let view = cx.entity();
         let items = git::menu_actions(status, false);
-        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+        let can_publish = status.local.is_repo && !status.local.has_primary_remote;
+        let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
+            view.update(cx, |this, cx| this.refresh_vcs(cx));
             for item in &items {
                 let action = item.action;
                 menu = menu.item(
@@ -668,6 +671,12 @@ impl Workspace {
                         }),
                     ),
                 );
+            }
+            if can_publish {
+                menu =
+                    menu.item(PopupMenuItem::new("Publish repository").icon(icon("icons/cloud-upload.svg")).on_click(
+                        window.listener_for(&view, |this, _, window, cx| this.open_publish_dialog(window, cx)),
+                    ));
             }
             menu
         };
@@ -682,7 +691,7 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| match &kind {
                         QuickKind::Run(action) => this.run_git_action(action, None, cx),
                         QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
-                        QuickKind::Publish => this.open_publish_hint(window, cx),
+                        QuickKind::Publish => this.open_publish_dialog(window, cx),
                         QuickKind::Hint(_) => {}
                     })),
             )
@@ -726,7 +735,7 @@ impl Workspace {
                         .child(field("Branch", div().text_sm().child(branch.clone())))
                         .child(field("Commit message (optional)", Input::new(&message))),
                 )
-                .button_props(gpui_kit::component::dialog::DialogButtonProps::default().ok_text("Commit"))
+                .footer(dialog_footer("commit-confirm", "Commit"))
                 .on_ok(move |_, _, cx: &mut App| {
                     let text = message.read(cx).value().trim().to_owned();
                     view.update(cx, |this, cx| this.run_commit(text, cx));
@@ -739,9 +748,112 @@ impl Workspace {
         self.run_git_action("commit", (!message.is_empty()).then_some(message), cx);
     }
 
-    /// Publishing a repository needs a source-control sign-in flow this client does not have yet.
-    fn open_publish_hint(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.error = Some("Add a remote to this repository to publish it.".into());
+    /// `PublishRepositoryDialog`: the first signed-in source-control provider, `account/` prefilled.
+    fn open_publish_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let discovery = client.request("server.discoverSourceControl", json!({})).await;
+            let _ = this.update_in(cx, |this, window, cx| match discovery {
+                Ok(discovery) => match publish_provider(&discovery) {
+                    Some((kind, label, account)) => this.show_publish_dialog(kind, label, account, window, cx),
+                    None => {
+                        this.error = Some("No signed-in source control provider. Set one up in Settings.".into());
+                        cx.notify();
+                    }
+                },
+                Err(error) => {
+                    this.error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn show_publish_dialog(
+        &mut self,
+        provider: String,
+        label: String,
+        account: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::input::{Input, InputState};
+        use gpui_kit::{AppContext as _, Focusable as _};
+        let prefill = account.map(|account| format!("{account}/")).unwrap_or_default();
+        let repository =
+            cx.new(|cx| InputState::new(window, cx).default_value(prefill).placeholder("owner/repository"));
+        let public = std::rc::Rc::new(std::cell::Cell::new(false));
+        let view = cx.entity();
+        let focus = std::cell::Cell::new(true);
+        let title: SharedString = format!("Publish to {label}").into();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus.replace(false) {
+                repository.focus_handle(cx).focus(window, cx);
+            }
+            let visibility = |id: &'static str, text: &'static str, value: bool| {
+                let public = public.clone();
+                Button::new(id)
+                    .label(text)
+                    .small()
+                    .map(|b| if public.get() == value { b.primary() } else { b.outline() })
+                    .on_click(move |_, window, _| {
+                        public.set(value);
+                        window.refresh();
+                    })
+            };
+            let (repository, public, view, provider) =
+                (repository.clone(), public.clone(), view.clone(), provider.clone());
+            dialog
+                .title(title.clone())
+                .w(px(448.))
+                .child(v_flex().gap_3().child(field("Repository", Input::new(&repository))).child(field(
+                    "Visibility",
+                    h_flex().gap_2().child(visibility("publish-private", "Private", false)).child(visibility(
+                        "publish-public",
+                        "Public",
+                        true,
+                    )),
+                )))
+                .footer(dialog_footer("publish-confirm", "Publish"))
+                .on_ok(move |_, _, cx: &mut App| {
+                    let repository = repository.read(cx).value().trim().to_owned();
+                    if repository.is_empty() || repository.ends_with('/') {
+                        return false;
+                    }
+                    let visibility = if public.get() { "public" } else { "private" };
+                    let provider = provider.clone();
+                    view.update(cx, |this, cx| this.publish_repository(provider, repository, visibility, cx));
+                    true
+                })
+        });
+    }
+
+    /// `sourceControl.publishRepository` with the web's defaults: `origin` over SSH.
+    fn publish_repository(&mut self, provider: String, repository: String, visibility: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        let input = json!({
+            "cwd": cwd,
+            "provider": provider,
+            "repository": repository,
+            "visibility": visibility,
+            "remoteName": "origin",
+            "protocol": "ssh",
+        });
+        self.vcs.running = Some("Publishing repository...".into());
+        cx.spawn(async move |this, cx| {
+            let result = client.request("sourceControl.publishRepository", input).await;
+            let _ = this.update(cx, |this, cx| {
+                this.vcs.running = None;
+                if let Err(error) = result {
+                    this.error = Some(error.to_string().into());
+                }
+                this.refresh_vcs(cx);
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -900,9 +1012,10 @@ impl Workspace {
                     .hover(colors.hover)
                     .active(colors.hover),
             )
+            .xsmall()
+            .icon(icon("icons/ellipsis.svg"))
             .size(px(24.))
             .rounded(px(6.))
-            .child(icon("icons/ellipsis.svg").with_size(px(14.)))
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
                 menu.min_w(px(240.)).item(
                     PopupMenuItem::new("Disconnect agent session")
@@ -994,6 +1107,28 @@ fn new_script(existing: &[Value], name: &str, command: &str) -> Value {
     let taken = |id: &str| existing.iter().any(|script| script.get("id").and_then(Value::as_str) == Some(id));
     let id = (1..).map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") }).find(|id| !taken(id)).unwrap();
     json!({"id": id, "name": name, "command": command, "icon": "play", "runOnWorktreeCreate": false})
+}
+
+/// `getPublishProviderReadiness`: the first available, signed-in provider as (kind, label, account).
+fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>)> {
+    discovery["sourceControlProviders"].as_array()?.iter().find_map(|provider| {
+        let auth = &provider["auth"];
+        let ready =
+            provider["status"].as_str() == Some("available") && auth["status"].as_str() != Some("unauthenticated");
+        if !ready {
+            return None;
+        }
+        let account = auth["account"]["value"].as_str().map(str::to_owned);
+        Some((provider["kind"].as_str()?.to_owned(), provider["label"].as_str()?.to_owned(), account))
+    })
+}
+
+/// Cancel and the confirming action; the action runs the dialog's `on_ok`.
+fn dialog_footer(id: &'static str, label: &'static str) -> impl IntoElement {
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    DialogFooter::new()
+        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
+        .child(DialogAction::new().child(Button::new(id).primary().label(label)))
 }
 
 fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
@@ -1285,6 +1420,17 @@ mod tests {
         assert_eq!(resolve_density(400., 300., 200.), Density::Full);
         assert_eq!(resolve_density(250., 300., 200.), Density::Compact);
         assert_eq!(resolve_density(150., 300., 200.), Density::Essential);
+    }
+
+    #[test]
+    fn publish_picks_the_first_signed_in_provider() {
+        let discovery = json!({"sourceControlProviders": [
+            {"kind": "gitlab", "label": "GitLab", "status": "missing", "auth": {"status": "unknown", "account": {"_tag": "None"}}},
+            {"kind": "github", "label": "GitHub", "status": "available", "auth": {"status": "unauthenticated", "account": {"_tag": "None"}}},
+            {"kind": "forgejo", "label": "Forgejo", "status": "available", "auth": {"status": "authenticated", "account": {"_tag": "Some", "value": "me"}}},
+        ]});
+        assert_eq!(publish_provider(&discovery), Some(("forgejo".into(), "Forgejo".into(), Some("me".into()))));
+        assert_eq!(publish_provider(&json!({"sourceControlProviders": []})), None);
     }
 
     #[test]

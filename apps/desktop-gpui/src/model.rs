@@ -781,11 +781,15 @@ pub struct ThreadProjection {
 #[serde(rename_all = "camelCase")]
 pub struct Checkpoint {
     pub id: String,
+    pub scope_id: String,
     #[serde(default)]
     pub run_id: Option<String>,
     /// The turn number the checkpoint closes; `None` for a scope's base snapshot.
     #[serde(default)]
     pub app_run_ordinal: Option<u32>,
+    #[serde(default)]
+    pub ordinal_within_scope: u32,
+    pub status: String,
     pub captured_at: String,
 }
 

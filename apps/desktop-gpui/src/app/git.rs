@@ -421,6 +421,7 @@ impl Workspace {
                 if let Err(error) = outcome {
                     this.error = Some(error.into());
                 }
+                this.refresh_vcs(cx);
                 cx.notify();
             });
         })
@@ -442,11 +443,31 @@ impl Workspace {
                 if let Err(error) = result {
                     this.error = Some(error.to_string().into());
                 }
+                this.refresh_vcs(cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// `vcs.refreshStatus` after a git operation, so the card does not wait on the watcher.
+    pub(super) fn refresh_vcs(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
+        cx.spawn(async move |this, cx| {
+            let Ok(value) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.vcs.cwd.as_deref() != Some(cwd.as_str()) {
+                    return;
+                }
+                if let Ok(local) = VcsLocal::deserialize(&value) {
+                    let remote = VcsRemote::deserialize(&value).unwrap_or_default();
+                    this.vcs.status = Some(VcsStatus { local, remote });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 }
 
