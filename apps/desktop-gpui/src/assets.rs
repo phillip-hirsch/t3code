@@ -15,6 +15,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
     ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
     ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),
+    ("icons/app/linux.svg", include_bytes!("../assets/icons/linux.svg")),
+    ("icons/app/mac-mini.svg", include_bytes!("../assets/icons/mac-mini.svg")),
+    ("icons/app/mac-studio.svg", include_bytes!("../assets/icons/mac-studio.svg")),
+    ("icons/app/onepassword.svg", include_bytes!("../assets/icons/onepassword.svg")),
 ];
 
 /// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
@@ -30,7 +34,9 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "alarm-clock-off",
     "bot",
     "brain",
+    "building",
     "chart-no-axes-column",
+    "chevrons-left-right-ellipsis",
     "chevron-down",
     "circle-dashed",
     "circle-dot-dashed",

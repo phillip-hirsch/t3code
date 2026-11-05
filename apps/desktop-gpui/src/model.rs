@@ -173,6 +173,8 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The latest `ServerConfig` as sent, with `settings` kept current.
+    pub raw_config: Value,
 }
 
 impl ServerInfo {
@@ -180,6 +182,7 @@ impl ServerInfo {
         match event.get("type").and_then(Value::as_str).unwrap_or_default() {
             "snapshot" => {
                 let config = &event["config"];
+                self.raw_config = config.clone();
                 self.providers = lossy(&config["providers"])?;
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
@@ -190,7 +193,13 @@ impl ServerInfo {
                 self.new_projects_root = text("/newProjectsRoot");
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
-            "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "settingsUpdated" => {
+                let settings = &event["payload"]["settings"];
+                if self.raw_config.is_object() {
+                    self.raw_config["settings"] = settings.clone();
+                }
+                self.apply_settings(settings)?
+            }
             _ => {}
         }
         Ok(())
