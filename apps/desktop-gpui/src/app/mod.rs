@@ -505,6 +505,7 @@ impl Workspace {
                 this.check_chatgpt_welcome(window, cx);
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);
+                this.report_browser_profiles(cx);
             },
         )];
         let devices = self.subscribe_device_state(window, cx);
