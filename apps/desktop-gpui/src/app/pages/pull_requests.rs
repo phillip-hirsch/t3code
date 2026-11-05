@@ -22,11 +22,22 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::sidebar::now_ms;
+use crate::pull_request_detail::Reference;
 use crate::pull_requests::{
     self as logic, CHECKS, DRAFTS, Entry, Filters, ListResult, MAX_PAGE_SIZE, PAGE_SIZE, REVIEWS, SORTS, STATES, Stats,
     View,
 };
 use crate::theme::{self, FONT_MONO, Tokens};
+
+/// `PullRequestRef` for a listed row.
+fn reference_of(entry: &Entry) -> Reference {
+    Reference {
+        project_id: entry.project_id.clone(),
+        host: Some(entry.host.clone()),
+        repository: entry.repository.clone(),
+        number: entry.number,
+    }
+}
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// `WorkspacePageContainer width="expanded"`: `max-w-6xl px-6 pt-6 pb-12`.
@@ -85,6 +96,10 @@ pub(in crate::app) struct PullRequestsState {
     list_state: ListState,
     _debounce: Option<Task<()>>,
     _search_subscription: Subscription,
+    /// The pull request open beside the list.
+    pub(super) panel: Option<super::pull_request_detail::Panel>,
+    /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
+    pub(super) last_merge_method: &'static str,
 }
 
 impl PullRequestsState {
@@ -122,7 +137,14 @@ impl PullRequestsState {
             list_state: ListState::new(0, ListAlignment::Top, px(480.)),
             _debounce: None,
             _search_subscription: subscription,
+            panel: None,
+            last_merge_method: "merge",
         }
+    }
+
+    /// The listed row for a pull request, which the panel shows while its detail loads.
+    pub(super) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
+        self.list.as_ref()?.entries.iter().find(|e| reference_of(e) == *reference).cloned()
     }
 
     fn filter_count(&self) -> usize {
@@ -219,7 +241,7 @@ impl Workspace {
 
     /// Reads the list; `more` continues from the last answer's cursors, or asks for a longer
     /// page when the host gave none.
-    fn read_pull_requests(&mut self, more: bool, cx: &mut Context<Self>) {
+    pub(super) fn read_pull_requests(&mut self, more: bool, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let state = &mut self.pull_requests;
         let cursors =
@@ -365,7 +387,7 @@ impl Workspace {
         state.rows = Rc::new(rows);
     }
 
-    pub(super) fn render_pull_requests(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let state = &self.pull_requests;
         let shown = state.rows.iter().any(|row| matches!(row, Row::Entry { .. }));
@@ -380,11 +402,32 @@ impl Workspace {
         } else {
             self.render_pull_request_list(&tokens, cx)
         };
-        v_flex()
-            .size_full()
+        let column = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .min_h_0()
             .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().flex_1().min_h_0().child(body));
+        if self.pull_requests.panel.is_none() {
+            return column.into_any_element();
+        }
+        // `RightPanelTabs mode="inline"` opens at half the window.
+        let width = (f32::from(window.viewport_size().width) / 2.).max(360.);
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .child(column)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(width))
+                    .h_full()
+                    .min_h_0()
+                    .border_l_1()
+                    .border_color(tokens.border)
+                    .child(self.render_pull_request_panel(window, cx)),
+            )
             .into_any_element()
     }
 
@@ -698,6 +741,7 @@ impl Workspace {
         let view = cx.entity();
         let t = *t;
         let now = now_ms();
+        let selected = self.pull_requests.panel.as_ref().map(|p| p.reference().clone());
         // Labels and author names show as the row's meta line widens (`@xs`, `@xl`, `@3xl`).
         let meta_width = f32::from(self.pull_requests.list_state.viewport_bounds().size.width).min(PAGE_MAX_WIDTH)
             - 2. * PAGE_GUTTER
@@ -706,7 +750,8 @@ impl Workspace {
             let content = match &rows[index] {
                 Row::Header { key, label, count, first } => group_header(key, label, *count, *first, &t),
                 Row::Entry { entry, stat, elsewhere, first } => {
-                    pull_request_row(entry, *stat, *elsewhere, *first, meta_width, now, &view, &t, window, cx)
+                    let selected = selected.as_ref().is_some_and(|r| *r == reference_of(entry));
+                    pull_request_row(entry, *stat, *elsewhere, *first, selected, meta_width, now, &view, &t, window, cx)
                 }
                 Row::Stale(error) => stale_banner(error.clone(), &view, &t, window),
                 Row::Footer(footer) => list_footer(*footer, &view, &t, window),
@@ -831,7 +876,7 @@ fn control_background(t: &Tokens) -> Hsla {
 }
 
 /// `Button variant="outline"` at the desktop's `sm:h-8`.
-fn outline_button(id: &'static str, t: &Tokens) -> Button {
+pub(super) fn outline_button(id: &'static str, t: &Tokens) -> Button {
     Button::new(id)
         .outline()
         .small()
@@ -983,7 +1028,7 @@ fn group_header(key: &str, label: &'static str, count: usize, first: bool, t: &T
 }
 
 /// Tailwind's tones the row glyphs use, light and dark (`pullRequestIcons.tsx`, `pullRequestPresentation.tsx`).
-fn tone(t: &Tokens, light: u32, dark: u32, dark_alpha: f32) -> Hsla {
+pub(super) fn tone(t: &Tokens, light: u32, dark: u32, dark_alpha: f32) -> Hsla {
     if t.dark { Hsla { a: dark_alpha, ..rgb(dark).into() } } else { rgb(light).into() }
 }
 
@@ -1025,7 +1070,7 @@ fn glyph(id: String, icon: Lucide, size: f32, color: Hsla, label: impl Into<Shar
 }
 
 /// `formatRelativeElapsed`.
-fn relative_time(elapsed_ms: i64) -> String {
+pub(super) fn relative_time(elapsed_ms: i64) -> String {
     let minutes = elapsed_ms.max(0) / 60_000;
     match minutes {
         0 => "just now".into(),
@@ -1036,7 +1081,7 @@ fn relative_time(elapsed_ms: i64) -> String {
 }
 
 /// A label chip, tinted by the label's color (`Badge variant="label" size="sm"`).
-fn label_chip(name: &str, color: Option<&str>, more: usize, t: &Tokens) -> impl IntoElement {
+pub(super) fn label_chip(name: &str, color: Option<&str>, more: usize, t: &Tokens) -> impl IntoElement {
     let (bg, fg) = match logic::label_color(color) {
         Some(hex) => {
             let label: Hsla = rgb(hex).into();
@@ -1075,6 +1120,7 @@ fn pull_request_row(
     stat: Option<(u64, u64)>,
     elsewhere: bool,
     first: bool,
+    selected: bool,
     meta_width: f32,
     now: i64,
     view: &Entity<Workspace>,
@@ -1206,7 +1252,7 @@ fn pull_request_row(
                 .map(|updated| div().ml_auto().flex_none().whitespace_nowrap().child(relative_time(now - updated))),
         );
 
-    let open = url.clone();
+    let picked = entry.clone();
     h_flex()
         .id(ElementId::Name(id("row").into()))
         .when(!first, |el| el.mt(px(2.)))
@@ -1216,7 +1262,7 @@ fn pull_request_row(
         .gap(px(8.))
         .rounded(px(6.))
         .cursor_pointer()
-        .hover(|s| s.bg(Hsla { a: t.accent.a * 0.6, ..t.accent }))
+        .map(|el| if selected { el.bg(t.accent) } else { el.hover(|s| s.bg(Hsla { a: t.accent.a * 0.6, ..t.accent })) })
         .child(
             div()
                 .relative()
@@ -1238,7 +1284,9 @@ fn pull_request_row(
                 }),
         )
         .child(v_flex().flex_1().min_w_0().child(title_line).child(meta_line))
-        .on_click(window.listener_for(view, move |_, _, _, cx| cx.open_url(&open)))
+        .on_click(window.listener_for(view, move |this, _, _, cx| {
+            this.open_pull_request_panel(reference_of(&picked), Some(picked.clone()), cx)
+        }))
         .into_any_element()
 }
 

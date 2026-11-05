@@ -10,6 +10,7 @@ mod model;
 mod model_label;
 mod new_thread;
 mod preview;
+mod pull_request_detail;
 mod pull_requests;
 mod requests;
 mod rpc;

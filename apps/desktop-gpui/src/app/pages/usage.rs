@@ -1216,7 +1216,7 @@ fn ghost_icon_button(id: &'static str, icon: Lucide, size: f32, t: &Tokens) -> B
 }
 
 /// `ToggleGroup variant="segmented"`.
-fn segmented<V: Copy + PartialEq + std::fmt::Debug + 'static>(
+pub(super) fn segmented<V: Copy + PartialEq + std::fmt::Debug + 'static>(
     id: &'static str,
     options: impl Iterator<Item = (V, &'static str)>,
     current: V,
