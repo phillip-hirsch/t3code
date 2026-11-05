@@ -31,6 +31,8 @@ pub enum MenuAction {
     },
     /// `/model` opens the model picker.
     Model,
+    /// `/plan` or `/default` switches the interaction mode.
+    Mode(&'static str),
 }
 
 /// The skills and commands a provider offers from `cwd`, falling back to its global lists.
@@ -186,9 +188,16 @@ pub fn skill_items(skills: &[ProviderSkill], query: &str) -> Vec<MenuItem> {
     skills.into_iter().map(|s| skill_item(s, display_name(s).to_owned(), "Run provider skill")).collect()
 }
 
-/// The `/` menu: `/model`, then the provider's commands, then skills as `/skill:name`.
-/// Provider commands work only at the very start of the prompt.
-pub fn slash_items(skills: &[ProviderSkill], commands: &[SlashCommand], query: &str, at_start: bool) -> Vec<MenuItem> {
+/// The `/` menu: `/model`, `/plan` and `/default` while plan mode is on, then the
+/// provider's commands, then skills as `/skill:name`. Provider commands work only at the
+/// very start of the prompt.
+pub fn slash_items(
+    skills: &[ProviderSkill],
+    commands: &[SlashCommand],
+    query: &str,
+    at_start: bool,
+    plan_mode: bool,
+) -> Vec<MenuItem> {
     let skills = invocable(skills);
     let mut items = vec![MenuItem {
         id: "slash:model".into(),
@@ -196,6 +205,20 @@ pub fn slash_items(skills: &[ProviderSkill], commands: &[SlashCommand], query: &
         description: "Switch response model for this thread".into(),
         action: MenuAction::Model,
     }];
+    if plan_mode {
+        items.extend(
+            [
+                ("plan", "Switch this thread into plan mode"),
+                ("default", "Switch this thread back to normal build mode"),
+            ]
+            .map(|(mode, description)| MenuItem {
+                id: format!("slash:{mode}"),
+                label: format!("/{mode}"),
+                description: description.into(),
+                action: MenuAction::Mode(mode),
+            }),
+        );
+    }
     if at_start {
         let skill_names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
         items.extend(commands.iter().filter(|c| !skill_names.contains(&c.name.to_lowercase())).map(|c| {
@@ -245,6 +268,7 @@ pub fn slash_items(skills: &[ProviderSkill], commands: &[SlashCommand], query: &
         },
         |item| match &item.action {
             MenuAction::Model => "0\0model".into(),
+            MenuAction::Mode(mode) => format!("0\0{mode}"),
             MenuAction::Command { name } => format!("1\0{name}"),
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
@@ -306,18 +330,24 @@ mod tests {
         let commands: Vec<SlashCommand> =
             serde_json::from_value(json!([{"name": "compact", "description": "Summarize"}, {"name": "review"}]))
                 .unwrap();
-        let all = slash_items(&skills, &commands, "", true);
+        let all = slash_items(&skills, &commands, "", true, false);
         assert_eq!(
             labels(&all),
             ["/model", "/compact", "/skill:review", "/skill:deploy-app"],
             "skills shadow commands"
         );
         assert_eq!(
-            labels(&slash_items(&skills, &commands, "", false)),
+            labels(&slash_items(&skills, &commands, "", false, false)),
             ["/model", "/skill:review", "/skill:deploy-app"]
         );
-        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true)), ["/compact"]);
-        assert_eq!(labels(&slash_items(&skills, &commands, "skill:dep", true)), ["/skill:deploy-app"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true, false)), ["/compact"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "skill:dep", true, false)), ["/skill:deploy-app"]);
+        assert_eq!(
+            labels(&slash_items(&[], &commands, "", false, true)),
+            ["/model", "/plan", "/default"],
+            "plan mode adds its commands anywhere in the prompt"
+        );
+        assert_eq!(labels(&slash_items(&[], &commands, "pla", true, true)), ["/plan"]);
     }
 
     #[test]

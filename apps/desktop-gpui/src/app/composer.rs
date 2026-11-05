@@ -24,7 +24,8 @@ use super::attachments::Attachment;
 use super::send::Intent;
 use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
-use crate::model::{RuntimeRequest, TurnItem};
+use crate::model::{ModelSelection, RuntimeRequest, TurnItem};
+use crate::new_thread::UsageFallback;
 use crate::requests::{self, Question, QuestionDraft};
 use crate::theme::{FONT_MONO, Tokens, tokens};
 
@@ -206,11 +207,22 @@ impl Workspace {
         if self.draft_workspace_key(keystroke, window, cx) || self.composer_shortcut(keystroke, window, cx) {
             return true;
         }
-        // Keys in the editor: the open menu first, then prompt history, then the send shortcuts.
+        // Keys in the editor: Shift+Tab, the open menu, then prompt history, then the send shortcuts.
         self.composer.focus_handle(cx).is_focused(window)
-            && (self.menu_key(keystroke, window, cx)
+            && (self.plan_toggle_key(keystroke, window, cx)
+                || self.menu_key(keystroke, window, cx)
                 || self.history_key(keystroke, window, cx)
                 || self.send_key(keystroke, window, cx))
+    }
+
+    /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
+    fn plan_toggle_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if keystroke.key != "tab" || !m.shift || m.control || m.alt || m.platform || !self.interaction_mode().0 {
+            return false;
+        }
+        self.toggle_interaction_mode(window, cx);
+        true
     }
 
     /// Up/Down recall this thread's earlier messages (`composerCommandKey.ts`).
@@ -551,6 +563,7 @@ impl Workspace {
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
+                .children(self.render_fallback_banner(&t, cx))
                 .children(self.render_question(&t, cx))
                 .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
                 .children(self.render_context_strip(&t, cx)),
@@ -561,6 +574,7 @@ impl Workspace {
         let mode = self.runtime_mode();
         // Drafts name their permissions in the row under the composer instead.
         let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
+        let (plan_ui, interaction) = self.interaction_mode();
         h_flex()
             .items_center()
             .px(px(8.))
@@ -602,6 +616,7 @@ impl Workspace {
                             .min_w_0()
                             .justify_end()
                             .gap(px(2.))
+                            .child(self.render_model_picker(t, cx))
                             .when(!strip_owns_mode && mode != self.default_runtime_mode(), |el| {
                                 let (_, label, icon) = runtime_modes()
                                     .into_iter()
@@ -616,8 +631,9 @@ impl Workspace {
                                     cx,
                                 ))
                             })
-                            .child(self.render_model_picker(t, cx)),
+                            .when(plan_ui, |el| el.child(self.render_interaction_toggle(interaction, t, cx))),
                     )
+                    .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
             )
     }
@@ -687,6 +703,9 @@ impl Workspace {
                         }),
                 )
                 .into_any_element();
+        }
+        if self.plan_follow_up_target().is_some() {
+            return self.render_plan_follow_up_action(t, cx);
         }
         let sendable = !self.composer_empty || self.has_attachments();
         if running && !sendable {
@@ -900,6 +919,119 @@ impl Workspace {
                     .child(actions),
             )
             .into_any_element()
+    }
+
+    /// A draft's model moved to `fallbackModelSelection` while the default's provider
+    /// is out of usage (`resolveNewThreadModelSelection`); an explicit pick wins.
+    pub(super) fn draft_usage_fallback(&self, default: &ModelSelection) -> Option<UsageFallback> {
+        let Some(Target::Draft { project_id }) = &self.target else { return None };
+        if self.model_override.is_some() || self.server_info.settings.get("fallbackModelSelection").is_null() {
+            return None;
+        }
+        crate::new_thread::usage_fallback(&self.server_info, default, Some(project_id), jiff::Timestamp::now())
+    }
+
+    /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
+    fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(Target::Draft { project_id }) = &self.target else { return None };
+        let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+        let default = self.server_info.new_thread_model(project)?;
+        let fallback = self.draft_usage_fallback(&default)?;
+        let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
+        if self.composer_ui.dismissed_fallback.as_ref() == Some(&window) {
+            return None;
+        }
+        let model_name = |selection: &ModelSelection| {
+            self.server_info
+                .provider(&selection.instance_id)
+                .and_then(|p| p.models.iter().find(|m| m.slug == selection.model))
+                .and_then(|m| m.name.clone())
+                .unwrap_or_else(|| selection.model.clone())
+        };
+        let exhausted = self.server_info.provider(&fallback.exhausted_instance)?;
+        let provider_name = exhausted.display_name.clone().unwrap_or_else(|| exhausted.driver.clone());
+        let hour12 =
+            crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));
+        let resets = fallback
+            .resets_at
+            .as_deref()
+            .and_then(|at| crate::timestamp::upcoming(at, &jiff::Zoned::now(), hour12))
+            .map(|at| format!(" · resets {at}"))
+            .unwrap_or_default();
+        let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let use_default = format!("Use {}", model_name(&default));
+        Some(
+            div()
+                .mx(px(22.))
+                .mb(px(-17.))
+                .child(
+                    h_flex()
+                        .px(px(4.))
+                        .pt(px(5.))
+                        // 5px padding plus the 17px the composer covers.
+                        .pb(px(22.))
+                        .gap(px(4.))
+                        .rounded_t(px(16.))
+                        .border_1()
+                        .border_color(outline)
+                        .bg(t.card.opacity(t.glass))
+                        .text_xs()
+                        .child(
+                            div()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(Lucide::Gauge).with_size(px(12.)).text_color(t.muted_foreground)),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .line_height(px(24.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(format!("Using {}", model_name(&fallback.selection))),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(t.muted_foreground)
+                                        .child(format!("{provider_name} is out of usage{resets}")),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap(px(2.))
+                                .child(
+                                    Button::new("fallback-use-default").ghost().xsmall().label(use_default).on_click(
+                                        cx.listener(move |this, _, _, cx| this.pick_model(default.clone(), cx)),
+                                    ),
+                                )
+                                .child(
+                                    Button::new("fallback-dismiss")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(Icon::new(Lucide::X))
+                                        .tooltip("Dismiss fallback model notice")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.composer_ui.dismissed_fallback = Some(window.clone());
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_question(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {

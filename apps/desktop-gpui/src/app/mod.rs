@@ -26,6 +26,8 @@ mod attachments;
 mod chat;
 mod composer;
 mod composer_menu;
+mod composer_meter;
+mod composer_plan;
 mod context_strip;
 mod details;
 mod git;
@@ -143,6 +145,8 @@ pub struct Workspace {
     picker: model_picker::PickerState,
     /// A draft's workspace mode, branch and permissions controls.
     draft_workspace: context_strip::DraftWorkspaceState,
+    /// Plan mode per target and the dismissed fallback notice.
+    composer_ui: composer_plan::ComposerUi,
     attachments: Vec<attachments::Attachment>,
     /// Where Up/Down prompt history stands.
     prompt_history: Option<crate::composer_text::HistoryPosition>,
@@ -272,6 +276,7 @@ impl Workspace {
             menu: Default::default(),
             picker: Default::default(),
             draft_workspace: Default::default(),
+            composer_ui: Default::default(),
             attachments: Vec::new(),
             prompt_history: None,
             chip_ids: Vec::new(),
@@ -741,7 +746,9 @@ impl Workspace {
         match &self.target {
             Some(Target::Thread(_)) => self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.clone(),
             Some(Target::Draft { project_id }) => {
-                self.server_info.new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))
+                let default =
+                    self.server_info.new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))?;
+                Some(self.draft_usage_fallback(&default).map_or(default, |fallback| fallback.selection))
             }
             None => None,
         }

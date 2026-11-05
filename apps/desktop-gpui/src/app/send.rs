@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::composer::ComposerDraft;
+use super::composer_plan;
 use super::{Target, Workspace, draft_title, new_id};
 use crate::new_thread::{self, DraftWorkspace};
 
@@ -87,7 +88,20 @@ impl Workspace {
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
-        if (text.is_empty() && !self.has_attachments()) || self.sending || self.target_rewinding() {
+        let (plan_ui, interaction_mode) = self.interaction_mode();
+        // `/plan` or `/default` alone switches modes without sending.
+        if let Some(mode) =
+            composer_plan::standalone_slash_command(&text).filter(|_| plan_ui && !self.has_attachments())
+        {
+            self.set_composer_text("", window, cx);
+            self.set_interaction_mode(mode, window, cx);
+            return;
+        }
+        let follow_up = self.plan_follow_up_target();
+        if (text.is_empty() && !self.has_attachments() && follow_up.is_none())
+            || self.sending
+            || self.target_rewinding()
+        {
             return;
         }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
@@ -103,8 +117,18 @@ impl Workspace {
         let origin = target.clone();
         let (declines, text_is_feedback) = self.approval_declines(&text);
         let mut background = false;
+        // Thread settings the message runs with, applied right before it.
+        let mut settings_commands = Vec::new();
+        let mut sent_mode = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
             Target::Thread(thread_id) => {
+                // A plan follow-up refines in plan mode, or implements in build mode (`resolvePlanFollowUpSubmission`).
+                let (message_text, interaction_mode) = match &follow_up {
+                    Some((_, markdown)) => composer_plan::plan_follow_up(&text, markdown),
+                    None => (message_text, interaction_mode),
+                };
+                settings_commands.extend(self.interaction_mode_command(&thread_id, interaction_mode));
+                sent_mode = Some(interaction_mode);
                 let running =
                     self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
                 let (dispatch_mode, delivery) = dispatch_fields(running, self.follow_up_behavior(), intent);
@@ -128,6 +152,9 @@ impl Workspace {
                 }
                 if let Some(context) = context.clone() {
                     command["context"] = context;
+                }
+                if let Some((plan_id, _)) = follow_up.as_ref().filter(|_| interaction_mode == "default") {
+                    command["sourcePlanRef"] = json!({"threadId": thread_id, "planId": plan_id});
                 }
                 ("orchestration.dispatchCommand", command, None, None)
             }
@@ -166,7 +193,7 @@ impl Workspace {
                     "generateTitle": true,
                     "modelSelection": model.to_json(),
                     "runtimeMode": self.runtime_mode(),
-                    "interactionMode": "default",
+                    "interactionMode": interaction_mode,
                     "workspaceStrategy": strategy.unwrap_or_else(|| json!({"type": "root"})),
                     "initialMessage": initial,
                 });
@@ -189,6 +216,14 @@ impl Workspace {
                 }
             }
             if result.is_ok() && !text_is_feedback {
+                for command in settings_commands {
+                    result = client.request("orchestration.dispatchCommand", command).await.map_err(|e| e.to_string());
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+            if result.is_ok() && !text_is_feedback {
                 if let Some((workspace, root)) = workspace {
                     let mode = workspace.default_mode(&client).await;
                     let choice = new_thread::WorkspaceChoice::default();
@@ -207,6 +242,9 @@ impl Workspace {
                 this.sending = false;
                 match result {
                     Ok(_) => {
+                        if let Some(mode) = sent_mode {
+                            this.remember_interaction_mode(origin.clone(), mode);
+                        }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {
                             // A background launch leaves a fresh draft in its place.
@@ -232,7 +270,9 @@ impl Workspace {
                     }
                     Err(error) => {
                         this.error = Some(error.into());
-                        this.give_back_prompt(&origin, text, window, cx);
+                        if !text.is_empty() {
+                            this.give_back_prompt(&origin, text, window, cx);
+                        }
                         if this.target.as_ref() == Some(&origin) {
                             this.attachments.extend(sent_attachments);
                         } else if let Some(ComposerDraft::Prompt(_, kept)) = this.composer_drafts.get_mut(&origin) {

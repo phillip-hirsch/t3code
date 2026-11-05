@@ -47,6 +47,8 @@ pub(super) struct DraftWorkspaceState {
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
+    /// `vcs.listRefs` for an open thread's checkout, by cwd (`persistComposerContextStrip`).
+    thread_refs: Option<(String, Value)>,
 }
 
 impl Workspace {
@@ -105,16 +107,31 @@ impl Workspace {
 
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
+        let thread = matches!(self.target, Some(Target::Thread(_)));
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
                 if let Ok(refs) = refs {
-                    this.draft_workspace.refs = Some(refs);
+                    match thread {
+                        true => this.draft_workspace.thread_refs = Some((cwd, refs)),
+                        false => this.draft_workspace.refs = Some(refs),
+                    }
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// The refs the branch picker lists: the thread checkout's, or the draft project's.
+    fn refs(&self) -> Option<&Value> {
+        match &self.target {
+            Some(Target::Thread(_)) => {
+                let (cwd, refs) = self.draft_workspace.thread_refs.as_ref()?;
+                (Some(cwd) == self.composer_cwd().as_ref()).then_some(refs)
+            }
+            _ => self.draft_workspace.refs.as_ref(),
+        }
     }
 
     pub(super) fn draft_env_mode(&self) -> EnvMode {
@@ -139,13 +156,7 @@ impl Workspace {
     }
 
     fn ref_list(&self) -> &[Value] {
-        self.draft_workspace
-            .refs
-            .as_ref()
-            .and_then(|r| r.get("refs"))
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        self.refs().and_then(|r| r.get("refs")).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
     }
 
     fn set_env_mode(&mut self, mode: EnvMode, cx: &mut Context<Self>) {
@@ -171,6 +182,11 @@ impl Workspace {
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
+        if let Some(Target::Thread(thread_id)) = self.target.clone() {
+            self.select_thread_branch(thread_id, name, cx);
+            self.focus_composer(window, cx);
+            return;
+        }
         if self.draft_env_mode() == EnvMode::Worktree && self.draft_workspace.choice.existing_worktree.is_none() {
             self.draft_workspace.choice.branch = Some(name);
             self.focus_composer(window, cx);
@@ -197,6 +213,12 @@ impl Workspace {
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
+        if let Some(Target::Thread(thread_id)) = self.target.clone() {
+            let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
+            let input = json!({"cwd": cwd, "refName": name, "switchRef": true});
+            self.run_thread_ref_command(thread_id, "vcs.createRef", input, name, worktree, cx);
+            return;
+        }
         self.run_ref_command(
             "vcs.createRef",
             json!({"cwd": cwd, "refName": name, "switchRef": true}),
@@ -264,10 +286,96 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The row under a draft's composer.
+    /// `selectBranch` on a started thread: reuse the worktree that has the ref checked
+    /// out, else switch the thread's checkout (`resolveBranchSelectionTarget`).
+    fn select_thread_branch(&mut self, thread_id: String, name: String, cx: &mut Context<Self>) {
+        let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
+        let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
+        let picked = self.ref_list().iter().find(|r| r["name"].as_str() == Some(name.as_str()));
+        let elsewhere = picked.and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
+        let is_default = picked.is_some_and(|r| r["isDefault"].as_bool() == Some(true));
+        if let Some(path) = elsewhere {
+            let next = (!is_within(&root, &path)).then_some(path);
+            self.set_thread_branch(&thread_id, &name, next, cx);
+            return;
+        }
+        let next = active.filter(|_| !is_default);
+        let checkout = next.clone().unwrap_or(root);
+        let input = json!({"cwd": checkout, "refName": name});
+        self.run_thread_ref_command(thread_id, "vcs.switchRef", input, name, next, cx);
+    }
+
+    fn run_thread_ref_command(
+        &mut self,
+        thread_id: String,
+        method: &'static str,
+        input: Value,
+        name: String,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = client.request(method, input).await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(value) => {
+                        let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
+                        this.set_thread_branch(&thread_id, &switched.unwrap_or(name), worktree, cx);
+                        this.refresh_refs(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("{method} failed: {error}");
+                        let failure = match method {
+                            "vcs.createRef" => "Failed to create and switch ref.",
+                            _ => "Failed to switch ref.",
+                        };
+                        this.error = Some(failure.into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `setThreadBranch`: a move to another checkout detaches the live provider
+    /// sessions first, then the thread records its branch and worktree.
+    fn set_thread_branch(&mut self, thread_id: &str, branch: &str, worktree: Option<String>, cx: &mut Context<Self>) {
+        let Some(projection) = self.open_projection() else { return };
+        let mut commands = Vec::new();
+        if worktree != projection.thread.worktree_path {
+            let command_id = super::new_id();
+            for session in
+                projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"))
+            {
+                commands.push(json!({
+                    "type": "provider-session.detach",
+                    "commandId": format!("{command_id}:detach:{}", session.id),
+                    "threadId": thread_id,
+                    "providerSessionId": session.id,
+                    "reason": "client-requested",
+                }));
+            }
+        }
+        commands.push(json!({
+            "type": "thread.metadata.update",
+            "commandId": super::new_id(),
+            "threadId": thread_id,
+            "branch": branch,
+            "worktreePath": worktree,
+        }));
+        for command in commands {
+            self.dispatch(command, cx);
+        }
+    }
+
+    /// `shouldShowComposerContextStrip`: always under a draft; under a started thread
+    /// only with `persistComposerContextStrip`, and then without permissions.
     pub(super) fn render_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !matches!(self.target, Some(Target::Draft { .. })) || self.target_project().is_none() {
-            return None;
+        self.target_project()?;
+        if matches!(self.target, Some(Target::Thread(_))) {
+            return self.render_thread_context_strip(t, cx);
         }
         let git = self.is_git_repo();
         let environment = self.environment_remote.then(|| self.render_environment_chip(t));
@@ -304,6 +412,51 @@ impl Workspace {
                     t,
                     cx,
                 )))
+                .into_any_element(),
+        )
+    }
+
+    fn render_thread_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let git = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
+        let persist = self.client_settings.values.bool("persistComposerContextStrip");
+        if !persist || !(git || self.environment_remote) {
+            return None;
+        }
+        let environment = self.environment_remote.then(|| self.render_environment_chip(t));
+        // A started thread keeps its workspace (`resolveLockedWorkspaceLabel`).
+        let worktree = self.git_cwd() != self.target_project().map(|p| p.workspace_root.clone());
+        let (icon, label) = if worktree { (Lucide::FolderGit, "Worktree") } else { (Lucide::Folder, "Local checkout") };
+        let locked = h_flex()
+            .id("env-mode-locked")
+            .min_w_0()
+            .h(px(24.))
+            .px(px(7.))
+            .gap(px(6.))
+            .text_color(t.muted_foreground.opacity(0.7))
+            .child(Icon::new(icon).with_size(px(12.)).flex_none())
+            .child(div().max_w(px(240.)).truncate().child(label))
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx));
+        Some(
+            h_flex()
+                .w_full()
+                .px(px(8.))
+                .pt(px(8.))
+                .gap(px(4.))
+                .text_xs()
+                .text_color(t.muted_foreground)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w(px(40.))
+                        .min_h(px(24.))
+                        .gap(px(4.))
+                        .children(environment)
+                        .when(git && self.environment_remote, |el| {
+                            el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border))
+                        })
+                        .when(git, |el| el.child(locked)),
+                )
+                .when(git, |el| el.child(self.render_branch_selector(t, cx)))
                 .into_any_element(),
         )
     }
@@ -390,12 +543,21 @@ impl Workspace {
 
     fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.draft_workspace;
-        let worktree_base = self.draft_env_mode() == EnvMode::Worktree && state.choice.existing_worktree.is_none();
+        let thread = matches!(self.target, Some(Target::Thread(_)));
+        let worktree_base =
+            !thread && self.draft_env_mode() == EnvMode::Worktree && state.choice.existing_worktree.is_none();
         let current =
             self.ref_list().iter().find(|r| r["current"].as_bool() == Some(true)).and_then(|r| r["name"].as_str());
-        let branch = match worktree_base {
-            true => state.choice.branch.as_deref().or_else(|| state.refs.as_ref().and_then(new_thread::default_base)),
-            false => state.choice.branch.as_deref().or(current),
+        let thread_branch = self
+            .open_projection()
+            .and_then(|p| p.thread.branch.as_deref())
+            .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.as_deref()));
+        let branch = match (thread, worktree_base) {
+            (true, _) => thread_branch.or(current),
+            (false, true) => {
+                state.choice.branch.as_deref().or_else(|| state.refs.as_ref().and_then(new_thread::default_base))
+            }
+            (false, false) => state.choice.branch.as_deref().or(current),
         };
         let is_remote = branch
             .and_then(|b| self.ref_list().iter().find(|r| r["name"].as_str() == Some(b)))
@@ -409,7 +571,7 @@ impl Workspace {
             (Some(b), false) => b.to_owned().into(),
         };
         let trigger = strip_button("branch-selector", t)
-            .disabled(state.refs.is_none())
+            .disabled(!thread && state.refs.is_none())
             .selected(state.branch_open)
             .child(Icon::new(Lucide::GitBranch).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label));
@@ -455,7 +617,7 @@ impl Workspace {
         let exact =
             self.ref_list().iter().any(|r| r["name"].as_str() == Some(self.draft_workspace.branch_query.as_str()));
         let create = (!query.is_empty() && !exact && !worktree_base).then(|| self.draft_workspace.branch_query.clone());
-        let total = self.draft_workspace.refs.as_ref().and_then(|r| r["totalCount"].as_u64());
+        let total = self.refs().and_then(|r| r["totalCount"].as_u64());
         let rows = refs.iter().map(|r| {
             let name = r["name"].as_str().unwrap_or_default().to_owned();
             let badge = if r["current"].as_bool() == Some(true) {
@@ -668,6 +830,13 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// `workspaceRelativeFilePath(root, path) !== null`: `path` is `root` or inside it.
+fn is_within(root: &str, path: &str) -> bool {
+    let normalize = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let (root, path) = (normalize(root), normalize(path));
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 /// `ComposerControl size="xs"`: 24px, 7px padding, 6px gap, text-xs, muted until hovered.

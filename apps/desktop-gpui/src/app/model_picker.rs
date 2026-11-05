@@ -163,7 +163,7 @@ impl Workspace {
         }
     }
 
-    fn pick_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+    pub(super) fn pick_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
         let key = (selection.instance_id.clone(), selection.model.clone());
         let options = self.picker.remembered.get(&key).cloned();
         self.model_override = Some(ModelSelection { options, ..selection });
