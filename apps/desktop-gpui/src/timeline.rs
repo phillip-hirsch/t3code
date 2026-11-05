@@ -82,7 +82,6 @@ pub enum WorkRowKind {
         entry: Rc<Entry>,
         label: SharedString,
         expanded: bool,
-        pending_approval: bool,
     },
     /// A collapsed group's summary, "Ran 2 commands and read 1 file".
     Toggle {
@@ -673,8 +672,13 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                         || e.question_answered
                         || is_pending(e)
                 };
+                // A pending approval is drawn once, with its buttons, by the composer.
+                if is_pending(work) {
+                    index += 1;
+                    continue;
+                }
                 if standalone(work) || work.run_id.as_ref().is_some_and(|run| itemized.contains(run)) {
-                    rows.push(single_row(work, work.label.to_string(), is_pending(work), expanded));
+                    rows.push(single_row(work, work.label.to_string(), expanded));
                     index += 1;
                     continue;
                 }
@@ -723,7 +727,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                         } else {
                             work_log::single_tool_call_label(single)
                         };
-                        rows.push(single_row(single, label, false, expanded));
+                        rows.push(single_row(single, label, expanded));
                     } else {
                         let label = work_log::collapse_whitespace(&single.label).into();
                         rows.push(toggle_row(&entry.id, &group_id, label, &visible_refs, open));
@@ -797,14 +801,13 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     rows
 }
 
-fn single_row(entry: &Rc<Entry>, label: String, pending_approval: bool, expanded: &HashSet<SharedString>) -> Row {
+fn single_row(entry: &Rc<Entry>, label: String, expanded: &HashSet<SharedString>) -> Row {
     Row::Work(WorkRow {
         id: entry.id.clone(),
         kind: WorkRowKind::Single {
             entry: entry.clone(),
             label: work_log::collapse_whitespace(&label).into(),
             expanded: expanded.contains(&entry_key(&entry.id)),
-            pending_approval,
         },
         continues: false,
     })
@@ -1056,5 +1059,38 @@ mod tests {
             Row::User { grouped_with_previous: true, steer: Some(Steer::Steered), continues_steer: false, .. }
         ));
         assert!(matches!(rows[2], Row::User { continues_steer: true, .. }));
+    }
+
+    #[test]
+    fn a_pending_approval_is_left_to_the_composer() {
+        let items = vec![
+            item(
+                "u",
+                "user_message",
+                "r1",
+                "2026-11-04T10:00:00.000Z",
+                json!({"text": "go", "inputIntent": "turn_start"}),
+            ),
+            item(
+                "ap",
+                "approval_request",
+                "r1",
+                "2026-11-04T10:00:01.000Z",
+                json!({"requestId": "q", "requestKind": "command", "prompt": "rm -rf build"}),
+            ),
+        ];
+        let mut p = projection(items, json!([{"id": "r1", "status": "waiting"}]));
+        let request = |status: &str| {
+            serde_json::from_value(
+                json!({"id": "q", "kind": "command", "status": status, "responseCapability": {"type": "live"}}),
+            )
+            .unwrap()
+        };
+        p.runtime_requests = vec![request("pending")];
+        let pending = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        p.runtime_requests = vec![request("resolved")];
+        let resolved = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        assert_eq!(pending, ["user go", "working"]);
+        assert_eq!(resolved, ["user go", "working", "live rm -rf build"]);
     }
 }

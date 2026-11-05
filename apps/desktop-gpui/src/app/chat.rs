@@ -736,9 +736,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElem
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
-        WorkRowKind::Single { entry, label, expanded, pending_approval } => {
-            single_entry(entry, label, *expanded, *pending_approval, this, t)
-        }
+        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t),
         WorkRowKind::Toggle { group, summary, icon, .. } => row
             .id(ElementId::Name(work.id.clone()))
             .cursor_pointer()
@@ -875,7 +873,6 @@ fn single_entry(
     entry: &Rc<Entry>,
     label: &SharedString,
     expanded: bool,
-    pending_approval: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -914,20 +911,6 @@ fn single_entry(
                     .text_color(alpha(t.foreground, 0.8))
                     .child(message)
             }))
-            .into_any_element();
-    }
-    if pending_approval {
-        let waiting = h_flex()
-            .ml(px(30.))
-            .pb(px(4.))
-            .gap(px(4.))
-            .text_xs()
-            .text_color(t.warning)
-            .child(Icon::new(IconName::Shield).size(px(12.)))
-            .child("Waiting for approval");
-        return row
-            .child(work_line(entry.icon(), icon_color(t), label.clone(), muted, None))
-            .child(waiting)
             .into_any_element();
     }
     let failed = entry.failed() && entry.status != Some(Status::Declined);
