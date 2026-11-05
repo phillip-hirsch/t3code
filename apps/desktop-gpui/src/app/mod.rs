@@ -422,8 +422,6 @@ impl Workspace {
         };
         workspace.sync_snap_shot(window, cx);
         workspace.sync_saved_sessions(window, cx);
-        #[cfg(windows)]
-        preview::PreviewState::warm_up(window, cx);
         workspace
     }
 
@@ -983,6 +981,11 @@ impl Render for Workspace {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
+        #[cfg(windows)]
+        if !self.preview.warm_requested && self.right_panel_open() {
+            self.preview.warm_requested = true;
+            preview::PreviewState::warm_up(window, cx);
+        }
         self.sync_servers(window, cx);
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);

@@ -40,9 +40,10 @@ const MINI_HEADER: f32 = 28.;
 /// The inline chrome row: `h-7` plus its `mb-3`.
 const CHROME_ROW: f32 = 28. + 12.;
 
-/// How long after the window opens [`PreviewState::warm_up`] starts WebView2.
+/// How long after the right panel first opens [`PreviewState::warm_up`] starts WebView2, so the
+/// panel draws before the blocking build.
 #[cfg(windows)]
-const WARM_UP_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+const WARM_UP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// What a native WebView tells the panel, in the order it happened.
 pub(super) enum PageEvent {
@@ -116,6 +117,9 @@ pub(super) struct PreviewState {
     /// start without its startup cost.
     #[cfg(windows)]
     _warm: Option<WebView>,
+    /// The warm-up has started; it runs once, the first time the right panel opens.
+    #[cfg(windows)]
+    pub(super) warm_requested: bool,
     _subscription: Subscription,
 }
 
@@ -153,13 +157,16 @@ impl PreviewState {
             unreachable_details: HashSet::new(),
             #[cfg(windows)]
             _warm: None,
+            #[cfg(windows)]
+            warm_requested: false,
             _subscription: subscription,
         }
     }
 
-    /// Starts WebView2 once the window has drawn and loaded, in a hidden view kept for the
-    /// session: the view build blocks the UI thread, and the first one also starts WebView2's
-    /// browser process (several times longer). Dropping the view would end that process.
+    /// Starts WebView2 the first time the right panel opens (Files, file previews and the browser
+    /// live there), in a hidden view kept for the session: the view build blocks the UI thread,
+    /// and the first one also starts WebView2's browser process (several times longer). Dropping
+    /// the view would end that process. Sessions that never open the panel pay nothing.
     #[cfg(windows)]
     pub(super) fn warm_up(window: &mut Window, cx: &mut Context<Workspace>) {
         cx.spawn_in(window, async move |this, cx| {
