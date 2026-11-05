@@ -65,6 +65,7 @@ pub struct Workspace {
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
     error: Option<SharedString>,
+    sidebar: sidebar::SidebarState,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -101,6 +102,7 @@ impl Workspace {
             sending: false,
             model_override: None,
             error: None,
+            sidebar: sidebar::SidebarState::new(window, cx),
             _connection_task: Self::connect(cx),
             _stream_tasks: Vec::new(),
             _subscriptions: subscriptions,
@@ -217,10 +219,11 @@ impl Workspace {
                     log::warn!("bad server config event: {error}");
                 }
             }),
-            Self::pump(shell, cx, |this, value, _| {
+            Self::pump(shell, cx, |this, value, cx| {
                 if let Err(error) = this.shell.apply(value) {
                     log::warn!("bad shell event: {error}");
                 }
+                this.sync_sidebar_tick(cx);
             }),
         ];
         self.subscribe_thread(cx);
@@ -487,7 +490,7 @@ impl Render for Workspace {
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(
                 v_flex()
                     .flex_1()

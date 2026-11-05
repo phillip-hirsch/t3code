@@ -175,14 +175,17 @@ pub struct ProjectShell {
     #[serde(default)]
     pub default_model_selection: Option<ModelSelection>,
     #[serde(default)]
-    pub pinned_at: Option<String>,
-    #[serde(default)]
     pub archived_at: Option<String>,
+    /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
+    #[serde(default)]
+    pub project_icon: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lineage {
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
     #[serde(default)]
     pub relationship_to_parent: Option<String>,
     #[serde(default)]
@@ -193,6 +196,25 @@ pub struct Lineage {
 #[serde(rename_all = "camelCase")]
 pub struct PendingRequestSummary {
     pub kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBackgroundTask {
+    pub kind: String,
+    #[serde(default)]
+    pub awaited: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoal {
+    pub status: String,
+}
+
+/// Keeps "absent" (`None`) apart from an explicit `null` (`Some(None)`).
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -221,50 +243,64 @@ pub struct ThreadShell {
     #[serde(default)]
     pub deleted_at: Option<String>,
     pub updated_at: String,
-}
-
-/// Sidebar pill, in the web's precedence order (`apps/web/src/components/Sidebar.logic.ts`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadPill {
-    Approval,
-    Input,
-    Waiting,
-    Working,
-    Failed,
-    Limited,
-    PlanReady,
-    Idle,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub interaction_mode: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub latest_run_id: Option<String>,
+    #[serde(default)]
+    pub active_run_id: Option<String>,
+    #[serde(default)]
+    pub latest_run_requested_at: Option<String>,
+    #[serde(default)]
+    pub latest_run_started_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub latest_run_completed_at: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub activity_run_started_at: Option<Option<String>>,
+    #[serde(default)]
+    pub latest_user_message_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub latest_user_authored_message_at: Option<Option<String>>,
+    #[serde(default)]
+    pub pending_guest_message_count: u32,
+    #[serde(default)]
+    pub pending_background_tasks: Vec<PendingBackgroundTask>,
+    #[serde(default)]
+    pub goal: Option<ThreadGoal>,
+    #[serde(default)]
+    pub title_regeneration: Option<Value>,
+    #[serde(default)]
+    pub settled_override: Option<String>,
+    #[serde(default)]
+    pub settled_at: Option<String>,
+    #[serde(default)]
+    pub unsettled_at: Option<String>,
+    #[serde(default)]
+    pub snoozed_until: Option<String>,
+    #[serde(default)]
+    pub snoozed_at: Option<String>,
+    #[serde(default)]
+    pub pin_order_key: Option<String>,
+    #[serde(default)]
+    pub last_visited_at: Option<String>,
 }
 
 impl ThreadShell {
     /// Subagents and side chats live under their parent, not in the main list.
     pub fn is_listed(&self) -> bool {
         self.lineage.relationship_to_parent.as_deref() != Some("subagent") && self.lineage.side_chat != Some(true)
-    }
-
-    pub fn pill(&self) -> ThreadPill {
-        if let Some(request) = &self.pending_runtime_request {
-            match request.kind.as_str() {
-                "user_input" => return ThreadPill::Input,
-                "auth_refresh" => {}
-                _ => return ThreadPill::Approval,
-            }
-        }
-        let status = self.activity_run_status.as_deref().unwrap_or(&self.status);
-        if is_active_run_status(status) {
-            return if self.blocked_on_thread_wait == Some(true) { ThreadPill::Waiting } else { ThreadPill::Working };
-        }
-        if self.status == "failed" {
-            return if self.last_error_class.as_deref() == Some("usage_limit") {
-                ThreadPill::Limited
-            } else {
-                ThreadPill::Failed
-            };
-        }
-        if self.has_actionable_proposed_plan {
-            return ThreadPill::PlanReady;
-        }
-        ThreadPill::Idle
     }
 }
 
@@ -373,21 +409,6 @@ impl ShellState {
             self.sequence = sequence;
         }
         Ok(())
-    }
-
-    /// Listed threads for a project, newest activity first.
-    pub fn project_threads(&self, project_id: &str) -> Vec<&ThreadShell> {
-        let mut threads: Vec<_> = self
-            .threads
-            .iter()
-            .filter(|t| {
-                t.project_id == project_id && t.is_listed() && t.archived_at.is_none() && t.deleted_at.is_none()
-            })
-            .collect();
-        threads.sort_by(|a, b| {
-            b.pinned_at.is_some().cmp(&a.pinned_at.is_some()).then_with(|| b.updated_at.cmp(&a.updated_at))
-        });
-        threads
     }
 }
 
