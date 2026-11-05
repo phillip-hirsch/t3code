@@ -7,6 +7,7 @@
 use super::*;
 use crate::app::Target;
 use crate::new_thread::{EnvMode, WorkspaceChoice};
+use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
 
 impl Workspace {
     fn pr_handoff_busy(&self) -> bool {
@@ -50,33 +51,58 @@ impl Workspace {
         window.push_notification(Notification::success(description).title("Asked in a thread"), cx);
     }
 
-    /// `startHandoff`: a checkout of the pull request with a thread on it, and the task if any.
+    /// `startHandoff` from the panel: a checkout of the shown pull request with a thread on it.
     pub(super) fn start_pr_handoff(
         &mut self,
         kind: String,
         task: Option<String>,
-        mode: &'static str,
+        mode: CheckoutMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         if self.pr_handoff_busy() {
             return;
         }
-        let Some(root) = self.pr_checkout_root(&detail) else { return };
-        let term = logic::terminology(&detail.provider).0;
-        let project_id = detail.project_id.clone();
+        let request = CheckoutRequest {
+            project_id: detail.project_id.clone(),
+            url: detail.url.clone(),
+            term: logic::terminology(&detail.provider).0,
+            task,
+            mode,
+        };
         self.set_pr_handoff(Some(kind));
+        self.prepare_pr_checkout(request, |this| this.set_pr_handoff(None), window, cx);
+    }
+
+    /// `startHandoff`'s checkout: a new draft in the project, the pull request checked out for it,
+    /// the draft pointed at the checkout and given the task. `settled` runs once it ends either way.
+    pub(in crate::app) fn prepare_pr_checkout(
+        &mut self,
+        request: CheckoutRequest,
+        settled: fn(&mut Workspace),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.shell.projects.iter().find(|p| p.id == request.project_id).map(|p| p.workspace_root.clone());
+        let (Some(client), Some(root)) = (self.client(), root) else {
+            settled(self);
+            return;
+        };
+        let term = request.term;
         window.push_notification(Notification::info("").title(format!("Preparing the {term} checkout...")), cx);
         // The checkout is made for the thread, so the draft's thread id exists first.
-        self.start_draft(project_id.clone(), window, cx);
-        let Some(thread_id) = self.terminal_thread(true) else { return };
-        let input = json!({"cwd": root, "reference": detail.url, "mode": mode, "threadId": thread_id});
+        self.start_draft(request.project_id.clone(), window, cx);
+        let Some(thread_id) = self.terminal_thread(true) else {
+            settled(self);
+            return;
+        };
+        let input = request.input(&root, &thread_id);
+        let CheckoutRequest { project_id, task, .. } = request;
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("git.preparePullRequestThread", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.set_pr_handoff(None);
+                settled(this);
                 let value = match result {
                     Ok(value) => value,
                     Err(error) => {
@@ -174,7 +200,7 @@ impl Workspace {
         let (_, stale) = panel.checks_state(&detail);
         let checks = if stale { &[][..] } else { detail.checks.as_slice() };
         let prompt = logic::fix_findings_handoff(&logic::HandoffSubject::of(&detail), &activity, checks);
-        self.start_pr_handoff("findings".into(), Some(prompt), "worktree", window, cx);
+        self.start_pr_handoff("findings".into(), Some(prompt), CheckoutMode::Worktree, window, cx);
     }
 
     pub(super) fn fix_pr_thread(
@@ -185,13 +211,19 @@ impl Workspace {
     ) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let prompt = logic::fix_thread_handoff(&logic::HandoffSubject::of(&detail), thread);
-        self.start_pr_handoff(format!("finding:thread:{}", thread.id), Some(prompt), "worktree", window, cx);
+        self.start_pr_handoff(
+            format!("finding:thread:{}", thread.id),
+            Some(prompt),
+            CheckoutMode::Worktree,
+            window,
+            cx,
+        );
     }
 
     pub(super) fn resolve_pr_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let prompt = logic::resolve_conflicts_prompt(&logic::HandoffSubject::of(&detail));
-        self.start_pr_handoff("conflicts".into(), Some(prompt), "worktree", window, cx);
+        self.start_pr_handoff("conflicts".into(), Some(prompt), CheckoutMode::Worktree, window, cx);
     }
 
     /// The selected lines and a request about them, for an agent (`addSelectionToAgent`).
@@ -239,13 +271,13 @@ impl Workspace {
                         Lucide::GitBranch,
                     )
                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                        this.start_pr_handoff("checkout:worktree".into(), None, "worktree", window, cx)
+                        this.start_pr_handoff("checkout:worktree".into(), None, CheckoutMode::Worktree, window, cx)
                     })),
                 )
                 .item(
                     entry("In this repository", "Switches the branch you are working in.", Lucide::FolderGit2)
                         .on_click(window.listener_for(&view, |this, _, window, cx| {
-                            this.start_pr_handoff("checkout:local".into(), None, "local", window, cx)
+                            this.start_pr_handoff("checkout:local".into(), None, CheckoutMode::Local, window, cx)
                         })),
                 )
             })
