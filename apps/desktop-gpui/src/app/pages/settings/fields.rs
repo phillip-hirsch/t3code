@@ -83,14 +83,13 @@ impl Workspace {
     }
 
     /// A whole-number stepper kept across frames (`NumberField`): typing stays local until
-    /// blur, Enter or a step commits it, clamped to `min..=max`; anything else reverts.
+    /// blur, Enter or a `step` commits it, clamped to `min..=max`; anything else reverts.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn number_field(
         &mut self,
         key: &str,
         value: i64,
-        min: i64,
-        max: i64,
+        (min, max, step): (i64, i64, i64),
         window: &mut Window,
         cx: &mut Context<Self>,
         on_commit: impl Fn(&mut Self, i64, &mut Window, &mut Context<Self>) + 'static,
@@ -102,7 +101,7 @@ impl Workspace {
         });
         state.update(cx, |field, cx| {
             field.on_commit = Some(on_commit);
-            (field.min, field.max) = (min, max);
+            (field.min, field.max, field.step) = (min, max, step);
             if field.value != value {
                 field.value = value;
                 field.input.update(cx, |input, cx| input.set_value(value.to_string(), window, cx));
@@ -117,6 +116,7 @@ pub(in crate::app) struct NumberField {
     value: i64,
     min: i64,
     max: i64,
+    step: i64,
     on_commit: Option<OnCommit<i64>>,
     workspace: WeakEntity<Workspace>,
     _subscriptions: [Subscription; 2],
@@ -136,11 +136,20 @@ impl NumberField {
             cx.subscribe_in(&input, window, |this, _, NumberInputEvent::Step(action), window, cx| {
                 let typed = this.input.read(cx).value().trim().parse::<f64>();
                 let current = typed.map_or(this.value, |typed| typed.round() as i64);
-                let step = if matches!(action, StepAction::Increment) { 1 } else { -1 };
-                this.commit(Some(current + step), window, cx);
+                let step = if matches!(action, StepAction::Increment) { this.step } else { -this.step };
+                this.commit(Some(current.saturating_add(step)), window, cx);
             }),
         ];
-        Self { input, value, min: i64::MIN, max: i64::MAX, on_commit: None, workspace, _subscriptions: subscriptions }
+        Self {
+            input,
+            value,
+            min: i64::MIN,
+            max: i64::MAX,
+            step: 1,
+            on_commit: None,
+            workspace,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn commit(&mut self, next: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {

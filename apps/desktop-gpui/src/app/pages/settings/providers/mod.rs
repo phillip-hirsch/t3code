@@ -31,7 +31,6 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::system::NumberField;
 use super::system::background;
 use super::widgets::{SettingRow, select_trigger};
 use crate::app::Workspace;
@@ -49,7 +48,6 @@ pub(super) struct ProvidersPage {
     inputs: HashMap<SharedString, PageInput>,
     models: models::ModelsUi,
     environment: instances::EnvironmentDraft,
-    health: Option<NumberField>,
     /// Managed Codex instances whose folded Runtime section is open.
     runtime_open: HashSet<String>,
 }
@@ -69,7 +67,7 @@ const IDLE_COMPACTION_MODES: &[(&str, &str)] =
     &[("onReturn", "When you return"), ("beforeCacheExpires", "Before the cache expires (beta)"), ("off", "Never")];
 
 /// `PROVIDER_HEALTH_INTERVAL_STEP_SECONDS`.
-const HEALTH_STEP_SECONDS: f64 = 30.;
+const HEALTH_STEP_SECONDS: i64 = 30;
 const HEALTH_KEY: &str = "providerHealthRefreshInterval";
 /// Its index in [`background::DURATION_KEYS`].
 const HEALTH: usize = 1;
@@ -187,7 +185,7 @@ impl Workspace {
         let content = [
             providers.into_any_element(),
             self.render_usage_limit_sources(window, cx),
-            self.render_providers_advanced(&page, window, cx).into_any_element(),
+            self.render_providers_advanced(window, cx).into_any_element(),
         ];
         let view = self.settings_view();
         self.settings_page("providers", &view, content, cx)
@@ -238,12 +236,7 @@ impl Workspace {
 
     /// Providers › Advanced: the health check interval, a Background activity override
     /// (`backgroundActivityOverrideSettings`), then `CompactIdleThreadsRow`.
-    fn render_providers_advanced(
-        &mut self,
-        page: &Entity<ProvidersPage>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_providers_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
 
@@ -256,18 +249,17 @@ impl Workspace {
             }
             patch
         });
-        if page.read(cx).health.is_none() {
-            let field = NumberField::new(HEALTH_STEP_SECONDS, 0., f64::MAX, window, cx, |this, seconds, window, cx| {
-                let patch = background::override_patch(&this.server_info.settings, HEALTH_KEY, json!(seconds * 1000.));
+        let input = self.number_field(
+            "provider-health-check-interval",
+            seconds as i64,
+            (0, i64::MAX, HEALTH_STEP_SECONDS),
+            window,
+            cx,
+            |this, seconds, window, cx| {
+                let patch = background::override_patch(&this.server_info.settings, HEALTH_KEY, json!(seconds * 1000));
                 this.update_settings(patch, window, cx);
-            });
-            page.update(cx, |page, _| page.health = Some(field));
-        }
-        let input = page.update(cx, |page, cx| {
-            let field = page.health.as_mut().expect("created above");
-            field.sync(seconds as f64, window, cx);
-            field.input.clone()
-        });
+            },
+        );
         let health = SettingRow::new("provider-health-check-interval")
             .description("Refresh provider status, versions, and models in the background. Set to 0 to disable.")
             .reset(reset_health)

@@ -9,13 +9,12 @@ mod archive;
 pub(super) mod background;
 mod cleanup;
 
-use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction};
+use gpui_kit::component::input::{InputState, NumberInput};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
@@ -23,9 +22,9 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
@@ -322,15 +321,23 @@ impl Workspace {
         if self.client().is_none() {
             return;
         }
-        let workspace = cx.weak_entity();
-        let fields = cx.new(|cx| BackgroundFields::new(workspace.clone(), window, cx));
         let view = cx.entity();
         window.open_dialog(cx, move |dialog: Dialog, window, cx| {
             let t = *theme::tokens(cx);
             let settings = view.read(cx).settings_json().clone();
             let resolved = background::resolve_server(&settings);
-            fields.update(cx, |fields, cx| fields.sync(&resolved, window, cx));
-            let fields = fields.read(cx);
+            // (min, step) per `background::DURATION_KEYS`, as the web's `IntervalSecondsField`s.
+            let inputs = [(0, 5), (0, 30), (5, 5), (5, 30)].into_iter().enumerate().map(|(index, (min, step))| {
+                let key = background::DURATION_KEYS[index];
+                let seconds = resolved.seconds(index) as i64;
+                view.update(cx, |this, cx| {
+                    this.number_field(key, seconds, (min, i64::MAX, step), window, cx, move |this, seconds, window, cx| {
+                        let patch = background::override_patch(this.settings_json(), key, json!(seconds * 1000));
+                        this.update_settings(patch, window, cx)
+                    })
+                })
+            });
+            let inputs: Vec<Entity<InputState>> = inputs.collect();
             let entry = |title: &'static str, description: &'static str, control: AnyElement, top: bool| {
                 h_flex()
                     .px_4()
@@ -426,25 +433,25 @@ impl Workspace {
                         .child(entry(
                             "Git fetch interval",
                             "Refresh remote branch status in the background.",
-                            seconds(&fields.inputs[0].input),
+                            seconds(&inputs[0]),
                             true,
                         ))
                         .child(entry(
                             "Provider health interval",
                             "Refresh provider availability, versions, and auth state. Model catalog updates follow Provider update checks.",
-                            seconds(&fields.inputs[1].input),
+                            seconds(&inputs[1]),
                             true,
                         ))
                         .child(entry(
                             "Host power monitor",
                             "Poll host power state while clients are active.",
-                            seconds(&fields.inputs[2].input),
+                            seconds(&inputs[2]),
                             true,
                         ))
                         .child(entry(
                             "Idle host monitor",
                             "Poll host power state when no foreground client is active.",
-                            seconds(&fields.inputs[3].input),
+                            seconds(&inputs[3]),
                             true,
                         ))
                         .child(h_flex().flex_wrap().children(pauses)),
@@ -471,109 +478,6 @@ impl Workspace {
                 )
         });
     }
-}
-
-/// The four interval fields of the background activity dialog.
-struct BackgroundFields {
-    inputs: Vec<NumberField>,
-}
-
-impl BackgroundFields {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // (min, step) per `background::DURATION_KEYS`, as the web's `IntervalSecondsField`s.
-        let fields = [(0., 5.), (0., 30.), (5., 5.), (5., 30.)];
-        let inputs = background::DURATION_KEYS
-            .iter()
-            .zip(fields)
-            .map(|(key, (min, step))| {
-                let workspace = workspace.clone();
-                NumberField::new(step, min, f64::MAX, window, cx, move |_, seconds, window, cx| {
-                    let _ = workspace.update(cx, |this, cx| {
-                        let patch = background::override_patch(this.settings_json(), key, json!(seconds as u64 * 1000));
-                        this.update_settings(patch, window, cx)
-                    });
-                })
-            })
-            .collect();
-        Self { inputs }
-    }
-
-    fn sync(&mut self, resolved: &background::Resolved, window: &mut Window, cx: &mut App) {
-        for (i, field) in self.inputs.iter_mut().enumerate() {
-            field.sync(resolved.seconds(i) as f64, window, cx);
-        }
-    }
-}
-
-/// A number field that commits on Enter, on blur and on its step buttons, like base-ui's
-/// `NumberField` `onValueCommitted`. It follows the saved value whenever that changes.
-pub(super) struct NumberField {
-    pub(super) input: Entity<InputState>,
-    saved: Option<f64>,
-    _subscriptions: [Subscription; 2],
-}
-
-impl NumberField {
-    pub(super) fn new<S: 'static>(
-        step: f64,
-        min: f64,
-        max: f64,
-        window: &mut Window,
-        cx: &mut Context<S>,
-        commit: impl Fn(&mut S, f64, &mut Window, &mut Context<S>) + 'static,
-    ) -> Self {
-        let input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx);
-            // Steps come back as events, so a step commits like Enter does.
-            state.set_step(None, window, cx);
-            state
-        });
-        let commit = Rc::new(commit);
-        let entered = commit.clone();
-        let subscriptions = [
-            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let parsed = input.read(cx).value().trim().parse::<f64>().ok().filter(|v| v.is_finite());
-                    match parsed {
-                        Some(value) => {
-                            let value = value.round().clamp(min, max);
-                            input.update(cx, |input, cx| input.set_value(format_number(value), window, cx));
-                            entered(this, value, window, cx);
-                        }
-                        // An empty or invalid entry goes back to the saved value on the next sync.
-                        None => input.update(cx, |input, cx| input.set_value("", window, cx)),
-                    }
-                }
-            }),
-            cx.subscribe_in(&input, window, move |this, input, event: &NumberInputEvent, window, cx| {
-                let NumberInputEvent::Step(action) = event;
-                let current = input.read(cx).value().trim().parse::<f64>().unwrap_or(min);
-                let value = match action {
-                    StepAction::Increment => current + step,
-                    StepAction::Decrement => current - step,
-                }
-                .round()
-                .clamp(min, max);
-                input.update(cx, |input, cx| input.set_value(format_number(value), window, cx));
-                commit(this, value, window, cx);
-            }),
-        ];
-        Self { input, saved: None, _subscriptions: subscriptions }
-    }
-
-    /// Shows `value` when it differs from the value last shown as saved.
-    pub(super) fn sync(&mut self, value: f64, window: &mut Window, cx: &mut App) {
-        let text = format_number(value);
-        let blank = self.input.read(cx).value().is_empty();
-        if self.saved != Some(value) || blank {
-            self.saved = Some(value);
-            self.input.update(cx, |input, cx| input.set_value(text, window, cx));
-        }
-    }
-}
-
-fn format_number(value: f64) -> String {
-    format!("{value}")
 }
 
 fn text(content: impl Into<SharedString>) -> AnyElement {

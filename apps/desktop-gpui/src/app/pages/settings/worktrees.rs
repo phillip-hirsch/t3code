@@ -223,9 +223,10 @@ impl Workspace {
         let days = cleanup[field].as_i64();
         let value: AnyElement = match days {
             Some(days) => {
-                let input = self.number_field(field, days, minimum, 3650, window, cx, move |this, days, window, cx| {
-                    this.update_settings(cleanup_patch(field, json!(days)), window, cx)
-                });
+                let input =
+                    self.number_field(field, days, (minimum, 3650, 1), window, cx, move |this, days, window, cx| {
+                        this.update_settings(cleanup_patch(field, json!(days)), window, cx)
+                    });
                 div()
                     .w(px(128.))
                     .child(

@@ -9,20 +9,20 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
-use super::{NumberField, format_bytes, notify_error, now_ms, relative_label, text};
+use super::{format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
 use crate::rpc::{RpcClient, StreamEvent};
 use crate::theme::{self, FONT_MONO, Tokens};
 
 /// `DATABASE_COMPACTION_RECOMMENDED_BYTES`.
 const COMPACTION_RECOMMENDED_BYTES: f64 = 1024. * 1024. * 1024.;
-const RETENTION_MAX_DAYS: f64 = 3650.;
+const RETENTION_MAX_DAYS: i64 = 3650;
 /// The days a retention rule starts at when switched on.
 const RETENTION_ON_DAYS: u64 = 8;
 
@@ -40,28 +40,11 @@ pub(super) struct StorageState {
     last_run_open: bool,
     /// The web keeps this per environment in local storage; this client keeps it while Settings is open.
     database_dismissed: bool,
-    artifacts: NumberField,
-    logs: NumberField,
     _streams: Vec<Task<()>>,
 }
 
 impl StorageState {
-    fn new(
-        client: Option<RpcClient>,
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let retention = |key: &'static str, window: &mut Window, cx: &mut Context<Self>| {
-            let workspace = workspace.clone();
-            NumberField::new(1., 1., RETENTION_MAX_DAYS, window, cx, move |_, days, window, cx| {
-                let _ = workspace.update(cx, |this, cx| {
-                    this.update_settings(json!({ "storageCleanup": { key: days as u64 } }), window, cx)
-                });
-            })
-        };
-        let artifacts = retention("browserArtifactsAfterDays", window, cx);
-        let logs = retention("logsAfterDays", window, cx);
+    fn new(client: Option<RpcClient>, cx: &mut Context<Self>) -> Self {
         let streams = client
             .map(|client| {
                 vec![
@@ -86,8 +69,6 @@ impl StorageState {
             running: false,
             last_run_open: false,
             database_dismissed: false,
-            artifacts,
-            logs,
             _streams: streams,
         }
     }
@@ -207,9 +188,7 @@ impl Workspace {
     pub(super) fn render_storage_sections(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
         let client = self.client();
-        let workspace = cx.weak_entity();
-        let state = window
-            .use_keyed_state("settings-storage", cx, |window, cx| StorageState::new(client, workspace, window, cx));
+        let state = window.use_keyed_state("settings-storage", cx, |_, cx| StorageState::new(client, cx));
         let info = &self.server_info;
         let (cleanup, cleanup_run, database) = (
             info.capability("storageCleanup"),
@@ -228,7 +207,6 @@ impl Workspace {
             sections.push(loose_section("artifacts-and-logs", "Artifacts and logs", [notice]));
             return sections;
         }
-        let storage = &self.settings_json()["storageCleanup"];
         let rows = [
             (
                 "Delete old browser artifacts",
@@ -242,15 +220,20 @@ impl Workspace {
             ),
         ]
         .map(|(title, description, key)| {
-            let days = storage[key].as_f64();
-            let field = state.update(cx, |state, cx| {
-                let field = if key == "logsAfterDays" { &mut state.logs } else { &mut state.artifacts };
-                if let Some(days) = days {
-                    field.sync(days, window, cx);
-                }
-                field.input.clone()
+            let days = self.settings_json()["storageCleanup"][key].as_f64();
+            let field = days.map(|days| {
+                self.number_field(
+                    key,
+                    days.round() as i64,
+                    (1, RETENTION_MAX_DAYS, 1),
+                    window,
+                    cx,
+                    move |this, days, window, cx| {
+                        this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx)
+                    },
+                )
             });
-            let control = self.retention_control(key, title, days, &field, &t, cx);
+            let control = self.retention_control(key, title, field.as_ref(), &t, cx);
             RowFrame::new(title).description(text(description)).control(control).render(&t).into_any_element()
         });
         sections.push(settings_section("artifacts-and-logs", "Artifacts and logs", rows, &t));
@@ -265,8 +248,7 @@ impl Workspace {
         &self,
         key: &'static str,
         label: &'static str,
-        days: Option<f64>,
-        input: &Entity<gpui_kit::component::input::InputState>,
+        input: Option<&Entity<gpui_kit::component::input::InputState>>,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -274,8 +256,8 @@ impl Workspace {
         let connected = self.client().is_some();
         h_flex()
             .gap_3()
-            .child(match days {
-                Some(_) => NumberInput::new(input)
+            .child(match input {
+                Some(input) => NumberInput::new(input)
                     .small()
                     .w(px(136.))
                     .accessibility_label(format!("{label} in days"))
@@ -285,7 +267,7 @@ impl Workspace {
             })
             .child(
                 Switch::new(SharedString::from(format!("retention-{key}")))
-                    .checked(days.is_some())
+                    .checked(input.is_some())
                     .accessibility_label(label)
                     .disabled(!connected)
                     .on_click(move |enabled, window, cx| {

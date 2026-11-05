@@ -309,9 +309,10 @@ impl Workspace {
             },
         ));
         let field = days.map(|days| {
-            let field = self.number_field("auto-settle-days", days, 1, 90, window, cx, |this, days, window, cx| {
-                this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
-            });
+            let field =
+                self.number_field("auto-settle-days", days, (1, 90, 1), window, cx, |this, days, window, cx| {
+                    this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
+                });
             div().w(px(96.)).child(NumberInput::new(&field).small())
         });
         let keep = self.server_info.capability("threadAutoSettlementScope");
@@ -593,8 +594,7 @@ impl Workspace {
         let field = self.number_field(
             &format!("snooze-amount-{key}"),
             amount,
-            1,
-            max,
+            (1, max, 1),
             window,
             cx,
             move |this, amount, window, cx| {
