@@ -146,7 +146,8 @@ struct Group {
     path: String,
     side: Side,
     line: u64,
-    threads: Vec<ReviewThread>,
+    /// Indexes into the activity's `review_threads`.
+    threads: Vec<usize>,
     pending: Vec<super::write::PendingComment>,
     draft: bool,
 }
@@ -183,7 +184,9 @@ fn merge_comments(first: &[ThreadComment], later: &[ThreadComment]) -> Vec<Threa
 async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, String> {
     let endpoint = endpoint.ok_or("Not connected to the environment.")?;
     let request = async move {
-        let response = reqwest::Client::new()
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let response = CLIENT
+            .get_or_init(reqwest::Client::new)
             .post(format!("{}/api/pull-requests/diff", endpoint.http_base))
             .bearer_auth(&endpoint.bearer_token)
             .json(&input)
@@ -192,7 +195,11 @@ async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, St
             .await
             .map_err(|error| error.to_string())?;
         let status = response.status();
-        let value: Value = response.json().await.unwrap_or(Value::Null);
+        let value: Value = match response.json().await {
+            Ok(value) => value,
+            Err(error) if status.is_success() => return Err(format!("Unreadable diff: {error}")),
+            Err(_) => Value::Null,
+        };
         if status.is_success() {
             return Ok(value);
         }
@@ -588,18 +595,13 @@ impl Workspace {
         }
 
         // Threads sit under their line when the shown diff has it; the rest list above the diff.
-        let threads = self
-            .pull_requests
-            .panel
-            .as_ref()
-            .and_then(|p| p.activity.as_ref())
-            .map(|a| a.review_threads.clone())
-            .unwrap_or_default();
+        let activity = self.pull_requests.panel.as_ref().and_then(|p| p.activity.clone());
+        let threads = activity.as_deref().map_or(&[][..], |a| a.review_threads.as_slice());
         let code = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()).expect("checked above");
         let shown_set: HashSet<&str> = shown.iter().map(String::as_str).collect();
         let mut groups: HashMap<SharedString, Group> = HashMap::new();
-        let mut orphans: Vec<ReviewThread> = Vec::new();
-        for thread in threads {
+        let mut orphans: Vec<&ReviewThread> = Vec::new();
+        for (index, thread) in threads.iter().enumerate() {
             let side = Side::parse(&thread.side);
             let placed = code.commit.is_none()
                 && shown_set.contains(thread.path.as_str())
@@ -607,10 +609,7 @@ impl Workspace {
                     code.patches.get(&thread.path).is_some_and(|f| diff_logic::line_in_diff(f, side, line))
                 });
             match (placed, thread.line) {
-                (true, Some(line)) => {
-                    let path = thread.path.clone();
-                    group_at(&mut groups, &path, side, line).threads.push(thread);
-                }
+                (true, Some(line)) => group_at(&mut groups, &thread.path, side, line).threads.push(index),
                 _ => orphans.push(thread),
             }
         }
@@ -667,10 +666,10 @@ impl Workspace {
             .render_annotation(move |annotation, window, cx| {
                 let ElementId::Name(key) = annotation.id() else { return div().into_any_element() };
                 let Some(group) = groups.get(key) else { return div().into_any_element() };
-                let group = group.clone();
+                let threads = activity.as_deref().map_or(&[][..], |a| a.review_threads.as_slice());
                 view.update(cx, |this, cx| {
                     let mut column = v_flex().py(px(4.));
-                    for thread in &group.threads {
+                    for thread in group.threads.iter().filter_map(|&index| threads.get(index)) {
                         column = column.child(this.render_review_thread(thread, &tokens, window, cx));
                     }
                     for comment in &group.pending {
@@ -823,15 +822,17 @@ impl Workspace {
     fn render_pr_code_toolbar(&self, detail: &Rc<Detail>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let Some(code) = panel.code.as_ref() else { return div().into_any_element() };
-        let mut commits = panel.activity.as_ref().map(|a| a.commits.clone()).unwrap_or_default();
-        commits.sort_by_key(|c| std::cmp::Reverse(parse_ms(&c.committed_date).unwrap_or(0)));
-        let selected = code.commit.as_ref().and_then(|oid| commits.iter().find(|c| &c.oid == oid));
+        let activity = panel.activity.clone().unwrap_or_default();
+        let mut newest_first: Vec<usize> = (0..activity.commits.len()).collect();
+        newest_first
+            .sort_by_cached_key(|&i| std::cmp::Reverse(parse_ms(&activity.commits[i].committed_date).unwrap_or(0)));
+        let selected = code.commit.as_ref().and_then(|oid| activity.commits.iter().find(|c| &c.oid == oid));
         let scope_label: SharedString =
             selected.map_or_else(|| "All commits".into(), |c| c.message_headline.clone()).into();
         let view = cx.entity();
         let current = code.commit.clone();
         let scope =
-            (!commits.is_empty()).then(|| {
+            (!activity.commits.is_empty()).then(|| {
                 Button::new("pr-code-scope")
                     .custom(
                         gpui_kit::component::button::ButtonCustomVariant::new(cx)
@@ -876,7 +877,7 @@ impl Workspace {
                                 }))
                             };
                         let mut menu = menu.min_w(px(220.)).item(pick("All commits".into(), None, None, window));
-                        for commit in &commits {
+                        for commit in newest_first.iter().map(|&i| &activity.commits[i]) {
                             menu = menu.item(pick(
                                 commit.message_headline.clone().into(),
                                 Some(commit.oid.clone()),
@@ -1117,7 +1118,7 @@ impl Workspace {
     }
 
     /// "Conversations not on the current diff", folded above the viewer.
-    fn render_pr_orphans(&mut self, threads: Vec<ReviewThread>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pr_orphans(&mut self, threads: Vec<&ReviewThread>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let code = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()).expect("the Code tab is open");
         let open = code.orphans_open;
         let partial = code.next_cursor().is_some();
@@ -1146,7 +1147,7 @@ impl Workspace {
             }));
         let mut body = Vec::new();
         if open {
-            let mut by_path: Vec<(String, Vec<ReviewThread>)> = Vec::new();
+            let mut by_path: Vec<(String, Vec<&ReviewThread>)> = Vec::new();
             for thread in threads {
                 match by_path.iter_mut().find(|(p, _)| *p == thread.path) {
                     Some((_, list)) => list.push(thread),
@@ -1155,7 +1156,7 @@ impl Workspace {
             }
             for (path, threads) in by_path {
                 let mut cards = Vec::new();
-                for thread in &threads {
+                for thread in threads {
                     cards.push(
                         v_flex()
                             .children(thread.line.map(|line| {

@@ -7,6 +7,15 @@ use gpui_kit::{Image, ImageFormat, img};
 
 use super::*;
 
+/// A picture larger than this is not read; the initial stands in.
+const MAX_AVATAR_BYTES: usize = 4 * 1024 * 1024;
+
+/// One client for every picture, so they share connections instead of a TLS handshake each.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap_or_default())
+}
+
 /// Pictures by address; `None` marks one being read or that could not be.
 fn cache() -> &'static Mutex<HashMap<String, Option<Arc<Image>>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Image>>>>> = OnceLock::new();
@@ -35,14 +44,21 @@ pub(super) fn avatar_or(actor: Option<&Actor>, size: f32, fallback: gpui_kit::Di
 async fn read(url: String) -> Option<Arc<Image>> {
     let bytes = crate::runtime()
         .spawn(async move {
-            let response = reqwest::Client::new().get(url).timeout(Duration::from_secs(20)).send().await.ok()?;
-            let response = response.error_for_status().ok()?;
+            let mut response = http().get(url).send().await.ok()?.error_for_status().ok()?;
             let mime = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.split(';').next().unwrap_or_default().trim().to_owned());
-            Some((mime, response.bytes().await.ok()?.to_vec()))
+            // The host's address, so the size is checked as it streams, not only by Content-Length.
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.ok()? {
+                if body.len() + chunk.len() > MAX_AVATAR_BYTES {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Some((mime, body))
         })
         .await
         .ok()??;
@@ -52,9 +68,9 @@ async fn read(url: String) -> Option<Arc<Image>> {
 }
 
 impl Workspace {
-    /// Reads the pictures of everyone the shown pull request names that are not read yet.
-    pub(super) fn read_pr_avatars(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+    /// Reads the pictures of everyone pull request `key` names that are not read yet.
+    pub(super) fn read_pr_avatars(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(panel) = self.pr_panel_ref(key) else { return };
         let mut actors: Vec<&Actor> = Vec::new();
         if let Some(detail) = &panel.detail {
             actors.extend(detail.author.iter());

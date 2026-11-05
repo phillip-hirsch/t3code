@@ -22,12 +22,19 @@ fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
 }
 
 impl Workspace {
-    /// The stack and linked threads, read once the detail says what the host supports.
+    /// The shown pull request's stack and linked threads.
     pub(super) fn read_pr_extras(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.pull_requests.panel.as_ref().map(|p| p.reference.key()) {
+            self.read_pr_extras_of(&key, cx);
+        }
+    }
+
+    /// `key`'s stack and linked threads, read once the detail says what the host supports.
+    pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(panel) = self.pr_panel_ref(key) else { return };
         let Some(detail) = panel.detail.clone() else { return };
-        let key = panel.reference.key();
+        let key = key.to_owned();
         let mut reference = panel.reference.to_json();
         if detail.capabilities.stacks == Some(true) {
             let (client, key) = (client.clone(), key.clone());
@@ -41,10 +48,14 @@ impl Workspace {
                 let result = client.request("pullRequests.stack", input).await;
                 let _ = this.update(cx, |this, cx| {
                     let Some(panel) = this.pr_panel(&key) else { return };
-                    match result {
-                        Ok(value) => {
-                            panel.stack = serde_json::from_value::<Stack>(value).ok().map(Rc::new);
+                    match result.map(serde_json::from_value::<Option<Stack>>) {
+                        Ok(Ok(stack)) => {
+                            panel.stack = stack.map(Rc::new);
                             panel.stack_failed = false;
+                        }
+                        Ok(Err(error)) => {
+                            log::warn!("unreadable pull request stack: {error}");
+                            panel.stack_failed = true;
                         }
                         Err(_) => panel.stack_failed = true,
                     }
@@ -402,7 +413,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.maintainer_saving = false;
                 match result {
-                    Ok(_) => this.read_pr_detail(cx),
+                    Ok(_) => this.read_pr_detail_of(&key, cx),
                     Err(error) => {
                         panel.maintainer_choice = None;
                         toast_error(
@@ -466,9 +477,9 @@ impl Workspace {
                         let label =
                             format!("#{number} {}", layer.title.clone().unwrap_or_else(|| layer.head_branch.clone()));
                         let reference = Reference { number, ..reference.clone() };
-                        let icon = match (layer.state.as_str(), layer.is_draft) {
-                            ("merged", _) => Lucide::GitMerge,
-                            ("closed", _) => Lucide::GitPullRequestClosed,
+                        let icon = match (layer.state, layer.is_draft) {
+                            (list_logic::State::Merged, _) => Lucide::GitMerge,
+                            (list_logic::State::Closed, _) => Lucide::GitPullRequestClosed,
                             (_, true) => Lucide::GitPullRequestDraft,
                             _ => Lucide::GitPullRequestArrow,
                         };

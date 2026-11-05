@@ -259,7 +259,7 @@ impl Workspace {
     fn browser_profiles_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let settings = &self.client_settings.values;
-        let at_limit = preview::user_profiles(settings).len() >= preview::PROFILE_MAX_COUNT;
+        let at_limit = preview::profiles_full(settings);
         let default_id = preview::default_profile_id(settings);
         let listed: Vec<Profile> = preview::resolve_profiles(&preview::user_profiles(settings))
             .into_iter()
@@ -339,14 +339,14 @@ impl Workspace {
     }
 
     fn create_browser_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut profiles = preview::user_profiles(&self.client_settings.values);
-        if profiles.len() >= preview::PROFILE_MAX_COUNT {
-            return;
-        }
-        let name = preview::unique_profile_name("New profile", &preview::resolve_profiles(&profiles));
+        let settings = &self.client_settings.values;
+        let name =
+            preview::unique_profile_name("New profile", &preview::resolve_profiles(&preview::user_profiles(settings)));
         let id = format!("profile-{}", uuid::Uuid::new_v4());
-        profiles.push(Profile { id, name, kind: ProfileKind::Persistent });
-        self.update_settings(json!({"browserProfiles": profiles}), window, cx);
+        let profile = Profile { id, name, kind: ProfileKind::Persistent };
+        if let Some(profiles) = preview::profiles_with_added(settings, &profile) {
+            self.update_settings(json!({"browserProfiles": profiles}), window, cx);
+        }
     }
 
     fn rename_browser_profile(&mut self, id: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -354,10 +354,7 @@ impl Workspace {
         if name.is_empty() {
             return;
         }
-        let mut profiles = preview::user_profiles(&self.client_settings.values);
-        for profile in profiles.iter_mut().filter(|p| p.id == id) {
-            profile.name = name.clone();
-        }
+        let profiles = preview::profiles_with_renamed(&self.client_settings.values, id, &name);
         self.update_settings(json!({"browserProfiles": profiles}), window, cx);
     }
 
@@ -475,8 +472,7 @@ impl Workspace {
                     return window.refresh();
                 }
                 let settings = &this.client_settings.values;
-                let profiles: Vec<Profile> =
-                    preview::user_profiles(settings).into_iter().filter(|p| p.id != id).collect();
+                let profiles = preview::profiles_without(settings, &id);
                 let mut patch = json!({"browserProfiles": profiles});
                 if settings.get("browserDefaultProfileId").as_str() == Some(id.as_str()) {
                     patch["browserDefaultProfileId"] = preview::DEFAULT_PROFILE_ID.into();

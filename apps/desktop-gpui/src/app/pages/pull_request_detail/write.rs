@@ -245,7 +245,7 @@ impl Workspace {
                     Err(error) => {
                         let message = match hint {
                             Some(hint) => logic::readable_failure(&list_logic::error_message(error), hint),
-                            None => String::new(),
+                            None => list_logic::error_message(error),
                         };
                         toast_error(window, cx, failure, message);
                     }
@@ -596,9 +596,9 @@ impl Workspace {
         let Some(input) = write.comment.clone() else { return div().into_any_element() };
         let busy = write.submitting.is_some() || panel.pending.is_some();
         let empty = text_of(&input, cx).trim().is_empty();
-        let follow_up = if detail.state == "open" && logic::can(detail, "close") {
+        let follow_up = if detail.state == list_logic::State::Open && logic::can(detail, "close") {
             Some("close")
-        } else if detail.state == "closed" && logic::can(detail, "reopen") {
+        } else if detail.state == list_logic::State::Closed && logic::can(detail, "reopen") {
             Some("reopen")
         } else {
             None

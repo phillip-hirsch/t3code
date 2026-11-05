@@ -1251,11 +1251,12 @@ impl Workspace {
             Surface::Files => {
                 ("files".into(), "Files".into(), Icon::new(IconName::Files).size(px(12.)).into_any_element())
             }
-            Surface::File(path) => (
-                format!("file:{path}").into(),
-                path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(),
-                Icon::new(IconName::File).size(px(12.)).into_any_element(),
-            ),
+            Surface::File(path) => {
+                (format!("file:{path}").into(), path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned().into(), {
+                    let (asset, color) = crate::file_icons::file_icon(path, self.dark_theme(cx));
+                    Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
+                })
+            }
             Surface::SideChat(thread_id) => {
                 let (title, state) = self.side_chat_tab(thread_id);
                 // Static dots: a side chat tab can stay open for a whole run.

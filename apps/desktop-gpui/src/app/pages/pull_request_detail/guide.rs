@@ -471,11 +471,7 @@ impl Workspace {
             .map(|(i, (path, note))| {
                 let open = panel.guide_files_open.contains(path);
                 let patch = code.and_then(|c| c.patch(path));
-                let stat = patch.map(|p| {
-                    let rows = diff_logic::file_rows(p);
-                    let count = |mark: char| rows.iter().filter(|r| r.mark == mark).count() as u64;
-                    (count('+'), count('-'))
-                });
+                let stat = patch.map(diff_logic::FilePatch::stat);
                 let key = path.clone();
                 let trigger = h_flex()
                     .id(ElementId::Name(format!("pr-guide-file:{path}").into()))
@@ -627,12 +623,7 @@ impl Workspace {
     fn ask_about_pr_guide_stop(&mut self, index: usize, question: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let Some(detail) = panel.detail.clone() else { return };
-        let Some(stop) = panel
-            .guide
-            .as_ref()
-            .and_then(|g| serde_json::from_value::<Guide>(g["guide"].clone()).ok())
-            .and_then(|g| g.stops.get(index).cloned())
-        else {
+        let Some(stop) = panel.guide_tour.as_ref().and_then(|g| g.as_ref().ok()?.stops.get(index).cloned()) else {
             return;
         };
         let prompt = logic::guide_stop_handoff(&logic::HandoffSubject::of(&detail), index, &stop, &question);
@@ -703,7 +694,7 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_color(t.foreground)
-                        .child(row.text.clone()),
+                        .child(row.text.to_owned()),
                 ),
         );
         if let Some((_, markers)) = line.and_then(|l| notes.iter().find(|(at, _)| *at == l)) {
