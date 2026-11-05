@@ -83,6 +83,13 @@ impl Workspace {
     }
 
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        // `/side` beats an open question, unless side chats are off and it may be a literal answer.
+        let prompt = self.composer.read(cx).value().to_string();
+        if (self.question.is_none() || self.side_chat_disabled_reason().is_none())
+            && self.submit_side_chat_command(&prompt, window, cx)
+        {
+            return;
+        }
         if self.question.is_some() {
             self.advance_question(window, cx);
             return;

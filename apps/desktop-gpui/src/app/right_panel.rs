@@ -102,6 +102,8 @@ pub(super) fn rollback_command(projection: &ThreadProjection, turn_count: u32, r
 pub(super) enum Surface {
     Diff,
     Browser(String),
+    /// A side chat's tab, by its thread id.
+    SideChat(String),
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -342,9 +344,12 @@ impl Workspace {
     }
 
     /// Closes a tab; a browser tab's session closes with it.
-    fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = self.user_panel_state() {
             panel.close(&surface);
+        }
+        if let Surface::SideChat(thread_id) = &surface {
+            self.release_side_chat(thread_id, cx);
         }
         if let (Surface::Browser(tab), Some(Target::Thread(thread_id))) = (&surface, self.target.clone()) {
             self.close_preview_tab(thread_id, tab.clone(), window, cx);
@@ -689,6 +694,11 @@ impl Workspace {
             self.right_panel.diff_mount = mount;
             (self.right_panel.wrap, self.right_panel.ignore_whitespace) = (None, None);
         }
+        let side_chat = match self.active_surface() {
+            Some(Surface::SideChat(thread_id)) => Some(thread_id.clone()),
+            _ => None,
+        };
+        self.sync_side_chat(side_chat.as_deref(), window, cx);
         let width = self.right_panel_width(window)?;
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
@@ -712,6 +722,7 @@ impl Workspace {
             (Some(Surface::Browser(tab)), Some(Target::Thread(thread_id))) => {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
+            (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -772,6 +783,7 @@ impl Workspace {
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
         let (diff, browser) = (self.diff_available(), self.browser_available());
+        let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -810,7 +822,8 @@ impl Workspace {
                     .size(px(24.))
                     .rounded(px(8.))
                     .dropdown_menu(move |menu: PopupMenu, window, _| {
-                        menu.min_w(px(200.))
+                        let menu = menu
+                            .min_w(px(200.))
                             .item(
                                 PopupMenuItem::new("Browser")
                                     .icon(Icon::new(IconName::Globe))
@@ -823,7 +836,18 @@ impl Workspace {
                                 PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
                                     window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
                                 ),
-                            )
+                            );
+                        match side_chat {
+                            Some(available) => menu.item(
+                                PopupMenuItem::new("Side chat")
+                                    .icon(Icon::new(IconName::MessagesSquare))
+                                    .disabled(!available)
+                                    .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                        this.add_side_chat_surface(window, cx)
+                                    })),
+                            ),
+                            None => menu,
+                        }
                     })
                     .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                         this.right_panel.add_menu_open = *open;
@@ -849,6 +873,23 @@ impl Workspace {
                 self.browser_tab_title(tab),
                 Icon::new(IconName::Globe).size(px(12.)).into_any_element(),
             ),
+            Surface::SideChat(thread_id) => {
+                let (title, state) = self.side_chat_tab(thread_id);
+                // Static dots: a side chat tab can stay open for a whole run.
+                let dot = state.map(|state| {
+                    div().absolute().top(px(-2.)).right(px(-2.)).size(px(6.)).rounded_full().bg(if state == "running" {
+                        tokens.muted_foreground
+                    } else {
+                        tokens.info
+                    })
+                });
+                let glyph = div()
+                    .relative()
+                    .child(Icon::new(IconName::MessagesSquare).size(px(12.)))
+                    .children(dot)
+                    .into_any_element();
+                (format!("side-chat:{thread_id}").into(), title, glyph)
+            }
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
         let tooltip: SharedString = format!("Close {title}").into();
@@ -959,6 +1000,20 @@ impl Workspace {
             "Available for Git repositories.",
         )
         .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
+        let side_chat = self.side_chats_offered().then(|| {
+            let reason = self.side_chat_disabled_reason();
+            row(
+                "right-panel-open-side-chat",
+                Icon::new(IconName::MessagesSquare).size(px(16.)).into_any_element(),
+                "Side chat",
+                "S",
+                reason.is_none(),
+                reason.unwrap_or("Available after the first message."),
+            )
+            .when(reason.is_none(), |el| {
+                el.on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
+            })
+        });
         div()
             .flex_1()
             .min_h_0()
@@ -981,7 +1036,7 @@ impl Workspace {
                             .text_color(tokens.foreground)
                             .child("Open a surface"),
                     )
-                    .child(v_flex().gap(px(2.)).child(browser).child(diff)),
+                    .child(v_flex().gap(px(2.)).child(browser).child(diff).children(side_chat)),
             )
             .into_any_element()
     }
@@ -1234,7 +1289,11 @@ impl Workspace {
                 })
                 .child({
                     // `--diffs-font-size`, the Code font size.
-                    let diff = Diff::new(&self.right_panel.diff).soft_wrap(wrap).flex_1().min_h_0().text_size(px(tokens.fonts.code_size));
+                    let diff = Diff::new(&self.right_panel.diff)
+                        .soft_wrap(wrap)
+                        .flex_1()
+                        .min_h_0()
+                        .text_size(px(tokens.fonts.code_size));
                     match scheme {
                         DiffColorScheme::RedGreen => diff.into_any_element(),
                         DiffColorScheme::BlueOrange => DiffTint {

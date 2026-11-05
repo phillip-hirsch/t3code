@@ -1030,6 +1030,8 @@ pub struct Run {
     pub active_attempt_id: Option<String>,
     #[serde(default)]
     pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub workspace_preparation: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

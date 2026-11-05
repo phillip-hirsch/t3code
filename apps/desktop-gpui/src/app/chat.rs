@@ -100,6 +100,10 @@ impl Workspace {
         let _changed = cx.observe(&view, move |this, _, cx| {
             if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
                 this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+            } else if let Some(side) = &this.side_chat.view
+                && let Some(index) = side.rows.iter().position(|row| shows_markdown(row, &row_key))
+            {
+                side.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             }
         });
         self.markdown.0.insert(key, MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
@@ -122,6 +126,7 @@ impl Workspace {
             self.expanded.insert(key);
         }
         self.refresh_rows(cx);
+        self.refresh_side_chat_rows(cx);
         cx.notify();
     }
 
@@ -371,7 +376,13 @@ fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEven
     }
 }
 
-fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut Window, cx: &mut App) -> AnyElement {
+pub(super) fn render_row(
+    row: &Row,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    _: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let t = *theme::tokens(cx);
     match row {
         Row::User {

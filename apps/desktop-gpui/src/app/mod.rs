@@ -45,6 +45,7 @@ mod preview;
 mod quit;
 mod right_panel;
 mod send;
+mod side_chat;
 mod sidebar;
 mod terminal;
 mod thread_menu;
@@ -211,6 +212,7 @@ pub struct Workspace {
     /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
     t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
     terminals: terminal::Terminals,
+    side_chat: side_chat::SideChats,
     /// Thread notifications: toasts, OS notifications and sounds.
     alerts: alerts::AlertState,
     quit: quit::QuitState,
@@ -330,6 +332,7 @@ impl Workspace {
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),
             terminals: terminal::Terminals::default(),
+            side_chat: Default::default(),
             alerts: Default::default(),
             quit: Default::default(),
             _subscriptions: subscriptions,
