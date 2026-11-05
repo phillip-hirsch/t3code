@@ -296,11 +296,15 @@ pub(super) struct RightPanel {
     base_picker: diff_base::BasePicker,
     /// Every file of the loaded selection; the patch shows them less hidden test files.
     all_diff_files: Vec<DiffFile>,
+    /// How many of `all_diff_files` are tests or test support.
+    diff_test_files: usize,
     hide_test_files: bool,
     tree_open: bool,
     /// Folded tree folders (with their trailing `/`) and the file picked in the tree.
     tree_folded: HashSet<String>,
     tree_selected: Option<String>,
+    /// The tree's visible rows, rebuilt when the shown files or the folds change.
+    tree_rows: std::rc::Rc<[diff_tree::Row]>,
     _diff_events: Subscription,
 }
 
@@ -335,10 +339,12 @@ impl RightPanel {
             base_refs: HashMap::new(),
             base_picker: Default::default(),
             all_diff_files: Vec::new(),
+            diff_test_files: 0,
             hide_test_files: false,
             tree_open: false,
             tree_folded: HashSet::new(),
             tree_selected: None,
+            tree_rows: std::rc::Rc::new([]),
             _diff_events: diff_events,
         }
     }
@@ -886,7 +892,12 @@ impl Workspace {
                 Some(input) => client.request("review.getBranchCommits", input).await.ok(),
                 None => None,
             };
-            let parsed = result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind));
+            let parsed =
+                cx.background_executor()
+                    .spawn(async move {
+                        result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind))
+                    })
+                    .await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(commits) = commits {
                     this.right_panel.commits = commits["commits"]
@@ -901,12 +912,12 @@ impl Workspace {
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
-                        this.right_panel.all_diff_files.clear();
+                        this.store_diff_files(Vec::new());
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No patch available for this selection.")
                     }
                     Ok(Some(parsed)) if parsed.files.is_empty() => {
-                        this.right_panel.all_diff_files.clear();
+                        this.store_diff_files(Vec::new());
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No net changes in this selection.")
                     }
@@ -919,7 +930,7 @@ impl Workspace {
                             this.client_settings.values.bool("diffFilesCollapsed"),
                             &paths,
                         );
-                        this.right_panel.all_diff_files = parsed.files;
+                        this.store_diff_files(parsed.files);
                         let shown = this.shown_diff_files();
                         diff.update(cx, |state, cx| {
                             state.set_files(shown, cx);
@@ -937,6 +948,7 @@ impl Workspace {
                         }
                     }
                 };
+                this.rebuild_tree_rows(cx);
                 cx.notify();
             });
         }));
@@ -1005,8 +1017,9 @@ impl Workspace {
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
-        self.right_panel.all_diff_files.clear();
+        self.store_diff_files(Vec::new());
         self.right_panel.diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.rebuild_tree_rows(cx);
     }
 
     /// The inline panel beside the main column, or `None` while closed.
@@ -1664,17 +1677,14 @@ impl Workspace {
             self.render_base_ref_picker(&head, &base, tokens, cx)
         });
         let can_refresh = !matches!(scope, DiffScope::Turn(_));
-        let files: Vec<SharedString> = match self.right_panel.load {
-            DiffLoad::Ready { .. } => {
-                self.right_panel.diff.read(cx).files().iter().map(|file| file.path().clone()).collect()
-            }
-            _ => Vec::new(),
+        let (shows_files, all_collapsed) = {
+            let state = self.right_panel.diff.read(cx);
+            let shows = matches!(self.right_panel.load, DiffLoad::Ready { .. }) && !state.files().is_empty();
+            (shows, shows && state.files().iter().all(|file| state.is_file_collapsed(file.path())))
         };
-        let all_collapsed =
-            !files.is_empty() && files.iter().all(|path| self.right_panel.diff.read(cx).is_file_collapsed(path));
         let (wrap, ignore_whitespace) = (self.diff_wrap(), self.diff_ignore_whitespace());
         let (test_files, hide_tests, tree_open) =
-            (self.test_file_count(), self.right_panel.hide_test_files, self.right_panel.tree_open);
+            (self.right_panel.diff_test_files, self.right_panel.hide_test_files, self.right_panel.tree_open);
         let has_files = !self.right_panel.all_diff_files.is_empty();
         let header = h_flex()
             .h(px(28.))
@@ -1706,7 +1716,7 @@ impl Workspace {
                                 })),
                         )
                     })
-                    .when(!files.is_empty(), |el| {
+                    .when(shows_files, |el| {
                         let label = if all_collapsed { "Expand all files" } else { "Collapse all files" };
                         let path =
                             if all_collapsed { "icons/chevrons-up-down.svg" } else { "icons/chevrons-down-up.svg" };
@@ -1714,11 +1724,11 @@ impl Workspace {
                             icon_toggle("diff-collapse", path, false, tokens, cx)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let collapse = !all_collapsed;
-                                    let files = files.clone();
                                     this.right_panel.diff.update(cx, |state, cx| {
-                                        for path in &files {
-                                            state.set_file_collapsed(path, collapse, cx);
+                                        let paths: Vec<SharedString> =
+                                            state.files().iter().map(|file| file.path().clone()).collect();
+                                        for path in &paths {
+                                            state.set_file_collapsed(path, !all_collapsed, cx);
                                         }
                                     });
                                     this.remember_collapsed(cx);
@@ -1867,7 +1877,7 @@ impl Workspace {
                 .child(icon(path).with_size(px(14.)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let layout = if value { "split" } else { "stacked" };
-                    this.client_settings.apply(json!({ "diffLayout": layout }).as_object().expect("an object"));
+                    this.client_settings.apply(&serde_json::Map::from_iter([("diffLayout".into(), layout.into())]));
                     let mode = if value { DiffMode::Split } else { DiffMode::Unified };
                     this.right_panel.diff.update(cx, |state, cx| state.set_mode(mode, cx));
                     cx.notify();
