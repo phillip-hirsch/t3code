@@ -1295,6 +1295,7 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
     let (accent, icon) = match Chip::from_id(id) {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
+        Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
         _ => (rgb(0x0096af), Lucide::File),
     };

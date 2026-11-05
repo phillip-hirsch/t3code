@@ -15,16 +15,61 @@ pub(super) enum KeyAction {
         keep_selection: bool,
     },
     Paste,
+    /// Ctrl+Shift+A.
+    SelectAll,
+    /// Shift+PageUp/PageDown by a page, Ctrl+Shift+Home/End to either end of the scrollback.
+    Scroll(History),
 }
 
-/// `app_cursor` is DECCKM: arrows send SS3 instead of CSI.
-pub(super) fn key_action(keystroke: &Keystroke, app_cursor: bool, has_selection: bool) -> Option<KeyAction> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum History {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+impl History {
+    pub fn scroll(self) -> alacritty_terminal::grid::Scroll {
+        use alacritty_terminal::grid::Scroll;
+        match self {
+            History::PageUp => Scroll::PageUp,
+            History::PageDown => Scroll::PageDown,
+            History::Top => Scroll::Top,
+            History::Bottom => Scroll::Bottom,
+        }
+    }
+}
+
+/// `app_cursor` is DECCKM: arrows send SS3 instead of CSI. The alternate screen has no
+/// scrollback, so its history keys go to the app.
+pub(super) fn key_action(
+    keystroke: &Keystroke,
+    app_cursor: bool,
+    alt_screen: bool,
+    has_selection: bool,
+) -> Option<KeyAction> {
     let m = &keystroke.modifiers;
     if m.platform || m.function {
         return None;
     }
     let key = keystroke.key.as_str();
     let (ctrl, alt, shift) = (m.control, m.alt, m.shift);
+    if ctrl && shift && !alt && key == "a" {
+        return Some(KeyAction::SelectAll);
+    }
+    if shift && !alt && !alt_screen {
+        let scroll = match (key, ctrl) {
+            ("pageup", false) => Some(History::PageUp),
+            ("pagedown", false) => Some(History::PageDown),
+            ("home", true) => Some(History::Top),
+            ("end", true) => Some(History::Bottom),
+            _ => None,
+        };
+        if let Some(scroll) = scroll {
+            return Some(KeyAction::Scroll(scroll));
+        }
+    }
     // `isTerminalCopyShortcut` / `isTerminalPasteShortcut` on Windows and Linux.
     if has_selection && ctrl && !alt && (key == "c" || (key == "insert" && !shift)) {
         return Some(KeyAction::Copy { keep_selection: shift });
@@ -145,7 +190,7 @@ mod tests {
     }
 
     fn send(spec: &'static str) -> Option<String> {
-        match key_action(&key(spec), false, false) {
+        match key_action(&key(spec), false, false, false) {
             Some(KeyAction::Send(bytes)) => Some(bytes.into_owned()),
             _ => None,
         }
@@ -178,19 +223,34 @@ mod tests {
 
     #[test]
     fn application_cursor_mode_uses_ss3() {
-        let up = key_action(&key("up"), true, false);
+        let up = key_action(&key("up"), true, false, false);
         assert_eq!(up, Some(KeyAction::Send("\x1bOA".into())));
-        let ctrl_up = key_action(&key("ctrl-up"), true, false);
+        let ctrl_up = key_action(&key("ctrl-up"), true, false, false);
         assert_eq!(ctrl_up, Some(KeyAction::Send("\x1b[1;5A".into())));
     }
 
     #[test]
     fn copy_needs_a_selection_and_paste_always_works() {
-        assert_eq!(key_action(&key("ctrl-c"), false, true), Some(KeyAction::Copy { keep_selection: false }));
-        assert_eq!(key_action(&key("ctrl-shift-c"), false, true), Some(KeyAction::Copy { keep_selection: true }));
-        assert_eq!(key_action(&key("ctrl-insert"), false, true), Some(KeyAction::Copy { keep_selection: false }));
-        assert_eq!(key_action(&key("ctrl-v"), false, false), Some(KeyAction::Paste));
-        assert_eq!(key_action(&key("ctrl-shift-v"), false, false), Some(KeyAction::Paste));
-        assert_eq!(key_action(&key("shift-insert"), false, false), Some(KeyAction::Paste));
+        assert_eq!(key_action(&key("ctrl-c"), false, false, true), Some(KeyAction::Copy { keep_selection: false }));
+        assert_eq!(
+            key_action(&key("ctrl-shift-c"), false, false, true),
+            Some(KeyAction::Copy { keep_selection: true })
+        );
+        assert_eq!(
+            key_action(&key("ctrl-insert"), false, false, true),
+            Some(KeyAction::Copy { keep_selection: false })
+        );
+        assert_eq!(key_action(&key("ctrl-v"), false, false, false), Some(KeyAction::Paste));
+        assert_eq!(key_action(&key("ctrl-shift-v"), false, false, false), Some(KeyAction::Paste));
+        assert_eq!(key_action(&key("shift-insert"), false, false, false), Some(KeyAction::Paste));
+    }
+
+    #[test]
+    fn select_all_and_history_keys() {
+        assert_eq!(key_action(&key("ctrl-shift-a"), false, false, false), Some(KeyAction::SelectAll));
+        assert_eq!(key_action(&key("shift-pageup"), false, false, false), Some(KeyAction::Scroll(History::PageUp)));
+        assert_eq!(key_action(&key("ctrl-shift-end"), false, false, false), Some(KeyAction::Scroll(History::Bottom)));
+        // Full-screen apps get the keys.
+        assert_eq!(key_action(&key("shift-pageup"), false, true, false), Some(KeyAction::Send("\x1b[5;2~".into())));
     }
 }

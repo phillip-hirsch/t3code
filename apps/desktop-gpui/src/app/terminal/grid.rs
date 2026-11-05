@@ -10,9 +10,8 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, ElementInputHandler, Entity, Font,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline, point, px,
-    relative, rgb, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, StrikethroughStyle, Style,
+    TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline, point, px, relative, rgb, size,
 };
 
 use super::session::TerminalSession;
@@ -299,6 +298,8 @@ pub(super) struct GridPrepaint {
     background_colors: Vec<Hsla>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     cursor: Option<Cursor>,
+    link_hovered: bool,
+    link_underlines: Vec<Bounds<Pixels>>,
 }
 
 impl Element for TerminalGrid {
@@ -409,8 +410,27 @@ impl Element for TerminalGrid {
             let shape = if self.focused { cursor_shape } else { CursorShape::HollowBlock };
             Cursor { bounds, shape, glyph: cursor_glyph }
         });
+        let link = session.hovered_link();
+        let link_underlines = link
+            .into_iter()
+            .flat_map(|link| &link.cells)
+            .filter_map(|(line, start, end)| {
+                let row = usize::try_from(line.0 + display_offset as i32).ok().filter(|row| *row < rows)?;
+                let at = cell_origin(row, *start) + point(px(0.), line_height - px(1.));
+                Some(Bounds::new(at, size(cell_width * (end - start) as f32, px(1.))))
+            })
+            .collect();
         session.geometry.set(geometry);
-        GridPrepaint { hitbox, geometry, backgrounds, background_colors, lines, cursor }
+        GridPrepaint {
+            hitbox,
+            geometry,
+            backgrounds,
+            background_colors,
+            lines,
+            cursor,
+            link_hovered: link.is_some(),
+            link_underlines,
+        }
     }
 
     fn paint(
@@ -423,7 +443,8 @@ impl Element for TerminalGrid {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.set_cursor_style(CursorStyle::IBeam, &prepaint.hitbox);
+        let cursor = if prepaint.link_hovered { CursorStyle::PointingHand } else { CursorStyle::IBeam };
+        window.set_cursor_style(cursor, &prepaint.hitbox);
         let line_height = prepaint.geometry.line_height;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for (bounds, color) in prepaint.backgrounds.iter().zip(&prepaint.background_colors) {
@@ -431,6 +452,9 @@ impl Element for TerminalGrid {
             }
             for (origin, line) in &prepaint.lines {
                 let _ = line.paint(*origin, line_height, TextAlign::Left, None, window, cx);
+            }
+            for bounds in &prepaint.link_underlines {
+                window.paint_quad(fill(*bounds, self.theme.foreground));
             }
             if let Some(cursor) = &prepaint.cursor {
                 if cursor.shape == CursorShape::HollowBlock {
@@ -450,19 +474,25 @@ impl Element for TerminalGrid {
         let session = self.session.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase.bubble() && hitbox.is_hovered(window) {
-                session.update(cx, |session, cx| session.mouse_down(event, window, cx));
+                // A tracking app's right click is its own, so the menu stays shut.
+                if session.update(cx, |session, cx| session.mouse_down(event, window, cx)) {
+                    cx.stop_propagation();
+                }
+            }
+        });
+        let hitbox = prepaint.hitbox.clone();
+        let session = self.session.clone();
+        let hovering = prepaint.link_hovered;
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            let inside = hitbox.is_hovered(window);
+            if phase.bubble() && (inside || hovering || event.pressed_button.is_some()) {
+                session.update(cx, |session, cx| session.mouse_move(event, inside, cx));
             }
         });
         let session = self.session.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-            if phase.bubble() && event.pressed_button == Some(MouseButton::Left) {
-                session.update(cx, |session, cx| session.mouse_drag(event, cx));
-            }
-        });
-        let session = self.session.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-            if phase.bubble() && event.button == MouseButton::Left {
-                session.update(cx, |session, _| session.mouse_up());
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase.bubble() {
+                session.update(cx, |session, cx| session.mouse_up(event, window, cx));
             }
         });
         let hitbox = prepaint.hitbox.clone();

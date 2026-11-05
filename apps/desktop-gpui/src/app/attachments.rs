@@ -447,7 +447,7 @@ impl Workspace {
             return Err("Retry or remove failed uploads before sending.".into());
         }
         let mut attachments = Vec::new();
-        let mut records = Vec::new();
+        let mut records = self.terminal_context_records(text);
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let size = attachment.bytes.len();

@@ -16,11 +16,15 @@ use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use gpui_kit::{
     AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Pixels, Render, ScrollEvent, Styled as _, Subscription, Task, UTF16Selection, Window, div,
-    point, size,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, Styled as _, Subscription,
+    Task, UTF16Selection, Window, div, point, size,
 };
 use serde_json::{Value, json};
+
+mod menu;
+mod pointer;
+
+use gpui_kit::component::menu::ContextMenuExt as _;
 
 use super::grid::{Geometry, TerminalGrid, TerminalTheme};
 use super::keys::{KeyAction, key_action};
@@ -90,6 +94,20 @@ pub(super) enum SessionEvent {
     Exited,
     /// Pressed: the drawer makes this pane active.
     Activated,
+    /// "Add to chat" on a selection.
+    AddToChat(Selected),
+    /// A clicked web link; Ctrl skips the in-app browser.
+    OpenUrl { url: String, force_browser: bool },
+    /// A clicked path that exists, resolved and with its `:line:column`.
+    OpenPath(String),
+}
+
+/// A selection for the composer (`TerminalContextSelection` without the label).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Selected {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
 }
 
 pub(super) struct TerminalSession {
@@ -113,6 +131,7 @@ pub(super) struct TerminalSession {
     writing: bool,
     selecting: bool,
     scroll_remainder: f32,
+    pointer: pointer::PointerState,
     _attach: Option<Task<()>>,
     _resize: Option<Task<()>>,
     _focus: [Subscription; 2],
@@ -182,6 +201,7 @@ impl TerminalSession {
             writing: false,
             selecting: false,
             scroll_remainder: 0.,
+            pointer: Default::default(),
             _attach: None,
             _resize: None,
             _focus,
@@ -194,6 +214,11 @@ impl TerminalSession {
 
     pub fn term(&self) -> &Term<Listener> {
         &self.term
+    }
+
+    /// The link to underline, if the pointer is on one.
+    pub fn hovered_link(&self) -> Option<&pointer::HoveredLink> {
+        self.pointer.hovered.as_ref()
     }
 
     /// Subscribes to the terminal's output; called again after a reconnect.
@@ -277,6 +302,7 @@ impl TerminalSession {
     /// them, or the shell would read stale replies as typed input.
     fn feed(&mut self, data: &str, reply: bool, cx: &mut Context<Self>) {
         self.parser.advance(&mut self.term, data.as_bytes());
+        self.pointer.forget_hover();
         let events: Vec<Event> = self.events.0.borrow_mut().drain(..).collect();
         for event in events {
             match event {
@@ -384,6 +410,44 @@ impl TerminalSession {
         .detach();
     }
 
+    /// `selectAll`: every line, scrollback included.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let grid = self.term.grid();
+        let top = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(-(grid.history_size() as i32)),
+            alacritty_terminal::index::Column(0),
+        );
+        let bottom = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(grid.screen_lines() as i32 - 1),
+            grid.last_column(),
+        );
+        let mut selection = Selection::new(SelectionType::Simple, top, Side::Left);
+        selection.update(bottom, Side::Right);
+        self.term.selection = Some(selection);
+        cx.notify();
+    }
+
+    /// `scrollToBottom`: back to the live screen.
+    pub fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.term.scroll_display(Scroll::Bottom);
+        cx.notify();
+    }
+
+    /// The selection as chat context: 1-based buffer lines (scrollback counts) and its text
+    /// without surrounding blank lines (`readSelectionAction`).
+    pub fn selected(&self) -> Option<Selected> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let text = self.term.selection_to_string()?;
+        let text = text.replace("\r\n", "\n").trim_matches('\n').to_owned();
+        if text.is_empty() {
+            return None;
+        }
+        let history = self.term.grid().history_size() as i32;
+        let line_start = (range.start.line.0 + history + 1).max(1) as usize;
+        let line_end = ((range.end.line.0 + history + 1).max(1) as usize).max(line_start);
+        Some(Selected { line_start, line_end, text })
+    }
+
     fn has_selection(&self) -> bool {
         self.term.selection.as_ref().is_some_and(|selection| !selection.is_empty())
     }
@@ -403,9 +467,16 @@ impl TerminalSession {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let app_cursor = self.term.mode().contains(TermMode::APP_CURSOR);
-        match key_action(&event.keystroke, app_cursor, self.has_selection()) {
+        let mode = *self.term.mode();
+        let (app_cursor, alt_screen) = (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::ALT_SCREEN));
+        self.pointer.cancel_selection_menu();
+        match key_action(&event.keystroke, app_cursor, alt_screen, self.has_selection()) {
             None => return,
+            Some(KeyAction::SelectAll) => self.select_all(cx),
+            Some(KeyAction::Scroll(scroll)) => {
+                self.term.scroll_display(scroll.scroll());
+                cx.notify();
+            }
             Some(KeyAction::Send(data)) => self.input(&data, cx),
             Some(KeyAction::Copy { keep_selection }) => {
                 self.copy(cx);
@@ -418,84 +489,23 @@ impl TerminalSession {
         }
         cx.stop_propagation();
     }
-
-    pub fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus.focus(window, cx);
-        cx.emit(SessionEvent::Activated);
-        if event.button != MouseButton::Left {
-            return;
-        }
-        let (point, right) = self.geometry.get().cell_at(event.position, self.term.grid().display_offset());
-        let side = if right { Side::Right } else { Side::Left };
-        match (&mut self.term.selection, event.modifiers.shift) {
-            (Some(selection), true) => selection.update(point, side),
-            _ => {
-                let kind = match event.click_count {
-                    2 => SelectionType::Semantic,
-                    3.. => SelectionType::Lines,
-                    _ => SelectionType::Simple,
-                };
-                self.term.selection = Some(Selection::new(kind, point, side));
-            }
-        }
-        self.selecting = true;
-        cx.notify();
-    }
-
-    pub fn mouse_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.selecting {
-            return;
-        }
-        let (point, right) = self.geometry.get().cell_at(event.position, self.term.grid().display_offset());
-        if let Some(selection) = &mut self.term.selection {
-            selection.update(point, if right { Side::Right } else { Side::Left });
-            cx.notify();
-        }
-    }
-
-    pub fn mouse_up(&mut self) {
-        self.selecting = false;
-    }
-
-    pub fn scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
-        let line_height = self.geometry.get().line_height;
-        if line_height <= Pixels::ZERO {
-            return;
-        }
-        self.scroll_remainder += event.delta.pixel_delta(line_height).y / line_height;
-        let lines = self.scroll_remainder.trunc();
-        self.scroll_remainder -= lines;
-        if lines == 0. {
-            return;
-        }
-        let mode = *self.term.mode();
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !mode.intersects(TermMode::MOUSE_MODE) {
-            // Full-screen apps without mouse reporting scroll by cursor keys, as xterm does.
-            let key = match (lines > 0., mode.contains(TermMode::APP_CURSOR)) {
-                (true, true) => "\x1bOA",
-                (true, false) => "\x1b[A",
-                (false, true) => "\x1bOB",
-                (false, false) => "\x1b[B",
-            };
-            self.send_input(&key.repeat(lines.abs() as usize), cx);
-        } else {
-            self.term.scroll_display(Scroll::Delta(lines as i32));
-            cx.notify();
-        }
-    }
 }
 
 impl Render for TerminalSession {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = TerminalTheme::new(crate::theme::tokens(cx));
         let focused = self.focus.is_focused(window);
+        let menu = self.context_menu(cx);
         div()
+            .id(gpui_kit::SharedString::from(format!("terminal-session-{}", self.terminal_id)))
             .size_full()
             .key_context("Terminal")
             .track_focus(&self.focus)
             .bg(theme.background)
             .on_key_down(cx.listener(Self::key_down))
             .child(TerminalGrid { session: cx.entity(), theme, focused })
+            .children(self.render_selection_menu())
+            .context_menu(menu)
     }
 }
 
