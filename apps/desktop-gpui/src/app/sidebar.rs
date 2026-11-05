@@ -805,7 +805,9 @@ impl Workspace {
         let now = now_ms();
         let query = self.search_query(cx);
         let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
-        let items = self.sidebar.items(&self.shell, self.target.as_ref(), connected && self.shell.live, now);
+        let working_shelf =
+            connected && self.shell.live && self.client_settings.values.bool("sidebarWorkingShelfEnabled");
+        let items = self.sidebar.items(&self.shell, self.target.as_ref(), working_shelf, now);
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();

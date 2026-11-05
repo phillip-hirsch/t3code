@@ -8,7 +8,14 @@ use super::Workspace;
 use super::titlebar::RIGHT_RESIZE_INSET;
 
 pub(super) const GUTTER: f32 = 48.;
-const MAX_LANE: f32 = 736.;
+/// `--chat-content-max-width` for each `chatWidth`: 46rem, 72rem, or the whole canvas.
+fn max_lane(chat_width: &str) -> f32 {
+    match chat_width {
+        "wide" => 1152.,
+        "full" => f32::INFINITY,
+        _ => 736.,
+    }
+}
 const MIN_LANE: f32 = 640.;
 pub(super) const CARD_WIDTH: f32 = 280.;
 pub(super) const CARD_INSET: f32 = 12.;
@@ -23,8 +30,8 @@ pub(super) struct Lane {
     pub right: f32,
 }
 
-pub(super) fn resolve_lane(canvas: f32, card_left: Option<f32>) -> Lane {
-    let centered = (canvas - GUTTER * 2.).clamp(0., MAX_LANE);
+pub(super) fn resolve_lane(canvas: f32, card_left: Option<f32>, max_lane: f32) -> Lane {
+    let centered = (canvas - GUTTER * 2.).clamp(0., max_lane);
     let lane_right = card_left.map_or(canvas - GUTTER, |left| left - CARD_CLEARANCE);
     let width = centered.min(lane_right - GUTTER).max(0.);
     let left = ((canvas - width) / 2.).min(lane_right - width).max(GUTTER);
@@ -54,7 +61,8 @@ impl Workspace {
     pub(super) fn chat_layout(&self, window: &Window) -> (Lane, Option<f32>) {
         let canvas = self.canvas_width(window);
         let card = (self.details_open && self.target.is_some()).then(|| inline_card_left(canvas)).flatten();
-        (resolve_lane(canvas, card), card)
+        let chat_width = self.client_settings.values.get("chatWidth").as_str().unwrap_or_default();
+        (resolve_lane(canvas, card, max_lane(chat_width)), card)
     }
 }
 
@@ -64,14 +72,17 @@ mod tests {
 
     #[test]
     fn lane_centers_without_a_card_and_clears_the_card_when_shown() {
-        assert_eq!(resolve_lane(1400., None), Lane { left: 332., width: 736., right: 332. });
+        let comfortable = max_lane("comfortable");
+        assert_eq!(resolve_lane(1400., None, comfortable), Lane { left: 332., width: 736., right: 332. });
+        assert_eq!(resolve_lane(1400., None, max_lane("wide")).width, 1152.);
+        assert_eq!(resolve_lane(1400., None, max_lane("full")), Lane { left: 48., width: 1304., right: 48. });
         // 1038px canvas: the card starts at 746, so the lane ends 32px before it and hugs the gutter.
         let card = inline_card_left(1038.);
         assert_eq!(card, Some(746.));
-        assert_eq!(resolve_lane(1038., card), Lane { left: 48., width: 666., right: 324. });
+        assert_eq!(resolve_lane(1038., card, comfortable), Lane { left: 48., width: 666., right: 324. });
         // A wide canvas keeps the lane centered when it already clears the card.
         let card = inline_card_left(2000.);
-        assert_eq!(resolve_lane(2000., card).left, 632.);
+        assert_eq!(resolve_lane(2000., card, comfortable).left, 632.);
     }
 
     #[test]

@@ -138,11 +138,25 @@ pub fn targets(scope: &Scope, projects: &[Project], environment: &Environment) -
 /// environment's settings. Overrides naming a provider instance the project disables are
 /// skipped, like the web; the web's text generation fallback for that case is not ported.
 pub fn resolve_project_settings(settings: &Settings, project: Option<&Project>) -> Target {
-    let project_id = project.map(|p| p.id.clone());
-    let stored = project_id
-        .as_deref()
-        .and_then(|id| settings.get("projectSettingsOverrides").get(id))
-        .and_then(Value::as_object);
+    let overrides = project_overrides(settings, project);
+    let mut effective = settings.clone();
+    let mut sources = HashMap::new();
+    for (key, value) in overrides {
+        sources.insert(key.clone(), Source::Project);
+        effective.set(key, value);
+    }
+    Target { project_id: project.map(|p| p.id.clone()), settings: effective, sources }
+}
+
+/// One key of `resolve_project_settings`, without copying the whole document.
+pub fn resolve_project_setting(settings: &Settings, project: Option<&Project>, key: &str) -> Value {
+    project_overrides(settings, project).remove(key).unwrap_or_else(|| settings.get(key).clone())
+}
+
+/// The project-scoped values a project overrides.
+fn project_overrides(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
+    let project_id = project.map(|p| p.id.as_str());
+    let stored = project_id.and_then(|id| settings.get("projectSettingsOverrides").get(id)).and_then(Value::as_object);
     let mut overrides = Map::new();
     if let Some(project) = project.filter(|_| !settings.bool("projectSettingsFolded")) {
         if let Some(model) = project.legacy_model_selection.as_ref().filter(|m| !m.is_null()) {
@@ -155,22 +169,19 @@ pub fn resolve_project_settings(settings: &Settings, project: Option<&Project>) 
     if let Some(stored) = stored {
         overrides.extend(stored.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    let mut effective = settings.clone();
-    let mut sources = HashMap::new();
+    let mut resolved = Map::new();
     for key in &contract().project_scoped_keys {
-        let Some(value) = overrides.get(key) else { continue };
+        let Some(value) = overrides.remove(key) else { continue };
         let names_disabled_instance = matches!(key.as_str(), "textGenerationModelSelection" | "defaultModelSelection")
             && value
                 .get("instanceId")
                 .and_then(Value::as_str)
-                .is_some_and(|instance| !provider_instance_enabled(settings, project_id.as_deref(), instance));
-        if names_disabled_instance {
-            continue;
+                .is_some_and(|instance| !provider_instance_enabled(settings, project_id, instance));
+        if !names_disabled_instance {
+            resolved.insert(key.clone(), value);
         }
-        effective.set(key.clone(), value.clone());
-        sources.insert(key.clone(), Source::Project);
     }
-    Target { project_id, settings: effective, sources }
+    resolved
 }
 
 /// `resolveProjectProviderInstanceEnabled`, treating an unconfigured instance as enabled.
@@ -645,6 +656,8 @@ mod tests {
         assert_eq!(target.source("defaultRuntimeMode"), Source::Environment);
         let other = resolve_project_settings(&s, Some(&project("p2")));
         assert_eq!(other.settings.get("defaultThreadEnvMode"), "local");
+        assert_eq!(resolve_project_setting(&s, Some(&project("p1")), "defaultThreadEnvMode"), "worktree");
+        assert_eq!(resolve_project_setting(&s, None, "defaultThreadEnvMode"), "local");
     }
 
     #[test]

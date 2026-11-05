@@ -297,15 +297,23 @@ pub fn history_step(
     Some((recalled.clone(), Some(HistoryPosition { index, recalled })))
 }
 
-/// The user's own messages, oldest first, as history recalls them: trimmed,
-/// without context chips, consecutive repeats once.
+/// `ATTACHMENT_ONLY_BOOTSTRAP_PROMPT`: the text of a message sent with files alone.
+pub const ATTACHMENT_ONLY_PROMPT: &str = "[User attached one or more files without additional text. Respond using the conversation context and the attached files.]";
+
+/// `recallableComposerPrompt`: a sent message as the composer takes it back, trimmed and
+/// without context chips, whose records are gone.
+pub fn recallable_prompt(text: &str) -> String {
+    let text = strip_context_links(text.strip_prefix("Ultrathink:\n").unwrap_or(text));
+    let text = text.trim();
+    if text == ATTACHMENT_ONLY_PROMPT { String::new() } else { text.to_owned() }
+}
+
+/// The user's own messages, oldest first, as history recalls them, consecutive repeats once.
 pub fn history_entries<'a>(messages: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
-    for text in messages {
-        let text = strip_context_links(text.strip_prefix("Ultrathink:\n").unwrap_or(text));
-        let text = text.trim();
-        if !text.is_empty() && entries.last().is_none_or(|last| last != text) {
-            entries.push(text.to_owned());
+    for text in messages.map(recallable_prompt) {
+        if !text.is_empty() && entries.last().is_none_or(|last| *last != text) {
+            entries.push(text);
         }
     }
     entries
@@ -322,7 +330,8 @@ fn strip_context_links(text: &str) -> String {
         });
         match link {
             Some(end) => {
-                out.push_str(&rest[..open]);
+                // An image chip is `![label](…)`.
+                out.push_str(rest[..open].strip_suffix('!').unwrap_or(&rest[..open]));
                 rest = &rest[end..];
                 if rest.starts_with(' ') {
                     rest = &rest[1..];
@@ -394,6 +403,8 @@ mod tests {
         let entries =
             history_entries(["one", "Ultrathink:\ntwo", "two", "  ", "x [T](t3-context://v1/thread/a) y"].into_iter());
         assert_eq!(entries, ["one", "two", "x y"]);
+        assert_eq!(recallable_prompt("look ![a.png](t3-context://v1/image/image_1) here"), "look here");
+        assert_eq!(recallable_prompt(ATTACHMENT_ONLY_PROMPT), "");
         assert_eq!(history_step(&entries, None, "draft", true), None);
         let (text, pos) = history_step(&entries, None, "", true).unwrap();
         assert_eq!(text, "x y");

@@ -257,17 +257,13 @@ impl Workspace {
         composer_text::history_entries(messages.filter_map(|item| item.str("text")))
     }
 
-    /// Enter sends; Ctrl+Enter takes the alternate path; Shift/Alt+Enter add a line.
+    /// Enter sends unless `sendShortcut` asks for Ctrl; Ctrl+Enter takes the alternate path.
     fn send_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let m = keystroke.modifiers;
-        if keystroke.key != "enter" || m.shift || (m.alt && !(m.control || m.platform)) {
-            return false;
-        }
-        let intent = match (m.control || m.platform, m.alt) {
-            (false, _) => Intent::Foreground,
-            (true, false) => Intent::Alternate,
-            (true, true) => Intent::AndNewThread,
-        };
+        let running = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
+        let draft = matches!(self.target, Some(Target::Draft { .. }));
+        let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
+        let prompt = self.composer.read(cx).value();
+        let Some(intent) = super::send::key_intent(keystroke, shortcut, &prompt, running, draft) else { return false };
         self.submit_with(intent, window, cx);
         true
     }
@@ -441,8 +437,10 @@ impl Workspace {
         }
     }
 
-    pub(super) fn default_runtime_mode(&self) -> &str {
-        self.server_info.settings.get("defaultRuntimeMode").as_str().unwrap_or(DEFAULT_RUNTIME_MODE)
+    /// `defaultRuntimeMode` for the open thread's or draft's project (`ChatView.tsx`).
+    pub(super) fn default_runtime_mode(&self) -> String {
+        let mode = self.server_info.project_setting(self.target_project(), "defaultRuntimeMode");
+        mode.as_str().unwrap_or(DEFAULT_RUNTIME_MODE).to_owned()
     }
 
     pub(super) fn runtime_mode(&self) -> String {
@@ -454,7 +452,7 @@ impl Workspace {
                 .and_then(|p| p.thread.runtime_mode.clone()),
             _ => self.runtime_mode_override.clone(),
         };
-        mode.unwrap_or_else(|| self.default_runtime_mode().to_owned())
+        mode.unwrap_or_else(|| self.default_runtime_mode())
     }
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -519,7 +517,7 @@ impl Workspace {
             .border_1()
             .border_color(outline)
             // The glass fill over the canvas, opaque so the banner tucked under it stays hidden.
-            .bg(t.background.blend(t.card.opacity(0.8)))
+            .bg(t.background.blend(t.card.opacity(t.glass)))
             .shadow(if t.dark {
                 vec![BoxShadow::new(px(0.), px(1.), white(0.03)).inset()]
             } else {
@@ -695,14 +693,20 @@ impl Workspace {
             return stop().into_any_element();
         }
         let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
-        let can_send = sendable && self.target.is_some() && self.client().is_some() && disabled_reason.is_none();
+        let can_send = sendable
+            && self.target.is_some()
+            && self.client().is_some()
+            && disabled_reason.is_none()
+            && !self.target_rewinding();
         let (fill, icon) = if can_send || self.sending {
             (t.primary, t.primary_foreground)
         } else {
             (t.foreground.opacity(0.12), t.muted_foreground)
         };
-        // `resolveComposerDispatchMode`: steer by default, Ctrl flips it to queue.
-        let queue = running && self.ctrl_held;
+        let follow_up = self.follow_up_behavior();
+        let alternate = if follow_up == "queue" { "steer" } else { "queue" };
+        let held = if self.ctrl_held { Intent::Alternate } else { Intent::Foreground };
+        let queue = running && super::send::queues(follow_up, held);
         let content: AnyElement = if self.sending {
             Spinner::new().small().color(icon).into_any_element()
         } else if running {
@@ -711,9 +715,17 @@ impl Workspace {
         } else {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
         };
-        let tooltip: Option<&'static str> = match (disabled_reason, running && can_send) {
-            (Some(reason), _) => Some(reason),
-            (None, true) => Some("Click to steer, Ctrl-click or Ctrl+Enter to queue"),
+        let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
+            (Some(reason), _) => Some(reason.into()),
+            (None, true) => {
+                let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
+                let keys = if super::send::requires_modifier(shortcut, &self.composer.read(cx).value()) {
+                    "Ctrl+Shift+Enter"
+                } else {
+                    "Ctrl+Enter"
+                };
+                Some(format!("Click to {follow_up}, Ctrl-click or {keys} to {alternate}").into())
+            }
             _ => None,
         };
         round_button("send", fill, t.primary)
@@ -732,7 +744,9 @@ impl Workspace {
                     },
                 ))
             })
-            .when_some(tooltip, |el, tooltip| el.tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx)))
+            .when_some(tooltip, |el, tooltip| {
+                el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            })
             .into_any_element()
     }
 
@@ -1016,7 +1030,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(outline)
-                        .bg(t.card.opacity(0.8))
+                        .bg(t.card.opacity(t.glass))
                         .text_xs()
                         .line_height(px(16.))
                         .shadow(if t.dark {

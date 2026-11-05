@@ -124,6 +124,8 @@ pub struct Workspace {
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     sending: bool,
+    /// Threads whose rewind is still rolling back on the server; they take no sends.
+    rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
     /// Runtime mode a new thread launches with; open threads keep theirs on the server.
@@ -239,6 +241,7 @@ impl Workspace {
             cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
         ];
         let client_settings = crate::settings::ClientSettings::load();
+        cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme, window, cx);
         Self {
             connection: Connection::Starting,
@@ -259,6 +262,7 @@ impl Workspace {
             scroller,
             composer,
             sending: false,
+            rewinding: HashSet::new(),
             model_override: None,
             runtime_mode_override: None,
             composer_empty: true,

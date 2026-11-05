@@ -451,15 +451,20 @@ impl ServerInfo {
         self.providers.iter().find(|p| p.instance_id == instance_id)
     }
 
+    /// A project-scoped setting as the project's threads see it (`resolveProjectSettings`).
+    pub fn project_setting(&self, project: Option<&ProjectShell>, key: &str) -> Value {
+        let project = project.map(ProjectShell::scope_project);
+        crate::settings::scope::resolve_project_setting(&self.settings, project.as_ref(), key)
+    }
+
     /// Model for a new thread: the project's or the user's default when its
     /// provider is usable, else the first ready provider's default model.
     /// Mirrors `resolveDefaultProviderModelSelection`.
     pub fn new_thread_model(&self, project: Option<&ProjectShell>) -> Option<ModelSelection> {
-        let preferred =
-            project.and_then(|p| p.default_model_selection.as_ref()).or(self.default_model_selection.as_ref());
+        let preferred = ModelSelection::deserialize(self.project_setting(project, "defaultModelSelection")).ok();
         if let Some(selection) = preferred {
             if self.provider(&selection.instance_id).is_some_and(Provider::is_selectable) {
-                return Some(selection.clone());
+                return Some(selection);
             }
         }
         let provider = self
@@ -529,6 +534,17 @@ pub struct ProjectShell {
     /// Legacy project-record scripts; settings overrides win (`resolveProjectScripts`).
     #[serde(default, deserialize_with = "lossy")]
     pub scripts: Vec<ProjectScript>,
+}
+
+impl ProjectShell {
+    pub fn scope_project(&self) -> crate::settings::scope::Project {
+        crate::settings::scope::Project {
+            id: self.id.clone(),
+            name: self.title.clone(),
+            legacy_model_selection: self.default_model_selection.as_ref().map(ModelSelection::to_json),
+            legacy_thread_env_mode: self.default_thread_env_mode.clone(),
+        }
+    }
 }
 
 /// `ProjectScript` (`packages/contracts/src/project.ts`).
@@ -894,6 +910,16 @@ pub struct AppThread {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
+    /// Why the last `checkpoint.rollback` failed, keyed by its command id.
+    #[serde(default)]
+    pub rollback_failure: Option<RollbackFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackFailure {
+    pub request_id: String,
+    pub message: String,
 }
 
 /// The token counts behind the context meter: `ThreadTokenUsageSnapshot` on a
@@ -1598,7 +1624,10 @@ mod tests {
                 {"instanceId": "claude", "driver": "claudeAgent", "enabled": true, "status": "ready",
                  "models": [{"slug": "custom", "isCustom": true}, {"slug": "haiku"}, {"slug": "opus", "isDefault": true}]}
             ],
-            "settings": {"defaultModelSelection": {"instanceId": "off", "model": "a"}},
+            "settings": {
+                "defaultModelSelection": {"instanceId": "off", "model": "a"},
+                "projectSettingsOverrides": {"p": {"defaultModelSelection": {"instanceId": "claude", "model": "haiku"}}}
+            },
             "environment": {"capabilities": {"threadStop": true}}
         }}))
         .unwrap();
@@ -1606,6 +1635,9 @@ mod tests {
         assert_eq!(info.providers.len(), 2, "an undecodable provider is skipped");
         let selection = info.new_thread_model(None).unwrap();
         assert_eq!((selection.instance_id.as_str(), selection.model.as_str()), ("claude", "opus"));
+        let project: ProjectShell =
+            serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
+        assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
     }
 
     #[test]

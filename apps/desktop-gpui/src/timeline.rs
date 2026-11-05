@@ -261,6 +261,8 @@ pub fn agent_elapsed(ms: i64) -> String {
 pub struct Checkpoint {
     pub scope_id: SharedString,
     pub checkpoint_id: SharedString,
+    /// The run ordinal the thread rewinds to; 0 is the thread start.
+    pub turn_count: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -756,7 +758,11 @@ fn revert_checkpoint(checkpoints: &[model::Checkpoint], turn_count: i64) -> Opti
                 c.app_run_ordinal == Some(turn_count)
             }
     })?;
-    Some(Checkpoint { scope_id: checkpoint.scope_id.clone().into(), checkpoint_id: checkpoint.id.clone().into() })
+    Some(Checkpoint {
+        scope_id: checkpoint.scope_id.clone().into(),
+        checkpoint_id: checkpoint.id.clone().into(),
+        turn_count,
+    })
 }
 
 /// `deriveAvailableRevertTurnCounts`: the runs whose provider turn is on the live provider

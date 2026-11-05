@@ -110,6 +110,10 @@ impl Workspace {
         let (skills, commands) = composer_search::provider_lists(&provider, cwd.as_deref());
         let items = match trigger.kind {
             TriggerKind::Skill => composer_search::skill_items(skills, &trigger.query),
+            // `getProviderSkillsForSlashMenu`: skills join `/` only when the setting allows.
+            _ if !self.client_settings.values.bool("showSkillsInSlashMenu") => {
+                composer_search::slash_items(&[], commands, &trigger.query, trigger.range.start == 0)
+            }
             _ => composer_search::slash_items(skills, commands, &trigger.query, trigger.range.start == 0),
         };
         self.menu.highlighted = self.menu.highlighted.min(items.len().saturating_sub(1));
@@ -295,7 +299,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(outline)
-                        .bg(t.background.blend(t.card.opacity(0.8)))
+                        .bg(t.background.blend(t.card.opacity(t.glass)))
                         .child(body),
                 )
                 .into_any_element(),
