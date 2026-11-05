@@ -25,10 +25,12 @@ use serde_json::{Value, json};
 use super::super::Workspace;
 use super::super::sidebar::now_ms;
 use crate::pull_request_detail::Reference;
+use crate::pull_requests::AssignableProject;
 use crate::pull_requests::{
     self as logic, CHECKS, DRAFTS, Entry, Filters, ListResult, MAX_PAGE_SIZE, PAGE_SIZE, REVIEWS, SORTS, STATES, Stats,
     View,
 };
+use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 /// `PullRequestRef` for a listed row.
@@ -261,10 +263,57 @@ impl Workspace {
         input
     }
 
-    /// Reads the list; `more` continues from the last answer's cursors, or asks for a longer
-    /// page when the host gave none.
+    /// The machines the list asks and, where a repository lives on several, the projects each
+    /// asks about (`usePullRequestScope`'s `environmentQueries`).
+    pub(super) fn pull_request_targets(&self) -> Vec<(SharedString, RpcClient, Option<Vec<String>>)> {
+        let mut connected: Vec<(&SharedString, RpcClient)> =
+            self.sessions().iter().filter_map(|s| Some((s.id.as_ref()?, s.client.clone()?))).collect();
+        connected.sort_by(|a, b| a.0.cmp(b.0));
+        if let Some(project) = &self.pull_requests.project {
+            let environment = self.shell.project_environment(project);
+            connected.retain(|(id, _)| Some(*id) == environment);
+            return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
+        }
+        let known = connected.iter().all(|(id, _)| self.shell.sequence(id) > 0);
+        if !known {
+            return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
+        }
+        let scratch = self.scratch_roots();
+        let projects: Vec<AssignableProject> = self
+            .shell
+            .projects
+            .iter()
+            .filter(|p| {
+                let root = crate::project_groups::normalize_path(&p.workspace_root);
+                !scratch.iter().any(|s| {
+                    s.environment_id == p.environment_id && crate::project_groups::normalize_path(&s.root) == root
+                })
+            })
+            .map(|p| AssignableProject {
+                id: p.id.clone(),
+                environment_id: p.environment_id.to_string(),
+                repository: p.repository_identity.as_ref().and_then(|r| r.canonical_key.clone()),
+            })
+            .collect();
+        let ids: Vec<&str> = connected.iter().map(|(id, _)| id.as_ref()).collect();
+        let assignment = logic::assign_projects(&projects, &ids, ids.first().copied());
+        connected
+            .into_iter()
+            .filter_map(|(id, client)| {
+                let assigned = assignment.get(id.as_ref())?;
+                let total = projects.iter().filter(|p| p.environment_id == id.as_ref()).count();
+                Some((id.clone(), client, (assigned.len() != total).then(|| assigned.clone())))
+            })
+            .collect()
+    }
+
+    /// Reads the list from every machine and merges it; `more` continues each machine from its
+    /// last cursors, or asks for a longer page when no host gave any.
     pub(super) fn read_pull_requests(&mut self, more: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let targets = self.pull_request_targets();
+        if targets.is_empty() {
+            return;
+        }
         let state = &mut self.pull_requests;
         let cursors =
             more.then(|| state.list.as_ref().map(|l| l.next_cursors.clone())).flatten().filter(|c| !c.is_empty());
@@ -276,9 +325,27 @@ impl Workspace {
         state.loading = true;
         state.loading_more = more;
         let continuing = cursors.is_some();
-        let input = self.pull_request_input(cursors.as_ref());
+        let requests: Vec<(String, RpcClient, Value)> = targets
+            .into_iter()
+            .filter_map(|(environment, client, project_ids)| {
+                let own =
+                    cursors.as_ref().and_then(|c| c.get(environment.as_ref())).and_then(Value::as_object).cloned();
+                // A continuation asks only the machines that have more.
+                if continuing && own.is_none() {
+                    return None;
+                }
+                let mut input = self.pull_request_input(own.as_ref());
+                if let Some(project_ids) = project_ids {
+                    input["projectIds"] = json!(project_ids);
+                }
+                Some((environment.to_string(), client, input))
+            })
+            .collect();
         cx.spawn(async move |this, cx| {
-            let result = client.request("pullRequests.list", input).await;
+            let reads = requests.into_iter().map(|(environment, client, input)| async move {
+                (environment, client.request("pullRequests.list", input).await)
+            });
+            let results = futures::future::join_all(reads).await;
             let _ = this.update(cx, |this, cx| {
                 let state = &mut this.pull_requests;
                 if state.generation != generation {
@@ -286,8 +353,26 @@ impl Workspace {
                 }
                 state.loading = false;
                 state.loading_more = false;
-                match result.map(serde_json::from_value::<ListResult>) {
-                    Ok(Ok(mut answer)) => {
+                // An unreachable machine must not hide the others' rows.
+                let mut answers = Vec::new();
+                let mut failure = None;
+                for (environment, result) in results {
+                    match result.map(serde_json::from_value::<ListResult>) {
+                        Ok(Ok(answer)) => answers.push((environment, answer)),
+                        Ok(Err(error)) => {
+                            failure.get_or_insert_with(|| format!("Unreadable pull request list: {error}"));
+                        }
+                        Err(error) => {
+                            failure.get_or_insert_with(|| logic::error_message(&error));
+                        }
+                    }
+                }
+                let result = match (answers.is_empty(), failure) {
+                    (true, Some(failure)) => Err(failure),
+                    _ => Ok(logic::merge_lists(answers)),
+                };
+                match result {
+                    Ok(mut answer) => {
                         state.error = None;
                         let (text, _) = logic::parse_query(&state.sent);
                         match (continuing, state.list.as_mut()) {
@@ -299,8 +384,7 @@ impl Workspace {
                         }
                         this.read_pull_request_stats(cx);
                     }
-                    Ok(Err(error)) => state.error = Some(format!("Unreadable pull request list: {error}").into()),
-                    Err(error) => state.error = Some(logic::error_message(&error).into()),
+                    Err(failure) => state.error = Some(failure.into()),
                 }
                 this.rebuild_pull_request_rows();
                 cx.notify();
@@ -310,20 +394,30 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Asks the host for the diff sizes the listing left at zero.
+    /// Asks each pull request's own machine for the diff sizes the listing left at zero.
     fn read_pull_request_stats(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(list)) = (self.client(), self.pull_requests.list.as_ref()) else { return };
+        let Some(list) = self.pull_requests.list.as_ref() else { return };
         let stats = &self.pull_requests.stats;
-        let refs: Vec<Value> = list
-            .entries
-            .iter()
-            .filter(|e| e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()))
-            .take(500)
-            .map(|e| e.reference())
-            .collect();
-        if refs.is_empty() {
-            return;
+        let mut by_environment: Vec<(&SharedString, Vec<Value>)> = Vec::new();
+        let missing =
+            list.entries.iter().filter(|e| e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()));
+        for entry in missing.take(500) {
+            let Some(environment) = self.shell.project_environment(&entry.project_id) else { continue };
+            match by_environment.iter_mut().find(|(held, _)| *held == environment) {
+                Some((_, refs)) => refs.push(entry.reference()),
+                None => by_environment.push((environment, vec![entry.reference()])),
+            }
         }
+        let reads: Vec<(RpcClient, Vec<Value>)> = by_environment
+            .into_iter()
+            .filter_map(|(environment, refs)| Some((self.env_client(environment)?, refs)))
+            .collect();
+        for (client, refs) in reads {
+            self.read_pull_request_stats_from(client, refs, cx);
+        }
+    }
+
+    fn read_pull_request_stats_from(&mut self, client: RpcClient, refs: Vec<Value>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let Ok(answer) = client.request("pullRequests.listStats", json!({"refs": refs})).await else { return };
             let _ = this.update(cx, |this, cx| {
@@ -342,10 +436,14 @@ impl Workspace {
 
     /// Refresh: the host is asked again rather than the server's cache.
     fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let clients: Vec<RpcClient> = self.pull_request_targets().into_iter().map(|(_, client, _)| client).collect();
+        if clients.is_empty() {
+            return;
+        }
         self.pull_requests.refreshing = true;
         cx.spawn(async move |this, cx| {
-            let _ = client.request("pullRequests.invalidate", json!({})).await;
+            let invalidations = clients.iter().map(|client| client.request("pullRequests.invalidate", json!({})));
+            futures::future::join_all(invalidations).await;
             let _ = this.update(cx, |this, cx| {
                 this.pull_requests.refreshing = false;
                 this.pull_requests.stats.clear();

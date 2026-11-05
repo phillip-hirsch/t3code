@@ -238,8 +238,6 @@ impl DeviceState {
 /// The workspace's device slot: the streamed state plus what Settings has in flight on it.
 #[derive(Default)]
 pub struct Devices {
-    /// `None` until this connection's first state arrives.
-    pub state: Option<DeviceState>,
     /// `pending` in the web's `DeviceIntegrationControls`: one device action at a time.
     pub pending: Option<Pending>,
     /// The last failed tool update, shown in that tool's version popover.

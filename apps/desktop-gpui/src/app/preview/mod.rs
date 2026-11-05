@@ -24,6 +24,7 @@ use super::right_panel::Surface;
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT};
 use super::{Target, Workspace};
 use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPreviews};
+use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 mod empty;
@@ -107,14 +108,12 @@ pub(super) struct PreviewState {
     discovery: empty::Discovery,
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<String>,
-    _events: Option<Task<()>>,
     _subscription: Subscription,
 }
 
 impl PreviewState {
-    /// The event stream ends with the socket; lists are refetched on reconnect.
+    /// The primary's socket closed: its profiles are reported again on reconnect.
     pub(super) fn disconnect(&mut self) {
-        self._events = None;
         self.reported_profiles = None;
     }
 }
@@ -144,7 +143,6 @@ impl PreviewState {
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
             unreachable_details: HashSet::new(),
-            _events: None,
             _subscription: subscription,
         }
     }
@@ -252,26 +250,36 @@ impl Workspace {
             || window.has_active_dialog(cx)
     }
 
-    /// Subscribes to every thread's preview events for this connection.
-    pub(super) fn subscribe_previews(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+    /// Subscribes to the preview events of every thread on one environment.
+    pub(super) fn subscribe_previews(
+        &mut self,
+        environment: &SharedString,
+        client: &RpcClient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         // Lists fetched before a reconnect may have missed events.
-        for previews in self.preview.threads.values_mut() {
-            previews.list_loaded = false;
-        }
-        self.preview.stale.extend(self.preview.threads.keys().cloned());
-        if let Some(thread_id) = self.preview_thread_id() {
-            self.preview.stale.insert(thread_id.to_owned());
+        let on_environment =
+            |this: &Self, thread_id: &str| this.thread_environment(thread_id).as_ref() == Some(environment);
+        let mut stale: Vec<String> =
+            self.preview.threads.keys().filter(|thread_id| on_environment(self, thread_id)).cloned().collect();
+        stale.extend(self.preview_thread_id().filter(|thread_id| on_environment(self, thread_id)).map(str::to_owned));
+        for thread_id in stale {
+            if let Some(previews) = self.preview.threads.get_mut(&thread_id) {
+                previews.list_loaded = false;
+            }
+            self.preview.stale.insert(thread_id);
         }
         let stream = client.stream("subscribePreviewEvents", json!({}));
-        self.preview._events = Some(Self::pump(
+        let task = Self::pump(
             stream,
             window,
             cx,
             |this, value| this.apply_preview_event(value),
             |this, window, cx| this.after_preview_change(window, cx),
-        ));
+        );
         self.after_preview_change(window, cx);
+        task
     }
 
     fn apply_preview_event(&mut self, event: &Value) {
@@ -299,26 +307,28 @@ impl Workspace {
 
     /// Refetches stale lists, drops views whose tab closed and refreshes the address bar.
     fn after_preview_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(client) = self.client() {
-            for thread_id in std::mem::take(&mut self.preview.stale) {
-                let client = client.clone();
-                cx.spawn_in(window, async move |this, cx| {
-                    let result = client.request("preview.list", json!({"threadId": thread_id})).await;
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        match result {
-                            Ok(list) => {
-                                let previews = this.preview.threads.entry(thread_id).or_default();
-                                if let Err(error) = previews.apply_list(&list) {
-                                    log::warn!("bad preview list: {error}");
-                                }
+        for thread_id in std::mem::take(&mut self.preview.stale) {
+            // A thread whose environment is offline refetches once it reconnects.
+            let Some(client) = self.thread_client(&thread_id) else {
+                self.preview.stale.insert(thread_id);
+                continue;
+            };
+            cx.spawn_in(window, async move |this, cx| {
+                let result = client.request("preview.list", json!({"threadId": thread_id})).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    match result {
+                        Ok(list) => {
+                            let previews = this.preview.threads.entry(thread_id).or_default();
+                            if let Err(error) = previews.apply_list(&list) {
+                                log::warn!("bad preview list: {error}");
                             }
-                            Err(error) => log::warn!("preview.list failed: {error}"),
                         }
-                        this.after_preview_change(window, cx);
-                    });
-                })
-                .detach();
-            }
+                        Err(error) => log::warn!("preview.list failed: {error}"),
+                    }
+                    this.after_preview_change(window, cx);
+                });
+            })
+            .detach();
         }
         let threads = &self.preview.threads;
         self.preview.tabs.retain(|tab_id, tab| threads.get(&tab.thread_id).is_none_or(|p| p.get(tab_id).is_some()));

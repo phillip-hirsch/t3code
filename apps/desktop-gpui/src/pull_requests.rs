@@ -814,6 +814,86 @@ pub fn append_page(held: &mut ListResult, mut next: ListResult, query: &str) {
     held.viewers.extend(next.viewers);
 }
 
+/// A project the pull request list can ask about, on its environment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssignableProject {
+    pub id: String,
+    pub environment_id: String,
+    /// `repositoryIdentity.canonicalKey`; projects without one are always asked on their own machine.
+    pub repository: Option<String>,
+}
+
+/// `assignProjectsToEnvironments`: a repository checked out on several machines is asked about
+/// once, on the preferred machine, else the earliest listed; other projects stay on their own.
+pub fn assign_projects(
+    projects: &[AssignableProject],
+    environment_ids: &[&str],
+    preferred: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    let rank = |environment: &str| environment_ids.iter().position(|id| *id == environment);
+    let key = |project: &AssignableProject| project.repository.as_ref().map(|k| k.to_lowercase());
+    let mut owner: HashMap<String, &str> = HashMap::new();
+    for project in projects {
+        let (Some(key), Some(project_rank)) = (key(project), rank(&project.environment_id)) else { continue };
+        match owner.get(&key) {
+            None => {
+                owner.insert(key, &project.environment_id);
+            }
+            Some(current) if Some(*current) == preferred => {}
+            Some(current) => {
+                if Some(project.environment_id.as_str()) == preferred
+                    || rank(current).is_none_or(|current_rank| project_rank < current_rank)
+                {
+                    owner.insert(key, &project.environment_id);
+                }
+            }
+        }
+    }
+    let mut assignment: HashMap<String, Vec<String>> = HashMap::new();
+    for project in projects {
+        if rank(&project.environment_id).is_none() {
+            continue;
+        }
+        if key(project).is_some_and(|key| owner.get(&key) != Some(&project.environment_id.as_str())) {
+            continue;
+        }
+        assignment.entry(project.environment_id.clone()).or_default().push(project.id.clone());
+    }
+    assignment
+}
+
+/// `mergePullRequestLists`: every machine's answer as one list, newest first. Continuation
+/// cursors stay apart, keyed by environment id, so each machine carries on from its own.
+pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
+    let mut merged = ListResult::default();
+    for (environment_id, answer) in answers {
+        for (host, login) in answer.viewers {
+            merged.viewers.entry(host).or_insert(login);
+        }
+        for provider in answer.providers {
+            match merged.providers.iter_mut().find(|held| held.host == provider.host) {
+                Some(held) => {
+                    if !held.configured && provider.configured {
+                        let searches_on_host = held.searches_on_host;
+                        *held = ProviderSummary { searches_on_host, ..provider.clone() };
+                    }
+                    held.searches_on_host &= provider.searches_on_host;
+                    held.configured |= provider.configured;
+                }
+                None => merged.providers.push(provider),
+            }
+        }
+        merged.entries.extend(answer.entries);
+        merged.errors.extend(answer.errors);
+        merged.truncated |= answer.truncated;
+        if !answer.next_cursors.is_empty() {
+            merged.next_cursors.insert(environment_id, Value::Object(answer.next_cursors));
+        }
+    }
+    merged.entries.sort_by(|l, r| by_recency(l, r));
+    merged
+}
+
 /// The error text the web shows for a failed read (`formatEnvironmentQueryError`, which reads
 /// each tagged error's `message` getter).
 pub fn error_message(error: &RpcError) -> String {
@@ -862,6 +942,52 @@ pub fn provider_name(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_repository_is_asked_once_on_the_preferred_machine() {
+        let project = |id: &str, env: &str, repo: Option<&str>| AssignableProject {
+            id: id.into(),
+            environment_id: env.into(),
+            repository: repo.map(Into::into),
+        };
+        let projects = [
+            project("a1", "a", Some("GitHub.com/x/repo")),
+            project("b1", "b", Some("github.com/x/repo")),
+            project("b2", "b", None),
+            project("c1", "c", Some("github.com/x/other")),
+        ];
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        let assignment = assign_projects(&projects, &["a", "b"], Some("b"));
+        assert_eq!(sorted(assignment["b"].clone()), ["b1", "b2"], "the preferred machine keeps the shared repo");
+        assert!(!assignment.contains_key("a"), "a has nothing left to ask");
+        assert!(!assignment.contains_key("c"), "machines not asked are left out");
+        let earliest = assign_projects(&projects, &["a", "b"], None);
+        assert_eq!((earliest["a"].clone(), earliest["b"].clone()), (vec!["a1".to_owned()], vec!["b2".to_owned()]));
+    }
+
+    #[test]
+    fn merged_lists_keep_each_machines_cursors_and_sort_newest_first() {
+        let answer = |entries: Vec<Rc<Entry>>, cursors: Value| ListResult {
+            entries,
+            next_cursors: cursors.as_object().cloned().unwrap_or_default(),
+            providers: vec![ProviderSummary {
+                host: "github.com".into(),
+                searches_on_host: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let merged = merge_lists(vec![
+            ("a".into(), answer(vec![entry(1, json!({}))], json!({"github.com": "c1"}))),
+            ("b".into(), answer(vec![entry(2, json!({}))], json!({}))),
+        ]);
+        assert_eq!(merged.entries.iter().map(|e| e.number).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
+        assert_eq!(merged.providers.len(), 1);
+    }
 
     #[test]
     fn host_answers_join_the_loaded_facets_after_their_room() {

@@ -40,6 +40,7 @@ mod files;
 mod find;
 mod git;
 mod header;
+mod host_picker;
 mod inspector;
 mod keep_alive;
 mod keymap;
@@ -206,9 +207,9 @@ pub struct Workspace {
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
+    /// The composer's "Run on" picker and each draft's machine choice.
+    host: host_picker::HostUi,
     _connection_task: Task<()>,
-    /// The primary environment's streams besides its config and shell.
-    _stream_tasks: Vec<Task<()>>,
     /// The launch landing ran (once, after the first shell snapshot).
     landed: bool,
     /// A page covering the chat in the main column.
@@ -375,8 +376,8 @@ impl Workspace {
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
+            host: Default::default(),
             _connection_task: Self::connect(window, cx),
-            _stream_tasks: Vec::new(),
             landed: false,
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
@@ -567,7 +568,6 @@ impl Workspace {
             return;
         }
         if !matches!(connection, Connection::Connected) {
-            self._stream_tasks.clear();
             self.set_primary_connection(None, None);
             self.preview.disconnect();
             if self.target_on_primary() {
@@ -604,9 +604,6 @@ impl Workspace {
         if let Some(primary) = self.primary_environment().cloned() {
             self.start_session(primary, window, cx);
         }
-        self._stream_tasks = vec![self.subscribe_device_state(window, cx)];
-        self.subscribe_terminal_metadata(&client, window, cx);
-        self.subscribe_previews(window, cx);
         // Rows that come back unchanged would not resync these.
         self.sync_worktree_setup(cx);
         self.sync_details(cx);
@@ -964,6 +961,7 @@ impl Render for Workspace {
         }
         self.sync_vcs(window, cx);
         self.sync_servers(window, cx);
+        self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(cx);

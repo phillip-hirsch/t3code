@@ -80,7 +80,7 @@ impl Workspace {
         let enabled = settings.bool("enableDeviceSupport");
         let simlock_enabled = settings.bool("simlockDeviceHostsEnabled");
         let model = sources.read(cx);
-        let state = self.devices.state.as_ref();
+        let state = self.settings_device_state();
         let supports_eas = state.is_some_and(|state| state.supports_eas_hosts);
         let supports_simlock = state.is_some_and(|state| state.supports_simlock_hosts) && simlock_enabled;
         let disabled = model.busy || self.settings_client().is_none();

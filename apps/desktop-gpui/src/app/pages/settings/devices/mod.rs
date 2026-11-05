@@ -26,21 +26,26 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::pages::settings::widgets::{RowFrame, settings_section};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
+use crate::rpc::RpcClient;
 use crate::rpc::RpcError;
 use crate::theme::{self, Tokens};
 
 impl Workspace {
-    /// Streams `subscribeDeviceState` for this connection; the task ends with the socket.
-    pub(in crate::app) fn subscribe_device_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
-        self.devices.state = None;
-        let Some(client) = self.settings_client() else { return Task::ready(()) };
+    /// Streams one environment's `subscribeDeviceState`; the task ends with its socket.
+    pub(in crate::app) fn subscribe_device_state(
+        &mut self,
+        environment: SharedString,
+        client: &RpcClient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         let stream = client.stream("subscribeDeviceState", json!({}));
         Self::pump(
             stream,
             window,
             cx,
-            |this, value| match DeviceState::decode(value) {
-                Ok(state) => this.devices.state = Some(state),
+            move |this, value| match DeviceState::decode(value) {
+                Ok(state) => this.set_device_state(&environment, state),
                 Err(error) => log::warn!("bad device state: {error}"),
             },
             |_, _, _| {},
@@ -61,9 +66,9 @@ impl Workspace {
     fn render_device_integration(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let empty = DeviceState::default();
-        let state = self.devices.state.as_ref().unwrap_or(&empty);
+        let state = self.settings_device_state().unwrap_or(&empty);
         let connected = self.settings_client().is_some();
-        let loaded = connected && self.devices.state.is_some();
+        let loaded = connected && self.settings_device_state().is_some();
         let setting = |key: &str| self.settings_info().settings.bool(key);
         let (enabled, agent_enabled) = (setting("enableDeviceSupport"), setting("enableAgentDeviceAccess"));
         let busy = state.readiness().busy;

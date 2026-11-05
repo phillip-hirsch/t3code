@@ -81,6 +81,7 @@ impl Workspace {
         if offers_links && readable && self.settings_client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));
         }
+        sections.extend(self.load_balancing_section(cx));
         self.settings_page("connections", &view, sections, cx)
     }
 

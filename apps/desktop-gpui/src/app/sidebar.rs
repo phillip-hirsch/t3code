@@ -1472,6 +1472,8 @@ impl Workspace {
                 .child(icon(name, 16., sb.icon))
         };
         let status: Option<(SharedString, Hsla)> = match &self.connection {
+            // A thread on a saved environment shows that environment's connection.
+            _ if !self.target_on_primary() => self.saved_target_status(tokens, cx),
             Connection::Connected if self.shell.live() => None,
             Connection::Connected => Some(("Syncing…".into(), tokens.muted_foreground)),
             Connection::Starting => Some(("Starting server…".into(), tokens.muted_foreground)),

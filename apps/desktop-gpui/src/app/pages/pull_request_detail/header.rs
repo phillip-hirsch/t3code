@@ -31,7 +31,7 @@ impl Workspace {
 
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let Some(detail) = panel.detail.clone() else { return };
         let key = key.to_owned();
@@ -377,7 +377,7 @@ impl Workspace {
 
     /// `thread.pull-request.link`, then the linked threads are read again.
     fn link_pr_to_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.thread_client(&thread_id) else { return };
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
@@ -397,7 +397,7 @@ impl Workspace {
 
     /// "Allow edits from maintainers" (`pullRequests.update` with `maintainerCanModify`).
     pub(super) fn save_pr_maintainer_edits(&mut self, value: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.maintainer_saving {
             return;
@@ -638,7 +638,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.pending.is_some() {
             return;

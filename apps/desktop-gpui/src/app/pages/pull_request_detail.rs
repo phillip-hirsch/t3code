@@ -31,7 +31,7 @@ use crate::pull_request_detail::{
     ReviewOutcome, TimelineRow,
 };
 use crate::pull_requests::{self as list_logic, Entry};
-use crate::rpc::RpcError;
+use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
@@ -331,6 +331,21 @@ impl Workspace {
         self.pull_requests.parked.get_mut(key)
     }
 
+    /// The socket of the machine the pull request `key` names lives on: its project's.
+    fn pull_request_client_of(&self, key: &str) -> Option<RpcClient> {
+        let shown = self.pull_requests.panel.as_ref().filter(|p| p.reference.key() == key);
+        let panel = shown.or_else(|| self.pull_requests.parked.get(key))?;
+        self.project_client(&panel.reference.project_id)
+    }
+
+    /// The socket of the shown pull request's machine.
+    pub(in crate::app) fn pull_request_client(&self) -> Option<RpcClient> {
+        match &self.pull_requests.panel {
+            Some(panel) => self.project_client(&panel.reference.project_id),
+            None => self.client(),
+        }
+    }
+
     fn shown_pr_key(&self) -> Option<String> {
         self.pull_requests.panel.as_ref().map(|p| p.reference.key())
     }
@@ -351,7 +366,7 @@ impl Workspace {
 
     /// Reads the detail and activity of the pull request `key` names, shown or parked; each lands on its own.
     fn read_pr_detail_of(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let reference = panel.reference.to_json();
         let mut detail_input = reference.clone();
@@ -428,7 +443,7 @@ impl Workspace {
     }
 
     fn refresh_pr_from_host_of(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel(key) else { return };
         panel.refreshing = true;
         let key = panel.reference.key();
@@ -483,7 +498,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
@@ -613,7 +628,7 @@ impl Workspace {
 
     /// `pullRequests.reviewGuide`, read again while a run is writing one.
     fn read_pr_guide(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         panel.guide_loading = true;
         let key = panel.reference.key();
@@ -657,7 +672,7 @@ impl Workspace {
 
     /// `useReviewGuideWriter.write`: starts an agent run on the server (`pullRequests.generateReviewGuide`).
     fn write_pr_guide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running") {
             return;

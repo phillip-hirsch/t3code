@@ -421,7 +421,7 @@ impl Workspace {
     }
 
     fn read_pr_files_viewed(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let (key, input) = (panel.reference.key(), panel.reference.to_json());
         cx.spawn(async move |this, cx| {
@@ -459,7 +459,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let (key, mut input) = (panel.reference.key(), panel.reference.to_json());
         let Some(code) = panel.code.as_mut() else { return };
@@ -500,7 +500,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let key = panel.reference.key();
         let mut input = panel.reference.to_json();

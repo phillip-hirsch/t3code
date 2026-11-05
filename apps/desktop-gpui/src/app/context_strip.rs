@@ -436,7 +436,8 @@ impl Workspace {
             return self.render_thread_context_strip(t, cx);
         }
         let git = self.is_git_repo();
-        let environment = self.environment_remote.then(|| self.render_environment_chip(t));
+        let environment = self.render_host_picker(t, cx);
+        let separated = git && environment.is_some();
         let mode = self.runtime_mode();
         let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
         Some(
@@ -455,9 +456,7 @@ impl Workspace {
                             .min_h(px(24.))
                             .gap(px(4.))
                             .children(environment)
-                            .when(git && self.environment_remote, |el| {
-                                el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border))
-                            })
+                            .when(separated, |el| el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border)))
                             .when(git, |el| el.child(self.render_env_mode_selector(t, cx))),
                     )
                 })
@@ -477,10 +476,11 @@ impl Workspace {
     fn render_thread_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let git = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
         let persist = self.client_settings.values.bool("persistComposerContextStrip");
-        if !persist || !(git || self.environment_remote) {
+        let environment = self.render_host_picker(t, cx);
+        if !persist || !(git || environment.is_some()) {
             return None;
         }
-        let environment = self.environment_remote.then(|| self.render_environment_chip(t));
+        let separated = git && environment.is_some();
         // A started thread keeps its workspace (`resolveLockedWorkspaceLabel`).
         let worktree = self.git_cwd() != self.target_project().map(|p| p.workspace_root.clone());
         let (icon, label) = if worktree { (Lucide::FolderGit, "Worktree") } else { (Lucide::Folder, "Local checkout") };
@@ -512,38 +512,12 @@ impl Workspace {
                         .min_h(px(24.))
                         .gap(px(4.))
                         .children(environment)
-                        .when(git && self.environment_remote, |el| {
-                            el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border))
-                        })
+                        .when(separated, |el| el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border)))
                         .when(git, |el| el.child(locked)),
                 )
                 .when(git, |el| el.child(self.render_branch_selector(t, cx)))
                 .into_any_element(),
         )
-    }
-
-    /// The machine the draft runs on; a locked label while this is the only environment.
-    fn render_environment_chip(&self, t: &Tokens) -> AnyElement {
-        let label: SharedString =
-            self.server_info().environment_label.clone().unwrap_or_else(|| "Run on".into()).into();
-        let icon = match self.server_info().machine_kind() {
-            "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
-            "laptop" => Lucide::Laptop,
-            "cloud" => Lucide::Cloud,
-            _ => Lucide::Server,
-        };
-        let tooltip = label.clone();
-        h_flex()
-            .id("environment-chip")
-            .min_w_0()
-            .h(px(24.))
-            .px(px(7.))
-            .gap(px(6.))
-            .text_color(t.muted_foreground.opacity(0.7))
-            .child(Icon::new(icon).with_size(px(12.)).flex_none())
-            .child(div().max_w(px(240.)).truncate().child(label))
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .into_any_element()
     }
 
     fn render_env_mode_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
@@ -909,7 +883,7 @@ fn is_within(root: &str, path: &str) -> bool {
 }
 
 /// `ComposerControl size="xs"`: 24px, 7px padding, 6px gap, text-xs, muted until hovered.
-fn strip_button(id: &'static str, t: &Tokens) -> Button {
+pub(super) fn strip_button(id: &'static str, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .xsmall()
