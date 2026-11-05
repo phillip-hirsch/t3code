@@ -485,12 +485,19 @@ impl SaveQueue {
         Some(self.revision)
     }
 
-    /// Settles a write; true when newer edits arrived meanwhile and need their own write.
-    pub(super) fn finish(&mut self, revision: u64, ok: bool) -> bool {
+    /// Confirms the write of `revision`; true when newer edits arrived meanwhile and need their own write.
+    pub(super) fn written(&mut self, revision: u64) -> bool {
+        self.confirmed = revision;
+        self.settle(revision)
+    }
+
+    /// Settles a failed write of `revision`; its edits stay unsaved, and only newer edits write again.
+    pub(super) fn failed(&mut self, revision: u64) -> bool {
+        self.settle(revision)
+    }
+
+    fn settle(&mut self, revision: u64) -> bool {
         self.writing = false;
-        if ok {
-            self.confirmed = revision;
-        }
         self.revision != revision
     }
 }
@@ -627,14 +634,14 @@ mod tests {
         let first = queue.start().unwrap();
         assert!(!queue.change(), "the revert waits for the write in flight");
         assert_eq!(queue.start(), None, "writes are serialized");
-        assert!(queue.finish(first, true), "the revert still needs its own write");
+        assert!(queue.written(first), "the revert still needs its own write");
         let revert = queue.start().unwrap();
-        assert!(!queue.finish(revert, true));
+        assert!(!queue.written(revert));
         assert!(!queue.pending());
 
         queue.change();
         let failed = queue.start().unwrap();
-        assert!(!queue.finish(failed, false), "a failed write with no newer edits is not retried");
+        assert!(!queue.failed(failed), "a failed write with no newer edits is not retried");
         assert!(queue.pending(), "but its edits stay unsaved");
     }
 }

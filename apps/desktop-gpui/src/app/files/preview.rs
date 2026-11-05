@@ -364,7 +364,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Duration> {
         let state = self.files.previews.get_mut(key)?;
-        let again = state.save.finish(revision, result.is_ok());
+        let again = if result.is_ok() { state.save.written(revision) } else { state.save.failed(revision) };
         let next = again.then(|| SAVE_DEBOUNCE.saturating_sub(state.last_change.elapsed()));
         match result {
             Ok(_) => state.saved = contents,
