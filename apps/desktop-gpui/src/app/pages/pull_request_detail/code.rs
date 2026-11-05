@@ -298,6 +298,18 @@ impl Workspace {
                                 })
                                 .collect(),
                         };
+                        // An unchanged page leaves the viewer, and its scroll, where they are.
+                        let same = code.slices.iter().any(|s| {
+                            s.cursor == cursor
+                                && s.patch == slice.patch
+                                && s.truncated == slice.truncated
+                                && s.next_cursor == slice.next_cursor
+                                && s.omitted == slice.omitted
+                        });
+                        if same {
+                            cx.notify();
+                            return;
+                        }
                         // A changed page drops the pages after it: their cursors name the old diff.
                         match code.slices.iter().position(|s| s.cursor == cursor) {
                             Some(index) => {

@@ -38,6 +38,7 @@ use crate::theme::{self, FONT_MONO, Tokens};
 mod code;
 mod handoff;
 mod header;
+mod live;
 pub(in crate::app) mod write;
 
 const CONVERSATION_PAGE: usize = 10;
@@ -104,6 +105,8 @@ pub(in crate::app) struct Panel {
     _picker_search: Option<Subscription>,
     /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
     handoff: Option<String>,
+    /// The header's fold scrolled away.
+    condensed: bool,
 }
 
 impl Panel {
@@ -151,6 +154,7 @@ impl Panel {
             maintainer_choice: None,
             _picker_search: None,
             handoff: None,
+            condensed: false,
         }
     }
 
@@ -217,7 +221,9 @@ impl Workspace {
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
             return;
         }
-        self.pull_requests.panel = Some(Panel::new(reference, seed));
+        if self.show_pr_tab(reference, seed, cx) {
+            return;
+        }
         self.read_pr_detail(cx);
         if self.server_info.settings.bool("reviewGuidesEnabled") {
             self.read_pr_guide(cx);
@@ -225,8 +231,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// "Collapse pull request panel": every tab closes with it.
     pub(super) fn close_pull_request_panel(&mut self, cx: &mut Context<Self>) {
         self.pull_requests.panel = None;
+        self.pull_requests.tabs.clear();
+        self.pull_requests.parked.clear();
         cx.notify();
     }
 
@@ -254,8 +263,12 @@ impl Workspace {
         true
     }
 
+    /// The open pull request `key` names, shown or parked in its tab, for an answer to land in.
     fn pr_panel(&mut self, key: &str) -> Option<&mut Panel> {
-        self.pull_requests.panel.as_mut().filter(|p| p.reference.key() == key)
+        if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference.key() == key) {
+            return self.pull_requests.panel.as_mut();
+        }
+        self.pull_requests.parked.get_mut(key)
     }
 
     /// Reads the detail and its activity; each lands on its own.
@@ -659,11 +672,7 @@ impl Workspace {
         frame
             .child(header)
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(body)
+                self.pr_scroll_watch(body, cx)
                     .children(composer.map(|c| div().absolute().right(px(16.)).bottom(px(12.)).child(c))),
             )
             .into_any_element()
@@ -792,6 +801,8 @@ impl Workspace {
             });
         let open_label = list_logic::open_on_host_label(&detail.provider);
         let number = number_link(&detail.url, detail.number, state_color, open_label);
+        let condensed = panel.condensed;
+        let condensed_row = self.render_pr_condensed_row(detail, t);
         let crumbs = h_flex()
             .flex_1()
             .min_w_0()
@@ -800,8 +811,18 @@ impl Workspace {
             .gap(px(4.))
             .text_xs()
             .text_color(t.muted_foreground)
-            .child(repository)
-            .child(number);
+            .when(!condensed, |el| el.child(repository))
+            .child(number)
+            .when(condensed, |el| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.foreground)
+                        .child(detail.title.clone()),
+                )
+            });
 
         let actions = h_flex()
             .flex_none()
@@ -975,7 +996,15 @@ impl Workspace {
             .border_b_1()
             .border_color(hairline)
             .child(h_flex().items_start().gap(px(8.)).child(crumbs).child(actions))
-            .child(v_flex().mt(px(4.)).px(px(16.)).pb(px(16.)).min_w_0().child(title).child(meta).child(branches))
+            .map(|el| {
+                if condensed {
+                    el.child(condensed_row)
+                } else {
+                    el.child(
+                        v_flex().mt(px(4.)).px(px(16.)).pb(px(16.)).min_w_0().child(title).child(meta).child(branches),
+                    )
+                }
+            })
             .child(tab_bar)
             .into_any_element()
     }
