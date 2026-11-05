@@ -14,9 +14,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 const FIRST_PORT: u16 = 3773;
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a stopping server gets to exit after SIGTERM before it is killed.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// `SERVER_EXIT_CODE_STATE_DIR_OWNED` in `packages/contracts/src/desktopBootstrap.ts`.
 const EXIT_STATE_DIR_OWNED: i32 = 78;
 /// `DESKTOP_BOOTSTRAP_TOKEN_WINDOW_MS` in `packages/shared/src/desktopBootstrapToken.ts`.
@@ -71,11 +74,53 @@ impl Endpoint {
     }
 }
 
-/// A server this process started. Dropping it kills the server.
+/// A server this process started. Dropping it kills the server; [`LocalServer::stop`] lets it
+/// exit first.
 pub struct LocalServer {
     child: Child,
     #[cfg(windows)]
     _job: Option<win32job::Job>,
+    _running: Running,
+}
+
+/// The servers this process runs, and whether the app is quitting, which stops them all.
+struct Servers {
+    quitting: watch::Sender<bool>,
+    running: watch::Sender<usize>,
+}
+
+static SERVERS: LazyLock<Servers> =
+    LazyLock::new(|| Servers { quitting: watch::Sender::new(false), running: watch::Sender::new(0) });
+
+/// Counts a [`LocalServer`] in [`Servers::running`] while it lives.
+struct Running;
+
+impl Running {
+    fn new() -> Self {
+        SERVERS.running.send_modify(|count| *count += 1);
+        Self
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        SERVERS.running.send_modify(|count| *count -= 1);
+    }
+}
+
+/// Resolves once the app quits (see [`stop_local_servers`]).
+async fn quitting() {
+    let _ = SERVERS.quitting.subscribe().wait_for(|quitting| *quitting).await;
+}
+
+/// Stops every server this process started and resolves once all have exited, as Electron's
+/// backend manager does before the app quits. Works on any executor.
+pub fn stop_local_servers() -> impl Future<Output = ()> + 'static {
+    SERVERS.quitting.send_replace(true);
+    let mut running = SERVERS.running.subscribe();
+    async move {
+        let _ = running.wait_for(|count| *count == 0).await;
+    }
 }
 
 /// Keeps a [`LocalServer`] alive on the runtime. Dropping the handle stops it.
@@ -85,6 +130,29 @@ pub struct ServerHandle {
 }
 
 impl LocalServer {
+    fn new(child: Child) -> Self {
+        Self {
+            #[cfg(windows)]
+            _job: contain(&child),
+            child,
+            _running: Running::new(),
+        }
+    }
+
+    /// SIGTERM, then a kill if the server is still running after [`STOP_TIMEOUT`]. Windows has
+    /// no SIGTERM, so it kills right away there, as Node's `ChildProcess.kill` does.
+    async fn stop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id().and_then(|id| i32::try_from(id).ok()) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM);
+            if tokio::time::timeout(STOP_TIMEOUT, self.child.wait()).await.is_ok() {
+                return;
+            }
+            log::warn!("the local server did not stop within {STOP_TIMEOUT:?}; killing it");
+        }
+        let _ = self.child.kill().await;
+    }
+
     pub fn supervise(self, runtime: &tokio::runtime::Handle) -> ServerHandle {
         let (exited_tx, exited) = futures::channel::oneshot::channel();
         let (stop, stop_rx) = futures::channel::oneshot::channel::<()>();
@@ -99,10 +167,13 @@ impl LocalServer {
                         Err(error) => format!("Lost track of the local server: {error}"),
                     };
                     let _ = exited_tx.send(reason);
+                    return;
                 }
-                // Sender dropped: the app is done with the server. `kill_on_drop` ends it.
+                // Sender dropped: the app is done with the server.
                 _ = stop_rx => {}
+                () = quitting() => {}
             }
+            server.stop().await;
         });
         ServerHandle { exited, _stop: stop }
     }
@@ -196,11 +267,11 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
         Some(Err(error)) => log::warn!("could not install t3 launcher: {error:#}"),
         None => {}
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("start {} {}", config.node.display(), config.server_entry.display()))?;
-    #[cfg(windows)]
-    let job = contain(&child);
+    let mut server = LocalServer::new(
+        command
+            .spawn()
+            .with_context(|| format!("start {} {}", config.node.display(), config.server_entry.display()))?,
+    );
 
     // Network access and Tailscale Serve, as `DesktopServerExposure` starts the server; the
     // client still talks to it over loopback.
@@ -219,17 +290,12 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
         "tailscaleServePort": tailscale_serve_port,
         "shellEnvironmentPrepared": shell.prepared,
     });
-    let mut stdin = child.stdin.take().context("server stdin")?;
+    let mut stdin = server.child.stdin.take().context("server stdin")?;
     stdin.write_all(format!("{bootstrap}\n").as_bytes()).await?;
     stdin.flush().await?;
     drop(stdin);
 
     let http_base = format!("http://127.0.0.1:{port}");
-    let mut server = LocalServer {
-        child,
-        #[cfg(windows)]
-        _job: job,
-    };
     tokio::select! {
         ready = wait_ready(&http_base, Some(READY_TIMEOUT)) => ready?,
         status = server.child.wait() => {
@@ -238,6 +304,10 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
                 bail!("another T3 server already owns {}", config.home.display());
             }
             bail!("server exited before it was ready (code {code:?})");
+        }
+        () = quitting() => {
+            server.stop().await;
+            bail!("the app quit before the server was ready");
         }
     }
     let endpoint = Endpoint { http_base, bearer_token: String::new(), bootstrap_secret: Some(secret) };

@@ -103,6 +103,11 @@ fn main() {
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
+        // Quitting stops the local server, as Electron's backend manager does. GPUI waits only
+        // briefly for this; `main` waits for the rest after `run` returns.
+        cx.on_app_quit(|_| backend::stop_local_servers()).detach();
+        #[cfg(unix)]
+        desktop::quit_on_signals(cx);
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -110,6 +115,12 @@ fn main() {
         cx.set_global(desktop::Desktop::load(launches, cx));
         open_main_window(cx);
     });
+    // Linux and Windows return here once the app quits (macOS exits inside `run`).
+    let stopped = runtime()
+        .block_on(async { tokio::time::timeout(backend::STOP_TIMEOUT * 2, backend::stop_local_servers()).await });
+    if stopped.is_err() {
+        log::warn!("the local server had not stopped when the app exited");
+    }
 }
 
 /// Opens the app's window where it was last closed. The app draws its own titlebar: Windows

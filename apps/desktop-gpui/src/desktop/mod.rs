@@ -46,6 +46,33 @@ pub fn top_level_window(hwnd: isize) -> Option<winsafe::HWND> {
     found
 }
 
+/// SIGTERM and SIGINT quit the app as its Quit command does, so the local server stops first.
+#[cfg(unix)]
+pub fn quit_on_signals(cx: &mut App) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (received, signals) = async_channel::bounded(1);
+    crate::runtime().spawn(async move {
+        let (mut terminate, mut interrupt) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(terminate), Ok(interrupt)) => (terminate, interrupt),
+            (Err(error), _) | (_, Err(error)) => {
+                log::warn!("could not listen for SIGTERM and SIGINT: {error}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = received.send(()).await;
+    });
+    cx.spawn(async move |cx| {
+        if signals.recv().await.is_ok() {
+            cx.update(|cx| cx.quit());
+        }
+    })
+    .detach();
+}
+
 /// This launch's arguments; one that isn't valid Unicode (an unpaired surrogate) is read lossily.
 pub fn launch_args() -> Vec<String> {
     std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect()

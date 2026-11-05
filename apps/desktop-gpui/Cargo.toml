@@ -67,6 +67,7 @@ tokio = { version = "1", features = [
   "net",
   "time",
   "process",
+  "signal",
   "sync",
   "io-util",
 ] }
@@ -101,6 +102,10 @@ windows = { version = "0.61", features = ["UI_ViewManagement"] }
 win32job = "2"
 # The taskbar badge's overlay icon is drawn with resvg; gpui already builds it with these features.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # The OS keyring that holds `secure_storage`'s key.
