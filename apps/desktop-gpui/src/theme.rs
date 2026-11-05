@@ -13,7 +13,15 @@ use crate::settings::{Settings, TYPOGRAPHY_ADVANCED_KEY};
 use crate::themes::{ThemeChoice, ThemeColors};
 
 pub const FONT_SANS: &str = "Inter";
-pub const FONT_MONO: &str = "Consolas";
+/// The first family of the web app's `--font-mono` stack each OS has by name: macOS doesn't
+/// expose SF Mono (`ui-monospace`) by name, and Linux's `monospace` is usually DejaVu Sans Mono.
+pub const FONT_MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else if cfg!(windows) {
+    "Consolas"
+} else {
+    "DejaVu Sans Mono"
+};
 
 /// Static Inter 4.1 weights, the version `@fontsource-variable/inter` ships.
 pub const FONTS: [&[u8]; 4] = [
