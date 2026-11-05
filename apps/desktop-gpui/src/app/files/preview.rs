@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
 use gpui_kit::component::notification::Notification;
@@ -19,7 +21,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::logic;
+use super::{asset, document, logic};
 use crate::app::right_panel::Surface;
 use crate::app::{Target, Workspace};
 use crate::rpc::RpcError;
@@ -355,12 +357,19 @@ impl Workspace {
         state.full = Some(FullFile::Loading);
         let request_key = key.clone();
         state._full = Some(cx.spawn_in(window, async move |this, cx| {
-            let bytes = fetch_asset(client, endpoint, resource).await;
+            let fetched = fetch_asset(client, endpoint, resource).await;
+            let text = cx
+                .background_spawn(async move {
+                    fetched.map(|bytes| {
+                        String::from_utf8(bytes)
+                            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+                    })
+                })
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(state) = this.files.previews.get_mut(&request_key) else { return };
-                state.full = Some(match bytes {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                state.full = Some(match text {
+                    Ok(text) => {
                         let editor = cx.new(|cx| EditorState::new(window, cx).language("text").default_value(text));
                         FullFile::Ready(editor)
                     }
@@ -386,12 +395,17 @@ impl Workspace {
         cx.spawn_in(window, async move |_, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
             let written = match fetch_asset(client, endpoint, resource).await {
-                Ok(bytes) => std::fs::write(&path, bytes).map_err(anyhow::Error::from),
+                Ok(bytes) => {
+                    cx.background_spawn(async move {
+                        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
+                    })
+                    .await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = written {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(error.to_string()).title("Could not read file"), cx)
+                    window.push_notification(Notification::error(format!("{error:#}")).title("Could not save file"), cx)
                 });
             }
         })
@@ -938,20 +952,18 @@ async fn fetch_asset(
     resource: Value,
 ) -> anyhow::Result<Vec<u8>> {
     let minted = client.request("assets.createUrl", json!({"resource": resource})).await?;
-    let relative = minted["relativeUrl"].as_str().unwrap_or_default().to_owned();
-    let url = if relative.starts_with("http") {
-        relative
-    } else {
-        format!("{}/{}", endpoint.http_base, relative.trim_start_matches('/'))
-    };
+    let url = document::resolve_asset_url(&endpoint.http_base, minted["relativeUrl"].as_str().unwrap_or_default());
+    let token = document::is_server_url(&url, &endpoint.http_base).then_some(endpoint.bearer_token);
     crate::runtime()
         .spawn(async move {
-            let response = reqwest::Client::new().get(url).bearer_auth(&endpoint.bearer_token).send().await?;
-            let response = response.error_for_status()?;
-            if response.content_length().is_some_and(|length| length > FULL_FILE_MAX_BYTES) {
-                anyhow::bail!("Text previews support files up to 256 MB.");
+            let mut request = asset::http().get(url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
             }
-            anyhow::Ok(response.bytes().await?.to_vec())
+            let response = request.send().await?.error_for_status()?;
+            asset::read_capped(response, FULL_FILE_MAX_BYTES)
+                .await?
+                .context("Text previews support files up to 256 MB.")
         })
         .await?
 }

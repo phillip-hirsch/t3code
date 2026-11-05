@@ -4,14 +4,15 @@
 
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{RenderableContent, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, ElementInputHandler, Entity, Font,
     FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, StrikethroughStyle, Style,
-    TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline, point, px, relative, rgb, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, SharedString,
+    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline, point, px,
+    relative, rgb, size,
 };
 
 use super::session::TerminalSession;
@@ -114,13 +115,33 @@ pub(super) struct RunStyle {
     pub strikethrough: bool,
 }
 
+impl RunStyle {
+    fn new(color: Hsla, flags: Flags) -> Self {
+        Self {
+            color,
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            strikethrough: flags.contains(Flags::STRIKEOUT),
+        }
+    }
+}
+
 /// Cells of one style on one row, starting at `column`.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Run {
     pub row: usize,
     pub column: usize,
-    pub text: String,
+    pub text: SharedString,
     pub style: RunStyle,
+}
+
+/// A run while `batch` still appends cells to it.
+struct PendingRun {
+    row: usize,
+    column: usize,
+    text: String,
+    style: RunStyle,
 }
 
 /// A span of cells on one row painted with one color.
@@ -145,7 +166,7 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
     let mut out = Batched::default();
     let offset = content.display_offset as i32;
     let colors = content.colors;
-    let mut run: Option<Run> = None;
+    let mut run: Option<PendingRun> = None;
     let mut wide = false;
     for indexed in content.display_iter {
         let cell = indexed.cell;
@@ -174,13 +195,7 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
                 _ => out.backgrounds.push(Span { row, column, len: cells, color: bg }),
             }
         }
-        let style = RunStyle {
-            color: fg,
-            bold: cell.flags.contains(Flags::BOLD),
-            italic: cell.flags.contains(Flags::ITALIC),
-            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-            strikethrough: cell.flags.contains(Flags::STRIKEOUT),
-        };
+        let style = RunStyle::new(fg, cell.flags);
         let blank = cell.c == ' ' || cell.c == '\t';
         let continues = !wide && run.as_ref().is_some_and(|run| run.row == row && run.style == style);
         if !continues {
@@ -189,7 +204,7 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
                 wide = false;
                 continue;
             }
-            run = Some(Run { row, column, text: String::new(), style });
+            run = Some(PendingRun { row, column, text: String::new(), style });
         }
         if let Some(run) = &mut run {
             run.text.push(if blank { ' ' } else { cell.c });
@@ -221,16 +236,26 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
     out
 }
 
-fn flush(run: &mut Option<Run>, runs: &mut Vec<Run>) {
-    if let Some(mut run) = run.take() {
-        let trimmed = run.text.trim_end_matches(' ').len();
-        if trimmed > 0 || run.style.underline || run.style.strikethrough {
-            if !run.style.underline && !run.style.strikethrough {
-                run.text.truncate(trimmed);
+fn flush(run: &mut Option<PendingRun>, runs: &mut Vec<Run>) {
+    if let Some(PendingRun { row, column, mut text, style }) = run.take() {
+        let trimmed = text.trim_end_matches(' ').len();
+        if trimmed > 0 || style.underline || style.strikethrough {
+            if !style.underline && !style.strikethrough {
+                text.truncate(trimmed);
             }
-            runs.push(run);
+            runs.push(Run { row, column, text: text.into(), style });
         }
     }
+}
+
+/// What a filled block cursor redraws over `cell`: its character with any combining marks.
+fn cursor_glyph_text(cell: &Cell) -> Option<String> {
+    if matches!(cell.c, ' ' | '\t') {
+        return None;
+    }
+    let mut text = String::from(cell.c);
+    text.extend(cell.zerowidth().into_iter().flatten());
+    Some(text)
 }
 
 /// Cell size and where the grid starts, in window coordinates.
@@ -342,7 +367,11 @@ impl Element for TerminalGrid {
         // `terminalGridSize`.
         let columns = (((bounds.size.width - PADDING * 2.) / cell_width).floor() as usize).max(1);
         let rows = (((bounds.size.height - PADDING * 2.) / line_height).floor() as usize).max(1);
-        self.session.update(cx, |session, cx| session.fit(columns, rows, cx));
+        let theme = self.theme;
+        let batched = self.session.update(cx, |session, cx| {
+            session.fit(columns, rows, cx);
+            session.batched(&theme)
+        });
         let session = self.session.read(cx);
         let term = session.term();
         // `terminalContentOriginY`: with scrollback, the last row sits on the bottom edge.
@@ -355,7 +384,6 @@ impl Element for TerminalGrid {
         let cursor_shape = content.cursor.shape;
         let display_offset = content.display_offset;
         let show_cursor = display_offset == 0 && !content.mode.contains(TermMode::VI);
-        let batched = batch(content, term.columns(), term.screen_lines(), &self.theme);
         let cell_origin =
             |row: usize, column: usize| origin + point(cell_width * column as f32, line_height * row as f32);
         let mut backgrounds = Vec::with_capacity(batched.backgrounds.len() + batched.selection.len());
@@ -367,7 +395,7 @@ impl Element for TerminalGrid {
         }
         let text_system = window.text_system().clone();
         let (base_font, font_size) = terminal_font(&fonts);
-        let shape = |text: String, style: &RunStyle| {
+        let shape = |text: SharedString, style: &RunStyle| {
             let font = Font {
                 weight: if style.bold { FontWeight::BOLD } else { FontWeight::NORMAL },
                 style: if style.italic { FontStyle::Italic } else { FontStyle::Normal },
@@ -381,23 +409,21 @@ impl Element for TerminalGrid {
                 underline: style.underline.then_some(UnderlineStyle { thickness: px(1.), color: None, wavy: false }),
                 strikethrough: style.strikethrough.then_some(StrikethroughStyle { thickness: px(1.), color: None }),
             };
-            text_system.shape_line(text.into(), font_size, &[run], Some(cell_width))
+            text_system.shape_line(text, font_size, &[run], Some(cell_width))
         };
-        let mut lines = Vec::with_capacity(batched.runs.len());
-        let mut cursor_glyph = None;
+        let lines: Vec<_> = batched
+            .runs
+            .iter()
+            .map(|run| (cell_origin(run.row, run.column), shape(run.text.clone(), &run.style)))
+            .collect();
         let cursor_row = cursor_point.line.0 + display_offset as i32;
-        for run in batched.runs {
-            if self.focused && show_cursor && run.row as i32 == cursor_row && cursor_shape == CursorShape::Block {
-                // The glyph under a filled block cursor is redrawn in the background color.
-                let at = cursor_point.column.0.checked_sub(run.column);
-                if let Some(ch) = at.and_then(|at| run.text.chars().nth(at)).filter(|c| *c != ' ') {
-                    let style = RunStyle { color: self.theme.background, ..run.style };
-                    cursor_glyph = Some(shape(ch.to_string(), &style));
-                }
-            }
-            let at = cell_origin(run.row, run.column);
-            lines.push((at, shape(run.text, &run.style)));
-        }
+        // The glyph under a filled block cursor is redrawn in the background color.
+        let cursor_glyph = (self.focused && show_cursor && cursor_shape == CursorShape::Block)
+            .then(|| &term.grid()[cursor_point])
+            .and_then(|cell| {
+                let text = cursor_glyph_text(cell)?;
+                Some(shape(text.into(), &RunStyle::new(self.theme.background, cell.flags)))
+            });
         let cursor = (show_cursor && cursor_shape != CursorShape::Hidden && cursor_row >= 0).then(|| {
             let at = cell_origin(cursor_row as usize, cursor_point.column.0);
             let wide = term.grid()[cursor_point].flags.contains(Flags::WIDE_CHAR);
@@ -546,7 +572,7 @@ mod tests {
         let term = term("ls \x1b[31mred\x1b[0m  done\r\n\r\n   ");
         let batched = batch(term.renderable_content(), 20, 3, &theme());
         let runs: Vec<(usize, usize, &str)> =
-            batched.runs.iter().map(|run| (run.row, run.column, run.text.as_str())).collect();
+            batched.runs.iter().map(|run| (run.row, run.column, run.text.as_ref())).collect();
         assert_eq!(runs, [(0, 0, "ls"), (0, 3, "red"), (0, 8, "done")]);
         assert_eq!(batched.runs[1].style.color, theme().palette[1]);
         assert!(batched.backgrounds.is_empty());
@@ -572,8 +598,18 @@ mod tests {
     fn wide_glyphs_end_their_run() {
         let term = term("a漢b");
         let batched = batch(term.renderable_content(), 20, 3, &theme());
-        let runs: Vec<(usize, &str)> = batched.runs.iter().map(|run| (run.column, run.text.as_str())).collect();
+        let runs: Vec<(usize, &str)> = batched.runs.iter().map(|run| (run.column, run.text.as_ref())).collect();
         assert_eq!(runs, [(0, "a漢"), (3, "b")]);
+    }
+
+    #[test]
+    fn the_block_cursor_redraws_its_own_cell() {
+        // "e" plus a combining acute accent, then "x"; the cursor goes back to each cell.
+        for (output, glyph) in [("e\u{301}x\r", Some("e\u{301}")), ("e\u{301}x\r\x1b[C", Some("x")), ("ab ", None)] {
+            let term = term(output);
+            let cell = &term.grid()[term.grid().cursor.point];
+            assert_eq!(cursor_glyph_text(cell).as_deref(), glyph, "{output:?}");
+        }
     }
 
     #[test]

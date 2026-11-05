@@ -243,6 +243,7 @@ impl Workspace {
             Incoming::Frame(image, size) => {
                 stream.stale.extend(stream.frame.replace(image));
                 stream.frame_size = size;
+                let _ = stream.outgoing.send(ACK.to_owned());
             }
             Incoming::Stopped(stop) => {
                 stream.stopped = Some(stop);
@@ -395,10 +396,10 @@ impl Workspace {
                 let tab = tab.clone();
                 cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
             })
-            .on_mouse_up(MouseButton::Middle, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
-            })
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx)),
+            )
             .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e)))
             .on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
                 if this.server_wheel(&wheel_tab, e) {
@@ -565,8 +566,9 @@ impl Workspace {
 
     fn server_mouse_up(&mut self, tab_id: &str, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        let Some(stream) = self.preview.server.streams.get(tab_id).filter(|s| s.buttons & bit != 0) else { return };
-        let _ = stream;
+        if !self.preview.server.streams.get(tab_id).is_some_and(|s| s.buttons & bit != 0) {
+            return;
+        }
         let Some((x, y)) = self.server_point(tab_id, event.position, true) else { return };
         let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
         stream.buttons &= !bit;
@@ -804,8 +806,11 @@ fn dom_key(keystroke: &Keystroke) -> Option<DomKey> {
     Some(DomKey { key, code, key_code, text })
 }
 
+/// The frame acknowledgement; the server sends the next frame after it.
+const ACK: &str = r#"{"type":"ack"}"#;
+
 /// The socket's life: (re)connects with backoff until the view drops `outgoing` or the server
-/// says to stop. Frames are acknowledged once decoded, so a slow viewer gets fewer of them.
+/// says to stop. The view acknowledges each frame it takes, so a slow viewer gets fewer of them.
 async fn run_stream(
     url: String,
     token: String,
@@ -845,14 +850,20 @@ async fn run_stream(
                 message = source.next() => match message {
                     Some(Ok(Message::Binary(jpeg))) => {
                         failures = 0;
-                        let decoded = tokio::task::block_in_place(|| decode_jpeg(&jpeg));
-                        if sink.send(Message::text(r#"{"type":"ack"}"#)).await.is_err() {
-                            break None;
-                        }
-                        if let Some((image, size)) = decoded
-                            && events.send(Incoming::Frame(image, size)).await.is_err()
-                        {
-                            return;
+                        // Off the IO workers, which also carry the RPC socket.
+                        let decoded = tokio::task::spawn_blocking(move || decode_jpeg(&jpeg)).await.ok().flatten();
+                        match decoded {
+                            Some((image, size)) => {
+                                if events.send(Incoming::Frame(image, size)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // The view never sees an undecodable frame, so it is acknowledged here.
+                            None => {
+                                if sink.send(Message::text(ACK)).await.is_err() {
+                                    break None;
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Text(text))) => {

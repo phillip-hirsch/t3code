@@ -3,7 +3,7 @@
 //! clipboard. Output only re-renders this view.
 
 use std::cell::{Cell, RefCell};
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ mod pointer;
 
 use gpui_kit::component::menu::ContextMenuExt as _;
 
-use super::grid::{Geometry, TerminalGrid, TerminalTheme};
+use super::grid::{Batched, Geometry, TerminalGrid, TerminalTheme, batch};
 use super::keys::{KeyAction, key_action};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 
@@ -110,11 +110,40 @@ pub(super) struct Selected {
     pub text: String,
 }
 
+/// The emulator and a count of its mutable borrows, so the grid rebatches only after a change.
+pub(super) struct Emulator {
+    term: Term<Listener>,
+    revision: u64,
+}
+
+impl Emulator {
+    fn new(size: GridSize, events: &Listener) -> Self {
+        Self { term: Term::new(Config::default(), &size, events.clone()), revision: 0 }
+    }
+}
+
+impl Deref for Emulator {
+    type Target = Term<Listener>;
+
+    fn deref(&self) -> &Term<Listener> {
+        &self.term
+    }
+}
+
+impl DerefMut for Emulator {
+    fn deref_mut(&mut self) -> &mut Term<Listener> {
+        self.revision += 1;
+        &mut self.term
+    }
+}
+
 pub(super) struct TerminalSession {
     pub thread_id: String,
     pub terminal_id: String,
     launch: Launch,
-    term: Term<Listener>,
+    term: Emulator,
+    /// The last batch, with the emulator revision and theme it was built from.
+    batched: Option<(u64, TerminalTheme, Rc<Batched>)>,
     parser: Processor,
     events: Listener,
     pub focus: FocusHandle,
@@ -138,10 +167,6 @@ pub(super) struct TerminalSession {
 }
 
 impl EventEmitter<SessionEvent> for TerminalSession {}
-
-fn new_term(size: GridSize, events: &Listener) -> Term<Listener> {
-    Term::new(Config::default(), &size, events.clone())
-}
 
 /// Takes the longest prefix of `outbox` that fits one `terminal.write`.
 fn take_chunk(outbox: &mut String) -> Option<String> {
@@ -186,7 +211,8 @@ impl TerminalSession {
             thread_id,
             terminal_id,
             launch,
-            term: new_term(GridSize { columns: 80, rows: 24 }, &events),
+            term: Emulator::new(GridSize { columns: 80, rows: 24 }, &events),
+            batched: None,
             parser: Processor::new(),
             events,
             focus,
@@ -214,6 +240,20 @@ impl TerminalSession {
 
     pub fn term(&self) -> &Term<Listener> {
         &self.term
+    }
+
+    /// The visible grid's runs and spans, rebatched only after the terminal or the theme changed.
+    pub fn batched(&mut self, theme: &TerminalTheme) -> Rc<Batched> {
+        if let Some((revision, cached_theme, batched)) = &self.batched
+            && *revision == self.term.revision
+            && cached_theme == theme
+        {
+            return batched.clone();
+        }
+        let term = &*self.term;
+        let batched = Rc::new(batch(term.renderable_content(), term.columns(), term.screen_lines(), theme));
+        self.batched = Some((self.term.revision, *theme, batched.clone()));
+        batched
     }
 
     /// The link to underline, if the pointer is on one.
@@ -294,16 +334,16 @@ impl TerminalSession {
 
     fn reset(&mut self) {
         let size = self.size.unwrap_or(GridSize { columns: 80, rows: 24 });
-        self.term = new_term(size, &self.events);
+        *self.term = Term::new(Config::default(), &size, self.events.clone());
         self.parser = Processor::new();
     }
 
     /// Replayed history and our own notices must not answer the queries in
     /// them, or the shell would read stale replies as typed input.
     fn feed(&mut self, data: &str, reply: bool, cx: &mut Context<Self>) {
-        self.parser.advance(&mut self.term, data.as_bytes());
+        self.parser.advance(&mut *self.term, data.as_bytes());
         self.pointer.forget_hover();
-        let events: Vec<Event> = self.events.0.borrow_mut().drain(..).collect();
+        let events = std::mem::take(&mut *self.events.0.borrow_mut());
         for event in events {
             match event {
                 Event::PtyWrite(text) if reply => self.send_input(&text, cx),
@@ -324,7 +364,7 @@ impl TerminalSession {
     }
 
     fn system_message(&mut self, message: &str) {
-        self.parser.advance(&mut self.term, format!("\r\n[terminal] {message}\r\n").as_bytes());
+        self.parser.advance(&mut *self.term, format!("\r\n[terminal] {message}\r\n").as_bytes());
         self.events.0.borrow_mut().clear();
     }
 
@@ -338,12 +378,13 @@ impl TerminalSession {
     }
 
     /// Queues `data` for the PTY; writes go out one at a time, in order.
+    /// Without a connection the input is dropped: queued keystrokes would run on reconnect.
     fn send_input(&mut self, data: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
         self.outbox.push_str(data);
         if self.writing {
             return;
         }
-        let Some(client) = self.client.clone() else { return };
         self.writing = true;
         let (thread_id, terminal_id) = (self.thread_id.clone(), self.terminal_id.clone());
         cx.spawn(async move |this, cx| {
@@ -436,7 +477,7 @@ impl TerminalSession {
     /// The selection as chat context: 1-based buffer lines (scrollback counts) and its text
     /// without surrounding blank lines (`readSelectionAction`).
     pub fn selected(&self) -> Option<Selected> {
-        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let range = self.term.selection.as_ref()?.to_range(&*self.term)?;
         let text = self.term.selection_to_string()?;
         let text = text.replace("\r\n", "\n").trim_matches('\n').to_owned();
         if text.is_empty() {
@@ -556,9 +597,12 @@ impl EntityInputHandler for TerminalSession {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry.get();
-        let cursor = self.term.grid().cursor.point;
-        let origin = geometry.origin
-            + point(geometry.cell_width * cursor.column.0 as f32, geometry.line_height * cursor.line.0 as f32);
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        let row =
+            usize::try_from(cursor.line.0 + grid.display_offset() as i32).ok().filter(|row| *row < geometry.rows)?;
+        let origin =
+            geometry.origin + point(geometry.cell_width * cursor.column.0 as f32, geometry.line_height * row as f32);
         Some(Bounds::new(origin, size(geometry.cell_width, geometry.line_height)))
     }
 

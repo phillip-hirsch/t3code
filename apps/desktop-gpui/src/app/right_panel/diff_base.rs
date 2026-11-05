@@ -285,7 +285,7 @@ impl Workspace {
             let both = choice.local.as_ref().zip(choice.remote.as_ref()).map(|(l, r)| (l.name.clone(), r.name.clone()));
             let use_remote = choice.remote.as_ref().is_some_and(|r| r.name == value);
             let remote_only = choice.local.is_none();
-            let pick = value.clone();
+            let pick = value;
             row(ElementId::Name(format!("diff-base-{}", choice.label).into()), checked)
                 .child(div().flex_1().min_w_0().truncate().child(choice.label.clone()))
                 .child(div().w(px(32.)).flex_none().flex().justify_end().map(|el| {

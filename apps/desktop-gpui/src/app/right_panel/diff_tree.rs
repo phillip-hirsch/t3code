@@ -3,13 +3,14 @@
 //! the list and the tree in agreement.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus};
 use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, div, px, uniform_list,
 };
 
 use super::super::Workspace;
@@ -56,7 +57,7 @@ pub(super) struct Row {
 
 /// The tree's visible rows: each folder before its contents, folders and files in the order
 /// of their first file, folded folders without their contents.
-pub(super) fn rows(files: &[(String, Status)], folded: &HashSet<String>) -> Vec<Row> {
+pub(super) fn rows(files: &[(&str, Status)], folded: &HashSet<String>) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
     // `diffFileTreePositions`: a folder ranks where its first file does.
@@ -103,7 +104,7 @@ pub(super) fn rows(files: &[(String, Status)], folded: &HashSet<String>) -> Vec<
             out.push(Row {
                 depth: segments.len() - 1,
                 name: segments.last().copied().unwrap_or_default().to_owned(),
-                path: path.clone(),
+                path: (*path).to_owned(),
                 status: Some(*status),
             });
         }
@@ -123,9 +124,19 @@ impl Workspace {
             .collect()
     }
 
-    /// How many loaded files are tests or test support.
-    pub(super) fn test_file_count(&self) -> usize {
-        self.right_panel.all_diff_files.iter().filter(|f| crate::pull_request_diff::is_test_file(f.path())).count()
+    /// Stores a loaded selection's files and counts its tests once, not every frame.
+    pub(super) fn store_diff_files(&mut self, files: Vec<DiffFile>) {
+        let panel = &mut self.right_panel;
+        panel.diff_test_files = files.iter().filter(|f| crate::pull_request_diff::is_test_file(f.path())).count();
+        panel.all_diff_files = files;
+    }
+
+    /// Rebuilds the tree's rows from the files the patch shows; run when they or the folds change.
+    pub(super) fn rebuild_tree_rows(&mut self, cx: &App) {
+        let panel = &mut self.right_panel;
+        let state = panel.diff.read(cx);
+        let files: Vec<(&str, Status)> = state.files().iter().map(|f| (f.path().as_ref(), Status::of(f))).collect();
+        panel.tree_rows = rows(&files, &panel.tree_folded).into();
     }
 
     /// Puts the filtered files back into the patch, keeping their folds.
@@ -141,83 +152,91 @@ impl Workspace {
                 state.set_file_collapsed(path, true, cx);
             }
         });
+        self.rebuild_tree_rows(cx);
         cx.notify();
     }
 
     /// The tree pane beside the patch.
     pub(super) fn render_diff_tree(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let state = self.right_panel.diff.read(cx);
-        let files: Vec<(String, Status)> =
-            state.files().iter().map(|file| (file.path().to_string(), Status::of(file))).collect();
-        let rows = rows(&files, &self.right_panel.tree_folded);
-        let scheme = self.diff_color_scheme();
-        let selected = self.right_panel.tree_selected.clone();
-        let list = rows.into_iter().map(|row| {
-            let is_folder = row.status.is_none();
-            let folded = is_folder && self.right_panel.tree_folded.contains(&row.path);
-            let color = match row.status {
-                Some(Status::Added) => git::addition_color(tokens, scheme),
-                Some(Status::Deleted) => git::deletion_color(tokens, scheme),
-                Some(Status::Renamed) => tokens.info,
-                Some(Status::Modified) => tokens.warning,
-                None => tokens.muted_foreground,
-            };
-            let glyph = if is_folder {
-                if folded { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }
-            } else {
-                "icons/file.svg"
-            };
-            let path = row.path.clone();
-            h_flex()
-                .id(ElementId::Name(format!("diff-tree-{}", row.path).into()))
-                .h(px(24.))
-                .flex_none()
-                .pl(px(8. + row.depth as f32 * 12.))
-                .pr(px(8.))
-                .gap(px(6.))
-                .rounded(px(4.))
-                .text_xs()
-                .cursor_pointer()
-                .text_color(if is_folder { tokens.muted_foreground } else { tokens.foreground })
-                .when(selected.as_deref() == Some(row.path.as_str()), |el| el.bg(tokens.accent))
-                .hover(|s| s.bg(tokens.accent.opacity(0.6)))
-                .child(icon(glyph).with_size(px(14.)).flex_none().text_color(tokens.muted_foreground))
-                .child(div().flex_1().min_w_0().truncate().child(row.name))
-                .children(row.status.map(|status| {
-                    div()
-                        .flex_none()
-                        .font_family(tokens.fonts.mono)
-                        .text_size(px(11.))
-                        .text_color(color)
-                        .child(status.letter())
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if is_folder {
-                        if !this.right_panel.tree_folded.remove(&path) {
-                            this.right_panel.tree_folded.insert(path.clone());
-                        }
-                    } else {
-                        this.right_panel.tree_selected = Some(path.clone());
-                        this.right_panel.diff.update(cx, |state, cx| {
-                            state.set_file_collapsed(&path, false, cx);
-                            state.scroll_to_file(&path, cx);
-                        });
-                    }
-                    cx.notify();
-                }))
-                .into_any_element()
-        });
+        let rows = self.right_panel.tree_rows.clone();
+        let list = uniform_list(
+            "diff-file-tree-rows",
+            rows.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                let tokens = *crate::theme::tokens(cx);
+                range.map(|index| this.diff_tree_row(&rows[index], &tokens, cx)).collect::<Vec<_>>()
+            }),
+        )
+        .size_full();
         div()
             .id("diff-file-tree")
             .w(gpui_kit::relative(0.4))
             .max_w(px(320.))
             .flex_none()
             .h_full()
-            .overflow_y_scroll()
             .p_1()
             .border_l_1()
             .border_color(tokens.border)
-            .children(list)
+            .child(list)
+            .into_any_element()
+    }
+
+    fn diff_tree_row(&self, row: &Row, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let is_folder = row.status.is_none();
+        let folded = is_folder && self.right_panel.tree_folded.contains(&row.path);
+        let selected = self.right_panel.tree_selected.as_deref() == Some(row.path.as_str());
+        let scheme = self.diff_color_scheme();
+        let color = match row.status {
+            Some(Status::Added) => git::addition_color(tokens, scheme),
+            Some(Status::Deleted) => git::deletion_color(tokens, scheme),
+            Some(Status::Renamed) => tokens.info,
+            Some(Status::Modified) => tokens.warning,
+            None => tokens.muted_foreground,
+        };
+        let glyph = if is_folder {
+            if folded { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }
+        } else {
+            "icons/file.svg"
+        };
+        let path = row.path.clone();
+        h_flex()
+            .id(ElementId::Name(format!("diff-tree-{}", row.path).into()))
+            .h(px(24.))
+            .flex_none()
+            .pl(px(8. + row.depth as f32 * 12.))
+            .pr(px(8.))
+            .gap(px(6.))
+            .rounded(px(4.))
+            .text_xs()
+            .cursor_pointer()
+            .text_color(if is_folder { tokens.muted_foreground } else { tokens.foreground })
+            .when(selected, |el| el.bg(tokens.accent))
+            .hover(|s| s.bg(tokens.accent.opacity(0.6)))
+            .child(icon(glyph).with_size(px(14.)).flex_none().text_color(tokens.muted_foreground))
+            .child(div().flex_1().min_w_0().truncate().child(row.name.clone()))
+            .children(row.status.map(|status| {
+                div()
+                    .flex_none()
+                    .font_family(tokens.fonts.mono)
+                    .text_size(px(11.))
+                    .text_color(color)
+                    .child(status.letter())
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if is_folder {
+                    if !this.right_panel.tree_folded.remove(&path) {
+                        this.right_panel.tree_folded.insert(path.clone());
+                    }
+                    this.rebuild_tree_rows(cx);
+                } else {
+                    this.right_panel.tree_selected = Some(path.clone());
+                    this.right_panel.diff.update(cx, |state, cx| {
+                        state.set_file_collapsed(&path, false, cx);
+                        state.scroll_to_file(&path, cx);
+                    });
+                }
+                cx.notify();
+            }))
             .into_any_element()
     }
 }
@@ -227,7 +246,7 @@ mod tests {
     use super::*;
 
     fn tree(paths: &[&str], folded: &[&str]) -> Vec<(usize, String)> {
-        let files: Vec<(String, Status)> = paths.iter().map(|p| ((*p).to_owned(), Status::Modified)).collect();
+        let files: Vec<(&str, Status)> = paths.iter().map(|p| (*p, Status::Modified)).collect();
         let folded: HashSet<String> = folded.iter().map(|f| (*f).to_owned()).collect();
         rows(&files, &folded).into_iter().map(|r| (r.depth, r.name)).collect()
     }

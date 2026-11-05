@@ -119,7 +119,7 @@ impl TerminalSession {
     }
 
     fn link_at(&self, point: GridPoint) -> Option<HoveredLink> {
-        let line = logical_line(&self.term, point.line);
+        let line = logical_line(&*self.term, point.line);
         let grid = self.term.grid();
         let point = if grid[point.line][point.column].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
             GridPoint::new(point.line, Column(point.column.0 - 1))

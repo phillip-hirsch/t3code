@@ -171,6 +171,9 @@ impl Terminals {
                     owners.insert(thread_id.clone(), environment.clone());
                     all.entry(thread_id).or_default().push(summary);
                 }
+                for list in all.values_mut() {
+                    sort_summaries(list);
+                }
             }
             Some("upsert") => {
                 let Some((thread_id, summary)) = Summary::parse(&event["terminal"]) else { return };
@@ -178,7 +181,10 @@ impl Terminals {
                 let list = all.entry(thread_id).or_default();
                 match list.iter_mut().find(|s| s.terminal_id == summary.terminal_id) {
                     Some(existing) => *existing = summary,
-                    None => list.push(summary),
+                    None => {
+                        list.push(summary);
+                        sort_summaries(list);
+                    }
                 }
             }
             Some("remove") => {
@@ -190,12 +196,13 @@ impl Terminals {
                     list.retain(|s| s.terminal_id != terminal_id);
                 }
             }
-            _ => return,
-        }
-        for list in all.values_mut() {
-            list.sort_by(|a, b| layout::numeric_order(&a.terminal_id, &b.terminal_id));
+            _ => {}
         }
     }
+}
+
+fn sort_summaries(list: &mut [Summary]) {
+    list.sort_by(|a, b| layout::numeric_order(&a.terminal_id, &b.terminal_id));
 }
 
 struct DrawerResize;
