@@ -229,7 +229,8 @@ fn dispatch_and_reload(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(client) = view.read(cx).client() else { return };
+    // The settings environment, whose archive the state shows.
+    let Some(client) = view.read(cx).settings_client() else { return };
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {
