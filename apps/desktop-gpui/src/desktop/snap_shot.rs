@@ -445,13 +445,17 @@ mod imp {
         FLASH.set(Some(window));
         cx.spawn(async move |cx| {
             // Placed in physical pixels outside any GPUI update: moving a window re-enters GPUI.
-            if let Some(popup) = super::super::top_level_window(hwnd) {
-                let _ = popup.SetWindowPos(
-                    w::HwndPlace::Place(co::HWND_PLACE::TOPMOST),
-                    w::POINT::with(origin.0, origin.1),
-                    w::SIZE::with(extent.0 as i32, extent.1 as i32),
-                    co::SWP::NOACTIVATE | co::SWP::SHOWWINDOW,
-                );
+            let placed =
+                super::super::top_level_window(hwnd).ok_or(co::ERROR::INVALID_WINDOW_HANDLE).and_then(|popup| {
+                    popup.SetWindowPos(
+                        w::HwndPlace::Place(co::HWND_PLACE::TOPMOST),
+                        w::POINT::with(origin.0, origin.1),
+                        w::SIZE::with(extent.0 as i32, extent.1 as i32),
+                        co::SWP::NOACTIVATE | co::SWP::SHOWWINDOW,
+                    )
+                });
+            if let Err(error) = placed {
+                log::warn!("could not show the snapshot flash: {error}");
             }
             cx.background_executor().timer(if animated { FLASH_ANIMATED } else { FLASH_STATIC }).await;
             let _ = cx.update(|cx| {

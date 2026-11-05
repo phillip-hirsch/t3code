@@ -185,7 +185,7 @@ pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32)) -> ((f32, f32),
 
 /// The Chromium net errors a failed load reports as Electron's `did-fail-load` does, so
 /// `LoadFailed` reads the same to agents and other clients.
-const NET_ERRORS: [(i64, &str); 15] = [
+const NET_ERRORS: [(i64, &str); 19] = [
     (-200, "ERR_CERT_COMMON_NAME_INVALID"),
     (-201, "ERR_CERT_DATE_INVALID"),
     (-117, "ERR_BAD_SSL_CLIENT_AUTH_CERT"),
@@ -200,15 +200,21 @@ const NET_ERRORS: [(i64, &str); 15] = [
     (-102, "ERR_CONNECTION_REFUSED"),
     (-105, "ERR_NAME_NOT_RESOLVED"),
     (-310, "ERR_TOO_MANY_REDIRECTS"),
+    (-312, "ERR_UNSAFE_PORT"),
+    (-100, "ERR_CONNECTION_CLOSED"),
+    (-324, "ERR_EMPTY_RESPONSE"),
+    (-107, "ERR_SSL_PROTOCOL_ERROR"),
     (-2, "ERR_FAILED"),
 ];
 
-/// Run in a page after its load: on WebView2's error page, the net error it shows (Chromium's
-/// `loadTimeData`), else `null`.
+/// Run in a page after its load: on WebView2's error page, the net error it names (in Chromium's
+/// `loadTimeData` or the page text), else `null`.
 pub const FAILURE_PROBE: &str = r#"(() => {
   if (location.protocol !== "chrome-error:") return null;
   const data = window.loadTimeData && window.loadTimeData.data_;
-  return String((data && data.errorCode) || "");
+  const text = (data ? JSON.stringify(data) : "") + " " + (document.body ? document.body.innerText : "");
+  const code = /\bERR_[A-Z_]+\b/.exec(text);
+  return code ? code[0] : "";
 })()"#;
 
 /// [`FAILURE_PROBE`]'s JSON result as the failed load's net error, or `None` for a page that loaded.
@@ -218,22 +224,33 @@ pub fn failed_load(result: &str) -> Option<(i64, &'static str)> {
     Some(NET_ERRORS.into_iter().find(|(_, known)| *known == name).unwrap_or((-2, "ERR_FAILED")))
 }
 
-/// Reports the top page's back/forward state over wry's IPC on load and on each history change,
-/// through Chromium's Navigation API (WebView2; WebKit lacks it and reports nothing).
+/// Reports the top page's URL and back/forward state over wry's IPC on load and on each history
+/// change, through Chromium's Navigation API (WebView2; WebKit lacks it and reports nothing).
 pub const HISTORY_SCRIPT: &str = r#"(() => {
   if (window !== window.top || !window.navigation || !window.ipc) return;
-  const post = () => window.ipc.postMessage(JSON.stringify({ t3History: { back: navigation.canGoBack, forward: navigation.canGoForward } }));
+  const post = () => window.ipc.postMessage(JSON.stringify({ t3History: { url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward } }));
   post();
   navigation.addEventListener("currententrychange", post);
   addEventListener("pageshow", post);
 })();"#;
 
-/// [`HISTORY_SCRIPT`]'s message: whether the page can go back and forward. The page can post it
-/// too, which only moves the toolbar's back/forward buttons.
-pub fn history_message(body: &str) -> Option<(bool, bool)> {
+/// [`HISTORY_SCRIPT`]'s message. The page can post one too, so its URL is only trusted within the
+/// page's own origin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageHistory {
+    pub url: String,
+    pub back: bool,
+    pub forward: bool,
+}
+
+pub fn history_message(body: &str) -> Option<PageHistory> {
     let message: serde_json::Value = serde_json::from_str(body).ok()?;
     let history = message.get("t3History")?;
-    Some((history.get("back")?.as_bool()?, history.get("forward")?.as_bool()?))
+    Some(PageHistory {
+        url: history.get("url")?.as_str()?.to_owned(),
+        back: history.get("back")?.as_bool()?,
+        forward: history.get("forward")?.as_bool()?,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -898,8 +915,11 @@ mod tests {
 
     #[test]
     fn reads_the_history_scripts_message() {
-        assert_eq!(history_message(r#"{"t3History":{"back":true,"forward":false}}"#), Some((true, false)));
-        assert_eq!(history_message(r#"{"t3History":{"back":true}}"#), None);
+        assert_eq!(
+            history_message(r#"{"t3History":{"url":"https://a.test/#b","back":true,"forward":false}}"#),
+            Some(PageHistory { url: "https://a.test/#b".into(), back: true, forward: false })
+        );
+        assert_eq!(history_message(r#"{"t3History":{"url":"https://a.test/","back":true}}"#), None);
         assert_eq!(history_message("not json"), None);
         assert_eq!(history_message(r#"{"other":1}"#), None);
     }

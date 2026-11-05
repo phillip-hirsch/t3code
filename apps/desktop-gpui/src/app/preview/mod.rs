@@ -44,11 +44,8 @@ pub(super) enum PageEvent {
     Started(String),
     Finished(String),
     Title(String),
-    /// The page's history moved, possibly without a load: whether it can go back and forward.
-    History {
-        back: bool,
-        forward: bool,
-    },
+    /// The page's history moved, possibly without a load.
+    History(preview::PageHistory),
     Failed {
         url: String,
         code: i64,
@@ -670,13 +667,16 @@ impl Workspace {
                 | NavStatus::LoadFailed { title, .. } => *title = new_title,
                 NavStatus::Idle => {}
             },
-            // Same-document navigation (pushState, fragments) has no load events: read the URL.
-            PageEvent::History { back, forward } => {
-                (tab.can_go_back, tab.can_go_forward) = (back, forward);
-                if let Ok(current) = tab.view.read(cx).raw().url()
+            // Same-document navigation (pushState, fragments) has no load events: take the page's
+            // URL, which can't leave the origin the view is on.
+            PageEvent::History(history) => {
+                (tab.can_go_back, tab.can_go_forward) = (history.back, history.forward);
+                let origin = |url: &str| url::Url::parse(url).ok().map(|url| url.origin());
+                let current = tab.view.read(cx).raw().url().ok();
+                if current.is_some_and(|current| origin(&current) == origin(&history.url))
                     && let NavStatus::Loading { url, .. } | NavStatus::Success { url, .. } = &mut tab.status
                 {
-                    *url = current;
+                    *url = history.url;
                 }
             }
             PageEvent::Failed { url, code, description } => {
@@ -1307,8 +1307,8 @@ fn page_builder<'a>(
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
-                if let Some((back, forward)) = preview::history_message(request.body()) {
-                    let _ = sender.try_send(PageEvent::History { back, forward });
+                if let Some(history) = preview::history_message(request.body()) {
+                    let _ = sender.try_send(PageEvent::History(history));
                 }
             }
         })
