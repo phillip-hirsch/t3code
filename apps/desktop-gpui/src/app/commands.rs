@@ -4,7 +4,7 @@
 //! `ModelPickerContent.tsx`). A handler returns `false` to leave the key to whatever
 //! is focused, as the web's handlers do. Commands this client has no surface for
 //! (`chat.find`, `filePicker.toggle`, `projectSearch.toggle`, `composer.stash`,
-//! `composer.host`, the queued-message commands, …) fall through the same way.
+//! `composer.host`, …) fall through the same way.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -123,6 +123,9 @@ impl Workspace {
                     && !context.model_picker_open
                     && self.go_to_adjacent_thread(command == "thread.next", window, cx);
             }
+            // The queue control's own guards decide; with nothing to act on the key falls through.
+            "thread.steerQueuedMessage" if chat => return held || self.steer_next_queued(cx),
+            "thread.editQueuedMessage" if chat => return held || self.edit_latest_queued(window, cx),
             "thread.stop" if chat => {
                 if !self.turn_running() {
                     return false;
