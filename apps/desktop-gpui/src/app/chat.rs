@@ -383,6 +383,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut 
             continues_steer,
             created_at,
             revert,
+            sent_by_t3code,
         } => {
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
@@ -397,6 +398,7 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut 
                 *grouped_with_previous,
                 *grouped_with_next,
                 expanded,
+                *sent_by_t3code,
                 this,
                 &t,
             )
@@ -735,6 +737,7 @@ fn user_row(
     grouped_with_previous: bool,
     grouped_with_next: bool,
     expanded: bool,
+    sent_by_t3code: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -792,10 +795,15 @@ fn user_row(
         .opacity(0.)
         .group_hover("timeline-row", |style| style.opacity(1.))
         .child(actions);
+    // `text-2xs`: 0.6875rem.
+    let attribution = sent_by_t3code.then(|| {
+        div().mr(px(4.)).text_size(rems(0.6875)).text_color(alpha(t.muted_foreground, 0.7)).child("Sent by T3 Code")
+    });
     let column = v_flex()
         .group("timeline-row")
         .items_end()
         .gap(px(4.))
+        .children(attribution)
         .children(steer_label)
         .child(bubble)
         .children(toggle_button)
@@ -887,6 +895,30 @@ fn code_block_header(
         .on_click(move |_, _, cx| {
             let _ = wrap_this.update(cx, |workspace, cx| workspace.toggle_code_wrap(&wrap_key, cx));
         });
+    let lang = block.lang();
+    let run = runnable_command(lang.as_deref().unwrap_or_default(), &code)
+        .filter(|_| !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
+        .map(|command| {
+            let this = this.clone();
+            div()
+                .id("run")
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_color(label_color)
+                .hover(|style| style.bg(t.accent).text_color(t.foreground))
+                .child(Icon::new(IconName::Play).size(px(12.)))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Run in terminal").build(window, cx))
+                .on_click(move |_, window, cx| {
+                    if let Some(cwd) = this.upgrade().and_then(|w| w.read(cx).git_cwd()) {
+                        let command = command.clone();
+                        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command }), cx);
+                    }
+                })
+        });
     let copy = message_actions::code_copy_button(this, id, code, t, cx);
     let fill = t.background.blend(code_background(t));
     h_flex()
@@ -903,8 +935,23 @@ fn code_block_header(
                 .text_color(label_color)
                 .children(block.lang().filter(|lang| !lang.is_empty())),
         )
-        .child(h_flex().gap(px(2.)).child(wrap_button).children((!streaming).then_some(copy)))
+        .child(h_flex().gap(px(2.)).child(wrap_button).children(run).children((!streaming).then_some(copy)))
         .into_any_element()
+}
+
+/// `MarkdownCodeBlock`'s `canRun`: a shell block whose command reads the same in the terminal.
+fn runnable_command(lang: &str, code: &str) -> Option<String> {
+    let shell = matches!(lang, "sh" | "bash" | "zsh" | "fish" | "shell" | "powershell" | "pwsh");
+    let command = code.trim();
+    // Control and invisible format characters (`\p{Cc}\p{Cf}`) can make the shown command
+    // differ from what the terminal receives.
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}')
+            || matches!(c, '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
+    };
+    let body = code.strip_suffix('\n').unwrap_or(code);
+    (shell && !command.is_empty() && !command.ends_with('\\') && !body.chars().any(hidden)).then(|| command.to_owned())
 }
 
 /// A short stable hash, to tell a message's code blocks apart.
@@ -1471,6 +1518,18 @@ fn detail_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_single_visible_shell_commands_run() {
+        assert_eq!(runnable_command("bash", "ls -la\n").as_deref(), Some("ls -la"));
+        assert_eq!(runnable_command("pwsh", "Get-Item .").as_deref(), Some("Get-Item ."));
+        assert_eq!(runnable_command("rust", "fn main() {}\n"), None);
+        assert_eq!(runnable_command("sh", "echo a \\\n"), None);
+        assert_eq!(runnable_command("sh", "  \n"), None);
+        assert_eq!(runnable_command("sh", "rm -rf \u{202e}/ tmp\n"), None);
+        // A newline or tab inside the block is a control character too, as on the web.
+        assert_eq!(runnable_command("sh", "a\nb\n"), None);
+    }
 
     #[test]
     fn thread_links_open_their_thread() {
