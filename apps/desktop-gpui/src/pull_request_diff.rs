@@ -57,6 +57,17 @@ pub struct FilePatch {
     hunks: Vec<Hunk>,
 }
 
+impl FilePatch {
+    /// Added and removed line counts, without building rows.
+    pub fn stat(&self) -> (u64, u64) {
+        self.hunks.iter().flat_map(|hunk| &hunk.lines).fold((0, 0), |(added, deleted), line| match line.change {
+            Change::Added => (added + 1, deleted),
+            Change::Deleted => (added, deleted + 1),
+            Change::Context => (added, deleted),
+        })
+    }
+}
+
 fn strip_side(path: &str, prefix: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim_end();
     (path != "/dev/null").then(|| path.strip_prefix(prefix).unwrap_or(path).to_owned())
@@ -213,18 +224,18 @@ pub fn review_anchor(
 }
 
 /// One line of a file's diff (`DiffRow`), for showing a few lines of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Row {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Row<'patch> {
     /// `+`, `-` or a space.
     pub mark: char,
     pub old: Option<u64>,
     pub new: Option<u64>,
-    pub text: String,
+    pub text: &'patch str,
     pub hunk: usize,
 }
 
 /// `fileDiffRows`.
-pub fn file_rows(file: &FilePatch) -> Vec<Row> {
+pub fn file_rows(file: &FilePatch) -> Vec<Row<'_>> {
     file.hunks
         .iter()
         .enumerate()
@@ -237,7 +248,7 @@ pub fn file_rows(file: &FilePatch) -> Vec<Row> {
                 },
                 old: (line.change != Change::Added).then_some(line.old),
                 new: (line.change != Change::Deleted).then_some(line.new),
-                text: line.text.clone(),
+                text: &line.text,
                 hunk,
             })
         })
@@ -246,7 +257,7 @@ pub fn file_rows(file: &FilePatch) -> Vec<Row> {
 
 /// `excerptRows`: the lines a guide excerpt names, with the removed lines an added run replaced
 /// (or the added lines a removed run became) kept beside them.
-pub fn excerpt_rows(rows: &[Row], new_side: bool, start: u64, end: u64) -> Vec<Row> {
+pub fn excerpt_rows<'patch>(rows: &[Row<'patch>], new_side: bool, start: u64, end: u64) -> Vec<Row<'patch>> {
     let line_of = |row: &Row| if new_side { row.new } else { row.old };
     let in_range = |row: &Row| line_of(row).is_some_and(|line| line >= start && line <= end);
     let Some(mut first) = rows.iter().position(in_range) else { return Vec::new() };
@@ -421,10 +432,9 @@ fn is_test_name(name: &str) -> bool {
         .rfind('.')
         .map(|dot| &lower[..dot])
         .is_some_and(|stem| ["_test", "_spec"].iter().any(|suffix| stem.ends_with(suffix)));
-    let class_test = ["Tests", "Test", "Spec"].iter().any(|word| {
-        ["java", "kt", "kts", "scala", "groovy", "cs", "php", "swift", "m"]
-            .iter()
-            .any(|ext| name.ends_with(&format!("{word}.{ext}")))
+    let class_test = name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        ["java", "kt", "kts", "scala", "groovy", "cs", "php", "swift", "m"].contains(&ext)
+            && ["Tests", "Test", "Spec"].iter().any(|word| stem.ends_with(word))
     });
     stem_kind.is_some_and(|kind| ["test", "spec", "e2e", "eval"].contains(&kind))
         || underscore
@@ -435,12 +445,16 @@ fn is_test_name(name: &str) -> bool {
 }
 
 /// `isTestChangedFile`: tests and their support files, judged from the path.
+/// The file lists call this per file on every render, so it doesn't allocate for the path.
 pub fn is_test_file(path: &str) -> bool {
-    let mut segments: Vec<&str> = path.split(['/', '\\']).collect();
-    let name = segments.pop().unwrap_or_default();
-    let dirs: Vec<String> = segments.iter().map(|s| s.to_lowercase()).collect();
-    let in_dir = |set: &[&str]| dirs.iter().any(|d| set.contains(&d.as_str()));
-    if GENERATED_FILES.contains(&name.to_lowercase().as_str()) || is_generated_name(name) || in_dir(&GENERATED_DIRS) {
+    let (dirs, name) = path.rsplit_once(['/', '\\']).unwrap_or(("", path));
+    let in_dir = |set: &[&str]| {
+        !dirs.is_empty() && dirs.split(['/', '\\']).any(|d| set.iter().any(|s| d.eq_ignore_ascii_case(s)))
+    };
+    if GENERATED_FILES.iter().any(|file| name.eq_ignore_ascii_case(file))
+        || is_generated_name(name)
+        || in_dir(&GENERATED_DIRS)
+    {
         return false;
     }
     is_mock_name(name) || in_dir(&MOCK_DIRS) || is_test_name(name) || in_dir(&TEST_DIRS)
@@ -597,7 +611,8 @@ deleted file mode 100644
 
     #[test]
     fn an_excerpt_keeps_the_lines_its_change_replaced() {
-        let rows = file_rows(&index_patch(PATCH)[0]);
+        let files = index_patch(PATCH);
+        let rows = file_rows(&files[0]);
         let shape = |rows: &[Row]| rows.iter().map(|r| format!("{}{}", r.mark, r.text)).collect::<Vec<_>>();
         assert_eq!(
             shape(&excerpt_rows(&rows, true, 11, 12)),
@@ -607,6 +622,13 @@ deleted file mode 100644
         assert_eq!(shape(&excerpt_rows(&rows, false, 11, 11)), ["-old", "+new", "+more"]);
         assert_eq!(shape(&excerpt_rows(&rows, true, 41, 42)), [" x", "-y", "+y2"], "a removed line between them stays");
         assert!(excerpt_rows(&rows, true, 90, 99).is_empty());
+        assert_eq!(
+            files[0].stat(),
+            (
+                rows.iter().filter(|r| r.mark == '+').count() as u64,
+                rows.iter().filter(|r| r.mark == '-').count() as u64
+            )
+        );
     }
 
     #[test]

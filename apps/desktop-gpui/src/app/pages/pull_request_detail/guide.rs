@@ -471,11 +471,7 @@ impl Workspace {
             .map(|(i, (path, note))| {
                 let open = panel.guide_files_open.contains(path);
                 let patch = code.and_then(|c| c.patch(path));
-                let stat = patch.map(|p| {
-                    let rows = diff_logic::file_rows(p);
-                    let count = |mark: char| rows.iter().filter(|r| r.mark == mark).count() as u64;
-                    (count('+'), count('-'))
-                });
+                let stat = patch.map(diff_logic::FilePatch::stat);
                 let key = path.clone();
                 let trigger = h_flex()
                     .id(ElementId::Name(format!("pr-guide-file:{path}").into()))
@@ -698,7 +694,7 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_color(t.foreground)
-                        .child(row.text.clone()),
+                        .child(row.text.to_owned()),
                 ),
         );
         if let Some((_, markers)) = line.and_then(|l| notes.iter().find(|(at, _)| *at == l)) {
