@@ -318,6 +318,7 @@ impl Workspace {
                     }
                 },
                 |this, _, cx| {
+                    this.observe_inbox_while_hidden();
                     this.notify_sidebar(cx);
                     this.track_visit(cx);
                 },

@@ -329,6 +329,16 @@ impl Workspace {
         self.sidebar.width
     }
 
+    /// The return tracker must see every shell change, like the web's. The
+    /// render pass feeds it while the sidebar shows; this covers it hidden.
+    pub(super) fn observe_inbox_while_hidden(&mut self) {
+        if self.sidebar_open {
+            return;
+        }
+        let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
+        self.sidebar.items(&self.shell, self.target.as_ref(), connected && self.shell.live, now_ms(), "");
+    }
+
     pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *crate::theme::tokens(cx);
         let sb = tokens.sidebar;
