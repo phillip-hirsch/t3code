@@ -239,6 +239,12 @@ impl AddHub {
         self.workspace.upgrade()?.read(cx).env_info(self.scope.as_ref()?)
     }
 
+    /// The dialog's environment has a socket; its cached config outlives a disconnect.
+    fn connected(&self, cx: &App) -> bool {
+        let Some((scope, workspace)) = self.scope.as_ref().zip(self.workspace.upgrade()) else { return false };
+        workspace.read(cx).env_client(scope).is_some()
+    }
+
     fn values(&self, cx: &App) -> (String, String, String) {
         let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
         (read(&self.url), read(&self.key), read(&self.label))
@@ -249,7 +255,10 @@ impl AddHub {
         if url.is_empty() || key.is_empty() {
             return;
         }
-        // A disconnected environment keeps the dialog open rather than saving elsewhere.
+        // A disconnected environment keeps the dialog and its form rather than saving elsewhere.
+        if !self.connected(cx) {
+            return;
+        }
         let Some(info) = self.info(cx) else { return };
         let sources = info.settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
         let id = source_id_from_url(&url, &sources);
@@ -299,7 +308,7 @@ impl AddHub {
                     .child(button("add-hub-cancel", "Cancel").outline().on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(
                         button("add-hub-save", "Add hub").primary()
-                            .disabled(url.is_empty() || key.is_empty())
+                            .disabled(url.is_empty() || key.is_empty() || !self.connected(cx))
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),
             )
