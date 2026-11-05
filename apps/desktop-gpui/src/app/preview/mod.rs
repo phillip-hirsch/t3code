@@ -1173,8 +1173,12 @@ impl Workspace {
         {
             menu = menu.child(separator()).child(
                 item("menu-clear-cookies".into(), "Clear cookies".into(), false, has_page).when(has_page, |el| {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.with_active_view(cx, clear_cookies);
+                    el.on_click(cx.listener(move |this, _, window, cx| {
+                        // Reading the cookies runs WebView2's message loop: a task, as `build_view` needs.
+                        cx.spawn_in(window, async move |this, cx| {
+                            let _ = this.update(cx, |this, cx| this.with_active_view(cx, clear_cookies));
+                        })
+                        .detach();
                         close(this, cx);
                     }))
                 }),
