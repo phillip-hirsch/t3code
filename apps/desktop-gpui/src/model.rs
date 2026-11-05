@@ -228,6 +228,11 @@ pub struct ServerInfo {
     pub platform_os: Option<String>,
     /// `environment.capabilities` from the config snapshot.
     pub capabilities: Value,
+    /// `config.keybindings`, the server's resolved rules (defaults not merged in).
+    pub keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    pub keybindings_config_path: Option<String>,
+    /// `config.availableEditors`, editor ids that can open a path on the server's host.
+    pub available_editors: Vec<String>,
 }
 
 impl ServerInfo {
@@ -248,6 +253,15 @@ impl ServerInfo {
                 self.new_projects_root = text("/newProjectsRoot");
                 self.platform_os = text("/environment/platform/os");
                 self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
+                self.keybindings = Rc::new(crate::keybindings::decode_rules(&config["keybindings"]));
+                self.keybindings_config_path = text("/keybindingsConfigPath");
+                self.available_editors = config["availableEditors"]
+                    .as_array()
+                    .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
+                    .unwrap_or_default();
+            }
+            "keybindingsUpdated" => {
+                self.keybindings = Rc::new(crate::keybindings::decode_rules(&event["payload"]["keybindings"]))
             }
             "providerStatuses" => {
                 self.providers = lossy(&event["payload"]["providers"])?;

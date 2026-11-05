@@ -3,11 +3,16 @@
 //! the scope layer are in `widgets.rs`.
 
 mod agents;
+mod chat;
 mod code;
 mod connections;
+mod diffs;
 mod general;
 mod providers;
 mod search;
+mod keybindings;
+mod placeholder;
+mod snap_shot;
 mod system;
 mod widgets;
 

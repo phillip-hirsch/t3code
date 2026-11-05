@@ -27,6 +27,7 @@ mod chat;
 mod composer;
 mod details;
 mod header;
+pub(crate) mod keymap;
 mod layout;
 mod pages;
 mod sidebar;
@@ -123,6 +124,12 @@ pub struct Workspace {
     client_settings: crate::settings::ClientSettings,
     history: pages::History,
     devices: crate::device::Devices,
+    /// The keybindings last installed into GPUI's keymap; see [`keymap`].
+    installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    /// Settings → Keybindings, created the first time it opens.
+    keybindings_panel: Option<gpui_kit::AnyView>,
+    /// Open "Advanced" folds in Settings sections, by section id.
+    settings_folds: HashSet<&'static str>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -191,6 +198,9 @@ impl Workspace {
             client_settings,
             history: pages::History::default(),
             devices: Default::default(),
+            installed_keybindings: Rc::default(),
+            keybindings_panel: None,
+            settings_folds: HashSet::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -342,6 +352,7 @@ impl Workspace {
                 }
             },
             |this, window, cx| {
+                this.sync_keymap(cx);
                 this.notify_sidebar(cx);
                 this.check_chatgpt_welcome(window, cx);
             },
@@ -807,6 +818,9 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::GoBack, window, cx| this.go_back(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::GoForward, window, cx| this.go_forward(window, cx)))
+            .on_action(cx.listener(|this, _: &keymap::OpenUsage, _, cx| this.open_page(pages::Page::Usage, cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {

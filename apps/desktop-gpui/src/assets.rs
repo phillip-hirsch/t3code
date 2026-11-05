@@ -61,6 +61,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "download",
     "file-diff",
     "flask-conical",
+    "file-braces",
     "folder",
     "folder-git",
     "folder-git-2",
