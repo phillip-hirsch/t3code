@@ -55,13 +55,13 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
     })
 }
 
-/// What a target keeps of the composer while another one is on screen, like
-/// the web's `composerDraftStore` (in memory only).
 /// A failed message first, then whatever was typed after it.
 fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
 }
 
+/// What a target keeps of the composer while another one is on screen, like
+/// the web's `composerDraftStore` (in memory only).
 pub(super) enum ComposerDraft {
     Prompt(String),
     /// An open question card; its prompt is the one it set aside.
