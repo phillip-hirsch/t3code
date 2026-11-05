@@ -11,6 +11,7 @@ mod diffs;
 mod fields;
 mod general;
 mod keybindings;
+mod licenses;
 mod model_select;
 
 mod providers;
@@ -722,6 +723,7 @@ impl Workspace {
             "labs" => self.render_settings_labs(window, cx),
             "about" => self.render_settings_about(window, cx),
             "archived" => self.render_settings_archived(window, cx),
+            "open-source-licenses" => self.render_settings_licenses(window, cx),
             _ => self.render_settings_general(window, cx),
         }
     }

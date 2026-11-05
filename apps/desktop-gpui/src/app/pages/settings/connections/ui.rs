@@ -28,7 +28,9 @@ pub(super) fn success() -> Hsla {
     rgb(0x00bc7d).into()
 }
 
-pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
+pub(in crate::app::pages::settings) fn tooltip(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
     let text = text.into();
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }

@@ -1203,7 +1203,7 @@ impl Workspace {
     }
 
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
-    fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let search = self.settings_ui.scope.clone();
         let workspace = cx.entity();

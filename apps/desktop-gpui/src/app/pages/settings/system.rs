@@ -246,11 +246,23 @@ impl Workspace {
             .small()
             .label("View policy")
             .on_click(|_, _, cx| cx.open_url(PRIVACY_POLICY_URL));
-        let legal = [RowFrame::new("Privacy policy")
-            .description(text(privacy))
-            .control(view_policy)
-            .render(&t)
-            .into_any_element()];
+        let view_licenses = Button::new("about-licenses")
+            .outline()
+            .small()
+            .label("View licenses")
+            .on_click(cx.listener(|this, _, _, cx| this.select_settings_section("open-source-licenses", cx)));
+        let legal = [
+            RowFrame::new("Privacy policy")
+                .description(text(privacy))
+                .control(view_policy)
+                .render(&t)
+                .into_any_element(),
+            RowFrame::new("Open source licenses")
+                .description(text("Notices for dependencies, assets, and optional tools used by T3 Code."))
+                .control(view_licenses)
+                .render(&t)
+                .into_any_element(),
+        ];
         let view = self.settings_view();
         let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
         self.settings_page("about", &view, sections, cx)
