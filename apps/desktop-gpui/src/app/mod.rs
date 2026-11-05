@@ -142,6 +142,8 @@ pub struct Workspace {
     palette: Option<palette::Palette>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
+    /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
+    scheduled_tasks_view: Option<gpui_kit::AnyView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -218,6 +220,7 @@ impl Workspace {
             settings_folds: HashSet::new(),
             palette: None,
             focus: cx.focus_handle(),
+            scheduled_tasks_view: None,
             _subscriptions: subscriptions,
         }
     }

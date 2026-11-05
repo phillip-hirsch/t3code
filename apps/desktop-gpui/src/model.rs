@@ -58,6 +58,8 @@ pub struct ProviderModel {
     pub sub_provider: Option<String>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    pub is_legacy: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -275,6 +277,10 @@ pub struct ServerInfo {
     pub project_organization: bool,
     /// The "No project" workspace; a project rooted there is the scratch project.
     pub scratch_workspace_root: Option<String>,
+    /// `environment.capabilities.oneTimeSchedules`: the server saves `{type: "once"}` tasks.
+    pub one_time_schedules: bool,
+    /// `ManagedPolicySummary`, or null when no administrator policy applies.
+    pub managed_policy: Value,
 }
 
 impl ServerInfo {
@@ -305,6 +311,9 @@ impl ServerInfo {
                     config.pointer("/environment/capabilities/projectOrganization").and_then(Value::as_bool)
                         == Some(true);
                 self.scratch_workspace_root = text("/scratchWorkspaceRoot");
+                self.one_time_schedules =
+                    config.pointer("/environment/capabilities/oneTimeSchedules").and_then(Value::as_bool) == Some(true);
+                self.managed_policy = config.get("managedPolicy").cloned().unwrap_or_default();
             }
             "keybindingsUpdated" => {
                 self.keybindings = Rc::new(crate::keybindings::decode_rules(&event["payload"]["keybindings"]))
@@ -444,14 +453,14 @@ pub struct ProjectShell {
     pub default_thread_env_mode: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,
     /// The repo favicon the server found, relative to the workspace root.
     #[serde(default)]
     pub favicon_path: Option<String>,
-    #[serde(default)]
-    pub pinned_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
