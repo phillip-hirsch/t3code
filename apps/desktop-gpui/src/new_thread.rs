@@ -72,20 +72,17 @@ impl DraftWorkspace {
         }
     }
 
-    /// The launch's `workspaceStrategy`, reading t3.json and the project's refs as the web does.
-    pub async fn strategy(self, client: &RpcClient) -> Result<Value, String> {
+    /// The mode a fresh draft starts in, reading t3.json when no setting decides.
+    pub async fn default_mode(&self, client: &RpcClient) -> EnvMode {
         let project_file = match self.configured {
             Some(_) => None,
             None => read_project_file_env_mode(client, &self.workspace_root).await,
         };
-        if self.env_mode(project_file) == EnvMode::Local {
-            return Ok(json!({"type": "root"}));
-        }
-        let refs = client
-            .request("vcs.listRefs", json!({"cwd": self.workspace_root, "limit": REF_LIST_LIMIT}))
-            .await
-            .map_err(|error| error.to_string())?;
-        worktree_strategy(&refs, self.start_from_origin)
+        self.env_mode(project_file)
+    }
+
+    pub fn start_from_origin(&self) -> bool {
+        self.start_from_origin
     }
 
     /// `applyProjectFile` + `resolveNewThreadEnvMode`.
@@ -105,18 +102,61 @@ impl DraftWorkspace {
     }
 }
 
-/// `planComposerTurn` and `resolveSendEnvMode` for a first message, given `vcs.listRefs`.
-fn worktree_strategy(refs: &Value, start_from_origin: bool) -> Result<Value, String> {
-    // Outside a repository there is nothing to branch from, so the thread runs in the checkout.
-    if refs.get("isRepo").and_then(Value::as_bool) != Some(true) {
-        return Ok(json!({"type": "root"}));
-    }
+/// `vcs.listRefs` for a project's checkout, as the draft's workspace controls use it.
+pub async fn list_refs(client: &RpcClient, cwd: &str) -> Result<Value, String> {
+    client
+        .request("vcs.listRefs", json!({"cwd": cwd, "limit": REF_LIST_LIMIT}))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// What the draft's workspace controls picked.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkspaceChoice {
+    pub mode: Option<EnvMode>,
+    /// Worktree mode: the base branch. Local mode: the branch switched to.
+    pub branch: Option<String>,
+    /// A previous thread's worktree to reuse, with its branch.
+    pub existing_worktree: Option<(String, Option<String>)>,
+    pub start_from_origin: Option<bool>,
+}
+
+/// The base branch a worktree draft starts from: the picked one, else the
+/// repository's default ref, else the current one.
+pub fn default_base(refs: &Value) -> Option<&str> {
     let list = refs.get("refs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let named = |flag: &str| {
         list.iter().find(|r| r.get(flag).and_then(Value::as_bool) == Some(true)).and_then(|r| r["name"].as_str())
     };
-    let base_ref = named("isDefault")
-        .or_else(|| named("current"))
+    named("isDefault").or_else(|| named("current"))
+}
+
+/// The launch's `workspaceStrategy` (`startThreadTurn` in `operations/commands.ts`).
+pub fn launch_strategy(
+    mode: EnvMode,
+    choice: &WorkspaceChoice,
+    refs: &Value,
+    start_from_origin: bool,
+) -> Result<Value, String> {
+    if let Some((worktree_path, branch)) = &choice.existing_worktree {
+        let mut strategy = json!({"type": "existing_worktree", "worktreePath": worktree_path});
+        if let Some(branch) = branch {
+            strategy["branch"] = branch.clone().into();
+        }
+        return Ok(strategy);
+    }
+    // Outside a repository there is nothing to branch from, so the thread runs in the checkout.
+    if mode == EnvMode::Local || refs.get("isRepo").and_then(Value::as_bool) != Some(true) {
+        let mut strategy = json!({"type": "root"});
+        if let (EnvMode::Local, Some(branch)) = (mode, &choice.branch) {
+            strategy["branch"] = branch.clone().into();
+        }
+        return Ok(strategy);
+    }
+    let base_ref = choice
+        .branch
+        .as_deref()
+        .or_else(|| default_base(refs))
         .ok_or_else(|| "Select a base branch before sending in New worktree mode.".to_owned())?;
     let mut strategy = json!({"type": "worktree", "baseRef": base_ref});
     if start_from_origin {
@@ -265,19 +305,31 @@ mod tests {
     }
 
     #[test]
-    fn worktree_strategy_branches_from_the_default_ref() {
+    fn launch_strategy_follows_the_workspace_controls() {
+        use EnvMode::*;
         let refs = json!({"isRepo": true, "refs": [
             {"name": "feature", "current": true, "isDefault": false},
             {"name": "main", "current": false, "isDefault": true},
         ]});
+        let none = WorkspaceChoice::default();
         assert_eq!(
-            worktree_strategy(&refs, true).unwrap(),
+            launch_strategy(Worktree, &none, &refs, true).unwrap(),
             json!({"type": "worktree", "baseRef": "main", "startFromOrigin": true})
         );
-        let no_default = json!({"isRepo": true, "refs": [{"name": "feature", "current": true, "isDefault": false}]});
-        assert_eq!(worktree_strategy(&no_default, false).unwrap(), json!({"type": "worktree", "baseRef": "feature"}));
-        assert!(worktree_strategy(&json!({"isRepo": true, "refs": []}), false).is_err());
-        assert_eq!(worktree_strategy(&json!({"isRepo": false, "refs": []}), true).unwrap(), json!({"type": "root"}));
+        let picked = WorkspaceChoice { branch: Some("feature".into()), ..none.clone() };
+        assert_eq!(
+            launch_strategy(Worktree, &picked, &refs, false).unwrap(),
+            json!({"type": "worktree", "baseRef": "feature"})
+        );
+        assert_eq!(launch_strategy(Local, &picked, &refs, true).unwrap(), json!({"type": "root", "branch": "feature"}));
+        assert_eq!(launch_strategy(Local, &none, &refs, true).unwrap(), json!({"type": "root"}));
+        let reuse = WorkspaceChoice { existing_worktree: Some(("C:/wt/a".into(), Some("a".into()))), ..none.clone() };
+        assert_eq!(
+            launch_strategy(Worktree, &reuse, &refs, true).unwrap(),
+            json!({"type": "existing_worktree", "worktreePath": "C:/wt/a", "branch": "a"})
+        );
+        assert!(launch_strategy(Worktree, &none, &json!({"isRepo": true, "refs": []}), false).is_err());
+        assert_eq!(launch_strategy(Worktree, &none, &json!({"isRepo": false}), true).unwrap(), json!({"type": "root"}));
     }
 
     #[test]

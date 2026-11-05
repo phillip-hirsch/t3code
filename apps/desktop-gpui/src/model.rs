@@ -58,6 +58,11 @@ pub struct ProviderModel {
     pub sub_provider: Option<String>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+    /// `"new"` shows a NEW badge in the model picker.
+    #[serde(default)]
+    pub badge: Option<String>,
+    #[serde(default)]
+    pub is_legacy: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -112,6 +117,60 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    /// Empty means every runtime mode.
+    #[serde(default)]
+    pub supported_runtime_modes: Vec<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `ServerProviderSkill` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+/// `ServerProviderSlashCommand`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+/// `ServerProviderWorkspaceSnapshot`: skills and commands as seen from one checkout.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub cwd: String,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -173,6 +232,12 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// Model picker favorites as `(instanceId, model)`.
+    pub favorites: Vec<(String, String)>,
+    /// `providerModelPreferences`, keyed by instance id.
+    pub model_preferences: Value,
+    /// `environment.capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
+    pub file_upload_limit: Option<u64>,
 }
 
 impl ServerInfo {
@@ -188,6 +253,8 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.file_upload_limit =
+                    config.pointer("/environment/capabilities/fileAttachments/maxUploadBytes").and_then(Value::as_u64);
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -205,6 +272,14 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.favorites = settings
+            .get("favorites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f.get("provider")?.as_str()?.to_owned(), f.get("model")?.as_str()?.to_owned())))
+            .collect();
+        self.model_preferences = settings.get("providerModelPreferences").cloned().unwrap_or_default();
         Ok(())
     }
 

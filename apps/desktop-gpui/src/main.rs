@@ -1,6 +1,8 @@
 mod app;
 mod assets;
 mod backend;
+mod composer_search;
+mod composer_text;
 mod inbox;
 mod model;
 mod model_label;
