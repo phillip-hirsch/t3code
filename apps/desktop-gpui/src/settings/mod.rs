@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::themes::{ThemeChoice, ThemeHalves};
+use crate::themes::{Library, ThemeChoice, ThemeHalves};
 
 /// Data generated from the TypeScript contracts by `tools/settings_data.test.ts`.
 #[derive(Deserialize)]
@@ -181,6 +181,8 @@ impl ThemePreference {
 const THEME_KEY: &str = "theme";
 const THEME_ID_KEY: &str = "themeId";
 const THEME_HALVES_KEY: &str = "themeHalves";
+/// `t3code:themes:v1`: the saved themes.
+const CUSTOM_THEMES_KEY: &str = "customThemes";
 /// `t3code:typography-advanced`: prompt, code and terminal fonts set separately.
 pub const TYPOGRAPHY_ADVANCED_KEY: &str = "typographyAdvanced";
 
@@ -190,6 +192,7 @@ pub struct ClientSettings {
     pub theme: ThemePreference,
     pub theme_id: Option<String>,
     pub theme_halves: ThemeHalves,
+    pub themes: Library,
     path: Option<PathBuf>,
 }
 
@@ -218,12 +221,24 @@ impl ClientSettings {
             theme,
             theme_id: text(&stored[THEME_ID_KEY]),
             theme_halves: ThemeHalves { light: text(&halves["light"]), dark: text(&halves["dark"]) },
+            themes: Library::new(crate::theme_file::parse_stored_list(&stored[CUSTOM_THEMES_KEY])),
             path,
         }
     }
 
     pub fn theme_choice(&self) -> ThemeChoice {
-        ThemeChoice { mode: self.theme, base: self.theme_id.clone(), halves: self.theme_halves.clone() }
+        ThemeChoice {
+            mode: self.theme,
+            base: self.theme_id.clone(),
+            halves: self.theme_halves.clone(),
+            library: self.themes.clone(),
+        }
+    }
+
+    /// Stores the saved themes and the pick that may name them.
+    pub fn set_themes(&mut self, themes: Library, choice: ThemeChoice) {
+        self.themes = themes;
+        self.set_theme_choice(choice);
     }
 
     /// Stores a theme library pick (mode, theme and mix together).
@@ -243,6 +258,8 @@ impl ClientSettings {
         document.insert(THEME_ID_KEY.into(), self.theme_id.clone().into());
         let halves = &self.theme_halves;
         document.insert(THEME_HALVES_KEY.into(), serde_json::json!({ "light": halves.light, "dark": halves.dark }));
+        let themes = self.themes.custom().iter().map(crate::theme_file::stored).collect();
+        document.insert(CUSTOM_THEMES_KEY.into(), Value::Array(themes));
         Value::Object(document)
     }
 
@@ -315,6 +332,13 @@ mod tests {
         choice.mode = ThemePreference::Dark;
         choice.assign_half(false, Some("grove".into()));
         settings.set_theme_choice(choice.clone());
+        let aurora = crate::theme_file::parse_theme_file(
+            &json!({"version": 1, "name": "Aurora", "appearance": "dark", "colors": {"canvas": "#101014"}}),
+        )
+        .unwrap();
+        let themes = settings.themes.install(aurora).unwrap();
+        let choice = ThemeChoice { base: Some("aurora".into()), library: themes.clone(), ..choice };
+        settings.set_themes(themes, choice.clone());
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let reloaded = ClientSettings::from_stored(&raw, None);
         assert_eq!(reloaded.values.get("timestampFormat"), "24-hour");

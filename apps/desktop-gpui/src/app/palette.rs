@@ -95,6 +95,8 @@ enum Run {
     PinProjects(Vec<String>, bool),
     Theme(crate::themes::CardId),
     Appearance(crate::settings::ThemePreference),
+    /// `themeEditor.toggle`.
+    ThemeEditor,
     /// Go to file or Search project contents, returning here on Esc.
     FileSearch(super::files::OverlayMode),
 }
@@ -565,6 +567,10 @@ impl Workspace {
         row.terms = &["change appearance", "light", "dark", "system", "mode", "toggle"];
         row.shortcut = self.shortcut("appearance.cycle");
         rows.push(row);
+        let mut row = lucide("theme-editor", IconName::Palette, "Toggle theme editor", Run::ThemeEditor);
+        row.terms = &["theme", "appearance", "colors", "palette", "customize"];
+        row.shortcut = self.shortcut("themeEditor.toggle");
+        rows.push(row);
         let mut row =
             lucide("pull-requests", IconName::GitPullRequestArrow, "Open pull requests", Run::Page(Page::PullRequests));
         row.terms = &["pull requests", "prs", "pr", "review", "merge", "branch"];
@@ -607,10 +613,12 @@ impl Workspace {
         rows
     }
 
-    /// "Change theme" (`useCommandPaletteThemeItems`): the standard card, then the built-in themes.
+    /// "Change theme" (`useCommandPaletteThemeItems`): the standard card, the built-in themes,
+    /// then the saved ones.
     fn theme_rows(&self, dark: bool) -> Vec<Row> {
         let current = self.client_settings.theme_choice().owner(dark);
-        let cards = crate::themes::built_in().iter().map(|theme| {
+        let saved = self.client_settings.themes.custom().iter();
+        let cards = crate::themes::built_in().iter().chain(saved).map(|theme| {
             let only = theme.single_appearance().map(|dark| if dark { "For dark mode" } else { "For light mode" });
             (Some(theme.id.clone()), theme.label.clone(), only)
         });
@@ -952,6 +960,7 @@ impl Workspace {
                 let choice = crate::themes::ThemeChoice { mode, ..self.client_settings.theme_choice() };
                 self.set_theme_choice(choice, window, cx);
             }
+            Run::ThemeEditor => self.toggle_theme_editor(window, cx),
             Run::FindIn { thread_id, query, message_id } => {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
