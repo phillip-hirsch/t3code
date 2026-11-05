@@ -100,6 +100,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) panel: Option<super::pull_request_detail::Panel>,
     /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
     pub(super) last_merge_method: &'static str,
+    /// Unsent reviews by pull request, kept across panels (`usePullRequestReviewStore`).
+    pub(super) reviews: std::collections::HashMap<String, super::pull_request_detail::write::ReviewDraft>,
 }
 
 impl PullRequestsState {
@@ -139,6 +141,7 @@ impl PullRequestsState {
             _search_subscription: subscription,
             panel: None,
             last_merge_method: "merge",
+            reviews: std::collections::HashMap::new(),
         }
     }
 

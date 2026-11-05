@@ -47,7 +47,54 @@ pub struct Check {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReviewCapabilities {
+    #[serde(default)]
+    pub inline_comment: bool,
+    #[serde(default)]
+    pub range_comment: Option<bool>,
+    #[serde(default)]
+    pub reply: bool,
+    #[serde(default)]
+    pub resolve: bool,
+    #[serde(default)]
+    pub verdicts: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerCapabilities {
+    #[serde(default)]
+    pub request: bool,
+    #[serde(default)]
+    pub list_candidates: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCapabilities {
+    #[serde(default)]
+    pub change_request: bool,
+    #[serde(default)]
+    pub comment: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    #[serde(default)]
+    pub diff: bool,
+    #[serde(default)]
+    pub comment: bool,
+    #[serde(default)]
+    pub reactions: Option<bool>,
+    #[serde(default)]
+    pub viewed_files: Option<String>,
+    #[serde(default)]
+    pub review: ReviewCapabilities,
+    #[serde(default)]
+    pub reviewers: ReviewerCapabilities,
+    #[serde(default)]
+    pub edit: Option<EditCapabilities>,
     #[serde(default)]
     pub actions: Vec<String>,
     #[serde(default)]
@@ -58,10 +105,42 @@ pub struct Capabilities {
     pub labels: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+/// Unreported host permissions are granted.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Permissions {
     #[serde(default)]
     pub actions: Vec<String>,
+    #[serde(default = "granted")]
+    pub comment: bool,
+    #[serde(default = "granted")]
+    pub resolve: bool,
+    #[serde(default)]
+    pub verdicts: Vec<String>,
+    #[serde(default = "granted")]
+    pub request_reviewers: bool,
+    #[serde(default)]
+    pub labels: Option<bool>,
+    #[serde(default)]
+    pub edit_change_request: Option<bool>,
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self {
+            actions: Vec::new(),
+            comment: true,
+            resolve: true,
+            verdicts: Vec::new(),
+            request_reviewers: true,
+            labels: None,
+            edit_change_request: None,
+        }
+    }
+}
+
+fn granted() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -81,6 +160,8 @@ pub struct Detail {
     pub provider: String,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub viewer: Option<String>,
     #[serde(default)]
     pub viewer_permissions: Permissions,
     pub project_id: String,
@@ -130,6 +211,17 @@ pub struct Detail {
     pub workflow_approvals_required: Option<u64>,
 }
 
+/// `PullRequestReaction`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Reaction {
+    pub content: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub viewer_has_reacted: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Comment {
@@ -146,6 +238,10 @@ pub struct Comment {
     pub path: Option<String>,
     #[serde(default)]
     pub review_state: Option<String>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub can_edit: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -159,6 +255,10 @@ pub struct ThreadComment {
     pub created_at: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub can_edit: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +268,10 @@ pub struct ReviewThread {
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
+    #[serde(default = "right_side")]
+    pub side: String,
+    #[serde(default)]
+    pub can_resolve: Option<bool>,
     #[serde(default)]
     pub is_resolved: bool,
     #[serde(default)]
@@ -178,6 +282,10 @@ pub struct ReviewThread {
     pub comment_count: Option<usize>,
     #[serde(default)]
     pub next_comments_cursor: Option<String>,
+}
+
+fn right_side() -> String {
+    "right".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -213,6 +321,8 @@ pub struct Activity {
     pub review_threads: Vec<ReviewThread>,
     #[serde(default)]
     pub commits: Vec<Commit>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
 }
 
 impl Activity {
@@ -293,6 +403,34 @@ pub fn resolve_merge_method(
 pub fn can(detail: &Detail, action: &str) -> bool {
     detail.capabilities.actions.iter().any(|a| a == action)
         && detail.viewer_permissions.actions.iter().any(|a| a == action)
+}
+
+fn same_login(a: Option<&str>, b: Option<&str>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
+}
+
+/// `canEditPullRequestChangeRequest`: the host's answer, else the author or someone who may merge.
+pub fn can_edit_change_request(detail: &Detail) -> bool {
+    if !detail.capabilities.edit.is_some_and(|e| e.change_request) {
+        return false;
+    }
+    detail.viewer_permissions.edit_change_request.unwrap_or_else(|| {
+        same_login(detail.viewer.as_deref(), detail.author.as_ref().map(|a| a.login.as_str()))
+            || detail.viewer_permissions.actions.iter().any(|a| a == "merge")
+    })
+}
+
+/// `canEditPullRequestComment`: a remark, not a review's summary, by the reader or that the host allows.
+pub fn can_edit_comment(detail: &Detail, kind: &str, author: Option<&Actor>, can_edit: Option<bool>) -> bool {
+    if !detail.capabilities.edit.is_some_and(|e| e.comment) || !matches!(kind, "issue-comment" | "review-comment") {
+        return false;
+    }
+    can_edit.unwrap_or_else(|| same_login(detail.viewer.as_deref(), author.map(|a| a.login.as_str())))
+}
+
+/// `canResolvePullRequestThread`: the thread's answer can only narrow the reader's permission.
+pub fn can_resolve_thread(detail: &Detail, thread: &ReviewThread) -> bool {
+    detail.viewer_permissions.resolve && thread.can_resolve != Some(false)
 }
 
 /// The header's one prominent control (`resolvePullRequestPrimaryControl`).
@@ -625,6 +763,8 @@ pub fn conversations(comments: &[Comment], threads: &[ReviewThread]) -> Vec<Conv
                     url: c.url.clone(),
                     path: Some(thread.path.clone()),
                     review_state: None,
+                    reactions: c.reactions.clone(),
+                    can_edit: c.can_edit,
                 })
             })
             .collect();
@@ -1023,6 +1163,30 @@ mod tests {
         assert!(actions.reopen && actions.delete_branch && !actions.close);
         let merged = detail(json!({"state": "merged"}));
         assert!(menu_actions(&merged, None).revert);
+    }
+
+    #[test]
+    fn editing_follows_the_hosts_answer_then_authorship() {
+        let caps = json!({"actions": [], "mergeMethods": [], "edit": {"changeRequest": true, "comment": true}});
+        let mine = detail(json!({"capabilities": caps.clone(), "viewer": "OctoCat", "author": {"login": "octocat"}}));
+        assert!(can_edit_change_request(&mine), "the author, in any case");
+        let theirs = detail(json!({"capabilities": caps.clone(), "viewer": "me", "author": {"login": "you"}}));
+        assert!(can_edit_change_request(&theirs), "someone who may merge");
+        let refused = detail(json!({
+            "capabilities": caps.clone(), "viewer": "octocat", "author": {"login": "octocat"},
+            "viewerPermissions": {"actions": ["merge"], "editChangeRequest": false},
+        }));
+        assert!(!can_edit_change_request(&refused), "the host's own answer wins");
+        assert!(!can_edit_change_request(&detail(json!({}))), "a host that cannot rewrite one");
+        let me = Actor { login: "octocat".into(), ..Actor::default() };
+        assert!(can_edit_comment(&mine, "review-comment", Some(&me), None));
+        assert!(!can_edit_comment(&mine, "review", Some(&me), None), "a review's summary");
+        assert!(!can_edit_comment(&mine, "issue-comment", Some(&me), Some(false)));
+        let thread: ReviewThread =
+            serde_json::from_value(json!({"id": "t", "path": "a", "canResolve": false})).unwrap();
+        assert!(!can_resolve_thread(&mine, &thread));
+        let open: ReviewThread = serde_json::from_value(json!({"id": "t", "path": "a"})).unwrap();
+        assert!(can_resolve_thread(&mine, &open) && open.side == "right");
     }
 
     #[test]

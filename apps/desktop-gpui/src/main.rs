@@ -11,6 +11,7 @@ mod model_label;
 mod new_thread;
 mod preview;
 mod pull_request_detail;
+mod pull_request_diff;
 mod pull_requests;
 mod requests;
 mod rpc;

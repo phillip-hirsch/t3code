@@ -35,6 +35,9 @@ use crate::pull_requests::{self as list_logic, Entry};
 use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
 
+mod code;
+pub(in crate::app) mod write;
+
 const CONVERSATION_PAGE: usize = 10;
 /// How long an inline "Confirm …?" stays armed (`useInlineActionConfirm`).
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
@@ -47,6 +50,7 @@ pub(super) enum Tab {
     Summary,
     Guide,
     Timeline,
+    Code,
 }
 
 /// One open pull request.
@@ -86,6 +90,8 @@ pub(in crate::app) struct Panel {
     guide_error: Option<SharedString>,
     guide_starting: bool,
     _guide_poll: Option<Task<()>>,
+    code: Option<code::CodeTab>,
+    write: write::WriteState,
 }
 
 impl Panel {
@@ -123,6 +129,8 @@ impl Panel {
             guide_error: None,
             guide_starting: false,
             _guide_poll: None,
+            code: None,
+            write: write::WriteState::default(),
         }
     }
 
@@ -272,6 +280,7 @@ impl Workspace {
                     Ok(Ok(activity)) => {
                         panel.activity = Some(Rc::new(activity));
                         panel.activity_error = None;
+                        panel.write.reactions.clear();
                     }
                     Ok(Err(error)) => panel.activity_error = Some(format!("Unreadable activity: {error}").into()),
                     Err(error) => panel.activity_error = Some(list_logic::error_message(&error).into()),
@@ -297,6 +306,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail(cx);
+                this.refresh_pr_code(cx);
             });
         })
         .detach();
@@ -592,6 +602,7 @@ impl Workspace {
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
         let tab = match panel.tab {
             Tab::Guide if !guides => Tab::Summary,
+            Tab::Code if !detail.capabilities.diff => Tab::Summary,
             tab => tab,
         };
         let header = self.render_pr_header(&detail, tab, guides, &t, window, cx);
@@ -599,8 +610,20 @@ impl Workspace {
             Tab::Summary => self.render_pr_summary(&detail, &t, window, cx),
             Tab::Timeline => self.render_pr_timeline(&detail, &t, cx),
             Tab::Guide => self.render_pr_guide(&t, cx),
+            Tab::Code => self.render_pr_code(&detail, &t, window, cx),
         };
-        frame.child(header).child(div().flex_1().min_h_0().relative().child(body)).into_any_element()
+        let composer = self.render_pr_composer(&detail, &t, cx);
+        frame
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(body)
+                    .children(composer.map(|c| div().absolute().right(px(16.)).bottom(px(12.)).child(c))),
+            )
+            .into_any_element()
     }
 
     /// The crumbs and collapse button while the detail is not in yet (`PullRequestDetailGhost`).
@@ -835,33 +858,59 @@ impl Workspace {
                     .children(diff_stat(detail.additions, detail.deletions, 12., t)),
             );
 
-        let title = div()
-            .min_h(px(24.))
-            .min_w_0()
-            .truncate()
-            .text_base()
-            .line_height(px(22.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(t.foreground)
-            .child(detail.title.clone());
+        let title = match self.render_pr_title_input(t) {
+            Some(input) => input,
+            None => h_flex()
+                .min_h(px(24.))
+                .min_w_0()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_base()
+                        .line_height(px(22.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.foreground)
+                        .child(detail.title.clone()),
+                )
+                .group(write::EDIT_GROUP)
+                .when(logic::can_edit_change_request(detail), |el| {
+                    el.child(write::hover_only(
+                        ghost_button("pr-edit-title", t)
+                            .size(px(20.))
+                            .p_0()
+                            .tooltip("Edit title")
+                            .child(Icon::new(Lucide::Pencil).with_size(px(12.)))
+                            .on_click(cx.listener(|this, _, window, cx| this.begin_pr_title_edit(window, cx))),
+                    ))
+                })
+                .into_any_element(),
+        };
 
         let mut tabs = vec![(Tab::Summary, "Summary")];
         if guides {
             tabs.push((Tab::Guide, "Guide"));
         }
         tabs.push((Tab::Timeline, "Timeline"));
+        if detail.capabilities.diff {
+            tabs.push((Tab::Code, "Code"));
+        }
         let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, cx, |this, tab, cx| {
             let Some(panel) = this.pull_requests.panel.as_mut() else { return };
             panel.tab = tab;
             if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
                 this.read_pr_guide(cx);
             }
+            if tab == Tab::Code {
+                this.open_pr_code(cx);
+            }
             cx.notify();
         });
         let status = match tab {
             Tab::Summary => Some(self.render_pr_checks_status(detail, checks_state, checks_stale, t, window, cx)),
             Tab::Timeline => Some(self.render_pr_timeline_status(t, cx)),
-            Tab::Guide => None,
+            Tab::Guide | Tab::Code => None,
         };
         let tab_bar = h_flex()
             .flex_wrap()
@@ -1348,39 +1397,66 @@ impl Workspace {
         let outcomes = logic::latest_review_outcomes(comments, commits);
         let reviewers = logic::reviewer_entries(reviewers, &outcomes);
 
+        let reviewer_picker = (detail.capabilities.reviewers.request && detail.capabilities.reviewers.list_candidates)
+            .then(|| self.render_pr_picker(true, detail.viewer_permissions.request_reviewers, t, cx));
         let reviewer_row = meta_row(
             Lucide::Users,
             "Reviewers",
-            if reviewers.is_empty() {
-                div().text_color(t.muted_foreground).child("None").into_any_element()
-            } else {
-                h_flex()
-                    .children(
-                        reviewers
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (actor, outcome))| reviewer_avatar(index, actor, outcome.as_ref(), t)),
-                    )
-                    .into_any_element()
-            },
+            h_flex()
+                .gap(px(6.))
+                .child(if reviewers.is_empty() {
+                    div().text_color(t.muted_foreground).child("None").into_any_element()
+                } else {
+                    h_flex()
+                        .children(
+                            reviewers
+                                .iter()
+                                .enumerate()
+                                .map(|(index, (actor, outcome))| reviewer_avatar(index, actor, outcome.as_ref(), t)),
+                        )
+                        .into_any_element()
+                })
+                .children(reviewer_picker)
+                .into_any_element(),
             t,
         );
+        let label_picker = (detail.capabilities.labels == Some(true))
+            .then(|| self.render_pr_picker(false, detail.viewer_permissions.labels != Some(false), t, cx));
         let label_row = (!detail.labels.is_empty() || detail.capabilities.labels == Some(true)).then(|| {
-            let value = if detail.labels.is_empty() {
-                div().text_color(t.muted_foreground).child("None").into_any_element()
-            } else {
-                h_flex()
-                    .flex_wrap()
-                    .gap(px(4.))
-                    .children(detail.labels.iter().map(|l| label_chip(&l.name, l.color.as_deref(), 0, t)))
-                    .into_any_element()
-            };
+            let value = h_flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .when(detail.labels.is_empty(), |el| el.child(div().text_color(t.muted_foreground).child("None")))
+                .children(detail.labels.iter().map(|l| label_chip(&l.name, l.color.as_deref(), 0, t)))
+                .children(label_picker)
+                .into_any_element();
             meta_row(Lucide::Tag, "Labels", value, t)
         });
 
         let description = description_open.then(|| {
+            if self.pr_editing("description") {
+                return self.render_pr_editor(t, cx);
+            }
             let text = if detail.body.trim().is_empty() { "_No description provided._" } else { detail.body.as_str() };
-            self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()))
+            let markdown =
+                self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()));
+            let edit = logic::can_edit_change_request(detail)
+                .then(|| self.pr_edit_button("description".into(), "description", detail.body.clone(), t, cx));
+            let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
+            Some(
+                v_flex()
+                    .gap(px(8.))
+                    .child(
+                        h_flex()
+                            .group(write::EDIT_GROUP)
+                            .items_start()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w_0().children(markdown))
+                            .children(edit),
+                    )
+                    .children(reactions)
+                    .into_any_element(),
+            )
         });
         let checks = checks_open.then(|| render_checks(&detail.checks, stale, t, cx));
         let comment_total = activity.as_ref().map_or(0, |a| a.comment_total());
@@ -1670,6 +1746,17 @@ impl Workspace {
     ) -> AnyElement {
         let body = logic::visible_body(&comment.body);
         let markdown = body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), b, cx));
+        let can_edit = self
+            .pull_requests
+            .panel
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+            .is_some_and(|d| logic::can_edit_comment(d, &comment.kind, comment.author.as_ref(), comment.can_edit));
+        let editor = if self.pr_editing(&comment.id) { self.render_pr_editor(t, cx) } else { None };
+        let edit_kind: &'static str = if comment.kind == "review-comment" { "review-comment" } else { "issue-comment" };
+        let edit = (can_edit && editor.is_none())
+            .then(|| self.pr_edit_button(comment.id.clone(), edit_kind, comment.body.clone(), t, cx));
+        let reactions = self.render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx);
         let outcome = logic::review_outcome(comment.review_state.as_deref());
         let state = match (outcome, comment.review_state.as_deref()) {
             (Some(outcome), _) => Some(outcome_badge(outcome, t)),
@@ -1692,14 +1779,31 @@ impl Workspace {
                     .px(px(12.))
                     .py(px(10.))
                     .child(comment_identity(comment, t))
-                    .children(state),
+                    .children(state)
+                    .children(reactions.map(|r| div().ml_auto().child(r))),
             )
             .when(!reply, |el| {
                 el.children(comment_location(comment, thread, t).map(|row| div().px(px(12.)).child(row)))
             })
-            .children(
-                markdown.map(|state| div().px(px(12.)).py(px(12.)).child(pr_markdown_view(&state, t, cx.entity()))),
-            )
+            .map(|el| match editor {
+                Some(editor) => el.child(div().px(px(12.)).py(px(12.)).child(editor)),
+                None if markdown.is_some() || edit.is_some() => el.child(
+                    h_flex()
+                        .group(write::EDIT_GROUP)
+                        .items_start()
+                        .gap(px(4.))
+                        .px(px(12.))
+                        .py(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .children(markdown.map(|state| pr_markdown_view(&state, t, cx.entity()))),
+                        )
+                        .children(edit),
+                ),
+                None => el,
+            })
             .into_any_element()
     }
 
@@ -1903,8 +2007,22 @@ fn collapse_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
         .on_click(cx.listener(|this, _, _, cx| this.close_pull_request_panel(cx)))
 }
 
+/// `Button size="xs" variant="outline"`.
+fn xs_outline(id: impl Into<ElementId>, t: &Tokens) -> Button {
+    Button::new(id)
+        .outline()
+        .xsmall()
+        .h(px(24.))
+        .px(px(8.))
+        .gap(px(4.))
+        .rounded(px(6.))
+        .border_color(t.input)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+}
+
 /// `Button size="xs" variant="ghost-muted"`.
-fn ghost_button(id: &'static str, t: &Tokens) -> Button {
+fn ghost_button(id: impl Into<ElementId>, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .xsmall()
