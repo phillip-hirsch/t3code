@@ -173,6 +173,8 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The raw `ServerSettings`, for settings sections that read fields not modeled here.
+    pub settings: Value,
 }
 
 impl ServerInfo {
@@ -197,6 +199,7 @@ impl ServerInfo {
     }
 
     fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.settings = settings.clone();
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
         self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);

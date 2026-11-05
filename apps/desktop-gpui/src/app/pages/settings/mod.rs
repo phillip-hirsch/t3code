@@ -4,6 +4,7 @@
 mod agents;
 mod code;
 mod connections;
+mod devices;
 mod general;
 mod system;
 

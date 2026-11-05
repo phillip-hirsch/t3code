@@ -17,8 +17,8 @@ impl Workspace {
         div().child("Browser").into_any_element()
     }
 
-    pub(super) fn render_settings_devices(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
-        div().child("Devices").into_any_element()
+    pub(super) fn render_settings_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_device_sources(window, cx)
     }
 
     pub(super) fn render_settings_scheduled_tasks(&mut self, _: &mut Window, _: &mut Context<Self>) -> AnyElement {
