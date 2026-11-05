@@ -341,6 +341,8 @@ impl Provider {
 /// What the client needs from `subscribeServerConfig`.
 #[derive(Default)]
 pub struct ServerInfo {
+    /// Bumped on every applied config event, so views can cache what they derive from it.
+    pub revision: u64,
     pub providers: Vec<Provider>,
     pub default_model_selection: Option<ModelSelection>,
     /// The environment's name, e.g. the machine's host name.
@@ -374,6 +376,7 @@ pub struct ServerInfo {
 
 impl ServerInfo {
     pub fn apply(&mut self, event: &Value) -> Result<(), serde_json::Error> {
+        self.revision += 1;
         match event.get("type").and_then(Value::as_str).unwrap_or_default() {
             "snapshot" => {
                 let config = &event["config"];

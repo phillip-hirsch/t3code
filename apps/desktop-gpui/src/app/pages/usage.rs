@@ -3,7 +3,7 @@
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
 mod prices;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::Local;
@@ -49,8 +49,93 @@ pub(in crate::app) struct UsageState {
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
     scroll: ScrollHandle,
-    /// Reset credits being spent (`None`) or spent, with the outcome, by account key.
-    redeemed: Vec<(String, String, Option<String>)>,
+    /// Reset credits being confirmed, spent, or spent with the outcome, one per account key.
+    redeemed: Vec<Redeem>,
+    /// The chart's data, kept across pointer moves; render may refill it, hence the cell.
+    chart: RefCell<Option<Rc<ChartData>>>,
+    /// The limit pools and what they were built from: server revision, hidden drivers, `limits_now`.
+    pools: Option<((u64, Vec<String>, i64), Rc<Vec<Pool>>)>,
+}
+
+/// What the usage chart draws, derived when its inputs change rather than on every pointer move.
+pub(in crate::app) struct ChartData {
+    /// The merged answer (held, so its address stays unique), window, providers and metric it was built from.
+    key: (Rc<Merged>, UsageWindow, Vec<&'static str>, bool),
+    periods: Vec<PeriodKey>,
+    columns: Vec<Vec<f64>>,
+    peak: f64,
+    max: f64,
+    ticks: Vec<f64>,
+    step_x: f32,
+    /// Each provider's slot, curve and total, the largest total first.
+    series: Rc<Vec<(usize, Vec<logic::Segment>, f64)>>,
+}
+
+impl ChartData {
+    fn new(merged: &Rc<Merged>, window: &UsageWindow, providers: &[&'static str], tokens: bool) -> Self {
+        let periods = window.periods();
+        let columns: Vec<Vec<f64>> = periods
+            .iter()
+            .map(|key| {
+                let period = key.find(merged);
+                providers.iter().map(|p| period.map_or(0., |period| period.value(p, tokens))).collect()
+            })
+            .collect();
+        let peak = columns.iter().flatten().fold(0f64, |max, v| max.max(*v));
+        let (max, ticks) = logic::nice_scale(peak);
+        let step_x = if periods.len() < 2 { 0. } else { logic::VIEW_WIDTH / (periods.len() - 1) as f32 };
+        // Each series is drawn from zero; the largest total sits at the back.
+        let mut series: Vec<(usize, Vec<logic::Segment>, f64)> = (0..providers.len())
+            .map(|slot| {
+                let points: Vec<(f32, f32)> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| (index as f32 * step_x, logic::value_to_y(column[slot], max)))
+                    .collect();
+                let total = columns.iter().map(|c| c[slot]).sum();
+                (slot, logic::smooth_curve(&points), total)
+            })
+            .collect();
+        series.sort_by(|l, r| r.2.total_cmp(&l.2));
+        Self {
+            key: (merged.clone(), window.clone(), providers.to_vec(), tokens),
+            periods,
+            columns,
+            peak,
+            max,
+            ticks,
+            step_x,
+            series: Rc::new(series),
+        }
+    }
+}
+
+pub(in crate::app) struct Redeem {
+    key: String,
+    name: String,
+    status: RedeemStatus,
+}
+
+enum RedeemStatus {
+    Confirming,
+    Running,
+    Done(String),
+}
+
+impl UsageState {
+    /// A credit for this account is being confirmed or spent, so another click must not spend a second one.
+    fn redeem_busy(&self, key: &str) -> bool {
+        redeem_busy(&self.redeemed, key)
+    }
+
+    fn set_redeem(&mut self, key: &str, name: &str, status: RedeemStatus) {
+        self.redeemed.retain(|r| r.key != key);
+        self.redeemed.push(Redeem { key: key.to_owned(), name: name.to_owned(), status });
+    }
+}
+
+fn redeem_busy(redeemed: &[Redeem], key: &str) -> bool {
+    redeemed.iter().any(|r| r.key == key && !matches!(r.status, RedeemStatus::Done(_)))
 }
 
 /// A usage window ending now, in the system time zone.
@@ -79,6 +164,8 @@ impl Default for UsageState {
             hover: None,
             scroll: ScrollHandle::new(),
             redeemed: Vec::new(),
+            pools: None,
+            chart: RefCell::default(),
         }
     }
 }
@@ -261,7 +348,6 @@ impl Workspace {
         self.read_usage(true, cx);
     }
 
-    /// The modal layer over the whole window while Usage is open.
     /// "Use a reset credit?", then `provider.consumeResetCredit` (`useResetCredit`).
     fn redeem_reset_credit(
         &mut self,
@@ -272,6 +358,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client() else { return };
+        if self.usage.redeem_busy(&key) {
+            return;
+        }
+        let previous = self.usage.redeemed.iter().position(|r| r.key == key).map(|i| self.usage.redeemed.remove(i));
+        self.usage.set_redeem(&key, &name, RedeemStatus::Confirming);
         let answer = window.prompt(
             gpui_kit::PromptLevel::Warning,
             "Use a reset credit?",
@@ -280,23 +371,25 @@ impl Workspace {
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let set = |this: &mut Self, status: Option<String>| {
-                this.usage.redeemed.retain(|(k, ..)| *k != key);
-                this.usage.redeemed.push((key.clone(), name.clone(), status));
-            };
+            let confirmed = answer.await == Ok(0);
             let _ = this.update(cx, |this, cx| {
-                set(this, None);
+                if confirmed {
+                    this.usage.set_redeem(&key, &name, RedeemStatus::Running);
+                } else {
+                    this.usage.redeemed.retain(|r| r.key != key);
+                    this.usage.redeemed.extend(previous);
+                }
                 cx.notify();
             });
+            if !confirmed {
+                return;
+            }
             let status = match client.request("provider.consumeResetCredit", input).await {
                 Ok(result) => logic::reset_outcome_text(&result),
                 Err(error) => error.to_string(),
             };
             let _ = this.update(cx, |this, cx| {
-                set(this, Some(status));
+                this.usage.set_redeem(&key, &name, RedeemStatus::Done(status));
                 cx.notify();
             });
         })
@@ -538,7 +631,7 @@ impl Workspace {
             )
     }
 
-    fn render_usage_body(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_usage_body(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         if !usage.environment_selected {
@@ -561,13 +654,27 @@ impl Workspace {
         }
     }
 
-    fn render_limits(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The limit pools, rebuilt only when the server config, the hidden drivers or the clock moved.
+    fn limit_pools(&mut self) -> Rc<Vec<Pool>> {
+        let key = (self.server_info().revision, self.usage.hidden.clone(), self.usage.limits_now);
+        if let Some((held, pools)) = &self.usage.pools
+            && *held == key
+        {
+            return pools.clone();
+        }
+        let sources = &self.server_info().config["usageLimitSources"];
+        let accounts = logic::limit_accounts(&self.server_info().providers, sources, &self.usage.hidden_drivers());
+        let pools = Rc::new(logic::limit_pools(accounts, self.usage.limits_now));
+        self.usage.pools = Some((key, pools.clone()));
+        pools
+    }
+
+    fn render_limits(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let pools = self.limit_pools();
         let usage = &self.usage;
         let providers = &self.server_info().providers;
         let hidden = usage.hidden_drivers();
         let now = usage.limits_now;
-        let sources = &self.server_info().config["usageLimitSources"];
-        let pools = logic::limit_pools(logic::limit_accounts(providers, sources, &hidden), now);
         let notices = logic::limit_notices(providers, &hidden);
         let environment = self.server_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         let links = logic::external_links(providers, &environment, &hidden);
@@ -577,7 +684,7 @@ impl Workspace {
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
         let environment_label = self.server_info().environment_label.clone();
-        for pool in &pools {
+        for pool in pools.iter() {
             let view = cx.weak_entity();
             let redeemed = &self.usage.redeemed;
             body = body.child(pool_section(pool, now, environment_label.as_deref(), redeemed, &view, t));
@@ -848,32 +955,20 @@ impl Workspace {
     ) -> impl IntoElement {
         let tokens = self.usage.tokens();
         let tz = Local;
-        let periods = window.periods();
-        let columns: Vec<Vec<f64>> = periods
-            .iter()
-            .map(|key| {
-                let period = key.find(merged);
-                providers.iter().map(|p| period.map_or(0., |period| period.value(p, tokens))).collect()
-            })
-            .collect();
-        let peak = columns.iter().flatten().fold(0f64, |max, v| max.max(*v));
-        let (max, ticks) = logic::nice_scale(peak);
-        let step_x = if periods.len() < 2 { 0. } else { logic::VIEW_WIDTH / (periods.len() - 1) as f32 };
-        // Each series is drawn from zero; the largest total sits at the back.
-        let mut series: Vec<(Hsla, Vec<logic::Segment>, f64)> = providers
-            .iter()
-            .enumerate()
-            .map(|(slot, kind)| {
-                let points: Vec<(f32, f32)> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(index, column)| (index as f32 * step_x, logic::value_to_y(column[slot], max)))
-                    .collect();
-                let total = columns.iter().map(|c| c[slot]).sum();
-                (provider_color(kind, t), logic::smooth_curve(&points), total)
-            })
-            .collect();
-        series.sort_by(|l, r| r.2.total_cmp(&l.2));
+        let data = {
+            let mut held = self.usage.chart.borrow_mut();
+            let fresh = |d: &&Rc<ChartData>| {
+                Rc::ptr_eq(&d.key.0, merged) && d.key.1 == *window && d.key.2 == providers && d.key.3 == tokens
+            };
+            match held.as_ref().filter(fresh) {
+                Some(data) => data.clone(),
+                None => held.insert(Rc::new(ChartData::new(merged, window, providers, tokens))).clone(),
+            }
+        };
+        let (periods, columns, ticks) = (&data.periods, &data.columns, &data.ticks);
+        let (peak, max, step_x) = (data.peak, data.max, data.step_x);
+        let colors: Vec<Hsla> = providers.iter().map(|kind| provider_color(kind, t)).collect();
+        let series = data.series.clone();
         let format = move |value: f64| if tokens { logic::format_tokens(value) } else { logic::format_usd(value) };
         let grid = t.border;
         let hover = self.usage.hover;
@@ -912,7 +1007,8 @@ impl Workspace {
                         builder.cubic_bezier_to(at(to.0, to.1), at(c1.0, c1.1), at(c2.0, c2.1));
                     }
                 };
-                for (color, segments, _) in &series {
+                for (slot, segments, _) in series.iter() {
+                    let color = &colors[*slot];
                     let mut area = PathBuilder::fill();
                     curve(&mut area, segments);
                     if !segments.is_empty() {
@@ -924,7 +1020,8 @@ impl Workspace {
                         window.paint_path(path, Hsla { a: color.a * 0.12, ..*color });
                     }
                 }
-                for (color, segments, _) in &series {
+                for (slot, segments, _) in series.iter() {
+                    let color = &colors[*slot];
                     let mut line = PathBuilder::stroke(px(2.));
                     curve(&mut line, segments);
                     if let Ok(path) = line.build() {
@@ -1103,7 +1200,7 @@ impl Workspace {
         let row_border = Hsla { a: t.border.a * 0.5, ..t.border };
         let mut table = v_flex().text_sm();
         if !by_time {
-            let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.clone() };
+            let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.iter().collect() };
             let peak =
                 models.iter().fold(0f64, |max, m| max.max(if tokens { m.total_tokens as f64 } else { m.cost_usd }));
             table = table.child(
@@ -1415,7 +1512,7 @@ fn pool_section(
     pool: &Pool,
     now: i64,
     environment: Option<&str>,
-    redeemed: &[(String, String, Option<String>)],
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1434,27 +1531,38 @@ fn pool_section(
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, environment, view, t)))
+        .children(
+            pool.windows
+                .iter()
+                .map(|window| pool_window_card(pool, window, color, now, environment, redeemed, view, t)),
+        )
         // The confirm closed with no popover to report back in, so progress and the outcome show here.
-        .children(redeemed.iter().filter(|(key, ..)| pool.accounts.iter().any(|a| &a.key == key)).map(
-            |(_, name, status)| {
+        .children(redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
+            let status = match &r.status {
+                RedeemStatus::Confirming => return None,
+                RedeemStatus::Running => "Using reset credit…".to_owned(),
+                RedeemStatus::Done(status) => status.clone(),
+            };
+            Some(
                 h_flex()
                     .gap(px(4.))
                     .text_xs()
                     .text_color(t.muted_foreground)
-                    .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(name.clone()))
-                    .child(status.clone().unwrap_or_else(|| "Using reset credit…".into()))
-            },
-        ))
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(r.name.clone()))
+                    .child(status),
+            )
+        }))
         .into_any_element()
 }
 
+#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_window_card(
     pool: &Pool,
     window: &PoolWindow,
     color: Hsla,
     now: i64,
     environment: Option<&str>,
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1463,7 +1571,7 @@ fn pool_window_card(
     let several = window.columns.len() > 1;
     let segments = window.columns.iter().map(|member| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, environment, view, t)
+        pool_segment(pool, window, member, several, color, now, environment, redeemed, view, t)
     });
     v_flex()
         .gap(px(12.))
@@ -1559,7 +1667,7 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
@@ -1568,6 +1676,7 @@ fn pool_segment(
     color: Hsla,
     now: i64,
     environment: Option<&str>,
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1670,7 +1779,7 @@ fn pool_segment(
                     )
                 }),
         )
-        .when_some(redeem, |el, input| {
+        .when_some(redeem.filter(|_| !redeem_busy(redeemed, &account.key)), |el, input| {
             let (view, key, name) = (view.clone(), account.key.clone(), account.name());
             el.on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {

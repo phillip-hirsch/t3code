@@ -178,9 +178,12 @@ pub const PRESETS: [Preset; 17] = [
 
 /// A fixed viewport shrunk to fit `available`, never enlarged: its on-screen size and the scale,
 /// which the page zoom also takes so the page still lays out at the viewport's CSS width.
+/// The server's size is outside data: an empty one counts as 1px, so the scale is never NaN.
 pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32)) -> ((f32, f32), f32) {
-    let scale = (available.0 / viewport.0).min(available.1 / viewport.1).clamp(0.05, 1.);
-    ((viewport.0 * scale, viewport.1 * scale), scale)
+    let (width, height) = (viewport.0.max(1.), viewport.1.max(1.));
+    let scale = (available.0 / width).min(available.1 / height);
+    let scale = if scale.is_finite() { scale.clamp(0.05, 1.) } else { 1. };
+    ((width * scale, height * scale), scale)
 }
 
 /// A WebView2 `COREWEBVIEW2_WEB_ERROR_STATUS` as the Chromium net error Electron reports
@@ -668,9 +671,43 @@ impl Profile {
     }
 }
 
-/// The stored `browserProfiles`, the user's own.
+/// The stored `browserProfiles`, the user's own. An entry this build can't read is skipped, not the whole list.
 pub fn user_profiles(settings: &crate::settings::Settings) -> Vec<Profile> {
-    serde_json::from_value(settings.get("browserProfiles").clone()).unwrap_or_default()
+    stored_profiles(settings).iter().filter_map(|value| Profile::deserialize(value).ok()).collect()
+}
+
+/// The stored entries as written. Edits start from these, so entries and fields this build can't read survive.
+fn stored_profiles(settings: &crate::settings::Settings) -> &[Value] {
+    settings.get("browserProfiles").as_array().map_or(&[], Vec::as_slice)
+}
+
+/// No room for another profile: the stored list, readable or not, is at the contract's limit.
+pub fn profiles_full(settings: &crate::settings::Settings) -> bool {
+    stored_profiles(settings).len() >= PROFILE_MAX_COUNT
+}
+
+/// `browserProfiles` with `profile` appended, or `None` when the list is full.
+pub fn profiles_with_added(settings: &crate::settings::Settings, profile: &Profile) -> Option<Value> {
+    if profiles_full(settings) {
+        return None;
+    }
+    let stored = stored_profiles(settings);
+    let added = serde_json::to_value(profile).expect("a profile is plain strings");
+    Some(Value::Array(stored.iter().cloned().chain([added]).collect()))
+}
+
+/// `browserProfiles` with profile `id` renamed to `name`.
+pub fn profiles_with_renamed(settings: &crate::settings::Settings, id: &str, name: &str) -> Value {
+    let mut stored = stored_profiles(settings).to_vec();
+    for entry in stored.iter_mut().filter(|entry| entry["id"] == id) {
+        entry["name"] = name.into();
+    }
+    Value::Array(stored)
+}
+
+/// `browserProfiles` without profile `id`.
+pub fn profiles_without(settings: &crate::settings::Settings, id: &str) -> Value {
+    stored_profiles(settings).iter().filter(|entry| entry["id"] != id).cloned().collect()
 }
 
 /// `resolveBrowserProfiles`: the built-ins, then the user's without ids taken, all persistent.
@@ -819,6 +856,31 @@ mod tests {
     }
 
     #[test]
+    fn one_unreadable_profile_neither_hides_nor_drops_the_others() {
+        let settings =
+            |patch: Value| crate::settings::Settings::layered(&crate::settings::contract().client_defaults, &patch);
+        let work = json!({"id": "profile-work", "name": "Work", "kind": "persistent", "color": "teal"});
+        let future = json!({"id": "profile-new", "name": "New", "kind": "sandboxed"});
+        let stored = settings(json!({"browserProfiles": [work, {"id": "nameless"}, future]}));
+        let ids: Vec<String> = user_profiles(&stored).into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["profile-work"]);
+
+        let renamed = profiles_with_renamed(&stored, "profile-work", "Job");
+        assert_eq!(
+            renamed,
+            json!([{"id": "profile-work", "name": "Job", "kind": "persistent", "color": "teal"}, {"id": "nameless"}, future])
+        );
+        let extra = Profile { id: "profile-b".into(), name: "B".into(), kind: ProfileKind::Persistent };
+        let added = profiles_with_added(&stored, &extra).unwrap();
+        assert_eq!(added.as_array().unwrap().len(), 4);
+        assert_eq!(added[1], json!({"id": "nameless"}));
+        assert_eq!(profiles_without(&stored, "profile-work"), json!([{"id": "nameless"}, future]));
+
+        let full = settings(json!({"browserProfiles": vec![json!({"id": "x"}); PROFILE_MAX_COUNT]}));
+        assert_eq!(profiles_with_added(&full, &extra), None);
+    }
+
+    #[test]
     fn profiles_resolve_like_the_contract_and_partition_their_tabs() {
         let settings =
             |patch: Value| crate::settings::Settings::layered(&crate::settings::contract().client_defaults, &patch);
@@ -855,6 +917,8 @@ mod tests {
     fn fits_fixed_viewports_without_enlarging_them() {
         assert_eq!(fit_viewport((375., 667.), (500., 900.)), ((375., 667.), 1.));
         assert_eq!(fit_viewport((820., 1180.), (410., 1180.)), ((410., 590.), 0.5));
+        assert_eq!(fit_viewport((0., 0.), (0., 0.)), ((0.05, 0.05), 0.05), "an empty viewport never makes a NaN size");
+        assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN)), ((375., 667.), 1.));
     }
 
     #[test]

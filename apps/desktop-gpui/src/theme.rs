@@ -197,8 +197,9 @@ impl Appearance {
     pub fn from_settings(settings: &Settings) -> Self {
         let percent = |key, default| settings.get(key).as_f64().map_or(default, |value| value as f32);
         Self {
-            contrast: percent("appearanceContrast", 100.),
-            glass: percent("glassOpacity", 80.),
+            // The contract's bounds (`AppearanceContrast`, `GlassOpacity`): a hand-edited 0 would blank the UI.
+            contrast: percent("appearanceContrast", 100.).clamp(50., 200.),
+            glass: percent("glassOpacity", 80.).clamp(40., 100.),
             fonts: Fonts::from_settings(settings),
         }
     }
