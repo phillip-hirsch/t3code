@@ -30,6 +30,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::codex_callback;
+
+mod antigravity;
 use crate::app::Workspace;
 use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
@@ -131,6 +133,8 @@ struct InstallState {
     executable_path: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    can_remove: bool,
     #[serde(default)]
     message: Option<String>,
 }
@@ -653,6 +657,10 @@ pub(in crate::app) struct AccountSection {
     terminal_focus: Option<FocusHandle>,
     terminal_queue: VecDeque<Value>,
     terminal_sending: bool,
+    // Antigravity setup.
+    antigravity: bool,
+    setup_pending: Option<&'static str>,
+    setup_error: Option<SharedString>,
 }
 
 /// The parts of the workspace a section renders from.
@@ -689,6 +697,9 @@ impl AccountSection {
             terminal_focus: None,
             terminal_queue: VecDeque::new(),
             terminal_sending: false,
+            antigravity: false,
+            setup_pending: None,
+            setup_error: None,
         }
     }
 
@@ -1248,6 +1259,9 @@ fn instance_enabled(instance: &Value) -> bool {
 
 impl Render for AccountSection {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.antigravity {
+            return self.render_antigravity(window, cx);
+        }
         let Some(snapshot) = self.snapshot(cx) else { return div().into_any_element() };
         let codex = self.wizard.is_some()
             || (snapshot.instance["driver"].as_str().unwrap_or(&snapshot.provider.driver) == "codex"

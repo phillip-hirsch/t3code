@@ -1343,7 +1343,7 @@ impl Workspace {
     }
 }
 
-fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoElement {
+pub(in crate::app) fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoElement {
     h_flex()
         .px(px(8.))
         .py(px(4.))

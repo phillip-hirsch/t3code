@@ -99,6 +99,9 @@ impl Workspace {
                 .into_any_element();
         }
         let page = window.use_keyed_state("settings-providers", cx, |_, _| ProvidersPage::default());
+        let view = self.settings_view();
+        let override_projects =
+            instances::override_projects(&view, self.server_info.capability("projectProviderInstanceOverrides"));
         let rows = instances::instance_rows(&self.server_info.settings, &self.server_info.providers_json);
         let selected = {
             let chosen = page.read(cx).selected.clone();
@@ -106,9 +109,19 @@ impl Workspace {
         };
         let list = rows
             .iter()
-            .map(|row| self.render_instance_list_row(&page, row, selected.as_ref() == Some(row), window, cx))
+            .map(|row| {
+                self.render_instance_list_row(
+                    &page,
+                    row,
+                    selected.as_ref() == Some(row),
+                    &override_projects,
+                    window,
+                    cx,
+                )
+            })
             .collect::<Vec<_>>();
-        let editor = selected.as_ref().map(|row| self.render_instance_editor(&page, row, window, cx));
+        let editor =
+            selected.as_ref().map(|row| self.render_instance_editor(&page, row, &override_projects, window, cx));
 
         let add_row = div()
             .id("providers-add-row")
@@ -188,7 +201,6 @@ impl Workspace {
             self.render_usage_limit_sources(window, cx),
             self.render_providers_advanced(window, cx).into_any_element(),
         ];
-        let view = self.settings_view();
         self.settings_page("providers", &view, content, cx)
     }
 

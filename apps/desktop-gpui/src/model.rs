@@ -1836,6 +1836,7 @@ mod tests {
             ],
             "settings": {
                 "defaultModelSelection": {"instanceId": "off", "model": "a"},
+                "providerInstances": {"claude": {"driver": "claudeAgent"}},
                 "projectSettingsOverrides": {"p": {"defaultModelSelection": {"instanceId": "claude", "model": "haiku"}}}
             },
             "environment": {"capabilities": {"threadStop": true}}

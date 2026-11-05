@@ -189,20 +189,80 @@ fn project_overrides(settings: &Settings, project: Option<&Project>) -> Map<Stri
     resolved
 }
 
-/// `resolveProjectProviderInstanceEnabled`, treating an unconfigured instance as enabled.
+/// Drivers that start disabled (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
+const DEFAULT_DISABLED_DRIVERS: &[&str] = &["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"];
+
+/// `resolveProviderInstanceEnabled`: an explicit `false` on the instance or its config wins.
+pub fn instance_enabled(instance: &Value) -> bool {
+    let config_enabled = instance.pointer("/config/enabled").and_then(Value::as_bool);
+    let enabled = instance.get("enabled").and_then(Value::as_bool);
+    if enabled == Some(false) || config_enabled == Some(false) {
+        return false;
+    }
+    enabled.or(config_enabled).unwrap_or_else(|| {
+        !DEFAULT_DISABLED_DRIVERS.contains(&instance.get("driver").and_then(Value::as_str).unwrap_or_default())
+    })
+}
+
+/// A project's own `enabled` for a provider instance, `None` when it inherits.
+pub fn provider_instance_override(settings: &Settings, project_id: &str, instance: &str) -> Option<bool> {
+    settings
+        .get("projectSettingsOverrides")
+        .get(project_id)?
+        .get("providerInstances")?
+        .get(instance)?
+        .get("enabled")?
+        .as_bool()
+}
+
+/// `resolveProjectProviderInstanceEnabled`.
 pub fn provider_instance_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
-    let project_override = project_id.and_then(|id| {
-        settings
-            .get("projectSettingsOverrides")
-            .get(id)?
-            .get("providerInstances")?
-            .get(instance)?
-            .get("enabled")?
-            .as_bool()
+    if let Some(enabled) = project_id.and_then(|id| provider_instance_override(settings, id, instance)) {
+        return enabled;
+    }
+    match settings.get("providerInstances").get(instance) {
+        Some(config) => instance_enabled(config),
+        // `isUnconfiguredDefaultInstanceEnabled`.
+        None => matches!(instance, "codex" | "claudeAgent"),
+    }
+}
+
+/// `buildProviderInstanceOverridePatch`: sets (or with `None` clears) each project's `enabled`
+/// for `instance`, keeping its other overrides. Always sends `providerInstances`, since an
+/// omitted map keeps the stored one.
+pub fn provider_override_patch(
+    settings: &Settings,
+    project_ids: &[String],
+    instance: &str,
+    value: Option<bool>,
+) -> Map<String, Value> {
+    let entries = project_ids.iter().map(|id| {
+        let mut rest =
+            settings.get("projectSettingsOverrides").get(id).and_then(Value::as_object).cloned().unwrap_or_default();
+        let mut instances = match rest.remove("providerInstances") {
+            Some(Value::Object(instances)) => instances,
+            _ => Map::new(),
+        };
+        let mut entry = match instances.remove(instance) {
+            Some(Value::Object(entry)) => entry,
+            _ => Map::new(),
+        };
+        match value {
+            Some(enabled) => entry.insert("enabled".into(), enabled.into()),
+            None => entry.remove("enabled"),
+        };
+        if !entry.is_empty() {
+            instances.insert(instance.to_owned(), Value::Object(entry));
+        }
+        let next = if rest.is_empty() && instances.is_empty() {
+            Value::Null
+        } else {
+            rest.insert("providerInstances".into(), Value::Object(instances));
+            Value::Object(rest)
+        };
+        (id.clone(), next)
     });
-    project_override
-        .or_else(|| settings.get("providerInstances").get(instance)?.get("enabled")?.as_bool())
-        .unwrap_or(true)
+    single("projectSettingsOverrides", Value::Object(entries.collect()))
 }
 
 /// `scopedSettingsAreMixed`: the targets disagree on any of `keys`.
@@ -692,6 +752,52 @@ mod tests {
         }));
         let target = resolve_project_settings(&s, Some(&project("p1")));
         assert_eq!(target.source("defaultModelSelection"), Source::Environment);
+    }
+
+    #[test]
+    fn provider_instances_resolve_like_the_contract() {
+        assert!(instance_enabled(&json!({"driver": "codex"})));
+        assert!(!instance_enabled(&json!({"driver": "grok"})));
+        assert!(instance_enabled(&json!({"driver": "grok", "config": {"enabled": true}})));
+        assert!(!instance_enabled(&json!({"driver": "codex", "enabled": true, "config": {"enabled": false}})));
+        let s = settings(json!({
+            "providerInstances": {"grok": {"driver": "grok"}, "codex_2": {"driver": "codex", "enabled": false}},
+            "projectSettingsOverrides": {"p1": {"providerInstances": {"codex_2": {"enabled": true}}}},
+        }));
+        assert!(provider_instance_enabled(&s, None, "codex"));
+        assert!(!provider_instance_enabled(&s, None, "cursor"));
+        assert!(!provider_instance_enabled(&s, None, "grok"));
+        assert!(!provider_instance_enabled(&s, Some("p2"), "codex_2"));
+        assert!(provider_instance_enabled(&s, Some("p1"), "codex_2"));
+        assert_eq!(provider_instance_override(&s, "p1", "codex_2"), Some(true));
+        assert_eq!(provider_instance_override(&s, "p1", "grok"), None);
+    }
+
+    #[test]
+    fn provider_overrides_set_and_clear_per_project() {
+        let s = settings(json!({"projectSettingsOverrides": {
+            "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {"codex": {"enabled": true}}},
+            "p2": {"providerInstances": {"codex": {"enabled": true}}},
+        }}));
+        let ids = ["p1".to_owned(), "p2".to_owned(), "p3".to_owned()];
+        let set = provider_override_patch(&s, &ids, "grok", Some(false));
+        assert_eq!(
+            Value::Object(set),
+            json!({"projectSettingsOverrides": {
+                "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {"codex": {"enabled": true}, "grok": {"enabled": false}}},
+                "p2": {"providerInstances": {"codex": {"enabled": true}, "grok": {"enabled": false}}},
+                "p3": {"providerInstances": {"grok": {"enabled": false}}},
+            }})
+        );
+        let cleared = provider_override_patch(&s, &ids, "codex", None);
+        assert_eq!(
+            Value::Object(cleared),
+            json!({"projectSettingsOverrides": {
+                "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {}},
+                "p2": null,
+                "p3": null,
+            }})
+        );
     }
 
     #[test]

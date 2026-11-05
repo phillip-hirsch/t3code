@@ -1,7 +1,7 @@
 //! The instance list and the selected instance's editor (`ProviderInstanceCard.tsx`,
 //! `ProviderSettingsForm.tsx`, `providerStatus.ts`, the row building in `ProviderSettingsPanel.tsx`).
 
-use gpui_kit::component::button::ButtonVariant;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::super::widgets::{SettingsView, layer_row, reset_button};
 use super::accent::{accent_color_picker, hex_color, normalize_accent_color};
 use super::accounts::codex_setup_managed;
 use super::drivers::{self, Driver, EnvironmentField};
@@ -21,6 +22,8 @@ use super::{
     ProvidersPage, divided, dot, ghost_icon_button, group, outline_button, section, settings_row, switch, text_input,
 };
 use crate::app::Workspace;
+use crate::settings::Settings;
+use crate::settings::scope::{self, ScopeKind};
 use crate::theme::{self, Tokens};
 
 /// One entry in the instance list (`InstanceRow`).
@@ -41,18 +44,29 @@ impl InstanceRow {
     }
 }
 
-/// Drivers that start disabled (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
-const DEFAULT_DISABLED_DRIVERS: &[&str] = &["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"];
+pub(super) use crate::settings::scope::instance_enabled as resolve_enabled;
 
-/// `resolveProviderInstanceEnabled`.
-pub(super) fn resolve_enabled(instance: &Value) -> bool {
-    let config_enabled = instance.pointer("/config/enabled").and_then(Value::as_bool);
-    let enabled = instance.get("enabled").and_then(Value::as_bool);
-    if enabled == Some(false) || config_enabled == Some(false) {
-        return false;
+/// The projects whose provider switches the page edits (`projectIds`), when the server keeps
+/// per-project provider overrides (`projectProviderInstanceOverrides`).
+pub(super) fn override_projects(view: &SettingsView, supported: bool) -> Vec<String> {
+    match &view.scope.kind {
+        ScopeKind::Project { members } if supported => members.iter().map(|m| m.id.clone()).collect(),
+        _ => Vec::new(),
     }
-    enabled.or(config_enabled).unwrap_or_else(|| {
-        !DEFAULT_DISABLED_DRIVERS.contains(&instance.get("driver").and_then(Value::as_str).unwrap_or_default())
+}
+
+/// A card's `projectOverride`: the first project's own value and the enablement it resolves to.
+#[derive(Clone, Copy)]
+struct ProjectOverride {
+    value: Option<bool>,
+    effective: bool,
+}
+
+fn project_override(settings: &Settings, projects: &[String], instance_id: &str) -> Option<ProjectOverride> {
+    let first = projects.first()?;
+    Some(ProjectOverride {
+        value: scope::provider_instance_override(settings, first, instance_id),
+        effective: scope::provider_instance_enabled(settings, Some(first), instance_id),
     })
 }
 
@@ -576,9 +590,9 @@ struct CardFacts {
     updating: bool,
 }
 
-fn card_facts(row: &InstanceRow, live: Option<&Value>, dispatching: bool) -> CardFacts {
+/// `enabled` is the project's effective value at project scope, else the instance's own.
+fn card_facts(row: &InstanceRow, live: Option<&Value>, dispatching: bool, enabled: bool) -> CardFacts {
     let instance = row.instance();
-    let enabled = resolve_enabled(&instance);
     let effective = live.map(|p| with_key(p, "enabled", Some(json!(enabled))));
     let status = if enabled { status_key(effective.as_ref()) } else { StatusKey::Disabled };
     let (headline, detail) = if enabled { summary(effective.as_ref()) } else { ("Disabled".into(), None) };
@@ -825,13 +839,16 @@ impl Workspace {
         page: &Entity<ProvidersPage>,
         row: &InstanceRow,
         selected: bool,
+        override_projects: &[String],
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let live = live_provider(&self.server_info.providers_json, &row.id);
         let dispatching = page.read(cx).updating.contains(&row.id);
-        let facts = card_facts(row, live, dispatching);
+        let project_override = project_override(&self.server_info.settings, override_projects, &row.id);
+        let enabled = project_override.map_or_else(|| resolve_enabled(&row.instance()), |o| o.effective);
+        let facts = card_facts(row, live, dispatching, enabled);
         let status_text = match &facts.update_progress {
             Some(progress) => format!("Updating · {progress}"),
             None => match (&facts.inline_detail, facts.status.needs_attention()) {
@@ -920,14 +937,99 @@ impl Workspace {
                     ),
             )
             .child(
-                switch(SharedString::from(format!("provider-enabled-{}", row.id)), facts.enabled)
-                    .accessibility_label(format!("Enable {}", facts.name))
-                    .on_change(cx.listener(move |this, checked: &bool, window, cx| {
-                        let next = with_key(&toggle_row.instance(), "enabled", Some(json!(*checked)));
-                        this.persist_provider_instance(&toggle_row.id, next, window, cx);
+                h_flex()
+                    .h(px(20.))
+                    .flex_none()
+                    .gap_1()
+                    .when_some(project_override.and_then(|o| o.value), |el, project_enabled| {
+                        let device_enabled = resolve_enabled(&row.instance());
+                        el.child(self.render_project_override(
+                            row,
+                            &facts.name,
+                            project_enabled,
+                            device_enabled,
+                            override_projects,
+                            cx,
+                        ))
+                    })
+                    .child(
+                        switch(SharedString::from(format!("provider-enabled-{}", row.id)), facts.enabled)
+                            .accessibility_label(format!("Enable {}", facts.name))
+                            .on_change(cx.listener({
+                                let projects = override_projects.to_vec();
+                                move |this, checked: &bool, window, cx| {
+                                    if !projects.is_empty() {
+                                        this.write_provider_override(&projects, &toggle_row.id, Some(*checked), cx);
+                                        return;
+                                    }
+                                    let next = with_key(&toggle_row.instance(), "enabled", Some(json!(*checked)));
+                                    this.persist_provider_instance(&toggle_row.id, next, window, cx);
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// `ProjectOverrideInheritance` and the reset beside an overridden switch.
+    fn render_project_override(
+        &self,
+        row: &InstanceRow,
+        name: &str,
+        project_enabled: bool,
+        device_enabled: bool,
+        projects: &[String],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let on_off = |enabled: bool| if enabled { "On" } else { "Off" }.to_owned();
+        let layers = [
+            scope::Layer { label: "Project".into(), value: on_off(project_enabled), effective: true, set: true },
+            scope::Layer { label: "Device".into(), value: on_off(device_enabled), effective: false, set: true },
+        ];
+        let id = SharedString::from(format!("provider-override-{}", row.id));
+        let reset_projects = projects.to_vec();
+        let reset_id = row.id.clone();
+        h_flex()
+            .child(
+                Popover::new(SharedString::from(format!("{id}-layers")))
+                    .anchor(gpui_kit::Anchor::TopRight)
+                    .p_0()
+                    .trigger(
+                        Button::new(SharedString::from(format!("{id}-trigger")))
+                            .ghost()
+                            .size(px(20.))
+                            .p_0()
+                            .rounded(px(4.))
+                            .child(Icon::new(gpui_kit::assets::IconName::Layers).size(px(12.)).text_color(t.primary))
+                            .tooltip("Overridden for this project"),
+                    )
+                    .content(move |_, _, cx| {
+                        let t = theme::tokens(cx);
+                        v_flex().w(px(320.)).px(px(12.)).py(px(10.)).children(layers.iter().map(|l| layer_row(l, t)))
+                    }),
+            )
+            .child(
+                reset_button(&id, "Reset to the device setting", cx)
+                    .accessibility_label(format!("Reset {name} enablement to default"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.write_provider_override(&reset_projects, &reset_id, None, cx);
                     })),
             )
             .into_any_element()
+    }
+
+    /// `writeProjectOverride`: a project switch or its reset, written to the environment.
+    fn write_provider_override(
+        &mut self,
+        projects: &[String],
+        instance_id: &str,
+        value: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let patch = scope::provider_override_patch(&self.server_info.settings, projects, instance_id, value);
+        self.update_environment_settings(Value::Object(patch), cx, |_, _, _| {});
     }
 
     /// The selected instance's sections: header with status and name, Setup, Runtime,
@@ -936,13 +1038,16 @@ impl Workspace {
         &mut self,
         page: &Entity<ProvidersPage>,
         row: &InstanceRow,
+        override_projects: &[String],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
         let live = live_provider(&self.server_info.providers_json, &row.id).cloned();
         let dispatching = page.read(cx).updating.contains(&row.id);
-        let facts = card_facts(row, live.as_ref(), dispatching);
+        let enabled = project_override(&self.server_info.settings, override_projects, &row.id)
+            .map_or_else(|| resolve_enabled(&row.instance()), |o| o.effective);
+        let facts = card_facts(row, live.as_ref(), dispatching, enabled);
         let instance = row.instance();
         let driver = drivers::driver(&row.driver);
         let mut sections = Vec::new();
@@ -1012,7 +1117,11 @@ impl Workspace {
         );
 
         // Setup: the account slot where the web shows provider authentication, then API-key fields.
-        let mut setup: Vec<AnyElement> = self.render_provider_account(&row.id, window, cx).into_iter().collect();
+        let mut setup: Vec<AnyElement> = if row.driver == "antigravity" {
+            vec![self.render_antigravity_setup(&row.id, window, cx)]
+        } else {
+            self.render_provider_account(&row.id, window, cx).into_iter().collect()
+        };
         for field in driver.map_or(&[][..], |d| d.environment_fields) {
             setup.push(self.render_environment_field(page, row, &instance, field, &t, window, cx));
         }
@@ -1740,14 +1849,6 @@ mod tests {
         assert!(!instance_rows(&settings, &[]).iter().any(|r| r.id == "cursor"));
         let settings = json!({"providerInstances": {"cursor": {"driver": "cursor", "enabled": true}}});
         assert!(instance_rows(&settings, &[cursor]).iter().any(|r| r.id == "cursor"));
-    }
-
-    #[test]
-    fn enabled_resolution() {
-        assert!(resolve_enabled(&json!({"driver": "codex"})));
-        assert!(!resolve_enabled(&json!({"driver": "grok"})));
-        assert!(resolve_enabled(&json!({"driver": "grok", "config": {"enabled": true}})));
-        assert!(!resolve_enabled(&json!({"driver": "codex", "enabled": true, "config": {"enabled": false}})));
     }
 
     #[test]
