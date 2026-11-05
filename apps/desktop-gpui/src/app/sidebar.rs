@@ -61,7 +61,8 @@ pub(super) struct SidebarState {
     _hover_card_delay: Option<Task<()>>,
     /// A menu opened by a click rather than a right-click (the snooze menu).
     menu: Option<OpenMenu>,
-    favicons: HashMap<String, Favicon>,
+    /// By workspace root, then favicon path, so a lookup needs no key built.
+    favicons: HashMap<String, HashMap<Option<String>, Favicon>>,
     renaming: Option<actions::Renaming>,
     /// The row the last single click opened, for double-click rename.
     clicked: Option<String>,
@@ -807,6 +808,9 @@ impl Workspace {
     /// (`Sidebar.tsx` row tooltip delay).
     fn hover_row(&mut self, thread_id: &str, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
+            if self.sidebar.hovered.as_deref() == Some(thread_id) {
+                return;
+            }
             self.sidebar.hovered = Some(thread_id.to_owned());
             self.sidebar.hover_card = None;
             let thread_id = thread_id.to_owned();
@@ -824,6 +828,8 @@ impl Workspace {
             self.sidebar.hovered = None;
             self.sidebar.hover_card = None;
             self.sidebar._hover_card_delay = None;
+        } else {
+            return;
         }
         self.notify_sidebar(cx);
     }
@@ -1172,7 +1178,8 @@ impl Workspace {
             list = list.child(self.render_empty_state(&tokens, cx));
         } else {
             for (index, item) in items.into_iter().enumerate() {
-                let key = item.nav_key();
+                // Only a focused list draws the cursor ring, so only it needs the row keys.
+                let ring = cursor.as_ref().is_some_and(|cursor| item.nav_key().as_ref() == Some(cursor));
                 let element = match item {
                     Item::Draft(row) => {
                         self.render_draft(&row, projects.get(row.project_id.as_str()).copied(), &tokens, cx)
@@ -1211,7 +1218,6 @@ impl Workspace {
                     }
                     Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
                 };
-                let ring = key.is_some() && key == cursor;
                 list = list.child(if ring { focus_ring(element, &tokens) } else { element });
             }
         }
@@ -2375,13 +2381,13 @@ pub(super) enum Favicon {
     Ready(Arc<Image>),
 }
 
-fn favicon_key(project: &ProjectShell) -> String {
-    format!("{}\0{}", project.workspace_root, project.favicon_path.as_deref().unwrap_or_default())
-}
-
 impl Workspace {
+    fn favicon_state(&self, project: &ProjectShell) -> Option<&Favicon> {
+        self.sidebar.favicons.get(&project.workspace_root)?.get(&project.favicon_path)
+    }
+
     pub(super) fn favicon(&self, project: &ProjectShell) -> Option<Arc<Image>> {
-        match self.sidebar.favicons.get(&favicon_key(project)) {
+        match self.favicon_state(project) {
             Some(Favicon::Ready(image)) => Some(image.clone()),
             _ => None,
         }
@@ -2393,11 +2399,11 @@ impl Workspace {
     fn load_favicons(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
         for project in &self.shell.projects {
-            let key = favicon_key(project);
-            if self.sidebar.favicons.contains_key(&key) {
+            if self.favicon_state(project).is_some() {
                 continue;
             }
-            self.sidebar.favicons.insert(key.clone(), Favicon::Loading);
+            let (root, path) = (project.workspace_root.clone(), project.favicon_path.clone());
+            self.sidebar.favicons.entry(root.clone()).or_default().insert(path.clone(), Favicon::Loading);
             let mut resource = json!({"_tag": "project-favicon", "cwd": project.workspace_root});
             if let Some(path) = &project.favicon_path {
                 resource["path"] = path.as_str().into();
@@ -2429,7 +2435,8 @@ impl Workspace {
                 }
                 .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.sidebar.favicons.insert(key, image.map_or(Favicon::Missing, Favicon::Ready));
+                    let state = image.map_or(Favicon::Missing, Favicon::Ready);
+                    this.sidebar.favicons.entry(root).or_default().insert(path, state);
                     this.notify_sidebar(cx);
                 });
             })
