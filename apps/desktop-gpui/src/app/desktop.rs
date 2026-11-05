@@ -67,7 +67,7 @@ pub(super) struct DesktopShell {
     pub(super) exposure: Option<crate::desktop::exposure::ExposureView>,
     pub(super) exposure_pending: bool,
     pub(super) _exposure_task: Option<Task<()>>,
-    _launches: Option<Task<()>>,
+    _launches: Task<()>,
 }
 
 impl DesktopShell {
@@ -76,14 +76,13 @@ impl DesktopShell {
         let desktop = cx.global::<Desktop>();
         let persistence = BoundsPersistence::new(&desktop.settings, desktop.initial, opened);
         let pending_links = desktop.launch_args.iter().filter_map(|arg| links::parse_app_link(arg)).collect();
-        let launches = desktop.launches.clone().map(|receiver| {
-            cx.spawn_in(window, async move |this, cx| {
-                while let Ok(args) = receiver.recv().await {
-                    if this.update_in(cx, |this, window, cx| this.receive_launch(args, window, cx)).is_err() {
-                        return;
-                    }
+        let receiver = desktop.launches.clone();
+        let launches = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(args) = receiver.recv().await {
+                if this.update_in(cx, |this, window, cx| this.receive_launch(args, window, cx)).is_err() {
+                    return;
                 }
-            })
+            }
         });
         let subscriptions = vec![
             cx.observe_window_bounds(window, |this, window, cx| this.window_bounds_changed(window, cx)),

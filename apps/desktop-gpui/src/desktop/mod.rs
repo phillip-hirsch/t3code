@@ -7,7 +7,10 @@ pub mod badge;
 pub mod cli;
 pub mod exposure;
 pub mod links;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod linux_url_handler;
 pub mod settings;
+pub mod shell_env;
 pub mod snap_shot;
 pub mod window_state;
 
@@ -22,8 +25,8 @@ pub struct Desktop {
     pub initial: InitialBounds,
     /// This launch's command line, which may carry an app link.
     pub launch_args: Vec<String>,
-    /// Later launches' command lines; see [`activation`].
-    pub launches: Option<async_channel::Receiver<Vec<String>>>,
+    /// Later launches' command lines ([`activation`]) and, on macOS, URLs the OS opens with the app.
+    pub launches: async_channel::Receiver<Vec<String>>,
 }
 
 impl Global for Desktop {}
@@ -49,7 +52,7 @@ pub fn launch_args() -> Vec<String> {
 }
 
 impl Desktop {
-    pub fn load(launches: Option<async_channel::Receiver<Vec<String>>>, cx: &App) -> Self {
+    pub fn load(launches: async_channel::Receiver<Vec<String>>, cx: &App) -> Self {
         let settings = DesktopSettings::load();
         let displays: Vec<WindowRect> = cx.displays().iter().map(|display| rect(display.bounds())).collect();
         let initial = window_state::initial_bounds(&settings, &displays);
@@ -57,6 +60,15 @@ impl Desktop {
             log::warn!("saved main window bounds could not be restored; using defaults");
         }
         Self { settings, initial, launch_args: launch_args(), launches }
+    }
+
+    /// Before macOS opens the closed window again: no replay of this launch's app links, and
+    /// the bounds it was closed with.
+    pub fn prepare_reopen(&mut self) {
+        self.launch_args.clear();
+        if let Some(rect) = self.settings.main_window_bounds {
+            self.initial = InitialBounds::Restored { rect, maximized: self.settings.main_window_maximized };
+        }
     }
 
     pub fn window_bounds(&self, cx: &App) -> WindowBounds {

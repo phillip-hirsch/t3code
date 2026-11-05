@@ -9,6 +9,8 @@ name = "t3-desktop"
 path = "src/main.rs"
 
 [dependencies]
+# Seals saved secrets on macOS and Linux under a key kept in the OS keyring (`secure_storage`).
+aes-gcm = "0.10"
 alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
@@ -40,6 +42,10 @@ gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-typescript",
   "tree-sitter-yaml",
 ] }
+# SnapShots: the window's app icon.
+file_icon_provider = "1"
+# SnapShots: the global capture shortcut.
+global-hotkey = "0.9"
 hmac = "0.12"
 # The system zone's IANA name, which usage reads send so the server buckets days locally.
 iana-time-zone = "0.1"
@@ -74,6 +80,8 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Office documents' XML parts; GPUI's SVG renderer already builds it.
 roxmltree = "0.21"
 wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
+# SnapShots: the screen capture.
+xcap = "0.9"
 
 [build-dependencies]
 serde_json = "1"
@@ -86,16 +94,41 @@ gpui-pre-windows = { version = "=0.3.11", default-features = false }
 windows-dpapi = "0.2"
 # Safe Win32 wrappers: foreground handoff, the taskbar badge, and SnapShots' window details.
 winsafe = { version = "0.0.29", features = ["dwm", "shell"] }
-# SnapShots: the global shortcut, the screen capture, the app icon and the window's UI Automation text.
-global-hotkey = "0.9"
-xcap = "0.9"
-file_icon_provider = "1"
+# SnapShots: the window's UI Automation text.
 uiautomation = { version = "0.25", default-features = false, features = ["input"] }
 # Reduced motion for SnapShots' flash, through WinRT's safe projection; WebView2 already builds this crate.
 windows = { version = "0.61", features = ["UI_ViewManagement"] }
 win32job = "2"
 # The taskbar badge's overlay icon is drawn with resvg; gpui already builds it with these features.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# The OS keyring that holds `secure_storage`'s key.
+keyring-core = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+# The Dock badge and SnapShots' reduced motion through AppKit's safe bindings; GPUI already builds these crates.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSAccessibility",
+  "NSApplication",
+  "NSDockTile",
+  "NSResponder",
+  "NSWorkspace",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# SnapShots' modifier-pair shortcut reads the modifier keys' state.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+  "std",
+  "CGEventSource",
+  "CGEventTypes",
+] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+# The launcher badge (Unity's LauncherEntry signal); the keyring store already builds it.
+zbus = "5"
 
 # Vendored crates.io copies with small patches; see vendor/README.md.
 [patch.crates-io]

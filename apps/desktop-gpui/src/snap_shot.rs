@@ -1,10 +1,29 @@
-//! SnapShots on Windows: the capture shortcut model and the copy the Settings page and
-//! the capture flow show (`packages/contracts/src/settings.ts`, `apps/desktop/src/snapShot/snapShot.ts`,
+//! SnapShots: the capture shortcut model and the copy the Settings page and the capture
+//! flow show, per platform as the web and Electron word them (`packages/contracts/src/settings.ts`, `apps/desktop/src/snapShot/snapShot.ts`,
 //! `DesktopSnapShot.ts`, `apps/web/src/lib/snapShotShortcut.ts`, `SnapShotSettings.logic.ts`).
 
 use serde_json::{Value, json};
 
 use crate::keybindings::{self, Shortcut as Chord};
+
+/// The platform a label or a shortcut is resolved for: `mod` is Cmd on macOS and Ctrl elsewhere,
+/// and each names its modifier keys its own way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Os {
+    Mac,
+    Windows,
+    Linux,
+}
+
+impl Os {
+    pub const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Linux
+    };
+}
 
 /// `SnapShotModifier`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,23 +54,30 @@ impl Modifier {
         }
     }
 
-    /// `OTHER_MODIFIER_LABELS`.
-    fn label(self) -> &'static str {
-        match self {
-            Self::Shift => "Shift",
-            Self::Meta => "Super",
-            Self::Control => "Ctrl",
-            Self::Alt => "Alt",
+    /// `APPLE_MODIFIER_LABELS` and `OTHER_MODIFIER_LABELS`.
+    fn label(self, os: Os) -> &'static str {
+        match (self, os) {
+            (Self::Shift, _) => "Shift",
+            (Self::Meta, Os::Mac) => "Command",
+            (Self::Control, Os::Mac) => "Control",
+            (Self::Alt, Os::Mac) => "Option",
+            (Self::Meta, _) => "Super",
+            (Self::Control, _) => "Ctrl",
+            (Self::Alt, _) => "Alt",
         }
     }
 
-    /// `modifierKeyLabel` on Windows.
-    fn key_label(self) -> &'static str {
-        match self {
-            Self::Shift => "⇧",
-            Self::Meta => "⊞",
-            Self::Control => "Ctrl",
-            Self::Alt => "Alt",
+    /// `modifierKeyLabel`.
+    fn key_label(self, os: Os) -> &'static str {
+        match (self, os) {
+            (Self::Shift, _) => "⇧",
+            (Self::Meta, Os::Mac) => "⌘",
+            (Self::Control, Os::Mac) => "⌃",
+            (Self::Alt, Os::Mac) => "⌥",
+            (Self::Meta, Os::Windows) => "⊞",
+            (Self::Meta, Os::Linux) => "Super",
+            (Self::Control, _) => "Ctrl",
+            (Self::Alt, _) => "Alt",
         }
     }
 }
@@ -100,40 +126,65 @@ impl Shortcut {
 
     /// `sameSnapShotShortcut`: pairs by modifier, chords by the keys they resolve to.
     pub fn same(&self, other: &Self) -> bool {
+        self.same_on(other, Os::CURRENT)
+    }
+
+    fn same_on(&self, other: &Self, os: Os) -> bool {
         match (self, other) {
             (Self::Pair(left), Self::Pair(right)) => left == right,
-            (Self::Chord(left), Self::Chord(right)) => chord_identity(left) == chord_identity(right),
+            (Self::Chord(left), Self::Chord(right)) => resolved(left, os) == resolved(right, os),
             _ => false,
         }
     }
 
-    /// `snapShotShortcutKeyLabels` on Windows, one per key cap.
+    /// `snapShotShortcutKeyLabels`, one per key cap.
     pub fn key_labels(&self) -> Vec<String> {
+        self.key_labels_on(Os::CURRENT)
+    }
+
+    fn key_labels_on(&self, os: Os) -> Vec<String> {
         match self {
-            Self::Pair(modifier) => vec![modifier.key_label().into(); 2],
+            Self::Pair(modifier) => vec![modifier.key_label(os).into(); 2],
             Self::Chord(chord) => {
-                let (ctrl, alt, shift, meta) = resolved(chord);
-                [(ctrl, Modifier::Control), (alt, Modifier::Alt), (shift, Modifier::Shift), (meta, Modifier::Meta)]
+                let keys = resolved(chord, os);
+                [(keys.ctrl, Modifier::Control), (keys.alt, Modifier::Alt), (keys.shift, Modifier::Shift)]
                     .into_iter()
+                    .chain([(keys.meta, Modifier::Meta)])
                     .filter(|(on, _)| *on)
-                    .map(|(_, modifier)| modifier.key_label().to_owned())
+                    .map(|(_, modifier)| modifier.key_label(os).to_owned())
                     .chain([key_label(&chord.key)])
                     .collect()
             }
         }
     }
 
-    /// `formatSnapShotShortcutLabel` on Windows.
+    /// `formatSnapShotShortcutLabel`.
     pub fn label(&self) -> String {
+        self.label_on(Os::CURRENT)
+    }
+
+    fn label_on(&self, os: Os) -> String {
         match self {
-            Self::Pair(modifier) => pair_label(*modifier),
+            Self::Pair(modifier) => pair_label(*modifier, os),
             Self::Chord(chord) => {
-                let (ctrl, alt, shift, meta) = resolved(chord);
-                let mut parts: Vec<String> = [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (meta, "Meta")]
-                    .into_iter()
-                    .filter(|(on, _)| *on)
-                    .map(|(_, name)| name.to_owned())
-                    .collect();
+                let keys = resolved(chord, os);
+                if os == Os::Mac {
+                    let glyph = |on: bool, glyph: &'static str| if on { glyph } else { "" };
+                    return format!(
+                        "{}{}{}{}{}",
+                        glyph(keys.ctrl, "⌃"),
+                        glyph(keys.alt, "⌥"),
+                        glyph(keys.shift, "⇧"),
+                        glyph(keys.meta, "⌘"),
+                        key_label(&chord.key)
+                    );
+                }
+                let mut parts: Vec<String> =
+                    [(keys.ctrl, "Ctrl"), (keys.alt, "Alt"), (keys.shift, "Shift"), (keys.meta, "Meta")]
+                        .into_iter()
+                        .filter(|(on, _)| *on)
+                        .map(|(_, name)| name.to_owned())
+                        .collect();
                 parts.push(key_label(&chord.key));
                 parts.join("+")
             }
@@ -145,20 +196,30 @@ fn has_modifier(chord: &Chord) -> bool {
     chord.meta_key || chord.ctrl_key || chord.shift_key || chord.alt_key || chord.mod_key
 }
 
-/// Ctrl, Alt, Shift and Meta, with `mod` resolved to Ctrl as on Windows.
-fn resolved(chord: &Chord) -> (bool, bool, bool, bool) {
-    (chord.ctrl_key || chord.mod_key, chord.alt_key, chord.shift_key, chord.meta_key)
+/// The keys a chord holds, with `mod` resolved for `os` (`shortcutConflictKey`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Keys {
+    key: String,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
 }
 
-/// `shortcutConflictKey` off macOS.
-fn chord_identity(chord: &Chord) -> (String, bool, bool, bool, bool) {
-    let (ctrl, alt, shift, meta) = resolved(chord);
-    (chord.key.clone(), meta, ctrl, shift, alt)
+fn resolved(chord: &Chord, os: Os) -> Keys {
+    let mac = os == Os::Mac;
+    Keys {
+        key: chord.key.clone(),
+        ctrl: chord.ctrl_key || (chord.mod_key && !mac),
+        alt: chord.alt_key,
+        shift: chord.shift_key,
+        meta: chord.meta_key || (chord.mod_key && mac),
+    }
 }
 
-/// `snapShotModifierPairLabel` off Apple platforms.
-fn pair_label(modifier: Modifier) -> String {
-    format!("{0} + {0}", modifier.label())
+/// `snapShotModifierPairLabel`.
+fn pair_label(modifier: Modifier, os: Os) -> String {
+    format!("{0} + {0}", modifier.label(os))
 }
 
 /// `formatShortcutKeyLabel`.
@@ -184,20 +245,24 @@ pub fn chord_from_input(input: &str) -> Option<Shortcut> {
     keybindings::parse_shortcut(input).filter(has_modifier).map(Shortcut::Chord)
 }
 
-/// `snapShotShortcutRegistrationFailureMessage` on Windows.
+/// `snapShotShortcutRegistrationFailureMessage`.
 pub fn registration_failure_message(shortcut: &Shortcut) -> String {
     match shortcut {
-        Shortcut::Pair(modifier) => format!("{} is not available on this system.", pair_label(*modifier)),
+        Shortcut::Pair(modifier) => format!("{} is not available on this system.", pair_label(*modifier, Os::CURRENT)),
         Shortcut::Chord(_) => "This shortcut is already used by the system or another app.".into(),
     }
 }
 
-/// `observedPairMessage` on Windows.
+/// `observedPairMessage`.
 pub fn observed_pair_message(modifier: Modifier) -> String {
-    let base = format!("{} is observed and cannot be reserved exclusively.", pair_label(modifier));
-    match modifier {
-        Modifier::Meta => format!("{base} This key can also open the system's own menu."),
-        Modifier::Alt => format!("{base} This key can also activate app menu bars."),
+    observed_pair_message_on(modifier, Os::CURRENT)
+}
+
+fn observed_pair_message_on(modifier: Modifier, os: Os) -> String {
+    let base = format!("{} is observed and cannot be reserved exclusively.", pair_label(modifier, os));
+    match (modifier, os) {
+        (Modifier::Meta, Os::Windows | Os::Linux) => format!("{base} This key can also open the system's own menu."),
+        (Modifier::Alt, Os::Windows) => format!("{base} This key can also activate app menu bars."),
         _ => base,
     }
 }
@@ -242,9 +307,16 @@ pub fn system_conflict(chord: &Chord) -> Option<&'static str> {
     None
 }
 
-/// `RegisterHotKey`'s modifier flags and virtual key for a chord, or `None` for a key it can't bind.
+/// `RegisterHotKey`'s modifier flags and virtual key for a chord, or `None` for a key it can't
+/// bind; macOS and Linux map the same pair to their own key codes.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn hotkey(chord: &Chord) -> Option<(u32, u32)> {
-    let (ctrl, alt, shift, meta) = resolved(chord);
+    hotkey_on(chord, Os::CURRENT)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn hotkey_on(chord: &Chord, os: Os) -> Option<(u32, u32)> {
+    let Keys { ctrl, alt, shift, meta, .. } = resolved(chord, os);
     let flags = [(alt, 0x1), (ctrl, 0x2), (shift, 0x4), (meta, 0x8)]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -325,22 +397,28 @@ pub fn shortcut_status(state: &State) -> Option<String> {
 }
 
 /// `DesktopSnapShotError` messages the capture flow shows.
+#[cfg(any(windows, target_os = "macos"))]
 pub const WINDOW_UNAVAILABLE: &str = "The active window is not available for capture.";
 pub const CAPTURE_FAILED: &str = "Could not capture the active window.";
+#[cfg(any(windows, target_os = "macos"))]
 pub const TOO_LARGE: &str = "The captured window is too large to attach.";
 
+#[cfg(any(windows, target_os = "macos"))]
 /// `PROVIDER_SEND_TURN_MAX_IMAGE_BYTES`.
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
+#[cfg(any(windows, target_os = "macos", test))]
 /// The capture's longest side stays within Electron's thumbnail bounds.
 pub const MAX_CAPTURE: (u32, u32) = (2_560, 1_600);
 
+#[cfg(any(windows, target_os = "macos", test))]
 /// The size a `width`×`height` capture scales down to so it fits [`MAX_CAPTURE`].
 pub fn fit_capture(width: u32, height: u32) -> (u32, u32) {
     let scale = (MAX_CAPTURE.0 as f64 / width.max(1) as f64).min(MAX_CAPTURE.1 as f64 / height.max(1) as f64).min(1.);
     (((width as f64 * scale).round() as u32).max(1), ((height as f64 * scale).round() as u32).max(1))
 }
 
+#[cfg(any(windows, test))]
 /// `snapShotAppName` on Windows: the executable's name without `.exe`, else "Window".
 pub fn app_name(image_path: &str) -> String {
     let name = image_path.rsplit(['\\', '/']).next().unwrap_or_default().trim();
@@ -404,10 +482,12 @@ pub fn source(
 
 /// `SNAP_SHOT_ACCESSIBLE_TEXT_MAX_CHARS` and `SNAP_SHOT_ACCESSIBILITY_MAX_NODES`.
 pub const ACCESSIBLE_TEXT_MAX: usize = 32_000;
+#[cfg(windows)]
 pub const ACCESSIBILITY_MAX_NODES: usize = 10_000;
 
 /// `accessibleWindowText`: element names and values in tree order, each once, one per line,
 /// cut to `max` UTF-16 units without splitting a character.
+#[cfg(any(windows, test))]
 pub fn accessible_text(candidates: impl IntoIterator<Item = String>, max: usize) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut text = String::new();
@@ -536,21 +616,33 @@ mod tests {
     }
 
     #[test]
-    fn mod_and_ctrl_are_the_same_shortcut_on_windows() {
-        assert!(chord("mod+shift+2").same(&chord("ctrl+shift+2")));
-        assert!(!chord("mod+shift+2").same(&chord("alt+shift+2")));
+    fn mod_is_ctrl_off_macos_and_cmd_on_it() {
+        assert!(chord("mod+shift+2").same_on(&chord("ctrl+shift+2"), Os::Windows));
+        assert!(chord("mod+shift+2").same_on(&chord("ctrl+shift+2"), Os::Linux));
+        assert!(!chord("mod+shift+2").same_on(&chord("ctrl+shift+2"), Os::Mac));
+        assert!(chord("mod+shift+2").same_on(&chord("meta+shift+2"), Os::Mac));
+        assert!(!chord("mod+shift+2").same_on(&chord("alt+shift+2"), Os::Windows));
         assert!(!Shortcut::Pair(Modifier::Shift).same(&Shortcut::Pair(Modifier::Alt)));
         assert!(chord_from_input("a").is_none());
     }
 
     #[test]
-    fn labels_follow_the_windows_formatting() {
-        assert_eq!(Shortcut::default().key_labels(), ["⇧", "⇧"]);
-        assert_eq!(Shortcut::default().label(), "Shift + Shift");
-        assert_eq!(Shortcut::Pair(Modifier::Meta).key_labels(), ["⊞", "⊞"]);
-        assert_eq!(chord("mod+alt+shift+arrowup").key_labels(), ["Ctrl", "Alt", "⇧", "Up"]);
-        assert_eq!(chord("mod+shift+space").label(), "Ctrl+Shift+Space");
-        assert_eq!(chord("meta+f12").label(), "Meta+F12");
+    fn labels_follow_each_platforms_formatting() {
+        assert_eq!(Shortcut::default().key_labels_on(Os::Windows), ["⇧", "⇧"]);
+        assert_eq!(Shortcut::default().label_on(Os::Windows), "Shift + Shift");
+        assert_eq!(Shortcut::Pair(Modifier::Meta).key_labels_on(Os::Windows), ["⊞", "⊞"]);
+        assert_eq!(chord("mod+alt+shift+arrowup").key_labels_on(Os::Windows), ["Ctrl", "Alt", "⇧", "Up"]);
+        assert_eq!(chord("mod+shift+space").label_on(Os::Windows), "Ctrl+Shift+Space");
+        assert_eq!(chord("meta+f12").label_on(Os::Windows), "Meta+F12");
+
+        assert_eq!(Shortcut::Pair(Modifier::Meta).key_labels_on(Os::Linux), ["Super", "Super"]);
+        assert_eq!(Shortcut::Pair(Modifier::Meta).label_on(Os::Linux), "Super + Super");
+
+        assert_eq!(Shortcut::Pair(Modifier::Alt).label_on(Os::Mac), "Option + Option");
+        assert_eq!(Shortcut::Pair(Modifier::Meta).key_labels_on(Os::Mac), ["⌘", "⌘"]);
+        assert_eq!(chord("mod+alt+shift+arrowup").key_labels_on(Os::Mac), ["⌥", "⇧", "⌘", "Up"]);
+        assert_eq!(chord("mod+shift+space").label_on(Os::Mac), "⇧⌘Space");
+        assert_eq!(chord("ctrl+f12").label_on(Os::Mac), "⌃F12");
     }
 
     #[test]
@@ -570,7 +662,7 @@ mod tests {
     #[test]
     fn chords_map_to_register_hotkey_arguments() {
         let hotkey_of = |input: &str| match chord(input) {
-            Shortcut::Chord(chord) => hotkey(&chord),
+            Shortcut::Chord(chord) => hotkey_on(&chord, Os::Windows),
             Shortcut::Pair(_) => None,
         };
         assert_eq!(hotkey_of("mod+shift+2"), Some((0x2 | 0x4, 0x32)));
@@ -578,6 +670,11 @@ mod tests {
         assert_eq!(hotkey_of("ctrl+f12"), Some((0x2, 0x7b)));
         assert_eq!(hotkey_of("ctrl+arrowdown"), Some((0x2, 0x28)));
         assert_eq!(hotkey_of("ctrl+f25"), None);
+        let mac = match chord("mod+shift+2") {
+            Shortcut::Chord(chord) => hotkey_on(&chord, Os::Mac),
+            Shortcut::Pair(_) => None,
+        };
+        assert_eq!(mac, Some((0x8 | 0x4, 0x32)), "mod is Cmd on macOS");
     }
 
     #[test]
@@ -602,9 +699,16 @@ mod tests {
             registration_failure_message(&Shortcut::default()),
             "Shift + Shift is not available on this system."
         );
-        assert!(observed_pair_message(Modifier::Alt).ends_with("This key can also activate app menu bars."));
+        assert!(
+            observed_pair_message_on(Modifier::Alt, Os::Windows).ends_with("This key can also activate app menu bars.")
+        );
         assert_eq!(
-            observed_pair_message(Modifier::Shift),
+            observed_pair_message_on(Modifier::Alt, Os::Mac),
+            "Option + Option is observed and cannot be reserved exclusively."
+        );
+        assert!(observed_pair_message_on(Modifier::Meta, Os::Linux).ends_with("open the system's own menu."));
+        assert_eq!(
+            observed_pair_message_on(Modifier::Shift, Os::Windows),
             "Shift + Shift is observed and cannot be reserved exclusively."
         );
     }

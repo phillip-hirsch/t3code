@@ -128,12 +128,7 @@ impl Workspace {
 
 /// `setNotificationBadge` through the desktop bridge.
 fn set_badge(window: &Window, count: usize) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    if let Ok(handle) = HasWindowHandle::window_handle(window)
-        && let RawWindowHandle::Win32(handle) = handle.as_raw()
-    {
-        crate::desktop::badge::set(handle.hwnd.get(), count);
-    }
+    crate::desktop::badge::set(window, count);
 }
 
 /// Plays an alert's sound off the UI thread; while one plays, the same sound again is dropped.

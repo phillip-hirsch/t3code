@@ -1,12 +1,90 @@
-//! The taskbar badge for unseen thread notifications (`notificationBadge.ts`): on Windows a red
-//! overlay icon with the count, drawn like `setNotificationBadge` in `threadNotifications.ts`.
+//! The badge for unseen thread notifications (`notificationBadge.ts`): on Windows a red overlay
+//! icon on the taskbar button, drawn like `setNotificationBadge` in `threadNotifications.ts`;
+//! on macOS the Dock icon's count and on Linux the launcher entry's count, as Electron's
+//! `app.setBadgeCount` shows them.
 
-/// The count as the badge shows it.
+#[cfg(not(target_os = "macos"))]
+use std::sync::mpsc::{Sender, channel};
+#[cfg(not(target_os = "macos"))]
+use std::sync::{Mutex, OnceLock};
+
+/// Shows `count` unseen threads for the app; 0 clears it.
+pub fn set(window: &gpui_kit::Window, count: usize) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            static WORKER: Worker<(isize, usize)> = OnceLock::new();
+            send_latest(&WORKER, "taskbar-badge", (handle.hwnd.get(), count), || {
+                let mut taskbar = windows_overlay::Taskbar::default();
+                move |(hwnd, count)| {
+                    if let Err(error) = taskbar.apply(hwnd, count) {
+                        log::warn!("could not update the taskbar badge: {error}");
+                    }
+                }
+            });
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        dock::set(count);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = window;
+        static WORKER: Worker<usize> = OnceLock::new();
+        send_latest(&WORKER, "launcher-badge", count, || {
+            |count| {
+                if let Err(error) = launcher::set(count) {
+                    log::debug!("could not update the launcher badge: {error}");
+                }
+            }
+        });
+    }
+}
+
+/// A badge thread's queue, started on first use (`None` when the thread couldn't start).
+#[cfg(not(target_os = "macos"))]
+type Worker<T> = OnceLock<Option<Mutex<Sender<T>>>>;
+
+/// Hands `update` to the badge's own thread, which `start`s its applier there and applies only
+/// the latest of queued updates (COM, fonts and D-Bus stay off the UI thread).
+#[cfg(not(target_os = "macos"))]
+fn send_latest<T: Send + 'static, F: FnMut(T)>(
+    worker: &'static Worker<T>,
+    name: &str,
+    update: T,
+    start: impl FnOnce() -> F + Send + 'static,
+) {
+    let worker = worker.get_or_init(|| {
+        let (sender, receiver) = channel::<T>();
+        let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
+            let mut apply = start();
+            while let Ok(mut update) = receiver.recv() {
+                while let Ok(next) = receiver.try_recv() {
+                    update = next;
+                }
+                apply(update);
+            }
+        });
+        spawned.ok().map(|_| Mutex::new(sender))
+    });
+    if let Some(sender) = worker {
+        let _ = sender.lock().expect("badge worker lock poisoned").send(update);
+    }
+}
+
+/// The count as the overlay icon shows it.
+#[cfg(windows)]
 pub fn label(count: usize) -> String {
     if count > 9 { "9+".into() } else { count.to_string() }
 }
 
 /// `setNotificationBadge`'s canvas as SVG: a red disc with the count in Segoe UI Semibold.
+#[cfg(windows)]
 pub fn svg(count: usize) -> String {
     let size = if count > 9 { 30 } else { 40 };
     format!(
@@ -15,38 +93,48 @@ pub fn svg(count: usize) -> String {
     )
 }
 
-/// Shows `count` on the window's taskbar button; 0 clears it.
-#[cfg(windows)]
-pub fn set(hwnd: isize, count: usize) {
-    use std::sync::OnceLock;
-    use std::sync::mpsc::{Sender, channel};
+/// `app.setBadgeCount` on macOS: the count on the Dock icon.
+#[cfg(target_os = "macos")]
+mod dock {
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::{MainThreadMarker, NSString};
 
-    // One thread applies updates in order, off the UI thread (COM and font loading).
-    static WORKER: OnceLock<Option<std::sync::Mutex<Sender<(isize, usize)>>>> = OnceLock::new();
-    let worker = WORKER.get_or_init(|| {
-        let (sender, receiver) = channel::<(isize, usize)>();
-        let spawned = std::thread::Builder::new().name("taskbar-badge".into()).spawn(move || {
-            let mut taskbar = windows_overlay::Taskbar::default();
-            while let Ok(mut update) = receiver.recv() {
-                // Only the latest count matters.
-                while let Ok(next) = receiver.try_recv() {
-                    update = next;
-                }
-                if let Err(error) = taskbar.apply(update.0, update.1) {
-                    log::warn!("could not update the taskbar badge: {error}");
-                }
-            }
-        });
-        spawned.ok().map(|_| std::sync::Mutex::new(sender))
-    });
-    if let Some(sender) = worker {
-        let _ = sender.lock().map(|sender| sender.send((hwnd, count)));
+    pub fn set(count: usize) {
+        let Some(main_thread) = MainThreadMarker::new() else {
+            log::warn!("the Dock badge can only be set from the main thread");
+            return;
+        };
+        let label = (count > 0).then(|| NSString::from_str(&count.to_string()));
+        NSApplication::sharedApplication(main_thread).dockTile().setBadgeLabel(label.as_deref());
     }
 }
 
-#[cfg(not(windows))]
-pub fn set(_hwnd: isize, _count: usize) {}
+/// `app.setBadgeCount` on Linux: Unity's launcher API, which GNOME's Dash to Dock, KDE Plasma
+/// and others read for this app's desktop entry.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod launcher {
+    use std::collections::HashMap;
 
+    use zbus::zvariant::Value;
+
+    use crate::desktop::linux_url_handler::DESKTOP_ENTRY;
+
+    pub fn set(count: usize) -> zbus::Result<()> {
+        let connection = zbus::blocking::Connection::session()?;
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        let properties: HashMap<&str, Value> =
+            HashMap::from([("count", Value::from(count)), ("count-visible", Value::from(count > 0))]);
+        connection.emit_signal(
+            None::<()>,
+            "/com/canonical/unity/launcherentry/t3code",
+            "com.canonical.Unity.LauncherEntry",
+            "Update",
+            &(format!("application://{DESKTOP_ENTRY}"), properties),
+        )
+    }
+}
+
+#[cfg(any(windows, test))]
 /// A one-image `.ico` file: 32-bit BGRA `pixels` (straight alpha, rows top to bottom) and a clear AND mask.
 pub fn ico(pixels: &[u8], size: u32) -> Vec<u8> {
     let side = size as usize;

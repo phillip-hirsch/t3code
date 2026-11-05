@@ -4,7 +4,7 @@
 //! `diagnosis.ts`, `presentation.ts`) and `resolveRemotePairingTarget` in
 //! `packages/shared/src/remote.ts`. SSH and T3 Connect routes are not ported.
 //!
-//! Bearer tokens are stored encrypted with Windows DPAPI (the guarantee Electron's
+//! Bearer tokens are stored encrypted by [`crate::secure_storage`] (the guarantee Electron's
 //! `safeStorage` gives the desktop app's connection catalog).
 
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::backend::{self, Endpoint, LocalServer};
+use crate::secure_storage as secure;
 
 /// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts`.
 const ORCHESTRATION_PROTOCOL_VERSION: u64 = 2;
@@ -420,7 +421,7 @@ struct StoredEnvironment {
     http_base_url: String,
     #[serde(default = "enabled_default")]
     enabled: bool,
-    /// The bearer token, DPAPI-encrypted, hex.
+    /// The bearer token, encrypted by [`secure`], hex.
     #[serde(default)]
     encrypted_token: String,
 }
@@ -523,33 +524,6 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
-}
-
-/// The bearer tokens, DPAPI-encrypted for the current Windows user.
-#[cfg(windows)]
-mod secure {
-    use windows_dpapi::{Scope, decrypt_data, encrypt_data};
-
-    pub fn protect(data: &[u8]) -> Result<Vec<u8>, String> {
-        encrypt_data(data, Scope::User, None).map_err(|error| format!("{error:#}"))
-    }
-
-    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
-        decrypt_data(data, Scope::User, None).map_err(|error| format!("{error:#}"))
-    }
-}
-
-#[cfg(not(windows))]
-mod secure {
-    const UNAVAILABLE: &str = "Secure credential storage is not available on this platform.";
-
-    pub fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
-        Err(UNAVAILABLE.into())
-    }
-
-    pub fn unprotect(_: &[u8]) -> Result<Vec<u8>, String> {
-        Err(UNAVAILABLE.into())
-    }
 }
 
 /// The workspace's environment: `T3_SERVER_URL`, else the local server, or the first enabled

@@ -151,11 +151,16 @@ pub(super) fn matches(keystroke: &Keystroke, shortcut: &Shortcut, mac: bool) -> 
 
 /// `resolveShortcutCommand`.
 pub(super) fn resolve<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutContext) -> Option<&'a str> {
+    resolve_on(rules, keystroke, context, MAC)
+}
+
+/// [`resolve`] as on macOS (`mod` is Cmd) or elsewhere (`mod` is Ctrl).
+fn resolve_on<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutContext, mac: bool) -> Option<&'a str> {
     rules
         .iter()
         .rev()
         .filter(|rule| context.admits(rule))
-        .find(|rule| matches(keystroke, &shortcut_for_context(rule, context), MAC))
+        .find(|rule| matches(keystroke, &shortcut_for_context(rule, context), mac))
         .map(|rule| rule.command.as_str())
 }
 
@@ -221,7 +226,12 @@ pub(super) fn format_label(shortcut: &Shortcut, mac: bool) -> String {
 
 /// `shortcutLabelForCommand` in the given context.
 pub(super) fn label_for(rules: &[Rule], command: &str, context: &ShortcutContext) -> Option<String> {
-    effective_shortcut(rules, command, context, MAC).map(|shortcut| format_label(&shortcut, MAC))
+    label_on(rules, command, context, MAC)
+}
+
+/// [`label_for`] as on macOS or elsewhere.
+fn label_on(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<String> {
+    effective_shortcut(rules, command, context, mac).map(|shortcut| format_label(&shortcut, mac))
 }
 
 /// `threadJumpIndexFromCommand`-style: `prefix.jump.N` as the 0-based index.
@@ -389,38 +399,45 @@ mod tests {
         let rules = defaults();
         let rest = ShortcutContext::default();
         let terminal = ShortcutContext { terminal_focus: true, ..rest };
-        assert_eq!(resolve(rules, &key("ctrl-w"), &rest), Some("rightPanel.close"));
-        assert_eq!(resolve(rules, &key("ctrl-w"), &terminal), Some("terminal.close"));
-        assert_eq!(resolve(rules, &key("ctrl-n"), &rest), Some("chat.new"));
-        assert_eq!(resolve(rules, &key("ctrl-n"), &terminal), Some("terminal.new"));
-        assert_eq!(resolve(rules, &key("ctrl-d"), &rest), Some("diff.toggle"));
-        assert_eq!(resolve(rules, &key("ctrl-k"), &terminal), None, "the palette yields to the terminal");
-        assert_eq!(resolve(rules, &key("ctrl-j"), &terminal), Some("terminal.toggle"));
+        assert_eq!(resolve_on(rules, &key("ctrl-w"), &rest, false), Some("rightPanel.close"));
+        assert_eq!(resolve_on(rules, &key("ctrl-w"), &terminal, false), Some("terminal.close"));
+        assert_eq!(resolve_on(rules, &key("ctrl-n"), &rest, false), Some("chat.new"));
+        assert_eq!(resolve_on(rules, &key("ctrl-n"), &terminal, false), Some("terminal.new"));
+        assert_eq!(resolve_on(rules, &key("ctrl-d"), &rest, false), Some("diff.toggle"));
+        assert_eq!(resolve_on(rules, &key("ctrl-k"), &terminal, false), None, "the palette yields to the terminal");
+        assert_eq!(resolve_on(rules, &key("ctrl-j"), &terminal, false), Some("terminal.toggle"));
         let custom = merge_with_defaults(&[compile("mod+alt+y", "sidebar.toggle", None).unwrap()]);
-        assert_eq!(resolve(&custom, &key("ctrl-alt-y"), &rest), Some("sidebar.toggle"));
-        assert_eq!(resolve(&custom, &key("ctrl-b"), &rest), None, "the server's rule replaces the default");
+        assert_eq!(resolve_on(&custom, &key("ctrl-alt-y"), &rest, false), Some("sidebar.toggle"));
+        assert_eq!(resolve_on(&custom, &key("ctrl-b"), &rest, false), None, "the server's rule replaces the default");
+        // `mod` is Cmd on macOS, so Ctrl alone no longer matches it there.
+        assert_eq!(resolve_on(rules, &key("cmd-w"), &rest, true), Some("rightPanel.close"));
+        assert_eq!(resolve_on(rules, &key("ctrl-w"), &rest, true), None);
+        assert_eq!(resolve_on(&custom, &key("cmd-alt-y"), &rest, true), Some("sidebar.toggle"));
     }
 
     #[test]
     fn conditions_read_focus_and_panels() {
         let rules = defaults();
         let rest = ShortcutContext::default();
-        assert_eq!(resolve(rules, &key("ctrl-t"), &rest), None);
+        assert_eq!(resolve_on(rules, &key("ctrl-t"), &rest, false), None);
         assert_eq!(
-            resolve(rules, &key("ctrl-t"), &ShortcutContext { right_panel_open: true, ..rest }),
+            resolve_on(rules, &key("ctrl-t"), &ShortcutContext { right_panel_open: true, ..rest }, false),
             Some("rightPanel.new")
         );
-        assert_eq!(resolve(rules, &key("ctrl-z"), &rest), Some("thread.undo"));
-        assert_eq!(resolve(rules, &key("ctrl-z"), &ShortcutContext { editable_focus: true, ..rest }), None);
+        assert_eq!(resolve_on(rules, &key("ctrl-z"), &rest, false), Some("thread.undo"));
+        assert_eq!(resolve_on(rules, &key("ctrl-z"), &ShortcutContext { editable_focus: true, ..rest }, false), None);
         assert_eq!(
-            resolve(rules, &key("ctrl-r"), &ShortcutContext { preview_focus: true, ..rest }),
+            resolve_on(rules, &key("ctrl-r"), &ShortcutContext { preview_focus: true, ..rest }, false),
             Some("preview.refresh")
         );
-        assert_eq!(resolve(rules, &key("ctrl-1"), &rest), Some("thread.jump.1"));
+        assert_eq!(resolve_on(rules, &key("ctrl-1"), &rest, false), Some("thread.jump.1"));
         let picker = ShortcutContext { model_picker_open: true, ..rest };
-        assert_eq!(resolve(rules, &key("ctrl-1"), &picker), Some("modelPicker.jump.1"));
-        assert_eq!(resolve(rules, &key("c"), &ShortcutContext { usage_page_open: true, ..rest }), Some("usage.cost"));
-        assert_eq!(resolve(rules, &key("c"), &rest), None);
+        assert_eq!(resolve_on(rules, &key("ctrl-1"), &picker, false), Some("modelPicker.jump.1"));
+        assert_eq!(
+            resolve_on(rules, &key("c"), &ShortcutContext { usage_page_open: true, ..rest }, false),
+            Some("usage.cost")
+        );
+        assert_eq!(resolve_on(rules, &key("c"), &rest, false), None);
     }
 
     #[test]
@@ -429,13 +446,13 @@ mod tests {
         let composer = ShortcutContext { composer_focus: true, ..ShortcutContext::default() };
         let running = ShortcutContext { turn_running: true, ..composer };
         let draft = ShortcutContext { draft_thread_route: true, ..composer };
-        assert_eq!(resolve(rules, &key("ctrl-enter"), &composer), None);
-        assert_eq!(resolve(rules, &key("ctrl-enter"), &running), Some("composer.sendAlternate"));
-        assert_eq!(resolve(rules, &key("ctrl-enter"), &draft), Some("composer.sendBackground"));
-        assert_eq!(resolve(rules, &key("ctrl-alt-enter"), &composer), Some("composer.sendAndNewThread"));
+        assert_eq!(resolve_on(rules, &key("ctrl-enter"), &composer, false), None);
+        assert_eq!(resolve_on(rules, &key("ctrl-enter"), &running, false), Some("composer.sendAlternate"));
+        assert_eq!(resolve_on(rules, &key("ctrl-enter"), &draft, false), Some("composer.sendBackground"));
+        assert_eq!(resolve_on(rules, &key("ctrl-alt-enter"), &composer, false), Some("composer.sendAndNewThread"));
         let modifier = ShortcutContext { composer_requires_modifier: true, ..running };
-        assert_eq!(resolve(rules, &key("ctrl-enter"), &modifier), None, "Mod+Enter sends");
-        assert_eq!(resolve(rules, &key("ctrl-shift-enter"), &modifier), Some("composer.sendAlternate"));
+        assert_eq!(resolve_on(rules, &key("ctrl-enter"), &modifier, false), None, "Mod+Enter sends");
+        assert_eq!(resolve_on(rules, &key("ctrl-shift-enter"), &modifier, false), Some("composer.sendAlternate"));
     }
 
     #[test]
@@ -461,12 +478,14 @@ mod tests {
     fn labels_show_the_live_shortcut() {
         let rules = defaults();
         let rest = ShortcutContext::default();
-        assert_eq!(label_for(rules, "sidebar.toggle", &rest).as_deref(), Some("Ctrl+B"));
-        assert_eq!(label_for(rules, "rightPanel.toggle", &rest).as_deref(), Some("Ctrl+Alt+B"));
-        assert_eq!(label_for(rules, "terminal.close", &rest), None, "its condition does not hold");
-        assert_eq!(label_for(rules, "workspace.focusNext", &rest).as_deref(), Some("Ctrl+F6"), "the newest rule");
+        assert_eq!(label_on(rules, "sidebar.toggle", &rest, false).as_deref(), Some("Ctrl+B"));
+        assert_eq!(label_on(rules, "rightPanel.toggle", &rest, false).as_deref(), Some("Ctrl+Alt+B"));
+        assert_eq!(label_on(rules, "terminal.close", &rest, false), None, "its condition does not hold");
+        assert_eq!(label_on(rules, "workspace.focusNext", &rest, false).as_deref(), Some("Ctrl+F6"), "the newest rule");
         let shadowed = merge_with_defaults(&[compile("mod+b", "usage.open", None).unwrap()]);
-        assert_eq!(label_for(&shadowed, "sidebar.toggle", &rest), None, "a later rule claims the chord");
+        assert_eq!(label_on(&shadowed, "sidebar.toggle", &rest, false), None, "a later rule claims the chord");
+        assert_eq!(label_on(rules, "sidebar.toggle", &rest, true).as_deref(), Some("\u{2318}B"));
+        assert_eq!(label_on(rules, "rightPanel.toggle", &rest, true).as_deref(), Some("\u{2325}\u{2318}B"));
         let shortcut = compile("mod+shift+arrowup", "x", None).unwrap().shortcut;
         assert_eq!(format_label(&shortcut, true), "\u{21e7}\u{2318}Up");
         assert_eq!(format_label(&compile("esc", "x", None).unwrap().shortcut, false), "Esc");

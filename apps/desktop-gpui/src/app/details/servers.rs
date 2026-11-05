@@ -221,7 +221,8 @@ impl Workspace {
                             ),
                     )
                     .tooltip(|window, cx| {
-                        Tooltip::new("Open in the browser panel. Ctrl-click for your browser.").build(window, cx)
+                        let click = if cfg!(target_os = "macos") { "⌘-click" } else { "Ctrl-click" };
+                        Tooltip::new(format!("Open in the browser panel. {click} for your browser.")).build(window, cx)
                     })
                     .on_click(
                         cx.listener(move |this, event, window, cx| this.open_server(url.clone(), event, window, cx)),

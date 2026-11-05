@@ -4,33 +4,39 @@
 //! different homes stay independent.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum Instance {
-    /// This process is the app; other launches' arguments arrive here.
-    Primary(async_channel::Receiver<Vec<String>>),
+    /// This process is the app; other launches' arguments arrive on the sender given to [`claim`].
+    Primary,
     /// The running app took the arguments.
     Forwarded,
 }
 
-/// Forwards `args` to a running app for `home`, or starts listening as the app.
-pub fn claim(home: &Path, args: &[String], runtime: &tokio::runtime::Handle) -> Instance {
+/// Forwards `args` to a running app for `home`, or starts listening as the app, sending later
+/// launches' arguments to `launches`.
+pub fn claim(
+    home: &Path,
+    args: &[String],
+    launches: async_channel::Sender<Vec<String>>,
+    runtime: &tokio::runtime::Handle,
+) -> Instance {
     let address = address(home);
     if forward(&address, args).is_ok() {
         return Instance::Forwarded;
     }
-    let (sender, receiver) = async_channel::unbounded();
-    match listen(&address, sender, runtime) {
-        Ok(()) => Instance::Primary(receiver),
+    match listen(&address, launches, runtime) {
+        Ok(()) => Instance::Primary,
         // Another launch started listening between our attempts.
         Err(_) if forward(&address, args).is_ok() => Instance::Forwarded,
         Err(error) => {
             log::warn!("could not take the single-instance channel {address}: {error}");
-            Instance::Primary(receiver)
+            Instance::Primary
         }
     }
 }
@@ -44,8 +50,17 @@ fn address(home: &Path) -> String {
     if cfg!(windows) {
         format!(r"\\.\pipe\t3code-gpui-{id}")
     } else {
-        home.join("userdata").join(format!("desktop-app-{id}.sock")).to_string_lossy().into_owned()
+        socket_dir().join(format!("t3code-gpui-{id}.sock")).to_string_lossy().into_owned()
     }
+}
+
+/// A Unix socket path must fit in 104 bytes on macOS (108 on Linux), so like Chromium's
+/// singleton socket it lives in the user's short runtime directory, not under the T3 home.
+fn socket_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|_| cfg!(target_os = "linux"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn message(args: &[String]) -> Vec<u8> {
@@ -131,10 +146,10 @@ async fn read_one(stream: impl tokio::io::AsyncRead + Unpin, sender: async_chann
     use tokio::io::AsyncBufReadExt as _;
     let mut line = Vec::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::AsyncReadExt::take(stream, MAX_MESSAGE_BYTES as u64 + 1));
-    if reader.read_until(b'\n', &mut line).await.is_ok() {
-        if let Some(args) = decode(line.trim_ascii_end()) {
-            let _ = sender.send(args).await;
-        }
+    if reader.read_until(b'\n', &mut line).await.is_ok()
+        && let Some(args) = decode(line.trim_ascii_end())
+    {
+        let _ = sender.send(args).await;
     }
 }
 
@@ -157,6 +172,9 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(a, address(Path::new("c:/users/ME/.t3-gpui")));
             assert!(a.starts_with(r"\\.\pipe\t3code-gpui-"));
+        } else {
+            let deep = address(&Path::new("/Users/someone").join("nested/".repeat(20)));
+            assert!(deep.len() < 104, "{deep} fits a macOS socket path");
         }
     }
 
@@ -165,11 +183,11 @@ mod tests {
     fn a_second_launch_hands_its_arguments_to_the_first() {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let home = std::env::temp_dir().join(format!("t3-activation-test-{}", std::process::id()));
-        let Instance::Primary(receiver) = claim(&home, &["first".into()], runtime.handle()) else {
-            panic!("the first launch must own the channel");
-        };
+        let (sender, receiver) = async_channel::unbounded();
+        assert_eq!(claim(&home, &["first".into()], sender, runtime.handle()), Instance::Primary);
         let args = vec!["second".to_owned(), "t3code://new?prompt=x".to_owned()];
-        assert!(matches!(claim(&home, &args, runtime.handle()), Instance::Forwarded));
+        let (unused, _) = async_channel::unbounded();
+        assert_eq!(claim(&home, &args, unused, runtime.handle()), Instance::Forwarded);
         assert_eq!(runtime.block_on(receiver.recv()).unwrap(), args);
         let _ = std::fs::remove_dir_all(home);
     }

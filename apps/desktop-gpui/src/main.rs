@@ -30,6 +30,7 @@ mod quit_shortcut;
 mod requests;
 mod rpc;
 mod search;
+mod secure_storage;
 mod settings;
 mod snap_shot;
 mod terminal_text;
@@ -51,7 +52,7 @@ mod worktree_setup;
 
 use std::sync::OnceLock;
 
-use gpui_kit::{AppContext as _, TitlebarOptions, WindowOptions, point, px, size};
+use gpui_kit::{AppContext as _, TitlebarOptions, WindowDecorations, WindowOptions, point, px, size};
 
 /// Network and process I/O run here; GPUI owns the UI thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -72,17 +73,30 @@ fn main() {
     #[cfg(windows)]
     gpui_windows::disable_direct_composition();
     // A second launch hands its command line to the running app and exits.
-    let launches = match settings::t3_home() {
-        Some(home) => {
-            let args = desktop::launch_args();
-            match desktop::activation::claim(&home, &args, runtime().handle()) {
-                desktop::activation::Instance::Forwarded => return,
-                desktop::activation::Instance::Primary(launches) => Some(launches),
-            }
+    let (links, launches) = async_channel::unbounded();
+    if let Some(home) = settings::t3_home() {
+        let args = desktop::launch_args();
+        if desktop::activation::claim(&home, &args, links.clone(), runtime().handle())
+            == desktop::activation::Instance::Forwarded
+        {
+            return;
         }
-        None => None,
-    };
-    gpui_kit::application().with_assets(assets::Assets).run(|cx| {
+    }
+    let app = gpui_kit::application().with_assets(assets::Assets);
+    // macOS hands `t3code://` links to the running app as URLs (Electron's `open-url`).
+    app.on_open_urls(move |urls| {
+        let _ = links.try_send(urls);
+    });
+    // A Dock click with the window closed opens it again (Electron's `activate`).
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            cx.global_mut::<desktop::Desktop>().prepare_reopen();
+            open_main_window(cx);
+        } else {
+            cx.activate(true);
+        }
+    });
+    app.run(|cx| {
         gpui_kit::init(cx);
         // Windows shows OS notifications under this identity.
         cx.set_app_identity("com.t3tools.t3code.gpui", "T3 Code");
@@ -90,24 +104,34 @@ fn main() {
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
         cx.bind_keys(app::terminal_key_bindings());
-        let desktop = desktop::Desktop::load(launches, cx);
-        let window_bounds = desktop.window_bounds(cx);
-        cx.set_global(desktop);
-        // The app draws its own 40px titlebar; Windows keeps the native resize frame.
-        let options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("T3 Code".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(16.), px(13.))),
-            }),
-            window_bounds: Some(window_bounds),
-            window_min_size: Some(size(px(840.), px(620.))),
-            ..Default::default()
-        };
-        gpui_kit::open_window(options, cx, |window, cx| {
-            theme::sync(window, cx);
-            cx.new(|cx| app::Workspace::new(window, cx))
-        })
-        .expect("failed to open window");
+        app::menu::init(cx);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        desktop::linux_url_handler::register();
+        cx.set_global(desktop::Desktop::load(launches, cx));
+        open_main_window(cx);
     });
+}
+
+/// Opens the app's window where it was last closed. The app draws its own titlebar: Windows
+/// keeps the native resize frame, macOS its traffic lights, and Linux asks for client-side
+/// decorations like Electron's frameless `titleBarOverlay` window.
+fn open_main_window(cx: &mut gpui_kit::App) {
+    let (x, y) = app::TRAFFIC_LIGHTS;
+    let options = WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("T3 Code".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(x), px(y))),
+        }),
+        window_bounds: Some(cx.global::<desktop::Desktop>().window_bounds(cx)),
+        window_min_size: Some(size(px(840.), px(620.))),
+        window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+        ..Default::default()
+    };
+    let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
+        theme::sync(window, cx);
+        cx.new(|cx| app::Workspace::new(window, cx))
+    })
+    .expect("failed to open window");
+    cx.set_global(app::menu::MainWindow { window, workspace: workspace.downgrade() });
 }

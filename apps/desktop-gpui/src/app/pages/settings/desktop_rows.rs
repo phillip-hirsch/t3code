@@ -34,7 +34,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    pub(super) fn about_update_description(&self) -> String {
+    pub(in crate::app) fn about_update_description(&self) -> String {
         update_disabled_reason(&self.settings_info().managed_policy)
     }
 

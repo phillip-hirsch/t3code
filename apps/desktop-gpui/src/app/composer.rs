@@ -900,7 +900,8 @@ impl Workspace {
                 let keys = super::keymap::label_for(&self.keymap, "composer.sendAlternate", &context)
                     .map(|keys| format!(" or {keys}"))
                     .unwrap_or_default();
-                Some(format!("Click to {follow_up}, Ctrl-click{keys} to {alternate}").into())
+                let modifier = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+                Some(format!("Click to {follow_up}, {modifier}-click{keys} to {alternate}").into())
             }
             _ => None,
         };
