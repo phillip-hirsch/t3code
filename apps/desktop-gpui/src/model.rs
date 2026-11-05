@@ -112,6 +112,8 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub supports_conversation_rollback: Option<bool>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -162,6 +164,8 @@ pub struct ServerInfo {
     pub default_model_selection: Option<ModelSelection>,
     pub default_runtime_mode: Option<String>,
     pub thread_stop: bool,
+    /// `orchestration.subscribeCommandOutput` streams a command's output.
+    pub command_output_streaming: bool,
     /// The environment's name, e.g. the machine's host name.
     pub environment_label: Option<String>,
     platform_machine: Option<String>,
@@ -184,6 +188,9 @@ impl ServerInfo {
                 self.apply_settings(&config["settings"])?;
                 self.thread_stop =
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
+                self.command_output_streaming =
+                    config.pointer("/environment/capabilities/commandOutputStreaming").and_then(Value::as_bool)
+                        == Some(true);
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
@@ -604,6 +611,10 @@ pub struct ProviderThread {
     pub id: String,
     #[serde(default)]
     pub context_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -612,6 +623,12 @@ pub struct ProviderTurn {
     pub id: String,
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub run_attempt_id: Option<String>,
+    #[serde(default)]
+    pub ordinal: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -623,6 +640,10 @@ pub struct Run {
     pub started_at: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub ordinal: i64,
+    #[serde(default)]
+    pub active_attempt_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -633,6 +654,36 @@ pub struct RunAttempt {
     #[serde(default)]
     pub root_node_id: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// A captured checkpoint, the target of `checkpoint.rollback`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub id: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub ordinal_within_scope: i64,
+    #[serde(default)]
+    pub app_run_ordinal: Option<i64>,
+    pub status: String,
+}
+
+/// An execution node; items reach their run attempt through `parentNodeId`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionNode {
+    pub id: String,
+    #[serde(default)]
+    pub parent_node_id: Option<String>,
+    #[serde(default)]
+    pub root_node_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -732,6 +783,10 @@ pub struct ThreadProjection {
     pub provider_threads: Vec<ProviderThread>,
     #[serde(default, deserialize_with = "lossy")]
     pub provider_turns: Vec<ProviderTurn>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub nodes: Vec<ExecutionNode>,
 }
 
 impl ThreadProjection {
@@ -831,6 +886,8 @@ impl ThreadProjection {
                 }
                 upsert(&mut self.provider_turns, turn, |t| &t.id);
             }
+            "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
+            "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
             "thread.pull-request-link-updated" => {}
             kind if kind.starts_with("thread.") => self.thread = AppThread::deserialize(payload)?,
             _ => {}

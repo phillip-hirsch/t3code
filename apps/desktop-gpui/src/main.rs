@@ -7,8 +7,10 @@ mod model_label;
 mod new_thread;
 mod requests;
 mod rpc;
+mod terminal_text;
 mod theme;
 mod timeline;
+mod timestamp;
 mod work_log;
 
 use std::sync::OnceLock;

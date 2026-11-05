@@ -6,10 +6,23 @@
 //! Everything a row needs is derived once per item into an [`Entry`], so rows
 //! compare cheaply and rendering reads no JSON.
 
+use std::rc::Rc;
+
 use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::model::TurnItem;
+
+/// The item an entry came from, for the details an expanded row shows.
+/// Equal by identity: an update replaces the item.
+#[derive(Clone, Debug)]
+pub struct ItemRef(pub Rc<TurnItem>);
+
+impl PartialEq for ItemRef {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -159,6 +172,7 @@ pub struct Entry {
     pub search_label: Option<SharedString>,
     pub paths: Vec<SharedString>,
     pub action: Action,
+    pub item: ItemRef,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +180,7 @@ pub struct Entry {
 
 /// `projectedWorkEntry` in `apps/web/src/session-logic.ts`, plus the
 /// notification entry built in `deriveTimelineEntriesFromVisibleTurnItems`.
-pub fn entry_from_item(item: &TurnItem) -> Entry {
+pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
     let raw = &item.raw;
     let text = |key: &str| str_at(raw, key).map(SharedString::from);
     let title = str_at(raw, "title").map(str::trim).filter(|t| !t.is_empty()).map(SharedString::from);
@@ -212,6 +226,7 @@ pub fn entry_from_item(item: &TurnItem) -> Entry {
         search_label: None,
         paths: Vec::new(),
         action: Action::Other,
+        item: ItemRef(item.clone()),
     };
     let fallback = |title: &Option<SharedString>, text: &str| title.clone().unwrap_or_else(|| text.to_owned().into());
     match item_type {
@@ -374,19 +389,28 @@ fn compaction_label(item: &TurnItem) -> String {
     }
 }
 
-/// `formatTokens` in `packages/shared/src/usageFormat.ts`.
+/// `formatTokens` in `packages/shared/src/usageFormat.ts`: 120K, 45.6K, 1.50K.
 fn format_tokens(count: f64) -> String {
-    let compact = |value: f64, suffix: &str| {
-        let text = if value >= 100. { format!("{value:.0}") } else { format!("{value:.1}") };
-        format!("{}{suffix}", text.trim_end_matches(".0"))
+    let trim = |value: f64| {
+        let digits = if value.abs() >= 100. {
+            0
+        } else if value.abs() >= 10. {
+            1
+        } else {
+            2
+        };
+        let text = format!("{value:.digits$}");
+        match text.split_once('.') {
+            Some((whole, fraction)) if fraction.bytes().all(|b| b == b'0') => whole.to_owned(),
+            _ => text,
+        }
     };
-    if count >= 1_000_000. {
-        compact(count / 1_000_000., "m")
-    } else if count >= 1_000. {
-        compact(count / 1_000., "k")
-    } else {
-        format!("{count:.0}")
+    for (scale, suffix) in [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")] {
+        if count.abs() >= scale {
+            return format!("{}{suffix}", trim(count / scale));
+        }
     }
+    format!("{count:.0}")
 }
 
 /// `providerErrorPresentation` in session-logic.ts.
@@ -1873,7 +1897,13 @@ mod tests {
         let mut value = value;
         value["status"] = value.get("status").cloned().unwrap_or(json!("completed"));
         value["id"] = value.get("id").cloned().unwrap_or(json!("item"));
-        entry_from_item(&serde_json::from_value::<TurnItem>(value).unwrap())
+        entry_from_item(&Rc::new(serde_json::from_value::<TurnItem>(value).unwrap()))
+    }
+
+    #[test]
+    fn token_counts_format_like_the_web() {
+        let formatted: Vec<String> = [120_000., 45_600., 1_500., 1_000., 999., 2_500_000.].map(format_tokens).into();
+        assert_eq!(formatted, ["120K", "45.6K", "1.50K", "1K", "999", "2.50M"]);
     }
 
     fn command(input: &str) -> Entry {
