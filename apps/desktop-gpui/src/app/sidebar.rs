@@ -611,7 +611,7 @@ impl Workspace {
         self.sidebar.search.read(cx).value().trim().to_lowercase()
     }
 
-    fn route_thread(&self) -> Option<&str> {
+    pub(super) fn route_thread(&self) -> Option<&str> {
         match &self.target {
             Some(Target::Thread(id)) => Some(id),
             _ => None,

@@ -101,17 +101,20 @@ enum Run {
     FileSearch(super::files::OverlayMode),
 }
 
+#[derive(Clone)]
 enum RowIcon {
     Lucide(IconName),
     Project(String),
 }
 
+#[derive(Clone)]
 enum Description {
     Text(SharedString),
     /// "You:" / "Agent:" and the snippet in highlighted runs.
     Snippet(bool, Vec<(String, bool)>),
 }
 
+#[derive(Clone)]
 struct Row {
     key: SharedString,
     icon: RowIcon,
@@ -175,7 +178,35 @@ pub(super) struct Palette {
     placeholder: &'static str,
     /// The app is dark: the theme list marks the dark appearance's theme as current.
     dark: bool,
+    /// The root view's Threads group, ranked once per query and shell change.
+    threads: Option<ThreadRanking>,
     _subscription: Subscription,
+}
+
+/// Ranking every thread is the palette's one cost that grows with the data, so it runs
+/// when its inputs change, not on each repaint, and only the listed rows are built.
+struct ThreadRanking {
+    key: RankingKey,
+    /// The exact pass; with no query, the recent threads.
+    strict: RankedThreads,
+    /// The typo-tolerant pass, needed only when no exact thread match is strong.
+    typos: Option<RankedThreads>,
+}
+
+#[derive(PartialEq)]
+struct RankingKey {
+    query: String,
+    revision: u64,
+    current: Option<String>,
+    /// Rows show "5m ago" and rank by recency.
+    minute: i64,
+}
+
+struct RankedThreads {
+    /// The listed rows, with whether each matched strongly.
+    rows: Vec<(Row, bool)>,
+    /// Any thread matched strongly, listed or not.
+    strong: bool,
 }
 
 /// `isFilesystemBrowseQuery`: the query reads as a path.
@@ -241,6 +272,7 @@ impl Workspace {
             messages: MessageSearch::default(),
             placeholder: "",
             dark: crate::theme::tokens(cx).dark,
+            threads: None,
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -451,11 +483,9 @@ impl Workspace {
             .collect()
     }
 
-    /// The live shortcut label of `command` (`shortcutCommand`).
+    /// The live shortcut label of `command` (`shortcutCommand`), as tooltips show it.
     fn shortcut(&self, command: &str) -> Option<SharedString> {
-        let keybindings = self.server_info.keybindings_json();
-        super::pages::settings::code::projects::scripts::shortcut_label_for_command(keybindings, Some(command))
-            .map(Into::into)
+        self.shortcut_label(command).map(Into::into)
     }
 
     /// Actions in `CommandPalette.tsx` order.
@@ -665,7 +695,7 @@ impl Workspace {
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let mut parts: Vec<String> = project.map(|p| p.title.clone()).into_iter().collect();
         parts.extend(thread.branch.clone());
-        if self.target.as_ref() == Some(&Target::Thread(thread.id.clone())) {
+        if self.route_thread() == Some(thread.id.as_str()) {
             parts.push("Current thread".into());
         }
         row.description = Some(Description::Text(parts.join(" · ").into()));
@@ -711,13 +741,9 @@ impl Workspace {
             }
             _ => {}
         }
+        let Some(ranking) = &palette.threads else { return Vec::new() };
         if tokens.is_empty() {
-            let mut recent: Vec<_> = self
-                .palette_threads()
-                .filter(|t| self.target.as_ref() != Some(&Target::Thread(t.id.clone())))
-                .collect();
-            recent.sort_by_key(|t| std::cmp::Reverse(used_at(t)));
-            let recent = recent.into_iter().take(RECENT_LIMIT).map(|t| self.thread_row(t, now)).collect();
+            let recent = ranking.strict.rows.iter().map(|(row, _)| row.clone()).collect();
             return vec![
                 Group { label: "Actions", rows: self.action_rows() },
                 Group { label: "Recent Threads", rows: recent },
@@ -737,8 +763,6 @@ impl Workspace {
                 })
                 .collect()
         };
-        let threads: Vec<(Row, &crate::model::ThreadShell)> =
-            self.palette_threads().map(|t| (self.thread_row(t, now), t)).collect();
         let project_rows: Vec<Row> = projects
             .iter()
             .map(|p| {
@@ -763,12 +787,16 @@ impl Workspace {
                 row
             })
             .collect();
+        let action_rows = self.action_rows();
         let rank = |typos: bool| {
-            let actions = score_rows(self.action_rows(), &tokens, typos);
-            let suggestions = score_rows(suggestions_clone(&suggestions), &tokens, typos);
-            let threads = self.score_threads(threads_clone(&threads), &tokens, typos, now);
-            let projects = score_rows(rows_clone(&project_rows), &tokens, typos);
-            let settings = score_rows(rows_clone(&settings), &tokens, typos);
+            let actions = score_rows(action_rows.clone(), &tokens, typos);
+            let suggestions = score_rows(suggestions.clone(), &tokens, typos);
+            let threads = match (typos, &ranking.typos) {
+                (true, Some(ranked)) => ranked.rows.clone(),
+                _ => ranking.strict.rows.clone(),
+            };
+            let projects = score_rows(project_rows.clone(), &tokens, typos);
+            let settings = score_rows(settings.clone(), &tokens, typos);
             [
                 ("Actions", actions),
                 ("Suggestions", suggestions),
@@ -778,10 +806,10 @@ impl Workspace {
             ]
         };
         let mut ranked = rank(false);
-        if !ranked.iter().any(|(_, rows)| rows.iter().any(|(_, strong)| *strong)) {
+        if !ranking.strict.strong && !ranked.iter().any(|(_, rows)| rows.iter().any(|(_, strong)| *strong)) {
             ranked = rank(true);
         }
-        let threads_matched = ranked[2].1.iter().any(|_| true);
+        let threads_matched = !ranked[2].1.is_empty();
         let mut groups: Vec<(u8, usize, Group)> = ranked
             .into_iter()
             .enumerate()
@@ -839,16 +867,45 @@ impl Workspace {
         groups
     }
 
-    fn score_threads(
-        &self,
-        rows: Vec<(Row, &crate::model::ThreadShell)>,
-        tokens: &[Vec<char>],
-        typos: bool,
-        now: i64,
-    ) -> Vec<(Row, bool)> {
-        let mut scored: Vec<(Row, bool, f32)> = rows
-            .into_iter()
-            .filter_map(|(mut row, thread)| {
+    /// Ranks the root view's threads for `query` unless the last ranking still holds.
+    fn rank_palette_threads(&mut self, query: &str) {
+        let Some(palette) = &self.palette else { return };
+        if palette.view != View::Root || is_browse_query(query) {
+            return;
+        }
+        let now = super::sidebar::now_ms();
+        let key = RankingKey {
+            query: query.to_owned(),
+            revision: self.shell.revision,
+            current: self.route_thread().map(str::to_owned),
+            minute: now / 60_000,
+        };
+        if palette.threads.as_ref().is_some_and(|ranking| ranking.key == key) {
+            return;
+        }
+        let tokens = search::fold_query(query);
+        let (strict, typos) = if tokens.is_empty() {
+            let mut recent: Vec<_> =
+                self.palette_threads().filter(|t| key.current.as_deref() != Some(t.id.as_str())).collect();
+            recent.sort_by_cached_key(|t| std::cmp::Reverse(used_at(t)));
+            let rows = recent.into_iter().take(RECENT_LIMIT).map(|t| (self.thread_row(t, now), false)).collect();
+            (RankedThreads { rows, strong: false }, None)
+        } else {
+            let strict = self.score_threads(&tokens, false, now);
+            let typos = (!strict.strong).then(|| self.score_threads(&tokens, true, now));
+            (strict, typos)
+        };
+        if let Some(palette) = &mut self.palette {
+            palette.threads = Some(ThreadRanking { key, strict, typos });
+        }
+    }
+
+    /// Scores every listed thread, then builds rows for the first [`THREAD_LIMIT`] only.
+    fn score_threads(&self, tokens: &[Vec<char>], typos: bool, now: i64) -> RankedThreads {
+        let current = self.route_thread();
+        let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
+            .palette_threads()
+            .filter_map(|thread| {
                 let title = Field::new(&thread.title);
                 let branch = thread
                     .branch
@@ -866,20 +923,30 @@ impl Workspace {
                 let found =
                     search::match_fields(tokens, &[title_field, Weighted::new(&branch, 0.6), project_field], typos)?;
                 let age = now - used_at(thread);
-                row.quality = found.quality;
-                let current = self.target.as_ref() == Some(&Target::Thread(thread.id.clone()));
-                Some((row, found.strong, if current { -1. } else { found.quality * search::usage_boost(age) }))
+                let rank =
+                    if current == Some(thread.id.as_str()) { -1. } else { found.quality * search::usage_boost(age) };
+                Some((thread, found.quality, found.strong, rank))
             })
             .collect();
         scored.sort_by(|a, b| {
-            let class = |r: &Row| search::class(r.quality);
-            (b.2 >= 0.)
-                .cmp(&(a.2 >= 0.))
-                .then(class(&b.0).min(2).cmp(&class(&a.0).min(2)))
-                .then(class(&b.0).cmp(&class(&a.0)))
-                .then(b.2.total_cmp(&a.2))
+            let (class_a, class_b) = (search::class(a.1), search::class(b.1));
+            (b.3 >= 0.)
+                .cmp(&(a.3 >= 0.))
+                .then(class_b.min(2).cmp(&class_a.min(2)))
+                .then(class_b.cmp(&class_a))
+                .then(b.3.total_cmp(&a.3))
         });
-        scored.into_iter().map(|(row, strong, _)| (row, strong)).collect()
+        let strong = scored.iter().any(|(_, _, strong, _)| *strong);
+        let rows = scored
+            .into_iter()
+            .take(THREAD_LIMIT)
+            .map(|(thread, quality, strong, _)| {
+                let mut row = self.thread_row(thread, now);
+                row.quality = quality;
+                (row, strong)
+            })
+            .collect();
+        RankedThreads { rows, strong }
     }
 
     fn browse_groups(&self, query: &str) -> Vec<Group> {
@@ -1063,8 +1130,9 @@ impl Workspace {
     }
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).value().to_string()) else { return };
+        self.rank_palette_threads(&query);
         let Some(palette) = &self.palette else { return };
-        let query = palette.input.read(cx).value().to_string();
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
         let groups = self.palette_groups(&query);
@@ -1134,9 +1202,10 @@ impl Workspace {
     }
 
     pub(super) fn render_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let query = self.palette.as_ref()?.input.read(cx).value().to_string();
+        self.rank_palette_threads(&query);
         let palette = self.palette.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
-        let query = palette.input.read(cx).value().to_string();
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
         let in_submenu = !palette.stack.is_empty();
@@ -1326,7 +1395,7 @@ impl Workspace {
     ) -> AnyElement {
         let muted = tokens.muted_foreground;
         let icon: AnyElement = match &row.icon {
-            RowIcon::Lucide(name) => Icon::new(name.clone()).size(px(16.)).text_color(muted).into_any_element(),
+            RowIcon::Lucide(name) => Icon::new(*name).size(px(16.)).text_color(muted).into_any_element(),
             RowIcon::Project(project_id) => match self.shell.projects.iter().find(|p| &p.id == project_id) {
                 Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
                 None => div().size(px(16.)).into_any_element(),
@@ -1445,10 +1514,10 @@ impl Workspace {
 fn used_at(thread: &crate::model::ThreadShell) -> i64 {
     thread
         .latest_user_authored_message_at
-        .clone()
-        .flatten()
-        .or_else(|| thread.latest_user_message_at.clone())
-        .and_then(|at| inbox::parse_ms(&at))
+        .as_ref()
+        .and_then(Option::as_deref)
+        .or(thread.latest_user_message_at.as_deref())
+        .and_then(inbox::parse_ms)
         .or_else(|| inbox::parse_ms(&thread.updated_at))
         .unwrap_or(0)
 }
@@ -1467,40 +1536,6 @@ fn up_path(directory: &str) -> Option<String> {
     let at = trimmed.rfind(['/', '\\'])?;
     let parent = &trimmed[..=at];
     (!parent.is_empty() && trimmed != "~").then(|| parent.to_owned())
-}
-
-fn rows_clone(rows: &[Row]) -> Vec<Row> {
-    rows.iter().map(row_clone).collect()
-}
-
-fn suggestions_clone(rows: &[Row]) -> Vec<Row> {
-    rows_clone(rows)
-}
-
-fn threads_clone<'a>(rows: &[(Row, &'a crate::model::ThreadShell)]) -> Vec<(Row, &'a crate::model::ThreadShell)> {
-    rows.iter().map(|(row, thread)| (row_clone(row), *thread)).collect()
-}
-
-fn row_clone(row: &Row) -> Row {
-    Row {
-        key: row.key.clone(),
-        icon: match &row.icon {
-            RowIcon::Lucide(name) => RowIcon::Lucide(name.clone()),
-            RowIcon::Project(id) => RowIcon::Project(id.clone()),
-        },
-        title: row.title.clone(),
-        strong: row.strong.clone(),
-        description: row.description.as_ref().map(|d| match d {
-            Description::Text(t) => Description::Text(t.clone()),
-            Description::Snippet(user, parts) => Description::Snippet(*user, parts.clone()),
-        }),
-        time: row.time.clone(),
-        shortcut: row.shortcut.clone(),
-        chevron: row.chevron,
-        run: row.run.clone(),
-        terms: row.terms,
-        quality: row.quality,
-    }
 }
 
 /// Scores rows on their title (plus the bold part); unmatched rows drop out.
@@ -1537,7 +1572,7 @@ fn rank_rows(rows: Vec<Row>, tokens: &[Vec<char>]) -> Vec<Row> {
     if tokens.is_empty() {
         return rows;
     }
-    let mut ranked = score_rows(rows_clone(&rows), tokens, false);
+    let mut ranked = score_rows(rows.clone(), tokens, false);
     if ranked.is_empty() {
         ranked = score_rows(rows, tokens, true);
     }
