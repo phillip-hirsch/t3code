@@ -9,6 +9,9 @@
 
 mod actions;
 mod defaults;
+mod rows;
+mod script_editor;
+mod scripts;
 mod favicon_picker;
 mod groups;
 mod icon;
@@ -717,12 +720,13 @@ impl Workspace {
             .child(Icon::new(IconName::Info).size(px(16.)).text_color(tokens.info))
             .child("Can't find a setting? Keep this project picked above and hop to any other settings page.");
 
+        let project_id = selection.group.representative().id.clone();
         v_flex()
             .gap_6()
             .child(alert)
             .child(section(None, overview, &tokens))
-            .children(self.render_project_defaults(&selection.group, window, cx))
-            .children(self.render_project_actions(&selection.group, window, cx))
+            .child(self.render_project_defaults(&project_id, window, cx))
+            .child(self.render_project_actions(&project_id, window, cx))
             .child(checkouts)
             .child(danger)
             .into_any_element()

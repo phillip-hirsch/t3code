@@ -54,6 +54,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "calendar-clock",
     "calendar-arrow-down",
     "calendar-arrow-up",
+    "bug",
     "chart-no-axes-column",
     "chevrons-left-right-ellipsis",
     "chevron-down",

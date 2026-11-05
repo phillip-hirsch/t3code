@@ -147,6 +147,8 @@ pub struct Workspace {
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
     scheduled_tasks_view: Option<gpui_kit::AnyView>,
     preview: preview::PreviewState,
+    /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
+    t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -225,6 +227,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
+            t3_project_files: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
