@@ -95,6 +95,10 @@ impl Attachment {
         &self.bytes
     }
 
+    pub(super) fn image(&self) -> Option<Arc<Image>> {
+        self.image.clone()
+    }
+
     /// The server's id once the upload finished.
     pub(super) fn uploaded_id(&self) -> Option<&str> {
         match &self.upload {
@@ -165,7 +169,7 @@ fn classify(name: &str) -> Result<(Kind, &'static str), String> {
 }
 
 /// `formatAttachmentSize`: whole KB, or one decimal of MB from 1024 KB.
-fn format_size(bytes: u64) -> String {
+pub(super) fn format_size(bytes: u64) -> String {
     let kb = (bytes as f64 / 1024.).ceil();
     if kb >= 1024. { format!("{:.1} MB", bytes as f64 / 1024. / 1024.) } else { format!("{kb} KB") }
 }
@@ -468,7 +472,7 @@ impl Workspace {
         .detach();
     }
 
-    fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };
         let attachment = self.attachments.remove(index);
         if let (Upload::Ready(id), Some(client)) = (&attachment.upload, self.client()) {
@@ -652,6 +656,7 @@ impl Workspace {
             Upload::Failed(_) => "Attach again".to_owned(),
         };
         let failed = matches!(attachment.upload, Upload::Failed(_));
+        let preview_id = id.clone();
         h_flex()
             .id(ElementId::Name(format!("attachment-{id}").into()))
             .min_w_0()
@@ -659,7 +664,20 @@ impl Workspace {
             .py(px(4.))
             .text_sm()
             .child(Icon::new(Lucide::File).with_size(px(16.)).text_color(t.muted_foreground))
-            .child(div().flex_1().min_w_0().truncate().text_color(t.foreground).child(attachment.name.clone()))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("preview-{id}").into()))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(t.foreground)
+                    .hover(|s| s.underline())
+                    .child(attachment.name.clone())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.open_attachment_preview(&preview_id, window, cx)),
+                    ),
+            )
             .child(div().text_xs().text_color(t.muted_foreground).child(status))
             .when(failed, |el| {
                 el.child(

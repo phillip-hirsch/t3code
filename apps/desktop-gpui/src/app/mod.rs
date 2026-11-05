@@ -23,6 +23,7 @@ use crate::runtime;
 use crate::timeline::{self, Row};
 
 mod alerts;
+mod attachment_preview;
 mod attachments;
 mod chat;
 mod composer;

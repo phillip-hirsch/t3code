@@ -526,6 +526,7 @@ impl Workspace {
         let placeholder = self.placeholder(first_approval);
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
+        let chip_view = view.clone();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -535,6 +536,15 @@ impl Workspace {
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| render_chip(token, &t))
+            // A file chip opens its preview (`composerContextActions.openFile`).
+            .on_token_click(move |event, window, cx| {
+                if let Some(Chip::Context { kind, id, .. }) = Chip::from_id(event.token().id())
+                    && kind == "file"
+                    && let Some(local_id) = id.strip_prefix("file_")
+                {
+                    let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+                }
+            })
             .on_paste(move |item, window, cx| {
                 view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
             });
