@@ -37,7 +37,16 @@ impl Workspace {
             return div().into_any_element();
         };
         let scripts = resolve_project_scripts(&self.server_info.settings, project);
-        let overridden = has_project_scripts_override(&self.server_info.settings, project_id);
+        // Every checkout of the group is a target; differing lists are edited one environment at a time.
+        let targets = self.script_targets(project_id);
+        let mixed = targets.iter().any(|id| {
+            self.shell
+                .projects
+                .iter()
+                .find(|p| &p.id == id)
+                .is_some_and(|p| resolve_project_scripts(&self.server_info.settings, p) != scripts)
+        });
+        let overridden = targets.iter().any(|id| has_project_scripts_override(&self.server_info.settings, id));
         let root = project.workspace_root.clone();
         let file = self.t3_project_file(&root, cx).clone();
         let importable: Vec<ScriptInput> =
@@ -98,7 +107,14 @@ impl Workspace {
                 .render(&t)
                 .into_any_element(),
         ];
-        if scripts.is_empty() {
+        if mixed {
+            list.push(
+                RowFrame::new("Different actions across environments")
+                    .description("Choose one environment to edit its list. Adding an action here adds it on every selected environment.")
+                    .render(&t)
+                    .into_any_element(),
+            );
+        } else if scripts.is_empty() {
             list.push(
                 div()
                     .px(px(16.))
@@ -109,7 +125,7 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        for script in &scripts {
+        for script in scripts.iter().filter(|_| !mixed) {
             list.push(self.render_action_row(project_id, script, &t, window, cx));
         }
         if file == T3ProjectFile::Invalid {
