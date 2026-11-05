@@ -7761,6 +7761,7 @@ dependencies = [
  "webview2-com",
  "win32job",
  "windows-core 0.61.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

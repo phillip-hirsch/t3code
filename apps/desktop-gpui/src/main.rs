@@ -4,6 +4,7 @@ mod backend;
 mod composer_search;
 mod composer_text;
 mod device;
+mod environments;
 mod inbox;
 mod keybindings;
 mod model;

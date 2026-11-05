@@ -70,6 +70,8 @@ pub(super) enum Variant {
     Outline,
     DestructiveOutline,
     Ghost,
+    /// `ghost-muted`: muted text on no background.
+    GhostMuted,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub(super) struct WebButton {
     variant: Variant,
     size: Size,
     disabled: bool,
+    full_width: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -103,6 +106,7 @@ impl WebButton {
             variant: Variant::Outline,
             size: Size::Xs,
             disabled: false,
+            full_width: false,
             on_click: None,
         }
     }
@@ -127,6 +131,11 @@ impl WebButton {
         self
     }
 
+    pub fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
+    }
+
     pub fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_click = Some(Rc::new(handler));
         self
@@ -145,10 +154,10 @@ impl RenderOnce for WebButton {
             Variant::DestructiveOutline => {
                 (outline_bg, t.input, t.error_foreground, t.error.opacity(0.04), t.error.opacity(0.32))
             }
-            Variant::Ghost => (
+            Variant::Ghost | Variant::GhostMuted => (
                 gpui_kit::transparent_black(),
                 gpui_kit::transparent_black(),
-                t.foreground,
+                if self.variant == Variant::Ghost { t.foreground } else { t.muted_foreground },
                 t.accent,
                 gpui_kit::transparent_black(),
             ),
@@ -170,7 +179,8 @@ impl RenderOnce for WebButton {
             .bg(bg)
             .text_color(text)
             .font_weight(FontWeight::MEDIUM)
-            .whitespace_nowrap();
+            .whitespace_nowrap()
+            .when(self.full_width, |el| el.w_full());
         let base = match self.size {
             Size::Xs => text_xs(base),
             Size::Default => text_sm(base),

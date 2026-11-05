@@ -45,6 +45,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// A saved environment's address and bearer session, which cannot be renewed.
+    pub fn bearer(http_base: &str, bearer_token: String) -> Self {
+        Self { http_base: http_base.trim_end_matches('/').to_owned(), bearer_token, bootstrap_secret: None }
+    }
+
     pub fn ws_url(&self) -> String {
         let rest = self.http_base.strip_prefix("http").unwrap_or(&self.http_base);
         format!("ws{rest}/ws")
