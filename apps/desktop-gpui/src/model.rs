@@ -58,6 +58,8 @@ pub struct ProviderModel {
     pub sub_provider: Option<String>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    pub is_legacy: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -112,6 +114,11 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub installed: bool,
+    /// `ServerProviderAuth`; only `status` is read.
+    #[serde(default)]
+    pub auth: Value,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -173,6 +180,10 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// `environment.capabilities.oneTimeSchedules`: the server saves `{type: "once"}` tasks.
+    pub one_time_schedules: bool,
+    /// `ManagedPolicySummary`, or null when no administrator policy applies.
+    pub managed_policy: Value,
 }
 
 impl ServerInfo {
@@ -188,6 +199,9 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.one_time_schedules =
+                    config.pointer("/environment/capabilities/oneTimeSchedules").and_then(Value::as_bool) == Some(true);
+                self.managed_policy = config.get("managedPolicy").cloned().unwrap_or_default();
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -291,6 +305,8 @@ pub struct ProjectShell {
     pub default_thread_env_mode: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,

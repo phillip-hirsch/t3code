@@ -117,6 +117,8 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
+    scheduled_tasks_view: Option<gpui_kit::AnyView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +181,7 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            scheduled_tasks_view: None,
             _subscriptions: subscriptions,
         }
     }
