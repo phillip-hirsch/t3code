@@ -30,10 +30,12 @@ mod header;
 mod layout;
 mod pages;
 mod sidebar;
+mod terminal;
 mod titlebar;
 mod visits;
 
 gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
+pub use terminal::key_bindings as terminal_key_bindings;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -117,6 +119,7 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    terminals: terminal::Terminals,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +182,7 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            terminals: terminal::Terminals::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -326,6 +330,7 @@ impl Workspace {
             |this, _, cx| this.notify_sidebar(cx),
         )];
         self.shell_retried = false;
+        self.subscribe_terminal_metadata(&client, window, cx);
         self.subscribe_shell(window, cx);
         self.subscribe_thread(window, cx);
         cx.notify();
@@ -622,7 +627,7 @@ impl Workspace {
                     let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
                     DraftWorkspace::new(&self.server_info, project, has_threads)
                 });
-                let thread_id = new_id();
+                let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
                 let input = json!({
                     "commandId": new_id(),
                     "creationSource": "web",
@@ -772,6 +777,7 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
+        let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()
             .size_full()
@@ -784,6 +790,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -817,7 +824,8 @@ impl Render for Workspace {
                                     )
                                     .children(self.render_details_card(window, cx)),
                             }
-                        })),
+                        }))
+                        .children(terminal_drawer),
                 ),
             )
             .child(self.render_titlebar_overlay(window, cx))

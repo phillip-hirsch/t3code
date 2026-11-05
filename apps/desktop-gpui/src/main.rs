@@ -39,6 +39,7 @@ fn main() {
             KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
             KeyBinding::new("ctrl-shift-b", app::ToggleThreadDetails, None),
         ]);
+        cx.bind_keys(app::terminal_key_bindings());
         // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {

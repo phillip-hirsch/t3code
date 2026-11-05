@@ -9,6 +9,7 @@ name = "t3-desktop"
 path = "src/main.rs"
 
 [dependencies]
+alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
 env_logger = "0.11"
