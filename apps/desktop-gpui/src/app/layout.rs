@@ -41,7 +41,8 @@ pub(super) fn inline_card_left(canvas: f32) -> Option<f32> {
 impl Workspace {
     fn canvas_width(&self, window: &Window) -> f32 {
         let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
-        f32::from(window.viewport_size().width) - sidebar - f32::from(RIGHT_RESIZE_INSET)
+        let right_panel = self.right_panel_width(window).unwrap_or(0.);
+        f32::from(window.viewport_size().width) - sidebar - right_panel - f32::from(RIGHT_RESIZE_INSET)
     }
 
     /// Whether the details card fits inline; otherwise it is a popover.

@@ -15,7 +15,7 @@ use gpui_kit::{
     rgb, svg,
 };
 
-use super::{ToggleSidebar, Workspace};
+use super::{ToggleRightPanel, ToggleSidebar, Workspace};
 use crate::theme;
 
 /// `--workspace-topbar-height` with Electron's 40px titlebar overlay on Windows.
@@ -127,8 +127,9 @@ impl Workspace {
                     .tooltip(tooltip("Terminal drawer is unavailable")),
             )
             .child(
-                toggle("toggle-right-panel", "icons/panel-right.svg", false, false)
-                    .tooltip(tooltip("Right panel is unavailable")),
+                toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
+                    .tooltip(tooltip("Toggle right panel (Ctrl+Alt+B)"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleRightPanel), cx)),
             )
     }
 }

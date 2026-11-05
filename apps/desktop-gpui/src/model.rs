@@ -173,6 +173,16 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    pub environment_id: Option<String>,
+    /// `settings.snoozePresets`; `None` uses `DEFAULT_SNOOZE_PRESETS`.
+    pub snooze_presets: Option<Value>,
+    /// `settings.confirmThreadArchive` / `confirmThreadDelete`.
+    pub confirm_thread_archive: bool,
+    pub confirm_thread_delete: bool,
+    /// `availableEditors`: the editor ids `shell.openInEditor` can launch here.
+    pub available_editors: Vec<String>,
+    /// `environment.capabilities`, read by the thread actions menu.
+    pub capabilities: Value,
 }
 
 impl ServerInfo {
@@ -186,8 +196,11 @@ impl ServerInfo {
                     config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
+                self.environment_id = text("/environment/environmentId");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.available_editors = lossy(&config["availableEditors"]).unwrap_or_default();
+                self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -205,7 +218,14 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.snooze_presets = settings.get("snoozePresets").cloned();
+        self.confirm_thread_archive = settings.get("confirmThreadArchive").and_then(Value::as_bool) == Some(true);
+        self.confirm_thread_delete = settings.get("confirmThreadDelete").and_then(Value::as_bool) != Some(false);
         Ok(())
+    }
+
+    pub fn capability(&self, name: &str) -> bool {
+        self.capabilities.get(name).and_then(Value::as_bool) == Some(true)
     }
 
     /// `resolveEnvironmentMachineKind` in `packages/contracts/src/server.ts`.
@@ -294,6 +314,9 @@ pub struct ProjectShell {
     /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
     #[serde(default)]
     pub project_icon: Option<Value>,
+    /// `ProjectScript`s, kept whole so an update sends back fields this client does not read.
+    #[serde(default)]
+    pub scripts: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -411,6 +434,8 @@ pub struct ThreadShell {
     pub snoozed_until: Option<String>,
     #[serde(default)]
     pub snoozed_at: Option<String>,
+    #[serde(default)]
+    pub auto_settle_disabled_at: Option<String>,
     #[serde(default)]
     pub pin_order_key: Option<String>,
     #[serde(default)]
@@ -604,6 +629,17 @@ pub struct ProviderThread {
     pub id: String,
     #[serde(default)]
     pub context_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub app_thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSession {
+    pub id: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -623,6 +659,8 @@ pub struct Run {
     pub started_at: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -732,6 +770,23 @@ pub struct ThreadProjection {
     pub provider_threads: Vec<ProviderThread>,
     #[serde(default, deserialize_with = "lossy")]
     pub provider_turns: Vec<ProviderTurn>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub provider_sessions: Vec<ProviderSession>,
+}
+
+/// `OrchestrationV2Checkpoint`: the git snapshot taken when a turn ends.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// The turn number the checkpoint closes; `None` for a scope's base snapshot.
+    #[serde(default)]
+    pub app_run_ordinal: Option<u32>,
+    pub captured_at: String,
 }
 
 impl ThreadProjection {
@@ -750,6 +805,24 @@ impl ThreadProjection {
             let active = self.thread.active_provider_thread_id.as_ref()?;
             self.provider_threads.iter().find(|thread| &thread.id == active)?.context_usage.as_ref()
         })
+    }
+
+    /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.
+    pub fn provider_session(&self) -> Option<&ProviderSession> {
+        let active = self.runs.iter().rev().find(|run| is_active_run_status(&run.status));
+        let provider_thread_id =
+            active.and_then(|run| run.provider_thread_id.as_ref()).or(self.thread.active_provider_thread_id.as_ref());
+        let attached = provider_thread_id
+            .and_then(|id| self.provider_threads.iter().find(|thread| &thread.id == id))
+            .or_else(|| {
+                self.provider_threads.iter().find(|thread| {
+                    thread.app_thread_id.as_ref() == Some(&self.thread.id) && thread.provider_session_id.is_some()
+                })
+            });
+        match attached.and_then(|thread| thread.provider_session_id.as_ref()) {
+            Some(id) => self.provider_sessions.iter().find(|session| &session.id == id),
+            None => self.provider_sessions.iter().rev().find(|s| !matches!(s.status.as_str(), "stopped" | "error")),
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -831,6 +904,16 @@ impl ThreadProjection {
                 }
                 upsert(&mut self.provider_turns, turn, |t| &t.id);
             }
+            "provider-session.attached" | "provider-session.updated" => {
+                upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id)
+            }
+            "provider-session.detached" => {
+                let id = payload["providerSessionId"].as_str().unwrap_or_default();
+                if let Some(session) = self.provider_sessions.iter_mut().find(|s| s.id == id) {
+                    session.status = "stopped".into();
+                }
+            }
+            "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "thread.pull-request-link-updated" => {}
             kind if kind.starts_with("thread.") => self.thread = AppThread::deserialize(payload)?,
             _ => {}

@@ -26,14 +26,25 @@ use crate::timeline::{self, Row};
 mod chat;
 mod composer;
 mod details;
+mod git;
 mod header;
 mod layout;
 mod pages;
+mod right_panel;
 mod sidebar;
+mod thread_menu;
 mod titlebar;
 mod visits;
 
-gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
+gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails, ToggleRightPanel]);
+
+/// Runs a shell command in the thread's terminal, as a project script does.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = workspace, no_json)]
+pub struct RunInTerminal {
+    pub cwd: String,
+    pub command: String,
+}
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -104,6 +115,13 @@ pub struct Workspace {
     details_popover: bool,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
+    /// The git status of the open target's workspace.
+    vcs: git::VcsWatch,
+    /// The editor "Open in" launches, once picked.
+    preferred_editor: Option<String>,
+    right_panel: right_panel::RightPanel,
+    /// The thread title's menu and inline rename.
+    title: thread_menu::TitleState,
     _connection_task: Task<()>,
     _stream_tasks: Vec<Task<()>>,
     _shell_task: Option<Task<()>>,
@@ -170,6 +188,10 @@ impl Workspace {
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
+            vcs: git::VcsWatch::default(),
+            preferred_editor: None,
+            right_panel: right_panel::RightPanel::new(cx),
+            title: thread_menu::TitleState::default(),
             _connection_task: Self::connect(window, cx),
             _stream_tasks: Vec::new(),
             _shell_task: None,
@@ -772,6 +794,8 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
+        self.sync_vcs(window, cx);
+        let right_panel = self.render_right_panel(window, cx);
         let theme = cx.theme();
         div()
             .size_full()
@@ -784,6 +808,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -794,31 +819,38 @@ impl Render for Workspace {
                 this.escape_details_popover(event, window, cx);
             }))
             .child(
-                h_flex().size_full().when(self.sidebar_open, |el| el.child(self.render_cached_sidebar())).child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .min_w_0()
-                        .pr(titlebar::RIGHT_RESIZE_INSET)
-                        .child(self.render_header(cx))
-                        .children(self.render_error(cx))
-                        .child(div().relative().flex_1().min_h_0().map(|el| {
-                            match (self.page, self.target.clone()) {
-                                (Some(page), _) => el.child(self.render_page(page, window, cx)),
-                                (None, Some(Target::Draft { project_id })) => el
-                                    .child(self.render_draft_stage(&project_id, window, cx))
-                                    .children(self.render_details_card(window, cx)),
-                                (None, _) => el
-                                    .child(
-                                        v_flex()
-                                            .size_full()
-                                            .child(self.render_body(window, cx))
-                                            .child(self.render_composer(window, cx)),
-                                    )
-                                    .children(self.render_details_card(window, cx)),
-                            }
-                        })),
-                ),
+                h_flex()
+                    .size_full()
+                    .when(self.sidebar_open, |el| el.child(self.render_cached_sidebar()))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
+                            .child(self.render_header(cx))
+                            .children(self.render_error(cx))
+                            .child(div().relative().flex_1().min_h_0().map(|el| {
+                                match (self.page, self.target.clone()) {
+                                    (Some(page), _) => el.child(self.render_page(page, window, cx)),
+                                    (None, Some(Target::Draft { project_id })) => el
+                                        .child(self.render_draft_stage(&project_id, window, cx))
+                                        .children(self.render_details_card(window, cx)),
+                                    (None, _) => el
+                                        .child(
+                                            v_flex()
+                                                .size_full()
+                                                .child(self.render_body(window, cx))
+                                                .child(self.render_composer(window, cx)),
+                                        )
+                                        .children(self.render_details_card(window, cx)),
+                                }
+                            })),
+                    )
+                    .children(
+                        right_panel
+                            .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
+                    ),
             )
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_settings(window, cx))

@@ -2,14 +2,15 @@
 //! doubles as the window's drag region (`ChatView.tsx` header + `ChatHeader.tsx`).
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WindowControlArea, div, px, rgb,
+    StatefulInteractiveElement as _, Styled as _, WindowControlArea, canvas, div, px, rgb,
 };
 
-use super::titlebar::{CAPTION_BUTTONS_WIDTH, COLLAPSED_CONTENT_LEFT, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT};
+use super::titlebar::{CAPTION_BUTTONS_WIDTH, COLLAPSED_CONTENT_LEFT, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
 use crate::theme;
 
@@ -18,12 +19,14 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
+        // An open right panel owns the titlebar controls, so the header only keeps `pr-10`.
+        let panel_open = self.right_panel_open();
         let header = h_flex()
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
             .pl(if self.sidebar_open { px(20.) } else { COLLAPSED_CONTENT_LEFT })
-            .pr(controls_inset)
+            .pr(if panel_open { px(0.) } else { controls_inset })
             .bg(tokens.background)
             .window_control_area(WindowControlArea::Drag);
         if let Some(page) = self.page {
@@ -69,7 +72,8 @@ impl Workspace {
                 .hover(|style| style.text_color(tokens.foreground))
         };
         let separator = || div().flex_none().text_color(tokens.muted_foreground).child("/");
-        let mut breadcrumb = h_flex().flex_1().min_w_0().gap_3().pr(px(96.)).text_sm().font_medium();
+        let mut breadcrumb =
+            h_flex().flex_1().min_w_0().gap_3().pr(px(if panel_open { 40. } else { 96. })).text_sm().font_medium();
         if let Some(project) = project {
             // `ChatHeader.tsx` names the project by its title, not its repository.
             let name: SharedString = project.title.clone().into();
@@ -100,9 +104,58 @@ impl Workspace {
                 )
                 .child(separator());
         }
-        header.child(
-            breadcrumb.child(div().min_w(px(40.)).flex_1().truncate().text_color(tokens.foreground).child(title)),
-        )
+        let title = match (&self.target, &self.title.rename) {
+            (Some(Target::Thread(_)), Some(rename)) => div()
+                .min_w(px(40.))
+                .flex_1()
+                .occlude()
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_rename(cx);
+                    }
+                }))
+                .child(Input::new(&rename.input).small().text_color(tokens.foreground))
+                .into_any_element(),
+            (Some(Target::Thread(_)), None) => self.render_title_button(title, &tokens, cx),
+            _ => div().min_w(px(40.)).flex_1().truncate().text_color(tokens.foreground).child(title).into_any_element(),
+        };
+        header.child(breadcrumb.child(title)).children(self.render_title_menu())
+    }
+
+    /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
+    fn render_title_button(&self, title: SharedString, tokens: &theme::Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let bounds = self.title.bounds.clone();
+        h_flex()
+            .id("thread-title")
+            .group("thread-title")
+            .relative()
+            .min_w(px(40.))
+            .flex_shrink(1.)
+            .gap_1()
+            .occlude()
+            .cursor_pointer()
+            .text_color(tokens.foreground)
+            .child(div().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .id("thread-title-chevron")
+                    .flex_none()
+                    .invisible()
+                    .group_hover("thread-title", |style| style.visible())
+                    .child(icon("icons/chevron-down.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.click_title(1, true, window, cx);
+                    })),
+            )
+            .child(
+                canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, _, _, _| {}).absolute().size_full(),
+            )
+            .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
+                this.click_title(event.click_count(), false, window, cx)
+            }))
+            .into_any_element()
     }
 
     pub(super) fn render_error(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {

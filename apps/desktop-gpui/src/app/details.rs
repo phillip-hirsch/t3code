@@ -1,18 +1,23 @@
 //! The floating thread details card at the canvas' top right
-//! (`chat/ThreadDetailsCard.tsx`, `ThreadDetailsPanel.tsx`). Only rows backed by
-//! real data render: environment, branch, the parent thread, usage limits and context.
+//! (`chat/ThreadDetailsCard.tsx`, `ThreadDetailsPanel.tsx`): the environment,
+//! Open in, project scripts, branch, git actions, Changes, lineage, usage limits
+//! and context, at the density the card's height allows.
 
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    Anchor, AnyElement, App, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, anchored, deferred, div,
-    hsla, point, px, relative, rgb,
+    hsla, img, point, px, relative, rgb, svg,
 };
+use serde_json::{Value, json};
 
+use super::git::{self, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
-use super::{Target, Workspace};
+use super::{Target, Workspace, new_id};
 use crate::model::{ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 
@@ -20,8 +25,13 @@ const CARD_WIDTH: f32 = 280.;
 const CARD_INSET: f32 = 12.;
 const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
+/// A section's 8px top and 10px bottom padding.
+const SECTION_PADDING: f32 = 18.;
+/// A section heading: 32px plus its 4px bottom margin.
+const HEADING_HEIGHT: f32 = 36.;
 
 /// The card's opaque stand-ins for `dropdown-glass`; GPUI has no backdrop blur.
+#[derive(Clone, Copy)]
 struct CardColors {
     background: Hsla,
     border: Hsla,
@@ -53,6 +63,25 @@ impl CardColors {
     }
 }
 
+/// `resolveThreadDetailsCardDensity`: compact drops the environment and lineage
+/// rows, essential also drops Open in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Density {
+    Essential,
+    Compact,
+    Full,
+}
+
+fn resolve_density(available: f32, full: f32, compact: f32) -> Density {
+    if full <= available {
+        Density::Full
+    } else if compact <= available {
+        Density::Compact
+    } else {
+        Density::Essential
+    }
+}
+
 /// One label | bar | value row of the usage grid (`ThreadDetailsUsage.tsx` `UsageRow`).
 struct Meter {
     id: SharedString,
@@ -65,6 +94,58 @@ struct Meter {
     value: SharedString,
     value_color: Hsla,
     tooltip: SharedString,
+}
+
+/// A section and the rows it would take at each density, for the height estimate.
+struct Section {
+    element: AnyElement,
+    /// Content height without padding.
+    height: f32,
+    /// Shown only at this density or above.
+    min_density: Density,
+}
+
+/// `EDITORS` labels, with the file manager named for Windows.
+fn editor_label(id: &str) -> &str {
+    match id {
+        "cursor" => "Cursor",
+        "trae" => "Trae",
+        "kiro" => "Kiro",
+        "vscode" => "VS Code",
+        "vscode-insiders" => "VS Code Insiders",
+        "vscodium" => "VSCodium",
+        "zed" => "Zed",
+        "antigravity" => "Antigravity",
+        "idea" => "IntelliJ IDEA",
+        "file-manager" if cfg!(target_os = "macos") => "Finder",
+        "file-manager" if cfg!(target_os = "windows") => "File Explorer",
+        "file-manager" => "Files",
+        other => other,
+    }
+}
+
+/// The editor's logo (`OpenInPicker.tsx` `resolveOpenInOptions`), full color where the web's is.
+fn editor_icon(id: &str, tokens: &Tokens) -> AnyElement {
+    let size = px(16.);
+    match id {
+        "vscode" => img("icons/app/vscode.svg").size(size).flex_none().into_any_element(),
+        "file-manager" if cfg!(target_os = "windows") => {
+            img("icons/app/file-explorer.svg").size(size).flex_none().into_any_element()
+        }
+        "cursor" => svg()
+            .path("icons/app/cursor.svg")
+            .size(size)
+            .flex_none()
+            .text_color(rgb(if tokens.dark { 0xedecec } else { 0x26251e }))
+            .into_any_element(),
+        "file-manager" => {
+            icon("icons/folder-closed.svg").with_size(size).text_color(tokens.muted_foreground).into_any_element()
+        }
+        _ => icon("icons/square-arrow-out-up-right.svg")
+            .with_size(size)
+            .text_color(tokens.muted_foreground)
+            .into_any_element(),
+    }
 }
 
 impl Workspace {
@@ -97,15 +178,39 @@ impl Workspace {
         }
         let tokens = *theme::tokens(cx);
         let colors = CardColors::new(&tokens);
-        let sections: Vec<AnyElement> = [
-            self.workspace_section(&tokens, &colors),
-            self.branch_section(&tokens, &colors),
+        let inline = self.details_inline(window);
+        let viewport = window.viewport_size();
+        let available = if inline {
+            f32::from(viewport.height - TITLEBAR_HEIGHT) - CARD_INSET * 2.
+        } else {
+            f32::from(viewport.height) - 104.
+        };
+        let sections: Vec<Section> = [
+            self.workspace_section(&tokens, &colors, cx),
+            self.version_control_section(&tokens, &colors, cx),
             self.lineage_section(&tokens, &colors, cx),
             self.usage_section(&tokens, &colors),
             self.context_section(&tokens, &colors),
         ]
         .into_iter()
         .flatten()
+        .collect();
+        let height_at = |density: Density| {
+            let heights = sections.iter().filter(|s| s.min_density <= density).map(|s| s.height + SECTION_PADDING);
+            heights.sum::<f32>() + 2.
+        };
+        let density = resolve_density(available, height_at(Density::Full), height_at(Density::Compact));
+        // Re-rendered at the chosen density, so hidden rows never build.
+        let sections: Vec<AnyElement> = [
+            self.workspace_section_at(density, &tokens, &colors, cx),
+            self.version_control_section_at(density, &tokens, &colors, cx),
+            (density == Density::Full).then(|| self.lineage_section(&tokens, &colors, cx)).flatten(),
+            self.usage_section(&tokens, &colors),
+            self.context_section(&tokens, &colors),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|section| section.element)
         .enumerate()
         .map(|(index, section)| {
             v_flex()
@@ -127,7 +232,7 @@ impl Workspace {
             .border_color(colors.border)
             .bg(colors.background)
             .children(sections);
-        if self.details_inline(window) {
+        if inline {
             return Some(
                 div()
                     .absolute()
@@ -142,8 +247,8 @@ impl Workspace {
         // `PopoverPopup variant="panel"` under the header, `align="end"`: 4px align
         // offset plus its 8px padding put the card where the inline one sits, 8px
         // below the header, capped at `100dvh - 6.5rem`.
-        let viewport = window.viewport_size();
-        let corner = point(viewport.width - RIGHT_RESIZE_INSET - px(CARD_INSET), TITLEBAR_HEIGHT + px(8.));
+        let right = self.right_panel_width(window).map_or(px(0.), px) + RIGHT_RESIZE_INSET;
+        let corner = point(viewport.width - right - px(CARD_INSET), TITLEBAR_HEIGHT + px(8.));
         Some(
             deferred(
                 anchored().anchor(Anchor::TopRight).position(corner).child(
@@ -161,8 +266,40 @@ impl Workspace {
         )
     }
 
+    fn workspace_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
+        self.workspace_section_at(Density::Full, tokens, colors, cx).map(|mut section| {
+            // Compact keeps Open in and the scripts row; essential keeps only scripts.
+            section.min_density = Density::Essential;
+            section.height = section.height.min(ROW_HEIGHT * 3.);
+            section
+        })
+    }
+
+    /// Environment, Open in and the project scripts row (`ThreadDetailsPanel` workspace section).
+    fn workspace_section_at(
+        &self,
+        density: Density,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Section> {
+        let rows: Vec<AnyElement> = [
+            (density == Density::Full).then(|| self.environment_row(tokens, colors)).flatten(),
+            (density != Density::Essential).then(|| self.open_in_row(tokens, colors, cx)).flatten(),
+            self.scripts_row(tokens, colors, cx),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!rows.is_empty()).then(|| Section {
+            height: rows.len() as f32 * ROW_HEIGHT,
+            element: v_flex().children(rows).into_any_element(),
+            min_density: Density::Essential,
+        })
+    }
+
     /// The environment row: machine icon, environment label, workspace kind at the far right.
-    fn workspace_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
+    fn environment_row(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
         let label = self.server_info.environment_label.clone()?;
         let machine = match self.server_info.machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => "icons/monitor.svg",
@@ -196,19 +333,460 @@ impl Workspace {
         )
     }
 
-    fn branch_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
-        let branch = self.open_projection()?.thread.branch.clone()?;
+    /// The editor the Open in row launches: the last one picked, else the first available (`usePreferredEditor`).
+    fn preferred_editor(&self) -> Option<&str> {
+        let available = &self.server_info.available_editors;
+        self.preferred_editor
+            .as_deref()
+            .filter(|editor| available.iter().any(|id| id == editor))
+            .or_else(|| available.first().map(String::as_str))
+    }
+
+    /// `OpenInPicker` in panel mode: the row opens the preferred editor, the chevron picks it.
+    fn open_in_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let project = self.target_project()?;
+        if project.workspace_root.is_empty() {
+            return None;
+        }
+        let preferred = self.preferred_editor().map(str::to_owned);
+        let label: SharedString = match &preferred {
+            Some(editor) => format!("Open in {}", editor_label(editor)).into(),
+            None => "Open in editor".into(),
+        };
+        let leading = match &preferred {
+            Some(editor) => editor_icon(editor, tokens),
+            None => icon("icons/square-arrow-out-up-right.svg")
+                .with_size(px(16.))
+                .text_color(tokens.muted_foreground)
+                .into_any_element(),
+        };
+        let view = cx.entity();
+        let editors = self.server_info.available_editors.clone();
+        let current = preferred.clone();
+        let menu_tokens = *tokens;
+        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            if editors.is_empty() {
+                return menu.item(PopupMenuItem::new("No installed editors found").disabled(true));
+            }
+            for editor in &editors {
+                let picked = editor.clone();
+                let label = SharedString::from(editor_label(editor).to_owned());
+                let checked = current.as_deref() == Some(editor.as_str());
+                let item_editor = editor.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        h_flex().gap_2().child(editor_icon(&item_editor, &menu_tokens)).child(label.clone())
+                    })
+                    .checked(checked)
+                    .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                        this.preferred_editor = Some(picked.clone());
+                        cx.notify();
+                    })),
+                );
+            }
+            menu
+        };
+        let enabled = preferred.is_some() && self.git_cwd().is_some();
         Some(
-            row(colors)
-                .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                .child(div().flex_1().min_w_0().truncate().child(branch))
+            split_row("details-open-in", colors, cx)
+                .child(
+                    split_primary("details-open-in-primary", colors, enabled, cx)
+                        .child(leading)
+                        .child(div().min_w_0().truncate().child(label))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editor) = preferred.clone() {
+                                this.open_in_editor(editor, cx);
+                            }
+                        })),
+                )
+                .child(split_hairline("details-open-in", colors))
+                .child(
+                    split_menu("details-open-in-menu", tokens, colors, cx)
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                            build(menu.min_w(px(264.)), window, cx)
+                        }),
+                )
                 .into_any_element(),
         )
     }
 
+    /// `shell.openInEditor` on the thread's workspace.
+    fn open_in_editor(&mut self, editor: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };
+        self.preferred_editor = Some(editor.clone());
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = client.request("shell.openInEditor", json!({"cwd": cwd, "editor": editor})).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(format!("Couldn't open the editor: {error}").into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// `ProjectScriptsControl` in panel mode: run the first script, pick or add one from the menu,
+    /// or "Add project script" while the project has none.
+    fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let project = self.target_project()?;
+        let project_id = project.id.clone();
+        let scripts: Vec<(SharedString, SharedString)> = project
+            .scripts
+            .iter()
+            .filter_map(|script| {
+                let name = script.get("name")?.as_str()?;
+                let command = script.get("command")?.as_str()?;
+                Some((name.to_owned().into(), command.to_owned().into()))
+            })
+            .collect();
+        let Some((name, command)) = scripts.first().cloned() else {
+            return Some(
+                action_row("details-add-script", colors, cx)
+                    .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
+                    .child(div().ml(px(2.)).truncate().child("Add project script"))
+                    .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_add_script_dialog(project_id.clone(), window, cx)
+                    }))
+                    .into_any_element(),
+            );
+        };
+        let view = cx.entity();
+        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            for (name, command) in &scripts {
+                let command = command.clone();
+                menu = menu.item(PopupMenuItem::new(name.clone()).icon(icon("icons/play.svg")).on_click(
+                    window.listener_for(&view, move |this, _, window, cx| {
+                        this.run_project_script(command.clone(), window, cx)
+                    }),
+                ));
+            }
+            let project_id = project_id.clone();
+            menu.separator().item(PopupMenuItem::new("Add action").icon(icon("icons/plus.svg")).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.open_add_script_dialog(project_id.clone(), window, cx)
+                }),
+            ))
+        };
+        let tooltip: SharedString = format!("Run {name}").into();
+        Some(
+            split_row("details-scripts", colors, cx)
+                .child(
+                    split_primary("details-scripts-primary", colors, true, cx)
+                        .child(icon("icons/play.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                        .child(div().min_w_0().truncate().child(name))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.run_project_script(command.clone(), window, cx)
+                            }),
+                        ),
+                )
+                .child(split_hairline("details-scripts", colors))
+                .child(
+                    split_menu("details-scripts-menu", tokens, colors, cx)
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                            build(menu.min_w(px(264.)), window, cx)
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
+    fn run_project_script(&mut self, command: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = self.git_cwd() else { return };
+        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: command.to_string() }), cx);
+    }
+
+    /// `ProjectScriptEditorDialog` for a new script, saved with `project.update`.
+    fn open_add_script_dialog(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::input::{Input, InputState};
+        use gpui_kit::{AppContext as _, Focusable as _};
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Test"));
+        let command = cx.new(|cx| InputState::new(window, cx).placeholder("bun test"));
+        let view = cx.entity();
+        let focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus.replace(false) {
+                name.focus_handle(cx).focus(window, cx);
+            }
+            let (name, command, view) = (name.clone(), command.clone(), view.clone());
+            let project_id = project_id.clone();
+            dialog
+                .title("Add Action")
+                .w(px(448.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(field("Name", Input::new(&name)))
+                        .child(field("Command", Input::new(&command))),
+                )
+                .button_props(gpui_kit::component::dialog::DialogButtonProps::default().ok_text("Save action"))
+                .on_ok(move |_, _, cx: &mut App| {
+                    let name = name.read(cx).value().trim().to_owned();
+                    let command = command.read(cx).value().trim().to_owned();
+                    if name.is_empty() || command.is_empty() {
+                        return false;
+                    }
+                    view.update(cx, |this, cx| this.add_project_script(&project_id, name, command, cx));
+                    true
+                })
+        });
+    }
+
+    fn add_project_script(&mut self, project_id: &str, name: String, command: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client() else { return };
+        let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
+        let mut scripts = project.scripts.clone();
+        scripts.push(new_script(&scripts, &name, &command));
+        let mutation = json!({
+            "type": "project.update",
+            "commandId": new_id(),
+            "projectId": project_id,
+            "scripts": scripts,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = client.request("projects.mutate", mutation).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(format!("Couldn't save the action: {error}").into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn version_control_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
+        self.version_control_section_at(Density::Full, tokens, colors, cx).map(|mut section| {
+            section.min_density = Density::Essential;
+            section
+        })
+    }
+
+    /// Branch, the git actions and Changes (`BranchToolbar` branch section + `GitActionsControl`).
+    fn version_control_section_at(
+        &self,
+        density: Density,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Section> {
+        self.vcs.cwd.as_ref()?;
+        let status = self.vcs.status.as_ref();
+        let is_repo = status.is_none_or(|status| status.local.is_repo);
+        let branch = status
+            .and_then(|status| status.local.ref_name.clone())
+            .or_else(|| self.open_projection().and_then(|p| p.thread.branch.clone()));
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if is_repo {
+            if let Some(branch) = branch {
+                rows.push(
+                    row(colors)
+                        .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                        .child(div().flex_1().min_w_0().truncate().child(branch))
+                        .into_any_element(),
+                );
+            }
+        }
+        let Some(status) = status else {
+            return (!rows.is_empty()).then(|| Section {
+                height: rows.len() as f32 * ROW_HEIGHT,
+                element: v_flex().children(rows).into_any_element(),
+                min_density: Density::Essential,
+            });
+        };
+        if !status.local.is_repo {
+            let running = self.vcs.running.is_some();
+            rows.push(
+                action_row("details-init-git", colors, cx)
+                    .when(running, |el| el.opacity(0.64))
+                    .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
+                    .child(div().ml(px(2.)).child(if running { "Initializing..." } else { "Initialize Git" }))
+                    .when(!running, |el| {
+                        el.on_click(
+                            cx.listener(|this, _, _, cx| this.run_vcs_request("vcs.init", "Initializing...", cx)),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        } else {
+            let quick = git::quick_action(Some(status), self.vcs.running.is_some());
+            let (insertions, deletions, _) = git::changes_totals(status);
+            let quiet_empty_draft = matches!(self.target, Some(Target::Draft { .. }))
+                && self.vcs.running.is_none()
+                && quick.disabled()
+                && insertions == 0
+                && deletions == 0;
+            if !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
+                rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
+            }
+            if !quiet_empty_draft {
+                rows.push(self.changes_row(status, tokens, colors, cx));
+            }
+        }
+        (!rows.is_empty()).then(|| Section {
+            height: rows.len() as f32 * ROW_HEIGHT,
+            element: v_flex().children(rows).into_any_element(),
+            min_density: Density::Essential,
+        })
+    }
+
+    /// The quick action with its menu, or the running action's progress.
+    fn git_actions_row(
+        &self,
+        status: &git::VcsStatus,
+        quick: &git::QuickAction,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(progress) = self.vcs.running.clone() {
+            return row(colors)
+                .bg(if tokens.dark { hsla(0., 0., 1., 0.055) } else { hsla(0., 0., 0., 0.035) })
+                .child(icon("icons/refresh-cw.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                .child(div().flex_1().min_w_0().truncate().child(progress))
+                .into_any_element();
+        }
+        let disabled = quick.disabled();
+        let kind = quick.kind.clone();
+        let hint = match &quick.kind {
+            QuickKind::Hint(hint) => Some(SharedString::from(hint.clone())),
+            _ => None,
+        };
+        let view = cx.entity();
+        let items = git::menu_actions(status, false);
+        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            for item in &items {
+                let action = item.action;
+                menu = menu.item(
+                    PopupMenuItem::new(item.label.clone()).icon(icon(item.icon)).disabled(!item.enabled).on_click(
+                        window.listener_for(&view, move |this, _, window, cx| match action {
+                            "commit" => this.open_commit_dialog(window, cx),
+                            action => this.run_git_action(action, None, cx),
+                        }),
+                    ),
+                );
+            }
+            menu
+        };
+        split_row("details-git", colors, cx)
+            .child(
+                split_primary("details-git-primary", colors, !disabled, cx)
+                    .child(icon(quick.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(div().min_w_0().truncate().child(quick.label.clone()))
+                    .when_some(hint, |el, hint| {
+                        el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| match &kind {
+                        QuickKind::Run(action) => this.run_git_action(action, None, cx),
+                        QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
+                        QuickKind::Publish => this.open_publish_hint(window, cx),
+                        QuickKind::Hint(_) => {}
+                    })),
+            )
+            .child(split_hairline("details-git", colors))
+            .child(
+                split_menu("details-git-menu", tokens, colors, cx)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                        build(menu.min_w(px(264.)), window, cx)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The commit dialog: an optional message; blank lets the server write one.
+    fn open_commit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::input::{Input, InputState};
+        use gpui_kit::{AppContext as _, Focusable as _};
+        let message = cx.new(|cx| InputState::new(window, cx).placeholder("Leave empty to auto-generate"));
+        let branch =
+            self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()).unwrap_or("(detached HEAD)".into());
+        let view = cx.entity();
+        let focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus.replace(false) {
+                message.focus_handle(cx).focus(window, cx);
+            }
+            let (message, view) = (message.clone(), view.clone());
+            dialog
+                .title("Commit changes")
+                .w(px(512.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::tokens(cx).muted_foreground)
+                                .child("Review and confirm your commit. Leave the message blank to auto-generate one."),
+                        )
+                        .child(field("Branch", div().text_sm().child(branch.clone())))
+                        .child(field("Commit message (optional)", Input::new(&message))),
+                )
+                .button_props(gpui_kit::component::dialog::DialogButtonProps::default().ok_text("Commit"))
+                .on_ok(move |_, _, cx: &mut App| {
+                    let text = message.read(cx).value().trim().to_owned();
+                    view.update(cx, |this, cx| this.run_commit(text, cx));
+                    true
+                })
+        });
+    }
+
+    fn run_commit(&mut self, message: String, cx: &mut Context<Self>) {
+        self.run_git_action("commit", (!message.is_empty()).then_some(message), cx);
+    }
+
+    /// Publishing a repository needs a source-control sign-in flow this client does not have yet.
+    fn open_publish_hint(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.error = Some("Add a remote to this repository to publish it.".into());
+        cx.notify();
+    }
+
+    /// `Changes  +N -M`: opens the diff in the right panel.
+    fn changes_row(
+        &self,
+        status: &git::VcsStatus,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (insertions, deletions, base) = git::changes_totals(status);
+        let addition = if insertions > 0 { git::addition_color(tokens) } else { tokens.muted_foreground };
+        let deletion = if deletions > 0 { git::deletion_color(tokens) } else { tokens.muted_foreground };
+        let base_label =
+            base.map(|base| SharedString::from(format!("vs {}", base.strip_prefix("origin/").unwrap_or(base))));
+        action_row("details-changes", colors, cx)
+            .child(icon("icons/file-diff.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+            .child(div().flex_none().child("Changes"))
+            .children(base_label.map(|label| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .text_color(colors.muted)
+                    .child(label)
+            }))
+            .child(
+                h_flex()
+                    .ml_auto()
+                    .flex_none()
+                    .gap(px(6.))
+                    .font_family(theme::FONT_MONO)
+                    .text_xs()
+                    .child(div().text_color(addition).child(format!("+{}", git::group_thousands(insertions))))
+                    .child(div().text_color(deletion).child(format!("-{}", git::group_thousands(deletions)))),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx)))
+            .into_any_element()
+    }
+
     /// `ThreadRelationshipsPanel` from the shell: the parent thread, running
     /// subagents, and settled ones folded under "Previous agents".
-    fn lineage_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn lineage_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
         let Some(Target::Thread(id)) = &self.target else { return None };
         let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
         let parent = thread.lineage.parent_thread_id.as_ref().and_then(|parent| self.thread_shell(parent));
@@ -221,7 +799,11 @@ impl Workspace {
                     && child.lineage.relationship_to_parent.as_deref() == Some("subagent")
             })
             .partition(|child| is_settled_status(&child.status));
-        if parent.is_none() && active.is_empty() && previous.is_empty() {
+        let can_detach = self
+            .open_projection()
+            .and_then(|projection| projection.provider_session())
+            .is_some_and(|session| !matches!(session.status.as_str(), "stopped" | "error"));
+        if parent.is_none() && active.is_empty() && previous.is_empty() && !can_detach {
             return None;
         }
         let relationship_row = |thread: &ThreadShell, path: &'static str, cx: &mut Context<Self>| {
@@ -247,18 +829,24 @@ impl Workspace {
             0 => "Lineage".into(),
             running => format!("Lineage · {running} running").into(),
         };
-        let mut section = v_flex()
-            // A lone "Previous agents" row names itself.
-            .when(parent.is_some() || !active.is_empty(), |el| el.child(section_heading(heading, tokens)));
+        let mut rows = 0usize;
+        let show_heading = parent.is_some() || !active.is_empty() || can_detach;
+        let mut section = v_flex().when(show_heading, |el| {
+            let actions = can_detach.then(|| self.lineage_menu(tokens, colors, cx));
+            el.child(section_heading(heading, tokens).children(actions))
+        });
         if let Some(parent) = parent {
             section = section.child(relationship_row(parent, "icons/corner-left-up.svg", cx));
+            rows += 1;
         }
         for child in &active {
             section = section.child(relationship_row(child, "icons/bot.svg", cx));
+            rows += 1;
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
             let thread_id = id.clone();
+            rows += 1;
             section = section.child(
                 row(colors)
                     .id("details-previous-agents")
@@ -291,10 +879,61 @@ impl Workspace {
             if expanded {
                 for child in &previous {
                     section = section.child(relationship_row(child, "icons/bot.svg", cx));
+                    rows += 1;
                 }
             }
         }
-        Some(section.into_any_element())
+        Some(Section {
+            height: rows as f32 * ROW_HEIGHT + if show_heading { HEADING_HEIGHT } else { 0. },
+            element: section.into_any_element(),
+            min_density: Density::Full,
+        })
+    }
+
+    /// The Lineage heading's "…" menu: Disconnect agent session (`provider-session.detach`).
+    fn lineage_menu(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        Button::new("details-lineage-more")
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .foreground(tokens.muted_foreground)
+                    .hover(colors.hover)
+                    .active(colors.hover),
+            )
+            .size(px(24.))
+            .rounded(px(6.))
+            .child(icon("icons/ellipsis.svg").with_size(px(14.)))
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
+                menu.min_w(px(240.)).item(
+                    PopupMenuItem::new("Disconnect agent session")
+                        .icon(icon("icons/unplug.svg"))
+                        .on_click(window.listener_for(&view, |this, _, _, cx| this.detach_provider_sessions(cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// `stopThreadSession`: detaches every provider session of the open thread.
+    fn detach_provider_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(projection) = self.open_projection() else { return };
+        let thread_id = projection.thread.id.clone();
+        let command_id = new_id();
+        let commands: Vec<Value> = projection
+            .provider_sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "type": "provider-session.detach",
+                    "commandId": format!("{command_id}:detach:{}", session.id),
+                    "threadId": thread_id,
+                    "providerSessionId": session.id,
+                    "reason": "client-requested",
+                })
+            })
+            .collect();
+        for command in commands {
+            self.dispatch(command, cx);
+        }
     }
 
     fn thread_shell(&self, id: &str) -> Option<&ThreadShell> {
@@ -302,31 +941,63 @@ impl Workspace {
     }
 
     /// The selected provider's limit windows; each bar reads as room left.
-    fn usage_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
+    fn usage_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<Section> {
         let selection = self.composer_model()?;
         let limits = self.server_info.provider(&selection.instance_id)?.usage_limits.as_ref()?;
-        Some(meter_grid(limit_meters(limits, tokens), colors))
+        let meters = limit_meters(limits, tokens);
+        Some(Section {
+            height: meters.len() as f32 * METER_ROW_HEIGHT,
+            element: meter_grid(meters, colors),
+            min_density: Density::Essential,
+        })
     }
 
-    fn context_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
+    fn context_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<Section> {
         let usage = self.open_projection()?.context_usage()?;
-        Some(meter_grid(vec![context_meter(usage, tokens)], colors))
+        Some(Section {
+            height: METER_ROW_HEIGHT,
+            element: meter_grid(vec![context_meter(usage, tokens)], colors),
+            min_density: Density::Essential,
+        })
     }
 
-    fn open_projection(&self) -> Option<&crate::model::ThreadProjection> {
+    pub(super) fn open_projection(&self) -> Option<&crate::model::ThreadProjection> {
         match &self.target {
             Some(Target::Thread(_)) => self.thread.as_ref()?.state.projection.as_ref(),
             _ => None,
         }
     }
 
-    fn target_project(&self) -> Option<&crate::model::ProjectShell> {
+    pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
         let project_id = match self.target.as_ref()? {
             Target::Thread(id) => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
             Target::Draft { project_id } => project_id,
         };
         self.shell.projects.iter().find(|project| &project.id == project_id)
     }
+}
+
+/// A new `ProjectScript` with a unique slug id (`nextProjectScriptId`).
+fn new_script(existing: &[Value], name: &str, command: &str) -> Value {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug: String = slug.chars().take(24).collect();
+    let slug = slug.trim_end_matches('-');
+    let base = if slug.is_empty() { "script".to_owned() } else { slug.to_owned() };
+    let taken = |id: &str| existing.iter().any(|script| script.get("id").and_then(Value::as_str) == Some(id));
+    let id = (1..).map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") }).find(|id| !taken(id)).unwrap();
+    json!({"id": id, "name": name, "command": command, "icon": "play", "runOnWorktreeCreate": false})
+}
+
+fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
+    v_flex().gap(px(6.)).child(div().text_sm().font_weight(gpui_kit::FontWeight::MEDIUM).child(label)).child(input)
 }
 
 /// The statuses `ThreadRelationshipsControl.tsx` files under "Previous agents".
@@ -348,11 +1019,67 @@ fn row(colors: &CardColors) -> gpui_kit::Div {
         .text_color(colors.label)
 }
 
-fn section_heading(title: SharedString, tokens: &Tokens) -> impl IntoElement {
+/// `part="row"`: a whole-row button with the panel's hover fill.
+fn action_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let hover = colors.hover;
+    row(colors).id(id).cursor_pointer().hover(move |style| style.bg(hover))
+}
+
+/// `THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS`: the pair shares one hover fill and shows its hairline.
+fn split_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let hover = colors.hover;
+    h_flex().id(id).group(id).h(px(ROW_HEIGHT)).w_full().flex_none().rounded(px(8.)).hover(move |style| style.bg(hover))
+}
+
+/// The split's primary half; each half stacks its own fill over the group's.
+fn split_primary(
+    id: &'static str,
+    colors: &CardColors,
+    enabled: bool,
+    _: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let hover = colors.hover;
+    h_flex()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .gap(px(10.))
+        .px(px(10.))
+        .rounded_l(px(8.))
+        .text_size(px(13.))
+        .font_weight(gpui_kit::FontWeight::MEDIUM)
+        .text_color(colors.label)
+        .when(enabled, |el| el.cursor_pointer().hover(move |style| style.bg(hover)))
+        .when(!enabled, |el| el.opacity(0.64))
+}
+
+/// The 1×16 `bg-border/65` hairline between the halves, shown while the pair is hovered.
+fn split_hairline(group: &'static str, colors: &CardColors) -> impl IntoElement {
+    let line = colors.divider;
+    div().w(px(1.)).h(px(16.)).flex_none().group_hover(group, move |style| style.bg(line))
+}
+
+/// The 32px chevron half that opens the row's menu.
+fn split_menu(id: &'static str, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Workspace>) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx).foreground(tokens.muted_foreground).hover(colors.hover).active(colors.hover),
+        )
+        .w(px(32.))
+        .h(px(ROW_HEIGHT))
+        .rounded_r(px(8.))
+        .rounded_l(px(0.))
+        .child(icon("icons/chevron-down.svg").with_size(px(16.)))
+}
+
+fn section_heading(title: SharedString, tokens: &Tokens) -> gpui_kit::Div {
     h_flex()
         .mb_1()
         .min_h(px(32.))
         .px(px(10.))
+        .gap_2()
+        .justify_between()
         .text_size(px(11.))
         .line_height(px(16.))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -407,9 +1134,11 @@ fn context_meter(usage: &TokenUsage, tokens: &Tokens) -> Meter {
         None => used_label.clone(),
     };
     let tooltip = match (used, max) {
-        (Some(used), Some(max)) => {
-            format!("Context: {used}% used · {} of {} tokens", group_thousands(usage.used_tokens), group_thousands(max))
-        }
+        (Some(used), Some(max)) => format!(
+            "Context: {used}% used · {} of {} tokens",
+            git::group_thousands(usage.used_tokens),
+            git::group_thousands(max)
+        ),
         _ => format!("Context: {used_label} tokens used"),
     };
     let (fill_color, value_color) = match used {
@@ -528,19 +1257,6 @@ fn format_context_tokens(value: u64) -> String {
     }
 }
 
-/// `toLocaleString("en-US")` for an integer.
-fn group_thousands(value: u64) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,10 +1281,17 @@ mod tests {
     }
 
     #[test]
-    fn thousands_are_grouped() {
-        assert_eq!(group_thousands(7), "7");
-        assert_eq!(group_thousands(1_000), "1,000");
-        assert_eq!(group_thousands(345_000), "345,000");
-        assert_eq!(group_thousands(1_000_000), "1,000,000");
+    fn density_steps_down_as_the_card_shrinks() {
+        assert_eq!(resolve_density(400., 300., 200.), Density::Full);
+        assert_eq!(resolve_density(250., 300., 200.), Density::Compact);
+        assert_eq!(resolve_density(150., 300., 200.), Density::Essential);
+    }
+
+    #[test]
+    fn new_scripts_get_unique_slugs() {
+        let existing = vec![json!({"id": "run-tests"})];
+        assert_eq!(new_script(&existing, "Run tests", "bun test")["id"], "run-tests-2");
+        assert_eq!(new_script(&[], "Dev server!", "bun dev")["id"], "dev-server");
+        assert_eq!(new_script(&[], "!!!", "x")["id"], "script");
     }
 }
