@@ -7744,6 +7744,7 @@ dependencies = [
  "gpui-kit",
  "gpui-webview",
  "hmac",
+ "image",
  "jiff",
  "lb-wry",
  "log",

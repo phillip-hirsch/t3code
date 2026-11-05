@@ -3,7 +3,7 @@
 //! This client hosts a thread's desktop-runtime preview tabs in native WebViews
 //! (WebView2 on Windows) and reports their navigation with `preview.reportStatus`,
 //! as Electron's `<webview>` host does. Server-runtime tabs, which agents open, run in
-//! the server's own Chromium; this client cannot draw them yet, so they are not listed.
+//! the server's own Chromium and stream to the panel (`server.rs`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,6 +29,7 @@ use crate::theme::{self, Tokens};
 
 #[cfg(windows)]
 mod native;
+mod server;
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
@@ -96,6 +97,8 @@ pub(super) struct PreviewState {
     pub(super) menu_open: bool,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
+    /// Agent tabs' streams.
+    server: server::ServerStreams,
     _events: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -137,6 +140,7 @@ impl PreviewState {
             address_tab: None,
             menu_open: false,
             stale: HashSet::new(),
+            server: Default::default(),
             _events: None,
             _subscription: subscription,
         }
@@ -171,9 +175,9 @@ impl Workspace {
         }
     }
 
-    /// Tabs this client can draw: everything but the server's own browser.
+    /// Tabs this client draws: its own pages and the agents' streamed ones.
     fn hosted_sessions<'a>(previews: &'a ThreadPreviews) -> impl Iterator<Item = &'a Session> {
-        previews.sessions.iter().filter(|session| !session.server_hosted())
+        previews.sessions.iter()
     }
 
     /// The tab the panel shows, else the thread's focused tab, or its last drawable one when an
@@ -184,9 +188,7 @@ impl Workspace {
             Some(Surface::Browser(tab)) => previews.get(tab),
             _ => None,
         };
-        shown
-            .or_else(|| previews.active().filter(|session| !session.server_hosted()))
-            .or_else(|| Self::hosted_sessions(previews).last())
+        shown.or_else(|| previews.active()).or_else(|| Self::hosted_sessions(previews).last())
     }
 
     /// A tab's zoom and page colour scheme: its own, else the defaults it was created with.
@@ -496,9 +498,15 @@ impl Workspace {
                 return;
             }
         };
-        let Some(tab_id) = self.active_session(&thread_id).map(|s| s.tab_id.clone()) else {
+        let Some((tab_id, server)) = self.active_session(&thread_id).map(|s| (s.tab_id.clone(), s.server_hosted()))
+        else {
             return self.open_preview_tab(thread_id, Some(url), window, cx);
         };
+        if server {
+            self.send_server_input(&tab_id, json!({"type": "navigate", "url": url}));
+            window.blur(cx);
+            return;
+        }
         match self.preview.tabs.get(&tab_id) {
             Some(tab) => tab.view.update(cx, |view, _| view.load_url(&url)),
             None => self.host_tab(&thread_id, &tab_id, &url, window, cx),
@@ -729,6 +737,7 @@ impl Workspace {
     /// Applies each hosted tab's zoom, colour scheme and visibility to its native view, after the
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.retain_server_streams(cx);
         let covered = self.browser_covered(window, cx);
         let panel = self.preview.panel_view.take().filter(|_| !covered);
         let mini = self.preview.mini_view.take().filter(|_| !covered);
@@ -740,8 +749,9 @@ impl Workspace {
                 if self.preview.tabs.contains_key(tab_id) {
                     continue;
                 }
-                let url =
-                    self.preview.threads.get(&thread_id).and_then(|p| p.get(tab_id)).and_then(|s| s.nav_status.url());
+                let url = (self.preview.threads.get(&thread_id).and_then(|p| p.get(tab_id)))
+                    .filter(|s| !s.server_hosted())
+                    .and_then(|s| s.nav_status.url());
                 if let Some(url) = url.map(str::to_owned) {
                     self.host_tab(&thread_id, tab_id, &url, window, cx);
                 }
@@ -790,7 +800,7 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .child(self.render_preview_chrome(thread_id, &tokens, window, cx))
-            .child(self.render_page_area(thread_id, tab_id, available, cx))
+            .child(self.render_page_area(thread_id, tab_id, available, window, cx))
             .into_any_element()
     }
 
@@ -800,10 +810,15 @@ impl Workspace {
         thread_id: &str,
         tab_id: &str,
         available: (f32, f32),
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id)).cloned();
+        if let Some(session) = session.as_ref().filter(|s| s.server_hosted()) {
+            let follow_size = session.viewport.size().is_none();
+            return self.render_server_page(thread_id, tab_id, follow_size, &tokens, window, cx);
+        }
         let fixed = session.as_ref().and_then(|s| s.viewport.size()).map(|size| preview::fit_viewport(size, available));
         self.preview.panel_view = Some((tab_id.to_owned(), fixed.map_or(1., |(_, scale)| scale)));
         let view = self.preview.tabs.get(tab_id).map(|tab| tab.view.clone());
@@ -835,10 +850,20 @@ impl Workspace {
     ) -> impl IntoElement {
         let session = self.active_session(thread_id);
         let hosted = session.and_then(|s| self.preview.tabs.get(&s.tab_id));
-        let (can_back, can_forward) = hosted.map_or((false, false), |tab| (tab.can_go_back, tab.can_go_forward));
-        let loading = hosted.is_some_and(HostedTab::loading);
+        // An agent tab navigates over its stream, from the server's own history.
+        let server_tab = session.filter(|s| s.server_hosted());
+        let (can_back, can_forward) = match server_tab {
+            Some(s) => (s.can_go_back, s.can_go_forward),
+            None => hosted.map_or((false, false), |tab| (tab.can_go_back, tab.can_go_forward)),
+        };
+        let loading = match server_tab {
+            Some(s) => matches!(s.nav_status, NavStatus::Loading { .. }),
+            None => hosted.is_some_and(HostedTab::loading),
+        };
         let url = self.active_url();
-        let has_page = hosted.is_some();
+        let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
+        let server_tab = server_tab.map(|s| s.tab_id.clone());
+        let (back_tab, forward_tab, reload_tab) = (server_tab.clone(), server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
         // The menu's top-right corner: under the trigger at the chrome row's right end.
         let menu_corner = point(window.viewport_size().width - RIGHT_RESIZE_INSET - px(8.), TITLEBAR_HEIGHT + px(32.));
@@ -857,10 +882,13 @@ impl Workspace {
                         icon_button("preview-back", IconName::ArrowLeft, can_back, tokens)
                             .tooltip(tooltip("Back"))
                             .when(can_back, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| {
-                                    this.with_active_view(cx, |view| {
+                                el.on_click(cx.listener(move |this, _, _, cx| match &back_tab {
+                                    Some(tab) => {
+                                        this.send_server_input(tab, json!({"type": "history", "delta": -1}));
+                                    }
+                                    None => this.with_active_view(cx, |view| {
                                         let _ = view.evaluate_script("history.back()");
-                                    })
+                                    }),
                                 }))
                             }),
                     )
@@ -868,10 +896,13 @@ impl Workspace {
                         icon_button("preview-forward", IconName::ArrowRight, can_forward, tokens)
                             .tooltip(tooltip("Forward"))
                             .when(can_forward, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| {
-                                    this.with_active_view(cx, |view| {
+                                el.on_click(cx.listener(move |this, _, _, cx| match &forward_tab {
+                                    Some(tab) => {
+                                        this.send_server_input(tab, json!({"type": "history", "delta": 1}));
+                                    }
+                                    None => this.with_active_view(cx, |view| {
                                         let _ = view.evaluate_script("history.forward()");
-                                    })
+                                    }),
                                 }))
                             }),
                     )
@@ -879,10 +910,13 @@ impl Workspace {
                         icon_button("preview-reload", IconName::RotateCw, has_page, tokens)
                             .tooltip(tooltip(if loading { "Loading…" } else { "Refresh" }))
                             .when(has_page, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| {
-                                    this.with_active_view(cx, |view| {
+                                el.on_click(cx.listener(move |this, _, _, cx| match &reload_tab {
+                                    Some(tab) => {
+                                        this.send_server_input(tab, json!({"type": "reload"}));
+                                    }
+                                    None => this.with_active_view(cx, |view| {
                                         let _ = view.reload();
-                                    })
+                                    }),
                                 }))
                             }),
                     ),
@@ -949,6 +983,9 @@ impl Workspace {
                 }),
             );
         let Some(session) = session.filter(|_| self.preview.menu_open) else { return div().child(trigger) };
+        let server = session.server_hosted();
+        let move_label = self.move_tab_label(session);
+        let moving = session.clone();
         let (zoom, appearance) = self.tab_look(session);
         let preset = session.viewport.preset_id().map(str::to_owned);
         let fill = session.viewport.size().is_none();
@@ -998,14 +1035,26 @@ impl Workspace {
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| close(this, cx)))
             .child(item("menu-hard-reload".into(), "Hard reload".into(), false, has_page).when(has_page, |el| {
                 el.on_click(cx.listener(move |this, _, _, cx| {
-                    this.with_active_view(cx, hard_reload);
+                    if server {
+                        this.adjust_preview("preview.adjust", json!({"hardReload": true}), cx);
+                    } else {
+                        this.with_active_view(cx, hard_reload);
+                    }
                     close(this, cx);
                 }))
             }))
-            .child(item("menu-devtools".into(), "Open DevTools".into(), false, has_page).when(has_page, |el| {
-                el.on_click(cx.listener(move |this, _, _, cx| {
-                    this.with_active_view(cx, |view| view.open_devtools());
+            .when(!server, |menu| {
+                menu.child(item("menu-devtools".into(), "Open DevTools".into(), false, has_page).when(has_page, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.with_active_view(cx, |view| view.open_devtools());
+                        close(this, cx);
+                    }))
+                }))
+            })
+            .children(move_label.map(|label| {
+                item("menu-move-tab".into(), label, false, true).on_click(cx.listener(move |this, _, window, cx| {
                     close(this, cx);
+                    this.move_preview_tab(moving.clone(), window, cx);
                 }))
             }))
             .child(separator())
