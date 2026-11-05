@@ -206,10 +206,18 @@ fn font_specimen(background: &str, foreground: &str, dark: bool) -> String {
 
 /// An asset URL as the client fetches it: relative URLs join the server's origin.
 pub(super) fn resolve_asset_url(http_base: &str, relative: &str) -> String {
-    if relative.starts_with("http") {
+    if relative.starts_with("http://") || relative.starts_with("https://") {
         relative.to_owned()
     } else {
         format!("{}/{}", http_base.trim_end_matches('/'), relative.trim_start_matches('/'))
+    }
+}
+
+/// Whether `url` is on the server at `http_base`: only those requests carry the bearer token.
+pub(super) fn is_server_url(url: &str, http_base: &str) -> bool {
+    match (url::Url::parse(url), url::Url::parse(http_base)) {
+        (Ok(url), Ok(base)) => url.origin() == base.origin(),
+        _ => false,
     }
 }
 
@@ -602,6 +610,7 @@ mod tests {
         assert!(audio.contains("content=\"dark\""));
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
+        assert_eq!(resolve_asset_url("http://h:1", "httpx/y"), "http://h:1/httpx/y", "a path, not a URL");
         assert_eq!(css_hex(gpui_kit::rgb(0x0a0b0c).into()), "#0a0b0c");
         assert_eq!(css_hex(gpui_kit::rgba(0xffffff80).into()), "rgba(255,255,255,0.502)");
         assert_eq!(font_mime(b"wOF2...."), Some("font/woff2"));
@@ -622,5 +631,21 @@ mod tests {
         assert!(page.contains("const source = \"graph TD\\n A\\u003c/script>\\u003cb>x\\u003c/b>\";"));
         assert!(page.contains("default-src 'none'") && page.contains("--pele-bg:#000"));
         assert!(pele_script().starts_with(b"/*! Pele 1.8.0"), "the vendored renderer decompresses");
+    }
+
+    #[test]
+    fn the_bearer_token_only_goes_to_the_server() {
+        let base = "http://127.0.0.1:3999";
+        for (url, server) in [
+            ("http://127.0.0.1:3999/api/assets/a", true),
+            ("http://127.0.0.1:3999", true),
+            ("https://127.0.0.1:3999/api/assets/a", false),
+            ("http://127.0.0.1:4000/api/assets/a", false),
+            ("http://evil.example/api/assets/a", false),
+            ("http://127.0.0.1:3999@evil.example/a", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(is_server_url(url, base), server, "{url}");
+        }
     }
 }

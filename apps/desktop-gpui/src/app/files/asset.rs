@@ -82,26 +82,37 @@ fn parse(kind: FileKind, name: &str, bytes: &[u8]) -> Result<Parsed, String> {
     }
 }
 
+/// One HTTP client for file fetches, so connections are pooled.
+pub(super) fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// The response body, or `None` once it passes `limit` bytes, with or without a Content-Length.
+pub(super) async fn read_capped(mut response: reqwest::Response, limit: u64) -> reqwest::Result<Option<Vec<u8>>> {
+    if response.content_length().is_some_and(|length| length > limit) {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if (body.len() + chunk.len()) as u64 > limit {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
 /// The file's bytes from a signed asset URL, refused past `limit`.
 pub(super) async fn fetch_bounded(url: String, limit: u64, too_large: &'static str) -> Result<Vec<u8>, String> {
     crate::runtime()
         .spawn(async move {
             let failed = "The file could not be loaded. Close it and try again.".to_owned();
-            let mut response = reqwest::Client::new().get(url).send().await.map_err(|_| failed.clone())?;
+            let response = http().get(url).send().await.map_err(|_| failed.clone())?;
             if !response.status().is_success() {
                 return Err(failed);
             }
-            if response.content_length().is_some_and(|length| length > limit) {
-                return Err(too_large.to_owned());
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| failed.clone())? {
-                bytes.extend_from_slice(&chunk);
-                if bytes.len() as u64 > limit {
-                    return Err(too_large.to_owned());
-                }
-            }
-            Ok(bytes)
+            read_capped(response, limit).await.map_err(|_| failed)?.ok_or_else(|| too_large.to_owned())
         })
         .await
         .map_err(|error| error.to_string())?
@@ -280,5 +291,38 @@ impl Workspace {
             Some(AssetLoad::Ready(Viewer::Notebook(_))) => self.render_notebook(key, tokens, window, cx),
             Some(AssetLoad::Ready(Viewer::Office(_))) => self.render_office(key, width, tokens, cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    /// A chunked body (no Content-Length) of three 4-byte chunks, read with each limit.
+    async fn read_chunked(limit: u64) -> Option<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            let body = "4\r\naaaa\r\n4\r\nbbbb\r\n4\r\ncccc\r\n0\r\n\r\n";
+            let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.expect("request");
+        assert_eq!(response.content_length(), None, "the server sends no length");
+        let body = read_capped(response, limit).await.expect("read");
+        server.await.expect("server");
+        body
+    }
+
+    #[test]
+    fn reads_without_a_content_length_stop_at_the_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        assert_eq!(runtime.block_on(read_chunked(12)).as_deref(), Some(&b"aaaabbbbcccc"[..]));
+        assert_eq!(runtime.block_on(read_chunked(11)), None);
     }
 }

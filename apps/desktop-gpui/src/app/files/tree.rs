@@ -49,7 +49,8 @@ pub(super) struct TreeState {
     listed: HashMap<String, Vec<Entry>>,
     /// Folders asked for, for Refresh.
     requested: HashSet<String>,
-    loading: HashSet<String>,
+    /// Shared with the rows the last frame drew; copied only when it changes while they hold it.
+    loading: Rc<HashSet<String>>,
     queue: VecDeque<String>,
     in_flight: usize,
     errors: HashMap<String, String>,
@@ -167,7 +168,7 @@ impl Workspace {
             TreeState {
                 listed: HashMap::new(),
                 requested: HashSet::new(),
-                loading: HashSet::new(),
+                loading: Rc::default(),
                 queue: VecDeque::new(),
                 in_flight: 0,
                 errors: HashMap::new(),
@@ -198,7 +199,7 @@ impl Workspace {
             return;
         }
         tree.requested.insert(folder.clone());
-        tree.loading.insert(folder.clone());
+        Rc::make_mut(&mut tree.loading).insert(folder.clone());
         tree.queue.push_back(folder);
         self.pump_folder_loads(cwd, cx);
     }
@@ -209,7 +210,7 @@ impl Workspace {
         while tree.in_flight < MAX_LOADS {
             let Some(folder) = tree.queue.pop_front() else { break };
             let Some(client) = client.clone() else {
-                tree.loading.remove(&folder);
+                Rc::make_mut(&mut tree.loading).remove(&folder);
                 tree.errors.insert(folder, "Not connected.".into());
                 continue;
             };
@@ -224,7 +225,7 @@ impl Workspace {
                 let _ = this.update(cx, |this, cx| {
                     let Some(tree) = this.tree(&cwd) else { return };
                     tree.in_flight -= 1;
-                    tree.loading.remove(&folder);
+                    Rc::make_mut(&mut tree.loading).remove(&folder);
                     match result {
                         Ok(value) => {
                             let entries: Vec<Entry> = logic::entries_from_json(&value)
@@ -445,7 +446,7 @@ impl Workspace {
         let truncated = searching && tree.search.truncated && !tree.search.pending;
         let loading_line = (!ready || tree.search.pending) && (rows.is_empty() || no_matches);
         let query = tree.query.clone();
-        let loading_folders: Rc<HashSet<String>> = Rc::new(tree.loading.clone());
+        let loading_folders = tree.loading.clone();
         let scroll = tree.scroll.clone();
         let muted = tokens.muted_foreground;
         let key = cwd.to_owned();

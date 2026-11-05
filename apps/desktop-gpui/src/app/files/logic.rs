@@ -132,7 +132,7 @@ impl ContentMatch {
     pub(super) fn from_json(value: &Value) -> Option<Self> {
         Some(Self {
             path: value["path"].as_str()?.to_owned(),
-            line: value["lineNumber"].as_u64()? as u32,
+            line: u32::try_from(value["lineNumber"].as_u64()?).ok()?,
             text: value["lineContent"].as_str().unwrap_or_default().to_owned(),
             ranges: value["matchRanges"]
                 .as_array()
