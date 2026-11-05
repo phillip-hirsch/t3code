@@ -24,7 +24,7 @@ fn is_space(c: char) -> bool {
 }
 
 /// `\p{Sc}`, for the symbols a keyboard types.
-fn is_currency(c: char) -> bool {
+pub fn is_currency(c: char) -> bool {
     matches!(c, '$' | '€' | '£' | '¥' | '₹' | '¢' | '₩' | '₽' | '₺' | '₪' | '₫' | '฿' | '₴' | '₦' | '₱')
 }
 

@@ -40,7 +40,7 @@ const PROMPT_LINK_MAX: usize = 8000;
 /// The copy button that just copied, shown as a check until the timer clears it.
 #[derive(Default)]
 pub(super) struct CopyFeedback {
-    id: Option<SharedString>,
+    pub(super) id: Option<SharedString>,
     _reset: Option<Task<()>>,
 }
 
@@ -62,7 +62,7 @@ pub(super) fn prompt_link(prompt: &str) -> Option<String> {
 }
 
 impl Workspace {
-    fn copied(&mut self, id: SharedString, duration: Duration, cx: &mut Context<Self>) {
+    pub(super) fn copied(&mut self, id: SharedString, duration: Duration, cx: &mut Context<Self>) {
         self.copy_feedback.id = Some(id);
         self.copy_feedback._reset = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(duration).await;

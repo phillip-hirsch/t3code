@@ -164,7 +164,7 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
 }
 
 impl Workspace {
-    fn preview_thread_id(&self) -> Option<&str> {
+    pub(super) fn preview_thread_id(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread(id) => Some(id),
             Target::Draft { .. } => None,
@@ -392,7 +392,7 @@ impl Workspace {
 
     /// `preview.open` with the default viewport; `external_fallback` opens `url` in the system
     /// browser when the tab can't be opened, as `useOpenLink` does.
-    fn request_preview_tab(
+    pub(super) fn request_preview_tab(
         &mut self,
         thread_id: String,
         url: Option<String>,

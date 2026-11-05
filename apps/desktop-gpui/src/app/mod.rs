@@ -37,6 +37,7 @@ mod header;
 mod inspector;
 pub(crate) mod keymap;
 mod layout;
+mod markdown_ui;
 mod message_actions;
 mod minimap;
 mod model_picker;
@@ -221,6 +222,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    chat_menu: Option<markdown_ui::ChatMenu>,
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
@@ -344,6 +346,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            chat_menu: None,
             requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),

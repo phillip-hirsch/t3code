@@ -74,6 +74,7 @@ impl Workspace {
                         .with_bottom_fade(background),
                     )
                     .children(minimap)
+                    .children(self.render_chat_menu())
                     .into_any_element()
             }
         }
@@ -87,15 +88,16 @@ impl Workspace {
         breaks: bool,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        let source = |text: &SharedString| if breaks { hard_breaks(text) } else { text.to_string() };
-        if let Some(state) = self.markdown.0.get_mut(&key) {
-            if state.text != *text {
-                state.text = text.clone();
-                state.view.update(cx, |view, cx| view.set_text(&source(text), cx));
-            }
+        if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
             return state.view.clone();
         }
-        let view = cx.new(|cx| TextViewState::markdown(&source(text), cx));
+        let source = self.with_skill_links(&if breaks { hard_breaks(text) } else { text.to_string() });
+        if let Some(state) = self.markdown.0.get_mut(&key) {
+            state.text = text.clone();
+            state.view.update(cx, |view, cx| view.set_text(&source, cx));
+            return state.view.clone();
+        }
+        let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let row_key = key.clone();
         let _changed = cx.observe(&view, move |this, _, cx| {
             if let Some(index) = this.rows.iter().position(|row| shows_markdown(row, &row_key)) {
@@ -927,7 +929,8 @@ fn markdown_view(
         .py(px(1.4))
         .text_size(px(11.9));
     let t = *t;
-    let (header_this, link_this) = (this.clone(), this.clone());
+    let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
+    let table_key = key.clone();
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -936,7 +939,15 @@ fn markdown_view(
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
+        .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .on_link_click(move |url, event, window, cx| {
+            // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
+            if matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right) {
+                let _ =
+                    link_this.update(cx, |workspace, cx| workspace.open_link_menu(url, event.position(), window, cx));
+                return;
+            }
             let _ = link_this.update(cx, |workspace, cx| match thread_link(url) {
                 Some(thread_id) => workspace.select_thread(thread_id, window, cx),
                 // A project's pull request opens in its panel (`pullRequestLinksOpenInApp`); Ctrl-click and
