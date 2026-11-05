@@ -1,0 +1,4 @@
+# Tests may unwrap, expect and print: a panic there is the assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
