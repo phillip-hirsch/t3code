@@ -518,15 +518,21 @@ impl Workspace {
                 .await
                 .map_err(|e| e.message())?;
             let _ = this.update(cx, |this, cx| {
-                let _ = this.server_info.apply(&json!({"type": "settingsUpdated", "payload": {"settings": settings}}));
+                let event = json!({"type": "settingsUpdated", "payload": {"settings": settings}});
+                if let Err(error) = this.server_info.apply(&event) {
+                    log::warn!("saved settings did not decode: {error}");
+                }
                 cx.notify();
             });
             for (method, input) in write.bindings {
                 let result = client.request(method, input).await.map_err(|e| e.message())?;
+                // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
+                let Some(keybindings) = result.get("keybindings").filter(|rules| rules.is_array()) else { continue };
                 let _ = this.update(cx, |this, cx| {
-                    let event =
-                        json!({"type": "keybindingsUpdated", "payload": {"keybindings": result["keybindings"]}});
-                    let _ = this.server_info.apply(&event);
+                    let event = json!({"type": "keybindingsUpdated", "payload": {"keybindings": keybindings}});
+                    if let Err(error) = this.server_info.apply(&event) {
+                        log::warn!("saved keybindings did not decode: {error}");
+                    }
                     cx.notify();
                 });
             }

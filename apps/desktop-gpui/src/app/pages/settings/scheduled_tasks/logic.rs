@@ -73,13 +73,15 @@ pub(in crate::app) enum Schedule {
 impl Schedule {
     pub fn of(value: &Value) -> Self {
         let text = |key: &str| value[key].as_str().unwrap_or_default().to_owned();
+        // `0..=6`, Sunday first; anything else is dropped rather than wrapped.
+        let weekday = |day: &Value| day.as_u64().and_then(|day| u8::try_from(day).ok()).filter(|day| *day < 7);
         match value["type"].as_str() {
             Some("interval") => Schedule::Interval { every_ms: value["everyMs"].as_f64().unwrap_or(0.) },
             Some("fixed_time") => Schedule::FixedTime {
                 time_of_day: text("timeOfDay"),
                 weekdays: value["weekdays"]
                     .as_array()
-                    .map(|days| days.iter().filter_map(|d| d.as_u64().map(|d| d as u8)).collect())
+                    .map(|days| days.iter().filter_map(weekday).collect())
                     .unwrap_or_default(),
             },
             Some("once") => Schedule::Once { run_at: text("runAt") },
@@ -534,6 +536,8 @@ mod tests {
             task_to_draft(&task(json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [5, 1]})), &zone());
         assert_eq!(draft.schedule_mode, ScheduleMode::Fixed);
         assert_eq!(draft.weekdays, BTreeSet::from([1, 5]));
+        let wrapped = Schedule::of(&json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [256, 263, 3]}));
+        assert_eq!(wrapped, Schedule::FixedTime { time_of_day: "07:15".into(), weekdays: vec![3] });
         assert_eq!(
             schedule_from_draft(&draft, &zone()),
             Some(json!({"type": "fixed_time", "timeOfDay": "07:15", "weekdays": [1, 5]}))

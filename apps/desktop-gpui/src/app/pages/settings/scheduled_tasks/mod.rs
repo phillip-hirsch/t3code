@@ -4,7 +4,6 @@
 //! path (`ScheduledTaskEnvironmentSection`); the web's multi-environment list, scope filtering
 //! (`matchesScheduledTaskScope`, everything matches the global scope) and `?taskId=` deep links
 //! do not apply yet. The section has no plain setting rows: every control is RPC-backed.
-//! `section`, `group` and `row` below are placeholders for the foundation's settings widgets.
 
 mod editor;
 pub(in crate::app) mod logic;

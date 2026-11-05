@@ -319,7 +319,7 @@ impl Workspace {
                 this.devices.pending = None;
                 if let Err(error) = result {
                     log::warn!("device.configure failed: {error}");
-                    let note = Notification::error(format!("Could not update {label}."))
+                    let note = Notification::error(format!("Could not update {label}: {}", error_message(&error)))
                         .title("Device settings not saved on all environments");
                     window.push_notification(note, cx);
                 }

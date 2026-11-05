@@ -343,31 +343,18 @@ pub(super) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// `formatAccessTimestamp` (`dateStyle: medium, timeStyle: short`), in UTC: the app
-/// has no time zone database, so it names the zone instead of guessing it.
+/// `formatAccessTimestamp` (`dateStyle: medium, timeStyle: short`) in this machine's zone.
 pub(super) fn format_timestamp(iso: &str) -> String {
-    let Some(ms) = parse_iso_ms(iso) else { return iso.to_owned() };
-    let days = ms.div_euclid(86_400_000);
-    let minute_of_day = ms.rem_euclid(86_400_000) / 60_000;
-    // Civil from days, after Howard Hinnant.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let (hour, minute) = (minute_of_day / 60, minute_of_day % 60);
-    let (hour12, meridiem) = match hour {
-        0 => (12, "AM"),
-        1..12 => (hour, "AM"),
-        12 => (12, "PM"),
-        _ => (hour - 12, "PM"),
-    };
-    format!("{} {day}, {year}, {hour12}:{minute:02} {meridiem} UTC", MONTHS[(month - 1) as usize])
+    format_timestamp_in(iso, &chrono::Local)
+}
+
+fn format_timestamp_in<Tz: chrono::TimeZone>(iso: &str, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
+        .unwrap_or_else(|_| iso.to_owned())
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
@@ -683,8 +670,10 @@ mod tests {
 
     #[test]
     fn timestamps_format_as_medium_date_and_short_time() {
-        assert_eq!(format_timestamp("2026-11-05T15:04:00.000Z"), "Nov 5, 2026, 3:04 PM UTC");
-        assert_eq!(format_timestamp("2024-02-29T00:30:00Z"), "Feb 29, 2024, 12:30 AM UTC");
+        assert_eq!(format_timestamp_in("2026-11-05T15:04:00.000Z", &chrono::Utc), "Nov 5, 2026, 3:04 PM");
+        assert_eq!(format_timestamp_in("2024-02-29T00:30:00Z", &chrono::Utc), "Feb 29, 2024, 12:30 AM");
+        let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert_eq!(format_timestamp_in("2024-02-29T20:30:00Z", &tokyo), "Mar 1, 2024, 5:30 AM");
         assert_eq!(format_timestamp("nonsense"), "nonsense");
     }
 

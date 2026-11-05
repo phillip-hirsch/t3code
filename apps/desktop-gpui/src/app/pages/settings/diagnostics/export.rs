@@ -99,6 +99,9 @@ impl DiagnosticsState {
         let signal = SIGNALS[index].4;
         cx.spawn(async move |this, cx| {
             let response = client.request("server.checkOtlpEndpoint", json!({ "signal": signal, "url": url })).await;
+            if let Err(error) = &response {
+                log::warn!("server.checkOtlpEndpoint failed: {error}");
+            }
             let _ = this.update(cx, |this, cx| {
                 let slot = &mut this.export.checks[index];
                 if slot.as_ref().is_none_or(|check| check.url != url || check.result.is_some()) {

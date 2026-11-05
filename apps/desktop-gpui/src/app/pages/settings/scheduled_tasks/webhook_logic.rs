@@ -414,8 +414,6 @@ pub(super) enum Tone {
     Success,
     Warning,
     Error,
-    #[allow(dead_code, reason = "the task list's running status badge uses it")]
-    Info,
     Outline,
 }
 

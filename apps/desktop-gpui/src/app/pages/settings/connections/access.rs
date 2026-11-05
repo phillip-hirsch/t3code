@@ -249,7 +249,12 @@ impl Workspace {
         let label: SharedString = self.environment_label().unwrap_or("This machine").to_owned().into();
         let mut rows = Vec::new();
         if let Some(organization) = config.pointer("/managedPolicy/organization").and_then(Value::as_str) {
-            let support = config.pointer("/managedPolicy/supportUrl").and_then(Value::as_str).map(str::to_owned);
+            // Only a web page: the OS would open any scheme it is handed.
+            let support = config
+                .pointer("/managedPolicy/supportUrl")
+                .and_then(Value::as_str)
+                .filter(|url| url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "https" | "http")))
+                .map(str::to_owned);
             rows.push(managed_notice(organization, support, t));
         }
         if s.grants(ENVIRONMENT_MAINTAIN) {
@@ -800,7 +805,8 @@ impl CreateLinkForm {
                     Ok(created) => {
                         let (Some(id), Some(credential)) = (created["id"].as_str(), created["credential"].as_str())
                         else {
-                            return;
+                            let message = "The environment sent no pairing credential.";
+                            return error_toast(window, cx, "Could not create pairing URL", message.to_owned());
                         };
                         let _ = this.access.update(cx, |access, cx| {
                             access.credentials.insert(id.to_owned(), credential.to_owned());

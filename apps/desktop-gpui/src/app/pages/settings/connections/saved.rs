@@ -35,6 +35,11 @@ pub(super) struct SavedUi {
     _tick: Option<Task<()>>,
 }
 
+/// A save through a `SavedEnvironments` that was dropped did not happen.
+fn gone(_: anyhow::Error) -> Result<(), String> {
+    Err("The environment list is no longer available.".into())
+}
+
 impl Workspace {
     /// `<SettingsSection id="this-app">` with `LocalEnvironmentSetting`.
     pub(super) fn this_app_section(&self, cx: &App, t: &Tokens) -> AnyElement {
@@ -385,8 +390,8 @@ fn confirm_local_environment(saved: WeakEntity<SavedEnvironments>, enabled: bool
             .ok_text(if enabled { "Restart and turn off" } else { "Restart and turn on" })
             .when(enabled, |dialog| dialog.ok_variant(gpui_kit::component::button::ButtonVariant::Danger))
             .on_ok(move |_, window, cx| {
-                let saved = saved.update(cx, |saved, _| saved.set_local_environment_enabled(!enabled));
-                match saved.unwrap_or(Ok(())).and_then(|()| relaunch()) {
+                let saved = saved.update(cx, |saved, _| saved.set_local_environment_enabled(!enabled)).unwrap_or_else(gone);
+                match saved.and_then(|()| relaunch()) {
                     Ok(()) => cx.quit(),
                     Err(error) => error_toast(window, cx, "Couldn't change this setting.", error),
                 }
@@ -436,7 +441,7 @@ impl AddForm {
                 let saved = match result {
                     // The workspace's own environment is already here (`register` skips platform entries).
                     Ok(paired) if this.primary_id.as_deref() == Some(&paired.environment_id) => Ok(()),
-                    Ok(paired) => this.saved.update(cx, |saved, cx| saved.add(paired, cx)).unwrap_or(Ok(())),
+                    Ok(paired) => this.saved.update(cx, |saved, cx| saved.add(paired, cx)).unwrap_or_else(gone),
                     Err(error) => Err(error),
                 };
                 match saved {
@@ -601,7 +606,7 @@ struct RenameForm {
 impl RenameForm {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.label.read(cx).value().to_string();
-        let result = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx)).unwrap_or(Ok(()));
+        let result = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx)).unwrap_or_else(gone);
         match result {
             Ok(()) => window.close_dialog(cx),
             Err(error) => {

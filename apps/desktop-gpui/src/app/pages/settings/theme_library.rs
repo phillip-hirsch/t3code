@@ -709,9 +709,9 @@ fn export_theme(theme: &ThemeDefinition, window: &mut Window, cx: &mut App) {
         .spawn(cx, async move |cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
             if let Err(error) = std::fs::write(&path, contents) {
+                let message = format!("Could not write {}: {error}", path.display());
                 let _ = cx.update(|window, cx| {
-                    window
-                        .push_notification(Notification::error(error.to_string()).title("Could not export theme"), cx);
+                    window.push_notification(Notification::error(message).title("Could not export theme"), cx);
                 });
             }
         })

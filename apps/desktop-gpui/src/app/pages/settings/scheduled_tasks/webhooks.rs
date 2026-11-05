@@ -2,19 +2,6 @@
 //! (`WebhookEndpointField`, `WebhookDeliveryMode`, `WebhookFiltersField`, the webhook branch of
 //! `ScheduledTaskEditorForm` and `WebhookDeliveriesDialog` in
 //! `apps/web/src/components/settings/ScheduledTasksSettings.tsx`).
-//!
-//! How the editor and the list use this file:
-//! - `Workspace::webhook_context()` captures the client, HTTP origin and session once, when the
-//!   editor or a menu opens.
-//! - Editor: create `cx.new(|cx| WebhookFields::new(context, task, window, cx))` when the dialog opens
-//!   (`task` is the edited `ScheduledTask` JSON, `None` for a new task) and keep it for the dialog's
-//!   life, so typed text survives re-renders. Show `render_webhook_fields(&fields)` while the schedule
-//!   mode is "webhook". Call `set_task` when the task list refreshes (`liveTask`), `set_disabled`
-//!   while saving, and on save `fields.read(cx).schedule(cx)`: `Ok` is the upsert's `schedule`,
-//!   `Err` the toasts to show, in order. When switching to "On webhook", fill an empty prompt with
-//!   `DEFAULT_WEBHOOK_PROMPT`. A managed `webhookTasks` denial still hides these fields, as on the web.
-//! - List row: the web shows no URL on rows; a webhook task's actions menu has "Deliveries" in place
-//!   of "Run now". Add it with `webhook_menu_item(menu, &context, &task)`; `open_deliveries` opens the dialog directly.
 
 use std::time::Duration;
 
@@ -800,7 +787,6 @@ pub(super) fn badge(tone: Tone, text: impl Into<SharedString>, t: &Tokens) -> im
         Tone::Success => tint(t.success_foreground),
         Tone::Warning => (t.warning.opacity(if t.dark { 0.16 } else { 0.08 }), t.warning_foreground),
         Tone::Error => (t.error.opacity(if t.dark { 0.16 } else { 0.08 }), t.error_foreground),
-        Tone::Info => (t.info.opacity(if t.dark { 0.16 } else { 0.08 }), t.info_foreground),
         Tone::Outline => (if t.dark { t.input.opacity(0.32) } else { t.background }, t.foreground),
     };
     div()
