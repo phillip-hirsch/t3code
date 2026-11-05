@@ -37,6 +37,7 @@ mod header;
 mod inspector;
 pub(crate) mod keymap;
 mod layout;
+mod markdown_images;
 mod markdown_ui;
 mod message_actions;
 mod minimap;
@@ -224,6 +225,7 @@ pub struct Workspace {
     quit: quit::QuitState,
     queue: queue::QueueUi,
     now: thread_now::NowUi,
+    markdown_images: markdown_images::ImageCache,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
@@ -350,6 +352,7 @@ impl Workspace {
             quit: Default::default(),
             queue: Default::default(),
             now: Default::default(),
+            markdown_images: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,

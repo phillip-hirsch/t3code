@@ -97,6 +97,7 @@ impl Workspace {
             return state.view.clone();
         }
         let source = self.with_skill_links(&if breaks { hard_breaks(text) } else { text.to_string() });
+        self.load_markdown_images(&key, &source, cx);
         if let Some(state) = self.markdown.0.get_mut(&key) {
             state.text = text.clone();
             state.view.update(cx, |view, cx| view.set_text(&source, cx));
@@ -179,7 +180,7 @@ fn thought_key(entry_id: &str) -> SharedString {
     format!("thought:{entry_id}").into()
 }
 
-fn shows_markdown(row: &Row, key: &str) -> bool {
+pub(super) fn shows_markdown(row: &Row, key: &str) -> bool {
     match row {
         Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
         Row::Workflow { row, .. } => key.strip_prefix("workflow-script:") == Some(row.opening.message_id.as_str()),
@@ -225,9 +226,11 @@ fn markdown_with(
     let key_for_view = key.clone();
     match this.update(cx, |workspace, cx| {
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
-        (workspace.markdown_state(key, text, user, cx), wrap)
+        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone())
     }) {
-        Ok((state, wrap)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t).into_any_element(),
+        Ok((state, wrap, images)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t)
+            .image_source(images.resolver())
+            .into_any_element(),
         Err(_) => div().into_any_element(),
     }
 }
