@@ -37,8 +37,8 @@ gpui-kit = { version = "0.9.0", features = [
   "tree-sitter-yaml",
 ] }
 hmac = "0.12"
-# Agent browser tabs stream JPEG frames; GPUI already builds this crate.
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Agent browser tabs stream JPEG frames and SnapShots encode PNG; GPUI already builds both codecs.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jiff = "0.2"
 log = "0.4"
 raw-window-handle = "0.6"
@@ -69,13 +69,34 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
+# SnapShots' UI Automation text and the taskbar badge's overlay icon; WebView2 already builds this crate.
+windows = { version = "0.61", features = [
+  "Win32_Graphics_Gdi",
+  "Win32_System_Com",
+  "Win32_System_Variant",
+  "Win32_UI_Accessibility",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 windows-core = "0.61"
 win32job = "2"
-# The taskbar badge's overlay icon; gpui already builds resvg with these features.
+# The taskbar badge's overlay icon is drawn with resvg; gpui already builds it with these features.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
-windows = { version = "0.61", features = ["Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
-# DPAPI for saved environments' bearer tokens.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# DPAPI for saved environments' bearer tokens; SnapShots' shortcut, window capture and flash.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 # gpui-base 0.9.0 plus one patch (text decorations on the textarea); see vendor/README.md.
 [patch.crates-io]

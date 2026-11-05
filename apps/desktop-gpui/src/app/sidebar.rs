@@ -1095,7 +1095,7 @@ impl Workspace {
     }
 
     /// New thread in the open thread's project, else the first project.
-    fn new_thread_project(&self) -> Option<String> {
+    pub(super) fn new_thread_project(&self) -> Option<String> {
         let current = match &self.target {
             Some(Target::Thread(id)) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| t.project_id.clone()),
             Some(Target::Draft { project_id }) => Some(project_id.clone()),

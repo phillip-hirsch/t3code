@@ -360,7 +360,7 @@ fn parse_when_draft(expression: &str) -> Result<Option<When>, &'static str> {
 }
 
 /// `keybindingFromKeyboardEvent` for a GPUI keystroke: Ctrl is `mod` except on macOS, where Cmd is.
-fn binding_from_keystroke(keystroke: &Keystroke, mac: bool) -> Option<String> {
+pub(in crate::app) fn binding_from_keystroke(keystroke: &Keystroke, mac: bool) -> Option<String> {
     let key = keystroke.key.to_lowercase();
     let token = match key.as_str() {
         "up" => "arrowup".to_owned(),

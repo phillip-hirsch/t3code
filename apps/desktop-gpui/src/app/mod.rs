@@ -59,6 +59,7 @@ mod right_panel;
 mod send;
 mod side_chat;
 mod sidebar;
+mod snap_shot;
 mod terminal;
 mod thread_menu;
 mod thread_menu_actions;
@@ -238,6 +239,8 @@ pub struct Workspace {
     side_chat: side_chat::SideChats,
     /// Thread notifications: toasts, OS notifications and sounds.
     alerts: alerts::AlertState,
+    /// The SnapShot capture shortcut and Settings' shortcut recorder.
+    snap_shot: snap_shot::SnapShotUi,
     quit: quit::QuitState,
     queue: queue::QueueUi,
     banners: banners::BannerUi,
@@ -298,7 +301,7 @@ impl Workspace {
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
-        Self {
+        let mut workspace = Self {
             connection: Connection::Starting,
             endpoint: None,
             server: None,
@@ -383,6 +386,7 @@ impl Workspace {
             terminals: terminal::Terminals::default(),
             side_chat: Default::default(),
             alerts: Default::default(),
+            snap_shot: Default::default(),
             quit: Default::default(),
             queue: Default::default(),
             banners: Default::default(),
@@ -390,7 +394,9 @@ impl Workspace {
             keep_alive: Default::default(),
             saved_environments,
             _subscriptions: subscriptions,
-        }
+        };
+        workspace.sync_snap_shot(window, cx);
+        workspace
     }
 
     /// Starts or finds the server, then keeps one socket open, reconnecting after drops.
@@ -1004,6 +1010,7 @@ impl Render for Workspace {
                 this.quit_key_up(event, cx)
             }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
+                this.snap_shot_record_modifiers(event, cx);
                 this.quit_modifiers_changed(event, cx)
             }))
             .child(
