@@ -2,22 +2,23 @@
 //! `ProviderSettingsForm.tsx`, `providerStatus.ts`, the row building in `ProviderSettingsPanel.tsx`).
 
 use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Rgba, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Window, div, px, svg,
+    AnyElement, ClipboardItem, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Value, json};
 
-use super::drivers::{self, Control, Driver, EnvironmentField, Field};
+use super::accent::{accent_color_picker, hex_color, normalize_accent_color};
+use super::accounts::codex_setup_managed;
+use super::drivers::{self, Driver, EnvironmentField};
 use super::{
-    ProvidersPage, dot, ghost_icon_button, outline_button, section, select_button, settings_row, switch, text_input,
+    ProvidersPage, divided, dot, ghost_icon_button, group, outline_button, section, settings_row, switch, text_input,
 };
 use crate::app::Workspace;
 use crate::theme::{self, Tokens};
@@ -385,19 +386,8 @@ pub(super) fn last_checked_label(providers: &[Value], now_ms: i64) -> Option<Str
     })
 }
 
-/// `nextProviderConfigWithFieldValue` for text and select fields; `None` drops the config.
-pub(super) fn next_config_with_value(config: Option<&Value>, field: &Field, value: &str) -> Option<Value> {
-    let mut base = config.and_then(Value::as_object).cloned().unwrap_or_default();
-    if !field.persist_empty && value.trim().is_empty() {
-        base.remove(field.key);
-    } else {
-        base.insert(field.key.to_owned(), json!(value));
-    }
-    (!base.is_empty()).then_some(Value::Object(base))
-}
-
 /// Replaces `key` in an instance config, or removes it for `None`.
-fn with_key(instance: &Value, key: &str, value: Option<Value>) -> Value {
+pub(super) fn with_key(instance: &Value, key: &str, value: Option<Value>) -> Value {
     let mut next = instance.as_object().cloned().unwrap_or_default();
     match value {
         Some(value) => next.insert(key.to_owned(), value),
@@ -543,15 +533,8 @@ pub(super) fn initials(label: &str) -> String {
     }
 }
 
-/// `normalizeProviderAccentColor`: `#rrggbb` or nothing.
 pub(super) fn accent_color(instance: &Value) -> Option<String> {
-    let value = instance.get("accentColor")?.as_str()?.trim();
-    (value.len() == 7 && value.starts_with('#') && value[1..].bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| value.to_owned())
-}
-
-fn hex_color(hex: &str) -> Hsla {
-    u32::from_str_radix(&hex[1..], 16).map_or(gpui_kit::black(), |rgb| gpui_kit::rgb(rgb).into())
+    normalize_accent_color(instance.get("accentColor").and_then(Value::as_str))
 }
 
 /// `providerAccentForegroundColor`: black or white, whichever contrasts more.
@@ -562,12 +545,6 @@ fn accent_foreground(hex: &str) -> Hsla {
     };
     let luminance = 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
     if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) { gpui_kit::black() } else { gpui_kit::white() }
-}
-
-fn to_hex(color: Hsla) -> String {
-    let rgba: Rgba = color.into();
-    let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", channel(rgba.r), channel(rgba.g), channel(rgba.b))
 }
 
 fn display_name(row: &InstanceRow, instance: &Value) -> String {
@@ -1035,22 +1012,7 @@ impl Workspace {
         );
 
         // Setup: the account slot where the web shows provider authentication, then API-key fields.
-        let mut setup: Vec<AnyElement> = Vec::new();
-        let can_authenticate = live.as_ref().and_then(|p| p.pointer("/setup/canAuthenticate")).and_then(Value::as_bool);
-        let acp_installed = live.as_ref().is_some_and(|p| p["driver"] == "acpRegistry" && p["installed"] == true);
-        if can_authenticate == Some(true) || acp_installed || row.driver == "antigravity" {
-            setup.push(self.render_provider_account(&row.id, window, cx));
-        } else if row.driver == "cursor" && can_authenticate == Some(false) {
-            setup.push(
-                settings_row(
-                    "Cursor account",
-                    Some("Using CURSOR_API_KEY. Remove it from this provider's environment to use browser sign-in."),
-                    None,
-                    &t,
-                )
-                .into_any_element(),
-            );
-        }
+        let mut setup: Vec<AnyElement> = self.render_provider_account(&row.id, window, cx).into_iter().collect();
         for field in driver.map_or(&[][..], |d| d.environment_fields) {
             setup.push(self.render_environment_field(page, row, &instance, field, &t, window, cx));
         }
@@ -1058,15 +1020,18 @@ impl Workspace {
             sections.push(section("Setup", None, None, setup, false, &t).into_any_element());
         }
 
-        // Runtime: the driver's settings form, or a note for drivers this build does not know.
+        // Runtime: a managed Codex instance's paths in a fold, the driver's settings form, or a note
+        // for drivers this build does not know.
+        let config = instance.get("config").cloned().unwrap_or_default();
+        let managed_codex = row.driver == "codex" && codex_setup_managed(&config);
         match driver {
+            _ if managed_codex => {
+                let fields = self.render_codex_runtime_fields(&row.id, window, cx);
+                sections.push(self.render_runtime_fold(page, &row.id, fields, &t, cx));
+            }
             Some(driver) if !driver.fields.is_empty() => {
-                let fields = runtime_fields(driver, instance.get("config"));
-                let rows = fields
-                    .into_iter()
-                    .map(|field| self.render_settings_field(page, row, &instance, field, &t, window, cx))
-                    .collect::<Vec<_>>();
-                sections.push(section("Runtime", None, None, rows, false, &t).into_any_element());
+                let form = self.render_provider_runtime_form(&row.id, driver, config, window, cx);
+                sections.push(section("Runtime", None, None, [form], false, &t).into_any_element());
             }
             Some(_) => {}
             None => sections.push(
@@ -1102,6 +1067,8 @@ impl Workspace {
             )
             .into_any_element(),
         );
+
+        sections.extend(self.render_acp_session_management(&row.id, false, window, cx));
 
         if driver.is_some() {
             let models = self.render_models_section(page, row, live.as_ref(), &instance, window, cx);
@@ -1262,43 +1229,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let accent = accent_color(instance);
-        let picker_key = row.id.clone();
-        let picker = {
-            let existing = page.read(cx).models.accent_pickers.get(&picker_key).map(|(state, _)| state.clone());
-            match existing {
-                Some(state) => state,
-                None => {
-                    let state = cx.new(|cx| {
-                        let state = ColorPickerState::new(window, cx);
-                        match &accent {
-                            Some(hex) => state.default_value(hex_color(hex)),
-                            None => state,
-                        }
-                    });
-                    let instance_id = row.id.clone();
-                    let subscription: Subscription =
-                        cx.subscribe_in(&state, window, move |this, _, event: &ColorPickerEvent, window, cx| {
-                            let ColorPickerEvent::Change(color) = event;
-                            let Some(row) =
-                                instance_rows(&this.server_info.settings, &this.server_info.providers_json)
-                                    .into_iter()
-                                    .find(|r| r.id == instance_id)
-                            else {
-                                return;
-                            };
-                            let next = with_key(&row.instance(), "accentColor", color.map(|c| json!(to_hex(c))));
-                            if next != row.instance() {
-                                this.persist_provider_instance(&row.id, next, window, cx);
-                            }
-                        });
-                    page.update(cx, |page, _| {
-                        page.models.accent_pickers.insert(picker_key, (state.clone(), subscription))
-                    });
-                    state
-                }
-            }
-        };
+        let view = cx.entity().downgrade();
+        let accent_row = row.clone();
+        let picker = accent_color_picker(
+            SharedString::from(format!("provider-accent-{}", row.id)),
+            &display_name(row, instance),
+            accent_color(instance).as_deref(),
+            move |color, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    let Some(row) = this.instance_row(&accent_row.id) else { return };
+                    let next = with_key(&row.instance(), "accentColor", (!color.is_empty()).then(|| json!(color)));
+                    this.persist_provider_instance(&row.id, next, window, cx);
+                });
+            },
+            window,
+            cx,
+        );
         let name_row = row.clone();
         let input = self.draft_input(
             page,
@@ -1314,18 +1260,7 @@ impl Workspace {
                 this.persist_provider_instance(&name_row.id, next, window, cx);
             },
         );
-        h_flex()
-            .gap_2()
-            .justify_end()
-            .child(
-                ColorPicker::new(&picker)
-                    .small()
-                    .anchor(gpui_kit::Anchor::TopLeft)
-                    .accessibility_label(format!("Accent color for {}", display_name(row, instance)))
-                    .when(accent.is_none(), |p| p.icon(Icon::new(gpui_kit::assets::IconName::Plus).size(px(14.)))),
-            )
-            .child(text_input(&input, Some(224.)))
-            .into_any_element()
+        h_flex().gap_2().justify_end().child(picker).child(text_input(&input, Some(224.))).into_any_element()
     }
 
     /// One `environmentFields` row, e.g. Cursor's API key, kept as a sensitive variable.
@@ -1392,108 +1327,58 @@ impl Workspace {
         settings_row(field.label, field.description, Some(control.into_any_element()), t).into_any_element()
     }
 
-    /// One field of the driver's settings form (`ProviderSettingsFieldRow`, `variant="settings"`).
-    #[allow(clippy::too_many_arguments)]
-    fn render_settings_field(
-        &mut self,
+    /// The saved instance behind a list row, looked up again when a deferred edit commits.
+    pub(super) fn instance_row(&self, instance_id: &str) -> Option<InstanceRow> {
+        instance_rows(&self.server_info.settings, &self.server_info.providers_json)
+            .into_iter()
+            .find(|row| row.id == instance_id)
+    }
+
+    /// A managed Codex instance's Runtime section: folded, its header outside the card
+    /// (`FoldedSettingsSection` with `headerPlacement="outside"`).
+    fn render_runtime_fold(
+        &self,
         page: &Entity<ProvidersPage>,
-        row: &InstanceRow,
-        instance: &Value,
-        field: RuntimeField,
+        instance_id: &str,
+        fields: AnyElement,
         t: &Tokens,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let RuntimeField { field, label, description, placeholder } = field;
-        let config = instance.get("config");
-        let current = config.and_then(|c| c.get(field.key)).and_then(Value::as_str).unwrap_or_default().to_owned();
-        let control = match field.control {
-            Control::Select(options) => {
-                let fallback = options.first().map_or("", |(value, _)| *value);
-                let shown = if current.is_empty() { fallback.to_owned() } else { current };
-                let select_row = row.clone();
-                let view = cx.entity().downgrade();
-                select_button(
-                    SharedString::from(format!("provider-field-{}-{}", row.id, field.key)),
-                    super::options(options),
-                    &shown,
-                    224.,
-                    t,
-                    move |value, window, cx| {
-                        let instance = select_row.instance();
-                        let next_value = if value.as_ref() == fallback { "" } else { value.as_ref() };
-                        let config = next_config_with_value(instance.get("config"), field, next_value);
-                        let next = with_key(&instance, "config", config);
-                        let _ = view
-                            .update(cx, |this, cx| this.persist_provider_instance(&select_row.id, next, window, cx));
-                    },
-                )
-                .into_any_element()
-            }
-            Control::Text | Control::Password => {
-                let secret_configured = field.secret && !current.is_empty();
-                let shown = if field.secret { "" } else { current.as_str() };
-                let placeholder = if secret_configured {
-                    "Stored secret, enter a new value to replace"
-                } else if field.secret {
-                    placeholder.unwrap_or("Not set")
-                } else {
-                    placeholder.unwrap_or("")
-                };
-                let commit_row = row.clone();
-                let input = self.draft_input(
-                    page,
-                    format!("field:{}:{}", row.id, field.key),
-                    shown,
-                    placeholder,
-                    field.control == Control::Password,
-                    window,
-                    cx,
-                    move |this, value, window, cx| {
-                        let instance = commit_row.instance();
-                        let saved = instance.pointer(&format!("/config/{}", field.key)).and_then(Value::as_str);
-                        if field.secret && value.is_empty() && saved.is_some_and(|s| !s.is_empty()) {
-                            return;
-                        }
-                        let config = next_config_with_value(instance.get("config"), field, &value);
-                        this.persist_provider_instance(
-                            &commit_row.id,
-                            with_key(&instance, "config", config),
-                            window,
-                            cx,
-                        );
-                    },
-                );
-                let clear_row = row.clone();
-                h_flex()
-                    .w(px(224.))
-                    .gap_2()
-                    .child(text_input(&input, None).flex_1())
-                    .when(secret_configured, |el| {
-                        el.child(
-                            ghost_icon_button(
-                                SharedString::from(format!("field-clear-{}", field.key)),
-                                gpui_kit::assets::IconName::X,
-                                t,
-                            )
-                            .size(px(28.))
-                            .tooltip(format!("Clear {label}"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let instance = clear_row.instance();
-                                let config = next_config_with_value(instance.get("config"), field, "");
-                                this.persist_provider_instance(
-                                    &clear_row.id,
-                                    with_key(&instance, "config", config),
-                                    window,
-                                    cx,
-                                );
-                            })),
+        let open = page.read(cx).runtime_open.contains(instance_id);
+        let (page, id) = (page.clone(), instance_id.to_owned());
+        v_flex()
+            .w_full()
+            .gap(px(10.))
+            .child(
+                h_flex().min_h(px(28.)).px_4().child(
+                    h_flex()
+                        .id(SharedString::from(format!("provider-instance-{instance_id}-runtime")))
+                        .min_h(px(28.))
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(t.foreground.opacity(0.7))
+                        .child("Runtime")
+                        .child(
+                            Icon::new(if open {
+                                gpui_kit::assets::IconName::ChevronDown
+                            } else {
+                                gpui_kit::assets::IconName::ChevronRight
+                            })
+                            .size(px(16.)),
                         )
-                    })
-                    .into_any_element()
-            }
-        };
-        settings_row(label, description, Some(control), t).into_any_element()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            page.update(cx, |page, cx| {
+                                if !page.runtime_open.remove(&id) {
+                                    page.runtime_open.insert(id.clone());
+                                }
+                                cx.notify();
+                            })
+                        })),
+                ),
+            )
+            .when(open, |el| el.child(group(divided([fields], t), false, t)))
+            .into_any_element()
     }
 
     /// Generic variables (`ProviderEnvironmentSection`): rows of name, value and sensitivity.
@@ -1584,12 +1469,7 @@ impl Workspace {
                 published
             });
             let Some(published) = published else { return };
-            let Some(row) = instance_rows(&this.server_info.settings, &this.server_info.providers_json)
-                .into_iter()
-                .find(|r| r.id == instance_id)
-            else {
-                return;
-            };
+            let Some(row) = this.instance_row(instance_id) else { return };
             let instance = row.instance();
             let mut next: Vec<Value> = environment(&instance)
                 .into_iter()
@@ -1776,6 +1656,7 @@ impl Workspace {
     ) {
         let view = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
+            let alert = alert.entrance(DialogEntrance::None);
             let (view, instance_id, uninstall_agent) = (view.clone(), instance_id.clone(), uninstall_agent.clone());
             alert
                 .title(title.clone())
@@ -1829,42 +1710,6 @@ impl Workspace {
                 })
         });
     }
-}
-
-/// A form field with the local-ACP relabelling `deriveProviderSettingsFields` applies.
-pub(super) struct RuntimeField {
-    field: &'static Field,
-    label: &'static str,
-    description: Option<&'static str>,
-    placeholder: Option<&'static str>,
-}
-
-/// The fields a driver's form shows for this config: a local ACP command shows only its source
-/// and executable.
-pub(super) fn runtime_fields(driver: &'static Driver, config: Option<&Value>) -> Vec<RuntimeField> {
-    let local_acp = driver.kind == "acpRegistry" && config.and_then(|c| c.get("source")) == Some(&json!("local"));
-    driver
-        .fields
-        .iter()
-        .filter(|field| !local_acp || field.key == "source" || field.key == "commandPath")
-        .map(|field| {
-            if local_acp && field.key == "commandPath" {
-                RuntimeField {
-                    field,
-                    label: "Executable",
-                    description: Some("Executable name or path on this environment."),
-                    placeholder: Some("e.g. dsh"),
-                }
-            } else {
-                RuntimeField {
-                    field,
-                    label: field.label,
-                    description: field.description,
-                    placeholder: field.placeholder,
-                }
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1959,23 +1804,6 @@ mod tests {
     }
 
     #[test]
-    fn config_field_values() {
-        let field = &drivers::driver("codex").unwrap().fields[0];
-        assert_eq!(next_config_with_value(None, field, "/bin/codex"), Some(json!({"binaryPath": "/bin/codex"})));
-        assert_eq!(next_config_with_value(Some(&json!({"binaryPath": "x"})), field, "  "), None);
-        let persist = drivers::driver("antigravity").unwrap().fields.iter().find(|f| f.key == "binaryPath").unwrap();
-        assert_eq!(next_config_with_value(None, persist, ""), Some(json!({"binaryPath": ""})));
-    }
-
-    #[test]
-    fn local_acp_shows_source_and_executable() {
-        let driver = drivers::driver("acpRegistry").unwrap();
-        let local = runtime_fields(driver, Some(&json!({"source": "local"})));
-        assert_eq!(local.iter().map(|f| f.label).collect::<Vec<_>>(), ["ACP source", "Executable"]);
-        assert_eq!(runtime_fields(driver, None).len(), 4);
-    }
-
-    #[test]
     fn environment_field_values() {
         let env = vec![
             json!({"name": "A", "value": "1", "sensitive": false}),
@@ -2016,6 +1844,5 @@ mod tests {
         assert_eq!(initials("Theo's Codex"), "TC");
         assert_eq!(accent_color(&json!({"accentColor": "#2563eb"})).as_deref(), Some("#2563eb"));
         assert_eq!(accent_color(&json!({"accentColor": "blue"})), None);
-        assert_eq!(to_hex(hex_color("#2563eb")), "#2563eb");
     }
 }

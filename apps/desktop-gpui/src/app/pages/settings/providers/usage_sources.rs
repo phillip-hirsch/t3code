@@ -4,6 +4,7 @@
 //! once to the server's secret storage (`AddUsageLimitSourceDialog.tsx`).
 
 use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
@@ -14,9 +15,9 @@ use gpui_kit::{
 use reqwest::Url;
 use serde_json::{Map, Value, json};
 
-use super::accounts::{button, failure_message, settings_row};
+use super::accounts::{button, settings_row};
 use crate::app::Workspace;
-use crate::theme::{self, Tokens};
+use crate::theme;
 
 /// `sourceIdFromUrl` (`AddUsageLimitSourceDialog.logic.ts`): a saved hub keeps
 /// its id; a new one gets an id no other hub uses, since settings merge by id.
@@ -139,7 +140,7 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| this.open_add_hub_dialog(window, cx))),
                     ),
             )
-            .child(group(&t).child(rows))
+            .child(super::group(rows, true, &t))
             .into_any_element()
     }
 
@@ -169,6 +170,7 @@ impl Workspace {
     fn confirm_remove_hub(&mut self, id: String, label: String, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
+            let alert = alert.entrance(DialogEntrance::None);
             let workspace = workspace.clone();
             let id = id.clone();
             alert
@@ -181,7 +183,7 @@ impl Workspace {
                 .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
                     let patch = json!({ "usageLimitSources": { id.clone(): null } });
-                    update_settings(&workspace, patch, window, cx);
+                    let _ = workspace.update(cx, |this, cx| this.update_settings(patch, window, cx));
                     true
                 })
         });
@@ -190,38 +192,10 @@ impl Workspace {
     fn open_add_hub_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
         let dialog = cx.new(|cx| AddHub::new(workspace, window, cx));
-        window.open_dialog(cx, move |modal, _, cx| dialog.update(cx, |this, cx| this.render_dialog(modal, cx)));
+        window.open_dialog(cx, move |modal, _, cx| {
+            dialog.update(cx, |this, cx| this.render_dialog(modal.entrance(DialogEntrance::None), cx))
+        });
     }
-}
-
-/// `useUpdateEnvironmentSettings`: a server patch, with a toast when it fails.
-fn update_settings(workspace: &WeakEntity<Workspace>, patch: Value, window: &mut Window, cx: &mut App) {
-    let Some(client) = workspace.upgrade().and_then(|w| w.read(cx).client()) else { return };
-    let environment = workspace
-        .upgrade()
-        .and_then(|w| w.read(cx).server_info.environment_label.clone())
-        .unwrap_or_else(|| "this environment".into());
-    window
-        .spawn(cx, async move |cx| {
-            if let Err(error) = client.request("server.updateSettings", json!({ "patch": patch })).await {
-                let message = failure_message(&error, "The save failed. Try reconnecting and saving again.");
-                let _ = cx.update(|window, cx| {
-                    window.push_notification(
-                        gpui_kit::component::notification::Notification::error(format!(
-                            "Could not save on {environment}: {message}"
-                        ))
-                        .title("Setting not saved"),
-                        cx,
-                    )
-                });
-            }
-        })
-        .detach();
-}
-
-/// The grouped card a settings section's rows sit in.
-fn group(t: &Tokens) -> gpui_kit::Div {
-    div().rounded_xl().border_1().border_color(t.border).bg(t.card)
 }
 
 struct AddHub {
@@ -271,7 +245,8 @@ impl AddHub {
         if !label.is_empty() {
             source["label"] = label.into();
         }
-        update_settings(&self.workspace, json!({ "usageLimitSources": { id: source } }), window, cx);
+        let patch = json!({ "usageLimitSources": { id: source } });
+        let _ = self.workspace.update(cx, |this, cx| this.update_settings(patch, window, cx));
         window.close_dialog(cx);
     }
 

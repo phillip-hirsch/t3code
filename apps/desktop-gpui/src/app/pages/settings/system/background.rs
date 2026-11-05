@@ -4,7 +4,7 @@
 use serde_json::{Map, Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Profile {
+pub(in super::super) enum Profile {
     Balanced,
     Performance,
     BatterySaver,
@@ -56,9 +56,9 @@ const DEFAULT_GIT_FETCH_MS: u64 = 30_000;
 const DEFAULT_PROVIDER_HEALTH_MS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Resolved {
-    pub(super) profile: Profile,
-    pub(super) durations_ms: [u64; 4],
+pub(in super::super) struct Resolved {
+    pub(in super::super) profile: Profile,
+    pub(in super::super) durations_ms: [u64; 4],
     pub(super) pauses: [bool; 4],
 }
 
@@ -68,7 +68,7 @@ impl Resolved {
         self.durations_ms == other.durations_ms && self.pauses == other.pauses
     }
 
-    pub(super) fn seconds(&self, index: usize) -> u64 {
+    pub(in super::super) fn seconds(&self, index: usize) -> u64 {
         (self.durations_ms[index] as f64 / 1000.).round() as u64
     }
 
@@ -79,7 +79,7 @@ impl Resolved {
     }
 }
 
-pub(super) fn preset(profile: Profile) -> Resolved {
+pub(in super::super) fn preset(profile: Profile) -> Resolved {
     let (durations_ms, pauses) = match profile {
         Profile::Performance => ([15_000, 60_000, 30_000, 120_000], [true, false, false, false]),
         Profile::Balanced => {
@@ -112,7 +112,7 @@ fn resolve(background: &Value) -> Resolved {
 
 /// `resolveServerBackgroundActivitySettings`: the legacy flat fields still count while
 /// `backgroundActivity` is untouched.
-pub(super) fn resolve_server(settings: &Value) -> Resolved {
+pub(in super::super) fn resolve_server(settings: &Value) -> Resolved {
     let background = &settings["backgroundActivity"];
     let untouched = background["profile"].as_str().unwrap_or("balanced") == "balanced"
         && background.get("baseProfile").is_none()
@@ -175,7 +175,7 @@ pub(super) fn shared_policy_patch(settings: &Value, profile: Profile) -> Value {
 }
 
 /// `backgroundActivityOverrideSettings`: every resolved value, with `key` set to `value`.
-pub(super) fn override_patch(settings: &Value, key: &str, value: Value) -> Value {
+pub(in super::super) fn override_patch(settings: &Value, key: &str, value: Value) -> Value {
     let mut overrides = resolve_server(settings).overrides();
     overrides.insert(key.into(), value);
     let base = base_profile(&settings["backgroundActivity"]);

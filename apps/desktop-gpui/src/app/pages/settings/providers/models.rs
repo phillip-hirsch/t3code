@@ -2,16 +2,15 @@
 //! `customModelEditor.logic.ts`): which ones the picker shows, favorites and order, and the
 //! custom models saved in the instance's `config.customModels`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::color_picker::ColorPickerState;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -38,7 +37,6 @@ pub(super) struct ModelsUi {
     editor_error: Option<String>,
     next_key: u64,
     pub revealed_email: bool,
-    pub accent_pickers: HashMap<String, (Entity<ColorPickerState>, Subscription)>,
 }
 
 impl ModelsUi {
@@ -659,13 +657,8 @@ impl Workspace {
         if page.read(cx).models.instance.as_deref() != Some(row.id.as_str()) {
             let id = row.id.clone();
             page.update(cx, |page, _| {
-                let keep = (std::mem::take(&mut page.models.accent_pickers), page.models.revealed_email);
-                page.models = ModelsUi {
-                    instance: Some(id),
-                    accent_pickers: keep.0,
-                    revealed_email: keep.1,
-                    ..Default::default()
-                };
+                let revealed_email = page.models.revealed_email;
+                page.models = ModelsUi { instance: Some(id), revealed_email, ..Default::default() };
             });
         }
         let view = models_view(&self.server_info.settings, row, live, instance);

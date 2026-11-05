@@ -3,10 +3,16 @@
 //! `deriveProviderSettingsFields` derives it from the settings schema annotations.
 //! Generated from those schemas; regenerate when a driver's settings schema changes.
 
+use serde_json::Value;
+
 pub(super) struct Driver {
     pub kind: &'static str,
     pub label: &'static str,
     pub has_default_instance: bool,
+    /// `featured: false` lists the driver under the Add provider wizard's "Show more".
+    pub featured: bool,
+    /// Registry entries for the same agent, left out of the ACP Registry list.
+    pub acp_ids: &'static [&'static str],
     pub badge_label: Option<&'static str>,
     pub environment_fields: &'static [EnvironmentField],
     pub fields: &'static [Field],
@@ -26,6 +32,7 @@ pub(super) enum Control {
     Select(&'static [(&'static str, &'static str)]),
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Field {
     pub key: &'static str,
     pub control: Control,
@@ -43,6 +50,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "codex",
         label: "Codex",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["codex-acp"],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -90,6 +99,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "claudeAgent",
         label: "Claude",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["claude-acp"],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -151,6 +162,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "cursor",
         label: "Cursor",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["cursor"],
         badge_label: None,
         environment_fields: &[EnvironmentField {
             name: "CURSOR_API_KEY",
@@ -164,6 +177,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "grok",
         label: "Grok",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["grok-build"],
         badge_label: None,
         environment_fields: &[],
         fields: &[Field {
@@ -180,6 +195,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "fx",
         label: "fx",
         has_default_instance: true,
+        featured: false,
+        acp_ids: &[],
         badge_label: None,
         environment_fields: &[],
         fields: &[Field {
@@ -196,6 +213,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "opencode",
         label: "OpenCode",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["opencode", "opencode-v2"],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -232,6 +251,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "antigravity",
         label: "Antigravity",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["antigravity-acp"],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -291,6 +312,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "kiro",
         label: "Kiro",
         has_default_instance: true,
+        featured: false,
+        acp_ids: &[],
         badge_label: Some("Early Access"),
         environment_fields: &[EnvironmentField {
             name: "KIRO_API_KEY",
@@ -312,6 +335,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "muse",
         label: "Muse Code",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &[],
         badge_label: None,
         environment_fields: &[],
         fields: &[Field {
@@ -330,6 +355,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "pi",
         label: "Pi",
         has_default_instance: true,
+        featured: true,
+        acp_ids: &["pi-acp"],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -357,6 +384,8 @@ pub(super) const DRIVERS: &[Driver] = &[
         kind: "acpRegistry",
         label: "ACP Registry",
         has_default_instance: false,
+        featured: true,
+        acp_ids: &[],
         badge_label: None,
         environment_fields: &[],
         fields: &[
@@ -406,4 +435,66 @@ pub(super) const DRIVERS: &[Driver] = &[
 
 pub(super) fn driver(kind: &str) -> Option<&'static Driver> {
     DRIVERS.iter().find(|driver| driver.kind == kind)
+}
+
+pub(super) fn is_local_acp(driver: &str, config: &Value) -> bool {
+    driver == "acpRegistry" && config.get("source").and_then(Value::as_str) == Some("local")
+}
+
+/// `deriveProviderSettingsFields`: a local ACP command shows only its source and executable.
+pub(super) fn visible_fields(driver: &Driver, config: &Value) -> Vec<Field> {
+    if !is_local_acp(driver.kind, config) {
+        return driver.fields.to_vec();
+    }
+    driver
+        .fields
+        .iter()
+        .filter(|field| field.key == "source" || field.key == "commandPath")
+        .map(|field| match field.key {
+            "commandPath" => Field {
+                label: "Executable",
+                description: Some("Executable name or path on this environment."),
+                placeholder: Some("e.g. dsh"),
+                ..*field
+            },
+            _ => *field,
+        })
+        .collect()
+}
+
+/// `nextProviderConfigWithFieldValue` for string values: an empty value removes the key unless
+/// the field persists empties; an empty config is `None`.
+pub(super) fn next_config(config: &Value, field: &Field, value: &str) -> Option<Value> {
+    let mut base = config.as_object().cloned().unwrap_or_default();
+    if !field.persist_empty && value.trim().is_empty() {
+        base.remove(field.key);
+    } else {
+        base.insert(field.key.into(), value.into());
+    }
+    (!base.is_empty()).then_some(Value::Object(base))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn empty_values_clear_keys_unless_the_field_persists_them() {
+        let binary = driver("codex").unwrap().fields[0];
+        assert_eq!(next_config(&Value::Null, &binary, "/bin/codex"), Some(json!({"binaryPath": "/bin/codex"})));
+        assert_eq!(next_config(&json!({"binaryPath": "x"}), &binary, "  "), None);
+        let agent_id = driver("acpRegistry").unwrap().fields[1];
+        assert_eq!(next_config(&Value::Null, &agent_id, ""), Some(json!({"agentId": ""})));
+    }
+
+    #[test]
+    fn local_acp_shows_only_its_source_and_executable() {
+        let acp = driver("acpRegistry").unwrap();
+        let local = visible_fields(acp, &json!({"source": "local"}));
+        assert_eq!(local.iter().map(|f| f.key).collect::<Vec<_>>(), ["source", "commandPath"]);
+        assert_eq!(local[1].label, "Executable");
+        assert_eq!(visible_fields(acp, &Value::Null).len(), 4);
+    }
 }

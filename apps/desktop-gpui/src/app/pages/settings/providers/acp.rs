@@ -10,6 +10,7 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -23,7 +24,8 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::add::{DRIVERS, is_configured_acp_agent, settings_row};
+use super::add::{is_configured_acp_agent, settings_row};
+use super::drivers::DRIVERS;
 use crate::app::Workspace;
 use crate::rpc::RpcError;
 use crate::theme::{FONT_MONO, Tokens, tokens};
@@ -844,6 +846,7 @@ fn confirm_destructive(
 ) {
     let on_confirm = std::rc::Rc::new(on_confirm);
     window.open_alert_dialog(cx, move |alert, _, _| {
+        let alert = alert.entrance(DialogEntrance::None);
         let on_confirm = on_confirm.clone();
         alert.title(message.clone()).show_cancel(true).ok_text(action).ok_variant(ButtonVariant::Danger).on_ok(
             move |_, window, cx| {
@@ -1116,7 +1119,8 @@ impl AcpSessions {
         let can_list = sessions.is_some_and(|s| s.can_list);
         let can_import = sessions.is_some_and(|s| s.can_load || s.can_resume);
         let can_delete = sessions.is_some_and(|s| s.can_delete);
-        let can_logout = provider.auth.can_logout == Some(true) && !provider.setup.as_ref().is_some_and(|s| s.can_authenticate);
+        let can_logout =
+            provider.auth.can_logout == Some(true) && !provider.setup.as_ref().is_some_and(|s| s.can_authenticate);
         let can_configure = provider.configurable_providers;
         if !can_list && !can_logout && !can_configure {
             return None;

@@ -12,7 +12,7 @@
 //! contextWindowMeterEnabled; their rows wait for the client-settings store.
 
 mod archive;
-mod background;
+pub(super) mod background;
 mod cleanup;
 mod layout;
 

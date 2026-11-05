@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::radio::Radio;
@@ -383,8 +384,8 @@ impl Workspace {
         instance_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(provider) = self.server_info.provider(instance_id) else { return div().into_any_element() };
+    ) -> Option<AnyElement> {
+        let provider = self.server_info.provider(instance_id)?;
         let instance = &self.server_info.settings["providerInstances"][instance_id];
         let driver = instance["driver"].as_str().unwrap_or(&provider.driver);
         let codex_managed = driver == "codex" && codex_setup_managed(&instance["config"]);
@@ -393,25 +394,29 @@ impl Workspace {
         {
             if driver == "cursor" && can_authenticate == Some(false) {
                 let t = theme::tokens(cx);
-                return settings_row(
-                    t,
-                    "Cursor account",
-                    Some(text(
-                        "Using CURSOR_API_KEY. Remove it from this provider's environment to use browser sign-in.",
-                    )),
-                    None,
-                )
-                .into_any_element();
+                return Some(
+                    settings_row(
+                        t,
+                        "Cursor account",
+                        Some(text(
+                            "Using CURSOR_API_KEY. Remove it from this provider's environment to use browser sign-in.",
+                        )),
+                        None,
+                    )
+                    .into_any_element(),
+                );
             }
-            return div().into_any_element();
+            return None;
         }
         let workspace = cx.weak_entity();
         let id = instance_id.to_owned();
-        window
-            .use_keyed_state(SharedString::from(format!("provider-account-{instance_id}")), cx, move |_, _| {
-                AccountSection::new(workspace, id, None)
-            })
-            .into_any_element()
+        Some(
+            window
+                .use_keyed_state(SharedString::from(format!("provider-account-{instance_id}")), cx, move |_, _| {
+                    AccountSection::new(workspace, id, None)
+                })
+                .into_any_element(),
+        )
     }
 
     /// `CodexManagedRuntimeFields`: the runtime paths of a managed Codex instance.
@@ -441,6 +446,7 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let dialog = cx.new(|cx| AddCodexAccount::new(workspace, on_created, window, cx));
         window.open_dialog(cx, move |modal, window, cx| {
+            let modal = modal.entrance(DialogEntrance::None);
             dialog.update(cx, |this, cx| this.render_dialog(modal, window, cx))
         });
     }
@@ -460,6 +466,7 @@ impl Workspace {
         cx.global_mut::<Welcome>().showing = Some(key.clone());
         let detail: SharedString = format!("{provider_name} on {environment}").into();
         window.open_dialog(cx, move |modal, _, cx| {
+            let modal = modal.entrance(DialogEntrance::None);
             let t = *theme::tokens(cx);
             let dismiss_key = key.clone();
             let close_key = key.clone();
@@ -905,6 +912,7 @@ impl AccountSection {
     fn open_account_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let section = cx.entity();
         window.open_dialog(cx, move |modal, _, cx| {
+            let modal = modal.entrance(DialogEntrance::None);
             let t = *theme::tokens(cx);
             let this = section.read(cx);
             let profiles: Vec<AuthMethod> = this
@@ -1066,6 +1074,7 @@ impl AccountSection {
             "Sign out of {provider_name} on {environment}? This stops running threads that share this sign-in. Thread history is kept."
         );
         window.open_alert_dialog(cx, move |alert, _, _| {
+            let alert = alert.entrance(DialogEntrance::None);
             let section = section.clone();
             alert.description(message.clone()).ok_text("Sign out").show_cancel(true).on_ok(move |_, _, cx| {
                 section.update(cx, |this, cx| {
@@ -1929,6 +1938,7 @@ impl Render for RuntimeFields {
         let binary_placeholder =
             if self.install.error.is_some() { "Could not read runtime path" } else { "Not installed" };
         let shadow = paths.as_ref().and_then(|p| p.shadow_home_path.clone());
+        let rule = || div().border_t_1().border_color(t.border.opacity(0.5));
         v_flex()
             .child(settings_row(
                 &t,
@@ -1936,13 +1946,13 @@ impl Render for RuntimeFields {
                 Some(text("Selected by T3 Code.")),
                 Some(field(executable, binary_placeholder)),
             ))
-            .child(settings_row(
+            .child(rule().child(settings_row(
                 &t,
                 "CODEX_HOME path",
                 Some(text("Shared Codex config, sessions, and state.")),
                 Some(field(paths.as_ref().map(|p| p.home_path.clone()), "Unavailable")),
-            ))
-            .child(settings_row(
+            )))
+            .child(rule().child(settings_row(
                 &t,
                 "Shadow home path",
                 Some(text(if shadow.is_some() {
@@ -1951,7 +1961,7 @@ impl Render for RuntimeFields {
                     "This instance uses the shared Codex home directly."
                 })),
                 Some(field(shadow, if paths.is_some() { "Not used" } else { "Unavailable" })),
-            ))
+            )))
     }
 }
 
