@@ -239,7 +239,7 @@ impl Workspace {
                     Err(error) => {
                         let message = match hint {
                             Some(hint) => logic::readable_failure(&list_logic::error_message(error), hint),
-                            None => String::new(),
+                            None => list_logic::error_message(error),
                         };
                         toast_error(window, cx, failure, message);
                     }

@@ -535,8 +535,13 @@ impl Welcome {
         }
         self.acknowledged.push(key.to_owned());
         if let Some(path) = Self::path() {
-            let _ = path.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(path, serde_json::to_vec(&self.acknowledged).unwrap_or_default());
+            let saved = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, serde_json::to_vec(&self.acknowledged).unwrap_or_default()));
+            if let Err(error) = saved {
+                log::warn!("could not save {}: {error}", path.display());
+            }
         }
     }
 }

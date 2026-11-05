@@ -87,7 +87,7 @@ type IconFuture = Shared<BoxFuture<'static, Option<SharedString>>>;
 /// take the text color, like the web's alpha recolor filter. Non-SVG icons keep the fallback glyph.
 fn load_icon(url: &str) -> IconFuture {
     static ICONS: OnceLock<Mutex<HashMap<String, IconFuture>>> = OnceLock::new();
-    let mut icons = ICONS.get_or_init(Default::default).lock().unwrap();
+    let mut icons = ICONS.get_or_init(Default::default).lock().expect("the icon cache lock is never poisoned");
     icons
         .entry(url.to_owned())
         .or_insert_with(|| {
@@ -106,8 +106,15 @@ fn load_icon(url: &str) -> IconFuture {
 }
 
 async fn fetch_icon(url: String) -> Option<Arc<[u8]>> {
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().ok()?;
-    let response = client.get(&url).send().await.ok()?;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_default()
+    });
+    let mut response = client.get(&url).send().await.ok()?;
     let svg = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -116,8 +123,15 @@ async fn fetch_icon(url: String) -> Option<Arc<[u8]>> {
     if !response.status().is_success() || !svg || response.content_length().unwrap_or(0) > MAX_ICON_BYTES as u64 {
         return None;
     }
-    let bytes = response.bytes().await.ok()?;
-    (bytes.len() <= MAX_ICON_BYTES).then(|| bytes.to_vec().into())
+    // A chunked answer has no Content-Length, so the cap holds while it streams.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_ICON_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body.into())
 }
 
 fn fxhash(text: &str) -> u64 {

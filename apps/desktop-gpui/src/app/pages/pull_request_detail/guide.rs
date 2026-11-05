@@ -627,12 +627,7 @@ impl Workspace {
     fn ask_about_pr_guide_stop(&mut self, index: usize, question: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let Some(detail) = panel.detail.clone() else { return };
-        let Some(stop) = panel
-            .guide
-            .as_ref()
-            .and_then(|g| serde_json::from_value::<Guide>(g["guide"].clone()).ok())
-            .and_then(|g| g.stops.get(index).cloned())
-        else {
+        let Some(stop) = panel.guide_tour.as_ref().and_then(|g| g.as_ref().ok()?.stops.get(index).cloned()) else {
             return;
         };
         let prompt = logic::guide_stop_handoff(&logic::HandoffSubject::of(&detail), index, &stop, &question);

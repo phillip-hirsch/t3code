@@ -65,6 +65,13 @@ pub(in crate::app) struct Panel {
     seed: Option<Rc<Entry>>,
     detail: Option<Rc<Detail>>,
     activity: Option<Rc<Activity>>,
+    /// Derived from `activity` once when it lands (`set_activity`), so render only borrows.
+    conversations: Rc<Vec<Conversation>>,
+    review_outcomes: Rc<Vec<(String, logic::ReviewOutcome)>>,
+    newest_commit: Option<i64>,
+    /// The detail and activity reads in flight; a newer read drops (cancels) the older one.
+    _detail_read: Option<Task<()>>,
+    _activity_read: Option<Task<()>>,
     detail_error: Option<(SharedString, bool)>,
     activity_error: Option<SharedString>,
     detail_loading: bool,
@@ -90,7 +97,9 @@ pub(in crate::app) struct Panel {
     summary_scroll: ScrollHandle,
     timeline: ListState,
     timeline_rows: Rc<Vec<TimelineRow>>,
-    guide: Option<Value>,
+    guide: Option<Rc<Value>>,
+    /// `guide["guide"]` decoded once when it lands (`set_guide`); `None` while there is none.
+    guide_tour: Option<Result<Rc<logic::Guide>, SharedString>>,
     guide_loading: bool,
     guide_error: Option<SharedString>,
     guide_starting: bool,
@@ -123,6 +132,11 @@ impl Panel {
             seed,
             detail: None,
             activity: None,
+            conversations: Rc::default(),
+            review_outcomes: Rc::default(),
+            newest_commit: None,
+            _detail_read: None,
+            _activity_read: None,
             detail_error: None,
             activity_error: None,
             detail_loading: false,
@@ -147,6 +161,7 @@ impl Panel {
             timeline: ListState::new(0, ListAlignment::Top, px(600.)),
             timeline_rows: Rc::default(),
             guide: None,
+            guide_tour: None,
             guide_loading: false,
             guide_error: None,
             guide_starting: false,
@@ -172,6 +187,39 @@ impl Panel {
 
     pub(super) fn reference(&self) -> &Reference {
         &self.reference
+    }
+
+    fn set_activity(&mut self, activity: Activity) {
+        self.conversations = Rc::new(logic::conversations(&activity.comments, &activity.review_threads));
+        self.review_outcomes = Rc::new(logic::latest_review_outcomes(&activity.comments, &activity.commits));
+        self.newest_commit = logic::newest_commit_ms(&activity.commits);
+        self.activity = Some(Rc::new(activity));
+    }
+
+    fn set_guide(&mut self, value: Value) {
+        use serde::Deserialize as _;
+        let guide = &value["guide"];
+        self.guide_tour = (!guide.is_null()).then(|| {
+            logic::Guide::deserialize(guide)
+                .map(Rc::new)
+                .map_err(|error| format!("Unreadable review guide: {error}").into())
+        });
+        self.guide = Some(Rc::new(value));
+    }
+
+    fn rebuild_timeline(&mut self) {
+        let (Some(detail), Some(activity)) = (&self.detail, &self.activity) else {
+            self.timeline_rows = Rc::default();
+            self.timeline.reset(0);
+            return;
+        };
+        let mut events = logic::build_timeline(detail, activity, logic::terminology(&detail.provider).0);
+        if !self.timeline_newest {
+            events.reverse();
+        }
+        let rows = logic::group_timeline(events);
+        self.timeline.reset(rows.len());
+        self.timeline_rows = Rc::new(rows);
     }
 
     fn provider(&self) -> &str {
@@ -283,32 +331,41 @@ impl Workspace {
         self.pull_requests.parked.get_mut(key)
     }
 
-    /// Reads the detail and its activity; each lands on its own.
+    fn pr_panel_ref(&self, key: &str) -> Option<&Panel> {
+        match &self.pull_requests.panel {
+            Some(panel) if panel.reference.key() == key => Some(panel),
+            _ => self.pull_requests.parked.get(key),
+        }
+    }
+
+    /// Reads the shown pull request's detail and activity.
     fn read_pr_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.pull_requests.panel.as_ref().map(|p| p.reference.key()) {
+            self.read_pr_detail_of(&key, cx);
+        }
+    }
+
+    /// Reads `key`'s detail and its activity; each lands on its own, in that pull request's tab.
+    fn read_pr_detail_of(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        panel.detail_loading = true;
-        panel.activity_loading = true;
-        let key = panel.reference.key();
+        let Some(panel) = self.pr_panel_ref(key) else { return };
         let reference = panel.reference.to_json();
         let mut detail_input = reference.clone();
         detail_input["allowStale"] = json!(false);
-        let (detail_client, detail_key) = (client.clone(), key.clone());
-        cx.spawn(async move |this, cx| {
+        let (detail_client, detail_key, key) = (client.clone(), key.to_owned(), key.to_owned());
+        let detail_read = cx.spawn(async move |this, cx| {
             let result = detail_client.request("pullRequests.detail", detail_input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(panel) = this.pr_panel(&detail_key) else { return };
                 panel.detail_loading = false;
+                let (mut first, mut landed) = (false, false);
                 match result.map(serde_json::from_value::<Detail>) {
                     Ok(Ok(detail)) => {
-                        let first = panel.detail.is_none();
+                        first = panel.detail.is_none();
+                        landed = true;
                         panel.detail = Some(Rc::new(detail));
                         panel.detail_error = None;
                         panel.maintainer_choice = None;
-                        if first {
-                            this.read_pr_extras(cx);
-                        }
-                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => {
                         panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false))
@@ -317,31 +374,45 @@ impl Workspace {
                         panel.detail_error = Some((list_logic::error_message(&error).into(), is_not_found(&error)))
                     }
                 }
-                this.rebuild_pr_timeline();
+                panel.rebuild_timeline();
+                if first {
+                    this.read_pr_extras_of(&detail_key, cx);
+                }
+                if landed {
+                    this.read_pr_avatars(&detail_key, cx);
+                }
                 cx.notify();
             });
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
+        });
+        let activity_key = key.clone();
+        let activity_read = cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.activity", reference).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
+                let Some(panel) = this.pr_panel(&activity_key) else { return };
                 panel.activity_loading = false;
+                let mut landed = false;
                 match result.map(serde_json::from_value::<Activity>) {
                     Ok(Ok(activity)) => {
-                        panel.activity = Some(Rc::new(activity));
+                        landed = true;
+                        panel.set_activity(activity);
                         panel.activity_error = None;
                         panel.write.reactions.clear();
-                        this.read_pr_avatars(cx);
                     }
                     Ok(Err(error)) => panel.activity_error = Some(format!("Unreadable activity: {error}").into()),
                     Err(error) => panel.activity_error = Some(list_logic::error_message(&error).into()),
                 }
-                this.rebuild_pr_timeline();
+                panel.rebuild_timeline();
+                if landed {
+                    this.read_pr_avatars(&activity_key, cx);
+                }
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        let Some(panel) = self.pr_panel(&key) else { return };
+        panel.detail_loading = true;
+        panel.activity_loading = true;
+        panel._detail_read = Some(detail_read);
+        panel._activity_read = Some(activity_read);
         cx.notify();
     }
 
@@ -357,8 +428,10 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
-                this.read_pr_detail(cx);
-                this.refresh_pr_code(cx);
+                this.read_pr_detail_of(&key, cx);
+                if this.pull_requests.panel.as_ref().is_some_and(|p| p.reference.key() == key) {
+                    this.refresh_pr_code(cx);
+                }
             });
         })
         .detach();
@@ -528,7 +601,7 @@ impl Workspace {
                 match result {
                     Ok(value) => {
                         panel.guide_error = None;
-                        panel.guide = Some(value);
+                        panel.set_guide(value);
                     }
                     Err(error) => panel.guide_error = Some(list_logic::error_message(&error).into()),
                 }
@@ -576,7 +649,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.guide_starting = false;
                 match result {
-                    Ok(value) => panel.guide = Some(value),
+                    Ok(value) => panel.set_guide(value),
                     Err(error) => toast_error(
                         window,
                         cx,
@@ -596,19 +669,9 @@ impl Workspace {
     }
 
     fn rebuild_pr_timeline(&mut self) {
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        let (Some(detail), Some(activity)) = (&panel.detail, &panel.activity) else {
-            panel.timeline_rows = Rc::default();
-            panel.timeline.reset(0);
-            return;
-        };
-        let mut events = logic::build_timeline(detail, activity, logic::terminology(&detail.provider).0);
-        if !panel.timeline_newest {
-            events.reverse();
+        if let Some(panel) = self.pull_requests.panel.as_mut() {
+            panel.rebuild_timeline();
         }
-        let rows = logic::group_timeline(events);
-        panel.timeline.reset(rows.len());
-        panel.timeline_rows = Rc::new(rows);
     }
 
     fn toggle_pr_disclosure(&mut self, key: String, cx: &mut Context<Self>) {
@@ -624,14 +687,15 @@ impl Workspace {
     /// One markdown body, parsed once and kept while the panel shows this pull request.
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
         let panel = self.pull_requests.panel.as_mut()?;
-        let source = logic::strip_html_comments(text);
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
-            if *held != source {
+            if held != text {
+                let source = logic::strip_html_comments(text);
                 view.update(cx, |view, cx| view.set_text(&source, cx));
-                *held = source;
+                text.clone_into(held);
             }
             return Some(view.clone());
         }
+        let source = logic::strip_html_comments(text);
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {
@@ -639,7 +703,7 @@ impl Workspace {
             }
             cx.notify();
         });
-        panel.markdown.insert(key.to_owned(), (source, view.clone(), changed));
+        panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
     }
 
@@ -1486,12 +1550,7 @@ impl Workspace {
         let activity = panel.activity.as_ref();
         let approvals = activity
             .filter(|a| !a.comments_truncated)
-            .map(|a| {
-                logic::latest_review_outcomes(&a.comments, &a.commits)
-                    .iter()
-                    .filter(|(_, e)| e.outcome == "approved" && !e.stale)
-                    .count()
-            })
+            .map(|_| panel.review_outcomes.iter().filter(|(_, e)| e.outcome == "approved" && !e.stale).count())
             .unwrap_or(0);
         let approved = outcome_color("approved", t);
         let item =
@@ -1543,14 +1602,11 @@ impl Workspace {
         let (_, stale) = panel.checks_state(detail);
         let [description_open, checks_open, comments_open] = panel.sections;
         let scroll = panel.summary_scroll.clone();
-        let (comments, commits, reviewers) = match &activity {
-            Some(a) => {
-                (a.comments.as_slice(), a.commits.as_slice(), a.reviewers.as_deref().unwrap_or(&detail.reviewers))
-            }
-            None => (&[][..], &[][..], detail.reviewers.as_slice()),
+        let reviewers = match &activity {
+            Some(a) => a.reviewers.as_deref().unwrap_or(&detail.reviewers),
+            None => detail.reviewers.as_slice(),
         };
-        let outcomes = logic::latest_review_outcomes(comments, commits);
-        let reviewers = logic::reviewer_entries(reviewers, &outcomes);
+        let reviewers = logic::reviewer_entries(reviewers, &panel.review_outcomes);
 
         let reviewer_picker = (detail.capabilities.reviewers.request && detail.capabilities.reviewers.list_candidates)
             .then(|| self.render_pr_picker(true, detail.viewer_permissions.request_reviewers, t, cx));
@@ -1642,11 +1698,11 @@ impl Workspace {
     ) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let (bots, resolved, newest) = (panel.show_bots, panel.show_resolved, panel.comments_newest);
-        let hidden = activity.map_or(0, |a| {
-            let items = logic::conversations(&a.comments, &a.review_threads);
+        let hidden = activity.map_or(0, |_| {
+            let items = &panel.conversations;
             let all: usize = items.iter().map(|i| i.comments().count()).sum();
             let kept: usize =
-                logic::filter_conversations(&items, bots, resolved).iter().map(|i| i.comments().count()).sum();
+                logic::filter_conversations(items, bots, resolved).iter().map(|i| i.comments().count()).sum();
             all - kept
         });
         let view = cx.entity();
@@ -1713,13 +1769,13 @@ impl Workspace {
         let (bots, resolved, newest, shown) =
             (panel.show_bots, panel.show_resolved, panel.comments_newest, panel.shown_conversations);
         let toggled = panel.toggled.clone();
-        let items = logic::conversations(&activity.comments, &activity.review_threads);
+        let items = panel.conversations.clone();
         let loaded: usize = items.iter().map(|i| i.comments().count()).sum();
         let filtered = logic::filter_conversations(&items, bots, resolved);
         let hidden_by_filter = loaded - filtered.iter().map(|i| i.comments().count()).sum::<usize>();
         let start = filtered.len().saturating_sub(shown);
         let older = start;
-        let mut visible: Vec<Conversation> = filtered[start..].to_vec();
+        let mut visible = filtered[start..].to_vec();
         if newest {
             visible.reverse();
         }
@@ -1764,7 +1820,7 @@ impl Workspace {
                 }))
         });
         let mut cards = Vec::with_capacity(visible.len());
-        for item in &visible {
+        for item in visible {
             cards.push(self.render_conversation(item, &toggled, t, cx));
         }
         let (top, bottom) = if newest { (None, older_button) } else { (older_button, None) };
@@ -1796,16 +1852,16 @@ impl Workspace {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let root = item.comments().next().expect("a conversation has a first comment").clone();
-        let thread = item.thread().cloned();
-        let (replies, more, has_more): (Vec<Comment>, usize, bool) = match item {
-            Conversation::Thread { replies, more_replies, has_more, .. } => (replies.clone(), *more_replies, *has_more),
-            Conversation::Comment(_) => (Vec::new(), 0, false),
+        let root = item.comments().next().expect("a conversation has a first comment");
+        let thread = item.thread();
+        let (replies, more, has_more): (&[Comment], usize, bool) = match item {
+            Conversation::Thread { replies, more_replies, has_more, .. } => (replies, *more_replies, *has_more),
+            Conversation::Comment(_) => (&[], 0, false),
         };
-        let more_url = std::iter::once(&root).chain(&replies).find_map(|c| c.url.clone());
+        let more_url = item.comments().find_map(|c| c.url.clone());
         let more_replies = has_more.then(|| more_replies_line(more, more_url, t));
         let mut reply_cards = Vec::with_capacity(replies.len());
-        for reply in &replies {
+        for reply in replies {
             reply_cards.push(self.render_comment_card(reply, None, true, t, cx));
         }
         let replies_column = (!reply_cards.is_empty()).then(|| {
@@ -1818,13 +1874,13 @@ impl Workspace {
                 .children(reply_cards)
         });
         if !item.finished() {
-            let card = self.render_comment_card(&root, thread.as_ref(), false, t, cx);
+            let card = self.render_comment_card(root, thread, false, t, cx);
             return v_flex().gap(px(8.)).child(card).children(replies_column).children(more_replies).into_any_element();
         }
         // A resolved thread or dismissed review folds to one line (`CollapsedComment`).
         let key = format!("comment:{}", item.id());
         let open = toggled.contains(&key);
-        let label = if thread.as_ref().is_some_and(|t| t.is_resolved) { "Resolved" } else { "Review dismissed" };
+        let label = if thread.is_some_and(|t| t.is_resolved) { "Resolved" } else { "Review dismissed" };
         let reply_count = replies.len() + more;
         let body = logic::visible_body(&root.body);
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
@@ -1842,7 +1898,7 @@ impl Workspace {
                         h_flex()
                             .flex_wrap()
                             .gap(px(8.))
-                            .child(comment_identity(&root, t))
+                            .child(comment_identity(root, t))
                             .when(reply_count > 0, |el| {
                                 el.child(div().text_xs().text_color(t.muted_foreground).child(format!(
                                     "{reply_count} {}",
@@ -1870,7 +1926,7 @@ impl Workspace {
                                     })),
                             ),
                     )
-                    .children(comment_location(&root, thread.as_ref(), t))
+                    .children(comment_location(root, thread, t))
                     .children(
                         preview.map(|line| {
                             div().mt(px(8.)).truncate().text_xs().text_color(t.muted_foreground).child(line)
@@ -1987,8 +2043,7 @@ impl Workspace {
                 .into_any_element();
         }
         let toggled = panel.toggled.clone();
-        let commits = panel.activity.as_ref().map(|a| a.commits.clone()).unwrap_or_default();
-        let commits = Rc::new(commits);
+        let newest_commit = panel.newest_commit;
         let view = cx.entity();
         let t = *t;
         let now = now_ms();
@@ -2004,9 +2059,15 @@ impl Workspace {
                         lifecycle_event(event, term, now, &t)
                     }
                     (None, _) => match logic::review_outcome(event.review_state.as_deref()) {
-                        Some(outcome) => {
-                            verdict_event(event, outcome, logic::verdict_stale(&event.at, &commits), &view, now, &t, cx)
-                        }
+                        Some(outcome) => verdict_event(
+                            event,
+                            outcome,
+                            logic::verdict_stale(&event.at, newest_commit),
+                            &view,
+                            now,
+                            &t,
+                            cx,
+                        ),
                         None => thread_event(event, &toggled, &view, now, &t, window, cx),
                     },
                 },
@@ -2038,7 +2099,8 @@ impl Workspace {
 
     fn render_pr_guide(&mut self, t: &Tokens, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
-        let result = panel.guide.clone().unwrap_or(Value::Null);
+        let result = panel.guide.clone().unwrap_or_default();
+        let tour = panel.guide_tour.clone();
         let running = panel.guide_starting || result["run"]["_tag"] == "Running";
         let current = result["currentHeadSha"].as_str();
         let failure = (result["run"]["_tag"] == "Failed" && result["run"]["headSha"].as_str() == current)
@@ -2115,14 +2177,12 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().child(text))
                 .when(!running, |el| el.child(write_button("Rewrite", cx)))
         });
-        match serde_json::from_value::<logic::Guide>(guide.clone()) {
-            Ok(guide) => self.render_pr_guide_tour(&guide, banner.map(IntoElement::into_any_element), width, t, cx),
-            Err(error) => div()
-                .p(px(16.))
-                .text_xs()
-                .text_color(t.error)
-                .child(format!("Unreadable review guide: {error}"))
-                .into_any_element(),
+        match tour {
+            Some(Ok(guide)) => {
+                self.render_pr_guide_tour(&guide, banner.map(IntoElement::into_any_element), width, t, cx)
+            }
+            Some(Err(error)) => div().p(px(16.)).text_xs().text_color(t.error).child(error).into_any_element(),
+            None => div().into_any_element(),
         }
     }
 }

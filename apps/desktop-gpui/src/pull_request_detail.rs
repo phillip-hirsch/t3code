@@ -753,13 +753,13 @@ fn instant(iso: &str) -> Option<i64> {
     parse_ms(iso)
 }
 
-fn newest_commit_ms(commits: &[Commit]) -> Option<i64> {
+pub fn newest_commit_ms(commits: &[Commit]) -> Option<i64> {
     commits.iter().filter_map(|c| instant(&c.committed_date)).max()
 }
 
 /// `isPullRequestVerdictStale`: the verdict came before the newest commit.
-pub fn verdict_stale(at: &str, commits: &[Commit]) -> bool {
-    matches!((instant(at), newest_commit_ms(commits)), (Some(at), Some(newest)) if at < newest)
+pub fn verdict_stale(at: &str, newest_commit: Option<i64>) -> bool {
+    matches!((instant(at), newest_commit), (Some(at), Some(newest)) if at < newest)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -771,6 +771,7 @@ pub struct ReviewOutcome {
 
 /// `latestPullRequestReviewOutcomes`: each reviewer's newest verdict, dismissals dropped.
 pub fn latest_review_outcomes(comments: &[Comment], commits: &[Commit]) -> Vec<(String, ReviewOutcome)> {
+    let newest_commit = newest_commit_ms(commits);
     let mut order: Vec<String> = Vec::new();
     let mut latest: HashMap<String, (i64, ReviewOutcome)> = HashMap::new();
     for comment in comments {
@@ -783,7 +784,7 @@ pub fn latest_review_outcomes(comments: &[Comment], commits: &[Commit]) -> Vec<(
         if !latest.contains_key(&key) {
             order.push(key.clone());
         }
-        let stale = verdict_stale(&comment.created_at, commits);
+        let stale = verdict_stale(&comment.created_at, newest_commit);
         latest.insert(key, (at, ReviewOutcome { actor: comment.author.clone(), outcome, stale }));
     }
     order
@@ -936,7 +937,7 @@ pub fn conversations(comments: &[Comment], threads: &[ReviewThread]) -> Vec<Conv
 
 /// `filterPullRequestConversationItems`: bot chatter and finished conversations are hidden
 /// unless asked for; a bot's verdict is not chatter.
-pub fn filter_conversations(items: &[Conversation], bots: bool, resolved: bool) -> Vec<Conversation> {
+pub fn filter_conversations(items: &[Conversation], bots: bool, resolved: bool) -> Vec<&Conversation> {
     items
         .iter()
         .filter(|item| {
@@ -948,7 +949,6 @@ pub fn filter_conversations(items: &[Conversation], bots: bool, resolved: bool) 
                 (bots || !comment.author.as_ref().is_some_and(|a| a.is_bot) || verdict) && (resolved || !finished)
             })
         })
-        .cloned()
         .collect()
 }
 

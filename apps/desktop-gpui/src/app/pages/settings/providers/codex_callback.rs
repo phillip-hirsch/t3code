@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 
 const INVALID_REQUEST: &str = "Invalid ChatGPT sign-in request.";
 const EXPIRES_AFTER: Duration = Duration::from_secs(300);
+/// Browsers open idle preconnect sockets; one may not hold up the redirect behind it for longer.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_PAGE: &str = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><title>T3 Code</title><style>body{font-family:system-ui;display:grid;place-items:center;min-height:90vh;margin:0}main{max-width:360px;padding:32px}h1{font-size:24px}p{line-height:1.6;opacity:.7}</style></head><body><main><h1>Return to T3 Code</h1><p>Your sign-in response has been received. T3 Code is finishing the connection. You can close this tab.</p></main></body></html>";
 
 /// The parts of an OpenAI authorization URL the callback must match.
@@ -115,7 +117,8 @@ pub(super) fn callback_url(value: &str, request: &AuthorizationRequest) -> Resul
 pub(super) async fn listen(authorization_url: String) -> Result<(TcpListener, AuthorizationRequest)> {
     let request = authorization_request(&authorization_url)?;
     let port = request.redirect_uri.port().ok_or_else(|| anyhow!(INVALID_REQUEST))?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|_| {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|error| {
+        log::warn!("chatgpt callback: binding port {port}: {error}");
         anyhow!(
             "The ChatGPT callback port is in use on this computer. Close the other sign-in and try again, or paste the redirect URL in T3 Code."
         )
@@ -129,7 +132,7 @@ pub(super) async fn receive(listener: TcpListener, request: AuthorizationRequest
         loop {
             let (mut stream, _) = listener.accept().await?;
             let mut buffer = vec![0; 16_384 + 1024];
-            let read = stream.read(&mut buffer).await.unwrap_or(0);
+            let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buffer)).await.ok().and_then(Result::ok).unwrap_or(0);
             let head = String::from_utf8_lossy(&buffer[..read]);
             let target = head.lines().next().and_then(|line| line.strip_prefix("GET ")).and_then(|r| r.split(' ').next());
             let callback =

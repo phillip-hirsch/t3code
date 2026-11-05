@@ -9,6 +9,8 @@ use crate::rpc::StreamEvent;
 
 /// `LIVE_REFRESH_INTERVAL_MS`: an open pull request is read again this often while the app is in front.
 const LIVE_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// A refresh stream the server ended is asked for again after this long, never in a hot loop.
+const RESUBSCRIBE_AFTER: Duration = Duration::from_secs(60);
 const MIN_WIDTH: f32 = 360.;
 /// The list keeps at least this much beside the panel.
 const LIST_MIN_WIDTH: f32 = 320.;
@@ -92,7 +94,22 @@ impl Workspace {
                     StreamEvent::Item(_) => {
                         let _ = this.update(cx, |this, cx| this.refresh_pr_in_place(cx));
                     }
-                    StreamEvent::End(_) => break,
+                    // A dropped socket restarts with the page on reconnect (`page_opened`);
+                    // anything else the server ended is asked for again after a pause.
+                    StreamEvent::End(result) => {
+                        let disconnected = matches!(result, Err(crate::rpc::RpcError::Disconnected(_)));
+                        if !disconnected {
+                            log::warn!("pull request refreshes ended: {result:?}");
+                            cx.background_executor().timer(RESUBSCRIBE_AFTER).await;
+                        }
+                        let _ = this.update(cx, |this, cx| {
+                            this.pull_requests._live = None;
+                            if !disconnected {
+                                this.follow_pull_requests(cx);
+                            }
+                        });
+                        break;
+                    }
                 }
             }
         });
