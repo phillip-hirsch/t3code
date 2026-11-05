@@ -173,22 +173,26 @@ pub fn write_launcher(target: &Target) -> Result<PathBuf> {
     Ok(launcher)
 }
 
+#[cfg(any(windows, test))]
 fn same_windows_path(left: &str, right: &str) -> bool {
     let trim = |value: &str| value.trim_end_matches(['\\', '/']).to_lowercase();
     trim(left) == trim(right)
 }
 
+#[cfg(any(windows, test))]
 fn path_entries(value: &str, separator: char) -> Vec<&str> {
     value.split(separator).filter(|entry| !entry.is_empty()).collect()
 }
 
 /// The user PATH with `dir` appended, or `None` when it is already there.
+#[cfg(any(windows, test))]
 pub fn with_path_entry(user_path: &str, dir: &str) -> Option<String> {
     let entries = path_entries(user_path, ';');
     (!entries.iter().any(|entry| same_windows_path(entry, dir))).then(|| [entries, vec![dir]].concat().join(";"))
 }
 
 /// The user PATH without `dir`, or `None` when it was not there.
+#[cfg(any(windows, test))]
 pub fn without_path_entry(user_path: &str, dir: &str) -> Option<String> {
     let entries = path_entries(user_path, ';');
     let kept: Vec<&str> = entries.iter().copied().filter(|entry| !same_windows_path(entry, dir)).collect();
@@ -263,6 +267,7 @@ if ($env:T3_SET -eq '1') {
 }
 
 /// `ownedPathMarker`: records that the PATH entry is ours to remove.
+#[cfg(windows)]
 fn owned_path_marker(target: &Target) -> PathBuf {
     target.home.join("userdata").join("cli-command-path-entry")
 }
