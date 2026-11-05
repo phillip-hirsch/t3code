@@ -1055,15 +1055,16 @@ fn plan_card(
     cx: &mut App,
     t: &Tokens,
 ) -> AnyElement {
-    let title: SharedString = text
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix('#').map(|h| h.trim_start_matches('#').trim().to_owned()))
-        .unwrap_or_else(|| "Proposed plan".into())
-        .into();
+    let title: SharedString = crate::proposed_plan::title(text).unwrap_or("Proposed plan").to_owned().into();
     let key = timeline::entry_key(id);
     let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&key));
-    let collapsible = text.lines().count() > 18;
+    let collapsible = crate::proposed_plan::can_collapse(text);
     let collapsed = collapsible && !expanded;
+    let (body_key, body_text): (SharedString, SharedString) = if collapsed {
+        (format!("{id}:preview").into(), crate::proposed_plan::collapsed_preview(text, 10).into())
+    } else {
+        (id.clone(), crate::proposed_plan::displayed(text).into())
+    };
     let card_background = alpha(t.card, 0.7);
     let badge = div()
         .h(px(18.))
@@ -1083,8 +1084,8 @@ fn plan_card(
         .text_color(alpha(t.foreground, 0.9))
         .child(markdown_with(
             this,
-            id.clone(),
-            text,
+            body_key,
+            &body_text,
             MarkdownKind::Assistant { streaming: false },
             Some(lane_width - 42.),
             t,
@@ -1117,20 +1118,24 @@ fn plan_card(
                 .on_click(toggle(this, key.clone())),
         )
     });
-    let card = v_flex()
-        .p(px(20.))
-        .rounded(px(16.))
-        .border_1()
-        .border_color(alpha(t.border, 0.8))
-        .bg(card_background)
-        .child(
-            h_flex()
-                .gap(px(12.))
-                .child(badge)
-                .child(div().min_w_0().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(title)),
-        )
-        .child(body)
-        .children(toggle_button);
+    let card =
+        v_flex()
+            .p(px(20.))
+            .rounded(px(16.))
+            .border_1()
+            .border_color(alpha(t.border, 0.8))
+            .bg(card_background)
+            .child(
+                h_flex()
+                    .gap(px(12.))
+                    .justify_between()
+                    .child(h_flex().min_w_0().gap(px(8.)).child(badge).child(
+                        div().min_w_0().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(title),
+                    ))
+                    .child(super::plan_actions::plan_actions_button(this, id, text, cx)),
+            )
+            .child(body)
+            .children(toggle_button);
     lane(16., card).into_any_element()
 }
 

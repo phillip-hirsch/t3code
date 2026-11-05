@@ -77,6 +77,14 @@ impl Workspace {
     /// A user edit. While a question is open the editor holds its custom answer;
     /// programmatic changes (`set_composer_text`) never reach the draft.
     pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+        self.close_stash_menu(cx);
+        if self.composer_ui.length_error.is_some() {
+            let error = composer_text::prompt_length_error(&self.composer.read(cx).value());
+            if error != self.composer_ui.length_error {
+                self.composer_ui.length_error = error;
+                cx.notify();
+            }
+        }
         self.save_custom_answer(cx);
         self.sync_composer_empty(cx);
         let state = self.composer.read(cx);
@@ -141,6 +149,7 @@ impl Workspace {
         };
         self.prompt_history = None;
         self.menu = Default::default();
+        self.prompt_stash.open = false;
         self.picker.dismiss();
         if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
             self.composer_drafts.remove(&target);
@@ -206,7 +215,10 @@ impl Workspace {
         if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
-        if self.draft_workspace_key(keystroke, window, cx) || self.composer_shortcut(keystroke, window, cx) {
+        if self.stash_menu_key(keystroke, window, cx)
+            || self.draft_workspace_key(keystroke, window, cx)
+            || self.composer_shortcut(keystroke, window, cx)
+        {
             return true;
         }
         // Keys in the editor: Shift+Tab, the open menu, then prompt history, then the send shortcuts.
@@ -562,14 +574,22 @@ impl Workspace {
                     )
                 }),
             ))
+            .children(self.composer_ui.length_error.clone().map(|error| {
+                div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
+            }))
             .child(self.render_footer(&t, cx));
         div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
-                .children(self.render_fallback_banner(&t, cx))
-                .children(self.render_question(&t, cx))
-                .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
+                .children(self.render_banner_dock(&t, cx))
+                .child(
+                    div()
+                        .relative()
+                        .children(self.render_command_menu(&t, cx))
+                        .children(self.render_stash_menu(f32::from(window.viewport_size().height) * 0.4, &t, cx))
+                        .child(surface),
+                )
                 .children(self.render_context_strip(&t, cx)),
         )
     }
@@ -944,6 +964,26 @@ impl Workspace {
         crate::new_thread::usage_fallback(&self.server_info, default, Some(project_id), jiff::Timestamp::now())
     }
 
+    /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
+    /// on their right.
+    fn render_banner_dock(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let banners: Vec<AnyElement> =
+            self.render_fallback_banner(t, cx).into_iter().chain(self.render_question(t, cx)).collect();
+        let badge = self.render_stash_badge(t, cx);
+        if banners.is_empty() && badge.is_none() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .mx(px(22.))
+                .items_end()
+                .gap(px(4.))
+                .child(v_flex().flex_1().min_w_0().children(banners))
+                .children(badge)
+                .into_any_element(),
+        )
+    }
+
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Target::Draft { project_id }) = &self.target else { return None };
@@ -975,7 +1015,6 @@ impl Workspace {
         let use_default = format!("Use {}", model_name(&default));
         Some(
             div()
-                .mx(px(22.))
                 .mb(px(-17.))
                 .child(
                     h_flex()
@@ -1164,7 +1203,6 @@ impl Workspace {
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         Some(
             div()
-                .mx(px(22.))
                 .mb(px(-17.))
                 .child(
                     v_flex()

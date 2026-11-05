@@ -104,6 +104,11 @@ impl Workspace {
         {
             return;
         }
+        if let Some(error) = crate::composer_text::prompt_length_error(&text) {
+            self.composer_ui.length_error = Some(error);
+            cx.notify();
+            return;
+        }
         let (Some(client), Some(target)) = (self.client(), self.target.clone()) else { return };
         let (attachments, context) = match self.attachment_payload(&text) {
             Ok(payload) => payload,

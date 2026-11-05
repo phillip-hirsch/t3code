@@ -63,15 +63,44 @@ pub(super) struct Attachment {
 impl Attachment {
     /// A sent message's attachment, back in the composer as a new upload.
     pub(super) fn restored(kind: &str, name: String, mime: String, bytes: Vec<u8>) -> Self {
+        Self::restored_as(new_id(), kind, name, mime, bytes)
+    }
+
+    /// Restored under the id its prompt's chips still name.
+    pub(super) fn restored_as(local_id: String, kind: &str, name: String, mime: String, bytes: Vec<u8>) -> Self {
         let kind = if kind == "image" { Kind::Image } else { Kind::File };
         let image = image_format(&mime)
             .filter(|_| kind == Kind::Image)
             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-        Self { local_id: new_id(), kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
+        Self { local_id, kind, name, mime, bytes: Arc::new(bytes), image, upload: Upload::Uploading }
     }
 
     pub(super) fn local_id(&self) -> &str {
         &self.local_id
+    }
+
+    pub(super) fn kind_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn mime(&self) -> &str {
+        &self.mime
+    }
+
+    pub(super) fn bytes(&self) -> &Arc<Vec<u8>> {
+        &self.bytes
+    }
+
+    /// The server's id once the upload finished.
+    pub(super) fn uploaded_id(&self) -> Option<&str> {
+        match &self.upload {
+            Upload::Ready(id) => Some(id),
+            _ => None,
+        }
     }
 
     fn context_id(&self) -> String {
@@ -231,10 +260,54 @@ impl Workspace {
                     self.add_paths(paths.paths().to_vec(), window, cx);
                     handled = true;
                 }
+                gpui_kit::ClipboardEntry::String(text) if !handled => {
+                    handled = self.fold_pasted_text(text.text(), window, cx);
+                }
                 gpui_kit::ClipboardEntry::String(_) => {}
             }
         }
         handled
+    }
+
+    /// `foldPastedText`: a large paste, or one past the input limit, attaches as a text
+    /// file; one that can neither fit nor attach is refused.
+    fn fold_pasted_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = self.composer.read(cx);
+        let selected = state.selected_range();
+        let value = state.value();
+        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected.clone()]);
+        let would_exceed = kept + composer_text::js_length(text) > composer_text::MAX_INPUT_CHARS;
+        if !composer_text::paste_folds(text, would_exceed) {
+            return false;
+        }
+        let limit = self.server_info.file_upload_limit().map(|l| l.min(MAX_FILE_BYTES));
+        let can_stage = self.target.is_some() && self.can_attach() && self.attachments.len() < MAX_ATTACHMENTS;
+        let refuse = |title: &'static str, description: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            let toast = gpui_kit::component::notification::Notification::error(description).title(title);
+            gpui_kit::component::WindowExt::push_notification(window, toast, cx);
+            true
+        };
+        let Some(limit) = limit.filter(|_| can_stage) else {
+            return would_exceed
+                && refuse(
+                    "Pasted text is too large for this message",
+                    "Remove some text or an attachment, then paste again.",
+                    window,
+                    cx,
+                );
+        };
+        if text.len() as u64 > limit {
+            return would_exceed
+                && refuse(
+                    "Pasted text is too large to attach",
+                    "Reduce the clipboard contents or save a smaller excerpt as a file.",
+                    window,
+                    cx,
+                );
+        }
+        let name = composer_text::next_pasted_text_name(self.attachments.iter().map(|a| a.name.as_str()));
+        self.add_attachment(name, Kind::File, "text/plain", text.as_bytes().to_vec(), window, cx);
+        true
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {

@@ -349,8 +349,73 @@ fn strip_context_links(text: &str) -> String {
     out
 }
 
+/// `PROVIDER_SEND_TURN_MAX_INPUT_CHARS`, in UTF-16 units like a JS string's length.
+pub const MAX_INPUT_CHARS: usize = 120_000;
+/// `PASTED_TEXT_ATTACHMENT_THRESHOLD_BYTES`.
+const PASTED_TEXT_THRESHOLD_BYTES: usize = 32 * 1024;
+
+/// A JS string's `length`.
+pub fn js_length(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `getComposerPromptLengthValidationMessage`.
+pub fn prompt_length_error(prompt: &str) -> Option<String> {
+    let excess = js_length(prompt.trim()).checked_sub(MAX_INPUT_CHARS).filter(|e| *e > 0)?;
+    let label = if excess == 1 { "character" } else { "characters" };
+    Some(format!(
+        "Prompt is {} {label} over the {}-character limit. Shorten or split it before sending.",
+        group_thousands(excess),
+        group_thousands(MAX_INPUT_CHARS)
+    ))
+}
+
+/// `pastedTextDisposition`: large pastes, and pastes past the input limit, become a file.
+pub fn paste_folds(text: &str, would_exceed_limit: bool) -> bool {
+    !text.is_empty() && (would_exceed_limit || text.len() >= PASTED_TEXT_THRESHOLD_BYTES)
+}
+
+/// `nextPastedTextFileName`.
+pub fn next_pasted_text_name<'a>(existing: impl Iterator<Item = &'a str>) -> String {
+    let taken: Vec<String> = existing.map(str::to_lowercase).collect();
+    if !taken.iter().any(|n| n == "pasted-text.txt") {
+        return "pasted-text.txt".into();
+    }
+    (2..).map(|n| format!("pasted-text-{n}.txt")).find(|name| !taken.contains(name)).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_prompts_and_pastes_follow_the_web_limits() {
+        assert_eq!(super::prompt_length_error(&"a".repeat(super::MAX_INPUT_CHARS)), None);
+        assert_eq!(
+            super::prompt_length_error(&format!(" {} ", "a".repeat(super::MAX_INPUT_CHARS + 1))).as_deref(),
+            Some("Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.")
+        );
+        assert!(super::prompt_length_error(&"😀".repeat(60_001)).unwrap().starts_with("Prompt is 2 characters"));
+        assert!(!super::paste_folds("short", false) && super::paste_folds("short", true));
+        assert!(super::paste_folds(&"é".repeat(16 * 1024), false), "the threshold counts bytes");
+        assert!(!super::paste_folds("", true));
+        assert_eq!(super::next_pasted_text_name(["a.txt"].into_iter()), "pasted-text.txt");
+        assert_eq!(
+            super::next_pasted_text_name(["Pasted-Text.txt", "pasted-text-2.txt"].into_iter()),
+            "pasted-text-3.txt"
+        );
+    }
+
     use super::*;
 
     fn kind(text: &str) -> Option<(TriggerKind, String)> {

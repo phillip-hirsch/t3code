@@ -41,7 +41,9 @@ mod minimap;
 mod model_picker;
 mod pages;
 mod palette;
+mod plan_actions;
 mod preview;
+mod prompt_stash;
 mod quit;
 mod right_panel;
 mod send;
@@ -150,6 +152,8 @@ pub struct Workspace {
     /// Plan mode per target and the dismissed fallback notice.
     composer_ui: composer_plan::ComposerUi,
     attachments: Vec<attachments::Attachment>,
+    /// Prompts set aside with `composer.stash`.
+    prompt_stash: prompt_stash::PromptStash,
     /// Where Up/Down prompt history stands.
     prompt_history: Option<crate::composer_text::HistoryPosition>,
     /// The editor's chip ids after the last edit, to notice deleted attachment chips.
@@ -288,6 +292,7 @@ impl Workspace {
             draft_workspace: Default::default(),
             composer_ui: Default::default(),
             attachments: Vec::new(),
+            prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
             ctrl_held: false,
@@ -891,6 +896,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
             .map(|el| self.on_terminal_actions(el, cx))
+            .map(|el| self.on_stash_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();
