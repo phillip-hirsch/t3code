@@ -11,6 +11,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -270,7 +272,7 @@ enum SignIn {
 /// What Source control keeps across frames: the discovery scan, folds and the in-progress
 /// GitHub sign-in and token form.
 struct SourceControlState {
-    discovery: Option<Value>,
+    discovery: Option<Rc<Value>>,
     error: Option<String>,
     pending: bool,
     _scan: Option<Task<()>>,
@@ -330,7 +332,7 @@ impl SourceControlState {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(result) => {
-                        this.discovery = Some(result);
+                        this.discovery = Some(Rc::new(result));
                         this.error = None;
                     }
                     Err(error) => this.error = Some(error.message()),
@@ -816,14 +818,15 @@ impl Workspace {
         }
         parts.push(self.token_form(state, host.kind, credentials, window, cx));
         if item["status"] == "available" {
-            let accounts = item["auth"]["accounts"].as_array().cloned().unwrap_or_default();
-            parts.push(self.account_choices(state, host.kind, credentials, &accounts, cx));
+            let accounts = item["auth"]["accounts"].as_array().map_or(&[][..], Vec::as_slice);
+            parts.push(self.account_choices(state, host.kind, credentials, accounts, cx));
         }
         v_flex().gap(px(24.)).children(parts).into_any_element()
     }
 
-    fn host_settings(&self, kind: &str) -> Value {
-        self.server_info.settings.get("sourceControlHosts").get(kind).cloned().unwrap_or_else(|| json!({}))
+    /// The saved settings of one host kind; `Null` (reads as empty) when it has none.
+    fn host_settings(&self, kind: &str) -> &Value {
+        &self.server_info.settings.get("sourceControlHosts")[kind]
     }
 
     /// `SourceControlAppSignInSettings`: the device-code sign-in card.
@@ -1562,7 +1565,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *tokens(cx);
-        let saved = self.host_settings(host.kind);
+        let saved = self.host_settings(host.kind).clone();
         let kind = host.kind;
         let mut column = v_flex().gap(px(12.));
         for field in host.fields {

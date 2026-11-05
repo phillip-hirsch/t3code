@@ -46,20 +46,21 @@ struct Removal {
 enum Use {
     Standard,
     Theme(String),
-    /// `selectCollectionDefaults`: the first light and dark variants.
-    Collection(String, Vec<ThemeDefinition>),
+    /// `selectCollectionDefaults`: the first light and dark variants of the collection with
+    /// this key.
+    Collection(String),
 }
 
-/// One `ThemeLibraryCard`.
-struct Card {
+/// One `ThemeLibraryCard`, borrowing the saved themes it shows.
+struct Card<'a> {
     key: String,
     label: String,
     card: CardId,
     on_use: Use,
     previews: Vec<(bool, Preview)>,
     duplicate: Session,
-    /// A saved theme and the collection it belongs to: Edit, Export and Remove.
-    custom: Option<(ThemeDefinition, Vec<ThemeDefinition>)>,
+    /// A saved theme: Edit, Export and Remove.
+    custom: Option<&'a ThemeDefinition>,
 }
 
 fn previews_of(theme: &ThemeDefinition) -> Vec<(bool, Preview)> {
@@ -72,7 +73,7 @@ fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_
 }
 
 /// `collectionVariantLabels`: each variant's label without the words all of them share.
-fn variant_labels(themes: &[ThemeDefinition]) -> Vec<String> {
+fn variant_labels(themes: &[&ThemeDefinition]) -> Vec<String> {
     let words: Vec<Vec<&str>> = themes.iter().map(|theme| theme.label.split_whitespace().collect()).collect();
     let Some(first) = words.first() else { return Vec::new() };
     let shared = first
@@ -91,19 +92,24 @@ fn variant_labels(themes: &[ThemeDefinition]) -> Vec<String> {
 }
 
 /// Saved themes grouped by collection, in library order (`customThemeCollections`).
-fn collections(themes: &[ThemeDefinition]) -> Vec<(String, Vec<ThemeDefinition>)> {
-    let mut groups: Vec<(String, Vec<ThemeDefinition>)> = Vec::new();
+fn collections(themes: &[ThemeDefinition]) -> Vec<(String, Vec<&ThemeDefinition>)> {
+    let mut groups: Vec<(String, Vec<&ThemeDefinition>)> = Vec::new();
     for theme in themes {
         let key = match &theme.collection {
             Some(collection) => format!("collection:{}", collection.id),
             None => format!("theme:{}", theme.id),
         };
         match groups.iter_mut().find(|(id, _)| *id == key) {
-            Some((_, group)) => group.push(theme.clone()),
-            None => groups.push((key, vec![theme.clone()])),
+            Some((_, group)) => group.push(theme),
+            None => groups.push((key, vec![theme])),
         }
     }
     groups
+}
+
+/// The saved collection with this key, as `collections` groups it.
+fn collection<'a>(themes: &'a [ThemeDefinition], key: &str) -> Vec<&'a ThemeDefinition> {
+    collections(themes).into_iter().find(|(id, _)| id == key).map(|(_, group)| group).unwrap_or_default()
 }
 
 pub(in crate::app) fn toast(window: &mut Window, cx: &mut App, title: String, description: String) {
@@ -144,20 +150,16 @@ impl Workspace {
             let index = self.settings_ui.theme_library.variant.get(&key).copied().unwrap_or_else(|| {
                 group.iter().position(|theme| owners.iter().any(|o| o.as_deref() == Some(&theme.id))).unwrap_or(0)
             });
-            let theme = group[index.min(group.len() - 1)].clone();
-            let on_use = if group.len() == 1 {
-                Use::Theme(theme.id.clone())
-            } else {
-                Use::Collection(key.clone(), group.clone())
-            };
+            let theme = group[index.min(group.len() - 1)];
+            let on_use = if group.len() == 1 { Use::Theme(theme.id.clone()) } else { Use::Collection(key.clone()) };
             let card = Card {
                 key: key.clone(),
                 label: theme.label.clone(),
                 card: Some(theme.id.clone()),
                 on_use,
-                previews: previews_of(&theme),
+                previews: previews_of(theme),
                 duplicate: seed(Some(&theme.id), &theme.label),
-                custom: Some((theme, group.clone())),
+                custom: Some(theme),
             };
             let fan = (group.len() > 1).then_some(group.as_slice());
             rendered.push(self.render_theme_card(card, &owners, fan, &t, cx));
@@ -259,7 +261,8 @@ impl Workspace {
         match on_use {
             Use::Standard => choice.use_theme(None),
             Use::Theme(id) => choice.use_card(Some(id.clone())),
-            Use::Collection(key, themes) => {
+            Use::Collection(key) => {
+                let themes = collection(self.client_settings.themes.custom(), key);
                 for dark in [false, true] {
                     if let Some(theme) = themes.iter().find(|theme| theme.colors_for(dark).is_some()) {
                         choice.assign_half(dark, Some(theme.id.clone()));
@@ -283,7 +286,7 @@ impl Workspace {
         &self,
         card: Card,
         owners: &[CardId; 2],
-        fan: Option<&[ThemeDefinition]>,
+        fan: Option<&[&ThemeDefinition]>,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -321,7 +324,7 @@ impl Workspace {
             format!("Use for {mode} mode only").into()
         };
         let label = match (&card.custom, fan) {
-            (Some((theme, _)), Some(_)) => theme.collection.as_ref().map_or(card.label.clone(), |c| c.label.clone()),
+            (Some(theme), Some(_)) => theme.collection.as_ref().map_or(card.label.clone(), |c| c.label.clone()),
             _ => card.label.clone(),
         };
         let icon_button = |id: &str, icon: IconName, text: &'static str| {
@@ -340,9 +343,9 @@ impl Workspace {
                 }))
                 .into_any_element(),
         ];
-        if let Some((theme, group)) = card.custom.clone() {
+        if let Some(theme) = card.custom {
             let edit = Session { editing: Some(theme.id.clone()), ..Session::new(t.dark) };
-            let export = theme.clone();
+            let (export, remove) = (theme.id.clone(), (theme.id.clone(), key.clone()));
             actions.push(
                 icon_button("edit", IconName::PenLine, "Edit theme")
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -353,10 +356,12 @@ impl Workspace {
             );
             actions.push(
                 icon_button("export", IconName::Upload, "Export theme file")
-                    .on_click(move |_, window, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        export_theme(&export, window, cx);
-                    })
+                        if let Some(theme) = this.client_settings.themes.custom().iter().find(|t| t.id == export) {
+                            export_theme(theme, window, cx);
+                        }
+                    }))
                     .into_any_element(),
             );
             actions.push(
@@ -364,7 +369,12 @@ impl Workspace {
                     .text_color(t.error_foreground)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.confirm_remove_theme(theme.clone(), group.clone(), window, cx);
+                        let (id, key) = &remove;
+                        let themes = this.client_settings.themes.custom();
+                        let group: Vec<ThemeDefinition> = collection(themes, key).into_iter().cloned().collect();
+                        if let Some(theme) = group.iter().find(|theme| &theme.id == id).cloned() {
+                            this.confirm_remove_theme(theme, group, window, cx);
+                        }
                     }))
                     .into_any_element(),
             );
@@ -408,7 +418,7 @@ impl Workspace {
     fn render_variant_fan(
         &self,
         key: &str,
-        themes: &[ThemeDefinition],
+        themes: &[&ThemeDefinition],
         owners: &[CardId; 2],
         t: &Tokens,
         cx: &mut Context<Self>,
@@ -424,7 +434,7 @@ impl Workspace {
         );
         for dark in [false, true] {
             let options: Vec<(usize, &ThemeDefinition)> =
-                themes.iter().enumerate().filter(|(_, theme)| theme.colors_for(dark).is_some()).collect();
+                themes.iter().copied().enumerate().filter(|(_, theme)| theme.colors_for(dark).is_some()).collect();
             let active = |theme: &ThemeDefinition| owners[dark as usize].as_deref() == Some(theme.id.as_str());
             let Some(&(selected_index, selected)) = options.iter().find(|(_, theme)| active(theme)).or(options.first())
             else {

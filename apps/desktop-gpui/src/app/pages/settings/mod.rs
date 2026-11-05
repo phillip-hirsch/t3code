@@ -181,8 +181,8 @@ impl SettingsUi {
                 cx.notify();
             }
             InputEvent::PressEnter { .. } => {
-                if let Some(item) = this.settings_results(cx).get(this.settings_ui.active_result).cloned() {
-                    this.open_settings_search_result(&item, window, cx);
+                if let Some(item) = this.settings_results(cx).get(this.settings_ui.active_result).copied() {
+                    this.open_settings_search_result(item, window, cx);
                 }
             }
             _ => {}
@@ -428,14 +428,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn settings_results(&self, cx: &gpui_kit::App) -> Vec<SearchItem> {
-        let query = self.settings_ui.search.read(cx).value();
-        search::search(&query, contract().search.iter().filter(|item| search::available(item)), |to| {
-            section_label(to).unwrap_or_default()
-        })
-        .into_iter()
-        .cloned()
-        .collect()
+    fn settings_results(&self, cx: &gpui_kit::App) -> Vec<&'static SearchItem> {
+        search::search(&self.settings_ui.search.read(cx).value(), search::shipped())
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).
@@ -527,7 +521,7 @@ impl Workspace {
                     .gap(px(4.))
                     .children(results.into_iter().enumerate().map(|(index, item)| {
                         let is_active = index == active;
-                        let open = item.clone();
+                        let open = item;
                         h_flex()
                             .id(SharedString::from(format!("settings-search-result-{}", item.id)))
                             .min_h(px(40.))
@@ -546,7 +540,7 @@ impl Workspace {
                                 }
                             }))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_settings_search_result(&open, window, cx)
+                                this.open_settings_search_result(open, window, cx)
                             }))
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(

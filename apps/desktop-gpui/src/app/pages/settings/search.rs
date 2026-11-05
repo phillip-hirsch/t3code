@@ -1,6 +1,8 @@
 //! Settings search (`searchSettings` in `apps/web/src/components/settings/settingsSearch.ts`).
 
-use crate::settings::SearchItem;
+use std::sync::LazyLock;
+
+use crate::settings::{SearchItem, contract};
 
 /// `normalizeSearchText`: lowercase, accents dropped, whitespace collapsed.
 fn normalize(text: &str) -> String {
@@ -12,7 +14,36 @@ fn normalize(text: &str) -> String {
 fn fold_accent(c: char) -> char {
     const FROM: &str = "àáâãäåèéêëìíîïñòóôõöùúûüýÿçÀÁÂÃÄÅÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝÇ";
     const TO: &str = "aaaaaaeeeeiiiinooooouuuuyycAAAAAAEEEEIIIINOOOOOUUUUYC";
-    FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c)
+    FROM.chars().zip(TO.chars()).find_map(|(from, to)| (from == c).then_some(to)).unwrap_or(c)
+}
+
+/// An item's searchable text, normalized once: its title, then every field it matches on.
+pub(super) struct Indexed {
+    title: String,
+    fields: Vec<String>,
+}
+
+impl Indexed {
+    pub(super) fn new(item: &SearchItem, section_label: &str) -> Self {
+        let title = normalize(&item.title);
+        let mut fields = vec![title.clone(), normalize(section_label)];
+        fields.extend(item.search_terms.iter().map(|term| normalize(term)));
+        Self { title, fields }
+    }
+}
+
+/// The shipped items this client offers, with their normalized text.
+pub(super) fn shipped() -> &'static [(&'static SearchItem, Indexed)] {
+    static INDEX: LazyLock<Vec<(&'static SearchItem, Indexed)>> = LazyLock::new(|| {
+        let label = |to: &str| super::section_label(to).unwrap_or_default();
+        contract()
+            .search
+            .iter()
+            .filter(|item| available(item))
+            .map(|item| (item, Indexed::new(item, label(&item.to))))
+            .collect()
+    });
+    &INDEX
 }
 
 /// Whether the item exists in this client: a desktop app on this OS, with only the
@@ -38,27 +69,20 @@ pub(super) fn available(item: &SearchItem) -> bool {
 
 /// Matches every query token somewhere in the title, section label or search terms, and
 /// ranks whole-title, title-prefix and title matches first; secondary items go last.
-pub(super) fn search<'a>(
-    query: &str,
-    items: impl IntoIterator<Item = &'a SearchItem>,
-    section_label: impl Fn(&str) -> &'a str,
-) -> Vec<&'a SearchItem> {
+pub(super) fn search<'a>(query: &str, items: &'a [(&'a SearchItem, Indexed)]) -> Vec<&'a SearchItem> {
     let query = normalize(query);
     if query.is_empty() {
         return Vec::new();
     }
     let tokens: Vec<&str> = query.split(' ').collect();
     let mut ranked: Vec<(&SearchItem, usize, u8)> = items
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter_map(|(index, item)| {
-            let title = normalize(&item.title);
-            let mut fields = vec![title.clone(), normalize(section_label(&item.to))];
-            fields.extend(item.search_terms.iter().map(|term| normalize(term)));
+        .filter_map(|(index, (item, Indexed { title, fields }))| {
             if !tokens.iter().all(|token| fields.iter().any(|field| field.contains(token))) {
                 return None;
             }
-            let rank = if title == query {
+            let rank = if *title == query {
                 5
             } else if title.starts_with(&query) {
                 4
@@ -71,7 +95,7 @@ pub(super) fn search<'a>(
             } else {
                 0
             };
-            Some((item, index, rank))
+            Some((*item, index, rank))
         })
         .collect();
     ranked.sort_by(|a, b| a.0.secondary.cmp(&b.0.secondary).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
@@ -94,10 +118,9 @@ mod tests {
     }
 
     fn ids(query: &str, items: &[SearchItem]) -> Vec<String> {
-        search(query, items, |to| if to == "general" { "General" } else { "Appearance" })
-            .into_iter()
-            .map(|i| i.id.clone())
-            .collect()
+        let label = |to: &str| if to == "general" { "General" } else { "Appearance" };
+        let indexed: Vec<_> = items.iter().map(|item| (item, Indexed::new(item, label(&item.to)))).collect();
+        search(query, &indexed).into_iter().map(|i| i.id.clone()).collect()
     }
 
     #[test]
@@ -132,9 +155,7 @@ mod tests {
 
     #[test]
     fn the_shipped_index_finds_its_settings() {
-        let contract = crate::settings::contract();
-        let label = |to: &str| super::super::section_label(to).unwrap_or_default();
-        let results = search("delete confirmation", contract.search.iter().filter(|i| available(i)), label);
+        let results = search("delete confirmation", shipped());
         assert_eq!(results.first().map(|i| i.id.as_str()), Some("delete-confirmation"));
     }
 }
