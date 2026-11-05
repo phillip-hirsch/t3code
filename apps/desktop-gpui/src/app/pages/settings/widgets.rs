@@ -606,6 +606,8 @@ impl Workspace {
         if !plan.client_patch.is_empty() {
             self.client_settings.apply(&plan.client_patch);
             theme::set_appearance(theme::Appearance::from_settings(&self.client_settings.values), window, cx);
+            // `composerRichTextEnabled` and the theme's colors.
+            self.sync_composer_marks(cx);
             cx.notify();
             // The sidebar is a cached view and reads several device settings.
             self.notify_sidebar(cx);

@@ -678,6 +678,7 @@ impl Workspace {
     ) {
         self.client_settings.set_theme_choice(choice.clone());
         theme::set_preference(choice, window, cx);
+        self.sync_composer_marks(cx);
         cx.notify();
     }
 

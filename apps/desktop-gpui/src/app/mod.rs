@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::component::input::{InputEvent, TextareaState};
+use gpui_kit::component::input::{InputEvent, TextareaMode, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -154,6 +154,8 @@ pub struct Workspace {
     prompt_history: Option<crate::composer_text::HistoryPosition>,
     /// The editor's chip ids after the last edit, to notice deleted attachment chips.
     chip_ids: Vec<String>,
+    /// The composer's Markdown styling, made the first time `composerRichTextEnabled` paints.
+    composer_marks: Option<gpui_kit::component::input::TextDecorationCollection<TextareaMode>>,
     /// Ctrl (Cmd) is down, which turns steer into queue.
     ctrl_held: bool,
     /// Connected through `T3_SERVER_URL` rather than to this app's own server.
@@ -247,7 +249,10 @@ impl Workspace {
                 }
             }),
             cx.observe(&scroller, |_, _, cx| cx.notify()),
-            cx.observe_window_appearance(window, |_, window, cx| crate::theme::sync(window, cx)),
+            cx.observe_window_appearance(window, |this, window, cx| {
+                crate::theme::sync(window, cx);
+                this.sync_composer_marks(cx);
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);
@@ -290,6 +295,7 @@ impl Workspace {
             attachments: Vec::new(),
             prompt_history: None,
             chip_ids: Vec::new(),
+            composer_marks: None,
             ctrl_held: false,
             environment_remote: false,
             dragging_files: false,
