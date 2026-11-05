@@ -51,8 +51,36 @@ pub(in crate::app) struct UsageState {
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
     scroll: ScrollHandle,
-    /// Reset credits being spent (`None`) or spent, with the outcome, by account key.
-    redeemed: Vec<(String, String, Option<String>)>,
+    /// Reset credits being confirmed, spent, or spent with the outcome, one per account key.
+    redeemed: Vec<Redeem>,
+}
+
+pub(in crate::app) struct Redeem {
+    key: String,
+    name: String,
+    status: RedeemStatus,
+}
+
+enum RedeemStatus {
+    Confirming,
+    Running,
+    Done(String),
+}
+
+impl UsageState {
+    /// A credit for this account is being confirmed or spent, so another click must not spend a second one.
+    fn redeem_busy(&self, key: &str) -> bool {
+        redeem_busy(&self.redeemed, key)
+    }
+
+    fn set_redeem(&mut self, key: &str, name: &str, status: RedeemStatus) {
+        self.redeemed.retain(|r| r.key != key);
+        self.redeemed.push(Redeem { key: key.to_owned(), name: name.to_owned(), status });
+    }
+}
+
+fn redeem_busy(redeemed: &[Redeem], key: &str) -> bool {
+    redeemed.iter().any(|r| r.key == key && !matches!(r.status, RedeemStatus::Done(_)))
 }
 
 impl Default for UsageState {
@@ -259,7 +287,6 @@ impl Workspace {
         self.read_usage(true, cx);
     }
 
-    /// The modal layer over the whole window while Usage is open.
     /// "Use a reset credit?", then `provider.consumeResetCredit` (`useResetCredit`).
     fn redeem_reset_credit(
         &mut self,
@@ -270,6 +297,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client() else { return };
+        if self.usage.redeem_busy(&key) {
+            return;
+        }
+        let previous = self.usage.redeemed.iter().position(|r| r.key == key).map(|i| self.usage.redeemed.remove(i));
+        self.usage.set_redeem(&key, &name, RedeemStatus::Confirming);
         let answer = window.prompt(
             gpui_kit::PromptLevel::Warning,
             "Use a reset credit?",
@@ -278,23 +310,25 @@ impl Workspace {
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            let set = |this: &mut Self, status: Option<String>| {
-                this.usage.redeemed.retain(|(k, ..)| *k != key);
-                this.usage.redeemed.push((key.clone(), name.clone(), status));
-            };
+            let confirmed = answer.await == Ok(0);
             let _ = this.update(cx, |this, cx| {
-                set(this, None);
+                if confirmed {
+                    this.usage.set_redeem(&key, &name, RedeemStatus::Running);
+                } else {
+                    this.usage.redeemed.retain(|r| r.key != key);
+                    this.usage.redeemed.extend(previous);
+                }
                 cx.notify();
             });
+            if !confirmed {
+                return;
+            }
             let status = match client.request("provider.consumeResetCredit", input).await {
                 Ok(result) => logic::reset_outcome_text(&result),
                 Err(error) => error.to_string(),
             };
             let _ = this.update(cx, |this, cx| {
-                set(this, Some(status));
+                this.usage.set_redeem(&key, &name, RedeemStatus::Done(status));
                 cx.notify();
             });
         })
@@ -1413,7 +1447,7 @@ fn pool_section(
     pool: &Pool,
     now: i64,
     environment: Option<&str>,
-    redeemed: &[(String, String, Option<String>)],
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1432,27 +1466,38 @@ fn pool_section(
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, environment, view, t)))
+        .children(
+            pool.windows
+                .iter()
+                .map(|window| pool_window_card(pool, window, color, now, environment, redeemed, view, t)),
+        )
         // The confirm closed with no popover to report back in, so progress and the outcome show here.
-        .children(redeemed.iter().filter(|(key, ..)| pool.accounts.iter().any(|a| &a.key == key)).map(
-            |(_, name, status)| {
+        .children(redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
+            let status = match &r.status {
+                RedeemStatus::Confirming => return None,
+                RedeemStatus::Running => "Using reset credit…".to_owned(),
+                RedeemStatus::Done(status) => status.clone(),
+            };
+            Some(
                 h_flex()
                     .gap(px(4.))
                     .text_xs()
                     .text_color(t.muted_foreground)
-                    .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(name.clone()))
-                    .child(status.clone().unwrap_or_else(|| "Using reset credit…".into()))
-            },
-        ))
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(r.name.clone()))
+                    .child(status),
+            )
+        }))
         .into_any_element()
 }
 
+#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_window_card(
     pool: &Pool,
     window: &PoolWindow,
     color: Hsla,
     now: i64,
     environment: Option<&str>,
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1461,7 +1506,7 @@ fn pool_window_card(
     let several = window.columns.len() > 1;
     let segments = window.columns.iter().map(|member| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, environment, view, t)
+        pool_segment(pool, window, member, several, color, now, environment, redeemed, view, t)
     });
     v_flex()
         .gap(px(12.))
@@ -1557,7 +1602,7 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
@@ -1566,6 +1611,7 @@ fn pool_segment(
     color: Hsla,
     now: i64,
     environment: Option<&str>,
+    redeemed: &[Redeem],
     view: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1668,7 +1714,7 @@ fn pool_segment(
                     )
                 }),
         )
-        .when_some(redeem, |el, input| {
+        .when_some(redeem.filter(|_| !redeem_busy(redeemed, &account.key)), |el, input| {
             let (view, key, name) = (view.clone(), account.key.clone(), account.name());
             el.on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
