@@ -1079,7 +1079,21 @@ fn markdown_view(
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .on_link_click(move |url, event, window, cx| {
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
-            if matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right) {
+            let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
+            // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).
+            if thread_link(url).is_none() {
+                let target = link_this
+                    .upgrade()
+                    .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
+                if let Some(target) = target {
+                    let _ = link_this.update(cx, |workspace, cx| match right {
+                        true => workspace.open_file_menu(target, event.position(), window, cx),
+                        false => workspace.open_file_link(&target, window, cx),
+                    });
+                    return;
+                }
+            }
+            if right {
                 let _ =
                     link_this.update(cx, |workspace, cx| workspace.open_link_menu(url, event.position(), window, cx));
                 return;

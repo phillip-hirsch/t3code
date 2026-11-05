@@ -109,7 +109,7 @@ struct Section {
 }
 
 /// `EDITORS` labels, with the file manager named for Windows.
-fn editor_label(id: &str) -> &str {
+pub(super) fn editor_label(id: &str) -> &str {
     match id {
         "cursor" => "Cursor",
         "trae" => "Trae",
@@ -367,7 +367,7 @@ impl Workspace {
     }
 
     /// The editor the Open in row launches: the last one picked, else the first available (`usePreferredEditor`).
-    fn preferred_editor(&self) -> Option<&str> {
+    pub(super) fn preferred_editor(&self) -> Option<&str> {
         let available = &self.server_info.available_editors;
         self.preferred_editor
             .as_deref()
