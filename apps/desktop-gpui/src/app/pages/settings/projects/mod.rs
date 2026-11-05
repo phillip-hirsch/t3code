@@ -48,7 +48,6 @@ pub(super) struct ProjectsPanel {
     checkout: Option<String>,
     /// The last shown checkouts, so a grouping change can follow them to their new group.
     last_members: Vec<String>,
-    grouping: GroupingSettings,
     name: Entity<InputState>,
     /// The `projectKey:displayName` the name field was filled from; the web keys the input by it.
     name_for: Option<String>,
@@ -67,7 +66,6 @@ impl ProjectsPanel {
             selected: None,
             checkout: None,
             last_members: Vec::new(),
-            grouping: GroupingSettings::load(),
             name: cx.new(|cx| InputState::new(window, cx)),
             name_for: None,
             name_edited: false,
@@ -109,7 +107,7 @@ impl Workspace {
     pub(super) fn render_settings_projects_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let panel = window.use_keyed_state("settings-projects-panel", cx, ProjectsPanel::new);
         self.watch_project_name(&panel, window, cx);
-        let groups = self.settings_project_groups(&panel, cx);
+        let groups = self.settings_project_groups();
         let selection = self.resolve_project_selection(&panel, &groups, cx);
         let tokens = *theme::tokens(cx);
         let body = match (&selection, panel.read(cx).selected.is_some()) {
@@ -187,10 +185,10 @@ impl Workspace {
         settings_section("project", "Project", [v_flex().p_1().gap_px().children(items).into_any_element()], &tokens)
     }
 
-    fn settings_project_groups(&self, panel: &Entity<ProjectsPanel>, cx: &App) -> Vec<ProjectGroup> {
+    fn settings_project_groups(&self) -> Vec<ProjectGroup> {
         groups::build_groups(
             &self.shell.projects,
-            &panel.read(cx).grouping,
+            &GroupingSettings::from_settings(&self.client_settings.values),
             self.server_info.environment_id.as_deref().unwrap_or_default(),
             self.server_info.scratch_workspace_root.as_deref(),
         )
@@ -265,7 +263,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let groups = self.settings_project_groups(panel, cx);
+        let groups = self.settings_project_groups();
         let Some(selection) = self.resolve_project_selection(panel, &groups, cx) else { return };
         if title.is_empty() {
             window.push_notification(Notification::warning("Project title cannot be empty"), cx);
@@ -453,23 +451,12 @@ impl Workspace {
         .detach();
     }
 
-    fn set_grouping_rule(
-        &mut self,
-        panel: &Entity<ProjectsPanel>,
-        physical_key: String,
-        mode: Option<GroupingMode>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let saved = panel.update(cx, |panel, cx| {
-            panel.grouping.set_override(&physical_key, mode);
-            cx.notify();
-            panel.grouping.save()
-        });
-        if let Err(error) = saved {
-            log::error!("failed to save checkout grouping rule: {error}");
-            toast_error(window, cx, "Could not save grouping rule", error.to_string());
-        }
+    fn set_grouping_rule(&mut self, physical_key: String, mode: Option<GroupingMode>, cx: &mut Context<Self>) {
+        let mut grouping = GroupingSettings::from_settings(&self.client_settings.values);
+        grouping.set_override(&physical_key, mode);
+        self.client_settings.apply(&grouping.overrides_patch());
+        self.notify_sidebar(cx);
+        cx.notify();
     }
 
     /// The project's own favicon when it shows one (no custom icon).
@@ -733,7 +720,7 @@ impl Workspace {
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let several = selection.members.len() > 1;
-        let grouping = panel.read(cx).grouping.clone();
+        let grouping = GroupingSettings::from_settings(&self.client_settings.values);
         let environment = self.server_info.environment_label.clone().unwrap_or_else(|| "Environment".into());
         let mut rows = vec![
             div()
@@ -755,7 +742,7 @@ impl Workspace {
                 None => format!("Default ({})", grouping.mode.label()),
             };
             let menu = {
-                let (panel, key) = (panel.clone(), member.physical_key.clone());
+                let key = member.physical_key.clone();
                 let workspace = cx.weak_entity();
                 Button::new(ElementId::Name(format!("grouping-{}", member.physical_key).into()))
                     .outline()
@@ -771,13 +758,12 @@ impl Workspace {
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
                         let choices = std::iter::once(None).chain(GroupingMode::ALL.map(Some));
                         for choice in choices {
-                            let (panel, key, workspace) = (panel.clone(), key.clone(), workspace.clone());
+                            let (key, workspace) = (key.clone(), workspace.clone());
                             let text = choice.map_or("Use global default", GroupingMode::label);
                             menu = menu.item(PopupMenuItem::new(text).checked(choice == selected).on_click(
-                                move |_, window, cx| {
+                                move |_, _, cx| {
                                     let key = key.clone();
-                                    let _ = workspace
-                                        .update(cx, |this, cx| this.set_grouping_rule(&panel, key, choice, window, cx));
+                                    let _ = workspace.update(cx, |this, cx| this.set_grouping_rule(key, choice, cx));
                                 },
                             ));
                         }

@@ -786,6 +786,8 @@ pub struct ShellState {
     pub threads: Vec<ThreadShell>,
     pub sequence: u64,
     pub live: bool,
+    /// Counts applied elements, so views can cache what they derive from projects and threads.
+    pub revision: u64,
     /// A full snapshot failed to decode, so deltas wait for the next one.
     needs_snapshot: bool,
 }
@@ -800,6 +802,7 @@ impl ShellState {
                 return Ok(());
             }
         }
+        self.revision += 1;
         match kind {
             "synchronized" => self.live = true,
             "snapshot" => {

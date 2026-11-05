@@ -15,9 +15,9 @@ use serde_json::json;
 
 use super::{icon, project_icon, tooltip};
 use crate::app::palette::View;
-use crate::app::{Workspace, new_id, project_name};
+use crate::app::{Workspace, new_id};
 use crate::inbox;
-use crate::model::ProjectShell;
+use crate::project_groups::{self, ProjectGroup};
 use crate::theme::Tokens;
 
 /// The open filter popup.
@@ -28,19 +28,27 @@ pub(super) struct FilterMenu {
 }
 
 impl Workspace {
-    /// The projects the filter lists: "All projects" (`None`) while the query
-    /// is empty, then the pickable projects whose name contains it.
-    fn filter_rows(&self, query: &str) -> Vec<Option<&ProjectShell>> {
+    /// The project groups the filter lists: "All projects" (`None`) while the query
+    /// is empty, then the pickable groups whose name contains it.
+    fn filter_rows<'g>(groups: &'g [ProjectGroup], query: &str) -> Vec<Option<&'g ProjectGroup>> {
         let query = query.trim().to_lowercase();
-        let projects = inbox::pickable_projects(&self.shell.projects, &self.shell.threads);
-        let mut rows: Vec<Option<&ProjectShell>> = if query.is_empty() { vec![None] } else { Vec::new() };
+        let mut rows: Vec<Option<&ProjectGroup>> = if query.is_empty() { vec![None] } else { Vec::new() };
         rows.extend(
-            projects
+            project_groups::pickable(groups)
                 .into_iter()
-                .filter(|p| query.is_empty() || project_name(p).to_lowercase().contains(&query))
+                .filter(|g| query.is_empty() || g.display_name.to_lowercase().contains(&query))
                 .map(Some),
         );
         rows
+    }
+
+    /// Open project groups in view: the scoped ones, else all of them.
+    fn groups_in_view(&self) -> usize {
+        let groups = self.project_groups();
+        match super::scoped_groups(&groups, &self.sidebar.scope).len() {
+            0 => project_groups::pickable(&groups).len(),
+            scoped => scoped,
+        }
     }
 
     fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -66,8 +74,8 @@ impl Workspace {
     }
 
     /// A plain pick replaces the scope and closes; Shift toggles and stays open.
-    fn pick_scope(&mut self, project: Option<String>, toggle: bool, cx: &mut Context<Self>) {
-        match (project, toggle) {
+    fn pick_scope(&mut self, group: Option<String>, toggle: bool, cx: &mut Context<Self>) {
+        match (group, toggle) {
             (None, _) => self.set_scope(Vec::new(), cx),
             (Some(id), false) => self.set_scope(vec![id], cx),
             (Some(id), true) => {
@@ -88,7 +96,9 @@ impl Workspace {
     fn filter_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let Some(filter) = &self.sidebar.filter else { return };
         let query = filter.query.read(cx).value().to_string();
-        let rows: Vec<Option<String>> = self.filter_rows(&query).into_iter().map(|p| p.map(|p| p.id.clone())).collect();
+        let groups = self.project_groups();
+        let rows: Vec<Option<String>> =
+            Self::filter_rows(&groups, &query).into_iter().map(|g| g.map(|g| g.key.clone())).collect();
         let highlight = filter.highlight;
         match event.keystroke.key.as_str() {
             "escape" => self.close_filter(cx),
@@ -125,26 +135,24 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    /// `projects.mutate project.update {pinned}` (`ProjectPinButton`).
-    fn toggle_project_pin(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
-        let pinned = project.pinned_at.is_none();
-        let mutation =
-            json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "pinned": pinned});
-        self.mutate_project(mutation, cx);
+    /// `setProjectGroupPinned`: `projects.mutate project.update {pinned}` for every member.
+    pub(super) fn set_projects_pinned(&mut self, project_ids: &[String], pinned: bool, cx: &mut Context<Self>) {
+        for project_id in project_ids {
+            let mutation =
+                json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "pinned": pinned});
+            self.mutate_project(mutation, cx);
+        }
     }
 
     /// `chat.new` and the New thread button: a draft in the current project when
     /// `in_project` (Shift, `chat.newLocal`) or only one project is in view,
     /// else "New thread in…" in the palette.
     pub(in crate::app) fn new_thread(&mut self, in_project: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let in_view = if self.sidebar.scope.is_empty() {
-            inbox::pickable_projects(&self.shell.projects, &self.shell.threads).len()
-        } else {
-            self.sidebar.scope.len()
-        };
-        if in_project || in_view <= 1 {
-            let project = self.new_thread_project().or_else(|| self.sidebar.scope.first().cloned()).or_else(|| {
+        if in_project || self.groups_in_view() <= 1 {
+            let groups = self.project_groups();
+            let scoped =
+                super::scoped_groups(&groups, &self.sidebar.scope).first().map(|g| g.representative().id.clone());
+            let project = self.new_thread_project().or(scoped).or_else(|| {
                 inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
             });
             if let Some(project_id) = project {
@@ -171,12 +179,7 @@ impl Workspace {
                 .hover(|s| s.bg(sb.row_hover))
         };
         let has_projects = !self.shell.projects.is_empty();
-        let in_view = if self.sidebar.scope.is_empty() {
-            inbox::pickable_projects(&self.shell.projects, &self.shell.threads).len()
-        } else {
-            self.sidebar.scope.len()
-        };
-        let show_hint = in_view > 1;
+        let show_hint = self.groups_in_view() > 1;
         let muted = tokens.muted_foreground;
         h_flex()
             .flex_none()
@@ -215,20 +218,14 @@ impl Workspace {
     /// The ListFilter trigger (or the scoped projects' icons) and its popup.
     fn render_filter(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
-        let scoped: Vec<&ProjectShell> = self
-            .sidebar
-            .scope
-            .iter()
-            .filter_map(|id| self.shell.projects.iter().find(|p| &p.id == id && p.archived_at.is_none()))
-            .collect();
+        let groups = self.project_groups();
+        let scoped_groups = super::scoped_groups(&groups, &self.sidebar.scope);
+        let scoped: Vec<_> = scoped_groups.iter().map(|g| g.representative()).collect();
         let label: SharedString = if scoped.is_empty() {
             "Filter threads by project".into()
         } else {
-            format!(
-                "Filter threads by project: {}",
-                scoped.iter().map(|p| project_name(p).to_string()).collect::<Vec<_>>().join(", ")
-            )
-            .into()
+            let names: Vec<&str> = scoped_groups.iter().map(|g| g.display_name.as_str()).collect();
+            format!("Filter threads by project: {}", names.join(", ")).into()
         };
         let trigger_icon: AnyElement = match scoped.as_slice() {
             [] => icon(IconName::ListFilter, 16., sb.icon).into_any_element(),
@@ -270,17 +267,19 @@ impl Workspace {
     fn render_filter_popup(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let filter = self.sidebar.filter.as_ref()?;
         let query = filter.query.read(cx).value().to_string();
-        let rows = self.filter_rows(&query);
+        let groups = self.project_groups();
+        let rows = Self::filter_rows(&groups, &query);
+        let scope_shown = !super::scoped_groups(&groups, &self.sidebar.scope).is_empty();
         let fg = tokens.foreground;
-        let list = v_flex().px(px(4.)).py(px(4.)).children(rows.iter().enumerate().map(|(i, project)| {
+        let list = v_flex().px(px(4.)).py(px(4.)).children(rows.iter().enumerate().map(|(i, group)| {
             let highlighted = i == filter.highlight;
-            let selected = match project {
-                None => self.sidebar.scope.is_empty(),
-                Some(p) => self.sidebar.scope.contains(&p.id),
+            let selected = match group {
+                None => !scope_shown,
+                Some(g) => self.sidebar.scope.contains(&g.key),
             };
-            let row_icon: AnyElement = match project {
+            let row_icon: AnyElement = match group {
                 None => icon(IconName::Folder, 16., tokens.muted_foreground).into_any_element(),
-                Some(p) => project_icon(p, tokens, false, 16., self.favicon(p)),
+                Some(g) => project_icon(g.representative(), tokens, false, 16., self.favicon(g.representative())),
             };
             let badge = selected.then(|| {
                 div()
@@ -297,7 +296,7 @@ impl Workspace {
                     .justify_center()
                     .child(icon(IconName::Check, 8., tokens.primary_foreground))
             });
-            let pick = project.map(|p| p.id.clone());
+            let pick = group.map(|g| g.key.clone());
             let small_button = |id: SharedString| {
                 div()
                     .id(id)
@@ -311,23 +310,23 @@ impl Workspace {
                     .text_color(tokens.muted_foreground)
                     .hover(|s| s.bg(fg.opacity(0.06)).text_color(fg))
             };
-            let controls = project.map(|p| {
-                let pinned = p.pinned_at.is_some();
-                let (pin_id, gear_id) = (p.id.clone(), p.id.clone());
-                let name = project_name(p);
+            let controls = group.map(|g| {
+                let pinned = g.pinned;
+                let members: Vec<String> = g.members.iter().map(|m| m.project.id.clone()).collect();
+                let name = &g.display_name;
                 let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
                 let gear_title: SharedString = format!("Project settings for {name}").into();
                 h_flex()
                     .ml_auto()
                     .child(
-                        small_button(format!("filter-pin-{}", p.id).into())
+                        small_button(format!("filter-pin-{}", g.key).into())
                             .when(!pinned && !highlighted, |el| el.invisible())
                             .tooltip(move |window, cx| {
                                 gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.toggle_project_pin(&pin_id, cx);
+                                this.set_projects_pinned(&members, !pinned, cx);
                             }))
                             .child(
                                 gpui_kit::component::Icon::new(if pinned { IconName::PinOff } else { IconName::Pin })
@@ -335,13 +334,12 @@ impl Workspace {
                             ),
                     )
                     .child(
-                        small_button(format!("filter-gear-{}", p.id).into())
+                        small_button(format!("filter-gear-{}", g.key).into())
                             .tooltip(move |window, cx| {
                                 gpui_kit::component::tooltip::Tooltip::new(gear_title.clone()).build(window, cx)
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                let _ = &gear_id;
                                 this.close_filter(cx);
                                 this.open_settings("projects", cx);
                             }))
@@ -349,7 +347,7 @@ impl Workspace {
                     )
             });
             h_flex()
-                .id(SharedString::from(format!("filter-row-{}", project.map_or("all", |p| p.id.as_str()))))
+                .id(SharedString::from(format!("filter-row-{}", group.map_or("all", |g| g.key.as_str()))))
                 .min_h(px(28.))
                 .px(px(8.))
                 .py(px(4.))
@@ -375,7 +373,7 @@ impl Workspace {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .child(project.map_or(SharedString::from("All projects"), |p| project_name(p))),
+                        .child(group.map_or(SharedString::from("All projects"), |g| g.display_name.clone().into())),
                 )
                 .children(controls)
         }));

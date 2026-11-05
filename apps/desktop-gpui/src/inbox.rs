@@ -101,13 +101,6 @@ pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadSh
     sorted
 }
 
-/// `pickableProjectGroups`: pinned projects first, each part newest first.
-pub fn pickable_projects<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Vec<&'a ProjectShell> {
-    let mut sorted = projects_by_recency(projects, threads);
-    sorted.sort_by_key(|p| p.pinned_at.is_none());
-    sorted
-}
-
 /// Milliseconds until [`format_relative`] shows a different label.
 pub fn relative_changes_in(elapsed_ms: i64) -> i64 {
     let elapsed = elapsed_ms.max(0);
@@ -522,6 +515,32 @@ pub fn recedes(status: Status, unread: bool, woke: bool, active: bool) -> bool {
     }
 }
 
+/// The dot on a closed boring-sidebar folder (`resolveSidebarFolderDot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderDot {
+    Attention,
+    Failed,
+    Unread,
+    Working,
+}
+
+/// The most urgent state among a closed folder's hidden threads. Waiting threads stay quiet,
+/// like their rows, and only a ready thread reads as done.
+pub fn folder_dot(hidden: &[Facts]) -> Option<FolderDot> {
+    let has = |wanted: &[Status]| hidden.iter().any(|f| wanted.contains(&f.status()));
+    if has(&[Status::Input, Status::Approval, Status::Request, Status::Limited]) {
+        Some(FolderDot::Attention)
+    } else if has(&[Status::Failed]) {
+        Some(FolderDot::Failed)
+    } else if hidden.iter().any(|f| f.status() == Status::Ready && f.is_unread()) {
+        Some(FolderDot::Unread)
+    } else if has(&[Status::Working, Status::Preparing]) {
+        Some(FolderDot::Working)
+    } else {
+        None
+    }
+}
+
 /// How long a thread that stopped working stays on the Working shelf: an
 /// orchestrator run can end moments before its continuation starts.
 const WORKING_EXIT_GRACE_MS: i64 = 2_000;
@@ -623,12 +642,14 @@ pub struct Sections<'a> {
     pub settled: Vec<Facts<'a>>,
 }
 
-/// `partitionSidebarThreads` with the default inbox settings (Working shelf on).
-/// `working_shelf` is false while the environment is disconnected.
+/// `partitionSidebarThreads`. `working_shelf` is false while the environment is disconnected
+/// or the shelf is off; `sort_active_by_send` sorts Active as the Working shelf does, for the
+/// boring sidebar's folders.
 pub fn partition<'a>(
     threads: &'a [ThreadShell],
     now: i64,
     working_shelf: bool,
+    sort_active_by_send: bool,
     returns: &mut ReturnTracker,
     include: impl Fn(&ThreadShell) -> bool,
 ) -> Sections<'a> {
@@ -659,10 +680,14 @@ pub fn partition<'a>(
         let created = if key.is_none() { ms(Some(&f.thread.created_at)).unwrap_or(0) } else { 0 };
         (key.is_none(), key, Reverse(created), id(f))
     });
-    sections.active.sort_by_cached_key(|f| {
-        let returned = returns.returned_at(id(f)).unwrap_or(0);
-        (Reverse(f.return_timestamp().max(returned)), id(f))
-    });
+    if sort_active_by_send {
+        sections.active.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
+    } else {
+        sections.active.sort_by_cached_key(|f| {
+            let returned = returns.returned_at(id(f)).unwrap_or(0);
+            (Reverse(f.return_timestamp().max(returned)), id(f))
+        });
+    }
     sections.working.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
     sections.snoozed.sort_by_cached_key(|f| ms(f.thread.snoozed_until.as_deref()).unwrap_or(i64::MAX));
     sections.settled.sort_by_cached_key(|f| (Reverse(f.settled_timestamp().unwrap_or(0)), id(f)));
@@ -1164,7 +1189,7 @@ mod tests {
             ),
             thread("archived", json!({"archivedAt": NOW})),
         ];
-        let sections = partition(&threads, now(), true, &mut ReturnTracker::default(), |_| true);
+        let sections = partition(&threads, now(), true, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.snoozed), ["snoozed"]);
         assert_eq!(ids(&sections.settled), ["settled"]);
         assert_eq!(ids(&sections.pinned), ["pinned"]);
@@ -1173,7 +1198,7 @@ mod tests {
         active.sort();
         assert_eq!(active, ["asking", "snooze-over", "woke-early"]);
 
-        let offline = partition(&threads, now(), false, &mut ReturnTracker::default(), |_| true);
+        let offline = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
         assert!(offline.working.is_empty(), "a disconnected environment has no Working shelf");
     }
 
@@ -1199,7 +1224,7 @@ mod tests {
         assert_eq!(flagged(child(json!({"status": "running", "creationSource": "provider"}))), None);
 
         let threads = vec![parent.clone(), child(json!({"status": "running"}))];
-        let sections = partition(&threads, now(), true, &mut ReturnTracker::default(), |_| true);
+        let sections = partition(&threads, now(), true, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.active), ["parent"]);
         assert_eq!(sections.active[0].status(), Status::Approval);
     }
@@ -1282,7 +1307,7 @@ mod tests {
         observe(&mut tracker, &[a.clone(), b.clone()], 12_000);
         assert_eq!((tracker.returned_at("a"), tracker.returned_at("b")), (Some(12_000), None));
         let threads = [a.clone(), b.clone()];
-        let sections = partition(&threads, 12_500, true, &mut tracker, |_| true);
+        let sections = partition(&threads, 12_500, true, false, &mut tracker, |_| true);
         assert_eq!(ids(&sections.active), ["b", "a"]);
         // The b hold ended at this partition, so it no longer reads as working.
         assert!(sections.working.is_empty());
@@ -1323,12 +1348,15 @@ mod tests {
                 json!({"latestRunId": "r", "status": "running", "latestUserAuthoredMessageAt": "2026-11-02T00:00:00.000Z", "latestRunRequestedAt": "2026-11-04T00:00:00.000Z"}),
             ),
         ];
-        let sections = partition(&threads, now(), true, &mut ReturnTracker::default(), |_| true);
+        let sections = partition(&threads, now(), true, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.active), ["a-unsettled", "a-run", "a-old"]);
         assert_eq!(ids(&sections.pinned), ["p-a", "p-b", "p-new", "p-old"]);
         assert_eq!(ids(&sections.settled), ["s-msg", "s-at"]);
         assert_eq!(ids(&sections.snoozed), ["z-soon", "z-late"]);
         assert_eq!(ids(&sections.working), ["w-run", "w-msg"]);
+        // Boring sidebar folders: no Working shelf, and Active sorts by send.
+        let folders = partition(&threads, now(), false, true, &mut ReturnTracker::default(), |_| true);
+        assert_eq!(ids(&folders.active), ["w-run", "w-msg", "a-old", "a-run", "a-unsettled"]);
     }
 
     #[test]
@@ -1365,6 +1393,12 @@ mod tests {
         assert!(!recedes(Status::Ready, false, false, true));
         assert!(recedes(Status::Working, false, false, false));
         assert!(!recedes(Status::Failed, false, false, false));
+        // A closed folder's dot: attention over failure over done; waiting stays quiet.
+        assert_eq!(folder_dot(&[read, waiting]), None);
+        assert_eq!(folder_dot(&[read, unread, waiting]), Some(FolderDot::Unread));
+        assert_eq!(folder_dot(&[unread, limited]), Some(FolderDot::Attention));
+        let running = thread("running", json!({"latestRunId": "r", "status": "running"}));
+        assert_eq!(folder_dot(&[read, Facts::new(&running, &requests)]), Some(FolderDot::Working));
     }
 
     #[test]

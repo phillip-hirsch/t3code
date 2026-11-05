@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use super::{Shelf, now_ms};
 use crate::app::thread_menu::hosted_thread_link;
-use crate::app::{Target, Workspace, new_id, project_name};
+use crate::app::{Target, Workspace, new_id};
 use crate::inbox::{self, Facts};
 
 /// The undoable actions (`showThreadUndoNotice`).
@@ -443,10 +443,12 @@ impl Workspace {
         let info = &self.server_info;
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let sidebar = origin == MenuOrigin::Sidebar;
-        let filter = project.filter(|p| sidebar && p.archived_at.is_none()).map(|p| {
-            let scoped = self.sidebar.scope == [p.id.clone()];
-            let label = if scoped { "Show all projects".to_owned() } else { format!("Filter by {}", project_name(p)) };
-            (label, if scoped { Vec::new() } else { vec![p.id.clone()] })
+        let groups = self.project_groups();
+        let group = project.and_then(|p| groups.iter().find(|g| g.contains(&p.id)));
+        let filter = group.filter(|g| sidebar && !g.archived).map(|g| {
+            let scoped = self.sidebar.scope == [g.key.clone()];
+            let label = if scoped { "Show all projects".to_owned() } else { format!("Filter by {}", g.display_name) };
+            (label, if scoped { Vec::new() } else { vec![g.key.clone()] })
         });
         Some(ThreadMenu {
             thread_id: thread.id.clone(),
