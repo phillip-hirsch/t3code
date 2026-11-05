@@ -424,6 +424,44 @@ const KNOWN_NON_WEB_SCHEMES: [&str; 14] = [
 /// The DuckDuckGo template, the web's default `browserSearchEngine`.
 pub const DEFAULT_SEARCH_TEMPLATE: &str = "https://duckduckgo.com/?q=%s";
 
+/// `resolveSearchUrlTemplate`: the engine's template, or a valid custom one, else DuckDuckGo.
+pub fn search_template(settings: &crate::settings::Settings) -> String {
+    let template = match settings.get("browserSearchEngine").as_str().unwrap_or_default() {
+        "google" => "https://www.google.com/search?q=%s",
+        "bing" => "https://www.bing.com/search?q=%s",
+        "brave" => "https://search.brave.com/search?q=%s",
+        "kagi" => "https://kagi.com/search?q=%s",
+        "ecosia" => "https://www.ecosia.org/search?q=%s",
+        "custom" => {
+            let custom = settings.get("browserCustomSearchUrl").as_str().unwrap_or_default().trim();
+            if valid_search_template(custom) { custom } else { DEFAULT_SEARCH_TEMPLATE }
+        }
+        _ => DEFAULT_SEARCH_TEMPLATE,
+    };
+    template.to_owned()
+}
+
+/// `isValidSearchUrlTemplate`: an http(s) URL whose `%s` sits after the authority.
+fn valid_search_template(template: &str) -> bool {
+    let fill = |query: &str| url::Url::parse(&template.replace("%s", &encode_uri_component(query))).ok();
+    let authority = |url: &url::Url| {
+        (url.username().to_owned(), url.password().map(str::to_owned), url.host_str().map(str::to_owned), url.port())
+    };
+    match (template.contains("%s"), fill("a"), fill("b")) {
+        (true, Some(a), Some(b)) => matches!(a.scheme(), "http" | "https") && authority(&a) == authority(&b),
+        _ => false,
+    }
+}
+
+/// `resolveLinkTarget`: whether a clicked link opens in a browser tab rather than the system
+/// browser. A modified or middle click always goes to the system browser.
+pub fn link_opens_in_app(url: &str, modified: bool, settings: &crate::settings::Settings, can_open: bool) -> bool {
+    !modified
+        && can_open
+        && settings.get("browserLinkTarget").as_str() == Some("app")
+        && url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
 fn explicit_scheme(input: &str) -> Option<String> {
     let colon = input.find(':')?;
     let scheme = &input[..colon];
@@ -556,6 +594,28 @@ mod tests {
         for rejected in ["mailto:a@b.c", "file:///etc/passwd", "javascript:alert(1)", ""] {
             assert!(resolve_address(rejected, search).is_err(), "{rejected}");
         }
+    }
+
+    #[test]
+    fn search_engine_and_link_target_follow_the_settings() {
+        let settings =
+            |patch: Value| crate::settings::Settings::layered(&crate::settings::contract().client_defaults, &patch);
+        let template = |engine: &str, custom: &str| {
+            search_template(&settings(json!({"browserSearchEngine": engine, "browserCustomSearchUrl": custom})))
+        };
+        assert_eq!(template("duckduckgo", ""), DEFAULT_SEARCH_TEMPLATE);
+        assert_eq!(template("kagi", ""), "https://kagi.com/search?q=%s");
+        assert_eq!(template("custom", " https://s.test/find?q=%s "), "https://s.test/find?q=%s");
+        assert_eq!(template("custom", "https://%s.test/"), DEFAULT_SEARCH_TEMPLATE, "the query picks the host");
+        assert_eq!(template("custom", "https://s.test/find"), DEFAULT_SEARCH_TEMPLATE, "no %s");
+        assert_eq!(template("custom", "ftp://s.test/?q=%s"), DEFAULT_SEARCH_TEMPLATE);
+
+        let app = settings(json!({"browserLinkTarget": "app"}));
+        assert!(link_opens_in_app("https://example.com/", false, &app, true));
+        assert!(!link_opens_in_app("https://example.com/", true, &app, true), "ctrl or middle click");
+        assert!(!link_opens_in_app("https://example.com/", false, &app, false), "no thread to host it");
+        assert!(!link_opens_in_app("mailto:a@b.c", false, &app, true));
+        assert!(!link_opens_in_app("https://example.com/", false, &settings(json!({})), true), "system default");
     }
 
     #[test]

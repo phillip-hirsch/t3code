@@ -808,8 +808,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (insertions, deletions, base) = git::changes_totals(status);
-        let addition = if insertions > 0 { git::addition_color(tokens) } else { tokens.muted_foreground };
-        let deletion = if deletions > 0 { git::deletion_color(tokens) } else { tokens.muted_foreground };
+        let scheme = git::DiffColorScheme::from_settings(&self.client_settings.values);
+        let addition = if insertions > 0 { git::addition_color(tokens, scheme) } else { tokens.muted_foreground };
+        let deletion = if deletions > 0 { git::deletion_color(tokens, scheme) } else { tokens.muted_foreground };
         let base_label =
             base.map(|base| SharedString::from(format!("vs {}", base.strip_prefix("origin/").unwrap_or(base))));
         action_row("details-changes", colors, cx)

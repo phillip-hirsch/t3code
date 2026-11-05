@@ -4,26 +4,28 @@
 //! The web's other surfaces (terminal, files, pull requests, devices, side chats) are not
 //! native yet, so the launcher offers Browser and Diff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, DragMoveEvent, ElementId, Empty, Entity, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    Window, WindowControlArea, deferred, div, px,
+    AnyElement, App, AppContext as _, Bounds, Context, DragMoveEvent, Element, ElementId, Empty, Entity,
+    GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
+    ParentElement as _, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, Window, WindowControlArea, deferred, div, px,
 };
 use serde_json::{Value, json};
 
-use super::git;
+use super::git::{self, DiffColorScheme};
 use super::titlebar::{CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
-use crate::model::ThreadProjection;
+use crate::model::{Checkpoint, ThreadProjection};
 use crate::theme::{self, Tokens};
 
 const DEFAULT_WIDTH: f32 = 540.;
@@ -109,9 +111,28 @@ struct PanelState {
     surfaces: Vec<Surface>,
     active: Option<Surface>,
     scope: DiffScope,
+    /// Bumped by every panel change the user makes (`userActionRevisionByThreadKey`).
+    user_revision: u64,
+    /// The turn whose diff was last offered on its own (`proactiveDiffTurnId`).
+    proactive_diff_run: Option<String>,
 }
 
 impl PanelState {
+    /// `openProactive` for a turn's diff: offered once per turn, and refused after a panel
+    /// choice made since `revision` or while the diff already shows.
+    fn open_proactive_diff(&mut self, run: &str, revision: u64) -> bool {
+        if self.proactive_diff_run.as_deref() == Some(run) {
+            return false;
+        }
+        self.proactive_diff_run = Some(run.to_owned());
+        if self.user_revision != revision || (self.open && self.active == Some(Surface::Diff)) {
+            return false;
+        }
+        self.upsert(Surface::Diff);
+        self.scope = DiffScope::Branch;
+        true
+    }
+
     /// `upsertSurface`: adds the surface if missing, shows the panel and activates it.
     fn upsert(&mut self, surface: Surface) {
         if !self.surfaces.contains(&surface) {
@@ -160,6 +181,8 @@ struct DiffKey {
     ignore_whitespace: bool,
     /// The turn count, or the git status totals, so new work refetches.
     version: (u64, u64, u64),
+    /// `deriveWorkspaceMutationId` for git selections: an edit that keeps the totals refetches too.
+    mutation: (Option<String>, Option<String>),
     refresh: u64,
 }
 
@@ -186,16 +209,32 @@ pub(super) struct RightPanel {
     loaded: Option<DiffKey>,
     load: DiffLoad,
     _task: Option<Task<()>>,
-    split: bool,
-    wrap: bool,
-    ignore_whitespace: bool,
+    /// The wrap and whitespace toggles; unset, they follow `wordWrap` and `diffIgnoreWhitespace`.
+    wrap: Option<bool>,
+    ignore_whitespace: Option<bool>,
+    /// The target whose Diff surface shows; the toggles reset when it changes, as `DiffPanel` remounts.
+    diff_mount: Option<Target>,
+    /// Folded files of each selection the user folded or unfolded (`collapsedFileKeysByScopeKey`).
+    collapsed: HashMap<(Target, DiffScope), HashSet<SharedString>>,
+    /// The selection whose files `diff` holds.
+    shown: Option<(Target, DiffScope)>,
     refresh: u64,
     commits: Vec<Commit>,
+    /// The tab strip, and the tab it last scrolled into view.
+    tabs_scroll: ScrollHandle,
+    revealed_tab: Option<(Target, Surface, usize)>,
+    observation: Option<Observation>,
+    _diff_events: Subscription,
 }
 
 impl RightPanel {
     pub(super) fn new(cx: &mut Context<Workspace>) -> Self {
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
+        let diff_events = cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
+            if matches!(event, DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_)) {
+                this.remember_collapsed(cx);
+            }
+        });
         Self {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
@@ -204,11 +243,17 @@ impl RightPanel {
             loaded: None,
             load: DiffLoad::Idle,
             _task: None,
-            split: false,
-            wrap: false,
-            ignore_whitespace: false,
+            wrap: None,
+            ignore_whitespace: None,
+            diff_mount: None,
+            collapsed: HashMap::new(),
+            shown: None,
             refresh: 0,
             commits: Vec::new(),
+            tabs_scroll: ScrollHandle::new(),
+            revealed_tab: None,
+            observation: None,
+            _diff_events: diff_events,
         }
     }
 }
@@ -224,6 +269,13 @@ impl Workspace {
     fn panel_state_mut(&mut self) -> Option<&mut PanelState> {
         let target = self.target.clone()?;
         Some(self.right_panel.panels.entry(target).or_default())
+    }
+
+    /// The panel state for a change the user made, which proactive opens then defer to.
+    fn user_panel_state(&mut self) -> Option<&mut PanelState> {
+        let panel = self.panel_state_mut()?;
+        panel.user_revision += 1;
+        Some(panel)
     }
 
     pub(super) fn right_panel_open(&self) -> bool {
@@ -249,7 +301,7 @@ impl Workspace {
     pub(super) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel_open() {
             self.close_right_panel(cx);
-        } else if let Some(panel) = self.panel_state_mut() {
+        } else if let Some(panel) = self.user_panel_state() {
             panel.open = true;
             self.sync_active_browser(window, cx);
             cx.notify();
@@ -263,7 +315,7 @@ impl Workspace {
         {
             self.float_browser(thread_id, tab, cx);
         }
-        if let Some(panel) = self.panel_state_mut() {
+        if let Some(panel) = self.user_panel_state() {
             panel.open = false;
         }
         self.preview.menu_open = false;
@@ -273,7 +325,7 @@ impl Workspace {
     /// Adds (or focuses) a surface and shows the panel.
     pub(super) fn open_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
-        if let Some(panel) = self.panel_state_mut() {
+        if let Some(panel) = self.user_panel_state() {
             panel.upsert(surface);
         }
         self.sync_active_browser(window, cx);
@@ -281,7 +333,7 @@ impl Workspace {
     }
 
     fn activate_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut().filter(|panel| panel.surfaces.contains(&surface)) {
+        if let Some(panel) = self.user_panel_state().filter(|panel| panel.surfaces.contains(&surface)) {
             panel.open = true;
             panel.active = Some(surface);
         }
@@ -291,7 +343,7 @@ impl Workspace {
 
     /// Closes a tab; a browser tab's session closes with it.
     fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut() {
+        if let Some(panel) = self.user_panel_state() {
             panel.close(&surface);
         }
         if let (Surface::Browser(tab), Some(Target::Thread(thread_id))) = (&surface, self.target.clone()) {
@@ -332,6 +384,80 @@ impl Workspace {
         matches!(self.target, Some(Target::Thread(_))) && self.vcs.status.as_ref().is_none_or(|s| s.local.is_repo)
     }
 
+    /// `diffLayout`, which the layout toggle also writes.
+    fn diff_mode(&self) -> DiffMode {
+        match self.client_settings.values.get("diffLayout").as_str() {
+            Some("split") => DiffMode::Split,
+            _ => DiffMode::Unified,
+        }
+    }
+
+    fn diff_wrap(&self) -> bool {
+        self.right_panel.wrap.unwrap_or_else(|| self.client_settings.values.bool("wordWrap"))
+    }
+
+    fn diff_ignore_whitespace(&self) -> bool {
+        self.right_panel.ignore_whitespace.unwrap_or_else(|| self.client_settings.values.bool("diffIgnoreWhitespace"))
+    }
+
+    fn diff_color_scheme(&self) -> DiffColorScheme {
+        DiffColorScheme::from_settings(&self.client_settings.values)
+    }
+
+    /// Records the shown selection's folds once the user changes one.
+    fn remember_collapsed(&mut self, cx: &mut Context<Self>) {
+        let Some(shown) = self.right_panel.shown.clone() else { return };
+        let state = self.right_panel.diff.read(cx);
+        let folded = state.files().iter().map(DiffFile::path).filter(|path| state.is_file_collapsed(path)).cloned();
+        self.right_panel.collapsed.insert(shown, folded.collect());
+    }
+
+    /// `useProactivePanels` for turn diffs: with proactive panels on, a turn that just completed
+    /// with enough changes opens the branch diff, unless the user chose a panel since it started.
+    /// Change-request panels are not native, so their half of the hook is not ported.
+    pub(super) fn observe_proactive_panels(&mut self, cx: &mut Context<Self>) {
+        let Some(Target::Thread(thread_id)) = self.target.clone() else {
+            self.right_panel.observation = None;
+            return;
+        };
+        let target = Target::Thread(thread_id.clone());
+        let revision = self.right_panel.panels.get(&target).map_or(0, |panel| panel.user_revision);
+        let projection = self.open_projection();
+        let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
+        let mut observation = observe(self.right_panel.observation.as_ref(), &thread_id, running.as_deref(), revision);
+        let Some(projection) = projection else {
+            self.right_panel.observation = Some(observation);
+            return;
+        };
+        let latest = projection.runs.iter().rev().find(|run| run.status != "queued");
+        let settled = latest
+            .filter(|run| {
+                !matches!(run.status.as_str(), "preparing" | "queued" | "starting" | "running" | "waiting")
+                    && running.as_ref() != Some(&run.id)
+            })
+            .map(|run| run.id.clone());
+        let completed = latest.is_some_and(|run| run.status == "completed");
+        let newly = settled.filter(|run| {
+            turn_just_completed(observation.running.as_ref().map(Option::as_deref), running.as_deref(), run, completed)
+        });
+        let offer = match &newly {
+            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") => {
+                let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
+                turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
+            }
+            _ => DiffOffer::Ignore,
+        };
+        if offer != DiffOffer::Defer {
+            observation.running = Some(running);
+        }
+        let revision = observation.revision;
+        self.right_panel.observation = Some(observation);
+        let (DiffOffer::Open, Some(run)) = (offer, newly) else { return };
+        if self.right_panel.panels.entry(target).or_default().open_proactive_diff(&run, revision) {
+            cx.notify();
+        }
+    }
+
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
         if let Some(panel) = self.panel_state_mut() {
             panel.scope = scope;
@@ -343,6 +469,10 @@ impl Workspace {
     fn sync_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_surface() != Some(&Surface::Diff) {
             return;
+        }
+        let mode = self.diff_mode();
+        if self.right_panel.diff.read(cx).mode() != mode {
+            self.right_panel.diff.update(cx, |state, cx| state.set_mode(mode, cx));
         }
         let Some(panel) = self.panel_state().cloned() else { return };
         let Some(target) = self.target.clone() else { return };
@@ -361,18 +491,28 @@ impl Workspace {
                 (ins, del, s.local.working_tree.insertions + s.local.working_tree.deletions)
             }),
         };
+        let mutation = match &scope {
+            DiffScope::Turn(_) => (None, None),
+            _ => self
+                .open_projection()
+                .map(|p| workspace_mutation_id(p, turns.first().map(|t| t.completed_at.as_str())))
+                .unwrap_or_default(),
+        };
+        let ignore_whitespace = self.diff_ignore_whitespace();
         let key = DiffKey {
             target: target.clone(),
             cwd: cwd.clone(),
             scope: scope.clone(),
-            ignore_whitespace: self.right_panel.ignore_whitespace,
+            ignore_whitespace,
             version,
+            mutation,
             refresh: self.right_panel.refresh,
         };
         if self.right_panel.loaded.as_ref() == Some(&key) {
             return;
         }
         self.right_panel.loaded = Some(key);
+        let selection = (target.clone(), scope.clone());
         let (Some(client), Target::Thread(thread_id)) = (self.client(), target) else { return };
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
@@ -380,7 +520,6 @@ impl Workspace {
             self.clear_diff(cx);
             return;
         }
-        let ignore_whitespace = self.right_panel.ignore_whitespace;
         let request = match &scope {
             DiffScope::Turn(run) => {
                 let Some(turn) = turns.iter().find(|t| &t.run_id == run) else {
@@ -450,7 +589,19 @@ impl Workspace {
                     Ok(Some(parsed)) => {
                         let additions = parsed.files.iter().map(DiffFile::additions).sum();
                         let deletions = parsed.files.iter().map(DiffFile::deletions).sum();
-                        diff.update(cx, |state, cx| state.set_files(parsed.files, cx));
+                        let paths: Vec<SharedString> = parsed.files.iter().map(|file| file.path().clone()).collect();
+                        let folded = collapsed_files(
+                            this.right_panel.collapsed.get(&selection),
+                            this.client_settings.values.bool("diffFilesCollapsed"),
+                            &paths,
+                        );
+                        diff.update(cx, |state, cx| {
+                            state.set_files(parsed.files, cx);
+                            for path in &paths {
+                                state.set_file_collapsed(path, folded.contains(path), cx);
+                            }
+                        });
+                        this.right_panel.shown = Some(selection);
                         DiffLoad::Ready {
                             additions,
                             deletions,
@@ -533,10 +684,29 @@ impl Workspace {
 
     /// The inline panel beside the main column, or `None` while closed.
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let mount = self.target.clone().filter(|_| self.active_surface() == Some(&Surface::Diff));
+        if self.right_panel.diff_mount != mount {
+            self.right_panel.diff_mount = mount;
+            (self.right_panel.wrap, self.right_panel.ignore_whitespace) = (None, None);
+        }
         let width = self.right_panel_width(window)?;
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
         let panel = self.panel_state().cloned().unwrap_or_default();
+        // A newly active tab, or a new tab, can sit outside the scrolled strip.
+        let active_index = panel.active.as_ref().and_then(|active| panel.surfaces.iter().position(|s| s == active));
+        if let (Some(index), Some(target)) = (active_index, self.target.clone()) {
+            let key = (target, panel.surfaces[index].clone(), panel.surfaces.len());
+            if self.right_panel.revealed_tab.as_ref() != Some(&key) {
+                self.right_panel.tabs_scroll.scroll_to_item(index);
+                // A strip shown for the first time has no viewport to scroll within until it lays out.
+                if self.right_panel.tabs_scroll.bounds().size.width > px(0.) {
+                    self.right_panel.revealed_tab = Some(key);
+                } else {
+                    window.request_animation_frame();
+                }
+            }
+        }
         let content = match (&panel.active, self.target.clone()) {
             (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, cx),
             (Some(Surface::Browser(tab)), Some(Target::Thread(thread_id))) => {
@@ -616,7 +786,16 @@ impl Workspace {
             .pr(reserve)
             .gap_1()
             .window_control_area(WindowControlArea::Drag)
-            .children(tabs)
+            .child(
+                h_flex()
+                    .id("right-panel-tabs")
+                    .min_w_0()
+                    .h_full()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.right_panel.tabs_scroll)
+                    .children(tabs),
+            )
             .child(
                 Button::new("right-panel-add")
                     .custom(
@@ -627,6 +806,7 @@ impl Workspace {
                     )
                     .xsmall()
                     .icon(icon("icons/plus.svg"))
+                    .flex_none()
                     .size(px(24.))
                     .rounded(px(8.))
                     .dropdown_menu(move |menu: PopupMenu, window, _| {
@@ -913,6 +1093,7 @@ impl Workspace {
                     menu.max_h(px(320.)).scrollable(true)
                 })
             });
+        let scheme = self.diff_color_scheme();
         let (refs, stats, truncated) = match &self.right_panel.load {
             DiffLoad::Ready { additions, deletions, head, base, truncated } => {
                 let refs = matches!(scope, DiffScope::Branch).then(|| {
@@ -931,6 +1112,7 @@ impl Workspace {
         };
         let all_collapsed =
             !files.is_empty() && files.iter().all(|path| self.right_panel.diff.read(cx).is_file_collapsed(path));
+        let (wrap, ignore_whitespace) = (self.diff_wrap(), self.diff_ignore_whitespace());
         let header = h_flex()
             .h(px(28.))
             .mb_3()
@@ -950,8 +1132,8 @@ impl Workspace {
                             .gap_1()
                             .font_family(theme::FONT_MONO)
                             .text_size(px(11.))
-                            .child(div().text_color(git::addition_color(tokens)).child(format!("+{additions}")))
-                            .child(div().text_color(git::deletion_color(tokens)).child(format!("-{deletions}")))
+                            .child(div().text_color(git::addition_color(tokens, scheme)).child(format!("+{additions}")))
+                            .child(div().text_color(git::deletion_color(tokens, scheme)).child(format!("-{deletions}")))
                     }))
                     .when(can_refresh, |el| {
                         el.child(
@@ -978,33 +1160,31 @@ impl Workspace {
                                             state.set_file_collapsed(path, collapse, cx);
                                         }
                                     });
+                                    this.remember_collapsed(cx);
                                     cx.notify();
                                 })),
                         )
                     })
                     .child(self.render_layout_toggle(tokens, cx))
-                    .child(
-                        icon_toggle("diff-wrap", "icons/text-wrap.svg", self.right_panel.wrap, tokens, cx)
-                            .tooltip(|window, cx| Tooltip::new("Toggle line wrapping").build(window, cx))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right_panel.wrap = !this.right_panel.wrap;
+                    .child({
+                        let label = if wrap { "Disable line wrapping" } else { "Enable line wrapping" };
+                        icon_toggle("diff-wrap", "icons/text-wrap.svg", wrap, tokens, cx)
+                            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.right_panel.wrap = Some(!wrap);
                                 cx.notify();
-                            })),
-                    )
-                    .child(
-                        icon_toggle(
-                            "diff-whitespace",
-                            "icons/pilcrow.svg",
-                            self.right_panel.ignore_whitespace,
-                            tokens,
-                            cx,
-                        )
-                        .tooltip(|window, cx| Tooltip::new("Hide whitespace changes").build(window, cx))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.right_panel.ignore_whitespace = !this.right_panel.ignore_whitespace;
-                            cx.notify();
-                        })),
-                    ),
+                            }))
+                    })
+                    .child({
+                        let label =
+                            if ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" };
+                        icon_toggle("diff-whitespace", "icons/pilcrow.svg", ignore_whitespace, tokens, cx)
+                            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
+                                cx.notify();
+                            }))
+                    }),
             );
         let quiet = |text: SharedString| {
             div()
@@ -1052,22 +1232,26 @@ impl Workspace {
                             .child("This preview exceeds the size limit. Changes shown are incomplete."),
                     )
                 })
-                .child(
+                .child({
                     // Pierre's default size for headers and code.
-                    Diff::new(&self.right_panel.diff)
-                        .soft_wrap(self.right_panel.wrap)
-                        .flex_1()
-                        .min_h_0()
-                        .text_size(px(13.)),
-                )
+                    let diff = Diff::new(&self.right_panel.diff).soft_wrap(wrap).flex_1().min_h_0().text_size(px(13.));
+                    match scheme {
+                        DiffColorScheme::RedGreen => diff.into_any_element(),
+                        DiffColorScheme::BlueOrange => DiffTint {
+                            child: diff.into_any_element(),
+                            colors: (git::addition_color(tokens, scheme), git::deletion_color(tokens, scheme)),
+                        }
+                        .into_any_element(),
+                    }
+                })
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
     }
 
-    /// The stacked / split segmented toggle (`ToggleGroup variant="segmented"`).
+    /// The stacked / split segmented toggle (`ToggleGroup variant="segmented"`), saved as `diffLayout`.
     fn render_layout_toggle(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let split = self.right_panel.split;
+        let split = self.diff_mode() == DiffMode::Split;
         let segment = |id: &'static str, path: &'static str, pressed: bool, value: bool, cx: &mut Context<Self>| {
             let pressed_bg = tokens.input.opacity(0.72);
             let hover = tokens.input.opacity(0.32);
@@ -1084,7 +1268,8 @@ impl Workspace {
                 .when(!pressed, |el| el.hover(move |style| style.bg(hover)))
                 .child(icon(path).with_size(px(14.)))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.right_panel.split = value;
+                    let layout = if value { "split" } else { "stacked" };
+                    this.client_settings.apply(json!({ "diffLayout": layout }).as_object().expect("an object"));
                     let mode = if value { DiffMode::Split } else { DiffMode::Unified };
                     this.right_panel.diff.update(cx, |state, cx| state.set_mode(mode, cx));
                     cx.notify();
@@ -1097,6 +1282,164 @@ impl Workspace {
             .bg(tokens.input.opacity(0.4))
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
+    }
+}
+
+/// The files a selection shows folded: the user's folds once they changed any, else every
+/// file or none by `diffFilesCollapsed`.
+fn collapsed_files(
+    remembered: Option<&HashSet<SharedString>>,
+    collapse_by_default: bool,
+    paths: &[SharedString],
+) -> HashSet<SharedString> {
+    match remembered {
+        Some(folded) => folded.clone(),
+        None if collapse_by_default => paths.iter().cloned().collect(),
+        None => HashSet::new(),
+    }
+}
+
+/// `deriveWorkspaceMutationId`: the last settled item that may have written files, and the
+/// newest turn's completion.
+fn workspace_mutation_id(
+    projection: &ThreadProjection,
+    latest_turn_completed_at: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let item = projection.visible_turn_items.iter().rev().map(|row| &row.item).find(|item| {
+        matches!(item.item_type.as_str(), "command_execution" | "file_change" | "dynamic_tool" | "subagent")
+            && !matches!(item.status.as_str(), "pending" | "running" | "waiting")
+    });
+    (item.map(|item| item.id.clone()), latest_turn_completed_at.map(str::to_owned))
+}
+
+/// What the proactive panel last saw of the open thread (`ProactivePanelObservation`).
+#[derive(Clone, Debug, PartialEq)]
+struct Observation {
+    thread_id: String,
+    /// The running turn at the last read; `None` before the first, when a just-completed turn still opens.
+    running: Option<Option<String>>,
+    /// The turn the user's last panel choice belongs to.
+    user_turn: Option<String>,
+    /// The panel revision a proactive open must still find.
+    revision: u64,
+}
+
+/// `observeProactivePanelUserChoice`: a panel choice made since the thread opened or its
+/// current turn started outranks a proactive open.
+fn observe(previous: Option<&Observation>, thread_id: &str, running: Option<&str>, revision: u64) -> Observation {
+    let same = previous.filter(|previous| previous.thread_id == thread_id);
+    let new_turn = same.is_some_and(|previous| running.is_some() && running != previous.user_turn.as_deref());
+    Observation {
+        thread_id: thread_id.to_owned(),
+        running: same.and_then(|previous| previous.running.clone()),
+        user_turn: running.map(str::to_owned).or_else(|| same.and_then(|previous| previous.user_turn.clone())),
+        revision: match same {
+            Some(previous) if !new_turn => previous.revision,
+            _ => revision,
+        },
+    }
+}
+
+/// `shouldOpenProactiveTurnDiff`: the settled turn is the one that was running at the last read.
+fn turn_just_completed(previous: Option<Option<&str>>, running: Option<&str>, settled: &str, completed: bool) -> bool {
+    running.is_none() && completed && previous.is_none_or(|previous| previous == Some(settled))
+}
+
+#[derive(Debug, PartialEq)]
+enum DiffOffer {
+    /// Its checkpoint or the repository status has not loaded yet.
+    Defer,
+    Ignore,
+    Open,
+}
+
+/// `resolveProactiveTurnDiffAction`: only a turn with enough changes is worth opening.
+fn turn_diff_offer(checkpoint: Option<&Checkpoint>, is_repo: Option<bool>) -> DiffOffer {
+    let (Some(checkpoint), Some(is_repo)) = (checkpoint.filter(|c| c.status != "missing"), is_repo) else {
+        return DiffOffer::Defer;
+    };
+    if !is_repo || checkpoint.status != "ready" || checkpoint.files.is_empty() {
+        return DiffOffer::Ignore;
+    }
+    let totals = checkpoint.file_totals();
+    if totals.count >= 3 || totals.additions + totals.deletions >= 50 { DiffOffer::Open } else { DiffOffer::Ignore }
+}
+
+/// The blue-orange scheme's line colors while the diff lays out and paints: the component
+/// reads added and removed lines from the global theme's success and danger colors.
+struct DiffTint {
+    child: AnyElement,
+    colors: (Hsla, Hsla),
+}
+
+impl DiffTint {
+    fn tinted<R>(colors: (Hsla, Hsla), cx: &mut App, f: impl FnOnce(&mut App) -> R) -> R {
+        let theme = Theme::global_mut(cx);
+        let saved = (theme.success, theme.danger);
+        (theme.success, theme.danger) = colors;
+        let result = f(cx);
+        let theme = Theme::global_mut(cx);
+        (theme.success, theme.danger) = saved;
+        result
+    }
+}
+
+impl IntoElement for DiffTint {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for DiffTint {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let child = &mut self.child;
+        (Self::tinted(self.colors, cx, |cx| child.request_layout(window, cx)), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        Self::tinted(self.colors, cx, |cx| child.prepaint(window, cx));
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        Self::tinted(self.colors, cx, |cx| child.paint(window, cx));
     }
 }
 
@@ -1259,6 +1602,72 @@ mod tests {
         assert_eq!(command["restoreFiles"], true);
         assert_eq!(rollback_command(projection, 0, false).unwrap()["checkpointId"], "c0");
         assert!(rollback_command(projection, 2, false).is_none(), "a missing checkpoint cannot be restored");
+    }
+
+    #[test]
+    fn folds_follow_the_default_until_the_user_folds() {
+        let paths: Vec<SharedString> = vec!["a.rs".into(), "b.rs".into()];
+        assert_eq!(collapsed_files(None, true, &paths), paths.iter().cloned().collect());
+        assert!(collapsed_files(None, false, &paths).is_empty());
+        let folded: HashSet<SharedString> = ["a.rs".into()].into();
+        assert_eq!(collapsed_files(Some(&folded), true, &paths), folded, "a new file in a folded selection opens");
+    }
+
+    #[test]
+    fn workspace_mutations_skip_unsettled_and_read_only_items() {
+        let item = |id: &str, kind: &str, status: &str| {
+            let item = json!({"id": id, "type": kind, "threadId": "t", "ordinal": 1, "status": status});
+            json!({"visibility": "visible", "sourceThreadId": "t", "sourceItemId": id, "item": item})
+        };
+        let projection: ThreadProjection = serde_json::from_value(json!({
+            "thread": {"id": "t", "title": "T"},
+            "visibleTurnItems": [
+                item("edit", "file_change", "completed"),
+                item("cmd", "command_execution", "running"),
+                item("msg", "assistant_message", "completed"),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(workspace_mutation_id(&projection, Some("12:00")), (Some("edit".into()), Some("12:00".into())));
+    }
+
+    #[test]
+    fn a_completed_turn_opens_its_diff_once_unless_the_user_chose_a_panel() {
+        // The turn runs, then settles: the diff opens for a big enough checkpoint.
+        let running = observe(None, "t", Some("r1"), 0);
+        assert_eq!((running.revision, running.user_turn.as_deref()), (0, Some("r1")));
+        let previous = Some(Some("r1"));
+        assert!(turn_just_completed(previous, None, "r1", true));
+        assert!(!turn_just_completed(previous, None, "r1", false), "failed or interrupted");
+        assert!(!turn_just_completed(Some(None), None, "r1", true), "it had settled before");
+        assert!(turn_just_completed(None, None, "r1", true), "first read of the thread");
+
+        let checkpoint = |status: &str, files: usize, lines: u64| {
+            let file = json!({"path": "a", "kind": "modified", "additions": lines, "deletions": 0});
+            serde_json::from_value::<Checkpoint>(json!({"id": "c", "scopeId": "s", "status": status,
+                "files": vec![file; files]}))
+            .unwrap()
+        };
+        assert_eq!(turn_diff_offer(Some(&checkpoint("ready", 3, 1)), Some(true)), DiffOffer::Open);
+        assert_eq!(turn_diff_offer(Some(&checkpoint("ready", 1, 50)), Some(true)), DiffOffer::Open);
+        assert_eq!(turn_diff_offer(Some(&checkpoint("ready", 2, 10)), Some(true)), DiffOffer::Ignore);
+        assert_eq!(turn_diff_offer(Some(&checkpoint("ready", 3, 1)), Some(false)), DiffOffer::Ignore);
+        assert_eq!(turn_diff_offer(Some(&checkpoint("missing", 3, 1)), Some(true)), DiffOffer::Defer);
+        assert_eq!(turn_diff_offer(Some(&checkpoint("ready", 3, 1)), None), DiffOffer::Defer);
+
+        let mut panel = PanelState::default();
+        assert!(panel.open_proactive_diff("r1", 0));
+        assert!(panel.open && panel.active == Some(Surface::Diff));
+        panel.open = false;
+        assert!(!panel.open_proactive_diff("r1", 0), "each turn is offered once");
+        panel.user_revision = 1;
+        assert!(!panel.open_proactive_diff("r2", 0), "the user chose a panel during the turn");
+        assert!(!panel.open && panel.proactive_diff_run.as_deref() == Some("r2"));
+
+        // A choice before the next turn starts is superseded once it runs.
+        let next = observe(Some(&running), "t", Some("r3"), 1);
+        assert_eq!(next.revision, 1);
+        assert_eq!(observe(Some(&next), "t", None, 2).revision, 1, "choices during the turn still count");
     }
 
     #[test]

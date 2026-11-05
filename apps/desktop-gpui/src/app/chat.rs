@@ -827,11 +827,11 @@ fn markdown_view(
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
-        .on_link_click(move |url, _, window, cx| match thread_link(url) {
-            Some(thread_id) => {
-                let _ = link_this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
-            }
-            None => cx.open_url(url),
+        .on_link_click(move |url, event, window, cx| {
+            let _ = link_this.update(cx, |workspace, cx| match thread_link(url) {
+                Some(thread_id) => workspace.select_thread(thread_id, window, cx),
+                None => workspace.open_link(url, event, window, cx),
+            });
         })
 }
 

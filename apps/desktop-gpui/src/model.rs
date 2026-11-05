@@ -1017,6 +1017,38 @@ pub struct Checkpoint {
     pub status: String,
     #[serde(default)]
     pub captured_at: String,
+    #[serde(default)]
+    pub files: Vec<CheckpointFile>,
+    /// Sent when `files` is a prefix; covers the full list.
+    #[serde(default)]
+    pub files_total: Option<CheckpointFileTotals>,
+}
+
+impl Checkpoint {
+    /// `checkpointFileTotals`.
+    pub fn file_totals(&self) -> CheckpointFileTotals {
+        self.files_total.clone().unwrap_or_else(|| CheckpointFileTotals {
+            count: self.files.len() as u64,
+            additions: self.files.iter().map(|f| f.additions).sum(),
+            deletions: self.files.iter().map(|f| f.deletions).sum(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointFile {
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct CheckpointFileTotals {
+    pub count: u64,
+    pub additions: u64,
+    pub deletions: u64,
 }
 
 /// An execution node; items reach their run attempt through `parentNodeId`.
