@@ -331,7 +331,7 @@ mod tests {
         let request = item(
             json!({"id": "i1", "type": "run_interrupt_request", "runId": "r1", "startedAt": "2026-01-01T00:00:00Z"}),
         );
-        let stop = run_stop(&runs, &[request.clone()]).unwrap();
+        let stop = run_stop(&runs, std::slice::from_ref(&request)).unwrap();
         assert!(!stop.unresponsive && !stop.background);
         assert_eq!(stop.run_id, "r1");
         let answered = item(json!({"id": "i2", "type": "run_interrupt_result", "runId": "r1"}));

@@ -889,18 +889,21 @@ pub fn conversations(comments: &[Comment], threads: &[ReviewThread]) -> Vec<Conv
             .comments
             .iter()
             .map(|c| {
-                by_id.get(c.id.as_str()).map(|c| (*c).clone()).unwrap_or_else(|| Comment {
-                    id: c.id.clone(),
-                    kind: "review-comment".into(),
-                    author: c.author.clone(),
-                    body: c.body.clone(),
-                    created_at: c.created_at.clone(),
-                    url: c.url.clone(),
-                    path: Some(thread.path.clone()),
-                    review_state: None,
-                    reactions: c.reactions.clone(),
-                    can_edit: c.can_edit,
-                })
+                by_id.get(c.id.as_str()).map_or_else(
+                    || Comment {
+                        id: c.id.clone(),
+                        kind: "review-comment".into(),
+                        author: c.author.clone(),
+                        body: c.body.clone(),
+                        created_at: c.created_at.clone(),
+                        url: c.url.clone(),
+                        path: Some(thread.path.clone()),
+                        review_state: None,
+                        reactions: c.reactions.clone(),
+                        can_edit: c.can_edit,
+                    },
+                    |c| (*c).clone(),
+                )
             })
             .collect();
         ordered.sort_by_key(|c| instant(&c.created_at).unwrap_or(0));
@@ -1743,12 +1746,12 @@ mod tests {
     #[test]
     fn editing_follows_the_hosts_answer_then_authorship() {
         let caps = json!({"actions": [], "mergeMethods": [], "edit": {"changeRequest": true, "comment": true}});
-        let mine = detail(json!({"capabilities": caps.clone(), "viewer": "OctoCat", "author": {"login": "octocat"}}));
+        let mine = detail(json!({"capabilities": caps, "viewer": "OctoCat", "author": {"login": "octocat"}}));
         assert!(can_edit_change_request(&mine), "the author, in any case");
-        let theirs = detail(json!({"capabilities": caps.clone(), "viewer": "me", "author": {"login": "you"}}));
+        let theirs = detail(json!({"capabilities": caps, "viewer": "me", "author": {"login": "you"}}));
         assert!(can_edit_change_request(&theirs), "someone who may merge");
         let refused = detail(json!({
-            "capabilities": caps.clone(), "viewer": "octocat", "author": {"login": "octocat"},
+            "capabilities": caps, "viewer": "octocat", "author": {"login": "octocat"},
             "viewerPermissions": {"actions": ["merge"], "editChangeRequest": false},
         }));
         assert!(!can_edit_change_request(&refused), "the host's own answer wins");

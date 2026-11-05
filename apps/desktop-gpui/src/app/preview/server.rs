@@ -193,7 +193,7 @@ impl Workspace {
             .finish();
         let ws_base = endpoint.http_base.replacen("http", "ws", 1);
         let url = format!("{ws_base}/api/preview-stream/ws?{query}");
-        let token = endpoint.bearer_token.clone();
+        let token = endpoint.bearer_token;
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = async_channel::unbounded();
         crate::runtime().spawn(run_stream(url, token, events_tx, outgoing_rx));
@@ -376,7 +376,7 @@ impl Workspace {
             .min_h_0()
             .overflow_hidden()
             .track_focus(&stream.focus)
-            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {}).absolute().size_full())
+            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .children(frame)
             .children(cursor)
             .on_mouse_down(
@@ -569,7 +569,7 @@ impl Workspace {
 
     fn server_mouse_up(&mut self, tab_id: &str, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        if !self.preview.server.streams.get(tab_id).is_some_and(|s| s.buttons & bit != 0) {
+        if self.preview.server.streams.get(tab_id).is_none_or(|s| s.buttons & bit == 0) {
             return;
         }
         let Some((x, y)) = self.server_point(tab_id, event.position, true) else { return };
@@ -933,7 +933,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<(Arc<RenderImage>, (u32, u32))> {
     let mut rgba = decoded.into_rgba8();
     let size = rgba.dimensions();
     // GPUI textures are BGRA.
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some((Arc::new(RenderImage::new([image::Frame::new(rgba)])), size))

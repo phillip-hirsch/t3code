@@ -169,10 +169,10 @@ impl Workspace {
                 }
                 match command {
                     "composer.mode" if matches!(self.target, Some(Target::Draft { .. })) => {
-                        self.draft_workspace_open_permissions(cx)
+                        self.draft_workspace_open_permissions(cx);
                     }
                     "modelPicker.toggle" | "composer.effort" if self.composer_picker_open() => {
-                        self.close_model_picker(window, cx)
+                        self.close_model_picker(window, cx);
                     }
                     _ => self.open_model_picker(window, cx),
                 }

@@ -174,8 +174,11 @@ impl Workspace {
                 };
                 settings_commands.extend(self.interaction_mode_command(&thread_id, interaction_mode));
                 sent_mode = Some(interaction_mode);
-                let running =
-                    self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
+                let running = self
+                    .thread
+                    .as_ref()
+                    .and_then(|t| t.state.projection.as_ref())
+                    .is_some_and(super::super::model::ThreadProjection::is_running);
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,

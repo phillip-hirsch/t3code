@@ -124,7 +124,7 @@ impl SavedEnvironments {
         let session = self.sessions.entry(environment_id.to_owned()).or_default();
         session.state = ConnectionState::default();
         session.client = None;
-        let own = environment.enabled && !self.primary.as_deref().is_some_and(|id| id == environment_id);
+        let own = environment.enabled && self.primary.as_deref().is_none_or(|id| id != environment_id);
         session._task = own.then(|| Self::supervise(environment, 0, cx));
         cx.notify();
     }
@@ -157,7 +157,7 @@ impl SavedEnvironments {
                     this.update_session(&id, cx, |s| {
                         s.state =
                             ConnectionState { phase: Phase::Connecting, attempt, retry_at: None, ..s.state.clone() };
-                    })
+                    });
                 });
                 if entered.is_err() {
                     return;
@@ -174,7 +174,7 @@ impl SavedEnvironments {
                                 s.machine = descriptor.machine();
                                 s.client = Some(client.clone());
                                 s.generation += 1;
-                            })
+                            });
                         });
                         if connected.is_err() {
                             return;
@@ -191,7 +191,7 @@ impl SavedEnvironments {
                                     retry_at: Some(retry_at(delay)),
                                     last_failure: Some(Failure::transport(reason)),
                                 };
-                            })
+                            });
                         });
                         if dropped.is_err() {
                             return;
@@ -216,7 +216,7 @@ impl SavedEnvironments {
                                     retry_at: delay.map(retry_at),
                                     last_failure: Some(failure),
                                 };
-                            })
+                            });
                         });
                         let Some(delay) = delay else { return };
                         if failed.is_err() {

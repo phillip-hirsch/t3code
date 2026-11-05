@@ -506,7 +506,7 @@ impl Workspace {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_pr_composer_body(
         &self,
         detail: &Detail,
@@ -933,7 +933,7 @@ impl Workspace {
                 .disabled(panel.write.thread_pending)
                 .child(if resolved { "Unresolve" } else { "Resolve" })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_pr_thread_resolved(id.clone(), !resolved, window, cx)
+                    this.set_pr_thread_resolved(id.clone(), !resolved, window, cx);
                 }))
                 .into_any_element()
         })
@@ -1043,7 +1043,7 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let input = cx.new(|cx| TextareaState::new(window, cx).rows(2).placeholder("Reply"));
                         input.update(cx, |input, cx| input.focus(window, cx));
-                        let sub = watch(&input, Some(|this, window, cx| this.send_pr_reply(window, cx)), window, cx);
+                        let sub = watch(&input, Some(crate::app::Workspace::send_pr_reply), window, cx);
                         if let Some(write) = this.pr_write() {
                             write.reply = Some((id.clone(), input));
                             write._watch.push(sub);
@@ -1106,7 +1106,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 let input = cx.new(|cx| TextareaState::new(window, cx).rows(6).default_value(body.clone()));
                 input.update(cx, |input, cx| input.focus(window, cx));
-                let sub = watch(&input, Some(|this, window, cx| this.save_pr_edit(window, cx)), window, cx);
+                let sub = watch(&input, Some(crate::app::Workspace::save_pr_edit), window, cx);
                 if let Some(write) = this.pr_write() {
                     write.editing = Some(Editing { subject: subject.clone(), kind, input, preview: false });
                     write._watch.push(sub);
@@ -1361,7 +1361,7 @@ impl Workspace {
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                     .when(can_react, |el| {
                         el.on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_pr_reaction(subject.clone(), content.clone(), next, window, cx)
+                            this.set_pr_reaction(subject.clone(), content.clone(), next, window, cx);
                         }))
                     }),
             );
@@ -1405,7 +1405,7 @@ impl Workspace {
                                 if let Some(write) = this.pr_write() {
                                     write.reaction_picker = None;
                                 }
-                                this.set_pr_reaction(subject.clone(), content.clone(), !pressed, window, cx)
+                                this.set_pr_reaction(subject.clone(), content.clone(), !pressed, window, cx);
                             }))
                     }))
                     .into_any_element()
@@ -1421,7 +1421,7 @@ impl Workspace {
                                 write.reaction_picker = open.then_some(key);
                             }
                             cx.notify();
-                        })
+                        });
                     })
                     .trigger(trigger)
                     .p(px(4.))
@@ -1589,7 +1589,7 @@ impl Workspace {
                         write.picker = None;
                         cx.notify();
                     }
-                })
+                });
             })
             .trigger(trigger)
             .w(px(288.))
@@ -1688,7 +1688,7 @@ impl Workspace {
                             .child(content)
                             .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(14.))))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.pick_pr_candidate(kind, candidate.clone(), window, cx)
+                                this.pick_pr_candidate(kind, candidate.clone(), window, cx);
                             }))
                             .into_any_element(),
                     );

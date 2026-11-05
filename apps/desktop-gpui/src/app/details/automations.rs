@@ -212,7 +212,7 @@ impl Workspace {
                                 .when(busy || running, |el| el.opacity(0.5))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if !running {
-                                        this.automation_action(run_id.clone(), None, window, cx)
+                                        this.automation_action(run_id.clone(), None, window, cx);
                                     }
                                 })),
                         )
@@ -223,7 +223,7 @@ impl Workspace {
                             .small()
                             .disabled(busy)
                             .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                this.automation_action(toggle_id.clone(), Some(*checked), window, cx)
+                                this.automation_action(toggle_id.clone(), Some(*checked), window, cx);
                             })),
                     )
                     .into_any_element()

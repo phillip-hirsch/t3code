@@ -123,10 +123,11 @@ pub(super) fn resolve_navigation(
 ) -> Navigation {
     let last = step_count.saturating_sub(1);
     let target = requested.min(last);
-    if let Some((step, true)) = prerequisite {
-        if current <= step && target > step {
-            return Navigation::Blocked(step.min(last));
-        }
+    if let Some((step, true)) = prerequisite
+        && current <= step
+        && target > step
+    {
+        return Navigation::Blocked(step.min(last));
     }
     if instance_id_error && current <= identity_step && target > identity_step {
         return Navigation::Blocked(identity_step.min(last));
@@ -370,7 +371,7 @@ impl ConfigForm {
             Control::Select(options) => {
                 let fallback = options.first().map(|(v, _)| *v).unwrap_or_default();
                 let current = Some(config_str(&self.config, field.key)).filter(|v| !v.is_empty()).unwrap_or(fallback);
-                let label = options.iter().find(|(v, _)| *v == current).map(|(_, l)| *l).unwrap_or(current).to_owned();
+                let label = options.iter().find(|(v, _)| *v == current).map_or(current, |(_, l)| *l).to_owned();
                 let current = current.to_owned();
                 let view = cx.entity();
                 Button::new(id("-select"))
@@ -389,7 +390,7 @@ impl ConfigForm {
                         for (value, label) in options {
                             menu = menu.item(PopupMenuItem::new(*label).checked(*value == current.as_str()).on_click(
                                 window.listener_for(&view, move |this, _, window, cx| {
-                                    this.select_option(field, value, window, cx)
+                                    this.select_option(field, value, window, cx);
                                 }),
                             ));
                         }

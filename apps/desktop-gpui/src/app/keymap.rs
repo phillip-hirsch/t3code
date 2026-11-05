@@ -351,7 +351,10 @@ impl super::Workspace {
     }
 
     pub(super) fn turn_running(&self) -> bool {
-        self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running())
+        self.thread
+            .as_ref()
+            .and_then(|t| t.state.projection.as_ref())
+            .is_some_and(super::super::model::ThreadProjection::is_running)
     }
 
     /// A command's shortcut label for a tooltip or menu, in the resting context (no terminal or preview focus).

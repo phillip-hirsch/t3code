@@ -426,10 +426,7 @@ mod tests {
         let local = ssh("other", "Android", "julius@android");
         let lists = [vec![], vec![local.clone()], vec![shared.clone(), local.clone()]];
         let saved: Vec<_> = lists.iter().map(|hosts| update(hosts, &shared, false)).collect();
-        assert_eq!(
-            saved,
-            [vec![shared.clone()], vec![local.clone(), shared.clone()], vec![shared.clone(), local.clone()]]
-        );
+        assert_eq!(saved, [vec![shared.clone()], vec![local.clone(), shared.clone()], vec![shared.clone(), local]]);
         let again: Vec<_> = saved.iter().map(|hosts| update(hosts, &shared, false)).collect();
         assert_eq!(again, saved);
     }
@@ -439,7 +436,7 @@ mod tests {
         let shared = ssh("shared", "Mac mini", "julius@macmini");
         let local = ssh("other", "Android", "julius@android");
         let edited = SshHost { target: "julius@new-address".into(), ..shared.clone() };
-        let saved: Vec<_> = [vec![shared.clone()], vec![local.clone(), shared.clone()]]
+        let saved: Vec<_> = [vec![shared.clone()], vec![local.clone(), shared]]
             .iter()
             .map(|hosts| update(hosts, &edited, false))
             .collect();
@@ -457,7 +454,7 @@ mod tests {
         let hosts = [remote.clone(), local.clone()];
         assert_eq!(update(&hosts, &shared, false), hosts);
         let saved = update_device_hosts(&hosts, &edited, false, &shared).unwrap();
-        assert_eq!(saved, [SshHost { id: remote.id.clone(), ..edited.clone() }, local.clone()]);
+        assert_eq!(saved, [SshHost { id: remote.id, ..edited.clone() }, local.clone()]);
         assert_eq!(update_device_hosts(&saved, &edited, false, &shared).unwrap(), saved);
         assert_eq!(update(&hosts, &shared, true), [local]);
     }
@@ -554,7 +551,7 @@ mod tests {
     fn adds_replaces_and_removes_one_simlock_host() {
         let host = simlock();
         let other = SimlockHost { id: "other".into(), label: "Other".into(), ..host.clone() };
-        let added = update_simlock_hosts(&[other.clone()], &host, false);
+        let added = update_simlock_hosts(std::slice::from_ref(&other), &host, false);
         assert_eq!(added.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["other", "simlock"]);
         let renamed = update_simlock_hosts(&added, &SimlockHost { label: "Renamed".into(), ..host.clone() }, false);
         assert_eq!(renamed.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["Other", "Renamed"]);

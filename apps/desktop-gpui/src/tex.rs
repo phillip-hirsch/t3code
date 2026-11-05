@@ -234,7 +234,7 @@ fn group(rest: &str) -> (&str, &str) {
         return (inner, "");
     }
     if let Some(command) = rest.strip_prefix('\\') {
-        let len = command.chars().take_while(|c| c.is_ascii_alphabetic()).map(char::len_utf8).sum::<usize>().max(1);
+        let len = command.chars().take_while(char::is_ascii_alphabetic).map(char::len_utf8).sum::<usize>().max(1);
         let end = (1 + len).min(rest.len());
         return (&rest[..end], &rest[end..]);
     }
@@ -280,7 +280,7 @@ fn convert(tex: &str) -> String {
             }
             '{' | '}' => rest = &rest[1..],
             '\\' => {
-                let command: String = rest[1..].chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                let command: String = rest[1..].chars().take_while(char::is_ascii_alphabetic).collect();
                 let after = &rest[1 + command.len()..];
                 match command.as_str() {
                     "frac" | "dfrac" | "tfrac" => {

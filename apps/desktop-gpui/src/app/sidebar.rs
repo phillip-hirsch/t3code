@@ -380,7 +380,7 @@ fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::A
 impl SidebarState {
     /// The rows to draw, in order: the web's `sidebarListItemsFresh`. `boring` folds the
     /// active threads into project folders (`useSidebarThreads` `folderGroups`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn items<'a>(
         &mut self,
         shell: &'a ShellState,
@@ -509,10 +509,12 @@ impl SidebarState {
                 },
                 // Folder rows show a status label without a duration, else the relative time.
                 Item::FolderRow(facts) => {
-                    if facts.status() == Status::Ready && !facts.is_woke(now) && !facts.is_unread() {
-                        if let Some(from) = facts.activity_timestamp() {
-                            at(inbox::relative_changes_in(now - from));
-                        }
+                    if facts.status() == Status::Ready
+                        && !facts.is_woke(now)
+                        && !facts.is_unread()
+                        && let Some(from) = facts.activity_timestamp()
+                    {
+                        at(inbox::relative_changes_in(now - from));
                     }
                 }
                 Item::Slim(facts, shelf) => {
@@ -751,12 +753,12 @@ impl Workspace {
                 cx.stop_propagation();
                 this.unpin_thread(&id, window, cx);
             }))
-            .child(div().absolute().group_hover(group.clone(), |s| s.invisible()).child(icon(
+            .child(div().absolute().group_hover(group.clone(), gpui_kit::Styled::invisible).child(icon(
                 IconName::Pin,
                 12.,
                 muted,
             )))
-            .child(div().absolute().invisible().group_hover(group, |s| s.visible()).child(icon(
+            .child(div().absolute().invisible().group_hover(group, gpui_kit::Styled::visible).child(icon(
                 IconName::PinOff,
                 12.,
                 fg,
@@ -1010,7 +1012,7 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_palette(super::palette::View::AddProject, window, cx)
+                            this.open_palette(super::palette::View::AddProject, window, cx);
                         }))
                         .child(div().mx(px(-2.)).child(Icon::new(IconName::Plus).size(px(12.))))
                         .child("Add project"),
@@ -1066,7 +1068,7 @@ impl Workspace {
                 ("right", Some(shelf)) if !expanded(self, shelf) => self.toggle_shelf(shelf, cx),
                 ("left", Some(shelf)) if expanded(self, shelf) => self.toggle_shelf(shelf, cx),
                 ("enter" | "space", None) if key.as_ref() == "settled:more" => {
-                    self.sidebar.settled_visible += SETTLED_PAGE
+                    self.sidebar.settled_visible += SETTLED_PAGE;
                 }
                 ("enter" | "space", None) => {
                     if let Some(id) = key.strip_prefix("thread:") {
@@ -1257,7 +1259,7 @@ impl Workspace {
                     .left(px(7.))
                     .w(px(2.))
                     .invisible()
-                    .group_hover("sidebar-rail", |s| s.visible())
+                    .group_hover("sidebar-rail", gpui_kit::Styled::visible)
                     .bg(sb.border),
             );
 
@@ -1315,11 +1317,9 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_focus(&self.sidebar.list_focus)
-                    .on_key_down(
-                        cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                            this.list_key(event, window, cx)
-                        }),
-                    )
+                    .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                        this.list_key(event, window, cx);
+                    }))
                     .child(list),
             )
             .children(
@@ -1417,7 +1417,7 @@ impl Workspace {
                     .text_color(sb.muted_foreground)
                     .hover(|s| s.bg(sb.row_hover))
                     .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                        this.search_key(event, window, cx)
+                        this.search_key(event, window, cx);
                     }))
                     .when(focused, |el| {
                         el.bg(sb.row_hover).border_1().border_color(tokens.ring.opacity(0.7)).px(px(7.))
@@ -1567,7 +1567,7 @@ impl Workspace {
                 .hover(|s| s.bg(sb.row_hover))
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.update_providers(label.clone(), candidates.clone(), window, cx)
+                    this.update_providers(label.clone(), candidates.clone(), window, cx);
                 }))
                 .child(icon(IconName::CircleArrowUp, 16., sb.foreground))
                 .into_any_element(),
@@ -1621,7 +1621,7 @@ impl Workspace {
             .when(!expanded, |i| i.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2)));
         text_xs(h_flex())
             .id(shelf.label())
-            .when(first, |el| el.mt_auto())
+            .when(first, gpui_kit::Styled::mt_auto)
             .mx(px(2.))
             .h(px(32.))
             .flex_none()
@@ -1674,7 +1674,7 @@ impl Workspace {
         Some(svg().path(path).size(px(14.)).flex_none().text_color(color.opacity(0.6)).into_any_element())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_card(
         &self,
         facts: Facts,
@@ -1770,8 +1770,8 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     if let Some(target) = target.clone() {
-                        this.discard_draft(target, window, cx)
-                    };
+                        this.discard_draft(target, window, cx);
+                    }
                 }))
                 .child(Icon::new(IconName::X).size(px(14.)))
         });
@@ -1828,7 +1828,7 @@ impl Workspace {
                         })
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.click_row(&open_id, event, window, cx)
+                        this.click_row(&open_id, event, window, cx);
                     }))
                     .child(
                         v_flex()
@@ -1914,7 +1914,7 @@ impl Workspace {
 
     /// A boring sidebar folder header (`SidebarProjectFolderHeader`): it reads like a shelf
     /// header, with the hidden count and a status dot only while it is closed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_folder(
         &self,
         group: &ProjectGroup,
@@ -1950,7 +1950,7 @@ impl Workspace {
             .flex()
             .items_center()
             .invisible()
-            .group_hover(FOLDER_GROUP, |s| s.visible())
+            .group_hover(FOLDER_GROUP, gpui_kit::Styled::visible)
             .child(
                 div()
                     .id(SharedString::from(format!("folder-new-button-{}", group.key)))
@@ -2001,7 +2001,7 @@ impl Workspace {
                             text_xs(div())
                                 .flex_none()
                                 .text_color(sb.muted_foreground)
-                                .group_hover(FOLDER_GROUP, |s| s.invisible())
+                                .group_hover(FOLDER_GROUP, gpui_kit::Styled::invisible)
                                 .child(hidden.to_string()),
                         )
                     })
@@ -2050,7 +2050,7 @@ impl Workspace {
 
     /// A one-line thread row in a folder (`variant="folder"`), or with the card's branch line
     /// under it (`folder-multiline`). Titles line up with the folder name, past its icon.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_folder_row(
         &self,
         facts: Facts,
@@ -2096,7 +2096,7 @@ impl Workspace {
             .h_full()
             .px(px(8.))
             .rounded(px(6.))
-            .group_hover(ROW_GROUP, |s| s.visible())
+            .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
             .text_color(tokens.muted_foreground)
             .hover(|s| s.text_color(sb.foreground))
             .tooltip(tooltip("Settle thread"))
@@ -2112,7 +2112,7 @@ impl Workspace {
             .min_w(px(32.))
             .flex_none()
             .justify_end()
-            .child(div().when(!woke_status, |el| el.group_hover(ROW_GROUP, |s| s.invisible())).child(label))
+            .child(div().when(!woke_status, |el| el.group_hover(ROW_GROUP, gpui_kit::Styled::invisible)).child(label))
             .child(settle);
         let title_color = if recede {
             sb.foreground.opacity(0.75)
@@ -2134,7 +2134,7 @@ impl Workspace {
         let title_icons = if multiline && meta.is_none() { self.provider_mark(&facts, sb.foreground) } else { None };
         let line = h_flex()
             .when(multiline, |el| el.h(px(24.)))
-            .when(!multiline, |el| el.size_full())
+            .when(!multiline, gpui_kit::Styled::size_full)
             .min_w_0()
             .gap(px(10.))
             .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
@@ -2180,7 +2180,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_slim(
         &self,
         facts: Facts,
@@ -2251,7 +2251,7 @@ impl Workspace {
                 .h_full()
                 .px(px(6.))
                 .rounded(px(6.))
-                .group_hover(ROW_GROUP, |s| s.visible())
+                .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
                 .text_color(tokens.muted_foreground)
                 .hover(|s| s.text_color(sb.foreground))
                 .tooltip(tooltip(label))
@@ -2320,7 +2320,9 @@ impl Workspace {
                     .justify_end()
                     .child(
                         div()
-                            .when(action.is_some() && !woke, |el| el.group_hover(ROW_GROUP, |s| s.invisible()))
+                            .when(action.is_some() && !woke, |el| {
+                                el.group_hover(ROW_GROUP, gpui_kit::Styled::invisible)
+                            })
                             .child(label),
                     )
                     .children(action),
@@ -2365,7 +2367,7 @@ impl Workspace {
         div()
             .id(SharedString::from(format!("woke-{thread_id}")))
             .cursor_pointer()
-            .hover(|s| s.underline())
+            .hover(gpui_kit::Styled::underline)
             .tooltip(tooltip("Dismiss Woke notification"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -2482,10 +2484,8 @@ pub(in crate::app) fn project_icon(
             .grayscale(grayscale)
             .into_any_element();
     }
-    let text = custom
-        .and_then(|icon| icon["text"].as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| inbox::monogram(&project.title));
+    let text =
+        custom.and_then(|icon| icon["text"].as_str()).map_or_else(|| inbox::monogram(&project.title), str::to_owned);
     let index = custom
         .and_then(|icon| icon["color"].as_str())
         .and_then(|name| inbox::PROJECT_COLORS.iter().position(|(n, ..)| *n == name))
@@ -2522,7 +2522,7 @@ pub(in crate::app) fn project_icon(
             h_flex()
                 .w(px(if glyphs.len() > 1 { 12. } else { 6. } * scale))
                 .justify_between()
-                .when(glyphs.len() < 2, |el| el.justify_center())
+                .when(glyphs.len() < 2, gpui_kit::Styled::justify_center)
                 .children(glyphs.into_iter().map(|glyph| SharedString::from(glyph.to_string()))),
         )
         .into_any_element()

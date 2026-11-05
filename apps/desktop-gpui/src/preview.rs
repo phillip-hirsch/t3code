@@ -588,10 +588,10 @@ pub fn resolve_address(input: &str, search_template: &str) -> Result<String, &'s
             let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
             labels.len() >= 2 && labels.iter().all(|label| !label.is_empty())
         };
-        if has_port || host.eq_ignore_ascii_case("localhost") || ipv4 || bracketed || dotted {
-            if let Ok(url) = normalize_url(trimmed) {
-                return Ok(url);
-            }
+        if (has_port || host.eq_ignore_ascii_case("localhost") || ipv4 || bracketed || dotted)
+            && let Ok(url) = normalize_url(trimmed)
+        {
+            return Ok(url);
         }
     }
     Ok(search_template.replace("%s", &encode_uri_component(trimmed)))

@@ -445,7 +445,7 @@ impl Workspace {
                 Ok(Err(error)) => {
                     log::error!("could not reach the server: {error:#}");
                     let _ = this.update(cx, |this, cx| {
-                        this.set_connection(Connection::Failed(format!("{error:#}").into()), cx)
+                        this.set_connection(Connection::Failed(format!("{error:#}").into()), cx);
                     });
                     return;
                 }
@@ -522,7 +522,7 @@ impl Workspace {
                         if this
                             .update_in(cx, |this, window, cx| {
                                 this.environment_remote = remote;
-                                this.on_connected(client.clone(), current, window, cx)
+                                this.on_connected(client.clone(), current, window, cx);
                             })
                             .is_err()
                         {
@@ -589,7 +589,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.connection = Connection::Connected;
-        self.set_primary_connection(Some(client.clone()), Some(endpoint));
+        self.set_primary_connection(Some(client), Some(endpoint));
         // Read per connection: the files may have changed, or never loaded while down.
         self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
@@ -627,10 +627,10 @@ impl Workspace {
                             }
                             StreamEvent::End(result) => {
                                 ended = true;
-                                if let Err(error) = result {
-                                    if !matches!(error, RpcError::Disconnected(_)) {
-                                        this.error = Some(error.to_string().into());
-                                    }
+                                if let Err(error) = result
+                                    && !matches!(error, RpcError::Disconnected(_))
+                                {
+                                    this.error = Some(error.to_string().into());
                                 }
                             }
                         }
@@ -1045,11 +1045,11 @@ impl Render for Workspace {
             }))
             .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| {
                 this.held_key = None;
-                this.quit_key_up(event, cx)
+                this.quit_key_up(event, cx);
             }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
                 this.snap_shot_record_modifiers(event, cx);
-                this.quit_modifiers_changed(event, cx)
+                this.quit_modifiers_changed(event, cx);
             }))
             .child(
                 h_flex()
@@ -1102,7 +1102,7 @@ impl Render for Workspace {
                                     .children(mini_player)
                                     .children(self.render_banner_lane(cx))
                                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
-                                        this.drop_paths(paths, window, cx)
+                                        this.drop_paths(paths, window, cx);
                                     }))
                                     .on_drag_move(cx.listener(Self::on_file_drag_move))
                                     .when(self.dragging_files && cx.has_active_drag(), |el| {

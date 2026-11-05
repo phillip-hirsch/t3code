@@ -587,7 +587,7 @@ impl Workspace {
                     window.push_notification(
                         Notification::error(logic::error_message(&error)).title("Unable to open file in browser"),
                         cx,
-                    )
+                    );
                 });
             }
         })

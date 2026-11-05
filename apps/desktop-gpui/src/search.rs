@@ -108,7 +108,7 @@ struct TokenMatch {
 }
 
 fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
-    if left.len().abs_diff(right.len()) > if swap_only { 0 } else { 1 } {
+    if left.len().abs_diff(right.len()) > usize::from(!swap_only) {
         return false;
     }
     let i = left.iter().zip(right).take_while(|(a, b)| a == b).count();
@@ -283,10 +283,8 @@ pub fn class(quality: f32) -> u8 {
         3
     } else if quality >= 0.7 {
         2
-    } else if quality >= 0.4 {
-        1
     } else {
-        0
+        u8::from(quality >= 0.4)
     }
 }
 

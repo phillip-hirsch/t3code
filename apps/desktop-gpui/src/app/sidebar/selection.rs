@@ -313,7 +313,7 @@ mod tests {
 
     fn keys(selection: &Selection) -> Vec<&str> {
         let mut keys: Vec<&str> = selection.keys.iter().map(String::as_str).collect();
-        keys.sort();
+        keys.sort_unstable();
         keys
     }
 

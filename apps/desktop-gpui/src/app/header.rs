@@ -141,7 +141,7 @@ impl Workspace {
                     .id("thread-title-chevron")
                     .flex_none()
                     .invisible()
-                    .group_hover("thread-title", |style| style.visible())
+                    .group_hover("thread-title", gpui_kit::Styled::visible)
                     .child(icon("icons/chevron-down.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -152,13 +152,13 @@ impl Workspace {
                     ),
             )
             .child(
-                canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, _, _, _| {}).absolute().size_full(),
+                canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, (), _, _| {}).absolute().size_full(),
             )
             // Mouse-down, like the panel toggles: the drag region swallows the release.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
-                    this.click_title(event.click_count, false, window, cx)
+                    this.click_title(event.click_count, false, window, cx);
                 }),
             )
             .into_any_element()

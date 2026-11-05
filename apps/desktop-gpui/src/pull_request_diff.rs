@@ -480,13 +480,12 @@ fn file_tier(path: &str) -> u8 {
         || dirs.iter().any(|d| ["__snapshots__", "__generated__", "dist", "build", "vendor"].contains(d));
     if generated {
         2
-    } else if name.contains(".test.")
-        || name.contains(".spec.")
-        || dirs.iter().any(|d| ["__tests__", "tests", "test"].contains(d))
-    {
-        1
     } else {
-        0
+        u8::from(
+            name.contains(".test.")
+                || name.contains(".spec.")
+                || dirs.iter().any(|d| ["__tests__", "tests", "test"].contains(d)),
+        )
     }
 }
 

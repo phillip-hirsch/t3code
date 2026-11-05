@@ -119,7 +119,7 @@ impl TerminalSession {
     }
 
     fn link_at(&self, point: GridPoint) -> Option<HoveredLink> {
-        let line = logical_line(&*self.term, point.line);
+        let line = logical_line(&self.term, point.line);
         let grid = self.term.grid();
         let point = if grid[point.line][point.column].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
             GridPoint::new(point.line, Column(point.column.0 - 1))
@@ -190,9 +190,8 @@ impl TerminalSession {
         let path = path.to_owned();
         cx.spawn(async move |this, cx| {
             let result = client.request("filesystem.getMetadata", json!({"paths": [key]})).await;
-            let exists = result
-                .ok()
-                .is_some_and(|value| matches!(value["entries"][0]["kind"].as_str(), Some("file" | "directory")));
+            let exists =
+                result.is_ok_and(|value| matches!(value["entries"][0]["kind"].as_str(), Some("file" | "directory")));
             let _ = this.update(cx, |this, cx| {
                 this.pointer.checked.insert(key.clone(), Some(exists));
                 if !exists {
@@ -249,11 +248,12 @@ impl TerminalSession {
             return false;
         }
         let (point, right) = self.grid_point(event.position);
-        if event.click_count == 1 && !modifiers.shift {
-            if let Some(link) = self.link_at(point) {
-                self.pointer.pending_link = Some((link, event.position));
-                return true;
-            }
+        if event.click_count == 1
+            && !modifiers.shift
+            && let Some(link) = self.link_at(point)
+        {
+            self.pointer.pending_link = Some((link, event.position));
+            return true;
         }
         self.start_selection(point, right, event.click_count, modifiers.shift);
         cx.notify();

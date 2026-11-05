@@ -558,7 +558,7 @@ impl Workspace {
                                 }
                             }))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_settings_search_result(open, window, cx)
+                                this.open_settings_search_result(open, window, cx);
                             }))
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(

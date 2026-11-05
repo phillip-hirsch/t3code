@@ -59,8 +59,7 @@ fn address(home: &Path) -> String {
 fn socket_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|_| cfg!(target_os = "linux"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
 fn message(args: &[String]) -> Vec<u8> {

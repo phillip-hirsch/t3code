@@ -281,10 +281,10 @@ impl TerminalSession {
                             StreamEvent::Item(value) => this.apply(&value, cx),
                             StreamEvent::End(result) => {
                                 ended = true;
-                                if let (Err(error), false) = (&result, this.exited) {
-                                    if !matches!(error, RpcError::Disconnected(_)) {
-                                        this.system_message(&error.to_string());
-                                    }
+                                if let (Err(error), false) = (&result, this.exited)
+                                    && !matches!(error, RpcError::Disconnected(_))
+                                {
+                                    this.system_message(&error.to_string());
                                 }
                             }
                         }
@@ -427,7 +427,7 @@ impl TerminalSession {
         self.term.resize(size);
         self._resize = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESIZE_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.send_size(cx));
+            let _ = this.update(cx, TerminalSession::send_size);
         }));
     }
 

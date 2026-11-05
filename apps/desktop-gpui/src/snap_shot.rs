@@ -414,8 +414,10 @@ pub const MAX_CAPTURE: (u32, u32) = (2_560, 1_600);
 #[cfg(any(windows, target_os = "macos", test))]
 /// The size a `width`×`height` capture scales down to so it fits [`MAX_CAPTURE`].
 pub fn fit_capture(width: u32, height: u32) -> (u32, u32) {
-    let scale = (MAX_CAPTURE.0 as f64 / width.max(1) as f64).min(MAX_CAPTURE.1 as f64 / height.max(1) as f64).min(1.);
-    (((width as f64 * scale).round() as u32).max(1), ((height as f64 * scale).round() as u32).max(1))
+    let scale = (f64::from(MAX_CAPTURE.0) / f64::from(width.max(1)))
+        .min(f64::from(MAX_CAPTURE.1) / f64::from(height.max(1)))
+        .min(1.);
+    (((f64::from(width) * scale).round() as u32).max(1), ((f64::from(height) * scale).round() as u32).max(1))
 }
 
 #[cfg(any(windows, test))]
@@ -743,7 +745,7 @@ mod tests {
     fn accessible_text_keeps_each_name_once_within_the_limit() {
         let lines = ["Editor", " Editor ", "", "a\0b", "Save"].map(String::from);
         assert_eq!(accessible_text(lines.clone(), 100), "Editor\nab\nSave");
-        assert_eq!(accessible_text(lines.clone(), 9), "Editor\nab");
+        assert_eq!(accessible_text(lines, 9), "Editor\nab");
         assert_eq!(accessible_text(["ab😀".to_owned()], 3), "ab");
         assert_eq!(flat_accessibility("  "), None);
         let flat = flat_accessibility("Editor\nSave").expect("text");

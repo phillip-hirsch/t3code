@@ -118,7 +118,7 @@ impl Workspace {
             let row = RowFrame::new(title).description(text(description)).render(&t).into_any_element();
             return self.settings_page(
                 "archived",
-                &view,
+                view,
                 [settings_section("archived", "Archived threads", [row], &t)],
                 cx,
             );
@@ -134,7 +134,7 @@ impl Workspace {
                 settings_section(SharedString::from(format!("archived-{}", project.id)), title, rows, &t)
             })
             .collect();
-        self.settings_page("archived", &view, sections, cx)
+        self.settings_page("archived", view, sections, cx)
     }
 
     fn archived_row(
@@ -169,13 +169,13 @@ impl Workspace {
                 let unarchive_item = {
                     let (view, state, id) = (view.clone(), state.clone(), id.clone());
                     move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                        unarchive(&view, &state, &id, window, cx)
+                        unarchive(&view, &state, &id, window, cx);
                     }
                 };
                 let delete_item = {
                     let (view, state, id, title) = (view.clone(), state.clone(), id.clone(), title.clone());
                     move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                        confirm_delete(view.clone(), state.clone(), id.clone(), title.clone(), window, cx)
+                        confirm_delete(view.clone(), state.clone(), id.clone(), title.clone(), window, cx);
                     }
                 };
                 menu.item(PopupMenuItem::new("Unarchive").on_click(unarchive_item))
@@ -241,7 +241,7 @@ fn dispatch_and_reload(
                 Err(crate::rpc::RpcError::Disconnected(_)) => {}
                 Err(crate::rpc::RpcError::Failure(error)) => {
                     let message = error["message"].as_str().unwrap_or("An error occurred.").to_owned();
-                    notify_error(window, cx, failure, message)
+                    notify_error(window, cx, failure, message);
                 }
                 Err(crate::rpc::RpcError::Defect(_)) => notify_error(window, cx, failure, "An error occurred."),
             });

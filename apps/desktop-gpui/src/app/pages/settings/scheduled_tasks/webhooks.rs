@@ -149,7 +149,7 @@ impl WebhookFields {
         }
         let has_secret = self.has_stored_secret();
         self.signature_secret.update(cx, |secret, cx| {
-            secret.set_placeholder(if has_secret { "Unchanged" } else { "Shared secret" }, window, cx)
+            secret.set_placeholder(if has_secret { "Unchanged" } else { "Shared secret" }, window, cx);
         });
         if link_changed {
             self.read_link_state(cx);
@@ -385,7 +385,7 @@ impl WebhookFields {
                         for op in FilterOp::ALL {
                             menu = menu.item(PopupMenuItem::new(op.label()).checked(op == current).on_click(
                                 window.listener_for(&view, move |this, _, window, cx| {
-                                    this.set_filter_op(id, op, window, cx)
+                                    this.set_filter_op(id, op, window, cx);
                                 }),
                             ));
                         }

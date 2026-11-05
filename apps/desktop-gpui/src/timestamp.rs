@@ -36,7 +36,7 @@ fn clock<Tz: TimeZone>(time: &DateTime<Tz>, hour12: bool) -> String {
     if !hour12 {
         return format!("{hour:02}:{:02}", time.minute());
     }
-    let twelve = if hour % 12 == 0 { 12 } else { hour % 12 };
+    let twelve = if hour.is_multiple_of(12) { 12 } else { hour % 12 };
     format!("{twelve}:{:02} {}", time.minute(), if hour < 12 { "AM" } else { "PM" })
 }
 

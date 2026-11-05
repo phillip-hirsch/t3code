@@ -608,7 +608,7 @@ mod tests {
         std::io::Write::write_all(&mut gz, b"plain").unwrap();
         let single = open_archive("notes.txt.gz", &gz.finish().unwrap()).unwrap();
         assert_eq!(single.entries[0].path, "notes.txt");
-        let mut damaged = bytes.clone();
+        let mut damaged = bytes;
         damaged[0] = b'x';
         assert_eq!(open_archive("x.tar", &damaged).err().unwrap(), "The TAR header is damaged.");
     }

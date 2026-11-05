@@ -285,11 +285,9 @@ impl Workspace {
                 .px(px(16.))
                 .child(label("Refine"))
                 .when(enabled, |el| {
-                    el.on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.submit_with(super::send::Intent::Foreground, window, cx)
-                        }),
-                    )
+                    el.on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_with(super::send::Intent::Foreground, window, cx);
+                    }))
                 })
                 .into_any_element();
         }
@@ -317,7 +315,7 @@ impl Workspace {
                         .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomRight, move |menu, window, _| {
                             menu.item(PopupMenuItem::new("Implement in a new thread").disabled(!enabled).on_click(
                                 window.listener_for(&view, |this, _, window, cx| {
-                                    this.implement_plan_in_new_thread(window, cx)
+                                    this.implement_plan_in_new_thread(window, cx);
                                 }),
                             ))
                         }),

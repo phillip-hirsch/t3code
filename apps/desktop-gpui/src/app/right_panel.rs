@@ -563,23 +563,22 @@ impl Workspace {
             menu.item(PopupMenuItem::new("Close").on_click(
                 window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
             ))
-            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(
-                window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx)
-                }),
-            ))
+            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(window.listener_for(
+                &view,
+                move |this, _, window, cx| {
+                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                },
+            )))
             .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx)
+                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
                 }),
             ))
-            .item(
-                PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
-                    window.listener_for(&view, move |this, _, window, cx| {
-                        this.close_surfaces(all.clone(), None, window, cx)
-                    }),
-                ),
-            )
+            .item(PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(all.clone(), None, window, cx);
+                }),
+            ))
         }
     }
 
@@ -801,7 +800,9 @@ impl Workspace {
         };
         let cwd = self.git_cwd();
         let version = match &scope {
-            DiffScope::Turn(run) => (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| t.turn_count as u64), 0, 0),
+            DiffScope::Turn(run) => {
+                (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| u64::from(t.turn_count)), 0, 0)
+            }
             _ => self.vcs.status.as_ref().map_or((0, 0, 0), |s| {
                 let (ins, del, _) = git::changes_totals(s);
                 (ins, del, s.local.working_tree.insertions + s.local.working_tree.deletions)
@@ -958,7 +959,7 @@ impl Workspace {
     /// "Edit from here?" (`RevertConfirmHost`): rewind the thread to before a user message,
     /// optionally restoring files, and put the message back in the composer. The timeline's
     /// per-message revert button calls this with the message's turn count and text.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(super) fn confirm_revert(
         &mut self,
         turn_count: u32,
@@ -1090,7 +1091,7 @@ impl Workspace {
                     .left(px(3.))
                     .w(px(2.))
                     .invisible()
-                    .group_hover("right-panel-resize", |s| s.visible())
+                    .group_hover("right-panel-resize", gpui_kit::Styled::visible)
                     .bg(tokens.border),
             );
         Some(
@@ -1186,13 +1187,13 @@ impl Workspace {
                                     .icon(icon("icons/square-terminal.svg"))
                                     .disabled(!terminal)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_terminal_surface(window, cx)
+                                        this.add_terminal_surface(window, cx);
                                     })),
                             )
                             .item(
                                 PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
                                     window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::Files, window, cx)
+                                        this.open_surface(Surface::Files, window, cx);
                                     }),
                                 ),
                             )
@@ -1216,7 +1217,7 @@ impl Workspace {
                                     .icon(Icon::new(IconName::Link))
                                     .disabled(!linked)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::PullRequests, window, cx)
+                                        this.open_surface(Surface::PullRequests, window, cx);
                                     })),
                             );
                         match side_chat {
@@ -1225,7 +1226,7 @@ impl Workspace {
                                     .icon(Icon::new(IconName::MessagesSquare))
                                     .disabled(!available)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_side_chat_surface(window, cx)
+                                        this.add_side_chat_surface(window, cx);
                                     })),
                             ),
                             None => menu,
@@ -1334,12 +1335,12 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(4.))
                     .hover(move |style| style.bg(muted))
-                    .child(div().group_hover(group.clone(), |style| style.invisible()).child(glyph))
+                    .child(div().group_hover(group.clone(), gpui_kit::Styled::invisible).child(glyph))
                     .child(
                         div()
                             .absolute()
                             .invisible()
-                            .group_hover(group, |style| style.visible())
+                            .group_hover(group, gpui_kit::Styled::visible)
                             .child(icon("icons/x.svg").with_size(px(12.))),
                     )
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -1358,7 +1359,7 @@ impl Workspace {
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.open_tab_menu(&menu_surface, event.position, window, cx)
+                    this.open_tab_menu(&menu_surface, event.position, window, cx);
                 }),
             )
             .into_any_element()
@@ -1406,34 +1407,33 @@ impl Workspace {
         });
         // "Open browser in a profile", beside the shortcut while there is more than one.
         let profiles = self.browser_profiles();
-        let browser = match browser_available && profiles.len() > 1 {
-            true => {
-                let view = cx.entity();
-                div().relative().child(browser).child(
-                    div().absolute().top(px(4.)).right(px(32.)).child(
-                        Button::new("right-panel-browser-profiles")
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .foreground(tokens.muted_foreground)
-                                    .hover(tokens.accent)
-                                    .active(tokens.accent),
-                            )
-                            .xsmall()
-                            .size(px(24.))
-                            .rounded(px(6.))
-                            .icon(icon("icons/chevron-down.svg"))
-                            .tooltip("Open browser in a profile")
-                            .dropdown_menu(move |menu: PopupMenu, window, _| {
-                                profile_items(menu.max_w(px(224.)), &profiles, &view, window)
-                            })
-                            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                                this.right_panel.add_menu_open = *open;
-                                cx.notify();
-                            })),
-                    ),
-                )
-            }
-            false => div().child(browser),
+        let browser = if browser_available && profiles.len() > 1 {
+            let view = cx.entity();
+            div().relative().child(browser).child(
+                div().absolute().top(px(4.)).right(px(32.)).child(
+                    Button::new("right-panel-browser-profiles")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(tokens.muted_foreground)
+                                .hover(tokens.accent)
+                                .active(tokens.accent),
+                        )
+                        .xsmall()
+                        .size(px(24.))
+                        .rounded(px(6.))
+                        .icon(icon("icons/chevron-down.svg"))
+                        .tooltip("Open browser in a profile")
+                        .dropdown_menu(move |menu: PopupMenu, window, _| {
+                            profile_items(menu.max_w(px(224.)), &profiles, &view, window)
+                        })
+                        .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                            this.right_panel.add_menu_open = *open;
+                            cx.notify();
+                        })),
+                ),
+            )
+        } else {
+            div().child(browser)
         };
         let terminal_available = self.terminal_available();
         let terminal = row(
@@ -1480,7 +1480,7 @@ impl Workspace {
         )
         .when_some(target, |el, reference| {
             el.on_click(cx.listener(move |this, _, window, cx| {
-                this.open_surface(Surface::PullRequest(reference.clone()), window, cx)
+                this.open_surface(Surface::PullRequest(reference.clone()), window, cx);
             }))
         });
         let linked = self.thread_links_pull_requests();
@@ -1567,8 +1567,7 @@ impl Workspace {
             DiffScope::Commit(sha) => commits
                 .iter()
                 .find(|c| &c.sha == sha)
-                .map(|c| c.subject.clone())
-                .unwrap_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]))
+                .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
                 .into(),
         };
         let view = cx.entity();
@@ -1627,11 +1626,12 @@ impl Workspace {
                                 )
                             })
                             .checked(checked)
-                            .on_click(
-                                window.listener_for(&turn_view, move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx)
-                                }),
-                            ),
+                            .on_click(window.listener_for(
+                                &turn_view,
+                                move |this, _, _, cx| {
+                                    this.set_diff_scope(value.clone(), cx);
+                                },
+                            )),
                         );
                     }
                     menu
@@ -1646,7 +1646,7 @@ impl Workspace {
                         let checked = scope == value;
                         menu = menu.item(PopupMenuItem::new(commit.subject.clone()).checked(checked).on_click(
                             window.listener_for(&commit_view, move |this, _, _, cx| {
-                                this.set_diff_scope(value.clone(), cx)
+                                this.set_diff_scope(value.clone(), cx);
                             }),
                         ));
                     }
@@ -1896,11 +1896,12 @@ fn profile_items(
 ) -> PopupMenu {
     for profile in profiles {
         let id = profile.id.clone();
-        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
-            window.listener_for(view, move |this, _, window, cx| {
-                this.add_browser_surface_in(Some(id.clone()), window, cx)
-            }),
-        ));
+        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(window.listener_for(
+            view,
+            move |this, _, window, cx| {
+                this.add_browser_surface_in(Some(id.clone()), window, cx);
+            },
+        )));
     }
     menu
 }
@@ -2043,7 +2044,7 @@ impl Element for DiffTint {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        _: &mut (),
+        (): &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2056,8 +2057,8 @@ impl Element for DiffTint {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
+        (): &mut (),
+        (): &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {

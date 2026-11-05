@@ -520,7 +520,7 @@ pub fn validate_label(label: &str) -> Result<String, &'static str> {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.is_empty() || text.len() % 2 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
@@ -928,7 +928,7 @@ mod tests {
         assert!(!document.to_string().contains("secret-token"));
         assert_eq!(Catalog::from_document(&document), catalog);
         // An unreadable credential keeps the entry, without its token.
-        let mut tampered = document.clone();
+        let mut tampered = document;
         tampered["environments"][0]["encryptedToken"] = json!("00ff");
         assert_eq!(Catalog::from_document(&tampered).environments[0].token, None);
         assert_eq!(Catalog::from_document(&json!({})), Catalog::default());

@@ -353,8 +353,7 @@ where
     Tz::Offset: std::fmt::Display,
 {
     chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
-        .unwrap_or_else(|_| iso.to_owned())
+        .map_or_else(|_| iso.to_owned(), |at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
@@ -469,7 +468,7 @@ pub(super) fn secret_provider_from_draft(
         match &id {
             None => issues.name = Some("The name needs at least one letter or digit.".into()),
             Some(id) if editing.is_none() && existing_ids.contains(id) => {
-                issues.name = Some("A secret provider with this name exists.".into())
+                issues.name = Some("A secret provider with this name exists.".into());
             }
             _ => {}
         }
@@ -609,7 +608,7 @@ mod tests {
 
     #[test]
     fn toggling_terminal_scopes_keeps_read_with_operate() {
-        let scopes = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let scopes = |list: &[&str]| list.iter().map(std::string::ToString::to_string).collect::<Vec<_>>();
         assert_eq!(toggle_scope(&[], TERMINAL_OPERATE, true), scopes(&[TERMINAL_OPERATE, TERMINAL_READ]));
         assert_eq!(
             toggle_scope(&scopes(&[TERMINAL_OPERATE, TERMINAL_READ, ACCESS_READ]), TERMINAL_READ, false),

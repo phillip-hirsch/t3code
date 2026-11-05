@@ -694,7 +694,7 @@ impl Workspace {
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(tokens.foreground)
                         .cursor_pointer()
-                        .hover(|s| s.underline())
+                        .hover(gpui_kit::Styled::underline)
                         .on_click(cx.listener(|this, _, window, cx| this.undo_thread_action(window, cx)))
                         .tooltip(move |window, cx| {
                             gpui_kit::component::tooltip::Tooltip::new(undo_tooltip.clone()).build(window, cx)
@@ -757,7 +757,7 @@ impl SnoozeItems {
                 let now = chrono::Local::now();
                 let Some(wake) = inbox::pick_snooze(&this.presets, &id, &this.settings, &now) else { return };
                 let _ = view.update(cx, |workspace, cx| {
-                    workspace.snooze_thread(&this.thread_id, wake, this.advance, window, cx)
+                    workspace.snooze_thread(&this.thread_id, wake, this.advance, window, cx);
                 });
             }));
         }
@@ -766,8 +766,9 @@ impl SnoozeItems {
         }
         let (view, thread_id, advance) = (view.clone(), self.thread_id.clone(), self.advance);
         menu.item(PopupMenuItem::new("Custom…").on_click(move |_, window, cx| {
-            let _ = view
-                .update(cx, |workspace, cx| workspace.open_custom_snooze(&[thread_id.clone()], advance, window, cx));
+            let _ = view.update(cx, |workspace, cx| {
+                workspace.open_custom_snooze(std::slice::from_ref(&thread_id), advance, window, cx)
+            });
         }))
     }
 }
@@ -912,7 +913,7 @@ impl ThreadMenu {
         menu = menu.submenu_with_icon(Some(Icon::new(Lucide::Copy)), "Copy", window, cx, move |mut menu, _, _| {
             let copy = |text: String| {
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 }
             };
             if let Some(path) = &path {

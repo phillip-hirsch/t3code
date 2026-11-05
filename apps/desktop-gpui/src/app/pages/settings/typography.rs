@@ -158,10 +158,10 @@ impl Workspace {
                 ),
             ]
         };
-        let mut items: Vec<AnyElement> = rows.into_iter().map(|row| self.font_row(&view, row, window, cx)).collect();
+        let mut items: Vec<AnyElement> = rows.into_iter().map(|row| self.font_row(view, row, window, cx)).collect();
         items.push(
             self.setting_row(
-                &view,
+                view,
                 SettingRow::new("word-wrap")
                     .description("Wrap long lines in code blocks, diffs, and file previews by default.")
                     .setting("wordWrap")
@@ -179,7 +179,7 @@ impl Workspace {
             }));
         // `FontSmoothingRow` is macOS-only, and GPUI has no grayscale smoothing to switch to.
         let advanced = [self.setting_row(
-            &view,
+            view,
             SettingRow::new("separate-fonts")
                 .description("Set the prompt, code, and terminal fonts separately instead of one monospace font.")
                 .control(separate_switch),
@@ -315,7 +315,7 @@ fn render_preview(preview: Preview, fonts: &Fonts, t: &Tokens) -> AnyElement {
                     .px(px(12.))
                     .gap(px(12.))
                     .whitespace_nowrap()
-                    .when_some(tint, |el, tint| el.bg(tint))
+                    .when_some(tint, gpui_kit::Styled::bg)
                     .child(div().w(px(8.)).text_color(t.muted_foreground).child(sign.to_string()))
                     .child(text)
             };
@@ -381,7 +381,7 @@ fn render_preview(preview: Preview, fonts: &Fonts, t: &Tokens) -> AnyElement {
                     h_flex().whitespace_nowrap().min_h(px((fonts.terminal_size * 1.35).round())).children(
                         segments
                             .into_iter()
-                            .map(|(text, color)| div().when_some(color, |el, c| el.text_color(c)).child(text)),
+                            .map(|(text, color)| div().when_some(color, gpui_kit::Styled::text_color).child(text)),
                     )
                 }))
                 .into_any_element()

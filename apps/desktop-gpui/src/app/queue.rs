@@ -480,7 +480,7 @@ pub(super) fn toggle_row(total: usize, expanded: bool, this: &WeakEntity<Workspa
         .child(label)
         .child(Icon::new(chevron).size(px(14.)))
         .on_click(move |_, _, cx| {
-            let _ = this.update(cx, |w, cx| w.toggle_queue(cx));
+            let _ = this.update(cx, super::Workspace::toggle_queue);
         });
     // `gap-2` above, the section's `pb-4` below.
     h_flex().w_full().justify_end().pr(px(4.)).pb(px(16.)).child(button).into_any_element()

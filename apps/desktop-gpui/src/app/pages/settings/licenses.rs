@@ -299,7 +299,7 @@ fn notice_row(state: &Entity<LicensesState>, entry: &Entry, open: bool, t: &Toke
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     let key = key.clone();
-                    toggle_state.update(cx, |s, cx| s.toggle(key, cx))
+                    toggle_state.update(cx, |s, cx| s.toggle(key, cx));
                 })
                 .child(
                     Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
@@ -434,7 +434,7 @@ impl Workspace {
                                 let focus = s.search.read(cx).focus_handle(cx);
                                 window.focus(&focus, cx);
                                 cx.notify();
-                            })
+                            });
                         }),
                 )
                 .into_any_element()
@@ -473,7 +473,7 @@ impl Workspace {
                         )
                         .child(WebButton::new("license-retry", "Try again").on_click(move |_, _, cx| {
                             let endpoint = endpoint.clone();
-                            retry.update(cx, |s, cx| s.load_server(endpoint, cx))
+                            retry.update(cx, |s, cx| s.load_server(endpoint, cx));
                         }))
                         .into_any_element(),
                 )
@@ -541,7 +541,7 @@ impl Workspace {
             .pt(px(24.))
             .pb(px(24.))
             .gap(px(32.))
-            .child(self.render_scope_sentence(&view, cx))
+            .child(self.render_scope_sentence(view, cx))
             .child(section)
             .into_any_element()
     }

@@ -51,7 +51,7 @@ impl StorageState {
                     Self::follow(&client, "server.getStorageCleanupReport", cx, |this, event| match event {
                         StreamEvent::Item(report) => this.report = Report::Ready(Some(report).filter(|r| !r.is_null())),
                         StreamEvent::End(Err(_)) if matches!(this.report, Report::Loading) => {
-                            this.report = Report::Failed
+                            this.report = Report::Failed;
                         }
                         StreamEvent::End(_) => {}
                     }),
@@ -147,7 +147,7 @@ fn entry_name(entry: &Value) -> String {
             let name = if entry["threadId"].is_null() {
                 path
             } else {
-                path.and_then(|p| p.split(['/', '\\']).filter(|s| !s.is_empty()).next_back())
+                path.and_then(|p| p.split(['/', '\\']).rfind(|s| !s.is_empty()))
             };
             name.unwrap_or("Worktrees").to_owned()
         }
@@ -176,7 +176,7 @@ fn group_digits(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);
@@ -230,7 +230,7 @@ impl Workspace {
                     window,
                     cx,
                     move |this, days, window, cx| {
-                        this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx)
+                        this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx);
                     },
                 )
             });
@@ -274,8 +274,8 @@ impl Workspace {
                     .on_click(move |enabled, window, cx| {
                         let days = if *enabled { json!(RETENTION_ON_DAYS) } else { Value::Null };
                         view.update(cx, |this, cx| {
-                            this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx)
-                        })
+                            this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx);
+                        });
                     }),
             )
             .into_any_element()
@@ -289,15 +289,15 @@ impl Workspace {
             Report::Ready(report) => report.clone(),
             _ => None,
         };
-        let description = if !has_rules {
-            "Turn on a cleanup rule to use this.".to_owned()
-        } else {
+        let description = if has_rules {
             match &storage.report {
                 Report::Ready(Some(report)) => last_run_description(report, now_ms()),
                 Report::Ready(None) => "Cleanup hasn't run yet.".into(),
                 Report::Failed => "Could not load the last run.".into(),
                 Report::Loading => "Loading last run…".into(),
             }
+        } else {
+            "Turn on a cleanup rule to use this.".to_owned()
         };
         let running = storage.running;
         let last_run_open = storage.last_run_open;
@@ -430,7 +430,7 @@ fn run_storage_cleanup(
                         }
                     }
                     Err(error) => {
-                        notify_error(window, cx, format!("Could not run cleanup on {label}"), error.to_string())
+                        notify_error(window, cx, format!("Could not run cleanup on {label}"), error.to_string());
                     }
                 }
             });
@@ -490,49 +490,6 @@ fn cleanup_results(report: &Value, machine: &str, t: &Tokens) -> Vec<AnyElement>
     rows
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_rule_is_on_from_retention_global_worktree_rules_or_a_custom_project() {
-        let off = json!({"storageCleanup": {"browserArtifactsAfterDays": null, "logsAfterDays": null,
-            "worktreeAfterDays": null, "worktreeSettledAfterDays": null, "worktreeOnMerge": false,
-            "worktreeOnDelete": false, "worktreeUnchanged": false}, "projectSettingsOverrides": {}});
-        assert!(!has_rules(&off));
-        let mut logs = off.clone();
-        logs["storageCleanup"]["logsAfterDays"] = json!(8);
-        assert!(has_rules(&logs));
-        let mut project = off.clone();
-        project["projectSettingsOverrides"] =
-            json!({"p": {"worktreeCleanup": {"mode": "custom", "rules": {"worktreeOnMerge": true}}}});
-        assert!(has_rules(&project));
-        project["projectSettingsOverrides"]["p"]["worktreeCleanup"]["mode"] = json!("off");
-        assert!(!has_rules(&project), "only custom project rules count");
-    }
-
-    #[test]
-    fn describes_last_run_entries_like_the_web() {
-        let report = json!({"finishedAt": "2026-11-05T11:00:00Z", "bytesFreed": 2048,
-            "counts": {"removed": 3, "kept": 1, "failed": 1}});
-        assert_eq!(counts_label(&report), "3 removed, 1 kept, 1 failed");
-        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
-        assert_eq!(
-            last_run_description(&report, now),
-            "Last run 1h ago. 2.00 KB recovered. 1 item couldn't be removed."
-        );
-
-        let worktree = json!({"kind": "worktree", "outcome": "removed", "path": "C:\\wt\\feature\\", "threadId": "t", "bytes": 1024, "files": 9});
-        assert_eq!(entry_name(&worktree), "feature");
-        assert_eq!(entry_size(&worktree).as_deref(), Some("1.00 KB"), "worktrees show no file count");
-        let logs =
-            json!({"kind": "logs", "outcome": "kept", "path": null, "threadId": null, "bytes": null, "files": 1200});
-        assert_eq!((entry_name(&logs).as_str(), entry_size(&logs)), ("Rotated logs", None));
-        let artifacts = json!({"kind": "browser-artifacts", "outcome": "removed", "bytes": null, "files": 1200});
-        assert_eq!(entry_size(&artifacts).as_deref(), Some("1,200 files"));
-    }
-}
-
 /// The header of a fold inside a card (`FoldedSettingsSection`, header inside).
 fn fold_header(
     id: impl Into<ElementId>,
@@ -560,4 +517,47 @@ fn fold_header(
             el.child(div().min_w_0().truncate().text_xs().text_color(t.muted_foreground).child(summary))
         })
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rule_is_on_from_retention_global_worktree_rules_or_a_custom_project() {
+        let off = json!({"storageCleanup": {"browserArtifactsAfterDays": null, "logsAfterDays": null,
+            "worktreeAfterDays": null, "worktreeSettledAfterDays": null, "worktreeOnMerge": false,
+            "worktreeOnDelete": false, "worktreeUnchanged": false}, "projectSettingsOverrides": {}});
+        assert!(!has_rules(&off));
+        let mut logs = off.clone();
+        logs["storageCleanup"]["logsAfterDays"] = json!(8);
+        assert!(has_rules(&logs));
+        let mut project = off;
+        project["projectSettingsOverrides"] =
+            json!({"p": {"worktreeCleanup": {"mode": "custom", "rules": {"worktreeOnMerge": true}}}});
+        assert!(has_rules(&project));
+        project["projectSettingsOverrides"]["p"]["worktreeCleanup"]["mode"] = json!("off");
+        assert!(!has_rules(&project), "only custom project rules count");
+    }
+
+    #[test]
+    fn describes_last_run_entries_like_the_web() {
+        let report = json!({"finishedAt": "2026-11-05T11:00:00Z", "bytesFreed": 2048,
+            "counts": {"removed": 3, "kept": 1, "failed": 1}});
+        assert_eq!(counts_label(&report), "3 removed, 1 kept, 1 failed");
+        let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
+        assert_eq!(
+            last_run_description(&report, now),
+            "Last run 1h ago. 2.00 KB recovered. 1 item couldn't be removed."
+        );
+
+        let worktree = json!({"kind": "worktree", "outcome": "removed", "path": "C:\\wt\\feature\\", "threadId": "t", "bytes": 1024, "files": 9});
+        assert_eq!(entry_name(&worktree), "feature");
+        assert_eq!(entry_size(&worktree).as_deref(), Some("1.00 KB"), "worktrees show no file count");
+        let logs =
+            json!({"kind": "logs", "outcome": "kept", "path": null, "threadId": null, "bytes": null, "files": 1200});
+        assert_eq!((entry_name(&logs).as_str(), entry_size(&logs)), ("Rotated logs", None));
+        let artifacts = json!({"kind": "browser-artifacts", "outcome": "removed", "bytes": null, "files": 1200});
+        assert_eq!(entry_size(&artifacts).as_deref(), Some("1,200 files"));
+    }
 }

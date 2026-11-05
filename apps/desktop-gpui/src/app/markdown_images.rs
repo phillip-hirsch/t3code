@@ -1,6 +1,6 @@
 //! Images in chat markdown (`ChatMarkdown`'s `img`, `classifyMarkdownImageSource`): web
 //! images load directly, workspace files through a signed `assets.createUrl` URL, and
-//! anything else stays blank. TextView asks for each image synchronously, so loads are
+//! anything else stays blank. `TextView` asks for each image synchronously, so loads are
 //! started when a message parses and the view reads them from a shared cache.
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
 pub(super) struct ImageCache(Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>);
 
 impl ImageCache {
-    /// TextView's `image_source`: the loaded image, else a blank one.
+    /// `TextView`'s `image_source`: the loaded image, else a blank one.
     pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
         let cache = self.0.clone();
         move |uri| {

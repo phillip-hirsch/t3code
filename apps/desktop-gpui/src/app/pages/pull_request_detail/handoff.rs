@@ -144,12 +144,12 @@ impl Workspace {
                     Some(path) => WorkspaceChoice {
                         mode: Some(EnvMode::Worktree),
                         branch: Some(branch.clone()),
-                        existing_worktree: Some((path.clone(), Some(branch.clone()))),
+                        existing_worktree: Some((path.clone(), Some(branch))),
                         start_from_origin: None,
                     },
                     None => WorkspaceChoice {
                         mode: Some(EnvMode::Local),
-                        branch: Some(branch.clone()),
+                        branch: Some(branch),
                         existing_worktree: None,
                         start_from_origin: None,
                     },
@@ -271,13 +271,13 @@ impl Workspace {
                         Lucide::GitBranch,
                     )
                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                        this.start_pr_handoff("checkout:worktree".into(), None, CheckoutMode::Worktree, window, cx)
+                        this.start_pr_handoff("checkout:worktree".into(), None, CheckoutMode::Worktree, window, cx);
                     })),
                 )
                 .item(
                     entry("In this repository", "Switches the branch you are working in.", Lucide::FolderGit2)
                         .on_click(window.listener_for(&view, |this, _, window, cx| {
-                            this.start_pr_handoff("checkout:local".into(), None, CheckoutMode::Local, window, cx)
+                            this.start_pr_handoff("checkout:local".into(), None, CheckoutMode::Local, window, cx);
                         })),
                 )
             })

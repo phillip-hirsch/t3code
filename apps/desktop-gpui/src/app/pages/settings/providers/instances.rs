@@ -280,10 +280,13 @@ pub(super) fn version_advisory(provider: &Value, show_compatibility: bool) -> Op
             let already_latest = advisory.is_some_and(|a| a["status"] == "current");
             return Some(Advisory {
                 title: title.into(),
-                detail: text(compat, "/message").map(str::to_owned).unwrap_or_else(|| match recommendation {
-                    Some(recommendation) => format!("Use {recommendation} for full support."),
-                    None => "Update for full support.".into(),
-                }),
+                detail: text(compat, "/message").map_or_else(
+                    || match recommendation {
+                        Some(recommendation) => format!("Use {recommendation} for full support."),
+                        None => "Update for full support.".into(),
+                    },
+                    str::to_owned,
+                ),
                 update_command: if target_version.is_some() || latest_incompatible || already_latest {
                     None
                 } else {
@@ -298,12 +301,13 @@ pub(super) fn version_advisory(provider: &Value, show_compatibility: bool) -> Op
     if advisory["status"] != "behind_latest" || latest_incompatible {
         return None;
     }
-    let detail = text(advisory, "/message").map(str::to_owned).unwrap_or_else(|| {
-        match version_label(text(advisory, "/latestVersion")) {
+    let detail = text(advisory, "/message").map_or_else(
+        || match version_label(text(advisory, "/latestVersion")) {
             Some(version) => format!("Update available: install {version}."),
             None => "Update available: install the latest provider version.".into(),
-        }
-    });
+        },
+        str::to_owned,
+    );
     Some(Advisory {
         title: "Update available".into(),
         detail,
@@ -522,13 +526,13 @@ pub(super) fn redacted_placeholder(value: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
     let mut state: i32 = 0x811c9dc5_u32 as i32;
     for unit in value.encode_utf16() {
-        state ^= unit as i32;
+        state ^= i32::from(unit);
         state = state.wrapping_mul(0x01000193);
     }
     let mut next_char = || {
         state = (state ^ ((state as u32) >> 13) as i32).wrapping_mul(0x85ebca6b_u32 as i32);
         state = (state ^ ((state as u32) >> 16) as i32).wrapping_mul(0xc2b2ae35_u32 as i32);
-        ALPHABET[(state as i64).unsigned_abs() as usize % ALPHABET.len()] as char
+        ALPHABET[i64::from(state).unsigned_abs() as usize % ALPHABET.len()] as char
     };
     value.chars().map(|c| if matches!(c, '@' | '.' | '-' | '_') { c } else { next_char() }).collect()
 }
@@ -554,7 +558,7 @@ pub(super) fn accent_color(instance: &Value) -> Option<String> {
 /// `providerAccentForegroundColor`: black or white, whichever contrasts more.
 fn accent_foreground(hex: &str) -> Hsla {
     let channel = |offset: usize| {
-        let value = u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap_or(0) as f32 / 255.;
+        let value = f32::from(u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap_or(0)) / 255.;
         if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
     };
     let luminance = 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
@@ -730,7 +734,7 @@ impl Workspace {
                         let target = advisory.target_version.clone();
                         move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
                             let _ = view.update(cx, |this, cx| {
-                                this.run_provider_update(&page, &driver, &instance_id, target.clone(), window, cx)
+                                this.run_provider_update(&page, &driver, &instance_id, target.clone(), window, cx);
                             });
                         }
                     };
@@ -883,7 +887,7 @@ impl Workspace {
                         select_page.update(cx, |page, cx| {
                             page.selected = Some(select_id.clone());
                             cx.notify();
-                        })
+                        });
                     }))
                     .child(icon)
                     .child(
@@ -1243,7 +1247,7 @@ impl Workspace {
                         .text_size(px(11.))
                         .when(!revealed, |el| el.opacity(0.6))
                         .hover(|s| s.text_color(t.foreground))
-                        .child(if revealed { email.clone() } else { redacted_placeholder(&email) })
+                        .child(if revealed { email } else { redacted_placeholder(&email) })
                         .tooltip(move |window, cx| {
                             Tooltip::new(if revealed { "Click to hide email" } else { "Click to reveal email" })
                                 .build(window, cx)
@@ -1252,7 +1256,7 @@ impl Workspace {
                             toggle.update(cx, |page, cx| {
                                 page.models.revealed_email = !page.models.revealed_email;
                                 cx.notify();
-                            })
+                            });
                         }))
                         .into_any_element(),
                 );
@@ -1373,7 +1377,7 @@ impl Workspace {
     }
 
     /// One `environmentFields` row, e.g. Cursor's API key, kept as a sensitive variable.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_environment_field(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -1482,7 +1486,7 @@ impl Workspace {
                                     page.runtime_open.insert(id.clone());
                                 }
                                 cx.notify();
-                            })
+                            });
                         })),
                 ),
             )
@@ -1523,7 +1527,7 @@ impl Workspace {
                         redacted: None,
                     });
                     cx.notify();
-                })
+                });
             }));
         let any_redacted = rows.iter().any(|r| r.redacted == Some(true));
         let editors = rows
@@ -1551,7 +1555,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_environment_variable(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -1615,7 +1619,7 @@ impl Workspace {
                 cx,
                 move |this, name, window, cx| {
                     let name = name.trim().to_owned();
-                    update(this, &move |row: &mut EnvRow| row.name = name.clone(), window, cx)
+                    update(this, &move |row: &mut EnvRow| row.name = name.clone(), window, cx);
                 },
             )
         };
@@ -1647,7 +1651,7 @@ impl Workspace {
                         },
                         window,
                         cx,
-                    )
+                    );
                 },
             )
         };
@@ -1673,7 +1677,7 @@ impl Workspace {
                     },
                     window,
                     cx,
-                )
+                );
             })
         };
         let lock = if env.sensitive { gpui_kit::assets::IconName::Lock } else { gpui_kit::assets::IconName::LockOpen };
@@ -1752,7 +1756,7 @@ impl Workspace {
     }
 
     /// `confirmProviderInstanceRemoval`, then the `remove` mutation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn confirm_instance_removal(
         &mut self,
         instance_id: String,

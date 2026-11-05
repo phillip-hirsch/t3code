@@ -203,7 +203,7 @@ mod tests {
         let typed = set_custom(&q, Some(&picked), "  green ".into());
         assert_eq!(answer(&q, Some(&typed)), Some(json!("green")));
         assert!(!is_selected(&q, Some(&typed), "Red"));
-        let cleared = set_custom(&q, Some(&picked), "".into());
+        let cleared = set_custom(&q, Some(&picked), String::new());
         assert_eq!(answer(&q, Some(&cleared)), Some(json!("Red")), "empty text keeps the pick");
     }
 
@@ -225,7 +225,7 @@ mod tests {
         let choice = question(
             json!({"id": "b", "header": "H", "question": "?", "options": options(), "allowCustomAnswer": false}),
         );
-        let questions = vec![initial.clone(), choice.clone()];
+        let questions = vec![initial, choice.clone()];
         let mut state = QuestionDraft::new("r".into(), questions.clone()).unwrap();
         assert_eq!(answers(&questions, &state.drafts), None);
         let typed = set_custom(&choice, None, "free text".into());

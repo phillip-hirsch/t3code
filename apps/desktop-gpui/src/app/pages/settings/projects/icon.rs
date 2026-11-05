@@ -219,7 +219,13 @@ pub(super) fn monogram(text: &str, color: &str, size: f32, tokens: &Tokens) -> A
         .font_weight(FontWeight::BOLD)
         .text_size(px(size * 8.25 / 16.))
         .line_height(px(size))
-        .child(h_flex().w(px(span)).justify_between().when(glyphs.len() < 2, |el| el.justify_center()).children(glyphs))
+        .child(
+            h_flex()
+                .w(px(span))
+                .justify_between()
+                .when(glyphs.len() < 2, gpui_kit::Styled::justify_center)
+                .children(glyphs),
+        )
         .into_any_element()
 }
 

@@ -279,7 +279,7 @@ mod tests {
         assert!(!parse_delimited("1\n2\r\n", ',', 2, 30, 2000).1, "the bound met at the end cuts nothing");
         assert_eq!(
             parse_delimited("a\n\nb", ',', 10, 10, 10).0,
-            [vec!["a".to_owned()], vec!["".into()], vec!["b".into()]]
+            [vec!["a".to_owned()], vec![String::new()], vec!["b".into()]]
         );
         assert!(parse_delimited("\"open", ',', 10, 10, 10).1, "an unclosed quote is truncation");
         assert_eq!(parse_delimited("abcdef", ',', 10, 10, 3).0, [vec!["abc".to_owned()]]);

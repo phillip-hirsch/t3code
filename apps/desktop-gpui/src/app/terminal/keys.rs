@@ -122,7 +122,7 @@ fn encode(
     key_char: Option<&str>,
 ) -> Option<Cow<'static, str>> {
     // xterm's modifier parameter: 1 + shift + 2·alt + 4·ctrl.
-    let modifier = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
     let alt_prefix = |s: &'static str| -> Cow<'static, str> { if alt { format!("\x1b{s}").into() } else { s.into() } };
     let cursor = |letter: char| -> Cow<'static, str> {
         match (modifier, app_cursor) {

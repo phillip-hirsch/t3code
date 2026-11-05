@@ -239,12 +239,12 @@ pub(super) fn extract(line: &str) -> Vec<LinkMatch> {
     let text = |start: usize, len: usize| chars[start..start + len].iter().collect::<String>();
     let mut found: Vec<LinkMatch> = Vec::new();
     // `POWERSHELL_PROMPT_PATH_PATTERN`.
-    if line.starts_with("PS ") && path_prefix(&chars, 3).is_some() {
-        if let Some(close) =
+    if line.starts_with("PS ")
+        && path_prefix(&chars, 3).is_some()
+        && let Some(close) =
             chars[3..].iter().position(|c| matches!(c, '>' | '\r' | '\n')).filter(|i| chars[3 + i] == '>')
-        {
-            found.push(LinkMatch { kind: LinkKind::Path, text: text(3, close), start: 3, end: 3 + close });
-        }
+    {
+        found.push(LinkMatch { kind: LinkKind::Path, text: text(3, close), start: 3, end: 3 + close });
     }
     let collides = |found: &[LinkMatch], range: Range| found.iter().any(|m| overlaps(range, (m.start, m.end)));
     let scan = |found: &mut Vec<LinkMatch>, kind: LinkKind, quoted: bool| {

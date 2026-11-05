@@ -172,7 +172,7 @@ impl Workspace {
     }
 
     /// `GuideStop`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_pr_guide_stop(
         &mut self,
         stop: &GuideStop,
@@ -188,8 +188,10 @@ impl Workspace {
         let header = h_flex()
             .justify_between()
             .gap(px(8.))
-            .child(match !beside {
-                true => ghost_button("pr-guide-stops", t)
+            .child(if beside {
+                div().text_xs().text_color(t.muted_foreground).child(counter).into_any_element()
+            } else {
+                ghost_button("pr-guide-stops", t)
                     .child(counter)
                     .child(
                         Icon::new(if list.is_some() { Lucide::ChevronUp } else { Lucide::ChevronDown })
@@ -201,8 +203,7 @@ impl Workspace {
                         }
                         cx.notify();
                     }))
-                    .into_any_element(),
-                false => div().text_xs().text_color(t.muted_foreground).child(counter).into_any_element(),
+                    .into_any_element()
             })
             .child(
                 h_flex()
@@ -226,7 +227,7 @@ impl Workspace {
                             .disabled(index + 1 >= count)
                             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_pr_guide_stop((index + 1).min(count - 1), cx)
+                                this.set_pr_guide_stop((index + 1).min(count - 1), cx);
                             })),
                     ),
             );
@@ -587,7 +588,7 @@ impl Workspace {
                     ))
                     .child(question.clone())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.ask_about_pr_guide_stop(index, asked.clone(), window, cx)
+                        this.ask_about_pr_guide_stop(index, asked.clone(), window, cx);
                     }))
                     .into_any_element()
             })
@@ -612,7 +613,7 @@ impl Workspace {
                             .child(Icon::new(Lucide::MessageCircleQuestionMark).with_size(px(14.)))
                             .child("Ask about this stop")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.ask_about_pr_guide_stop(index, String::new(), window, cx)
+                                this.ask_about_pr_guide_stop(index, String::new(), window, cx);
                             })),
                     )
                 })
@@ -683,7 +684,7 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
         out = out.child(
             h_flex()
                 .min_w_0()
-                .when_some(bg, |el, bg| el.bg(bg))
+                .when_some(bg, gpui_kit::Styled::bg)
                 .child(number(row.old))
                 .child(number(row.new))
                 .child(div().w(px(16.)).flex_none().text_color(t.muted_foreground).child(row.mark.to_string()))

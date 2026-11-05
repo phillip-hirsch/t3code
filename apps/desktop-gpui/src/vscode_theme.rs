@@ -121,7 +121,7 @@ fn parse_vscode_color(value: &Value) -> Option<Rgba> {
         return None;
     }
     let byte = |s: &str| u8::from_str_radix(s, 16).ok().map(f64::from);
-    let short = |i: usize| byte(&hex[i..i + 1].repeat(2));
+    let short = |i: usize| byte(&hex[i..=i].repeat(2));
     if hex.len() <= 4 {
         let a = if hex.len() == 4 { short(3)? / 255. } else { 1. };
         return Some(Rgba { r: short(0)?, g: short(1)?, b: short(2)?, a });
@@ -288,11 +288,12 @@ pub fn parse_vscode_theme(value: &Value) -> Result<ThemeDefinition, String> {
         .find(|candidate| stands_apart(candidate, &canvas_hex) && stands_apart(candidate, &action))
         .unwrap_or_else(|| "#808080".into());
     for key in ["input.background", "input.border"] {
-        if let Some(candidate) = solid_over(canvas, &[key]) {
-            if stands_apart(&candidate, &canvas_hex) && stands_apart(&candidate, &action) {
-                input = candidate;
-                break;
-            }
+        if let Some(candidate) = solid_over(canvas, &[key])
+            && stands_apart(&candidate, &canvas_hex)
+            && stands_apart(&candidate, &action)
+        {
+            input = candidate;
+            break;
         }
     }
     let search_match =
@@ -496,10 +497,10 @@ pub fn resolve_label_collisions(entries: Vec<(ThemeDefinition, Option<String>)>)
                 return theme;
             }
             for suffix in 2..100 {
-                if let Ok(candidate) = theme_file::renamed(&theme, &format!("{} {suffix}", theme.label)) {
-                    if seen.insert(candidate.id.clone()) {
-                        return candidate;
-                    }
+                if let Ok(candidate) = theme_file::renamed(&theme, &format!("{} {suffix}", theme.label))
+                    && seen.insert(candidate.id.clone())
+                {
+                    return candidate;
                 }
             }
             theme
@@ -566,7 +567,7 @@ mod tests {
         assert_eq!((paired[1].label.as_str(), paired[1].modes()), ("Solar", vec![false, true]));
         let renamed = resolve_label_collisions(vec![
             (other.clone(), Some("first-pick.json".into())),
-            (other.clone(), Some("first-pick.json".into())),
+            (other, Some("first-pick.json".into())),
         ]);
         assert_eq!(renamed.iter().map(|t| t.label.as_str()).collect::<Vec<_>>(), ["First Pick", "First Pick 2"]);
         assert_eq!(humanize_theme_name("one-dark_pro"), "One Dark Pro");

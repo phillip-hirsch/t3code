@@ -239,7 +239,7 @@ impl Workspace {
                         state.update(cx, |s, cx| {
                             s.check_endpoint(client.clone(), index, url, cx);
                             cx.notify();
-                        })
+                        });
                     })
             });
             let running_url = running[*key].as_str().unwrap_or_default();
@@ -296,7 +296,7 @@ impl Workspace {
         }
         let discard = {
             let (state, client, fields, saved, running) =
-                (state.clone(), client.clone(), fields.clone(), saved.clone(), running.clone());
+                (state.clone(), client.clone(), fields, saved.clone(), running);
             WebButton::new("otlp-discard", "Discard").disabled(changed.is_empty() || saving || !can_edit).on_click(
                 move |_, window, cx| {
                     for (input, value) in fields.iter().zip(saved.iter()) {
@@ -320,7 +320,7 @@ impl Workspace {
             )
         };
         let save = {
-            let (state, client) = (state.clone(), client.clone());
+            let (state, client) = (state.clone(), client);
             let patch: Map<String, Value> =
                 changed.iter().map(|&i| (SIGNALS[i].0.to_owned(), Value::String(values[i].clone()))).collect();
             WebButton::new("otlp-save", if saving { "Saving\u{2026}" } else { "Save" })
@@ -349,7 +349,7 @@ impl Workspace {
                         })
                         .detach();
                         cx.notify();
-                    })
+                    });
                 })
         };
         body.push(

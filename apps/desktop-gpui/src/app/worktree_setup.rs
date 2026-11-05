@@ -305,7 +305,7 @@ pub(super) fn setup_row(
     if running {
         let this = this.clone();
         actions = actions.child(button("setup-cancel", IconName::X, "Cancel").on_click(move |_, _, cx| {
-            let _ = this.update(cx, |w, cx| w.cancel_worktree_setup(cx));
+            let _ = this.update(cx, super::Workspace::cancel_worktree_setup);
         }));
     }
     let details = details_open.then(|| {

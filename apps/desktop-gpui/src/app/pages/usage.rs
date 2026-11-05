@@ -598,7 +598,7 @@ impl Workspace {
             .child(provider_label)
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.6, ..t.muted_foreground }))
             .dropdown_menu({
-                let view = view.clone();
+                let view = view;
                 move |mut menu, window, _| {
                     let none_hidden = hidden.is_empty();
                     menu =
@@ -609,7 +609,7 @@ impl Workspace {
                                 } else {
                                     Vec::new()
                                 };
-                                this.set_hidden_usage_providers(next, cx)
+                                this.set_hidden_usage_providers(next, cx);
                             }),
                         ))
                         .separator();
@@ -628,7 +628,7 @@ impl Workspace {
                                 }
                                 None => next.push(kind.to_owned()),
                             }
-                            this.set_hidden_usage_providers(next, cx)
+                            this.set_hidden_usage_providers(next, cx);
                         })));
                     }
                     menu
@@ -641,7 +641,7 @@ impl Workspace {
             usage.days,
             t,
             cx,
-            |this, days, cx| this.select_usage_window(days, cx),
+            super::super::Workspace::select_usage_window,
         );
         let metrics = segmented(
             "usage-metric",
@@ -649,7 +649,7 @@ impl Workspace {
             usage.metric,
             t,
             cx,
-            |this, metric, cx| this.select_usage_metric(metric, cx),
+            super::super::Workspace::select_usage_metric,
         );
         let disabled = usage.refreshing || (!limits && !usage.environment_selected);
         h_flex()
@@ -1040,7 +1040,7 @@ impl Workspace {
                 let cell = bounds_cell.clone();
                 move |bounds, _, _| cell.set(Some(bounds))
             },
-            move |bounds, _, window, _| {
+            move |bounds, (), window, _| {
                 let at = |x: f32, y: f32| {
                     point(
                         bounds.origin.x + bounds.size.width * (x / logic::VIEW_WIDTH),
@@ -1185,7 +1185,7 @@ impl Workspace {
                         .child(plot)
                         .children(tooltip)
                         .on_mouse_move({
-                            let cell = bounds_cell.clone();
+                            let cell = bounds_cell;
                             cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                                 let Some(bounds) = cell.get() else { return };
                                 if period_count == 0 || !bounds.contains(&event.position) {
@@ -1256,7 +1256,52 @@ impl Workspace {
         };
         let row_border = Hsla { a: t.border.a * 0.5, ..t.border };
         let mut table = v_flex().text_sm();
-        if !by_time {
+        if by_time {
+            let periods: Vec<&logic::Period> =
+                if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
+            let cell = |child: String| div().flex_1().flex().justify_end().pl(px(16.)).child(child);
+            table = table.child(
+                h_flex()
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(head_cell(if hourly { "Hour" } else { "Day" }.into()).w(relative(0.4)).pl(px(8.)))
+                    .children(providers.iter().map(|p| {
+                        cell(logic::provider_label(p).to_owned()).py(px(8.)).text_xs().text_color(t.muted_foreground)
+                    }))
+                    .child(cell("Total".into()).py(px(8.)).text_xs().text_color(t.muted_foreground))
+                    .child(cell("Tokens".into()).pr(px(8.)).py(px(8.)).text_xs().text_color(t.muted_foreground)),
+            );
+            if periods.is_empty() {
+                table = table.child(empty());
+            }
+            for period in periods {
+                let label = match period.hour_ms {
+                    Some(ms) => logic::format_hour_short(ms, &Local),
+                    None => logic::format_day_short(&period.day),
+                };
+                table =
+                    table.child(
+                        h_flex()
+                            .id(ElementId::Name(
+                                format!("usage-period-{}-{}", period.day, period.hour_ms.unwrap_or(0)).into(),
+                            ))
+                            .py(px(8.))
+                            .border_b_1()
+                            .border_color(row_border)
+                            .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
+                            .child(div().w(relative(0.4)).pl(px(8.)).text_color(t.foreground).child(label))
+                            .children(providers.iter().map(|p| {
+                                cell(logic::format_usd(period.value(p, false))).text_color(t.muted_foreground)
+                            }))
+                            .child(cell(logic::format_usd(period.cost_usd)).text_color(t.foreground))
+                            .child(
+                                cell(logic::format_tokens(period.total_tokens as f64))
+                                    .pr(px(8.))
+                                    .text_color(t.muted_foreground),
+                            ),
+                    );
+            }
+        } else {
             let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.iter().collect() };
             let peak =
                 models.iter().fold(0f64, |max, m| max.max(if tokens { m.total_tokens as f64 } else { m.cost_usd }));
@@ -1326,51 +1371,6 @@ impl Workspace {
                                 .child(logic::format_tokens(model.total_tokens as f64)),
                         ),
                 );
-            }
-        } else {
-            let periods: Vec<&logic::Period> =
-                if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
-            let cell = |child: String| div().flex_1().flex().justify_end().pl(px(16.)).child(child);
-            table = table.child(
-                h_flex()
-                    .border_b_1()
-                    .border_color(t.border)
-                    .child(head_cell(if hourly { "Hour" } else { "Day" }.into()).w(relative(0.4)).pl(px(8.)))
-                    .children(providers.iter().map(|p| {
-                        cell(logic::provider_label(p).to_owned()).py(px(8.)).text_xs().text_color(t.muted_foreground)
-                    }))
-                    .child(cell("Total".into()).py(px(8.)).text_xs().text_color(t.muted_foreground))
-                    .child(cell("Tokens".into()).pr(px(8.)).py(px(8.)).text_xs().text_color(t.muted_foreground)),
-            );
-            if periods.is_empty() {
-                table = table.child(empty());
-            }
-            for period in periods {
-                let label = match period.hour_ms {
-                    Some(ms) => logic::format_hour_short(ms, &Local),
-                    None => logic::format_day_short(&period.day),
-                };
-                table =
-                    table.child(
-                        h_flex()
-                            .id(ElementId::Name(
-                                format!("usage-period-{}-{}", period.day, period.hour_ms.unwrap_or(0)).into(),
-                            ))
-                            .py(px(8.))
-                            .border_b_1()
-                            .border_color(row_border)
-                            .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
-                            .child(div().w(relative(0.4)).pl(px(8.)).text_color(t.foreground).child(label))
-                            .children(providers.iter().map(|p| {
-                                cell(logic::format_usd(period.value(p, false))).text_color(t.muted_foreground)
-                            }))
-                            .child(cell(logic::format_usd(period.cost_usd)).text_color(t.foreground))
-                            .child(
-                                cell(logic::format_tokens(period.total_tokens as f64))
-                                    .pr(px(8.))
-                                    .text_color(t.muted_foreground),
-                            ),
-                    );
             }
         }
         v_flex().gap(px(12.)).child(header).child(table)
@@ -1841,7 +1841,7 @@ fn pool_segment(
             let (view, key, name) = (view.clone(), account.key.clone(), account.name());
             el.on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx)
+                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx);
                 });
             })
         })

@@ -326,7 +326,7 @@ impl Workspace {
             self.focus_composer(window, cx);
         } else if drawer.terminal_ids.is_empty() {
             // A setup or agent-started shell already runs: show it instead of starting another.
-            let running = self.terminals.running(&thread_id).first().map(|id| id.to_string());
+            let running = self.terminals.running(&thread_id).first().map(std::string::ToString::to_string);
             let existing =
                 running.or_else(|| self.terminals.summaries(&thread_id).first().map(|s| s.terminal_id.clone()));
             match existing {
@@ -546,11 +546,11 @@ impl Workspace {
             }
             let Some(mut launch) = self.terminal_launch() else { continue };
             // A known terminal reattaches where it was started.
-            if let Some(summary) = self.terminals.summaries(&thread_id).iter().find(|s| &s.terminal_id == terminal_id) {
-                if !summary.cwd.is_empty() {
-                    launch.cwd = summary.cwd.clone();
-                    launch.worktree_path = summary.worktree_path.clone();
-                }
+            if let Some(summary) = self.terminals.summaries(&thread_id).iter().find(|s| &s.terminal_id == terminal_id)
+                && !summary.cwd.is_empty()
+            {
+                launch.cwd = summary.cwd.clone();
+                launch.worktree_path = summary.worktree_path.clone();
             }
             let client = self.thread_client(&thread_id);
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
@@ -599,15 +599,15 @@ impl Workspace {
             SessionEvent::Exited => self.close_terminal(thread_id, terminal_id, cx),
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
-                    if drawer.active_id != terminal_id {
-                        drawer.set_active(terminal_id);
-                        cx.notify();
-                    }
+                if let Some(drawer) = self.terminals.drawers.get_mut(thread_id)
+                    && drawer.active_id != terminal_id
+                {
+                    drawer.set_active(terminal_id);
+                    cx.notify();
                 }
             }
             SessionEvent::AddToChat(selected) => {
-                self.add_terminal_context(thread_id, terminal_id, selected, window, cx)
+                self.add_terminal_context(thread_id, terminal_id, selected, window, cx);
             }
             // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
             SessionEvent::OpenUrl { url, force_browser } => {
@@ -625,7 +625,7 @@ impl Workspace {
             }
             SessionEvent::OpenPath(path) => match self.preferred_editor_id() {
                 Some(editor) => {
-                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx)
+                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx);
                 }
                 None => {
                     self.error = Some("No editor is available to open this path.".into());
@@ -690,7 +690,7 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &SplitTerminalVertical, _, cx| this.split_terminal(Split::Vertical, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, _, cx| this.new_terminal(cx)))
             .on_action(cx.listener(|this, action: &super::RunInTerminal, _, cx| {
-                this.run_in_terminal(action.cwd.clone(), action.command.clone(), cx)
+                this.run_in_terminal(action.cwd.clone(), action.command.clone(), cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTerminal, window, cx| {
                 let active =
@@ -809,7 +809,14 @@ impl Workspace {
                     .child(view),
             )
         });
-        div().flex().when(vertical, |el| el.flex_col()).flex_1().min_w_0().h_full().overflow_hidden().children(panes)
+        div()
+            .flex()
+            .when(vertical, gpui_kit::Styled::flex_col)
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .children(panes)
     }
 
     /// The split/new/close buttons over a lone terminal's top-right corner.
@@ -1055,8 +1062,8 @@ impl Workspace {
                         cx.stop_propagation();
                         this.request_close_terminal(close_id.clone(), window, cx);
                     }))
-                    .child(glyph("icons/square-terminal.svg").group_hover(group.clone(), |s| s.invisible()))
-                    .child(glyph("icons/x.svg").invisible().group_hover(group, |s| s.visible())),
+                    .child(glyph("icons/square-terminal.svg").group_hover(group.clone(), gpui_kit::Styled::invisible))
+                    .child(glyph("icons/x.svg").invisible().group_hover(group, gpui_kit::Styled::visible)),
             )
             .child(
                 div()

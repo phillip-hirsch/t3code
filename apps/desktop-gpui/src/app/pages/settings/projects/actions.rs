@@ -85,7 +85,7 @@ impl Workspace {
                             menu = menu.item(
                                 PopupMenuItem::new(label).icon(Icon::new(script_icon(&input.icon))).on_click(
                                     window.listener_for(&view, move |this, _, window, cx| {
-                                        this.import_project_script(&pid, &input, window, cx)
+                                        this.import_project_script(&pid, &input, window, cx);
                                     }),
                                 ),
                             );
@@ -206,7 +206,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = task.await {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.open_script_editor_with(&project_id, None, input, Some(error), window, cx)
+                    this.open_script_editor_with(&project_id, None, input, Some(error), window, cx);
                 });
             }
         })

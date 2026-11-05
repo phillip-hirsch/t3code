@@ -238,7 +238,7 @@ impl Workspace {
             .child(
                 ghost_text_button("providers-refresh", "", t)
                     .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw).size(px(14.)))
-                    .when_some(label, |button, label| button.label(label))
+                    .when_some(label, gpui_kit::component::button::Button::label)
                     .disabled(refreshing)
                     .tooltip("Refresh provider status")
                     .on_click(
@@ -309,7 +309,7 @@ impl Workspace {
                             .checked(!mixed && current == *value)
                             .disabled(*value == "off" && !never_available)
                             .on_click(window.listener_for(&workspace, move |this, _, window, cx| {
-                                this.update_settings(json!({ "idleCompaction": value }), window, cx)
+                                this.update_settings(json!({ "idleCompaction": value }), window, cx);
                             })),
                     );
                 }
@@ -568,7 +568,7 @@ impl Workspace {
 
     /// A text field that commits like the web's `DraftInput`: on blur or Enter, when it differs from
     /// the saved `value`, which it follows while unfocused.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn draft_input(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -618,7 +618,7 @@ impl Workspace {
     }
 
     /// Gets or creates the page's input under `key`; `on_event` sees all of its events.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn page_input(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -650,7 +650,7 @@ impl Workspace {
                 .default_value(value.to_owned())
         });
         let subscription = cx.subscribe_in(&state, window, move |this, input, event, window, cx| {
-            on_event(this, input, event, window, cx)
+            on_event(this, input, event, window, cx);
         });
         page.update(cx, |page, _| {
             page.inputs.insert(

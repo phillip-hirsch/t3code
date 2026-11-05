@@ -347,7 +347,7 @@ impl<'a> Zip<'a> {
     fn open(bytes: &'a [u8]) -> Result<Self, String> {
         let invalid = || "That extension package has an invalid ZIP directory.".to_owned();
         let u16_at = |at: usize| bytes.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
-        let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64);
+        let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])));
         let minimum = bytes.len().saturating_sub(65_557);
         let mut end = bytes.len().checked_sub(22).ok_or("That extension package has no ZIP directory.")?;
         while u32_at(end) != Some(0x06054b50) || end + 22 + u16_at(end + 20).unwrap_or(0) != bytes.len() {

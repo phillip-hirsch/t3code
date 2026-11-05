@@ -46,7 +46,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let follow_up = follow_up_description(view.str("sendShortcut"));
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let skills = row(
             self,
             SettingRow::new("skills-in-slash-menu")
@@ -80,7 +80,7 @@ impl Workspace {
             settings_section("composer", "Composer", composer, &t),
             settings_section("follow-ups", "Follow-ups", follow_ups, &t),
         ];
-        self.settings_page("chat", &view, sections, cx)
+        self.settings_page("chat", view, sections, cx)
     }
 }
 

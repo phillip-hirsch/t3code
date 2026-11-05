@@ -240,7 +240,7 @@ fn group_rows<'a>(rows: &[&'a KeyRow]) -> Vec<(&'static str, &'static str, Vec<&
 
 /// `buildKeybindingCommandOptions`: every static command plus the server's, by label.
 fn command_options(rules: &[Rule]) -> Vec<String> {
-    let mut commands: Vec<String> = STATIC_COMMANDS.iter().map(|c| c.to_string()).collect();
+    let mut commands: Vec<String> = STATIC_COMMANDS.iter().map(std::string::ToString::to_string).collect();
     for rule in rules {
         if !commands.contains(&rule.command) {
             commands.push(rule.command.clone());
@@ -309,7 +309,7 @@ const DEFAULT_WHEN_VARIABLE: &str = "terminalFocus";
 /// `buildWhenVariableOptions`: the core variables first, then every one the defaults use.
 fn when_variables() -> &'static [String] {
     static VARIABLES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let mut names: Vec<String> = CORE_WHEN_VARIABLES.iter().map(|n| n.to_string()).collect();
+        let mut names: Vec<String> = CORE_WHEN_VARIABLES.iter().map(std::string::ToString::to_string).collect();
         for rule in defaults() {
             collect_identifiers(rule.when_ast.as_ref(), &mut names);
         }
@@ -480,7 +480,7 @@ fn edit_at(node: &When, path: &[usize], edit: &WhenEdit) -> Option<When> {
     let Some((&index, rest)) = path.split_first() else { return apply_edit(node, edit) };
     match node {
         When::Not { node: inner } if condition_parts(node).is_none() => {
-            Some(edit_at(inner, rest, edit).map(When::not).unwrap_or_else(|| node.clone()))
+            Some(edit_at(inner, rest, edit).map_or_else(|| node.clone(), When::not))
         }
         When::And { .. } | When::Or { .. } => {
             let or = is_or(node);
@@ -1128,12 +1128,12 @@ impl KeybindingsPanel {
                             }
                             if can_remove {
                                 let id = id.clone();
-                                menu =
-                                    menu.item(PopupMenuItem::new("Remove").on_click(
-                                        window.listener_for(&panel, move |this, _, window, cx| {
-                                            this.remove(&id, window, cx)
-                                        }),
-                                    ));
+                                menu = menu.item(PopupMenuItem::new("Remove").on_click(window.listener_for(
+                                    &panel,
+                                    move |this, _, window, cx| {
+                                        this.remove(&id, window, cx);
+                                    },
+                                )));
                             }
                             menu
                         }),
@@ -1248,8 +1248,8 @@ impl KeybindingsPanel {
         let add_button = |label: &'static str, primary: bool, group: bool, cx: &mut Context<Self>| {
             let owned = id.to_owned();
             Button::new(SharedString::from(format!("kb-when-root-{label}-{primary}")))
-                .when(primary, |b| b.primary())
-                .when(!primary, |b| b.outline())
+                .when(primary, gpui_kit::component::button::ButtonVariants::primary)
+                .when(!primary, gpui_kit::component::button::Button::outline)
                 .compact()
                 .small()
                 .h(px(28.))
@@ -1339,7 +1339,7 @@ impl KeybindingsPanel {
     }
 
     /// `WhenExpressionNodeEditor`, one node and its operands.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_when_node(
         &self,
         id: &str,
@@ -1356,7 +1356,7 @@ impl KeybindingsPanel {
         let edit = |edit: WhenEdit| {
             let (owned, path, panel) = (id.to_owned(), path.clone(), panel.clone());
             move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                panel.update(cx, |this, cx| this.edit_when(&owned, &path, edit.clone(), window, cx))
+                panel.update(cx, |this, cx| this.edit_when(&owned, &path, edit.clone(), window, cx));
             }
         };
         let remove = removable.then(|| {
@@ -1422,7 +1422,7 @@ impl KeybindingsPanel {
                         menu = menu.item(PopupMenuItem::new(label).checked(next == or).on_click(window.listener_for(
                             &panel,
                             move |this, _, window, cx| {
-                                this.edit_when(&owned, &path, WhenEdit::Operator { or: next }, window, cx)
+                                this.edit_when(&owned, &path, WhenEdit::Operator { or: next }, window, cx);
                             },
                         )));
                     }
@@ -1500,7 +1500,7 @@ impl KeybindingsPanel {
                     let (owned, path, picked) = (owned.clone(), path.clone(), option.clone());
                     menu = menu.item(PopupMenuItem::new(option.clone()).checked(*option == current).on_click(
                         window.listener_for(&panel, move |this, _, window, cx| {
-                            this.edit_when(&owned, &path, WhenEdit::Identifier(picked.clone()), window, cx)
+                            this.edit_when(&owned, &path, WhenEdit::Identifier(picked.clone()), window, cx);
                         }),
                     ));
                 }
@@ -1523,7 +1523,7 @@ impl KeybindingsPanel {
         let command_label_el = div()
             .truncate()
             .text_color(if current.is_some() { t.foreground } else { t.muted_foreground })
-            .child(current.as_deref().map(command_label).unwrap_or_else(|| "Command".to_owned()));
+            .child(current.as_deref().map_or_else(|| "Command".to_owned(), command_label));
         let command_select = select_trigger(&"kb-new-command".into(), command_label_el, 224., t).dropdown_menu(
             move |mut menu, window, _| {
                 for command in &commands {
@@ -1725,7 +1725,7 @@ pub(in crate::app) fn open_keybindings_file(
                     window.push_notification(
                         Notification::error(error.message()).title("Unable to open keybindings file"),
                         cx,
-                    )
+                    );
                 });
             }
         })

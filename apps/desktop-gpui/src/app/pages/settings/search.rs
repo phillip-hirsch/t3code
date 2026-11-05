@@ -90,10 +90,8 @@ pub(super) fn search<'a>(query: &str, items: &'a [(&'a SearchItem, Indexed)]) ->
                 3
             } else if tokens.iter().all(|token| title.contains(token)) {
                 2
-            } else if fields.iter().any(|field| field.contains(&query)) {
-                1
             } else {
-                0
+                u8::from(fields.iter().any(|field| field.contains(&query)))
             };
             Some((*item, index, rank))
         })

@@ -38,32 +38,32 @@ impl Workspace {
         let description = "Capture a window and attach it to your current draft.";
         let status = snap_shot::status(&self.snap_shot.state, enabled);
         let row = SettingRow::new("snap-shot-enabled").description(description).status(Some(status));
-        let mut rows = vec![self.setting_row(&view, row.setting("snapShotEnabled").switch(), window, cx)];
+        let mut rows = vec![self.setting_row(view, row.setting("snapShotEnabled").switch(), window, cx)];
         if enabled {
             let accessibility = SettingRow::new("snap-shot-accessibility")
                 .description("Include text and controls when the app makes them available.")
                 .setting("snapShotIncludeAccessibility")
                 .switch();
-            rows.push(self.setting_row(&view, accessibility, window, cx));
+            rows.push(self.setting_row(view, accessibility, window, cx));
             let shortcut = self.snap_shot_shortcut_row(&t, cx);
-            rows.push(self.setting_row(&view, shortcut, window, cx));
+            rows.push(self.setting_row(view, shortcut, window, cx));
             let sound = SettingRow::new("snap-shot-sound")
                 .description("Choose the sound played when capture starts.")
                 .control(self.snap_shot_sound_menu(&t, cx));
-            rows.push(self.setting_row(&view, sound, window, cx));
+            rows.push(self.setting_row(view, sound, window, cx));
             let flash = SettingRow::new("snap-shot-flash")
                 .description("Show a gentle cue on the captured window.")
                 .setting("snapShotFlash")
                 .switch();
-            rows.push(self.setting_row(&view, flash, window, cx));
+            rows.push(self.setting_row(view, flash, window, cx));
             let animations = SettingRow::new("snap-shot-animations")
                 .description("Animate captured windows into your draft.")
                 .setting("snapShotAnimations")
                 .switch();
-            rows.push(self.setting_row(&view, animations, window, cx));
+            rows.push(self.setting_row(view, animations, window, cx));
         }
         let sections = [settings_section("snap-shots", "SnapShots", rows, &t)];
-        self.settings_page("snap-shot", &view, sections, cx)
+        self.settings_page("snap-shot", view, sections, cx)
     }
 
     fn render_snap_shot_unavailable(
@@ -89,10 +89,10 @@ impl Workspace {
             .setting("snapShotEnabled")
             .switch()
             .unavailable();
-        let row = self.setting_row(&view, row, window, cx);
+        let row = self.setting_row(view, row, window, cx);
         let group = v_flex().py(px(6.)).bg(t.muted.opacity(0.2)).child(notice).child(row).into_any_element();
         let sections = [settings_section("snap-shots", "SnapShots", [group], &t)];
-        self.settings_page("snap-shot", &view, sections, cx)
+        self.settings_page("snap-shot", view, sections, cx)
     }
 
     /// The shortcut field, and Save and Cancel while it holds an unsaved shortcut.

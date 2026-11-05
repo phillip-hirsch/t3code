@@ -43,10 +43,10 @@ pub(super) struct RequestUi {
 fn failure_message(error: &RpcError, tags: &[&str]) -> SharedString {
     if let RpcError::Failure(failure) = error {
         let tag = failure["_tag"].as_str().unwrap_or_default();
-        if let Some(message) = failure["message"].as_str().map(str::trim).filter(|m| !m.is_empty()) {
-            if tags.contains(&tag) {
-                return message.to_owned().into();
-            }
+        if let Some(message) = failure["message"].as_str().map(str::trim).filter(|m| !m.is_empty())
+            && tags.contains(&tag)
+        {
+            return message.to_owned().into();
         }
     }
     "Could not answer the request. Try again.".into()

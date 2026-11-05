@@ -520,10 +520,10 @@ impl Workspace {
         });
         let client = self.client();
         cx.spawn_in(window, async move |this, cx| {
-            if let Some(answer) = answer {
-                if answer.await != Ok(0) {
-                    return;
-                }
+            if let Some(answer) = answer
+                && answer.await != Ok(0)
+            {
+                return;
             }
             let Some(client) = client else { return };
             let _ = this.update(cx, |this, cx| {
@@ -564,52 +564,51 @@ impl Workspace {
         let can_bring_back = blocked.is_ok() && !self.side_chat.bringing_back;
         let (bring_parent, bring_thread, delete_thread, close_thread) =
             (parent_id.clone(), thread_id.to_owned(), thread_id.to_owned(), thread_id.to_owned());
-        let header =
-            h_flex()
-                .h(px(36.))
-                .flex_none()
-                .gap_1()
-                .pl_3()
-                .pr_1()
-                .border_b_1()
-                .border_color(t.border)
-                .child(div().min_w_0().flex_1().truncate().text_xs().font_weight(FontWeight::MEDIUM).child(title))
-                .child(
-                    div()
-                        .id("side-chat-bring-back")
-                        .child(
-                            Button::new("side-chat-bring-back-button")
-                                .ghost()
-                                .xsmall()
-                                .label("Bring back")
-                                .when(!can_bring_back, |b| b.opacity(0.64))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.bring_back(bring_parent.clone(), bring_thread.clone(), window, cx)
-                                })),
-                        )
-                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
-                )
-                .child(
-                    Button::new("side-chat-delete")
-                        .ghost()
-                        .xsmall()
-                        .icon(icon("icons/trash-2.svg"))
-                        .disabled(shell.is_none() || self.side_chat.deleting)
-                        .tooltip("Delete side chat")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.delete_side_chat(delete_thread.clone(), window, cx)
-                        })),
-                )
-                .child(
-                    Button::new("side-chat-close")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::X))
-                        .tooltip("Close side chat")
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.close_side_chat_tab(&close_thread, window, cx)),
-                        ),
-                );
+        let header = h_flex()
+            .h(px(36.))
+            .flex_none()
+            .gap_1()
+            .pl_3()
+            .pr_1()
+            .border_b_1()
+            .border_color(t.border)
+            .child(div().min_w_0().flex_1().truncate().text_xs().font_weight(FontWeight::MEDIUM).child(title))
+            .child(
+                div()
+                    .id("side-chat-bring-back")
+                    .child(
+                        Button::new("side-chat-bring-back-button")
+                            .ghost()
+                            .xsmall()
+                            .label("Bring back")
+                            .when(!can_bring_back, |b| b.opacity(0.64))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.bring_back(bring_parent.clone(), bring_thread.clone(), window, cx);
+                            })),
+                    )
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+            )
+            .child(
+                Button::new("side-chat-delete")
+                    .ghost()
+                    .xsmall()
+                    .icon(icon("icons/trash-2.svg"))
+                    .disabled(shell.is_none() || self.side_chat.deleting)
+                    .tooltip("Delete side chat")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.delete_side_chat(delete_thread.clone(), window, cx);
+                    })),
+            )
+            .child(
+                Button::new("side-chat-close")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::X))
+                    .tooltip("Close side chat")
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.close_side_chat_tab(&close_thread, window, cx)),
+                    ),
+            );
         let body = match (shell, self.side_chat.view.as_ref()) {
             (None, _) if self.active_environment().is_some_and(|id| self.shell.sequence(id) > 0) => div()
                 .p_3()

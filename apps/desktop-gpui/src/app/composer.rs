@@ -110,7 +110,7 @@ impl Workspace {
         let decorations = if enabled {
             let t = tokens(cx);
             let state = self.composer.read(cx);
-            let chips: Vec<_> = state.tokens().iter().map(|span| span.range()).collect();
+            let chips: Vec<_> = state.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
             crate::composer_markdown::spans(&state.value(), &chips)
                 .into_iter()
                 .map(|span| TextDecoration::new(span.range, mark_style(span.style, t)))
@@ -760,7 +760,11 @@ impl Workspace {
     }
 
     fn render_primary_action(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let running = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
+        let running = self
+            .thread
+            .as_ref()
+            .and_then(|t| t.state.projection.as_ref())
+            .is_some_and(super::super::model::ThreadProjection::is_running);
         let stop = || {
             round_button("stop", t.error.opacity(0.9), t.error)
                 .hover(|s| s.bg(t.error))
@@ -922,7 +926,7 @@ impl Workspace {
                         } else {
                             Intent::Foreground
                         };
-                        this.submit_with(intent, window, cx)
+                        this.submit_with(intent, window, cx);
                     }),
                 )
             })
@@ -950,29 +954,33 @@ impl Workspace {
         let app_name = item.and_then(|i| i.str("appName")).map(str::to_owned);
         let reason = item.and_then(|i| i.str("reason")).map(str::to_owned);
         // (decision, label, warning)
-        let options: Vec<(String, String, Option<SharedString>)> = item
-            .and_then(|i| i.raw.get("options"))
-            .and_then(Value::as_array)
-            .map(|options| {
-                options
-                    .iter()
-                    .filter_map(|o| {
-                        let warning =
-                            o.get("warning").and_then(Value::as_str).map(|w| SharedString::from(w.to_owned()));
-                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned(), warning))
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                [
-                    ("cancel", "Cancel"),
-                    ("decline", "Decline"),
-                    ("acceptForSession", "Always allow this session"),
-                    ("accept", "Approve"),
-                ]
-                .map(|(d, l)| (d.to_owned(), l.to_owned(), None))
-                .to_vec()
-            });
+        let options: Vec<(String, String, Option<SharedString>)> =
+            item.and_then(|i| i.raw.get("options")).and_then(Value::as_array).map_or_else(
+                || {
+                    [
+                        ("cancel", "Cancel"),
+                        ("decline", "Decline"),
+                        ("acceptForSession", "Always allow this session"),
+                        ("accept", "Approve"),
+                    ]
+                    .map(|(d, l)| (d.to_owned(), l.to_owned(), None))
+                    .to_vec()
+                },
+                |options| {
+                    options
+                        .iter()
+                        .filter_map(|o| {
+                            let warning =
+                                o.get("warning").and_then(Value::as_str).map(|w| SharedString::from(w.to_owned()));
+                            Some((
+                                o.get("decision")?.as_str()?.to_owned(),
+                                o.get("label")?.as_str()?.to_owned(),
+                                warning,
+                            ))
+                        })
+                        .collect()
+                },
+            );
         let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
         let inline =
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
@@ -1035,7 +1043,7 @@ impl Workspace {
                                 let item =
                                     if warning.is_some() { item.icon(Icon::new(Lucide::TriangleAlert)) } else { item };
                                 menu = menu.item(item.on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                    this.respond(request_id.clone(), json!({"decision": decision}), cx)
+                                    this.respond(request_id.clone(), json!({"decision": decision}), cx);
                                 })));
                             }
                             menu
@@ -1424,7 +1432,7 @@ fn render_option(
         .text_color(if selected { t.foreground } else { t.foreground.opacity(0.7) })
         .when(!selected && !disabled, |el| el.hover(|s| s.bg(t.muted.opacity(0.3))))
         .when(disabled, |el| el.opacity(0.5))
-        .when(!disabled, |el| el.cursor_pointer())
+        .when(!disabled, gpui_kit::Styled::cursor_pointer)
         .child(div().h(px(20.)).flex().items_center().flex_none().child(indicator))
         .child(
             v_flex()

@@ -319,7 +319,7 @@ impl Workspace {
                 };
                 match overlay.mode {
                     OverlayMode::Files => {
-                        overlay.picker_scroll.scroll_to_item(overlay.highlight, ScrollStrategy::Nearest)
+                        overlay.picker_scroll.scroll_to_item(overlay.highlight, ScrollStrategy::Nearest);
                     }
                     OverlayMode::Content => {
                         if let Some(row) = overlay.row_of_match(overlay.highlight) {

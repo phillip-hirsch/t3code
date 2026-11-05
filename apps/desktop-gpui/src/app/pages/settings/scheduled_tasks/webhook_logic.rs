@@ -539,7 +539,7 @@ mod tests {
         assert_eq!((draft.signature_encoding, draft.signature_prefix.as_str()), (Encoding::Base64, ""));
         assert_eq!(draft.coalesce_window_seconds, "30");
         // The stored secret stands in for an empty one; unchanged filters stay off the wire.
-        let mut expected = schedule.clone();
+        let mut expected = schedule;
         expected.as_object_mut().unwrap().remove("filters");
         assert_eq!(draft.schedule(true).unwrap(), expected);
         assert_eq!(draft.schedule(false).unwrap_err()[0].title, "Signing secret is required");

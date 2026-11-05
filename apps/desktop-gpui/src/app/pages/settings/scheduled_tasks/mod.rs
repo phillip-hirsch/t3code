@@ -56,9 +56,9 @@ pub(super) fn render(
         let t = *crate::theme::tokens(cx);
         let row = RowFrame::new(message).render(&t).into_any_element();
         let section = section_with_action("scheduled-tasks-unavailable", "Unavailable selection", None, [row], &t);
-        return workspace.settings_page("scheduled-tasks", &settings, [section], cx);
+        return workspace.settings_page("scheduled-tasks", settings, [section], cx);
     }
-    workspace.settings_page("scheduled-tasks", &settings, [view.into_any_element()], cx)
+    workspace.settings_page("scheduled-tasks", settings, [view.into_any_element()], cx)
 }
 
 /// The task list, shared so a row or the editor holds a task without copying it.
@@ -132,7 +132,7 @@ impl ScheduledTasksView {
                 let applied = this.update(cx, |this, cx| {
                     match event {
                         StreamEvent::Item(value) => {
-                            this.tasks = Load::Loaded(decode_tasks(&value).into_iter().map(Rc::new).collect())
+                            this.tasks = Load::Loaded(decode_tasks(&value).into_iter().map(Rc::new).collect());
                         }
                         // A dropped socket shows as disconnected; the next connection resubscribes.
                         StreamEvent::End(Ok(()) | Err(RpcError::Disconnected(_))) => {
@@ -286,7 +286,7 @@ impl ScheduledTasksView {
                     .disabled(busy)
                     .accessibility_label(format!("Enable {}", task.title))
                     .on_change(cx.listener(move |this, _: &bool, window, cx| {
-                        this.act(&toggle_task, Action::SetEnabled(!enabled), window, cx)
+                        this.act(&toggle_task, Action::SetEnabled(!enabled), window, cx);
                     })),
             )
             .child(menu);

@@ -245,7 +245,7 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(Message::Binary(bytes))) => Utf8Bytes::from(String::from_utf8_lossy(&bytes).into_owned()),
                     Some(Ok(Message::Close(frame))) => {
-                        break frame.map(|f| format!("closed by server: {} {}", f.code, f.reason)).unwrap_or_else(|| "closed by server".into())
+                        break frame.map_or_else(|| "closed by server".into(), |f| format!("closed by server: {} {}", f.code, f.reason))
                     }
                     Some(Ok(_)) => { last_inbound = Instant::now(); continue }
                     Some(Err(error)) => break format!("read failed: {error}"),
@@ -319,11 +319,11 @@ fn handle_server_message(
         ("Chunk", Some(id)) => {
             // Ack even for streams we already dropped, so the server's writer never stalls.
             acks.push(id);
-            if let Some(Pending::Stream(tx)) = pending.get(&id) {
-                if let Value::Array(values) = message["values"].take() {
-                    for value in values {
-                        let _ = tx.try_send(StreamEvent::Item(value));
-                    }
+            if let Some(Pending::Stream(tx)) = pending.get(&id)
+                && let Value::Array(values) = message["values"].take()
+            {
+                for value in values {
+                    let _ = tx.try_send(StreamEvent::Item(value));
                 }
             }
             None
@@ -374,9 +374,7 @@ fn decode_exit(exit: Option<&Value>) -> Result<Value, RpcError> {
 fn defect_text(defect: Option<&Value>) -> String {
     match defect {
         Some(Value::String(text)) => text.clone(),
-        Some(value) => {
-            value.get("message").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| value.to_string())
-        }
+        Some(value) => value.get("message").and_then(Value::as_str).map_or_else(|| value.to_string(), str::to_owned),
         None => "unknown defect".into(),
     }
 }

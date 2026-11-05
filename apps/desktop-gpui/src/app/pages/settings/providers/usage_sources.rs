@@ -75,7 +75,7 @@ impl Workspace {
 
         let mut rows = v_flex();
         if darwin {
-            let state = state.clone();
+            let state = state;
             rows = rows.child(settings_row(
                 &t,
                 "Cursor account usage",
@@ -85,7 +85,7 @@ impl Workspace {
                         .checked(cursor_enabled)
                         .disabled(updating)
                         .on_change(cx.listener(move |this, enabled: &bool, _, cx| {
-                            this.set_cursor_usage(*enabled, state.clone(), cx)
+                            this.set_cursor_usage(*enabled, state.clone(), cx);
                         }))
                         .into_any_element(),
                 ),
@@ -113,7 +113,7 @@ impl Workspace {
                         .ghost()
                         .xsmall()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.confirm_remove_hub(id.clone(), remove_label.clone(), window, cx)
+                            this.confirm_remove_hub(id.clone(), remove_label.clone(), window, cx);
                         }))
                         .into_any_element(),
                 ),
@@ -162,7 +162,7 @@ impl Workspace {
                 state.update(cx, |state, cx| {
                     state.updating_cursor = false;
                     cx.notify();
-                })
+                });
             });
         })
         .detach();

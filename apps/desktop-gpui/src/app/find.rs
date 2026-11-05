@@ -160,10 +160,10 @@ pub(super) fn query_for_message(snippet: &str, query: &str) -> String {
         .map(|w| w.replace('’', "'").to_lowercase())
         .collect();
     let chars: Vec<char> = snippet.chars().map(|c| if c == '’' || c == '‘' { '\'' } else { c }).collect();
-    if words.len() > 1 {
-        if let Some(range) = phrase_at(&chars, &words) {
-            return chars[range].iter().collect();
-        }
+    if words.len() > 1
+        && let Some(range) = phrase_at(&chars, &words)
+    {
+        return chars[range].iter().collect();
     }
     let word = words
         .iter()
@@ -434,14 +434,14 @@ impl Workspace {
     pub(super) fn step_find(&mut self, delta: i64, _: &mut Window, cx: &mut Context<Self>) {
         let Some(find) = &mut self.find else { return };
         let Some(result) = find.result.as_ref().filter(|r| r.total > 0 && r.complete) else { return };
-        if !find.loading {
-            if let Some(next) = result.stepped(delta) {
-                find.start = next.matched.clone();
-                find.result = Some(next);
-                self.reveal_find_match(cx);
-                cx.notify();
-                return;
-            }
+        if !find.loading
+            && let Some(next) = result.stepped(delta)
+        {
+            find.start = next.matched.clone();
+            find.result = Some(next);
+            self.reveal_find_match(cx);
+            cx.notify();
+            return;
         }
         if !find.loading {
             find.start = result.matched.clone();
@@ -569,7 +569,7 @@ impl Workspace {
         let Some(find) = &mut self.find else { return };
         for key in std::mem::take(&mut find.painted).into_keys() {
             if let Some(view) = self.markdown_view(&key) {
-                view.update(cx, |view, cx| view.clear_range_highlights(cx));
+                view.update(cx, gpui_kit::base::TextViewState::clear_range_highlights);
             }
         }
     }

@@ -47,7 +47,7 @@ impl Workspace {
             0.,
             cx,
         );
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let diffs = [
             row(
                 self,
@@ -102,7 +102,7 @@ impl Workspace {
             settings_section("diffs", "Diffs", diffs, &t),
             settings_section("pull-requests", "Pull requests", pull_requests, &t),
         ];
-        self.settings_page("diffs", &view, sections, cx)
+        self.settings_page("diffs", view, sections, cx)
     }
 }
 

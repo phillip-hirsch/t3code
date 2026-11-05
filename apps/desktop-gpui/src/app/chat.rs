@@ -658,7 +658,7 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
             .font_weight(FontWeight::MEDIUM)
             .text_color(color)
             .cursor_pointer()
-            .hover(|style| style.underline())
+            .hover(gpui_kit::Styled::underline)
             .child(label)
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
@@ -1113,9 +1113,12 @@ fn markdown_view(
                     .upgrade()
                     .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
                 if let Some(target) = target {
-                    let _ = link_this.update(cx, |workspace, cx| match right {
-                        true => workspace.open_file_menu(target, event.position(), window, cx),
-                        false => workspace.open_file_link(&target, window, cx),
+                    let _ = link_this.update(cx, |workspace, cx| {
+                        if right {
+                            workspace.open_file_menu(target, event.position(), window, cx)
+                        } else {
+                            workspace.open_file_link(&target, window, cx)
+                        }
                     });
                     return;
                 }
@@ -1146,7 +1149,7 @@ fn thread_link(url: &str) -> Option<String> {
 }
 
 /// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
-/// TextView pins the actions 8px into the block's top-right corner over its own fill,
+/// `TextView` pins the actions 8px into the block's top-right corner over its own fill,
 /// so given the block's `width` the row spans it and paints the block's color.
 fn code_block_header(
     this: &WeakEntity<Workspace>,
@@ -1245,7 +1248,7 @@ fn runnable_command(lang: &str, code: &str) -> Option<String> {
 
 /// FNV-1a, to tell apart code blocks that carry no source span.
 fn fnv1a(text: &str) -> u64 {
-    text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100000001b3))
+    text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
 }
 
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
@@ -1713,7 +1716,7 @@ fn entry_details(
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(t.foreground)
-                .child(markdown(this, thought_key(&entry.id), &text.into(), false, t, cx))
+                .child(markdown(this, thought_key(&entry.id), &text, false, t, cx))
                 .into_any_element(),
         );
     }
@@ -1820,7 +1823,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
         .min_w_0()
         .px(px(2.))
         .rounded(px(6.))
-        .when(expandable, |this| this.cursor_pointer())
+        .when(expandable, gpui_kit::Styled::cursor_pointer)
         .child(work_line(
             entry.icon(),
             color,

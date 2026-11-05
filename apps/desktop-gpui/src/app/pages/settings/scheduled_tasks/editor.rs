@@ -270,7 +270,7 @@ impl TaskEditor {
             // The next full hour. Keep the instant too, so an hour that repeats when clocks go back stays exact.
             let now = Utc::now();
             let next = now.with_minute(0).and_then(|t| t.with_second(0)).and_then(|t| t.with_nanosecond(0));
-            let next = next.map(|t| if t < now { t + chrono::Duration::hours(1) } else { t }).unwrap_or(now);
+            let next = next.map_or(now, |t| if t < now { t + chrono::Duration::hours(1) } else { t });
             let local: DateTime<Local> = next.with_timezone(&Local);
             self.draft.run_at = logic::to_datetime_local_value(&local);
             self.draft.saved_run_at = logic::to_iso(next);
@@ -564,7 +564,7 @@ impl Render for TaskEditor {
         let schedule_toggle = div().flex().items_center().children(modes.iter().map(|(m, label)| {
             let m = *m;
             let blocked = disabled || (m == ScheduleMode::Webhook && denial.is_some() && mode != ScheduleMode::Webhook);
-            toggle(SharedString::from(format!("schedule-mode-{label}")), *label, m == mode, false, blocked, &t).when(
+            toggle(SharedString::from(format!("schedule-mode-{label}")), label, m == mode, false, blocked, &t).when(
                 !blocked,
                 |this| {
                     this.on_click(cx.listener(move |this, _, window, cx| {
@@ -857,7 +857,7 @@ fn toggle(
             }
         })
         .when(disabled, |this| this.opacity(0.64))
-        .when(!disabled, |this| this.cursor_pointer())
+        .when(!disabled, gpui_kit::Styled::cursor_pointer)
         .when(!disabled && !pressed, |this| {
             let hover = if outline && t.dark { t.input.opacity(0.64) } else { t.accent };
             this.hover(move |style| style.bg(hover))

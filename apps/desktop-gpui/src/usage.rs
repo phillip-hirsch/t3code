@@ -597,7 +597,7 @@ fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, c) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -738,7 +738,7 @@ pub fn smooth_curve(points: &[(f32, f32)]) -> Vec<Segment> {
     tangents[count - 1] = slopes[count - 2];
     for index in 1..count - 1 {
         let (previous, next) = (slopes[index - 1], slopes[index]);
-        tangents[index] = if previous * next <= 0. { 0. } else { (previous + next) / 2. };
+        tangents[index] = if previous * next <= 0. { 0. } else { f32::midpoint(previous, next) };
     }
     for (index, &slope) in slopes.iter().enumerate() {
         if slope == 0. {

@@ -79,7 +79,7 @@ fn parse_hex(hex: &str) -> Option<(Rgb, f64)> {
         return None;
     }
     let byte = |s: &str| u8::from_str_radix(s, 16).ok().map(f64::from);
-    let short = |i: usize| byte(&hex[i..i + 1].repeat(2));
+    let short = |i: usize| byte(&hex[i..=i].repeat(2));
     match hex.len() {
         3 | 4 => {
             Some((Rgb { r: short(0)?, g: short(1)?, b: short(2)? }, if hex.len() == 4 { short(3)? / 255. } else { 1. }))
@@ -265,7 +265,7 @@ fn gamut_map(color: Oklch) -> Oklch {
     let resolution = 0.000001f64;
     let steps = (color.c.max(resolution).log2() - resolution.log2()).ceil().max(1.) as usize;
     for _ in 0..steps {
-        let mid = (low + high) / 2.;
+        let mid = f64::midpoint(low, high);
         if in_gamut(mid) { low = mid } else { high = mid }
     }
     Oklch { c: low, ..color }
@@ -287,7 +287,7 @@ fn solve_lightness(base: Oklch, against: &[Rgb], min: f64, lighter: bool) -> Okl
     }
     let (mut low, mut high) = if lighter { (base.l, 1.) } else { (0., base.l) };
     for _ in 0..18 {
-        let mid = (low + high) / 2.;
+        let mid = f64::midpoint(low, high);
         let passes = contrast_of(Oklch { l: mid, ..base }) >= min;
         if passes == lighter { high = mid } else { low = mid }
     }
@@ -320,7 +320,7 @@ fn readable_text(background: Rgb, foreground: Rgb, amount: f64, min: f64) -> Rgb
     }
     let (mut readable, mut lower, mut upper) = (foreground, 0., amount);
     for _ in 0..12 {
-        let candidate_amount = (lower + upper) / 2.;
+        let candidate_amount = f64::midpoint(lower, upper);
         let candidate = mix(foreground, background, candidate_amount);
         if contrast(candidate, background) >= min {
             readable = candidate;
@@ -427,7 +427,7 @@ pub fn vivid(dark_appearance: bool, background: &str, accent: &str) -> Roles {
             ("mutedForeground", rgb_color(readable_text(oklch_to_rgb(muted, true), text_rgb, 1., 4.6))),
             ("placeholder", rgb_color(readable_text(oklch_to_rgb(surface_raised, true), text_rgb, 1., 4.6))),
             ("secondaryLabel", muted_text.clone()),
-            ("iconMuted", muted_text.clone()),
+            ("iconMuted", muted_text),
             ("update", accent_color.clone()),
             ("updateForeground", foreground_on(update_surface)),
             ("updateSurface", oklch_color(update_surface)),

@@ -451,7 +451,7 @@ impl Workspace {
                 let (id, host) = (id.clone(), host.clone());
                 view.update(cx, |this, cx| {
                     if *open { this.open_picker(id, host, window, cx) } else { this.close_model_picker(window, cx) }
-                })
+                });
             })
             .trigger(trigger)
             .p_0()
@@ -723,7 +723,7 @@ impl Workspace {
                             .rounded(px(8.))
                             .hover(|s| s.bg(t.accent))
                             .when(!star_visible && !highlighted, |el| {
-                                el.invisible().group_hover(group.clone(), |s| s.visible())
+                                el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible)
                             })
                             .child(Icon::new(Lucide::Star).with_size(px(12.)).text_color(if row.favorite {
                                 t.warning
@@ -873,7 +873,7 @@ impl Workspace {
                                         PopupMenuItem::new(text)
                                             .checked(current.as_deref() == Some(option.as_str()))
                                             .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                                this.set_model_option(&id, Value::String(option.clone()), cx)
+                                                this.set_model_option(&id, Value::String(option.clone()), cx);
                                             })),
                                     );
                                 }

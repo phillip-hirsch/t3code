@@ -143,7 +143,7 @@ mod sealed {
 
             let other = random_key().unwrap();
             assert!(open(&other, &sealed).is_err(), "another key cannot read it");
-            let mut tampered = sealed.clone();
+            let mut tampered = sealed;
             *tampered.last_mut().unwrap() ^= 1;
             assert!(open(&key, &tampered).is_err(), "a changed byte fails authentication");
             assert!(open(&key, b"g1short").is_err());

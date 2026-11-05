@@ -145,7 +145,7 @@ pub fn default_roles(dark: bool) -> &'static Roles {
     &ROLES.get_or_init(|| {
         let theme = find_built_in("t3-chat").expect("t3-chat");
         [&theme.roles, theme.variant_roles.as_ref().expect("t3-chat dark")].map(|r| r.canonical().expect("t3-chat"))
-    })[dark as usize]
+    })[usize::from(dark)]
 }
 
 /// `getStandardThemeColors`: the stock T3 Code palette (its dark canvas is black), canonical.
@@ -156,7 +156,7 @@ pub fn standard_roles(dark: bool) -> &'static Roles {
         let mut dark = data.dark.clone();
         dark.insert("canvas".into(), "#000000".into());
         [&data.light, &dark].map(|map| Roles::from_map(map).and_then(|r| r.canonical().ok()).expect("standard"))
-    })[dark as usize]
+    })[usize::from(dark)]
 }
 
 #[derive(Deserialize)]

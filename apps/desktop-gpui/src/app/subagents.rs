@@ -182,18 +182,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let text = |key: &str| item.and_then(|i| i.str(key)).filter(|v| !v.is_empty()).map(str::to_owned);
-        let options: Vec<(String, String)> = item
-            .and_then(|i| i.raw.get("options"))
-            .and_then(Value::as_array)
-            .map(|options| {
-                options
-                    .iter()
-                    .filter_map(|o| {
-                        Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| DEFAULT_OPTIONS.map(|(d, l)| (d.to_owned(), l.to_owned())).to_vec());
+        let options: Vec<(String, String)> =
+            item.and_then(|i| i.raw.get("options")).and_then(Value::as_array).map_or_else(
+                || DEFAULT_OPTIONS.map(|(d, l)| (d.to_owned(), l.to_owned())).to_vec(),
+                |options| {
+                    options
+                        .iter()
+                        .filter_map(|o| {
+                            Some((o.get("decision")?.as_str()?.to_owned(), o.get("label")?.as_str()?.to_owned()))
+                        })
+                        .collect()
+                },
+            );
         let live = request.is_live();
         let enabled = live && self.subagents.responding.is_none();
         let mut actions = h_flex().flex_wrap().items_center().gap(px(8.)).text_xs();
@@ -210,7 +210,7 @@ impl Workspace {
                     .when(enabled, |el| {
                         el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
                             move |this, _, _, cx| {
-                                this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx)
+                                this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx);
                             },
                         ))
                     }),
@@ -239,7 +239,7 @@ impl Workspace {
                             menu = menu.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
                                 &view,
                                 move |this, _, _, cx| {
-                                    this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx)
+                                    this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx);
                                 },
                             )));
                         }
@@ -387,7 +387,7 @@ impl Workspace {
                             .icon(Icon::new(IconName::ListTree).size(px(16.)))
                             .label("Subagent work")
                             .on_click(move |_, window, cx| {
-                                open_native_work(client.clone(), thread_id.clone(), window, cx)
+                                open_native_work(client.clone(), thread_id.clone(), window, cx);
                             }),
                     )
                 })
@@ -431,7 +431,7 @@ impl NativeWork {
     }
 }
 
-/// `stepLabel`: "TOOL_CALL" reads "Tool call".
+/// `stepLabel`: "`TOOL_CALL`" reads "Tool call".
 fn step_label(kind: &str) -> String {
     let words = kind.to_lowercase().replace('_', " ");
     let mut chars = words.chars();

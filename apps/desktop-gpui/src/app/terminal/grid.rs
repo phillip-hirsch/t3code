@@ -97,7 +97,7 @@ impl TerminalTheme {
 }
 
 fn rgb8(r: u8, g: u8, b: u8, alpha: f32) -> Hsla {
-    let mut color: Hsla = rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into();
+    let mut color: Hsla = rgb((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)).into();
     color.a = alpha;
     color
 }
@@ -190,7 +190,7 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
         if bg != theme.background {
             match out.backgrounds.last_mut() {
                 Some(span) if span.row == row && span.column + span.len == column && span.color == bg => {
-                    span.len += cells
+                    span.len += cells;
                 }
                 _ => out.backgrounds.push(Span { row, column, len: cells, color: bg }),
             }
@@ -290,7 +290,7 @@ pub(super) fn cell_size(window: &Window, fonts: &Fonts) -> (Pixels, Pixels) {
     let text_system = window.text_system();
     let (font, font_size) = terminal_font(fonts);
     let font_id = text_system.resolve_font(&font);
-    let width = text_system.advance(font_id, font_size, 'M').map(|size| size.width).unwrap_or(px(7.));
+    let width = text_system.advance(font_id, font_size, 'M').map_or(px(7.), |size| size.width);
     let glyph = text_system.ascent(font_id, font_size) + text_system.descent(font_id, font_size).abs();
     let height = (f32::from(font_size) * 1.35).round().max(f32::from(glyph).ceil());
     (width, px(height))
@@ -357,7 +357,7 @@ impl Element for TerminalGrid {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        (): &mut (),
         window: &mut Window,
         cx: &mut App,
     ) -> GridPrepaint {
@@ -464,7 +464,7 @@ impl Element for TerminalGrid {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        (): &mut (),
         prepaint: &mut GridPrepaint,
         window: &mut Window,
         cx: &mut App,

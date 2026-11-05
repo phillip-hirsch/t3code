@@ -248,12 +248,12 @@ fn quoted_runs(raw: &str, separator: impl Fn(char) -> bool) -> Vec<&str> {
     let mut index = 0;
     while index < raw.len() {
         let c = raw[index..].chars().next().unwrap_or_default();
-        if c == '"' {
-            if let Some(close) = raw[index + 1..].find('"') {
-                start.get_or_insert(index);
-                index += close + 2;
-                continue;
-            }
+        if c == '"'
+            && let Some(close) = raw[index + 1..].find('"')
+        {
+            start.get_or_insert(index);
+            index += close + 2;
+            continue;
         }
         if c == '"' || separator(c) {
             if let Some(from) = start.take() {
@@ -779,7 +779,7 @@ pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<Labe
             match labels.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, facet)) => facet.count += 1,
                 None => {
-                    labels.push((key, LabelFacet { name: label.name.clone(), color: label.color.clone(), count: 1 }))
+                    labels.push((key, LabelFacet { name: label.name.clone(), color: label.color.clone(), count: 1 }));
                 }
             }
         }

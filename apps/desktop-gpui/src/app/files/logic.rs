@@ -41,7 +41,7 @@ pub(super) fn entries_from_json(value: &Value) -> Vec<Entry> {
 pub(super) fn error_message(error: &crate::rpc::RpcError) -> String {
     match error {
         crate::rpc::RpcError::Failure(value) => {
-            value["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string())
+            value["message"].as_str().map_or_else(|| error.to_string(), str::to_owned)
         }
         other => other.to_string(),
     }
@@ -166,7 +166,7 @@ pub(super) fn match_runs(line: &str, ranges: &[(usize, usize)]) -> Vec<(String, 
     let units = line.encode_utf16().count();
     let mut sorted: Vec<(usize, usize)> =
         ranges.iter().map(|&(s, e)| (s.min(units), e.min(units))).filter(|(s, e)| e > s).collect();
-    sorted.sort();
+    sorted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in sorted {
         match merged.last_mut() {
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(
             breadcrumbs("src/app/x.rs", "t3"),
             [
-                ("t3".into(), "".into()),
+                ("t3".into(), String::new()),
                 ("src".into(), "src".into()),
                 ("app".into(), "src/app".into()),
                 ("x.rs".into(), "src/app/x.rs".into())

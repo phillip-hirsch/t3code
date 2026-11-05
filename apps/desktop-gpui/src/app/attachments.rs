@@ -403,8 +403,7 @@ impl Workspace {
             files
                 .into_iter()
                 .map(|path| {
-                    let name =
-                        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+                    let name = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
                     let read = read_at_most(&path, MAX_FILE_BYTES);
                     (name, read)
                 })
@@ -426,10 +425,10 @@ impl Workspace {
                             this.add_attachment(name, kind, mime, bytes, window, cx);
                         }
                         Ok(Read::TooLarge(size)) => {
-                            this.error = this.attachment_error(&name, kind, size).map(Into::into)
+                            this.error = this.attachment_error(&name, kind, size).map(Into::into);
                         }
                         Ok(Read::Bytes(_)) => {
-                            this.error = Some(format!("'{name}' is empty or could not be read.").into())
+                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
                         }
                         Err(error) => {
                             log::warn!("could not read {name:?}: {error}");
@@ -674,7 +673,12 @@ impl Workspace {
         self.release_upload(&attachment, cx);
         let chip_id = attachment.chip_id();
         self.composer.update(cx, |state, cx| {
-            if let Some(span) = state.tokens().iter().find(|s| s.token().id().as_ref() == chip_id).map(|s| s.range()) {
+            if let Some(span) = state
+                .tokens()
+                .iter()
+                .find(|s| s.token().id().as_ref() == chip_id)
+                .map(gpui_kit::base::input::InlineTokenSpan::range)
+            {
                 state.set_selected_range(span, cx);
                 state.replace("", window, cx);
             }
@@ -855,7 +859,7 @@ impl Workspace {
                     .truncate()
                     .cursor_pointer()
                     .text_color(t.foreground)
-                    .hover(|s| s.underline())
+                    .hover(gpui_kit::Styled::underline)
                     .child(attachment.name.clone())
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.open_attachment_preview(&preview_id, window, cx)),

@@ -96,7 +96,7 @@ impl VcsStatus {
             "snapshot" => Some(Self { local: local()?, remote: remote() }),
             "localUpdated" => Some(Self { local: local()?, remote: current.map(|c| c.remote).unwrap_or_default() }),
             "remoteUpdated" => {
-                let local = current.map(|c| c.local).unwrap_or(VcsLocal { is_repo: true, ..VcsLocal::default() });
+                let local = current.map_or(VcsLocal { is_repo: true, ..VcsLocal::default() }, |c| c.local);
                 Some(Self { local, remote: remote() })
             }
             _ => current,
@@ -317,7 +317,7 @@ pub fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -390,10 +390,10 @@ impl Workspace {
                             StreamEvent::Item(_) => {}
                             StreamEvent::End(result) => {
                                 ended = true;
-                                if let Err(error) = result {
-                                    if !matches!(error, RpcError::Disconnected(_)) {
-                                        log::warn!("git status stream ended: {error}");
-                                    }
+                                if let Err(error) = result
+                                    && !matches!(error, RpcError::Disconnected(_))
+                                {
+                                    log::warn!("git status stream ended: {error}");
                                 }
                             }
                         }
@@ -452,7 +452,7 @@ impl Workspace {
                             });
                         }
                         Some("action_failed") => {
-                            outcome = Err(value["message"].as_str().unwrap_or("Git action failed.").to_owned())
+                            outcome = Err(value["message"].as_str().unwrap_or("Git action failed.").to_owned());
                         }
                         _ => {}
                     },

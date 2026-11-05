@@ -120,7 +120,7 @@ pub(super) fn accent_color_picker(
     cx: &mut App,
 ) -> AnyElement {
     let on_commit: Commit = Rc::new(on_commit);
-    let picker = window.use_keyed_state(id, cx, |window, cx| AccentPicker::new(window, cx));
+    let picker = window.use_keyed_state(id, cx, AccentPicker::new);
     let value = value.unwrap_or_default().to_owned();
     let display_name: SharedString = display_name.to_owned().into();
     picker.update(cx, |picker, _| {
@@ -390,7 +390,7 @@ fn thumb(size: Pixels, fill: Option<Hsla>) -> gpui_kit::Div {
         .rounded_full()
         .border_2()
         .border_color(hsla(0., 0., 1., 1.))
-        .when_some(fill, |el, fill| el.bg(fill))
+        .when_some(fill, gpui_kit::Styled::bg)
         .shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), hsla(0., 0., 0., 0.4)).spread_radius(px(1.))])
 }
 
@@ -420,7 +420,7 @@ impl Render for AccentPicker {
                 picker.update(cx, |this, cx| this.set_open(*open, window, cx));
             })
             .trigger(trigger)
-            .content(move |_, _, cx| content_picker.update(cx, |this, cx| this.panel(cx)))
+            .content(move |_, _, cx| content_picker.update(cx, AccentPicker::panel))
     }
 }
 

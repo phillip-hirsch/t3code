@@ -155,7 +155,7 @@ impl Workspace {
                             i + 1
                         }
                     }
-                    (_, None) | (_, Some(0)) => last,
+                    (_, None | Some(0)) => last,
                     (_, Some(i)) => i - 1,
                 };
                 self.sidebar.search_highlight = Some(ids[next].clone());

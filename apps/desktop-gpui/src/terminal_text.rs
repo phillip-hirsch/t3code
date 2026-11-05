@@ -164,7 +164,7 @@ impl TerminalText {
             if index > 0 {
                 out.push('\n');
             }
-            out.extend(line.iter().collect::<String>().trim_end().chars());
+            out.push_str(line.iter().collect::<String>().trim_end());
         }
         out
     }

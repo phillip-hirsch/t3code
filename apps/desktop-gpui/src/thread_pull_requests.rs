@@ -146,7 +146,7 @@ mod tests {
         };
         let links = vec![link(2, "agent", "open", "2026-01-01T00:00:00Z")];
         assert_eq!(panel_target("p", &links, Some(&linked), None).unwrap().project_id, "other");
-        let branch = LinkedPullRequest { number: 9, ..linked.clone() };
+        let branch = LinkedPullRequest { number: 9, ..linked };
         assert_eq!(panel_target("p", &[], None, Some(&branch)).unwrap().number, 9);
         assert!(panel_target("p", &[], None, None).is_none());
     }

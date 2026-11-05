@@ -196,7 +196,7 @@ impl Workspace {
                                     .icon(Icon::new(Lucide::Minimize2))
                                     .label("Compact context")
                                     .disabled(compact_blocked)
-                                    .on_click(move |_, _, cx| view.update(cx, |this, cx| this.compact_context(cx))),
+                                    .on_click(move |_, _, cx| view.update(cx, super::Workspace::compact_context)),
                             )
                             .when(compact_blocked, |el| {
                                 el.child(
@@ -270,7 +270,7 @@ fn has_compactable_conversation(projection: &crate::model::ThreadProjection) -> 
 fn ring(percentage: f32, track: Hsla, color: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        move |bounds, _, window, _| {
+        move |bounds, (), window, _| {
             let center = bounds.center();
             let at = |angle: f32| point(center.x + px(RADIUS * angle.cos()), center.y + px(RADIUS * angle.sin()));
             let arc = |from: f32, sweep: f32| {

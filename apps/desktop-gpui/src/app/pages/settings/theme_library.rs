@@ -164,7 +164,7 @@ impl Workspace {
             let fan = (group.len() > 1).then_some(group.as_slice());
             rendered.push(self.render_theme_card(card, &owners, fan, &t, cx));
         }
-        let create_seed = owners[initial_dark as usize].clone();
+        let create_seed = owners[usize::from(initial_dark)].clone();
         let header = h_flex()
             .min_h(px(32.))
             .pt(px(20.))
@@ -210,7 +210,8 @@ impl Workspace {
     fn render_mode_tiles(&self, owners: &[CardId; 2], t: &Tokens, cx: &mut Context<Self>) -> Div {
         let current = self.client_settings.theme;
         let library = &self.client_settings.themes;
-        let [light, dark] = [false, true].map(|dark| Preview::of_card(owners[dark as usize].as_deref(), dark, library));
+        let [light, dark] =
+            [false, true].map(|dark| Preview::of_card(owners[usize::from(dark)].as_deref(), dark, library));
         let tile = |mode: ThemePreference, label: &'static str| {
             let active = current == mode;
             let wireframe = match mode {
@@ -304,7 +305,7 @@ impl Workspace {
                     let dark = *dark;
                     let target = card.card.clone();
                     let mode = if dark { "dark" } else { "light" };
-                    let picked = owners[dark as usize] == card.card;
+                    let picked = owners[usize::from(dark)] == card.card;
                     circle_button(SharedString::from(format!("theme-{key}-{mode}")), colors, dark, picked, t)
                         .tooltip(tip(format!("Use {} for {mode} mode", card.label)))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -379,7 +380,7 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        let on_use = card.on_use.clone();
+        let on_use = card.on_use;
         v_flex()
             .id(SharedString::from(format!("theme-card-{key}")))
             .overflow_hidden()
@@ -435,7 +436,7 @@ impl Workspace {
         for dark in [false, true] {
             let options: Vec<(usize, &ThemeDefinition)> =
                 themes.iter().copied().enumerate().filter(|(_, theme)| theme.colors_for(dark).is_some()).collect();
-            let active = |theme: &ThemeDefinition| owners[dark as usize].as_deref() == Some(theme.id.as_str());
+            let active = |theme: &ThemeDefinition| owners[usize::from(dark)].as_deref() == Some(theme.id.as_str());
             let Some(&(selected_index, selected)) = options.iter().find(|(_, theme)| active(theme)).or(options.first())
             else {
                 continue;
@@ -690,10 +691,10 @@ fn removal_tile(
         )
         .on_click(move |_, _, cx| {
             workspace.update(cx, |this, cx| {
-                if let Some(removal) = &mut this.settings_ui.theme_library.removal {
-                    if !removal.selected.remove(&id) {
-                        removal.selected.insert(id.clone());
-                    }
+                if let Some(removal) = &mut this.settings_ui.theme_library.removal
+                    && !removal.selected.remove(&id)
+                {
+                    removal.selected.insert(id.clone());
                 }
                 cx.notify();
             });

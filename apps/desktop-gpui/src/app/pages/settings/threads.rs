@@ -93,12 +93,12 @@ impl Workspace {
     ) -> AnyElement {
         let t = *tokens(cx);
         let connected = self.settings_client().is_some();
-        let base = self.add_project_field(&view, window, cx);
-        let new_threads = self.new_threads_section(&view, true, window, cx);
-        let snooze = (!view.scope.is_project()).then(|| self.snooze_row(&view, window, cx));
-        let auto_settle = connected.then(|| self.auto_settle_rows(&view, window, cx));
-        let text_generation = self.text_generation_rows(&view, window, cx);
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let base = self.add_project_field(view, window, cx);
+        let new_threads = self.new_threads_section(view, true, window, cx);
+        let snooze = (!view.scope.is_project()).then(|| self.snooze_row(view, window, cx));
+        let auto_settle = connected.then(|| self.auto_settle_rows(view, window, cx));
+        let text_generation = self.text_generation_rows(view, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let new_projects = [
             row(
                 self,
@@ -136,7 +136,7 @@ impl Workspace {
         sections.push(settings_section("usage-limits", "Usage limits", usage, &t));
         sections.extend(auto_settle.map(|rows| settings_section("auto-settle", "Auto-settle", rows, &t)));
         sections.push(settings_section("text-generation", "Text generation", text_generation, &t));
-        self.settings_page("threads", &view, sections, cx)
+        self.settings_page("threads", view, sections, cx)
     }
 
     /// The folder box; a pasted full path replaces what is there (`resolvePastedPath`).
@@ -173,12 +173,14 @@ impl Workspace {
             !view.targets.is_empty() && view.targets.iter().all(|t| t.settings.get("defaultModelSelection").is_null());
         let pick = |key: &'static str| {
             move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-                this.update_settings(json!({ key: pick.to_json() }), window, cx)
+                this.update_settings(json!({ key: pick.to_json() }), window, cx);
             }
         };
         let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("defaultModelSelection")).ok();
         let selection = stored
-            .filter(|s| self.settings_info().provider(&s.instance_id).is_some_and(|p| p.is_selectable()))
+            .filter(|s| {
+                self.settings_info().provider(&s.instance_id).is_some_and(crate::model::Provider::is_selectable)
+            })
             .or_else(|| self.settings_info().automatic_model());
         let model: AnyElement = match &selection {
             Some(selection) => h_flex()
@@ -293,7 +295,7 @@ impl Workspace {
         let t = *tokens(cx);
         let mixed = view.mixed(&["fallbackModelSelection"]);
         let pick = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-            this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx)
+            this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx);
         };
         let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("fallbackModelSelection")).ok();
         let Some(shown) = stored.as_ref().or(default) else {
@@ -355,7 +357,7 @@ impl Workspace {
                         })
                         .checked(mode == current)
                         .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                            this.update_settings(json!({ "defaultRuntimeMode": mode }), window, cx)
+                            this.update_settings(json!({ "defaultRuntimeMode": mode }), window, cx);
                         })),
                     );
                 }
@@ -375,13 +377,13 @@ impl Workspace {
         let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false, &t).on_click(cx.listener(
             move |this, _, window, cx| {
                 let days = days.is_none().then_some(AUTO_SETTLE_DEFAULT_DAYS);
-                this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
+                this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx);
             },
         ));
         let field = days.map(|days| {
             let field =
                 self.number_field("auto-settle-days", days, (1, 90, 1), window, cx, |this, days, window, cx| {
-                    this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
+                    this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx);
                 });
             div().w(px(96.)).child(NumberInput::new(&field).small())
         });
@@ -438,7 +440,7 @@ impl Workspace {
         let connected = self.settings_client().is_some();
         let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
             let resolved = resolve_text_generation(Some(&pick), &this.settings_info().providers).unwrap_or(pick);
-            this.update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), window, cx)
+            this.update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), window, cx);
         };
         let control: AnyElement = match (&selection, connected) {
             (_, false) => muted("Connect an environment to choose its text generation model.", &t).into_any_element(),

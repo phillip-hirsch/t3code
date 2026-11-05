@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(resolve(json!([window(100., "2026-11-05T11:00:00Z")]), json!({}), fallback.clone()), None, "reset");
         assert_eq!(resolve(spent.clone(), json!({}), json!({})), None, "no fallback configured");
         assert_eq!(resolve(spent.clone(), json!({"auth": {"status": "unauthenticated"}}), fallback.clone()), None);
-        assert_eq!(resolve(spent.clone(), json!({"availability": "unavailable"}), fallback.clone()), None);
+        assert_eq!(resolve(spent.clone(), json!({"availability": "unavailable"}), fallback), None);
         let disabled_here = json!({
             "fallbackModelSelection": {"instanceId": "codex", "model": "gpt"},
             "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": false}}}},

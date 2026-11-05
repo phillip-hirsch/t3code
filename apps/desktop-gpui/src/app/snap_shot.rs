@@ -101,7 +101,7 @@ impl Workspace {
             let presses = ui.presses.clone();
             ui._listener = Some(cx.spawn_in(window, async move |this, cx| {
                 while presses.recv().await.is_ok() {
-                    if this.update_in(cx, |this, window, cx| this.on_snap_shot_press(window, cx)).is_err() {
+                    if this.update_in(cx, super::Workspace::on_snap_shot_press).is_err() {
                         break;
                     }
                 }
@@ -158,7 +158,7 @@ impl Workspace {
         if let Some(animated) = flash {
             cx.spawn(async move |_, cx| {
                 if let Ok(flash) = flashes.await {
-                    let _ = cx.update(|cx| platform::show_flash(flash, animated, cx));
+                    let () = cx.update(|cx| platform::show_flash(flash, animated, cx));
                 }
             })
             .detach();

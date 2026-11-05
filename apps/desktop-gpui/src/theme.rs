@@ -294,7 +294,7 @@ fn first_family(list: &str) -> Option<&'static str> {
     let name =
         list.split(',').map(|name| name.trim().trim_matches(['"', '\'']).trim()).find(|name| !name.is_empty())?;
     static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     Some(names.get(name).copied().unwrap_or_else(|| {
         let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
         names.insert(interned);

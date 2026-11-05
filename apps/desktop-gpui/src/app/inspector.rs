@@ -171,7 +171,7 @@ impl Workspace {
                                         StreamEvent::End(Ok(())) => *running = false,
                                     }
                                 }
-                                *text = output.text_content().into();
+                                *text = output.text_content();
                                 *loaded = true;
                                 if following {
                                     scroll.scroll_to_bottom();

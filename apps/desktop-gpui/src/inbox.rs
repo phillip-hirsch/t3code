@@ -750,8 +750,8 @@ pub fn is_provider_update_candidate(provider: &crate::model::Provider) -> bool {
     provider.enabled
         && !matches!(latest_status, Some("broken" | "unsupported"))
         && field("status").and_then(|s| s.as_str()) == Some("behind_latest")
-        && field("latestVersion").is_some_and(|v| v.is_string())
-        && field("canUpdate").and_then(|v| v.as_bool()) == Some(true)
+        && field("latestVersion").is_some_and(serde_json::Value::is_string)
+        && field("canUpdate").and_then(serde_json::Value::as_bool) == Some(true)
         && !matches!(updating, Some("queued" | "running"))
 }
 
@@ -858,7 +858,7 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
             (wake, format!("In {duration}"), false)
         }
         SnoozeSetting::At { day, hour, minute } => {
-            let today = now.weekday().num_days_from_sunday() as i64;
+            let today = i64::from(now.weekday().num_days_from_sunday());
             let days_ahead = match day.as_str() {
                 "today" => 0,
                 "tomorrow" => 1,
@@ -1244,12 +1244,12 @@ mod tests {
     fn resuming_cancels_a_hold_and_the_next_finish_gets_a_fresh_grace() {
         let mut tracker = ReturnTracker::default();
         let (idle, busy) = (running("a", false, json!({})), running("a", true, json!({})));
-        observe(&mut tracker, &[busy.clone()], 10_000);
-        observe(&mut tracker, &[idle.clone()], 10_000);
-        observe(&mut tracker, &[busy.clone()], 11_500);
+        observe(&mut tracker, std::slice::from_ref(&busy), 10_000);
+        observe(&mut tracker, std::slice::from_ref(&idle), 10_000);
+        observe(&mut tracker, std::slice::from_ref(&busy), 11_500);
         observe(&mut tracker, &[busy], 12_500);
         assert_eq!(tracker.returned_at("a"), None);
-        observe(&mut tracker, &[idle.clone()], 12_500);
+        observe(&mut tracker, std::slice::from_ref(&idle), 12_500);
         observe(&mut tracker, &[idle], 14_500);
         assert_eq!(tracker.returned_at("a"), Some(14_500));
     }
@@ -1288,7 +1288,7 @@ mod tests {
         observe(&mut tracker, &[a.clone(), b.clone()], 10_500);
         observe(&mut tracker, &[a.clone(), b.clone()], 12_000);
         assert_eq!((tracker.returned_at("a"), tracker.returned_at("b")), (Some(12_000), None));
-        let threads = [a.clone(), b.clone()];
+        let threads = [a, b];
         let sections = partition(&threads, 12_500, true, false, &mut tracker, |_| true);
         assert_eq!(ids(&sections.active), ["b", "a"]);
         // The b hold ended at this partition, so it no longer reads as working.

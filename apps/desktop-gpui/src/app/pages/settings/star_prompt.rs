@@ -103,7 +103,7 @@ impl Workspace {
             loop {
                 let idle_for = last_input.get().elapsed();
                 if idle_for < IDLE {
-                    cx.background_executor().timer(IDLE - idle_for).await;
+                    cx.background_executor().timer(IDLE.checked_sub(idle_for).unwrap()).await;
                     continue;
                 }
                 let Ok(active) = cx.update(|window, _| window.is_window_active()) else { return };

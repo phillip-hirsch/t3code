@@ -934,7 +934,7 @@ mod tests {
             assert_eq!(stash(&mut store, &format!("p{i}"), &[]), None);
         }
         let evicted = stash(&mut store, "newest", &[]);
-        assert_eq!(evicted.map(|e| e.id), Some(first.clone()), "the oldest goes first");
+        assert_eq!(evicted.map(|e| e.id), Some(first), "the oldest goes first");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "its bytes went with it");
 
         let reloaded = Store::open(Some(dir.clone()));

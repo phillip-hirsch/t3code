@@ -432,7 +432,7 @@ impl Render for NewWorktreeMode {
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(t.muted_foreground))
             .on_click(cx.listener(|this, _, window, cx| {
                 let open = !this.open;
-                this.set_open(open, window, cx)
+                this.set_open(open, window, cx);
             }));
         v_flex()
             .gap(px(6.))

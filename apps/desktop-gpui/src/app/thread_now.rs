@@ -208,7 +208,7 @@ impl Workspace {
         if self.sending {
             return;
         }
-        let running = self.open_projection().is_some_and(|p| p.is_running());
+        let running = self.open_projection().is_some_and(super::super::model::ThreadProjection::is_running);
         let mut command = json!({
             "type": "message.dispatch",
             "commandId": new_id(),
@@ -390,14 +390,15 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
                     },
                 ));
             }
-            match stop.unresponsive {
-                true => (
+            if stop.unresponsive {
+                (
                     IconName::TriangleAlert,
                     t.warning_foreground,
                     "Agent not responding to Stop".into(),
                     Some(div().child("It may be short on memory. Force stop kills its processes.").into_any_element()),
-                ),
-                false => (IconName::CircleStop, muted, "Stopping".into(), None),
+                )
+            } else {
+                (IconName::CircleStop, muted, "Stopping".into(), None)
             }
         }
         NowLine::Background(work) => {
@@ -418,7 +419,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
             (icon, muted, work.title.clone(), work.description.clone().map(|d| div().child(d).into_any_element()))
         }
         NowLine::Goal(goal) => {
-            let working = workspace.open_projection().is_some_and(|p| p.is_running());
+            let working = workspace.open_projection().is_some_and(super::super::model::ThreadProjection::is_running);
             if goal.can_resume && !working {
                 actions.push(inline_button(
                     "now-goal-resume",

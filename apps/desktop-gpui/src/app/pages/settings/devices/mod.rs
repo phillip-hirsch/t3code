@@ -59,7 +59,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let sections = [self.render_device_integration(cx), self.render_device_sources(window, cx)];
-        self.settings_page("devices", &view, sections, cx)
+        self.settings_page("devices", view, sections, cx)
     }
 
     /// `DeviceIntegrationControls`: the hub and agent access switches, and the local host's progress.
@@ -220,7 +220,7 @@ impl Workspace {
                         .label(if pending == Some(Pending::Check) { "Checking…" } else { "Check versions" })
                         .on_click(move |_, window, cx| {
                             let _ = workspace.update(cx, |this, cx| {
-                                this.list_devices(Pending::Check, json!({ "inspectOnly": true }), window, cx)
+                                this.list_devices(Pending::Check, json!({ "inspectOnly": true }), window, cx);
                             });
                         })
                 });
@@ -304,7 +304,7 @@ impl Workspace {
                                     .label(label)
                                     .disabled(retrying.is_some())
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.retry_device_host(host_id.clone(), window, cx)
+                                        this.retry_device_host(host_id.clone(), window, cx);
                                     })),
                             )
                         })
