@@ -140,6 +140,9 @@ impl Workspace {
     /// A later launch's arguments (`second-instance`): its app links open here, and the window
     /// comes forward either way.
     fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // Electron's reveal: `app.focus({ steal: true })` on macOS, then the window.
+        #[cfg(target_os = "macos")]
+        cx.activate(true);
         window.activate_window();
         self.desktop.pending_links.extend(args.iter().filter_map(|arg| links::parse_app_link(arg)));
         self.open_pending_links(window, cx);
