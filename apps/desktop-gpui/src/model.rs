@@ -4,6 +4,8 @@
 //! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
 //! values never fail a whole frame; only fields the UI reads are typed.
 
+use std::rc::Rc;
+
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -696,7 +698,8 @@ pub struct VisibleRow {
     pub visibility: String,
     pub source_thread_id: String,
     pub source_item_id: String,
-    pub item: TurnItem,
+    /// Shared with `turn_items`: a streamed update is stored once.
+    pub item: Rc<TurnItem>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -710,7 +713,7 @@ pub struct ThreadProjection {
     #[serde(default, deserialize_with = "lossy")]
     pub runtime_requests: Vec<RuntimeRequest>,
     #[serde(default, deserialize_with = "lossy")]
-    pub turn_items: Vec<TurnItem>,
+    pub turn_items: Vec<Rc<TurnItem>>,
     /// The timeline, in render order.
     #[serde(default, deserialize_with = "lossy")]
     pub visible_turn_items: Vec<VisibleRow>,
@@ -781,7 +784,7 @@ impl ThreadProjection {
                     .iter()
                     .rev()
                     .find(|item| item.item_type == item_type && item.str("requestId") == Some(request.id.as_str()));
-                (request, item)
+                (request, item.map(Rc::as_ref))
             })
             .collect()
     }
@@ -825,6 +828,7 @@ impl ThreadProjection {
     }
 
     fn apply_turn_item(&mut self, item: TurnItem) {
+        let item = Rc::new(item);
         let was_interrupt_request = self
             .turn_items
             .iter()
@@ -890,7 +894,7 @@ impl ThreadProjection {
 
     /// `upsertVisibleTurnItem`: replace in place when the ordinal is unchanged,
     /// else insert before the first later local row.
-    fn upsert_visible(&mut self, item: TurnItem) {
+    fn upsert_visible(&mut self, item: Rc<TurnItem>) {
         let rows = &mut self.visible_turn_items;
         let existing = rows.iter().rposition(|row| row.source_item_id == item.id);
         if let Some(index) = existing {
@@ -944,9 +948,29 @@ impl ThreadState {
                 let sequence = item["snapshotSequence"].as_u64().unwrap_or_default();
                 match ThreadProjection::deserialize(&item["projection"]) {
                     Ok(mut projection) => {
-                        let visible = projection.visible_turn_items.iter_mut().map(|row| &mut row.item);
-                        for item in projection.turn_items.iter_mut().chain(visible) {
-                            item.revision = sequence;
+                        // Freshly decoded, so every item is still unique and can be stamped.
+                        for item in projection.turn_items.iter_mut() {
+                            if let Some(item) = Rc::get_mut(item) {
+                                item.revision = sequence;
+                            }
+                        }
+                        // Rows share the table's item, so later updates replace one allocation.
+                        let by_id: std::collections::HashMap<&str, &Rc<TurnItem>> =
+                            projection.turn_items.iter().map(|item| (item.id.as_str(), item)).collect();
+                        let shared: Vec<Option<Rc<TurnItem>>> = projection
+                            .visible_turn_items
+                            .iter()
+                            .map(|row| by_id.get(row.item.id.as_str()).map(|item| Rc::clone(item)))
+                            .collect();
+                        for (row, shared) in projection.visible_turn_items.iter_mut().zip(shared) {
+                            match shared {
+                                Some(item) if item.thread_id == row.item.thread_id => row.item = item,
+                                _ => {
+                                    if let Some(item) = Rc::get_mut(&mut row.item) {
+                                        item.revision = sequence;
+                                    }
+                                }
+                            }
                         }
                         self.projection = Some(projection);
                         self.sequence = sequence;
@@ -1046,6 +1070,23 @@ mod tests {
 
     fn timeline(state: &ThreadState) -> Vec<String> {
         state.projection.as_ref().unwrap().visible_turn_items.iter().map(|row| row.source_item_id.clone()).collect()
+    }
+
+    #[test]
+    fn an_update_is_stored_once_for_the_table_and_the_timeline() {
+        let mut state = ThreadState::default();
+        state
+            .apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[item("a", "user_message", "r1", 1)])}))
+            .unwrap();
+        let shared = |state: &ThreadState, id: &str| {
+            let p = state.projection.as_ref().unwrap();
+            let row = p.visible_turn_items.iter().find(|row| row.source_item_id == id).unwrap();
+            let entry = p.turn_items.iter().find(|item| item.id == id).unwrap();
+            Rc::ptr_eq(&row.item, entry)
+        };
+        assert!(shared(&state, "a"), "a snapshot's rows share the table's items");
+        state.apply(&event(2, "turn-item.updated", item("b", "assistant_message", "r1", 2))).unwrap();
+        assert!(shared(&state, "b"), "an update shares one allocation");
     }
 
     #[test]
