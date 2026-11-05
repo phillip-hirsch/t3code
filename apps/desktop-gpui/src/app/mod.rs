@@ -29,11 +29,15 @@ mod details;
 mod header;
 mod layout;
 mod pages;
+mod palette;
 mod sidebar;
 mod titlebar;
 mod visits;
 
-gpui_kit::actions!(workspace, [ToggleSidebar, ToggleThreadDetails]);
+gpui_kit::actions!(
+    workspace,
+    [ToggleSidebar, ToggleThreadDetails, TogglePalette, NewThread, NewThreadInProject, UndoThreadAction]
+);
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -67,6 +71,8 @@ struct OpenThread {
 
 pub struct Workspace {
     connection: Connection,
+    /// The connected server's HTTP origin, for signed asset URLs.
+    http_base: Option<String>,
     server: Option<ServerHandle>,
     server_info: ServerInfo,
     shell: ShellState,
@@ -117,6 +123,10 @@ pub struct Workspace {
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     history: pages::History,
+    /// The command palette, while open.
+    palette: Option<palette::Palette>,
+    /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
+    focus: gpui_kit::FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -141,6 +151,7 @@ impl Workspace {
         ];
         Self {
             connection: Connection::Starting,
+            http_base: None,
             server: None,
             server_info: ServerInfo::default(),
             shell: ShellState::default(),
@@ -179,6 +190,8 @@ impl Workspace {
             page: None,
             settings: None,
             history: pages::History::default(),
+            palette: None,
+            focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -247,7 +260,13 @@ impl Workspace {
                     Ok(client) => {
                         renewed = false;
                         log::info!("connected");
-                        if this.update_in(cx, |this, window, cx| this.on_connected(client.clone(), window, cx)).is_err()
+                        let http_base = endpoint.http_base.clone();
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.http_base = Some(http_base);
+                                this.on_connected(client.clone(), window, cx)
+                            })
+                            .is_err()
                         {
                             return;
                         }
@@ -772,10 +791,14 @@ impl Render for Workspace {
         if self.details_inline(window) {
             self.details_popover = false;
         }
+        if window.focused(cx).is_none() {
+            self.focus.focus(window, cx);
+        }
         let theme = cx.theme();
         div()
             .size_full()
             .relative()
+            .track_focus(&self.focus)
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
@@ -784,6 +807,12 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &TogglePalette, window, cx| this.open_palette(palette::View::Root, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(false, window, cx)))
+            .on_action(cx.listener(|this, _: &NewThreadInProject, window, cx| this.new_thread(true, window, cx)))
+            .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
@@ -822,5 +851,6 @@ impl Render for Workspace {
             )
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_settings(window, cx))
+            .children(self.render_palette(window, cx))
     }
 }

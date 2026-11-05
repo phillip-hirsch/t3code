@@ -7,6 +7,7 @@ mod model_label;
 mod new_thread;
 mod requests;
 mod rpc;
+mod search;
 mod theme;
 mod timeline;
 mod work_log;
@@ -38,6 +39,11 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
             KeyBinding::new("ctrl-shift-b", app::ToggleThreadDetails, None),
+            KeyBinding::new("ctrl-k", app::TogglePalette, None),
+            KeyBinding::new("ctrl-n", app::NewThread, None),
+            KeyBinding::new("ctrl-shift-o", app::NewThread, None),
+            KeyBinding::new("ctrl-shift-n", app::NewThreadInProject, None),
+            KeyBinding::new("ctrl-z", app::UndoThreadAction, None),
         ]);
         // The app draws its own 40px titlebar; Windows keeps the native resize frame.
         let options = WindowOptions {

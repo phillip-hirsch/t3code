@@ -9,6 +9,11 @@ use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 use super::{Target, Workspace};
 
+/// Every Settings section as (group heading, route id, label), for search.
+pub(super) fn settings_sections() -> impl Iterator<Item = (Option<&'static str>, &'static str, &'static str)> {
+    settings::SETTINGS.iter().flat_map(|(group, items)| items.iter().map(move |(id, label)| (*group, *id, *label)))
+}
+
 /// A page that replaces the chat in the main column (`/_chat/pull-requests`, `/_chat/usage`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Page {
