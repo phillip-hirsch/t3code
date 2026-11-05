@@ -227,7 +227,13 @@ fn dispatch_and_reload(
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = cx.update(|window, cx| match result {
                 Ok(_) => state.update(cx, |state, cx| state.load(Some(client), cx)),
-                Err(error) => notify_error(window, cx, failure, error.to_string()),
+                // The web shows the error's message, else a generic line; never the tagged form.
+                Err(crate::rpc::RpcError::Disconnected(_)) => {}
+                Err(crate::rpc::RpcError::Failure(error)) => {
+                    let message = error["message"].as_str().unwrap_or("An error occurred.").to_owned();
+                    notify_error(window, cx, failure, message)
+                }
+                Err(crate::rpc::RpcError::Defect(_)) => notify_error(window, cx, failure, "An error occurred."),
             });
         })
         .detach();

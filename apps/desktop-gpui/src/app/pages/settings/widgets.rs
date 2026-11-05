@@ -20,9 +20,10 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
@@ -99,6 +100,8 @@ pub(in crate::app) struct SettingRow {
     title: SharedString,
     description: Option<AnyElement>,
     status: Option<SharedString>,
+    /// `PolicyTooltip`: an info icon after the title explaining the setting.
+    tip: Option<SharedString>,
     body: Option<AnyElement>,
     keys: Vec<&'static str>,
     control: Control,
@@ -146,12 +149,18 @@ impl SettingRow {
             title: title.into(),
             description: None,
             status: None,
+            tip: None,
             body: None,
             keys: Vec::new(),
             control: Control::None,
             unavailable: false,
             reset: None,
         }
+    }
+
+    pub(in crate::app) fn tip(mut self, tip: impl Into<SharedString>) -> Self {
+        self.tip = Some(tip.into());
+        self
     }
 
     pub(in crate::app) fn description(mut self, description: impl IntoElement) -> Self {
@@ -666,6 +675,19 @@ impl Workspace {
         content: impl IntoIterator<Item = AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.settings_page_sized(section, view, 896., gap, content, cx)
+    }
+
+    /// [`Self::settings_page_with_gap`] at another `WorkspacePageWidth` (`max-w-6xl` is 1152px).
+    pub(in crate::app) fn settings_page_sized(
+        &mut self,
+        section: &str,
+        view: &SettingsView,
+        max_width: f32,
+        gap: f32,
+        content: impl IntoIterator<Item = AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .id("settings-page-scroll")
             .flex_1()
@@ -675,7 +697,7 @@ impl Workspace {
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(896.))
+                    .max_w(px(max_width))
                     .mx_auto()
                     .px(px(24.))
                     .pt(px(24.))
@@ -710,7 +732,7 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
-        let SettingRow { id, title, description, status, body, control, unavailable, .. } = row;
+        let SettingRow { id, title, description, status, tip, body, control, unavailable, .. } = row;
         let (state, summary) = scope::row_inheritance(&view.scope, &view.targets, &view.environment(), &keys);
         let inheritance = (server_scoped && !keys.is_empty() && !view.targets.is_empty())
             .then(|| self.render_inheritance(view, &id, &keys, state, summary, overriding, &t, cx));
@@ -733,6 +755,14 @@ impl Workspace {
         let inert = if unavailable { Some("") } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
+        let title = h_flex().gap(px(6.)).child(title).when_some(tip, |el, tip| {
+            el.child(
+                div()
+                    .id(SharedString::from(format!("{id}-tip")))
+                    .child(Icon::new(IconName::Info).size(px(14.)).text_color(t.muted_foreground))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+            )
+        });
         let mut frame = RowFrame::new(title).dimmed(unavailable).status(status);
         frame.marker = inheritance.map(|marker| {
             div()
@@ -1052,23 +1082,29 @@ impl Workspace {
             (Control::Slider { min, max, step, unit }, Some(key)) => {
                 let value = view.value(key).as_f64().unwrap_or_default() as f32;
                 let state = self.settings_slider(key, min, max, step, value, window, cx);
+                let preview = (key == "panelAnimationDurationMs").then(|| panel_preview(value, window, cx, &t));
                 h_flex()
-                    .w(px(208.))
-                    .gap(px(12.))
+                    .gap(px(16.))
+                    .children(preview)
                     .child(
-                        div()
-                            .min_w(px(48.))
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .bg(t.muted)
-                            .text_center()
-                            .font_family(t.fonts.mono)
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("{value}{unit}")),
+                        h_flex()
+                            .w(px(208.))
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .min_w(px(48.))
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
+                                    .bg(t.muted)
+                                    .text_center()
+                                    .font_family(t.fonts.mono)
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{value}{unit}")),
+                            )
+                            .child(div().flex_1().min_w_0().child(Slider::new(&state).horizontal())),
                     )
-                    .child(div().flex_1().min_w_0().child(Slider::new(&state).horizontal()))
                     .into_any_element()
             }
             _ => return None,
@@ -1193,7 +1229,7 @@ impl Workspace {
     }
 
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
-    fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let search = self.settings_ui.scope.clone();
         let workspace = cx.entity();
@@ -1208,32 +1244,7 @@ impl Workspace {
             Some(_) => "Unavailable environment".to_owned(),
             None => "All environments".to_owned(),
         };
-        // Groups come sorted by name; a name shared by several shows where each lives, and
-        // archived ones say so (`ProjectScopeMenu`).
-        let projects: Rc<Vec<ScopeProject>> = Rc::new(
-            view.groups
-                .iter()
-                .map(|group| {
-                    let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
-                    let representative = group.representative();
-                    let location =
-                        shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
-                    let secondary = match (group.archived, location) {
-                        (true, Some(location)) => Some(format!("Archived · {location}")),
-                        (true, None) => Some("Archived".to_owned()),
-                        (false, location) => location,
-                    };
-                    ScopeProject {
-                        key: group.key.clone(),
-                        name: group.display_name.clone(),
-                        secondary,
-                        icon: representative.project_icon.clone(),
-                        title: representative.title.clone(),
-                        favicon: self.favicon(representative),
-                    }
-                })
-                .collect(),
-        );
+        let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
         let environment = (view.environment_id.clone(), view.environment_label.clone());
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
@@ -1244,15 +1255,30 @@ impl Workspace {
                 });
             }
         };
-        let project_menu = {
+        let picker = self.settings_ui.project_picker.as_ref().filter(|_| projects.len() > SCOPE_MENU_LIMIT);
+        let project_menu = if let Some(picker) = picker {
+            Select::new(&picker.state)
+                .small()
+                .max_w(px(288.))
+                .search_placeholder("Search projects")
+                .empty(|_, cx| {
+                    div()
+                        .p(px(8.))
+                        .text_sm()
+                        .text_color(theme::tokens(cx).muted_foreground)
+                        .child("No matches found.")
+                        .into_any_element()
+                })
+                .menu_width(px(320.))
+                .into_any_element()
+        } else {
             let (search, workspace, projects) = (search.clone(), workspace.clone(), projects.clone());
             let icon = selected.map(|group| {
                 let project = group.representative();
                 project_icon(project.project_icon.as_ref(), &project.title, self.favicon(project), 14., &t)
             });
-            scope_trigger("settings-scope-project", icon, project_label, &t).dropdown_menu_with_anchor(
-                gpui_kit::Anchor::TopLeft,
-                move |mut menu, _, _| {
+            scope_trigger("settings-scope-project", icon, project_label, &t)
+                .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
                     menu = menu
                         .item(
                             PopupMenuItem::new("All projects")
@@ -1281,8 +1307,8 @@ impl Workspace {
                         );
                     }
                     menu.max_w(px(320.)).max_h(px(360.)).scrollable(true)
-                },
-            )
+                })
+                .into_any_element()
         };
         let environment_menu = {
             let (search, workspace) = (search.clone(), workspace.clone());
@@ -1408,6 +1434,126 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
 }
 
 /// A project group as the scope sentence's menu lists it.
+/// `ScopeMenu` turns into a searchable combobox past this many projects.
+const SCOPE_MENU_LIMIT: usize = 6;
+
+/// The searchable project scope picker, rebuilt when the project list changes.
+pub(super) struct ScopeProjectPicker {
+    keys: Vec<String>,
+    state: gpui_kit::Entity<SelectState<SearchableVec<ScopeChoice>>>,
+    _subscription: gpui_kit::Subscription,
+}
+
+/// One combobox entry: All projects (`None`) or a project group.
+#[derive(Clone)]
+pub(super) struct ScopeChoice {
+    value: SharedString,
+    project: Option<ScopeProject>,
+}
+
+impl SelectItem for ScopeChoice {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.project.as_ref().map_or_else(|| "All projects".into(), |p| p.name.clone().into())
+    }
+
+    fn value(&self) -> &SharedString {
+        &self.value
+    }
+
+    /// The label, secondary line and key contain the query.
+    fn matches(&self, query: &str) -> bool {
+        let needle = query.trim().to_lowercase();
+        let secondary = self.project.as_ref().and_then(|p| p.secondary.as_deref()).unwrap_or_default();
+        format!("{} {secondary} {}", self.title(), self.value).to_lowercase().contains(&needle)
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
+        let t = theme::tokens(cx);
+        match &self.project {
+            None => h_flex().min_w_0().child("All projects"),
+            Some(ScopeProject { name, secondary, icon, title, favicon, .. }) => {
+                h_flex().min_w_0().gap(px(8.)).child(project_icon(icon.as_ref(), title, favicon.clone(), 14., t)).child(
+                    v_flex().min_w_0().child(div().truncate().child(name.clone())).children(
+                        secondary.clone().map(|secondary| {
+                            div().truncate().text_xs().text_color(t.muted_foreground).child(secondary)
+                        }),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+impl Workspace {
+    /// Groups come sorted by name; a name shared by several shows where each lives, and
+    /// archived ones say so (`ProjectScopeMenu`).
+    fn scope_projects(&self, view: &SettingsView) -> Vec<ScopeProject> {
+        view.groups
+            .iter()
+            .map(|group| {
+                let shared = view.groups.iter().any(|o| o.key != group.key && o.display_name == group.display_name);
+                let representative = group.representative();
+                let location =
+                    shared.then(|| format!("{} · {}", view.environment_label, representative.workspace_root));
+                let secondary = match (group.archived, location) {
+                    (true, Some(location)) => Some(format!("Archived · {location}")),
+                    (true, None) => Some("Archived".to_owned()),
+                    (false, location) => location,
+                };
+                ScopeProject {
+                    key: group.key.clone(),
+                    name: group.display_name.clone(),
+                    secondary,
+                    icon: representative.project_icon.clone(),
+                    title: representative.title.clone(),
+                    favicon: self.favicon(representative),
+                }
+            })
+            .collect()
+    }
+
+    /// Keeps the searchable project picker on the current projects and scope; it needs a window,
+    /// which the scope sentence does not get.
+    pub(super) fn sync_scope_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Groups never outnumber projects, so few projects skip the grouping.
+        if self.shell.projects.len() <= SCOPE_MENU_LIMIT {
+            self.settings_ui.project_picker = None;
+            return;
+        }
+        let view = self.settings_view();
+        let projects = self.scope_projects(&view);
+        if projects.len() <= SCOPE_MENU_LIMIT {
+            self.settings_ui.project_picker = None;
+            return;
+        }
+        let selected: SharedString = self.settings_ui.scope.project.clone().unwrap_or_default().into();
+        let keys: Vec<String> = projects.iter().map(|p| p.key.clone()).collect();
+        if let Some(picker) = &self.settings_ui.project_picker
+            && picker.keys == keys
+        {
+            let state = picker.state.clone();
+            if state.read(cx).selected_value() != Some(&selected) {
+                state.update(cx, |state, cx| state.set_selected_value(&selected, window, cx));
+            }
+            return;
+        }
+        let mut choices = vec![ScopeChoice { value: SharedString::default(), project: None }];
+        choices.extend(projects.into_iter().map(|p| ScopeChoice { value: p.key.clone().into(), project: Some(p) }));
+        let index = choices.iter().position(|c| c.value == selected).map(gpui_kit::component::IndexPath::new);
+        let state = cx.new(|cx| SelectState::new(SearchableVec::new(choices), index, window, cx).searchable(true));
+        let subscription = cx.subscribe_in(&state, window, |this, _, event: &SelectEvent<_>, _, cx| {
+            let SelectEvent::Confirm(Some(value)) = event else { return };
+            let project = (!value.is_empty()).then(|| value.to_string());
+            this.settings_ui.scope = this.settings_ui.scope.with_project(project);
+            this.settings_ui.target = None;
+            cx.notify();
+        });
+        self.settings_ui.project_picker = Some(ScopeProjectPicker { keys, state, _subscription: subscription });
+    }
+}
+
 #[derive(Clone)]
 struct ScopeProject {
     key: String,
@@ -1454,4 +1600,102 @@ pub(in crate::app) fn reset_button(
         .rounded(px(4.))
         .child(Icon::new(IconName::Undo2).size(px(12.)).text_color(t.muted_foreground))
         .tooltip(tooltip.into())
+}
+
+/// Whether `PanelAnimationsPreview` shows its panels, and how many times it was clicked.
+#[derive(Default)]
+struct PanelPreview {
+    closed: bool,
+    toggles: usize,
+}
+
+/// `PanelAnimationsPreview`: a sketch of the window whose panels slide shut or open at the
+/// chosen duration on each click. It animates once per click, never continuously.
+fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, t: &Tokens) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _};
+    let state = window.use_keyed_state("panel-animation-preview", cx, |_, _| PanelPreview::default());
+    let (closed, toggles) = (state.read(cx).closed, state.read(cx).toggles);
+    let t = *t;
+    // `open` runs 1 (shown) to 0 (hidden).
+    let sketch = move |open: f32| {
+        let line = |width: f32, alpha: f32| {
+            div().h(px(2.)).w(gpui_kit::relative(width)).rounded_full().bg(t.muted_foreground.opacity(alpha))
+        };
+        h_flex()
+            .size_full()
+            .child(div().h_full().flex_none().w(px(16. * open)).rounded(px(6.)).bg(t.sidebar.background))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px(px(4.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .gap(px(4.))
+                            .pt(px(4.))
+                            .child(line(1., 0.25))
+                            .child(line(0.8, 0.2))
+                            .child(line(0.6, 0.15)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .h(px(8. * open))
+                            .overflow_hidden()
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .bg(t.foreground.opacity(0.05))
+                            .when(open > 0., |el| el.border_t_1().border_color(t.border.opacity(0.7)))
+                            .child(
+                                div()
+                                    .h(px(1.))
+                                    .w(gpui_kit::relative(0.66))
+                                    .rounded_full()
+                                    .bg(t.muted_foreground.opacity(0.25)),
+                            ),
+                    ),
+            )
+            .child(div().h_full().flex_none().w(px(20. * open)).rounded(px(6.)).bg(t.muted))
+    };
+    let target = if closed { 0. } else { 1. };
+    let body = if toggles == 0 || duration_ms <= 0. {
+        sketch(target).into_any_element()
+    } else {
+        sketch(target)
+            .with_animation(
+                ElementId::NamedInteger("panel-preview".into(), toggles as u64),
+                Animation::new(std::time::Duration::from_millis(duration_ms as u64))
+                    .with_easing(|d| 1. - (1. - d) * (1. - d)),
+                move |_, delta| sketch(if closed { 1. - delta } else { delta }),
+            )
+            .into_any_element()
+    };
+    div()
+        .id("panel-animation-preview")
+        .w(px(112.))
+        .h(px(40.))
+        .flex_none()
+        .overflow_hidden()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .p(px(4.))
+        .cursor_pointer()
+        .tooltip(|window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new("Replay panel animation preview").build(window, cx)
+        })
+        .on_click(move |_, _, cx| {
+            state.update(cx, |preview, cx| {
+                preview.closed = !preview.closed;
+                preview.toggles += 1;
+                cx.notify();
+            })
+        })
+        .child(body)
+        .into_any_element()
 }

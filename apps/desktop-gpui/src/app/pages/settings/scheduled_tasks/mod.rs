@@ -47,6 +47,13 @@ pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
         })
         .clone();
     let settings = workspace.settings_view();
+    // `scope.kind === "unavailable"`: the selection names a project or machine that is gone.
+    if let crate::settings::scope::ScopeKind::Unavailable { message } = settings.scope.kind {
+        let t = *crate::theme::tokens(cx);
+        let row = RowFrame::new(message).render(&t).into_any_element();
+        let section = section_with_action("scheduled-tasks-unavailable", "Unavailable selection", None, [row], &t);
+        return workspace.settings_page("scheduled-tasks", &settings, [section], cx);
+    }
     workspace.settings_page("scheduled-tasks", &settings, [view.into_any_element()], cx)
 }
 

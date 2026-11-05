@@ -103,6 +103,25 @@ impl Workspace {
             settings_section("background-activity", "Background activity", [background], &t),
         ];
         sections.extend(storage);
+        let environment_id = view.environment().id.to_owned();
+        let view_diagnostics = Button::new("view-diagnostics").outline().small().label("View diagnostics").on_click(
+            cx.listener(move |this, _, _, cx| {
+                this.settings_ui.scope = this.settings_ui.scope.with_machine(Some(environment_id.clone()));
+                this.select_settings_section("diagnostics", cx);
+            }),
+        );
+        let description = if view.scope.kind == crate::settings::scope::ScopeKind::Environment {
+            "Inspect processes, resource use, and logs on this environment."
+        } else {
+            "Inspect processes, resource use, and logs on one environment at a time."
+        };
+        let diagnostics = self.setting_row(
+            &view,
+            SettingRow::new("diagnostics").description(description).control(view_diagnostics),
+            window,
+            cx,
+        );
+        sections.push(settings_section("diagnostics-section", "Diagnostics", [diagnostics], &t));
         self.settings_page("maintenance", &view, sections, cx)
     }
 
@@ -230,11 +249,23 @@ impl Workspace {
             .small()
             .label("View policy")
             .on_click(|_, _, cx| cx.open_url(PRIVACY_POLICY_URL));
-        let legal = [RowFrame::new("Privacy policy")
-            .description(text(privacy))
-            .control(view_policy)
-            .render(&t)
-            .into_any_element()];
+        let view_licenses = Button::new("about-licenses")
+            .outline()
+            .small()
+            .label("View licenses")
+            .on_click(cx.listener(|this, _, _, cx| this.select_settings_section("open-source-licenses", cx)));
+        let legal = [
+            RowFrame::new("Privacy policy")
+                .description(text(privacy))
+                .control(view_policy)
+                .render(&t)
+                .into_any_element(),
+            RowFrame::new("Open source licenses")
+                .description(text("Notices for dependencies, assets, and optional tools used by T3 Code."))
+                .control(view_licenses)
+                .render(&t)
+                .into_any_element(),
+        ];
         let view = self.settings_view();
         let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
         self.settings_page("about", &view, sections, cx)
@@ -508,7 +539,7 @@ fn relative_label(iso: &str, now_ms: i64) -> String {
 }
 
 /// `formatBytes` (`apps/web/src/lib/formatBytes.ts`).
-fn format_bytes(value: f64) -> String {
+pub(super) fn format_bytes(value: f64) -> String {
     if value.round() < 1024. {
         return format!("{} B", value.round());
     }

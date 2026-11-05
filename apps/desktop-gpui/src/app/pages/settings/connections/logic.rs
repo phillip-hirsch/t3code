@@ -7,12 +7,12 @@ use serde_json::Value;
 use crate::work_log::parse_iso_ms;
 
 pub(super) const ORCHESTRATION_READ: &str = "orchestration:read";
-const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
-pub(super) const SETTINGS_WRITE: &str = "settings:write";
+pub(in crate::app::pages::settings) const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
+pub(in crate::app::pages::settings) const SETTINGS_WRITE: &str = "settings:write";
 pub(super) const PROVIDERS_MANAGE: &str = "providers:manage";
-pub(super) const ENVIRONMENT_MAINTAIN: &str = "environment:maintain";
+pub(in crate::app::pages::settings) const ENVIRONMENT_MAINTAIN: &str = "environment:maintain";
 const PREVIEW_OPERATE: &str = "preview:operate";
-pub(super) const DIAGNOSTICS_READ: &str = "diagnostics:read";
+pub(in crate::app::pages::settings) const DIAGNOSTICS_READ: &str = "diagnostics:read";
 pub(super) const TERMINAL_READ: &str = "terminal:read";
 const TERMINAL_OPERATE: &str = "terminal:operate";
 const SOURCE_CONTROL_WRITE: &str = "source-control:write";
@@ -83,7 +83,7 @@ fn legacy_parent(scope: &str) -> Option<&'static str> {
 
 /// `GET /api/auth/session` (`AuthSessionState`).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct Session {
+pub(in crate::app::pages::settings) struct Session {
     pub authenticated: bool,
     /// `auth.policy`, e.g. "loopback-browser" or "remote-reachable".
     pub policy: Option<String>,

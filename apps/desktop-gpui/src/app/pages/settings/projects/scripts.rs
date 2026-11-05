@@ -449,6 +449,33 @@ pub(super) fn scripts_after_save(
     (id, scripts)
 }
 
+/// The project's list with `input` saved as `id`, added when the project lacks it, so every
+/// checkout of a group gets the same script (`submit` writes one id to every target).
+pub(super) fn scripts_with(
+    settings: &Value,
+    project: &ProjectShell,
+    id: &str,
+    input: &ScriptInput,
+) -> Vec<ProjectScript> {
+    let saved = build_project_script(id, input);
+    let mut found = false;
+    let mut scripts: Vec<ProjectScript> = resolve_project_scripts(settings, project)
+        .into_iter()
+        .map(|script| {
+            if script.id == id {
+                found = true;
+                saved.clone()
+            } else {
+                release_claimed_roles(script, input)
+            }
+        })
+        .collect();
+    if !found {
+        scripts.push(saved);
+    }
+    scripts
+}
+
 /// Scripts `t3.json` declares that the project does not have yet, by command or name.
 pub(super) fn importable_scripts<'a>(
     file: &'a T3ProjectFile,
@@ -517,6 +544,36 @@ impl Workspace {
         })
     }
 
+    /// The checkouts an action edit writes: on the Projects settings page, every checkout of the
+    /// project's group, like the web's targets; elsewhere just the one project.
+    pub(super) fn script_targets(&self, project_id: &str) -> Vec<String> {
+        if self.settings.as_deref() != Some("projects") {
+            return vec![project_id.to_owned()];
+        }
+        self.settings_project_groups()
+            .into_iter()
+            .find(|group| group.members.iter().any(|m| m.project.id == project_id))
+            .map(|group| group.members.into_iter().map(|m| m.project.id).collect())
+            .unwrap_or_else(|| vec![project_id.to_owned()])
+    }
+
+    /// Runs one write per target in turn; each reads the settings the previous one left.
+    fn write_targets(
+        &mut self,
+        project_id: &str,
+        write: impl Fn(&mut Self, &str, &mut Context<Self>) -> Task<Result<(), String>> + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let targets = self.script_targets(project_id);
+        cx.spawn(async move |this, cx| {
+            for target in targets {
+                let task = this.update(cx, |this, cx| write(this, &target, cx)).map_err(|e| e.to_string())?;
+                task.await?;
+            }
+            Ok(())
+        })
+    }
+
     /// Saves the editor's form as `script_id`, or as a new script when `None`.
     pub(super) fn save_project_script(
         &mut self,
@@ -526,10 +583,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
-        let (id, scripts) =
-            scripts_after_save(&self.server_info.settings, &self.shell.projects, project, script_id, input);
-        let keybinding = input.keybinding.as_ref().map(Option::as_deref);
-        self.write_project_scripts(project_id, |_, _| Some(scripts), Some(&id), keybinding, cx)
+        let (id, _) = scripts_after_save(&self.server_info.settings, &self.shell.projects, project, script_id, input);
+        let input = input.clone();
+        self.write_targets(
+            project_id,
+            move |this, target, cx| {
+                let keybinding = input.keybinding.as_ref().map(Option::as_deref);
+                this.write_project_scripts(
+                    target,
+                    |settings, project| Some(scripts_with(settings, project, &id, &input)),
+                    Some(&id),
+                    keybinding,
+                    cx,
+                )
+            },
+            cx,
+        )
     }
 
     pub(super) fn delete_project_script(
@@ -539,13 +608,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let id = script_id.to_owned();
-        self.write_project_scripts(
+        self.write_targets(
             project_id,
-            |settings, project| {
-                Some(resolve_project_scripts(settings, project).into_iter().filter(|s| s.id != id).collect())
+            move |this, target, cx| {
+                let id = id.clone();
+                this.write_project_scripts(
+                    target,
+                    |settings, project| {
+                        Some(resolve_project_scripts(settings, project).into_iter().filter(|s| s.id != id).collect())
+                    },
+                    Some(id.as_str()),
+                    Some(None),
+                    cx,
+                )
             },
-            Some(script_id),
-            Some(None),
             cx,
         )
     }
@@ -556,7 +632,11 @@ impl Workspace {
         project_id: &str,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        self.write_project_scripts(project_id, |_, _| None, None, None, cx)
+        self.write_targets(
+            project_id,
+            |this, target, cx| this.write_project_scripts(target, |_, _| None, None, None, cx),
+            cx,
+        )
     }
 
     /// Shows a failed write as a toast, like `reportScriptFailure`.
@@ -639,6 +719,24 @@ mod tests {
     fn binding(command: &str, key: &str, mod_key: bool, shift: bool) -> Value {
         json!({"command": command, "shortcut": {"key": key, "modKey": mod_key, "shiftKey": shift,
             "ctrlKey": false, "metaKey": false, "altKey": false}})
+    }
+
+    #[test]
+    fn group_saves_write_one_id_to_every_checkout() {
+        let settings = json!({"projectSettingsOverrides": {
+            "a": {"defaultProjectScripts": [script("lint")]},
+            "b": {"defaultProjectScripts": [script("test")]},
+        }});
+        let input = ScriptInput { name: "Lint".into(), command: "bun lint".into(), ..Default::default() };
+        let ids = |scripts: Vec<ProjectScript>| scripts.into_iter().map(|s| (s.id, s.command)).collect::<Vec<_>>();
+        assert_eq!(
+            ids(scripts_with(&settings, &project("a", vec![]), "lint", &input)),
+            [("lint".into(), "bun lint".into())]
+        );
+        assert_eq!(
+            ids(scripts_with(&settings, &project("b", vec![]), "lint", &input)),
+            [("test".into(), "run test".into()), ("lint".into(), "bun lint".into())]
+        );
     }
 
     #[test]

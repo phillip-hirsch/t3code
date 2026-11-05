@@ -245,6 +245,7 @@ impl Workspace {
                         if let Some(mode) = sent_mode {
                             this.remember_interaction_mode(origin.clone(), mode);
                         }
+                        this.record_prompt_sent(window, cx);
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {
                             // A background launch leaves a fresh draft in its place.

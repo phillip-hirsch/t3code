@@ -28,7 +28,9 @@ pub(super) fn success() -> Hsla {
     rgb(0x00bc7d).into()
 }
 
-pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
+pub(in crate::app::pages::settings) fn tooltip(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
     let text = text.into();
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
@@ -65,7 +67,7 @@ pub(super) fn glyph(path: &'static str, size: f32, color: Hsla) -> AnyElement {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Variant {
+pub(in crate::app::pages::settings) enum Variant {
     Primary,
     Outline,
     DestructiveOutline,
@@ -75,7 +77,7 @@ pub(super) enum Variant {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Size {
+pub(in crate::app::pages::settings) enum Size {
     /// `size="xs"`: 24px tall, text-xs.
     Xs,
     /// The default 32px button, used in dialog footers.
@@ -86,7 +88,7 @@ type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// `Button` from `ui/button.tsx` for the variants and sizes these sections use.
 #[derive(IntoElement)]
-pub(super) struct WebButton {
+pub(in crate::app::pages::settings) struct WebButton {
     id: ElementId,
     label: SharedString,
     icon: Option<gpui_kit::assets::IconName>,

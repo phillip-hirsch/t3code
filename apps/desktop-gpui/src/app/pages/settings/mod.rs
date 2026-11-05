@@ -7,16 +7,19 @@ mod chat;
 pub(in crate::app) mod code;
 mod connections;
 mod desktop_rows;
+mod diagnostics;
 mod diffs;
 mod fields;
 mod general;
 pub(in crate::app) mod keybindings;
+mod licenses;
 mod model_select;
 
 mod providers;
 pub(in crate::app) use providers::chatgpt_usage_button;
 mod search;
 mod snap_shot;
+mod star_prompt;
 mod system;
 mod theme_library;
 mod typography;
@@ -73,6 +76,21 @@ pub(in crate::app) const SETTINGS: &[(Option<&str>, &[(&str, &str)])] = &[
     (Some("Connections"), &[("connections", "Environments"), ("access", "Sharing & access"), ("secrets", "Secrets")]),
     (None, &[("maintenance", "Maintenance"), ("labs", "Labs"), ("about", "About"), ("archived", "Archive")]),
 ];
+
+/// `isSecretsFeatureEnabled`: the web's build flag `T3CODE_FEATURE_SECRETS`, read here from
+/// the environment. Off, the Secrets section and its search items do not exist.
+pub(in crate::app) fn secrets_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let flag = std::env::var("T3CODE_FEATURE_SECRETS").unwrap_or_default();
+        matches!(flag.trim().to_lowercase().as_str(), "1" | "true")
+    })
+}
+
+/// Whether a section exists in this build (`SETTINGS_NAV_GROUPS` drops Secrets without the flag).
+pub(in crate::app) fn section_enabled(id: &str) -> bool {
+    id != "secrets" || secrets_enabled()
+}
 
 /// Pages without a nav entry: id, breadcrumb label, and the section highlighted for them
 /// (`SETTINGS_DETAIL_PAGE_PARENTS`).
@@ -140,6 +158,9 @@ pub(in crate::app) struct SettingsUi {
     advanced_open: HashSet<&'static str>,
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
+    project_picker: Option<widgets::ScopeProjectPicker>,
+    /// `GitHubStarPrompt`'s once-per-session guard.
+    star_prompt_shown: bool,
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
@@ -174,6 +195,8 @@ impl SettingsUi {
             open_marker: None,
             advanced_open: HashSet::new(),
             font_pickers: HashMap::new(),
+            star_prompt_shown: false,
+            project_picker: None,
             last_grouping_mode: "repository",
             focus: cx.focus_handle(),
             focus_on_render: false,
@@ -294,6 +317,7 @@ impl Workspace {
             window.focus(&self.settings_ui.focus, cx);
         }
         let t = *theme::tokens(cx);
+        self.sync_scope_project_picker(window, cx);
         let content = self.render_settings_section(&section, window, cx);
         Some(
             div()
@@ -417,7 +441,7 @@ impl Workspace {
         self.settings_ui.focus_on_render = true;
     }
 
-    fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
+    pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
         self.settings_ui.target = None;
         self.settings_ui.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.open_settings(id, cx);
@@ -551,7 +575,7 @@ impl Workspace {
                                 .text_color(sb.muted_foreground.opacity(0.8))
                                 .child(heading)
                         }))
-                        .children(items.iter().map(|(id, label)| {
+                        .children(items.iter().filter(|(id, _)| section_enabled(id)).map(|(id, label)| {
                             let id: &'static str = id;
                             let active = nav_section(section) == id;
                             h_flex()
@@ -722,12 +746,14 @@ impl Workspace {
             "worktrees" => self.render_settings_worktrees(window, cx),
             "connections" => self.render_settings_connections(window, cx),
             "access" => self.render_settings_access(window, cx),
-            "secrets" => self.render_settings_secrets(window, cx),
-            // Diagnostics opens from Maintenance; its section agent gives it a page of its own.
-            "maintenance" | "diagnostics" => self.render_settings_maintenance(window, cx),
+            // The web redirects the route to General without the feature flag.
+            "secrets" if secrets_enabled() => self.render_settings_secrets(window, cx),
+            "maintenance" => self.render_settings_maintenance(window, cx),
+            "diagnostics" => self.render_settings_diagnostics(window, cx),
             "labs" => self.render_settings_labs(window, cx),
             "about" => self.render_settings_about(window, cx),
             "archived" => self.render_settings_archived(window, cx),
+            "open-source-licenses" => self.render_settings_licenses(window, cx),
             _ => self.render_settings_general(window, cx),
         }
     }

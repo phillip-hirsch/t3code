@@ -262,6 +262,7 @@ impl Workspace {
             },
         );
         let health = SettingRow::new("provider-health-check-interval")
+            .tip("This interval is configured here, then the shared Background activity policy decides whether provider probes may run when the timer fires. Custom intervals appear as Advanced in Maintenance settings.")
             .description("Refresh provider status, versions, and models in the background. Set to 0 to disable.")
             .reset(reset_health)
             .control(

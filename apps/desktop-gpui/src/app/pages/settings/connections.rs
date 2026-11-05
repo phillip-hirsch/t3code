@@ -14,10 +14,10 @@
 mod access;
 mod environments;
 mod exposure;
-mod logic;
+pub(super) mod logic;
 mod saved;
 mod secrets;
-mod ui;
+pub(super) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -52,7 +52,11 @@ impl Workspace {
 }
 
 /// Calls one of the server's `/api/auth/*` routes with this client's bearer session.
-async fn auth_request(endpoint: Option<Endpoint>, path: &'static str, body: Option<Value>) -> Result<Value, String> {
+pub(super) async fn auth_request(
+    endpoint: Option<Endpoint>,
+    path: &'static str,
+    body: Option<Value>,
+) -> Result<Value, String> {
     let endpoint = endpoint.ok_or("Not connected to the environment.")?;
     let request = async move {
         let client = reqwest::Client::new();
