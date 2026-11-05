@@ -355,6 +355,10 @@ impl Workspace {
             .filter_map(|s| s.id.clone())
             .filter(|id| !listed.contains(id))
             .collect();
+        // A thread or draft on a machine that left has nowhere to go.
+        if self.target.as_ref().is_some_and(|t| removed.contains(t.environment())) {
+            self.close_thread(window, cx);
+        }
         for id in &removed {
             self.sessions.retain(|s| !s.is(id));
             self.shell.remove_environment(id);
@@ -436,13 +440,16 @@ impl Workspace {
     /// scope's environment (`useSettingsScope().environment`), the primary on device pages.
     fn settings_index(&self) -> usize {
         let device = self.settings.as_deref().is_some_and(super::pages::settings::device_only);
-        self.settings_ui
-            .scope
-            .machine
-            .as_deref()
-            .filter(|_| !device)
-            .and_then(|id| self.session_index(id))
-            .filter(|&index| self.sessions[index].is_connected())
+        if device {
+            return PRIMARY;
+        }
+        let connected = |index: &usize| self.sessions[*index].is_connected();
+        let picked = self.settings_ui.scope.machine.as_deref().and_then(|id| self.session_index(id));
+        // `selectScopedSettingsEnvironments`: the primary while connected, else the first connected.
+        picked
+            .filter(connected)
+            .or_else(|| Some(PRIMARY).filter(connected))
+            .or_else(|| (0..self.sessions.len()).find(connected))
             .unwrap_or(PRIMARY)
     }
 
