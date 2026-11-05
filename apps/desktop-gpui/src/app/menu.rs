@@ -3,8 +3,9 @@
 //! View › Toggle Full Screen, Window and Help. Windows and Linux hide Electron's menu bar,
 //! so they get none.
 //!
-//! Quit has no key binding here: ⌘Q goes through the workspace's hold-to-quit gate
-//! (`confirmQuit`), which a menu key equivalent would bypass.
+//! Inside a window, ⌘Q goes through the workspace's hold-to-quit gate (`confirmQuit`), so Quit's
+//! key binding only matches outside every window's `Root` context. It still becomes the menu's
+//! ⌘Q, which quits directly when no window has focus, like Electron's `role: "quit"`.
 
 use gpui_kit::component::input;
 use gpui_kit::{
@@ -52,6 +53,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-cmd-h", HideOtherApps, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-q", QuitApp, Some("!Root")),
     ]);
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOtherApps, cx| cx.hide_other_apps());
