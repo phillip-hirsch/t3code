@@ -126,12 +126,7 @@ impl LaunchConfig {
             Some(path) => (PathBuf::from(path), user_home()?),
             None => (default_server_entry()?, repo_root()),
         };
-        // Separate from the Electron app's `~/.t3` until this client reaches parity,
-        // so both can run at once without fighting over the state directory.
-        let home = match std::env::var_os("T3CODE_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => user_home()?.join(".t3-gpui"),
-        };
+        let home = crate::settings::t3_home().context("no home directory; set T3CODE_HOME")?;
         Ok(Self { node, server_entry, home, cwd })
     }
 }

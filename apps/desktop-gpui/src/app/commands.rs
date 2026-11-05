@@ -3,7 +3,7 @@
 //! `useChatShortcuts.ts` and its groups, `Sidebar.tsx`, `UsagePage.tsx`,
 //! `ModelPickerContent.tsx`). A handler returns `false` to leave the key to whatever
 //! is focused, as the web's handlers do. Commands this client has no surface for
-//! (`composer.stash`, `composer.host`, …) fall through the same way.
+//! (`composer.host`, …) fall through the same way.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;

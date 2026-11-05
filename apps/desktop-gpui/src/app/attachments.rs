@@ -335,7 +335,7 @@ impl Workspace {
         let state = self.composer.read(cx);
         let selected = state.selected_range();
         let value = state.value();
-        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected.clone()]);
+        let kept = composer_text::js_length(&value) - composer_text::js_length(&value[selected]);
         let would_exceed = kept + composer_text::js_length(text) > composer_text::MAX_INPUT_CHARS;
         if !composer_text::paste_folds(text, would_exceed) {
             return false;
