@@ -22,8 +22,8 @@ impl Workspace {
         self.render_threads_settings(window, cx)
     }
 
-    pub(super) fn render_settings_browser(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_agent_browser_access(cx)
+    pub(super) fn render_settings_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_agent_browser_access(window, cx)
     }
 
     pub(super) fn render_settings_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

@@ -18,9 +18,10 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::hosts::{self, EasHost, PlatformAvailability, SimlockHost, SshHost, TokenEntry};
+use super::hosts::{self, EasHost, SimlockHost, SshHost, TokenEntry};
 use super::{failure_message, muted_text, notify_error, outline_button, test_host, update_settings};
 use crate::app::Workspace;
+use crate::device::PlatformAvailability;
 use crate::rpc::RpcClient;
 use crate::theme::{FONT_MONO, Tokens, tokens};
 

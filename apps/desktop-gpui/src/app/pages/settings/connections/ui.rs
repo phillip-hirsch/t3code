@@ -1,6 +1,5 @@
-//! Private stand-ins for the web's settings layout (`settingsLayout.tsx`,
-//! `FoldedSettingsSection.tsx`, `itemRows.ts`) and `ui/button.tsx`, until the
-//! shared settings widgets land.
+//! Small UI pieces the Connections, Access and Secrets sections share: text sizes, status dots,
+//! glyphs, item rows (`itemRows.ts`) and the web's `Button` (`ui/button.tsx`).
 
 use std::rc::Rc;
 
@@ -11,8 +10,6 @@ use gpui_kit::{
     AnyElement, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled, Window, div, px, rgb, svg,
 };
-
-use crate::theme::Tokens;
 
 pub(super) fn text_xs<E: Styled>(el: E) -> E {
     el.text_size(px(12.)).line_height(px(16.))
@@ -34,118 +31,6 @@ pub(super) fn success() -> Hsla {
 pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
     let text = text.into();
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
-}
-
-/// `SettingsPageContainer`: the scrolling page, 896px wide at most, sections 32px apart.
-pub(super) fn page(id: &'static str, children: impl IntoIterator<Item = AnyElement>) -> AnyElement {
-    div()
-        .id(id)
-        .size_full()
-        .overflow_y_scroll()
-        .child(
-            v_flex()
-                .mx_auto()
-                .w_full()
-                .max_w(px(896.))
-                .px(px(24.))
-                .pt(px(24.))
-                .pb(px(48.))
-                .gap(px(32.))
-                .children(children),
-        )
-        .into_any_element()
-}
-
-/// `SettingsGroup`: the rounded card, rows divided by hairlines.
-pub(super) fn group(t: &Tokens) -> Div {
-    v_flex()
-        .rounded(px(12.))
-        .border_1()
-        .border_color(t.border.opacity(0.6))
-        .bg(t.card.opacity(0.4))
-        .text_color(t.foreground)
-}
-
-/// Adds the group's top hairline to every child after the first.
-pub(super) fn divided(children: Vec<AnyElement>, t: &Tokens) -> Vec<AnyElement> {
-    children
-        .into_iter()
-        .enumerate()
-        .map(|(index, child)| {
-            if index == 0 {
-                child
-            } else {
-                div().border_t_1().border_color(t.border.opacity(0.5)).child(child).into_any_element()
-            }
-        })
-        .collect()
-}
-
-/// `SettingsSection`: a header with an optional icon and action over a group card.
-pub(super) fn section(
-    title: impl Into<SharedString>,
-    icon: Option<AnyElement>,
-    action: Option<AnyElement>,
-    rows: Vec<AnyElement>,
-    t: &Tokens,
-) -> AnyElement {
-    v_flex()
-        .gap(px(10.))
-        .child(
-            h_flex()
-                .min_h(px(28.))
-                .px(px(16.))
-                .gap(px(16.))
-                .justify_between()
-                .child(
-                    h_flex()
-                        .min_h(px(28.))
-                        .gap(px(8.))
-                        .text_size(px(16.))
-                        .line_height(px(24.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.foreground)
-                        .children(icon)
-                        .child(title.into()),
-                )
-                .child(h_flex().min_h(px(28.)).min_w(px(28.)).justify_end().children(action)),
-        )
-        .child(group(t).children(divided(rows, t)))
-        .into_any_element()
-}
-
-/// `SettingsRow`: title (with the reset slot), description and status on the left, control on the right.
-pub(super) fn row(
-    title: impl IntoElement,
-    description: Option<AnyElement>,
-    status: Option<AnyElement>,
-    control: Option<AnyElement>,
-    t: &Tokens,
-) -> Div {
-    h_flex()
-        .px(px(16.))
-        .py(px(12.))
-        .gap(px(32.))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(4.))
-                .child(
-                    h_flex()
-                        .min_h(px(20.))
-                        .gap(px(6.))
-                        .child(text_sm(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground)).child(title))
-                        .child(div().size(px(20.)).flex_none()),
-                )
-                .when_some(description, |el, description| {
-                    el.child(text_xs(div().max_w(px(672.)).text_color(t.muted_foreground)).child(description))
-                })
-                .when_some(status, |el, status| {
-                    el.child(text_xs(div().pt(px(2.)).text_color(t.muted_foreground)).child(status))
-                }),
-        )
-        .when_some(control, |el, control| el.child(h_flex().flex_none().gap(px(8.)).justify_end().child(control)))
 }
 
 /// `ITEM_ROW_CLASSNAME` + `ITEM_ROW_INNER_CLASSNAME`: details left, actions right.

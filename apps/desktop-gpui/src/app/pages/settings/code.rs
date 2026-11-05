@@ -4,8 +4,6 @@ use gpui_kit::{AnyElement, Context, Window};
 
 use crate::app::Workspace;
 
-#[path = "pending.rs"]
-pub(super) mod pending;
 #[path = "source_control.rs"]
 mod source_control;
 #[path = "worktrees.rs"]

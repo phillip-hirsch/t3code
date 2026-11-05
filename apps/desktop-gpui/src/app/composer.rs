@@ -442,7 +442,7 @@ impl Workspace {
     }
 
     pub(super) fn default_runtime_mode(&self) -> &str {
-        self.server_info.default_runtime_mode.as_deref().unwrap_or(DEFAULT_RUNTIME_MODE)
+        self.server_info.settings.get("defaultRuntimeMode").as_str().unwrap_or(DEFAULT_RUNTIME_MODE)
     }
 
     pub(super) fn runtime_mode(&self) -> String {

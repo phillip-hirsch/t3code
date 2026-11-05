@@ -30,8 +30,8 @@ mod context_strip;
 mod details;
 mod git;
 mod header;
-pub(crate) mod keymap;
 mod inspector;
+pub(crate) mod keymap;
 mod layout;
 mod message_actions;
 mod minimap;
@@ -39,17 +39,25 @@ mod model_picker;
 mod pages;
 mod palette;
 mod preview;
-mod send;
 mod right_panel;
+mod send;
 mod sidebar;
-mod thread_menu;
 mod terminal;
+mod thread_menu;
 mod titlebar;
 mod visits;
 
 gpui_kit::actions!(
     workspace,
-    [ToggleSidebar, ToggleThreadDetails, ToggleRightPanel, TogglePalette, NewThread, NewThreadInProject, UndoThreadAction]
+    [
+        ToggleSidebar,
+        ToggleThreadDetails,
+        ToggleRightPanel,
+        TogglePalette,
+        NewThread,
+        NewThreadInProject,
+        UndoThreadAction
+    ]
 );
 pub use preview::TogglePreview;
 
@@ -96,8 +104,6 @@ pub struct Workspace {
     connection: Connection,
     /// The server the socket talks to, for its HTTP routes (`/api/auth/*`).
     endpoint: Option<backend::Endpoint>,
-    /// The connected server's HTTP origin, for signed asset URLs.
-    http_base: Option<String>,
     server: Option<ServerHandle>,
     server_info: ServerInfo,
     shell: ShellState,
@@ -187,8 +193,6 @@ pub struct Workspace {
     installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
     /// Settings → Keybindings, created the first time it opens.
     keybindings_panel: Option<gpui_kit::AnyView>,
-    /// Open "Advanced" folds in Settings sections, by section id.
-    settings_folds: HashSet<&'static str>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
@@ -239,7 +243,6 @@ impl Workspace {
         Self {
             connection: Connection::Starting,
             endpoint: None,
-            http_base: None,
             server: None,
             server_info: ServerInfo::default(),
             shell: ShellState::default(),
@@ -302,7 +305,6 @@ impl Workspace {
             devices: Default::default(),
             installed_keybindings: Rc::default(),
             keybindings_panel: None,
-            settings_folds: HashSet::new(),
             palette: None,
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
@@ -381,7 +383,6 @@ impl Workspace {
                         let remote = !current.renewable();
                         if this
                             .update_in(cx, |this, window, cx| {
-                                this.http_base = Some(current.http_base.clone());
                                 this.environment_remote = remote;
                                 this.endpoint = Some(current);
                                 this.on_connected(client.clone(), window, cx)
@@ -449,6 +450,11 @@ impl Workspace {
             Connection::Connected(client) => Some(client.clone()),
             _ => None,
         }
+    }
+
+    /// The connected server's HTTP origin, for its routes and signed asset URLs.
+    fn http_base(&self) -> Option<&str> {
+        self.endpoint.as_ref().map(|e| e.http_base.as_str())
     }
 
     fn on_connected(&mut self, client: RpcClient, window: &mut Window, cx: &mut Context<Self>) {
@@ -740,7 +746,7 @@ impl Workspace {
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let thread_id = projection.thread.id.clone();
-        let command = if self.server_info.thread_stop {
+        let command = if self.server_info.capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };

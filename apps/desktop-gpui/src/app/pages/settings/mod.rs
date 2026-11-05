@@ -7,11 +7,13 @@ mod chat;
 pub(in crate::app) mod code;
 mod connections;
 mod diffs;
+mod fields;
 mod general;
+mod keybindings;
+mod model_select;
+
 mod providers;
 mod search;
-mod keybindings;
-mod placeholder;
 mod snap_shot;
 mod system;
 mod widgets;
@@ -483,9 +485,9 @@ impl Workspace {
                                     cx.notify();
                                 }
                             }))
-                            .on_click(
-                                cx.listener(move |this, _, window, cx| this.open_settings_search_result(&open, window, cx)),
-                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_settings_search_result(&open, window, cx)
+                            }))
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(
                                 v_flex()

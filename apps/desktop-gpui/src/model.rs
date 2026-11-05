@@ -317,25 +317,14 @@ impl Provider {
 pub struct ServerInfo {
     pub providers: Vec<Provider>,
     pub default_model_selection: Option<ModelSelection>,
-    pub default_runtime_mode: Option<String>,
-    pub thread_stop: bool,
-    /// `orchestration.subscribeCommandOutput` streams a command's output.
-    pub command_output_streaming: bool,
     /// The environment's name, e.g. the machine's host name.
     pub environment_label: Option<String>,
     platform_machine: Option<String>,
-    environment_icon: Option<String>,
-    /// Settings that pick a new thread's workspace; see `crate::new_thread`.
-    pub default_thread_env_mode: Option<String>,
-    pub new_worktrees_start_from_origin: Option<bool>,
-    pub project_settings_folded: bool,
-    /// `projectSettingsOverrides`, keyed by project id.
-    pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
     /// The full `ServerSettings` over the contract's defaults; see `crate::settings`.
     pub settings: crate::settings::Settings,
     pub environment_id: Option<String>,
-    /// The raw `config` of the last snapshot, its `settings` kept current by `settingsUpdated`.
+    /// The raw `config` of the last snapshot; read `settings` and `capabilities` instead of its copies.
     pub config: Value,
     /// The raw `ServerProvider` records, for settings pages that edit them.
     pub providers_json: Vec<Value>,
@@ -347,33 +336,14 @@ pub struct ServerInfo {
     pub keybindings_config_path: Option<String>,
     /// `config.availableEditors`, editor ids that can open a path on the server's host.
     pub available_editors: Vec<String>,
-    /// `snoozePresets`; null means the defaults (`crate::inbox::snooze_presets`).
-    pub snooze_presets: Value,
-    /// Where "Add project" starts browsing; empty means `~/`.
-    pub add_project_base_directory: String,
-    /// `capabilities.projectOrganization`: the server keeps project pin and archive.
-    pub project_organization: bool,
     /// The "No project" workspace; a project rooted there is the scratch project.
     pub scratch_workspace_root: Option<String>,
-    /// `environment.capabilities.oneTimeSchedules`: the server saves `{type: "once"}` tasks.
-    pub one_time_schedules: bool,
     /// `ManagedPolicySummary`, or null when no administrator policy applies.
     pub managed_policy: Value,
     /// `settings.providerInstances`, keyed by instance id.
     pub provider_instances: Value,
-    /// `ResolvedKeybindingsConfig` as sent, for project actions' shortcut labels and edits.
-    pub keybindings_json: Value,
-    /// `environment.capabilities.projectSettingsOverrides`; older servers keep scripts in `projectScriptOverrides`.
-    pub project_settings_overrides_capability: bool,
     /// Model picker favorites as `(instanceId, model)`.
     pub favorites: Vec<(String, String)>,
-    /// `providerModelPreferences`, keyed by instance id.
-    pub model_preferences: Value,
-    /// `environment.capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
-    pub file_upload_limit: Option<u64>,
-    /// `settings.confirmThreadArchive` / `confirmThreadDelete`.
-    pub confirm_thread_archive: bool,
-    pub confirm_thread_delete: bool,
 }
 
 impl ServerInfo {
@@ -385,11 +355,6 @@ impl ServerInfo {
                 self.providers = lossy(&config["providers"])?;
                 self.providers_json = config["providers"].as_array().cloned().unwrap_or_default();
                 self.apply_settings(&config["settings"])?;
-                self.thread_stop =
-                    config.pointer("/environment/capabilities/threadStop").and_then(Value::as_bool) == Some(true);
-                self.command_output_streaming =
-                    config.pointer("/environment/capabilities/commandOutputStreaming").and_then(Value::as_bool)
-                        == Some(true);
                 let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
                 self.environment_label = text("/environment/label");
                 self.environment_id = text("/environment/environmentId");
@@ -403,56 +368,31 @@ impl ServerInfo {
                     .as_array()
                     .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
                     .unwrap_or_default();
-                self.project_organization =
-                    config.pointer("/environment/capabilities/projectOrganization").and_then(Value::as_bool)
-                        == Some(true);
                 self.scratch_workspace_root = text("/scratchWorkspaceRoot");
-                self.one_time_schedules =
-                    config.pointer("/environment/capabilities/oneTimeSchedules").and_then(Value::as_bool) == Some(true);
                 self.managed_policy = config.get("managedPolicy").cloned().unwrap_or_default();
-                self.keybindings_json = config["keybindings"].clone();
-                self.project_settings_overrides_capability =
-                    config.pointer("/environment/capabilities/projectSettingsOverrides").and_then(Value::as_bool)
-                        == Some(true);
-                self.file_upload_limit =
-                    config.pointer("/environment/capabilities/fileAttachments/maxUploadBytes").and_then(Value::as_u64);
             }
             "keybindingsUpdated" => {
-                self.keybindings = Rc::new(crate::keybindings::decode_rules(&event["payload"]["keybindings"]));
-                self.keybindings_json = event["payload"]["keybindings"].clone();
+                let keybindings = &event["payload"]["keybindings"];
+                self.keybindings = Rc::new(crate::keybindings::decode_rules(keybindings));
+                if let Some(config) = self.config.as_object_mut() {
+                    config.insert("keybindings".into(), keybindings.clone());
+                }
             }
             "providerStatuses" => {
                 self.providers = lossy(&event["payload"]["providers"])?;
                 self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
             }
-            "settingsUpdated" => self.set_settings(&event["payload"]["settings"])?,
+            "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
             _ => {}
         }
         Ok(())
     }
 
-    /// Takes a full `ServerSettings`, from `settingsUpdated` or `server.updateSettings`.
-    pub fn set_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
-        self.apply_settings(settings)?;
-        if let Some(config) = self.config.as_object_mut() {
-            config.insert("settings".into(), settings.clone());
-        }
-        Ok(())
-    }
-
+    /// Takes a full `ServerSettings`, from a snapshot, `settingsUpdated` or `server.updateSettings`.
     pub fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
         self.settings = crate::settings::Settings::layered(&crate::settings::contract().server_defaults, settings);
         self.default_model_selection =
             Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
-        self.default_runtime_mode = settings.get("defaultRuntimeMode").and_then(Value::as_str).map(str::to_owned);
-        self.environment_icon = settings.get("environmentIcon").and_then(Value::as_str).map(str::to_owned);
-        self.default_thread_env_mode = settings.get("defaultThreadEnvMode").and_then(Value::as_str).map(str::to_owned);
-        self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
-        self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
-        self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
-        self.snooze_presets = settings.get("snoozePresets").cloned().unwrap_or_default();
-        self.add_project_base_directory =
-            settings.get("addProjectBaseDirectory").and_then(Value::as_str).unwrap_or_default().to_owned();
         self.provider_instances = settings.get("providerInstances").cloned().unwrap_or_default();
         self.favorites = settings
             .get("favorites")
@@ -461,9 +401,6 @@ impl ServerInfo {
             .flatten()
             .filter_map(|f| Some((f.get("provider")?.as_str()?.to_owned(), f.get("model")?.as_str()?.to_owned())))
             .collect();
-        self.model_preferences = settings.get("providerModelPreferences").cloned().unwrap_or_default();
-        self.confirm_thread_archive = settings.get("confirmThreadArchive").and_then(Value::as_bool) == Some(true);
-        self.confirm_thread_delete = settings.get("confirmThreadDelete").and_then(Value::as_bool) != Some(false);
         Ok(())
     }
 
@@ -471,9 +408,19 @@ impl ServerInfo {
         self.capabilities.get(name).and_then(Value::as_bool) == Some(true)
     }
 
+    /// `capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
+    pub fn file_upload_limit(&self) -> Option<u64> {
+        self.capabilities.pointer("/fileAttachments/maxUploadBytes").and_then(Value::as_u64)
+    }
+
+    /// `ResolvedKeybindingsConfig` as sent, for project actions' shortcut labels and edits.
+    pub fn keybindings_json(&self) -> &Value {
+        &self.config["keybindings"]
+    }
+
     /// `resolveEnvironmentMachineKind` in `packages/contracts/src/server.ts`.
     pub fn machine_kind(&self) -> &str {
-        self.environment_icon.as_deref().or(self.platform_machine.as_deref()).unwrap_or("server")
+        self.settings.get("environmentIcon").as_str().or(self.platform_machine.as_deref()).unwrap_or("server")
     }
 
     /// Every model of every usable provider, labelled for a picker.
@@ -1655,7 +1602,7 @@ mod tests {
             "environment": {"capabilities": {"threadStop": true}}
         }}))
         .unwrap();
-        assert!(info.thread_stop);
+        assert!(info.capability("threadStop"));
         assert_eq!(info.providers.len(), 2, "an undecodable provider is skipped");
         let selection = info.new_thread_model(None).unwrap();
         assert_eq!((selection.instance_id.as_str(), selection.model.as_str()), ("claude", "opus"));

@@ -9,13 +9,12 @@
 
 mod actions;
 mod defaults;
-mod rows;
-mod script_editor;
-pub(in crate::app) mod scripts;
 mod favicon_picker;
 mod groups;
 mod icon;
 mod icon_picker;
+mod script_editor;
+pub(in crate::app) mod scripts;
 
 use std::rc::Rc;
 
@@ -37,6 +36,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
+use crate::app::pages::settings::widgets::{RowFrame, card, reset_button, settings_section};
 use crate::app::{Target, Workspace, new_id};
 use crate::theme::{self, Tokens};
 
@@ -184,7 +184,7 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
-        section(Some("Project"), vec![v_flex().p_1().gap_px().children(items).into_any_element()], &tokens)
+        settings_section("project", "Project", [v_flex().p_1().gap_px().children(items).into_any_element()], &tokens)
     }
 
     fn settings_project_groups(&self, panel: &Entity<ProjectsPanel>, cx: &App) -> Vec<ProjectGroup> {
@@ -531,17 +531,21 @@ impl Workspace {
 
         let name_reset = can_reset_scratch_title.then(|| {
             let ids = ids.clone();
-            reset_button("reset-project-name", false, &tokens).on_click(cx.listener(move |this, _, window, cx| {
-                let update = json!({"title": groups::SCRATCH_PROJECT_TITLE});
-                this.update_projects(ids.clone(), update, "Failed to rename project", window, cx, |_, _| {});
-            }))
+            reset_button(&"reset-project-name".into(), "Reset to default", cx).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    let update = json!({"title": groups::SCRATCH_PROJECT_TITLE});
+                    this.update_projects(ids.clone(), update, "Failed to rename project", window, cx, |_, _| {});
+                },
+            ))
         });
         let icon_reset = icon_customized.then(|| {
             let (ids, panel) = (ids.clone(), panel.clone());
             let update = groups::default_icon_update(representative.is_scratch);
-            reset_button("reset-project-icon", saving_icon, &tokens).on_click(cx.listener(
-                move |this, _, window, cx| this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx),
-            ))
+            reset_button(&"reset-project-icon".into(), "Reset to default", cx).disabled(saving_icon).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx)
+                }),
+            )
         });
 
         let icon_controls = {
@@ -628,30 +632,23 @@ impl Workspace {
         };
 
         let mut overview = vec![
-            row(
-                "Name",
-                Some("The shared name for this project group in the sidebar and thread lists.".into()),
-                name_reset.map(IntoElement::into_any_element),
-                Some(div().w(px(256.)).child(Input::new(&name).small()).into_any_element()),
-                None,
-                &tokens,
-            ),
-            row(
-                "Project icon",
-                Some(
-                    icon::describe(
-                        representative.project.project_icon.as_ref(),
-                        representative.project.favicon_path.as_deref(),
-                    )
-                    .into(),
-                ),
-                icon_reset.map(IntoElement::into_any_element),
-                Some(icon_controls.into_any_element()),
-                None,
-                &tokens,
-            ),
+            RowFrame::new("Name")
+                .description("The shared name for this project group in the sidebar and thread lists.")
+                .reset(name_reset.map(IntoElement::into_any_element))
+                .control(div().w(px(256.)).child(Input::new(&name).small()).into_any_element())
+                .render(&tokens)
+                .into_any_element(),
+            RowFrame::new("Project icon")
+                .description(icon::describe(
+                    representative.project.project_icon.as_ref(),
+                    representative.project.favicon_path.as_deref(),
+                ))
+                .reset(icon_reset.map(IntoElement::into_any_element))
+                .control(icon_controls.into_any_element())
+                .render(&tokens)
+                .into_any_element(),
         ];
-        if self.server_info.project_organization {
+        if self.server_info.capability("projectOrganization") {
             let pin = {
                 let (panel, all_ids) = (panel.clone(), all_ids.clone());
                 Switch::new("pin-project").checked(group.pinned).disabled(organizing).on_click(cx.listener(
@@ -681,29 +678,24 @@ impl Workspace {
                         );
                     }))
             };
-            overview.push(row(
-                "Pin",
-                Some("Pinned projects come first in project pickers.".into()),
-                None,
-                Some(pin.into_any_element()),
-                None,
-                &tokens,
-            ));
-            overview.push(row(
-                "Archive",
-                Some(
-                    if archived {
+            overview.push(
+                RowFrame::new("Pin")
+                    .description("Pinned projects come first in project pickers.")
+                    .control(pin.into_any_element())
+                    .render(&tokens)
+                    .into_any_element(),
+            );
+            overview.push(
+                RowFrame::new("Archive")
+                    .description(if archived {
                         "Hidden from project pickers. Threads and files are kept."
                     } else {
                         "Hides the project from project pickers. Threads and files are kept."
-                    }
-                    .into(),
-                ),
-                None,
-                Some(archive.into_any_element()),
-                None,
-                &tokens,
-            ));
+                    })
+                    .control(archive.into_any_element())
+                    .render(&tokens)
+                    .into_any_element(),
+            );
         }
 
         let checkouts = self.render_checkouts(panel, selection, window, cx);
@@ -724,7 +716,7 @@ impl Workspace {
         v_flex()
             .gap_6()
             .child(alert)
-            .child(section(None, overview, &tokens))
+            .child(card(overview, &tokens))
             .child(self.render_project_defaults(&project_id, window, cx))
             .child(self.render_project_actions(&project_id, window, cx))
             .child(checkouts)
@@ -803,16 +795,15 @@ impl Workspace {
                         this.remove_project_members(&panel, &scoped, vec![member.clone()], window, cx)
                     }))
             });
-            rows.push(row(
-                &environment,
-                Some(member.project.workspace_root.clone().into()),
-                None,
-                Some(h_flex().gap_2().child(menu).children(remove).into_any_element()),
-                None,
-                &tokens,
-            ));
+            rows.push(
+                RowFrame::new(environment.clone())
+                    .description(member.project.workspace_root.clone())
+                    .control(h_flex().gap_2().child(menu).children(remove).into_any_element())
+                    .render(&tokens)
+                    .into_any_element(),
+            );
         }
-        section(Some("Checkouts"), rows, &tokens)
+        settings_section("checkouts", "Checkouts", rows, &tokens)
     }
 
     fn render_project_danger(
@@ -858,9 +849,16 @@ impl Workspace {
                     this.remove_project_members(&panel, &selection, members, window, cx)
                 }))
         };
-        section(
-            Some("Danger"),
-            vec![row(&title, Some(description.into()), None, Some(remove.into_any_element()), None, &tokens)],
+        settings_section(
+            "danger",
+            "Danger",
+            vec![
+                RowFrame::new(title.clone())
+                    .description(description)
+                    .control(remove.into_any_element())
+                    .render(&tokens)
+                    .into_any_element(),
+            ],
             &tokens,
         )
     }
@@ -874,97 +872,4 @@ fn member_ids(members: &[Member]) -> Vec<(String, String)> {
 /// `SettingsScopeNotice`, centered under the picker.
 fn notice(text: &'static str, tokens: &Tokens) -> AnyElement {
     div().py_8().text_center().text_sm().text_color(tokens.muted_foreground).child(text).into_any_element()
-}
-
-/// `SettingsSection` (grouped): a heading, then rows in a bordered card divided by hairlines.
-fn section(title: Option<&str>, rows: Vec<AnyElement>, tokens: &Tokens) -> AnyElement {
-    let count = rows.len();
-    v_flex()
-        .gap(px(10.))
-        .children(title.map(|title| {
-            h_flex()
-                .min_h(px(28.))
-                .px_4()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(tokens.foreground)
-                .child(title.to_owned())
-        }))
-        .child(
-            v_flex()
-                .rounded(px(12.))
-                .border_1()
-                .border_color(tokens.border.opacity(0.6))
-                .bg(tokens.card.opacity(0.4))
-                .children(rows.into_iter().enumerate().map(move |(index, row)| {
-                    div()
-                        .when(index > 0 && index < count, |el| el.border_t_1().border_color(tokens.border.opacity(0.5)))
-                        .child(row)
-                })),
-        )
-        .into_any_element()
-}
-
-/// `SettingsRow`: title and reset slot over the description, the control on the right.
-fn row(
-    title: &str,
-    description: Option<SharedString>,
-    reset: Option<AnyElement>,
-    control: Option<AnyElement>,
-    children: Option<AnyElement>,
-    tokens: &Tokens,
-) -> AnyElement {
-    v_flex()
-        .px_4()
-        .map(|el| if children.is_some() { el.pt_3().pb_1() } else { el.py_3() })
-        .child(
-            h_flex()
-                .gap_8()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .min_h(px(20.))
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(tokens.foreground)
-                                        .child(title.to_owned()),
-                                )
-                                .child(div().size(px(20.)).flex().items_center().justify_center().children(reset)),
-                        )
-                        .children(description.map(|description| {
-                            div()
-                                .max_w(px(672.))
-                                .text_xs()
-                                .line_height(px(18.))
-                                .text_color(tokens.muted_foreground)
-                                .child(description)
-                        })),
-                )
-                .children(control.map(|control| h_flex().flex_none().justify_end().gap_2().child(control))),
-        )
-        .children(children)
-        .into_any_element()
-}
-
-/// `SettingResetButton`: a micro ghost button with the undo arrow.
-fn reset_button(id: &'static str, disabled: bool, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id(id)
-        .size(px(20.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .text_color(tokens.muted_foreground)
-        .when(disabled, |el| el.opacity(0.64))
-        .when(!disabled, |el| el.cursor_pointer().hover(|s| s.bg(tokens.accent).text_color(tokens.foreground)))
-        .tooltip(tooltip("Reset to default"))
-        .child(Icon::new(IconName::Undo2).size(px(12.)))
 }

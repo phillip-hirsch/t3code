@@ -13,12 +13,12 @@ use gpui_kit::{
     Styled as _, Window, div, px,
 };
 
-use super::rows;
 use super::scripts::{
     ScriptInput, command_for_project_script, has_project_scripts_override, importable_scripts, resolve_project_scripts,
     script_icon, shortcut_label_for_command,
 };
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
 use crate::model::{ProjectScript, T3ProjectFile};
 use crate::theme::{self, FONT_MONO, Tokens};
 
@@ -47,13 +47,14 @@ impl Workspace {
         let mut controls = h_flex().gap(px(6.)).flex_wrap();
         if overridden {
             let pid = pid.clone();
-            controls =
-                controls.child(rows::reset_button("reset-project-actions", "actions to the environment's").on_click(
+            controls = controls.child(
+                reset_button(&"reset-project-actions".into(), "Reset actions to the environment's", cx).on_click(
                     cx.listener(move |this, _, window, cx| {
                         let task = this.reset_project_scripts(&pid, cx);
                         this.report_scripts_failure(task, window, cx);
                     }),
-                ));
+                ),
+            );
         }
         if !importable.is_empty() {
             let view = cx.entity();
@@ -91,16 +92,11 @@ impl Workspace {
         );
 
         let mut list = vec![
-            rows::row(
-                "Actions",
-                Some(
-                    "Commands that run in this project's checkout or its worktree, with optional shortcuts."
-                        .into_any_element(),
-                ),
-                Some(controls.into_any_element()),
-                &t,
-            )
-            .into_any_element(),
+            RowFrame::new("Actions")
+                .description("Commands that run in this project's checkout or its worktree, with optional shortcuts.")
+                .control(controls)
+                .render(&t)
+                .into_any_element(),
         ];
         if scripts.is_empty() {
             list.push(
@@ -118,16 +114,13 @@ impl Workspace {
         }
         if file == T3ProjectFile::Invalid {
             list.push(
-                rows::row(
-                    div().text_color(t.warning_foreground).child("t3.json is invalid"),
-                    Some("A t3.json exists in this checkout but fails to parse, so every action and icon it declares is ignored. Check the JSON syntax and icon values.".into_any_element()),
-                    None,
-                    &t,
-                )
-                .into_any_element(),
+                RowFrame::new(div().text_color(t.warning_foreground).child("t3.json is invalid"))
+                    .description("A t3.json exists in this checkout but fails to parse, so every action and icon it declares is ignored. Check the JSON syntax and icon values.")
+                    .render(&t)
+                    .into_any_element(),
             );
         }
-        rows::section("Actions", list, &t)
+        settings_section("project-actions", "Actions", list, &t)
     }
 
     fn render_action_row(
@@ -161,7 +154,7 @@ impl Workspace {
             .children(script.preview_url.is_some().then(|| badge("preview · desktop only")));
         let command = div().max_w_full().truncate().font_family(FONT_MONO).child(script.command.clone());
         let shortcut = shortcut_label_for_command(
-            &self.server_info.keybindings_json,
+            self.server_info.keybindings_json(),
             command_for_project_script(&script.id).as_deref(),
         );
         let (pid, sid) = (project_id.to_owned(), script.id.clone());
@@ -180,7 +173,7 @@ impl Workspace {
         v_flex()
             .id(SharedString::from(format!("project-action-{}", script.id)))
             .group(ROW_GROUP)
-            .child(rows::row(title, Some(command.into_any_element()), Some(control.into_any_element()), t).py(px(8.)))
+            .child(RowFrame::new(title).description(command).control(control).render(t).py(px(8.)))
             .into_any_element()
     }
 

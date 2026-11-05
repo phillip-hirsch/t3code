@@ -24,6 +24,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::{RowFrame, settings_section};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcError;
 use crate::theme::{self, FONT_MONO, Tokens};
@@ -47,15 +48,13 @@ impl Workspace {
     }
 
     pub(super) fn render_devices_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .gap(px(32.))
-            .child(self.render_device_integration(cx))
-            .child(self.render_device_sources(window, cx))
-            .into_any_element()
+        let view = self.settings_view();
+        let sections = [self.render_device_integration(cx), self.render_device_sources(window, cx)];
+        self.settings_page("devices", &view, sections, cx)
     }
 
     /// `DeviceIntegrationControls`: the hub and agent access switches, and the local host's progress.
-    fn render_device_integration(&self, cx: &mut Context<Self>) -> Div {
+    fn render_device_integration(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let empty = DeviceState::default();
         let state = self.devices.state.as_ref().unwrap_or(&empty);
@@ -66,10 +65,9 @@ impl Workspace {
         let busy = state.readiness().busy;
         let pending = self.devices.pending;
 
-        let hub = settings_row(
+        let hub = device_row(
             "device-hub",
             "Use devices",
-            None,
             description("Open simulators and emulators in the Device panel. Hub:", &t)
                 .child(self.render_tool_versions(state, Tool::Hub, loaded && !busy, cx)),
             h_flex()
@@ -95,10 +93,9 @@ impl Workspace {
                 ),
             &t,
         );
-        let agent = settings_row(
+        let agent = device_row(
             "agent-device-access",
             "Agents can use devices",
-            None,
             description("New agent sessions can open and drive these devices. agent-device:", &t)
                 .child(self.render_tool_versions(state, Tool::Agent, loaded && !busy, cx)),
             h_flex()
@@ -127,7 +124,7 @@ impl Workspace {
         if connected {
             rows.extend(self.render_host_updates(state, cx));
         }
-        settings_section("Devices", rows, &t)
+        settings_section("devices", "Devices", rows, &t)
     }
 
     /// `DeviceToolVersions` for one tool: the inline version, with details and actions in a popover.
@@ -376,62 +373,14 @@ fn error_message(error: &RpcError) -> String {
     .map_or_else(|| "The environment request failed.".to_owned(), str::to_owned)
 }
 
-/// `SettingsSection` (grouped): a 16px semibold heading over a bordered card of divided rows.
-fn settings_section(title: &'static str, rows: Vec<AnyElement>, t: &Tokens) -> Div {
-    v_flex()
-        .gap(px(10.))
-        .child(
-            h_flex()
-                .min_h(px(28.))
-                .px(px(16.))
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.foreground)
-                .child(title),
-        )
-        .child(
-            v_flex()
-                .rounded(px(12.))
-                .border_1()
-                .border_color(t.border.opacity(0.6))
-                .bg(t.card.opacity(0.4))
-                .text_color(t.foreground)
-                .children(rows.into_iter().enumerate().map(|(index, row)| {
-                    div().when(index > 0, |this| this.border_t_1().border_color(t.border.opacity(0.5))).child(row)
-                })),
-        )
-}
-
-/// `SettingsRow`: title with a reset slot and a description on the left, the control on the right.
-fn settings_row(
+fn device_row(
     id: &'static str,
     title: &'static str,
-    reset: Option<AnyElement>,
     description: Div,
     control: impl IntoElement,
     t: &Tokens,
 ) -> AnyElement {
-    h_flex()
-        .id(id)
-        .px(px(16.))
-        .py(px(12.))
-        .gap(px(32.))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(4.))
-                .child(
-                    h_flex()
-                        .min_h(px(20.))
-                        .gap(px(6.))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(title))
-                        .child(h_flex().size(px(20.)).flex_none().justify_center().children(reset)),
-                )
-                .child(description),
-        )
-        .child(h_flex().flex_none().min_w(px(160.)).justify_end().gap(px(8.)).child(control))
-        .into_any_element()
+    RowFrame::new(title).description(description).control(control).render(t).id(id).into_any_element()
 }
 
 /// A row description, `text-xs` muted; inline controls are appended after the text.

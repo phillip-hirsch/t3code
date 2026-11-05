@@ -276,19 +276,19 @@ fn wireframe(t: &Tokens) -> impl IntoElement {
 }
 
 impl Workspace {
-    pub(super) fn render_settings_chat(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_chat_section(cx)
+    pub(super) fn render_settings_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_chat_section(window, cx)
     }
 
-    pub(super) fn render_settings_diffs(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_diffs_section(cx)
+    pub(super) fn render_settings_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_diffs_section(window, cx)
     }
 
     pub(super) fn render_settings_keybindings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.render_keybindings_section(window, cx)
     }
 
-    pub(super) fn render_settings_snap_shot(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        self.render_snap_shot_section(cx)
+    pub(super) fn render_settings_snap_shot(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_snap_shot_section(window, cx)
     }
 }

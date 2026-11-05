@@ -2,9 +2,7 @@
 //! `ProjectDefaultsSettings category="general"`, `SnoozePresetsSettings.tsx`,
 //! `ThreadTitleInstructionsSettings.tsx`).
 //!
-//! Scoped in the web (`serverScoped`, written to every selected environment or project): every row
-//! here. The web hides Snooze at project scope; Model, Permissions and Workspace reword their
-//! descriptions there. This port edits the connected environment's settings only.
+//! Every row writes through the settings scope. The web hides Snooze at project scope.
 
 use std::collections::HashMap;
 
@@ -18,12 +16,11 @@ use gpui_kit::{
     AnyElement, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
-use super::super::code::pending::{
-    Control, Row, SERVER_SCOPES, SettingRowSpec, advanced, generates_text, muted, page, patch, reset_button,
-    resolve_pasted_path, resolve_text_generation, section, select, switch, trigger,
-};
+use super::super::fields::resolve_pasted_path;
+use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
+use super::super::widgets::{SettingRow, SettingsView, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
 use crate::theme::tokens;
@@ -34,67 +31,6 @@ mod snooze;
 use snooze::{KindMemory, Preset, Unit};
 
 const STREAMING: &[(&str, &str)] = &[("turn", "Wait for the full response"), ("paragraph", "Show finished paragraphs")];
-
-const ROWS: &[SettingRowSpec] = &[
-    SettingRowSpec {
-        id: "ghq-clone-layout",
-        label: "Clone into host folders",
-        description: "Clones go to github.com/owner/repo under the folder above, like ghq.",
-        path: "ghqCloneLayout",
-        control: Control::Switch,
-        default: Some("false"),
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "auto-resume-limited-threads",
-        label: "Resume after usage limits",
-        description: "Automatically resume threads when their usage limits reset. You can cancel auto-resume in each thread.",
-        path: "autoResumeLimitedThreads",
-        control: Control::Switch,
-        default: None,
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "snooze-limited-threads",
-        label: "Snooze until limits reset",
-        description: "Snooze threads until their usage limits reset. Enable auto-resume to continue the agent after the reset.",
-        path: "snoozeLimitedThreads",
-        control: Control::Switch,
-        default: None,
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "auto-settle-merged-threads",
-        label: "Auto-settle merged threads",
-        description: "Settle a thread when its pull request merges. Closed pull requests still settle automatically.",
-        path: "sidebarAutoSettleOnMerge",
-        control: Control::Switch,
-        default: Some("true"),
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "keep-threads-with-pr",
-        label: "Keep threads with a PR",
-        description: "Inactivity does not settle threads with a pull request. Merge and close still do.",
-        path: "sidebarAutoSettleKeepPullRequests",
-        control: Control::Switch,
-        default: None,
-        scopes: SERVER_SCOPES,
-    },
-    SettingRowSpec {
-        id: "thread-title-instructions",
-        label: "Thread title instructions",
-        description: "Appended to the prompt for new and regenerated thread titles.",
-        path: "threadTitleInstructions",
-        control: Control::Textarea("Keep titles to a few words. Lead with the main subject."),
-        default: Some("\"\""),
-        scopes: SERVER_SCOPES,
-    },
-];
-
-fn spec(id: &str) -> &'static SettingRowSpec {
-    ROWS.iter().find(|row| row.id == id).expect("settings row")
-}
 
 /// `runtimeModeConfig.ts`, in menu order.
 const RUNTIME_MODES: [(&str, &str, &str, Lucide); 4] = [
@@ -151,28 +87,97 @@ impl SnoozeEditor {
 impl Workspace {
     pub(super) fn render_threads_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
+        let view = self.settings_view();
         let connected = self.client().is_some();
-        let new_projects =
-            [self.add_project_row(window, cx), self.render_spec(spec("ghq-clone-layout"), window, cx).render(&t)];
-        let usage = ["auto-resume-limited-threads", "snooze-limited-threads"]
-            .map(|id| self.render_spec(spec(id), window, cx).render(&t));
-        let mut sections = vec![
-            section("New projects", None, new_projects, &t),
-            section("New threads", None, self.settings_new_thread_rows(cx), &t),
-            section("Snooze", None, [self.snooze_row(window, cx)], &t),
-            section("Usage limits", None, usage, &t),
+        let base = self.add_project_field(&view, window, cx);
+        let new_thread = self.new_thread_controls(&view, cx);
+        let snooze = view.scope.project_id().is_none().then(|| self.snooze_row(&view, window, cx));
+        let auto_settle = connected.then(|| self.auto_settle_rows(&view, window, cx));
+        let text_generation = self.text_generation_rows(&view, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let new_projects = [
+            row(
+                self,
+                SettingRow::new("add-project-starts-in")
+                    .description("Leave empty to use \"~/\" when the Add Project browser opens.")
+                    .setting("addProjectBaseDirectory")
+                    .control(base),
+            ),
+            row(
+                self,
+                SettingRow::new("ghq-clone-layout")
+                    .description("Clones go to github.com/owner/repo under the folder above, like ghq.")
+                    .setting("ghqCloneLayout")
+                    .switch(),
+            ),
         ];
-        if connected {
-            sections.push(section("Auto-settle", None, self.auto_settle_rows(window, cx), &t));
-        }
-        sections.push(section("Text generation", None, self.text_generation_rows(window, cx), &t));
-        page("settings-threads", sections)
+        let [model, fallback, permissions, workspace] = new_thread;
+        let automatic = view.value("defaultModelSelection").is_null() && connected;
+        let new_threads = [
+            row(
+                self,
+                SettingRow::titled("default-model", "Model")
+                    .description(if automatic {
+                        "Default model for new threads, selected automatically. Projects can override it."
+                    } else {
+                        "Default model for new threads. Projects can override it."
+                    })
+                    .setting("defaultModelSelection")
+                    .control(model),
+            ),
+            row(
+                self,
+                SettingRow::new("fallback-model")
+                    .description("Used for new threads when the default model's provider is out of usage.")
+                    .setting("fallbackModelSelection")
+                    .control(fallback),
+            ),
+            row(
+                self,
+                SettingRow::new("default-permissions")
+                    .description("Default permissions for new threads. Projects can override them.")
+                    .setting("defaultRuntimeMode")
+                    .control(permissions),
+            ),
+            row(
+                self,
+                SettingRow::titled("new-threads", "Workspace")
+                    .description("Where new threads start. Projects and their t3.json can override it.")
+                    .setting("defaultThreadEnvMode")
+                    .control(workspace),
+            ),
+        ];
+        let usage = [
+            row(
+                self,
+                SettingRow::new("auto-resume-limited-threads")
+                    .description("Automatically resume threads when their usage limits reset. You can cancel auto-resume in each thread.")
+                    .setting("autoResumeLimitedThreads")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("snooze-limited-threads")
+                    .description("Snooze threads until their usage limits reset. Enable auto-resume to continue the agent after the reset.")
+                    .setting("snoozeLimitedThreads")
+                    .switch(),
+            ),
+        ];
+        let mut sections = vec![
+            settings_section("new-projects", "New projects", new_projects, &t),
+            settings_section("new-threads", "New threads", new_threads, &t),
+        ];
+        sections.extend(snooze.map(|snooze| settings_section("snooze", "Snooze", [snooze], &t)));
+        sections.push(settings_section("usage-limits", "Usage limits", usage, &t));
+        sections.extend(auto_settle.map(|rows| settings_section("auto-settle", "Auto-settle", rows, &t)));
+        sections.push(settings_section("text-generation", "Text generation", text_generation, &t));
+        self.settings_page("threads", &view, sections, cx)
     }
 
-    fn add_project_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let t = *tokens(cx);
-        let saved = self.setting("addProjectBaseDirectory").as_str().unwrap_or_default().to_owned();
-        let field = self.text_field(
+    /// The folder box; a pasted full path replaces what is there (`resolvePastedPath`).
+    fn add_project_field(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let saved = view.str("addProjectBaseDirectory").to_owned();
+        self.text_field(
             "add-project-starts-in",
             &saved,
             "~/",
@@ -180,120 +185,71 @@ impl Workspace {
             Some(resolve_pasted_path),
             window,
             cx,
-            |this, text, cx| this.pending_update_settings(json!({ "addProjectBaseDirectory": text }), cx),
-        );
-        let reset = (!saved.is_empty()).then(|| {
-            reset_button(
-                "add-project-starts-in",
-                cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "addProjectBaseDirectory": "" }), cx)),
-            )
-        });
-        Row::new("add-project-starts-in", "Add project starts in")
-            .description("Leave empty to use \"~/\" when the Add Project browser opens.")
-            .reset(reset)
-            .control(field.sized(px(288.)))
-            .render(&t)
+            |this, text, window, cx| this.update_settings(json!({ "addProjectBaseDirectory": text }), window, cx),
+        )
+        .sized(px(288.))
+        .into_any_element()
     }
 
-    /// `ProjectDefaultsSettings category="general"`: Model, Fallback model, Permissions, Workspace.
-    fn settings_new_thread_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// `ProjectDefaultsSettings category="general"`: the Model, Fallback model, Permissions and
+    /// Workspace controls.
+    fn new_thread_controls(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> [AnyElement; 4] {
         let t = *tokens(cx);
-        let stored = self.setting("defaultModelSelection").clone();
-        let automatic = stored.is_null();
         let selection = self.server_info.new_thread_model(None);
-        let picked = |this: &mut Self, value: Value, cx: &mut Context<Self>| {
-            this.pending_update_settings(json!({ "defaultModelSelection": value }), cx)
+        let pick = |key: &'static str| {
+            move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
+                this.update_settings(json!({ key: pick.to_json() }), window, cx)
+            }
         };
-        let model_control: AnyElement = match &selection {
+        let model: AnyElement = match &selection {
             Some(selection) if self.server_info.provider(&selection.instance_id).is_some() => h_flex()
                 .gap(px(6.))
-                .child(self.model_picker(
-                    "default-model",
-                    selection,
-                    None,
-                    |_| true,
-                    cx,
-                    move |this, pick, cx| picked(this, pick.to_json(), cx),
-                ))
-                .children(self.traits_picker("default-model-traits", selection, cx, move |this, pick, cx| {
-                    picked(this, pick.to_json(), cx)
-                }))
+                .child(self.model_picker("default-model", selection, None, |_| true, cx, pick("defaultModelSelection")))
+                .children(self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection")))
                 .into_any_element(),
             _ => muted("No providers available", &t).into_any_element(),
         };
-        let model = Row::new("default-model", "Model")
-            .description(if self.client().is_some() && automatic {
-                "Default model for new threads, selected automatically. Projects can override it."
-            } else {
-                "Default model for new threads. Projects can override it."
-            })
-            .reset((!automatic).then(|| {
-                reset_button("default-model", cx.listener(move |this, _, _, cx| picked(this, Value::Null, cx)))
-            }))
-            .control(model_control);
-
         let fallback_stored: Option<ModelSelection> =
-            serde_json::from_value(self.setting("fallbackModelSelection").clone()).ok();
-        let fallback_selection = fallback_stored.clone().or(selection);
-        let set_fallback = |this: &mut Self, value: Value, cx: &mut Context<Self>| {
-            this.pending_update_settings(json!({ "fallbackModelSelection": value }), cx)
-        };
-        let fallback_control: AnyElement = match &fallback_selection {
-            Some(selection) => h_flex()
+            serde_json::from_value(view.value("fallbackModelSelection").clone()).ok();
+        let fallback: AnyElement = match fallback_stored.as_ref().or(selection.as_ref()) {
+            Some(shown) => h_flex()
                 .gap(px(6.))
                 .child(self.model_picker(
                     "fallback-model",
-                    selection,
+                    shown,
                     fallback_stored.is_none().then_some("None"),
                     |_| true,
                     cx,
-                    move |this, pick, cx| set_fallback(this, pick.to_json(), cx),
+                    pick("fallbackModelSelection"),
                 ))
                 .children(fallback_stored.as_ref().and_then(|stored| {
-                    self.traits_picker("fallback-model-traits", stored, cx, move |this, pick, cx| {
-                        set_fallback(this, pick.to_json(), cx)
-                    })
+                    self.traits_picker("fallback-model-traits", stored, cx, pick("fallbackModelSelection"))
                 }))
                 .into_any_element(),
             None => muted("No providers available", &t).into_any_element(),
         };
-        let fallback = Row::new("fallback-model", "Fallback model")
-            .description("Used for new threads when the default model's provider is out of usage.")
-            .reset(fallback_stored.is_some().then(|| {
-                reset_button("fallback-model", cx.listener(move |this, _, _, cx| set_fallback(this, Value::Null, cx)))
-            }))
-            .control(fallback_control);
-
-        let workspace_mode = self.setting("defaultThreadEnvMode").as_str().map(str::to_owned);
-        let effective = workspace_mode.clone().unwrap_or_else(|| "local".into());
-        let workspace = Row::new("new-threads", "Workspace")
-            .description("Where new threads start. Projects and their t3.json can override it.")
-            .reset(workspace_mode.is_some().then(|| {
-                reset_button(
-                    "default-workspace",
-                    cx.listener(|this, _, _, cx| this.pending_update_settings(json!({ "defaultThreadEnvMode": null }), cx)),
-                )
-            }))
-            .control(select(
-                "default-workspace",
-                env_mode_label(&effective),
-                ["local", "worktree"].map(|mode| (mode.into(), env_mode_label(mode).into())).to_vec(),
-                Some(effective.into()),
-                cx,
-                |this, mode, cx| this.pending_update_settings(json!({ "defaultThreadEnvMode": mode.as_ref() }), cx),
-            ));
-
-        vec![model.render(&t), fallback.render(&t), self.permissions_row(cx).render(&t), workspace.render(&t)]
+        let mode = view.str("defaultThreadEnvMode");
+        let mode = if mode.is_empty() { "local" } else { mode };
+        let workspace = self.value_select(
+            "default-workspace",
+            "defaultThreadEnvMode",
+            &json!(mode),
+            ["local", "worktree"].map(|mode| (json!(mode), env_mode_label(mode).into())).to_vec(),
+            env_mode_label(mode),
+            0.,
+            cx,
+        );
+        [model, fallback, self.permissions_control(view, cx), workspace]
     }
 
-    fn permissions_row(&mut self, cx: &mut Context<Self>) -> Row {
+    fn permissions_control(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
-        let current = self.setting("defaultRuntimeMode").as_str().unwrap_or(DEFAULT_RUNTIME_MODE).to_owned();
+        let current = view.str("defaultRuntimeMode");
+        let current = if current.is_empty() { DEFAULT_RUNTIME_MODE.to_owned() } else { current.to_owned() };
         let (_, label, _, icon) =
             RUNTIME_MODES.iter().find(|(id, ..)| *id == current).copied().unwrap_or(RUNTIME_MODES[3]);
         let view = cx.entity();
-        let menu_current = current.clone();
-        let trigger = trigger("default-permissions", &t)
+        trigger("default-permissions", &t)
             .child(Icon::new(icon).with_size(px(14.)).text_color(t.muted_foreground))
             .child(div().flex_1().child(label))
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
@@ -320,75 +276,91 @@ impl Workspace {
                                         .child(description),
                                 )
                         })
-                        .checked(mode == menu_current)
-                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                            this.pending_update_settings(json!({ "defaultRuntimeMode": mode }), cx)
+                        .checked(mode == current)
+                        .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                            this.update_settings(json!({ "defaultRuntimeMode": mode }), window, cx)
                         })),
                     );
                 }
                 menu
-            });
-        Row::new("default-permissions", "Permissions")
-            .description("Default permissions for new threads. Projects can override them.")
-            .reset((current != DEFAULT_RUNTIME_MODE).then(|| {
-                reset_button(
-                    "default-permissions",
-                    cx.listener(|this, _, _, cx| {
-                        this.pending_update_settings(json!({ "defaultRuntimeMode": DEFAULT_RUNTIME_MODE }), cx)
-                    }),
-                )
-            }))
-            .control(trigger)
+            })
+            .into_any_element()
     }
 
-    fn auto_settle_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn auto_settle_rows(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let t = *tokens(cx);
-        let days = self.setting("sidebarAutoSettleAfterDays").as_i64();
-        let mut rows = vec![self.render_spec(spec("auto-settle-merged-threads"), window, cx).render(&t)];
-        rows.push(
-            Row::new("auto-settle-inactive-threads", "Auto-settle inactive threads")
-                .description("Sidebar threads with no activity for this long settle automatically.")
-                .reset((days != Some(AUTO_SETTLE_DEFAULT_DAYS)).then(|| {
-                    reset_button(
-                        "auto-settle",
-                        cx.listener(|this, _, _, cx| {
-                            this.pending_update_settings(json!({ "sidebarAutoSettleAfterDays": AUTO_SETTLE_DEFAULT_DAYS }), cx)
-                        }),
-                    )
-                }))
-                .control(switch("auto-settle-inactive-threads", days.is_some(), cx, |this, on, cx| {
-                    let days = on.then_some(AUTO_SETTLE_DEFAULT_DAYS);
-                    this.pending_update_settings(json!({ "sidebarAutoSettleAfterDays": days }), cx)
-                }))
-                .render(&t),
-        );
-        if let Some(days) = days {
-            let field = self.number_field("auto-settle-days", days, 1, 90, window, cx, |this, days, cx| {
-                this.pending_update_settings(json!({ "sidebarAutoSettleAfterDays": days }), cx)
+        let days = view.value("sidebarAutoSettleAfterDays").as_i64();
+        let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false, &t).on_click(cx.listener(
+            move |this, _, window, cx| {
+                let days = days.is_none().then_some(AUTO_SETTLE_DEFAULT_DAYS);
+                this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
+            },
+        ));
+        let field = days.map(|days| {
+            let field = self.number_field("auto-settle-days", days, 1, 90, window, cx, |this, days, window, cx| {
+                this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx)
             });
-            rows.push(
-                Row::new("days-before-auto-settle", "Days of inactivity before auto-settle")
+            div().w(px(96.)).child(NumberInput::new(&field).small())
+        });
+        let keep = self.server_info.capability("threadAutoSettlementScope");
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
+        let mut rows = vec![
+            row(
+                self,
+                SettingRow::new("auto-settle-merged-threads")
+                    .description("Settle a thread when its pull request merges. Closed pull requests still settle automatically.")
+                    .setting("sidebarAutoSettleOnMerge")
+                    .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("auto-settle-inactive-threads")
+                    .description("Sidebar threads with no activity for this long settle automatically.")
+                    .setting("sidebarAutoSettleAfterDays")
+                    .control(toggle),
+            ),
+        ];
+        if let Some(field) = field {
+            rows.push(row(
+                self,
+                SettingRow::new("days-before-auto-settle")
                     .description("Any new activity un-settles a thread automatically.")
-                    .control(div().w(px(96.)).child(NumberInput::new(&field).small()))
-                    .render(&t),
-            );
-            if self.server_info.capabilities["threadAutoSettlementScope"] == true {
-                rows.push(self.render_spec(spec("keep-threads-with-pr"), window, cx).render(&t));
+                    .control(field),
+            ));
+            if keep {
+                rows.push(row(
+                    self,
+                    SettingRow::titled("keep-threads-with-pr", "Keep threads with a PR")
+                        .description(
+                            "Inactivity does not settle threads with a pull request. Merge and close still do.",
+                        )
+                        .setting("sidebarAutoSettleKeepPullRequests")
+                        .switch(),
+                ));
             }
         }
         rows
     }
 
-    fn text_generation_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn text_generation_rows(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let t = *tokens(cx);
         let stored: Option<ModelSelection> =
-            serde_json::from_value(self.setting("textGenerationModelSelection").clone()).ok();
+            serde_json::from_value(view.value("textGenerationModelSelection").clone()).ok();
         let selection = resolve_text_generation(stored.as_ref(), &self.server_info.providers);
-        let dirty = stored.as_ref().map(ModelSelection::to_json) != Some(default_text_generation());
         let connected = self.client().is_some();
-        let save = |this: &mut Self, pick: ModelSelection, cx: &mut Context<Self>| {
+        let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
             let resolved = resolve_text_generation(Some(&pick), &this.server_info.providers).unwrap_or(pick);
-            this.pending_update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), cx)
+            this.update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), window, cx)
         };
         let control: AnyElement = match (&selection, connected) {
             (_, false) => muted("Connect an environment to choose its text generation model.", &t).into_any_element(),
@@ -399,58 +371,40 @@ impl Workspace {
                 .children(self.traits_picker("text-generation-traits", selection, cx, save))
                 .into_any_element(),
         };
-        let model = Row::new("text-generation-model", "Text generation model")
-            .description("Used for thread titles and other generated text on connected devices with this provider. Source control can override it.")
-            .reset((connected && dirty).then(|| {
-                reset_button("text-generation-model", cx.listener(|this, _, _, cx| {
-                    this.pending_update_settings(json!({ "textGenerationModelSelection": default_text_generation() }), cx)
-                }))
-            }))
-            .control(control)
-            .render(&t);
-
-        let streaming = self.setting("responseStreamingMode").as_str().unwrap_or("paragraph").to_owned();
-        let streaming_row = Row::new("response-streaming", "Response streaming")
-            .description(if streaming == "turn" {
-                "Text appears once the agent finishes its turn."
-            } else {
-                "Each paragraph or code block appears as soon as it is complete."
-            })
-            .reset((streaming != "paragraph").then(|| {
-                reset_button(
-                    "response-streaming",
-                    cx.listener(|this, _, _, cx| {
-                        this.pending_update_settings(json!({ "responseStreamingMode": "paragraph" }), cx)
-                    }),
-                )
-            }))
-            .control(select(
-                "response-streaming",
-                STREAMING.iter().find(|(id, _)| *id == streaming).map_or("", |(_, label)| label),
-                STREAMING.iter().map(|(id, label)| ((*id).into(), (*label).into())).collect(),
-                Some(streaming.into()),
-                cx,
-                |this, mode, cx| this.pending_update_settings(json!({ "responseStreamingMode": mode.as_ref() }), cx),
-            ));
-        let open = window.use_keyed_state("settings-threads-advanced", cx, |_, _| false);
-        let rows = if *open.read(cx) {
-            vec![self.render_spec(spec("thread-title-instructions"), window, cx).render(&t), streaming_row.render(&t)]
-        } else {
-            Vec::new()
-        };
-        let fold = advanced("threads-advanced", *open.read(cx), rows, &t, move |_, _, cx| {
-            open.update(cx, |open, cx| {
-                *open = !*open;
-                cx.notify();
-            })
-        });
-        vec![model, fold]
+        let streaming = view.str("responseStreamingMode").to_owned();
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
+        let model = row(
+            self,
+            SettingRow::new("text-generation-model")
+                .description("Used for thread titles and other generated text on connected devices with this provider. Source control can override it.")
+                .setting("textGenerationModelSelection")
+                .control(control),
+        );
+        let instructions = row(
+            self,
+            SettingRow::new("thread-title-instructions")
+                .description("Appended to the prompt for new and regenerated thread titles.")
+                .setting("threadTitleInstructions")
+                .textarea("Keep titles to a few words. Lead with the main subject."),
+        );
+        let streaming = row(
+            self,
+            SettingRow::new("response-streaming")
+                .description(if streaming == "turn" {
+                    "Text appears once the agent finishes its turn."
+                } else {
+                    "Each paragraph or code block appears as soon as it is complete."
+                })
+                .setting("responseStreamingMode")
+                .select(STREAMING, 224.),
+        );
+        vec![model, self.advanced_fold("threads", [instructions, streaming], cx)]
     }
 
-    fn snooze_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn snooze_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
         let saved: Vec<Preset> =
-            serde_json::from_value(self.setting("snoozePresets").clone()).unwrap_or_else(|_| snooze::defaults());
+            serde_json::from_value(view.value("snoozePresets").clone()).unwrap_or_else(|_| snooze::defaults());
         let editor = window.use_keyed_state("settings-snooze-editor", cx, |_, _| SnoozeEditor::default());
         editor.update(cx, |editor, _| editor.adopt(&saved));
         let presets = editor.read(cx).presets();
@@ -461,18 +415,6 @@ impl Workspace {
         for ((key, preset), preview) in keys.iter().copied().zip(presets.iter()).zip(previews) {
             list.push(self.snooze_preset_row(&editor, key, preset, preview, window, cx));
         }
-        let reset = (!snooze::same_presets(&presets, &snooze::defaults())).then(|| {
-            let editor = editor.clone();
-            reset_button(
-                "snooze-options",
-                cx.listener(move |this, _, _, cx| {
-                    let mut rows: Vec<(u64, Preset)> =
-                        editor.update(cx, |e, _| e.fresh_keys(5)).into_iter().zip(snooze::defaults()).collect();
-                    snooze::sort_rows(&mut rows, &Local::now());
-                    this.save_snooze(&editor, rows, cx);
-                }),
-            )
-        });
         let full = presets.len() >= snooze::MAX_PRESETS;
         let add_editor = editor.clone();
         let settle_editor = editor.clone();
@@ -502,12 +444,12 @@ impl Workspace {
                             .icon(Icon::new(IconName::Plus).with_size(px(14.)))
                             .label("Add option")
                             .disabled(full)
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut rows = add_editor.read(cx).rows.clone();
                                 let presets: Vec<Preset> = rows.iter().map(|(_, p)| p.clone()).collect();
                                 let key = add_editor.update(cx, |e, _| e.fresh_keys(1))[0];
                                 rows.push((key, snooze::next_candidate(&presets)));
-                                this.save_snooze(&add_editor, rows, cx);
+                                this.save_snooze(&add_editor, rows, window, cx);
                             })),
                     )
                     .children(full.then(|| {
@@ -518,11 +460,11 @@ impl Workspace {
                             .child(format!("Up to {} options", snooze::MAX_PRESETS))
                     })),
             );
-        Row::new("snooze-options", "Snooze options")
+        let row = SettingRow::new("snooze-options")
             .description("Choices in every snooze menu, listed soonest first. Weekdays mean the next one after today.")
-            .reset(reset)
-            .body(body)
-            .render(&t)
+            .setting("snoozePresets")
+            .body(body);
+        self.setting_row(view, row, window, cx)
     }
 
     fn snooze_preset_row(
@@ -541,13 +483,15 @@ impl Workspace {
         };
         let when_label = snooze::WHEN.iter().find(|(id, _)| *id == when).map_or("", |(_, label)| label);
         let when_editor = editor.clone();
-        let when_select = select(
-            &format!("snooze-when-{key}"),
+        let when_options =
+            snooze::WHEN.iter().map(|(id, label)| (SharedString::from(*id), (*label).into(), *id == when)).collect();
+        let when_select = self.menu_select(
+            format!("snooze-when-{key}"),
+            when_options,
             when_label,
-            snooze::WHEN.iter().map(|(id, label)| ((*id).into(), (*label).into())).collect(),
-            Some(when.to_owned().into()),
+            0.,
             cx,
-            move |this, picked, cx| {
+            move |this, picked: SharedString, window, cx| {
                 let Some(preset) = when_editor.read(cx).rows.iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone())
                 else {
                     return;
@@ -561,7 +505,7 @@ impl Workspace {
                     };
                     when_editor.update(cx, |e, _| e.memory.insert(key, memory));
                 }
-                this.replace_snooze(&when_editor, key, next, cx);
+                this.replace_snooze(&when_editor, key, next, window, cx);
             },
         );
         let fields: AnyElement = match preset {
@@ -576,14 +520,14 @@ impl Workspace {
                     None,
                     window,
                     cx,
-                    move |this, text, cx| {
+                    move |this, text, window, cx| {
                         let Some(Preset::At { day, .. }) =
                             time_editor.read(cx).rows.iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone())
                         else {
                             return;
                         };
                         if snooze::parse_time(&text).is_some() {
-                            this.replace_snooze(&time_editor, key, Preset::At { day, time: text }, cx);
+                            this.replace_snooze(&time_editor, key, Preset::At { day, time: text }, window, cx);
                         }
                     },
                 );
@@ -614,10 +558,10 @@ impl Workspace {
                         .ghost()
                         .xsmall()
                         .icon(Icon::new(IconName::Close).with_size(px(14.)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             let rows: Vec<(u64, Preset)> =
                                 remove_editor.read(cx).rows.iter().filter(|(k, _)| *k != key).cloned().collect();
-                            this.save_snooze(&remove_editor, rows, cx);
+                            this.save_snooze(&remove_editor, rows, window, cx);
                         })),
                 ),
             )
@@ -639,22 +583,35 @@ impl Workspace {
         let amount = minutes / unit.minutes();
         let max = snooze::MAX_MINUTES / unit.minutes();
         let amount_editor = editor.clone();
-        let field =
-            self.number_field(&format!("snooze-amount-{key}"), amount, 1, max, window, cx, move |this, amount, cx| {
-                this.replace_snooze(&amount_editor, key, Preset::After { minutes: amount * unit.minutes() }, cx);
-            });
-        let unit_editor = editor.clone();
-        let unit_select = select(
-            &format!("snooze-unit-{key}"),
-            unit.label(amount),
-            Unit::ALL.iter().map(|u| (u.id().into(), u.label(amount).into())).collect(),
-            Some(unit.id().into()),
+        let field = self.number_field(
+            &format!("snooze-amount-{key}"),
+            amount,
+            1,
+            max,
+            window,
             cx,
-            move |this, picked, cx| {
-                let Some(next) = Unit::ALL.into_iter().find(|u| u.id() == picked.as_ref()) else { return };
+            move |this, amount, window, cx| {
+                this.replace_snooze(
+                    &amount_editor,
+                    key,
+                    Preset::After { minutes: amount * unit.minutes() },
+                    window,
+                    cx,
+                );
+            },
+        );
+        let unit_editor = editor.clone();
+        let unit_options = Unit::ALL.iter().map(|u| (*u, u.label(amount).into(), *u == unit)).collect();
+        let unit_select = self.menu_select(
+            format!("snooze-unit-{key}"),
+            unit_options,
+            unit.label(amount),
+            0.,
+            cx,
+            move |this, next: Unit, window, cx| {
                 unit_editor.update(cx, |e, _| e.units.insert(key, next));
                 let minutes = (amount * next.minutes()).min(snooze::MAX_MINUTES);
-                this.replace_snooze(&unit_editor, key, Preset::After { minutes }, cx);
+                this.replace_snooze(&unit_editor, key, Preset::After { minutes }, window, cx);
             },
         );
         h_flex()
@@ -664,13 +621,26 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn replace_snooze(&mut self, editor: &Entity<SnoozeEditor>, key: u64, next: Preset, cx: &mut Context<Self>) {
+    fn replace_snooze(
+        &mut self,
+        editor: &Entity<SnoozeEditor>,
+        key: u64,
+        next: Preset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let rows =
             editor.read(cx).rows.iter().map(|(k, p)| (*k, if *k == key { next.clone() } else { p.clone() })).collect();
-        self.save_snooze(editor, rows, cx);
+        self.save_snooze(editor, rows, window, cx);
     }
 
-    fn save_snooze(&mut self, editor: &Entity<SnoozeEditor>, rows: Vec<(u64, Preset)>, cx: &mut Context<Self>) {
+    fn save_snooze(
+        &mut self,
+        editor: &Entity<SnoozeEditor>,
+        rows: Vec<(u64, Preset)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let presets: Vec<Preset> = rows.iter().map(|(_, p)| p.clone()).collect();
         if presets == editor.read(cx).presets() {
             editor.update(cx, |e, cx| {
@@ -685,7 +655,7 @@ impl Workspace {
             cx.notify();
         });
         let editor = editor.clone();
-        self.update_settings_then(patch("snoozePresets", json!(presets)), cx, move |_, ok, cx| {
+        self.update_settings_then(json!({ "snoozePresets": presets }), window, cx, move |_, ok, cx| {
             if !ok {
                 editor.update(cx, |e, cx| {
                     e.written.clear();
@@ -699,9 +669,4 @@ impl Workspace {
 
 fn env_mode_label(mode: &str) -> &'static str {
     if mode == "worktree" { "New worktree" } else { "Current checkout" }
-}
-
-/// `DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection`.
-pub(super) fn default_text_generation() -> Value {
-    json!({"instanceId": "codex", "model": "gpt-6-luna", "options": [{"id": "reasoningEffort", "value": "low"}]})
 }

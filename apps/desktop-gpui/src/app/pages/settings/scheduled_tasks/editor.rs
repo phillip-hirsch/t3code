@@ -320,7 +320,7 @@ impl TaskEditor {
         }
         let (offers_once, policy) = {
             let info = &workspace.read(cx).server_info;
-            (self.offers_once(info.one_time_schedules), info.managed_policy.clone())
+            (self.offers_once(info.capability("oneTimeSchedules")), info.managed_policy.clone())
         };
         if schedule["type"] == "once" && !offers_once {
             return fail(
@@ -425,7 +425,7 @@ impl Render for TaskEditor {
                     .unwrap_or_else(|| format!("Thread {}", self.draft.thread_id))
             });
             (
-                self.offers_once(info.one_time_schedules),
+                self.offers_once(info.capability("oneTimeSchedules")),
                 logic::webhook_denial(&info.managed_policy),
                 info.environment_label.clone().unwrap_or_else(|| "Unavailable environment".into()),
                 machine_icon(info.machine_kind()),
@@ -547,9 +547,7 @@ impl Render for TaskEditor {
 
         let schedule_fields: AnyElement = match mode {
             ScheduleMode::Webhook if denial.is_some() && draft.enabled => div().into_any_element(),
-            ScheduleMode::Webhook => {
-                webhooks::render_webhook_fields(&self.webhook).into_any_element()
-            }
+            ScheduleMode::Webhook => webhooks::render_webhook_fields(&self.webhook).into_any_element(),
             ScheduleMode::Once => inline(&t)
                 .child(label("Run on", &t))
                 .child(div().w(px(224.)).child(DatePicker::new(&self.run_at).placeholder("Pick a date and time")))

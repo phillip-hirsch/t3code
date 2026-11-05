@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::super::widgets::{RowFrame, section_with_action, settings_section};
 use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft, Session};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, update_settings};
@@ -61,7 +62,8 @@ impl Workspace {
                 &t,
             )
         };
-        ui::page("settings-secrets-page", [section])
+        let view = self.settings_view();
+        self.settings_page("secrets", &view, [section], cx)
     }
 
     fn secret_providers(&self, state: &Entity<SecretsState>, environment: String, cx: &App, t: &Tokens) -> AnyElement {
@@ -82,17 +84,10 @@ impl Workspace {
         });
         let rows = if providers.is_empty() {
             vec![
-                ui::row(
-                    "No secret providers configured.",
-                    Some(
-                        "Add a 1Password account, then pick it as the source of a provider variable."
-                            .into_any_element(),
-                    ),
-                    None,
-                    None,
-                    t,
-                )
-                .into_any_element(),
+                RowFrame::new("No secret providers configured.")
+                    .description("Add a 1Password account, then pick it as the source of a provider variable.")
+                    .render(t)
+                    .into_any_element(),
             ]
         } else {
             providers
@@ -148,17 +143,21 @@ impl Workspace {
                         };
                         h_flex().gap(px(4.)).children(edit).child(remove).into_any_element()
                     });
-                    ui::row(title, Some(description), None, controls, t).into_any_element()
+                    RowFrame::new(title)
+                        .description(description)
+                        .control(div().children(controls))
+                        .render(t)
+                        .into_any_element()
                 })
                 .collect()
         };
-        ui::section("Secret providers", None, add, rows, t)
+        section_with_action("secret-providers", "Secret providers", add, rows, t)
     }
 }
 
 fn message_section(message: String, t: &Tokens) -> AnyElement {
     let text = text_sm(div().px(px(16.)).py(px(12.)).text_color(t.muted_foreground)).child(message);
-    ui::section("Secret providers", None, None, vec![text.into_any_element()], t)
+    settings_section("secret-providers", "Secret providers", [text.into_any_element()], t)
 }
 
 /// `RedactedSensitiveText`: the account as look-alike text until clicked.

@@ -16,6 +16,8 @@ use crate::inbox::{self, CustomSnooze, SnoozeUnit};
 pub(super) struct CustomSnoozeForm {
     workspace: WeakEntity<Workspace>,
     thread_id: String,
+    /// Move on from the open thread once it is snoozed, as the sidebar does.
+    advance: bool,
     duration: bool,
     date: Entity<InputState>,
     time: Entity<InputState>,
@@ -36,8 +38,8 @@ impl CustomSnoozeForm {
         };
         match inbox::resolve_custom_snooze(&input, &chrono::Local::now()) {
             Ok(wake) => {
-                let thread_id = self.thread_id.clone();
-                let _ = self.workspace.update(cx, |this, cx| this.snooze_thread(&thread_id, wake, window, cx));
+                let (thread_id, advance) = (self.thread_id.clone(), self.advance);
+                let _ = self.workspace.update(cx, |this, cx| this.snooze_thread(&thread_id, wake, advance, window, cx));
                 window.close_dialog(cx);
             }
             Err(error) => {
@@ -150,7 +152,13 @@ impl Render for CustomSnoozeForm {
 
 impl Workspace {
     /// Opens the dialog, seeded with now + 1 h (date mode) and 2 hours (duration mode).
-    pub(super) fn open_custom_snooze(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_custom_snooze(
+        &mut self,
+        thread_id: &str,
+        advance: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let seed = chrono::Local::now() + chrono::Duration::hours(1);
         let text_input = |value: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| {
@@ -166,6 +174,7 @@ impl Workspace {
         let form = cx.new(|_| CustomSnoozeForm {
             workspace,
             thread_id: thread_id.to_owned(),
+            advance,
             duration: false,
             date,
             time,

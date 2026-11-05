@@ -431,7 +431,10 @@ impl Workspace {
         let project = self.target_project()?;
         let project_id = project.id.clone();
         let scripts: Vec<(SharedString, SharedString)> =
-            super::pages::settings::code::projects::scripts::resolve_project_scripts(&self.server_info.settings, project)
+            super::pages::settings::code::projects::scripts::resolve_project_scripts(
+                &self.server_info.settings,
+                project,
+            )
             .into_iter()
             .map(|script| (script.name.into(), script.command.into()))
             .collect();
@@ -1350,5 +1353,4 @@ mod tests {
         assert_eq!(publish_provider(&discovery), Some(("forgejo".into(), "Forgejo".into(), Some("me".into()))));
         assert_eq!(publish_provider(&json!({"sourceControlProviders": []})), None);
     }
-
 }

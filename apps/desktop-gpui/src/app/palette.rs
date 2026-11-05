@@ -241,7 +241,13 @@ impl Workspace {
         palette.highlight = (view != View::Browse).then_some(0);
         let start = match view {
             View::Browse => {
-                let base = self.server_info.add_project_base_directory.trim_end_matches(['/', '\\']);
+                let base = self
+                    .server_info
+                    .settings
+                    .get("addProjectBaseDirectory")
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_end_matches(['/', '\\']);
                 if base.is_empty() { "~/".to_owned() } else { format!("{base}/") }
             }
             _ => String::new(),
@@ -825,7 +831,7 @@ impl Workspace {
 
     /// The server runs on this machine, so its paths are this machine's.
     fn server_is_local(&self) -> bool {
-        self.http_base.as_deref().is_some_and(|base| base.contains("://127.0.0.1") || base.contains("://localhost"))
+        self.http_base().is_some_and(|base| base.contains("://127.0.0.1") || base.contains("://localhost"))
     }
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {

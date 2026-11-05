@@ -669,9 +669,9 @@ impl Workspace {
             .child(icon("icons/chevron-down.svg").with_size(px(14.)).opacity(0.7))
             .dropdown_menu(move |menu: PopupMenu, window, cx| {
                 let pick = |label: &str, value: DiffScope, checked: bool, window: &mut Window| {
-                    PopupMenuItem::new(label.to_owned())
-                        .checked(checked)
-                        .on_click(window.listener_for(&view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)))
+                    PopupMenuItem::new(label.to_owned()).checked(checked).on_click(
+                        window.listener_for(&view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)),
+                    )
                 };
                 let latest_checked = matches!(&menu_scope, DiffScope::Turn(run) if Some(run) == menu_latest.as_ref());
                 let mut menu = menu
@@ -703,8 +703,9 @@ impl Workspace {
                             })
                             .checked(checked)
                             .on_click(
-                                window
-                                    .listener_for(&turn_view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)),
+                                window.listener_for(&turn_view, move |this, _, _, cx| {
+                                    this.set_diff_scope(value.clone(), cx)
+                                }),
                             ),
                         );
                     }
@@ -719,7 +720,9 @@ impl Workspace {
                         let value = DiffScope::Commit(commit.sha.clone());
                         let checked = scope == value;
                         menu = menu.item(PopupMenuItem::new(commit.subject.clone()).checked(checked).on_click(
-                            window.listener_for(&commit_view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)),
+                            window.listener_for(&commit_view, move |this, _, _, cx| {
+                                this.set_diff_scope(value.clone(), cx)
+                            }),
                         ));
                     }
                     menu.max_h(px(320.)).scrollable(true)

@@ -57,7 +57,6 @@ impl WebhookContext {
     pub(super) fn new(client: RpcClient, workspace: &Entity<Workspace>, cx: &App) -> Self {
         Self { client, endpoint: workspace.read(cx).endpoint.clone(), workspace: workspace.downgrade() }
     }
-
 }
 
 /// `ScheduledTaskEditorForm`'s webhook fields.

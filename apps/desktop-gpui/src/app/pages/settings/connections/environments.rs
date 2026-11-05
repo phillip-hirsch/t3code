@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::super::widgets::{RowFrame, section_with_action, settings_section};
 use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone, Session};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{auth_request, error_toast, success_toast};
@@ -71,14 +72,14 @@ impl Workspace {
         }
         let t = *theme::tokens(cx);
         let mut sections = vec![saved_environments(&t)];
-        let config = &self.server_info.config;
-        let offers_links = config.pointer("/environment/capabilities/peerLinks") == Some(&Value::Bool(true))
-            && config.pointer("/settings/linkedEnvironmentsEnabled") == Some(&Value::Bool(true));
+        let info = &self.server_info;
+        let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
         let readable = state.read(cx).session.as_ref().is_some_and(|s| s.grants(ACCESS_READ));
         if offers_links && readable && self.client().is_some() {
             sections.push(self.linked_environments(&state, cx, &t));
         }
-        ui::page("settings-environments-page", sections)
+        let view = self.settings_view();
+        self.settings_page("connections", &view, sections, cx)
     }
 
     fn linked_environments(&self, state: &Entity<EnvironmentsState>, cx: &App, t: &Tokens) -> AnyElement {
@@ -96,28 +97,21 @@ impl Workspace {
         });
         let rows = match &s.links {
             Some(Err(error)) => {
-                vec![ui::row("Could not load linked environments", Some(error.clone().into_any_element()), None, None, t).into_any_element()]
+                vec![RowFrame::new("Could not load linked environments").description(error.clone()).render(t).into_any_element()]
             }
-            None => vec![ui::row("Loading linked environments\u{2026}", None, None, None, t).into_any_element()],
+            None => vec![RowFrame::new("Loading linked environments\u{2026}").render(t).into_any_element()],
             Some(Ok(links)) if links.is_empty() => vec![
-                ui::row(
-                    "No linked environments",
-                    Some(
-                        "Link another machine running T3 Code, such as a VPS, so agents here can launch and drive threads there."
-                            .into_any_element(),
-                    ),
-                    None,
-                    None,
-                    t,
-                )
-                .into_any_element(),
+                RowFrame::new("No linked environments")
+                    .description("Link another machine running T3 Code, such as a VPS, so agents here can launch and drive threads there.")
+                    .render(t)
+                    .into_any_element(),
             ],
             Some(Ok(links)) => {
                 let now = now_ms();
                 links.iter().map(|link| linked_row(state, s, link, can_link, client.clone(), now, t)).collect()
             }
         };
-        ui::section("Linked environments", None, action, rows, t)
+        section_with_action("linked-environments", "Linked environments", action, rows, t)
     }
 }
 
@@ -150,7 +144,7 @@ fn saved_environments(t: &Tokens) -> AnyElement {
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("No saved remote environments"),
         );
-    ui::section("Environments", None, None, vec![empty.into_any_element()], t)
+    settings_section("environments", "Environments", [empty.into_any_element()], t)
 }
 
 fn linked_row(

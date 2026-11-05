@@ -126,7 +126,7 @@ fn image_format(mime: &str) -> Option<ImageFormat> {
 impl Workspace {
     /// The paperclip shows while the server takes file uploads.
     pub(super) fn can_attach(&self) -> bool {
-        self.server_info.file_upload_limit.is_some() && self.question.is_none()
+        self.server_info.file_upload_limit().is_some() && self.question.is_none()
     }
 
     pub(super) fn attachments_busy(&self) -> bool {
@@ -252,7 +252,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let size = bytes.len() as u64;
-        let file_limit = self.server_info.file_upload_limit.unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
+        let file_limit = self.server_info.file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
         let error = if self.attachments.len() >= MAX_ATTACHMENTS {
             Some(format!("You can attach up to {MAX_ATTACHMENTS} files per message."))
         } else if kind == Kind::Image && size > MAX_IMAGE_BYTES {
@@ -309,7 +309,7 @@ impl Workspace {
 
     /// Mints a signed upload URL, then POSTs the bytes to it.
     fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
-        let (client, http_base) = (self.client(), self.http_base.clone());
+        let (client, http_base) = (self.client(), self.http_base().map(str::to_owned));
         let Some(attachment) = self.attachments.iter_mut().find(|a| a.local_id == local_id) else { return };
         let (Some(client), Some(http_base)) = (client, http_base) else {
             attachment.upload = Upload::Failed("Not connected".into());

@@ -24,7 +24,9 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::placeholder::{MOD_LABEL, Row, chevron, page, section, select_trigger};
+use super::widgets::{RowFrame, card, select_trigger, settings_section};
+
+const MOD_LABEL: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
 use crate::app::Workspace;
 use crate::keybindings::{
     self, Rule, STATIC_COMMANDS, Shortcut, When, defaults, parse_shortcut, parse_when, shortcut_input, when_expression,
@@ -954,8 +956,7 @@ impl Render for KeybindingsPanel {
         let t = *theme::tokens(cx);
         let rows = filter_rows(&self.catalog.rows, &self.query);
         let groups = group_rows(&rows);
-        let mut children =
-            vec![section(Some("Keybindings"), None, [self.render_toolbar(&t, cx)], &t).into_any_element()];
+        let mut children = vec![settings_section("keybindings", "Keybindings", [self.render_toolbar(&t, cx)], &t)];
         if !self.connected {
             children.push(
                 div()
@@ -967,30 +968,30 @@ impl Render for KeybindingsPanel {
         }
         let mut body = Vec::new();
         if self.adding.is_some() {
-            body.push(super::placeholder::group([self.render_new_row(&t, window, cx)], &t).into_any_element());
+            body.push(card([self.render_new_row(&t, window, cx)], &t));
         }
         if groups.is_empty() {
-            body.push(
-                super::placeholder::group(
-                    [div()
-                        .px(px(16.))
-                        .py(px(48.))
-                        .text_center()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child("No keybindings match your search.")
-                        .into_any_element()],
-                    &t,
-                )
-                .into_any_element(),
-            );
+            body.push(card(
+                [div()
+                    .px(px(16.))
+                    .py(px(48.))
+                    .text_center()
+                    .text_sm()
+                    .text_color(t.muted_foreground)
+                    .child("No keybindings match your search.")
+                    .into_any_element()],
+                &t,
+            ));
         }
         for (_, title, rows) in groups {
             let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, window, cx)).collect();
-            body.push(section(Some(title), None, rendered, &t).into_any_element());
+            body.push(settings_section(SharedString::from(title), title, rendered, &t));
         }
         children.push(v_flex().gap(px(32.)).children(body).into_any_element());
-        page("settings-keybindings", children)
+        v_flex()
+            .id("settings-keybindings")
+            .gap(px(32.))
+            .children(children)
             // Builder and menu surfaces occlude, so this only sees clicks outside them.
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_when(cx)))
     }
@@ -1059,8 +1060,7 @@ impl KeybindingsPanel {
             .child(label)
             .when(row.source != Source::Default, |el| el.child(badge(row.source.label(), t)))
             .tooltip(move |window, cx| Tooltip::new(command.clone()).build(window, cx));
-        let mut rendered = Row::new(title);
-        rendered.description = Some(self.render_when_line(&row.id, &expression, when, t, window, cx));
+        let description = self.render_when_line(&row.id, &expression, when, t, window, cx);
         let saving = self.saving.as_deref() == Some(row.command.as_str());
         let control = h_flex()
             .flex_wrap()
@@ -1079,7 +1079,7 @@ impl KeybindingsPanel {
                     .on_click(cx.listener(move |this, _, window, cx| this.save(&id, window, cx)))
             }))
             .child(self.render_key_control(&row.id, key, &row.key, dirty, t, cx));
-        rendered.control = Some(control.into_any_element());
+        let rendered = RowFrame::new(title).description(description).control(control);
         div().group("kb-row").child(rendered.render(t)).into_any_element()
     }
 
@@ -1398,12 +1398,7 @@ impl KeybindingsPanel {
         let panel = cx.entity();
         let operator = {
             let (owned, path) = (id.to_owned(), path.clone());
-            select_trigger(SharedString::from(format!("{key}-op")), t)
-                .w(px(96.))
-                .h(px(28.))
-                .justify_between()
-                .child(if or { "or" } else { "and" })
-                .child(chevron(t))
+            select_trigger(&SharedString::from(format!("{key}-op")), if or { "or" } else { "and" }, 96., t)
                 .dropdown_menu(move |mut menu, window, _| {
                     for (label, next) in [("and", false), ("or", true)] {
                         let (owned, path) = (owned.clone(), path.clone());
@@ -1476,13 +1471,13 @@ impl KeybindingsPanel {
         options.extend(when_variables().iter().cloned());
         let (owned, path, current) = (id.to_owned(), path.to_vec(), name.to_owned());
         let panel = cx.entity();
-        select_trigger(SharedString::from(format!("{key}-var")), t)
-            .w_full()
-            .h(px(28.))
-            .justify_between()
+        let label = h_flex()
+            .min_w_0()
+            .gap(px(4.))
             .child(div().truncate().child(name.to_owned()))
-            .when(unknown, |el| el.child(unknown_warning(key, t)))
-            .child(chevron(t))
+            .when(unknown, |el| el.child(unknown_warning(key, t)));
+        select_trigger(&SharedString::from(format!("{key}-var")), label, 0., t)
+            .w_full()
             .dropdown_menu(move |mut menu, window, _| {
                 for option in &options {
                     let (owned, path, picked) = (owned.clone(), path.clone(), option.clone());
@@ -1508,17 +1503,12 @@ impl KeybindingsPanel {
         let panel = cx.entity();
         let commands = self.catalog.commands.clone();
         let current = adding.command.clone();
-        let command_select = select_trigger("kb-new-command", t)
-            .w(px(224.))
-            .justify_between()
-            .child(
-                div()
-                    .truncate()
-                    .text_color(if current.is_some() { t.foreground } else { t.muted_foreground })
-                    .child(current.as_deref().map(command_label).unwrap_or_else(|| "Command".to_owned())),
-            )
-            .child(chevron(t))
-            .dropdown_menu(move |mut menu, window, _| {
+        let command_label_el = div()
+            .truncate()
+            .text_color(if current.is_some() { t.foreground } else { t.muted_foreground })
+            .child(current.as_deref().map(command_label).unwrap_or_else(|| "Command".to_owned()));
+        let command_select = select_trigger(&"kb-new-command".into(), command_label_el, 224., t).dropdown_menu(
+            move |mut menu, window, _| {
                 for command in &commands {
                     let picked = command.clone();
                     menu = menu.item(
@@ -1533,10 +1523,10 @@ impl KeybindingsPanel {
                     );
                 }
                 menu.max_h(px(288.)).scrollable(true)
-            });
-        let mut row = Row::new("New keybinding");
-        row.description = Some(self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, window, cx));
-        row.control = Some(
+            },
+        );
+        let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, window, cx);
+        let row = RowFrame::new("New keybinding").description(description).control(
             h_flex()
                 .flex_wrap()
                 .gap(px(8.))
@@ -1570,8 +1560,7 @@ impl KeybindingsPanel {
                             }
                             cx.notify();
                         })),
-                )
-                .into_any_element(),
+                ),
         );
         div().bg(t.muted.opacity(0.15)).child(row.render(t)).into_any_element()
     }
@@ -1707,7 +1696,8 @@ impl Workspace {
             .clone();
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.
-        div().size_full().child(view).into_any_element()
+        let settings = self.settings_view();
+        self.settings_page("keybindings", &settings, [div().child(view).into_any_element()], cx)
     }
 }
 

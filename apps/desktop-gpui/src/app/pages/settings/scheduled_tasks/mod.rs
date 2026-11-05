@@ -24,13 +24,13 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    WeakEntity, Window, div, px, svg,
+    AnyElement, AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div, px, svg,
 };
 use serde_json::json;
 
 use self::logic::{ScheduledTask, decode_tasks, relative_label, schedule_label};
+use super::super::widgets::{RowFrame, section_with_action};
 use crate::app::Workspace;
 use crate::model::{ModelSelection, ServerInfo};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
@@ -47,7 +47,8 @@ pub(super) fn render(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
             AnyView::from(cx.new(|cx| ScheduledTasksView::new(owner, cx)))
         })
         .clone();
-    view.into_any_element()
+    let settings = workspace.settings_view();
+    workspace.settings_page("scheduled-tasks", &settings, [view.into_any_element()], cx)
 }
 
 enum Load {
@@ -180,7 +181,7 @@ impl ScheduledTasksView {
         }
     }
 
-    fn render_row(&self, task: &ScheduledTask, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> Row {
+    fn render_row(&self, task: &ScheduledTask, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
         let busy = self.busy.contains(&task.id);
         let schedule = task.schedule();
         let webhook = schedule == logic::Schedule::Webhook;
@@ -265,9 +266,9 @@ impl ScheduledTasksView {
             )
             .child(menu);
 
-        row(SharedString::from(format!("scheduled-task-{id}")), &task.title, t)
+        RowFrame::new(task.title.clone())
             .description(div().line_clamp(2).child(task.prompt.clone()))
-            .status(status)
+            .status(Some(status))
             .control(control)
     }
 }
@@ -288,17 +289,17 @@ impl Render for ScheduledTasksView {
             self.subscribe(client.clone(), cx);
         }
 
-        let body: Vec<Row> = match (&client, &self.tasks) {
+        let body: Vec<RowFrame> = match (&client, &self.tasks) {
             (None, _) => vec![
-                row("scheduled-tasks-disconnected", "Environment disconnected", &t)
+                RowFrame::new("Environment disconnected")
                     .description(format!("Reconnect {label} to view its scheduled tasks.")),
             ],
             (Some(_), Load::Failed(error)) => {
-                vec![row("scheduled-tasks-error", "Could not load scheduled tasks", &t).description(error.clone())]
+                vec![RowFrame::new("Could not load scheduled tasks").description(error.clone())]
             }
-            (Some(_), Load::Loading) => vec![row("scheduled-tasks-loading", "Loading scheduled tasks…", &t)],
+            (Some(_), Load::Loading) => vec![RowFrame::new("Loading scheduled tasks…")],
             (Some(_), Load::Loaded(tasks)) if tasks.is_empty() => vec![
-                row("scheduled-tasks-empty", "No scheduled tasks", &t)
+                RowFrame::new("No scheduled tasks")
                     .description("No tasks match this environment and project selection."),
             ],
             (Some(client), Load::Loaded(tasks)) => {
@@ -316,15 +317,8 @@ impl Render for ScheduledTasksView {
             .disabled(client.is_none())
             .on_click(cx.listener(|this, _, window, cx| this.open_editor(None, window, cx)));
 
-        page(&t)
-            .child(
-                section("Scheduled tasks", Some(new_task.into_any_element()), &t).child(
-                    group(&t).children(
-                        body.into_iter().enumerate().map(|(index, row)| row.into_any_element(index == 0, &t)),
-                    ),
-                ),
-            )
-            .into_any_element()
+        let rows = body.into_iter().map(|row| row.render(&t).into_any_element());
+        section_with_action("scheduled-tasks", "Scheduled tasks", Some(new_task.into_any_element()), rows, &t)
     }
 }
 
@@ -435,123 +429,4 @@ fn badge(status: &str, t: &Tokens) -> impl IntoElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(text)
         .child(status.to_owned())
-}
-
-/// `SettingsPageContainer`: the scrolling, centered `max-w-4xl` column.
-fn page(t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id("settings-scheduled-tasks-page")
-        .size_full()
-        .overflow_y_scroll()
-        .text_color(t.foreground)
-        .flex()
-        .flex_col()
-        .items_center()
-}
-
-/// `SettingsSection variant="plain"`: heading with an action, then its rows.
-fn section(title: &str, action: Option<AnyElement>, t: &Tokens) -> gpui_kit::Div {
-    div().w_full().max_w(px(896.)).px(px(24.)).pt(px(24.)).pb(px(48.)).flex().flex_col().gap(px(10.)).child(
-        div()
-            .min_h(px(28.))
-            .px(px(16.))
-            .flex()
-            .items_start()
-            .justify_between()
-            .gap(px(16.))
-            .child(
-                div()
-                    .min_h(px(28.))
-                    .flex()
-                    .items_center()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.foreground)
-                    .child(title.to_owned()),
-            )
-            .child(div().min_h(px(28.)).min_w(px(28.)).flex().items_center().justify_end().children(action)),
-    )
-}
-
-/// `SettingsGroup` (grouped): the bordered card whose rows are divided.
-fn group(t: &Tokens) -> gpui_kit::Div {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .rounded(px(12.))
-        .border_1()
-        .border_color(t.border.opacity(0.6))
-        .bg(t.card.opacity(0.4))
-        .overflow_hidden()
-}
-
-/// `SettingsRow`: title, description and status on the left, the control on the right.
-struct Row {
-    id: SharedString,
-    title: SharedString,
-    description: Option<AnyElement>,
-    status: Option<AnyElement>,
-    control: Option<AnyElement>,
-}
-
-fn row(id: impl Into<SharedString>, title: &str, _: &Tokens) -> Row {
-    Row { id: id.into(), title: title.to_owned().into(), description: None, status: None, control: None }
-}
-
-impl Row {
-    fn description(mut self, description: impl IntoElement) -> Self {
-        self.description = Some(description.into_any_element());
-        self
-    }
-
-    fn status(mut self, status: impl IntoElement) -> Self {
-        self.status = Some(status.into_any_element());
-        self
-    }
-
-    fn control(mut self, control: impl IntoElement) -> Self {
-        self.control = Some(control.into_any_element());
-        self
-    }
-
-    /// Rows after the first are divided by a top border (`[&>*+*]:border-t`).
-    fn into_any_element(self, first: bool, t: &Tokens) -> AnyElement {
-        div()
-            .id(self.id)
-            .w_full()
-            .px(px(16.))
-            .py(px(12.))
-            .when(!first, |this| this.border_t_1().border_color(t.border.opacity(0.5)))
-            .flex()
-            .items_center()
-            .gap(px(32.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .min_h(px(20.))
-                            .flex()
-                            .items_center()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(t.foreground)
-                            .child(self.title),
-                    )
-                    .children(self.description.map(|description| {
-                        div().max_w(px(672.)).text_xs().text_color(t.muted_foreground).child(description)
-                    }))
-                    .children(
-                        self.status
-                            .map(|status| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(status)),
-                    ),
-            )
-            .children(self.control.map(|control| div().flex_none().flex().items_center().justify_end().child(control)))
-            .into_any_element()
-    }
 }

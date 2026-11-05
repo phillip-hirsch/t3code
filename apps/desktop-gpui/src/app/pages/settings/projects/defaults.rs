@@ -7,18 +7,18 @@
 
 use std::rc::Rc;
 
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::{
     AnyElement, Context, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Value, json};
 
-use super::rows;
 use super::scripts::rpc_message;
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
 use crate::model::ModelSelection;
 use crate::model_label;
 use crate::theme;
@@ -197,7 +197,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let scope = if project_id.is_some() { "project" } else { "global" };
-        let rows = ROWS
+        let rows: Vec<AnyElement> = ROWS
             .iter()
             .filter(|spec| spec.categories.contains(&category) && spec.scopes.contains(&scope))
             .map(|spec| {
@@ -210,23 +210,23 @@ impl Workspace {
                     .filter(|target| &value != target)
                     .map(|target| {
                         let project_id = project_id.map(str::to_owned);
-                        rows::reset_button(SharedString::from(format!("reset-{}", spec.id)), &spec.label.to_lowercase())
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                        reset_button(&SharedString::from(spec.id), "Reset to default", cx).on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 this.write_setting(project_id.as_deref(), spec.path, target.clone(), window, cx)
-                            }))
+                            },
+                        ))
                     });
                 let description = if scope == "project" { spec.description } else { spec.global_description };
-                rows::row(
-                    spec.label,
-                    Some(description.into_any_element()),
-                    Some(h_flex().gap(px(6.)).children(reset).child(control).into_any_element()),
-                    &t,
-                )
-                .into_any_element()
+                RowFrame::new(spec.label)
+                    .description(description)
+                    .reset(reset)
+                    .control(control)
+                    .render(&t)
+                    .into_any_element()
             })
             .collect();
         let title = if category == "source-control" { "Repositories" } else { "New threads" };
-        rows::section(title, rows, &t)
+        settings_section(title, title, rows, &t)
     }
 
     fn render_row_control(
