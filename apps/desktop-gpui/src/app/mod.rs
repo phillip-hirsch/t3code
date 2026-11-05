@@ -270,7 +270,6 @@ impl Workspace {
                 if let Err(error) = this.shell.apply(value) {
                     log::warn!("bad shell event: {error}");
                 }
-                this.schedule_sidebar_clock(cx);
                 this.notify_sidebar(cx);
                 this.track_visit(cx);
             }),

@@ -18,7 +18,7 @@ use serde_json::json;
 
 use super::{Connection, Target, Workspace, new_id};
 use crate::inbox::{self, Facts, Status};
-use crate::model::ProjectShell;
+use crate::model::{ProjectShell, ShellState, ThreadShell};
 use crate::theme::{FONT_MONO, Tokens};
 
 const DEFAULT_WIDTH: f32 = 256.;
@@ -39,7 +39,9 @@ pub(super) struct SidebarState {
     /// changes layout, so it is state rather than a paint-time group hover.
     hovered: Option<String>,
     search: Entity<InputState>,
-    /// Wakes the sidebar when its next visible label or snooze deadline changes.
+    returns: inbox::ReturnTracker,
+    /// When `_clock` wakes the sidebar: its next visible label, snooze or hold deadline.
+    clock_at: Option<i64>,
     _clock: Option<Task<()>>,
     _search_subscription: Subscription,
 }
@@ -49,7 +51,6 @@ impl SidebarState {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscription = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.schedule_sidebar_clock(cx);
                 this.notify_sidebar(cx);
             }
         });
@@ -61,6 +62,8 @@ impl SidebarState {
             settled_visible: SETTLED_INITIAL,
             hovered: None,
             search,
+            returns: inbox::ReturnTracker::default(),
+            clock_at: None,
             _clock: None,
             _search_subscription: subscription,
         }
@@ -128,36 +131,37 @@ fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::A
     move |window, cx| Tooltip::new(label).build(window, cx)
 }
 
-impl Workspace {
-    fn search_query(&self, cx: &App) -> String {
-        self.sidebar.search.read(cx).value().trim().to_lowercase()
-    }
-
-    fn route_thread(&self) -> Option<&str> {
-        match &self.target {
-            Some(Target::Thread(id)) => Some(id),
-            _ => None,
-        }
-    }
-
+impl SidebarState {
     /// The rows to draw, in order: the web's `sidebarListItemsFresh`.
-    fn sidebar_items(&self, now: i64, query: &str) -> Vec<Item<'_>> {
-        let route = self.route_thread();
-        let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
-        let titles: HashMap<&str, &str> =
-            self.shell.projects.iter().map(|p| (p.id.as_str(), p.title.as_str())).collect();
-        let matches = |t: &crate::model::ThreadShell| {
+    fn items<'a>(
+        &mut self,
+        shell: &'a ShellState,
+        target: Option<&'a Target>,
+        working_shelf: bool,
+        now: i64,
+        query: &str,
+    ) -> Vec<Item<'a>> {
+        let route = match target {
+            Some(Target::Thread(id)) => Some(id.as_str()),
+            _ => None,
+        };
+        let titles: HashMap<&str, String> = if query.is_empty() {
+            HashMap::new()
+        } else {
+            shell.projects.iter().map(|p| (p.id.as_str(), p.title.to_lowercase())).collect()
+        };
+        let matches = |t: &ThreadShell| {
             query.is_empty()
                 || t.title.to_lowercase().contains(query)
-                || titles.get(t.project_id.as_str()).is_some_and(|p| p.to_lowercase().contains(query))
+                || titles.get(t.project_id.as_str()).is_some_and(|p| p.contains(query))
         };
-        let sections = inbox::partition(&self.shell.threads, now, connected && self.shell.live, matches);
+        let sections = inbox::partition(&shell.threads, now, working_shelf, &mut self.returns, matches);
         if !query.is_empty() {
             let all = [sections.pinned, sections.active, sections.working, sections.snoozed, sections.settled];
             return all.into_iter().flatten().map(|f| Item::Slim(f, None)).collect();
         }
         let mut items = Vec::new();
-        if let Some(Target::Draft { project_id }) = &self.target {
+        if let Some(Target::Draft { project_id }) = target {
             items.push(Item::Draft(project_id));
             items.push(Item::DraftDivider);
         }
@@ -167,29 +171,28 @@ impl Workspace {
         }
         let mut first = true;
         if !sections.working.is_empty() {
-            let (count, expanded) = (sections.working.len(), self.sidebar.working_expanded);
+            let (count, expanded) = (sections.working.len(), self.working_expanded);
             items.push(Item::Header { shelf: Shelf::Working, count, expanded, first });
             first = false;
             items.extend(route_only(sections.working, expanded, route).into_iter().map(Item::Card));
         }
         if !sections.snoozed.is_empty() {
-            let (count, expanded) = (sections.snoozed.len(), self.sidebar.snoozed_expanded);
+            let (count, expanded) = (sections.snoozed.len(), self.snoozed_expanded);
             items.push(Item::Header { shelf: Shelf::Snoozed, count, expanded, first });
             first = false;
             items.extend(
                 route_only(sections.snoozed, expanded, route).into_iter().map(|f| Item::Slim(f, Some(Shelf::Snoozed))),
             );
         }
-        let expanded = self.sidebar.settled_expanded;
+        let expanded = self.settled_expanded;
         items.push(Item::Header { shelf: Shelf::Settled, count: sections.settled.len(), expanded, first });
         let total = sections.settled.len();
         let mut settled: Vec<Facts<'_>> = sections.settled;
-        let hidden = total.saturating_sub(self.sidebar.settled_visible);
+        let hidden = total.saturating_sub(self.settled_visible);
         if hidden > 0 {
-            let route_row =
-                settled[self.sidebar.settled_visible..].iter().position(|f| Some(f.thread.id.as_str()) == route);
-            let route_row = route_row.map(|i| settled[self.sidebar.settled_visible + i]);
-            settled.truncate(self.sidebar.settled_visible);
+            let route_row = settled[self.settled_visible..].iter().position(|f| Some(f.thread.id.as_str()) == route);
+            let route_row = route_row.map(|i| settled[self.settled_visible + i]);
+            settled.truncate(self.settled_visible);
             settled.extend(route_row);
         }
         items.extend(route_only(settled, expanded, route).into_iter().map(|f| Item::Slim(f, Some(Shelf::Settled))));
@@ -200,11 +203,12 @@ impl Workspace {
     }
 
     /// Milliseconds until something the sidebar shows changes with time alone:
-    /// a duration or relative-time label, a wake label, or a snooze deadline.
-    fn next_clock_change(&self, now: i64, query: &str) -> Option<i64> {
-        let mut next: Option<i64> = None;
+    /// a duration or relative-time label, a wake label, a snooze deadline, or
+    /// a Working hold running out.
+    fn next_clock_change(&self, items: &[Item], threads: &[ThreadShell], now: i64) -> Option<i64> {
+        let mut next = self.returns.next_deadline().map(|deadline| deadline - now);
         let mut at = |delay: i64| next = Some(next.map_or(delay, |n| n.min(delay)));
-        for item in self.sidebar_items(now, query) {
+        for item in items {
             match item {
                 Item::Card(facts) => match facts.status() {
                     Status::Working | Status::Preparing => {
@@ -224,7 +228,7 @@ impl Workspace {
                     }
                 },
                 Item::Slim(facts, shelf) => {
-                    let from = if shelf == Some(Shelf::Settled) {
+                    let from = if *shelf == Some(Shelf::Settled) {
                         facts.settled_timestamp()
                     } else {
                         facts.activity_timestamp()
@@ -237,7 +241,7 @@ impl Workspace {
             }
         }
         // Waking moves a thread between shelves even while its shelf is collapsed.
-        for thread in &self.shell.threads {
+        for thread in threads {
             if let Some(delay) = inbox::parse_ms(thread.snoozed_until.as_deref().unwrap_or_default())
                 .and_then(|until| inbox::wake_changes_in(until - now))
             {
@@ -246,23 +250,39 @@ impl Workspace {
         }
         next
     }
+}
 
-    /// Re-arms the sidebar clock. Idle sidebars wake at most once a minute;
-    /// only a duration in its first minute ticks every second.
-    pub(super) fn schedule_sidebar_clock(&mut self, cx: &mut Context<Self>) {
-        let Some(delay) = self.next_clock_change(now_ms(), &self.search_query(cx)) else {
-            self.sidebar._clock = None;
+impl Workspace {
+    fn search_query(&self, cx: &App) -> String {
+        self.sidebar.search.read(cx).value().trim().to_lowercase()
+    }
+
+    fn route_thread(&self) -> Option<&str> {
+        match &self.target {
+            Some(Target::Thread(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Wakes the sidebar after `delay` ms, keeping a pending wake that still
+    /// fits. Idle sidebars wake at most once a minute; only a duration in its
+    /// first minute ticks every second.
+    fn arm_sidebar_clock(&mut self, delay: Option<i64>, now: i64, cx: &mut Context<Self>) {
+        let at = delay.map(|delay| now + delay.max(0) + 5);
+        if at == self.sidebar.clock_at {
             return;
-        };
-        self.sidebar._clock = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(delay.max(0) as u64 + 5)).await;
-            let _ = this.update(cx, |this, cx| {
-                this.notify_sidebar(cx);
-                this.schedule_sidebar_clock(cx);
-                // A snooze deadline can wake the open thread with no shell event to follow.
-                this.track_visit(cx);
-            });
-        }));
+        }
+        self.sidebar.clock_at = at;
+        self.sidebar._clock = at.map(|at| {
+            cx.spawn(async move |this, cx| {
+                let delay = (at - now_ms()).max(0) as u64;
+                cx.background_executor().timer(Duration::from_millis(delay)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.sidebar.clock_at = None;
+                    this.notify_sidebar(cx);
+                });
+            })
+        });
     }
 
     fn toggle_shelf(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
@@ -272,13 +292,7 @@ impl Workspace {
             Shelf::Settled => &mut self.sidebar.settled_expanded,
         };
         *expanded = !*expanded;
-        self.schedule_sidebar_clock(cx);
         self.notify_sidebar(cx);
-    }
-
-    fn open_from_sidebar(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_thread(thread_id, window, cx);
-        self.schedule_sidebar_clock(cx);
     }
 
     fn dispatch_thread_command(&mut self, kind: &str, thread_id: &str, cx: &mut Context<Self>) {
@@ -315,12 +329,14 @@ impl Workspace {
         self.sidebar.width
     }
 
-    pub(super) fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *crate::theme::tokens(cx);
         let sb = tokens.sidebar;
         let now = now_ms();
         let query = self.search_query(cx);
-        let items = self.sidebar_items(now, &query);
+        let connected = matches!(self.connection, Connection::Connected(_) | Connection::Connecting);
+        let items = self.sidebar.items(&self.shell, self.target.as_ref(), connected && self.shell.live, now, &query);
+        let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();
 
@@ -376,6 +392,7 @@ impl Workspace {
                 list = list.child(element);
             }
         }
+        self.arm_sidebar_clock(clock, now, cx);
 
         let rail = div()
             .id("sidebar-rail")
@@ -422,7 +439,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(self.render_chrome_row(&tokens))
-            .child(self.render_search_row(window, &tokens, cx))
+            .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(list))
             .child(self.render_sidebar_footer(&tokens))
             .child(deferred(rail).with_priority(1))
@@ -474,10 +491,15 @@ impl Workspace {
             )))
     }
 
-    fn render_search_row(&self, window: &mut Window, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_search_row(
+        &self,
+        searching: bool,
+        window: &mut Window,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let sb = tokens.sidebar;
         let focused = self.sidebar.search.focus_handle(cx).contains_focused(window, cx);
-        let searching = !self.search_query(cx).is_empty();
         let new_thread = self.new_thread_project();
         let header_button = |id: &'static str, name: IconName, label: &'static str| {
             div()
@@ -640,7 +662,6 @@ impl Workspace {
             .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar.settled_visible += SETTLED_PAGE;
-                this.schedule_sidebar_clock(cx);
                 this.notify_sidebar(cx);
             }))
             .child(icon(IconName::ChevronDown, 16., sb.muted_foreground))
@@ -818,9 +839,7 @@ impl Workspace {
                     .when(recede && matches!(status, Status::Working | Status::Preparing), |el| {
                         el.opacity(0.7).hover(|s| s.bg(sb.row_hover).opacity(1.))
                     })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.open_from_sidebar(open_id.clone(), window, cx)),
-                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_thread(open_id.clone(), window, cx)))
                     .child(
                         v_flex()
                             .when(has_meta, |el| el.h(px(78.)))
@@ -953,7 +972,7 @@ impl Workspace {
             .rounded(px(6.))
             .cursor_pointer()
             .map(|el| if active { el.bg(sb.row_active) } else { el.hover(|s| s.bg(sb.row_hover)) })
-            .on_click(cx.listener(move |this, _, window, cx| this.open_from_sidebar(open_id.clone(), window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.select_thread(open_id.clone(), window, cx)))
             .children(project.map(|p| {
                 div()
                     .flex_none()
