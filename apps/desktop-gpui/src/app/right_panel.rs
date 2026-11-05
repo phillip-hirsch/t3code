@@ -169,7 +169,8 @@ impl PanelState {
                 self.surfaces.push(surface);
             }
         }
-        if self.active.as_ref().is_some_and(|active| !self.surfaces.contains(active)) {
+        // Nothing active, as after a restart, also falls back to a browser tab.
+        if self.active.as_ref().is_none_or(|active| !self.surfaces.contains(active)) {
             let browser = self.surfaces.iter().find(|s| matches!(s, Surface::Browser(_)));
             self.active = browser.or(self.surfaces.first()).cloned();
         }
@@ -1686,6 +1687,9 @@ mod tests {
         only_browser.upsert(browser("a"));
         only_browser.reconcile_browsers(&[]);
         assert!(!only_browser.open, "losing the last session hides the panel");
+        let mut restarted = PanelState::default();
+        restarted.reconcile_browsers(&["left"]);
+        assert_eq!(restarted.active, Some(browser("left")), "a tab listed after a restart is selected");
     }
 
     #[test]
