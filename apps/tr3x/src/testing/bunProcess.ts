@@ -15,6 +15,17 @@ export interface BunProcess {
 }
 
 /**
+ * Keeps a test's daemon off the user's Rex server and control socket: no Rex
+ * unless the test brings a scratch one, and a state dir beside its home.
+ */
+function isolated(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    TR3X_REX_SERVER: "unix:///nonexistent/tr3x-test-rex.sock",
+    ...(env.TR3X_HOME === undefined ? {} : { XDG_STATE_HOME: `${env.TR3X_HOME}-state` }),
+  };
+}
+
+/**
  * Runs `args` on Bun, as the tr3x CLI runs. Vitest runs on Node, so its Node
  * runs the T3 server. `onCleanup` gets the kill that the test's teardown runs.
  */
@@ -28,7 +39,7 @@ export function spawnBun(
   const bun = findOnPath("bun", process.env);
   if (bun === undefined) throw new Error("These tests run the tr3x CLI with Bun; install it.");
   const child = NodeChildProcess.spawn(bun, args, {
-    env: { ...process.env, TR3X_NODE_BIN: process.execPath, ...env },
+    env: { ...process.env, TR3X_NODE_BIN: process.execPath, ...isolated(env), ...env },
     stdio: ["ignore", "pipe", "pipe"],
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: "SIGKILL" as const }),
   });
@@ -66,11 +77,14 @@ export async function runBun(
   return { code, output: run.output(), timedOut: run.child.signalCode === "SIGKILL" };
 }
 
-/** Resolves on the first output line matching `pattern`; rejects if the process exits first. */
-export function waitForLine(cli: BunProcess, pattern: RegExp): Promise<RegExpMatchArray> {
+/**
+ * Resolves on the first output line matching `pattern`, looking from output
+ * offset `from` on; rejects if the process exits first.
+ */
+export function waitForLine(cli: BunProcess, pattern: RegExp, from = 0): Promise<RegExpMatchArray> {
   return new Promise((resolve, reject) => {
     const check = () => {
-      const match = cli.output().match(pattern);
+      const match = cli.output().slice(from).match(pattern);
       if (!match) return false;
       cli.child.stdout?.off("data", onData);
       resolve(match);

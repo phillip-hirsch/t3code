@@ -29,7 +29,7 @@ import {
 } from "../testing/viewFixture.ts";
 import { App } from "./App.tsx";
 import type { ViewConnection } from "./connection.ts";
-import { mountView, type ViewStart, type ViewTarget } from "./main.tsx";
+import { type MountTarget, mountView, type ViewStart } from "./main.tsx";
 import type { ViewServer } from "./platform.ts";
 
 const model = (slug: string, name: string) => ({ slug, name, isCustom: false, capabilities: null });
@@ -127,7 +127,7 @@ type Scenario = () => Promise<void>;
  * and returns how startup ended, or throws if it hasn't ended in time.
  */
 async function startup(
-  target: ViewTarget,
+  target: MountTarget,
   bearerToken: () => Promise<string>,
   during: (ui: {
     readonly frame: (label: string, done: (frame: string) => boolean) => Promise<string>;
@@ -172,7 +172,7 @@ async function startup(
   }
 }
 
-const TARGETS: ReadonlyArray<readonly [string, ViewTarget]> = [
+const TARGETS: ReadonlyArray<readonly [string, MountTarget]> = [
   ["view <threadId>", { kind: "thread", threadId: ThreadId.make("thread-startup") }],
   ["view --new", { kind: "new", cwd: NodeURL.fileURLToPath(new URL(".", import.meta.url)) }],
 ];

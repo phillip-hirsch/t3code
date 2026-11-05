@@ -1,5 +1,9 @@
 import { Connection } from "@t3tools/client-runtime/connection";
 import {
+  type ArchiveThreadInput,
+  type CreateThreadInput,
+  type SettleThreadInput,
+  type UnarchiveThreadInput,
   cancelQueuedRun,
   createProject,
   type CancelQueuedRunInput,
@@ -15,6 +19,7 @@ import {
 import { createEnvironmentCatalogAtoms } from "@t3tools/client-runtime/state/connections";
 import {
   createEnvironmentCommand,
+  createEnvironmentRpcCommand,
   runAtomCommand,
   type AtomCommand,
 } from "@t3tools/client-runtime/state/runtime";
@@ -31,7 +36,13 @@ import {
   createThreadEnvironmentAtoms,
   ThreadHistoryController,
 } from "@t3tools/client-runtime/state/threads";
-import type { EnvironmentId, OrchestrationV2ShellSnapshot, ThreadId } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  ORCHESTRATION_V2_WS_METHODS,
+  type OrchestrationV2GetOlderSettledThreadsInput,
+  type OrchestrationV2ShellSnapshot,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -86,6 +97,31 @@ export function createViewConnection(server: Platform.ViewServer) {
     execute: (input: CancelQueuedRunInput) => cancelQueuedRun(input),
   });
 
+  const archivedShellCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:archived-shell",
+    tag: ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot,
+  });
+  const threadFamilyCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:thread-family",
+    tag: ORCHESTRATION_V2_WS_METHODS.getThreadFamily,
+  });
+  const olderSettledCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:older-settled",
+    tag: ORCHESTRATION_V2_WS_METHODS.getOlderSettledThreads,
+  });
+
+  /** A command's value, or its error thrown. */
+  const query = <Input, A, E>(
+    command: AtomCommand<{ environmentId: EnvironmentId; input: Input }, A, E>,
+    input: Input,
+  ): Promise<A> =>
+    runAtomCommand(registry, command, { environmentId, input }, { reportFailure: false }).then(
+      (result) => {
+        if (AsyncResult.isSuccess(result)) return result.value;
+        throw new Error(errorText(Cause.squash(result.cause)));
+      },
+    );
+
   const run = <Input, A, E>(
     command: AtomCommand<{ environmentId: EnvironmentId; input: Input }, A, E>,
     input: Input,
@@ -102,6 +138,8 @@ export function createViewConnection(server: Platform.ViewServer) {
     registry,
     connectionStateAtom: catalog.stateAtom(environmentId),
     providersAtom: serverAtoms.providersValueAtom(environmentId),
+    /** The server's shell: projects, threads, and the removals since its last snapshot. */
+    shellStateAtom: shell.stateValueAtom(environmentId),
     thread: threadAtoms(details, environmentId),
     /**
      * The server's shell once it arrives; mounted only for as long as this waits.
@@ -151,6 +189,17 @@ export function createViewConnection(server: Platform.ViewServer) {
     setRuntimeMode: (input: SetThreadRuntimeModeInput) => run(threadCommands.setRuntimeMode, input),
     cancelQueuedRun: (input: CancelQueuedRunInput) => run(cancelQueuedCommand, input),
     createProject: (input: CreateProjectInput) => run(createProjectCommand, input),
+    archiveThread: (input: ArchiveThreadInput) => run(threadCommands.archive, input),
+    unarchiveThread: (input: UnarchiveThreadInput) => run(threadCommands.unarchive, input),
+    /** Every archived thread; the shell leaves them out. */
+    archivedShell: () => query(archivedShellCommand, {}),
+    /** The active threads in `threadId`'s family, including ones the shell left out as older settled. */
+    threadFamily: (threadId: ThreadId) => query(threadFamilyCommand, { threadId }),
+    /** A page of the older settled threads a shell leaves out, below `before`. */
+    olderSettledThreads: (input: OrchestrationV2GetOlderSettledThreadsInput) =>
+      query(olderSettledCommand, input),
+    createThread: (input: CreateThreadInput) => run(threadCommands.create, input),
+    settleThread: (input: SettleThreadInput) => run(threadCommands.settle, input),
     loadEarlier: (threadId: ThreadId) => run(threadCommands.loadEarlierHistory, { threadId }),
     dispose: () => registry.dispose(),
   };
@@ -161,7 +210,18 @@ export type ViewConnection = ReturnType<typeof createViewConnection>;
 /** What the view reads and runs; the rest of `ViewConnection` serves startup. */
 export type ViewApi = Omit<
   ViewConnection,
-  "environmentId" | "shellSnapshot" | "createProject" | "dispose"
+  | "environmentId"
+  | "shellStateAtom"
+  | "shellSnapshot"
+  | "createProject"
+  | "archiveThread"
+  | "unarchiveThread"
+  | "archivedShell"
+  | "threadFamily"
+  | "olderSettledThreads"
+  | "createThread"
+  | "settleThread"
+  | "dispose"
 >;
 
 /**

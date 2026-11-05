@@ -11,6 +11,10 @@ export interface Tr3xPaths {
   readonly daemonStatePath: string;
   /** Written by the T3 server itself while it runs. */
   readonly serverRuntimeStatePath: string;
+  /** One-shot launch files that hand each tab its bearer: 0700, each file 0600. */
+  readonly launchDir: string;
+  /** The daemon's control socket for the CLI and Rex glue, `$XDG_STATE_HOME/tr3x/daemon.sock`. */
+  readonly controlSocketPath: string;
 }
 
 export function resolveTr3xPaths(
@@ -35,6 +39,12 @@ export function resolveTr3xPaths(
     daemonDir,
     daemonStatePath: NodePath.join(daemonDir, "daemon.json"),
     serverRuntimeStatePath: NodePath.join(home, "userdata", "server-runtime.json"),
+    launchDir: NodePath.join(daemonDir, "launch"),
+    controlSocketPath: NodePath.join(
+      NodePath.resolve(env.XDG_STATE_HOME?.trim() || NodePath.join(userHome, ".local", "state")),
+      "tr3x",
+      "daemon.sock",
+    ),
   };
 }
 

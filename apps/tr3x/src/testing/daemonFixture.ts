@@ -65,8 +65,8 @@ async function terminate(pid: number, isOurs: () => boolean): Promise<void> {
 }
 
 /** Starts `tr3x daemon` on Bun in `home`; pair it with an unconditional `stop()` in teardown. */
-export function startDaemon(home: string): DaemonFixture {
-  const daemon = spawnBun([CLI, "daemon"], { TR3X_HOME: home }, () => {});
+export function startDaemon(home: string, env: NodeJS.ProcessEnv = {}): DaemonFixture {
+  const daemon = spawnBun([CLI, "daemon"], { ...env, TR3X_HOME: home }, () => {});
   let serverPid: number | undefined;
   const started = waitForLine(daemon, STARTED).then((match) => {
     serverPid = Number(match[1]);

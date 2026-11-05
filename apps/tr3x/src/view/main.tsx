@@ -1,23 +1,26 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off -- The view runs on Bun outside the Effect runtime.
 import * as NodeCrypto from "node:crypto";
-import * as NodeFS from "node:fs";
-import * as NodePath from "node:path";
 import { createCliRenderer, type CliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { RegistryContext } from "@effect/atom-react";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  EnvironmentId,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
+import { controlRequest } from "../daemon/control.ts";
 import { readLiveDaemonState } from "../daemon/daemonState.ts";
 import { fetchRecordedEnvironment } from "../daemon/health.ts";
-import { issueLocalSession } from "../daemon/localSession.ts";
+import { waitForLaunchFile } from "../daemon/launchFile.ts";
+import { IssuedSession, issueLocalSession } from "../daemon/localSession.ts";
 import type { Tr3xPaths } from "../paths.ts";
 import { describeError } from "../redact.ts";
 import { App } from "./App.tsx";
+import { resolveProject } from "./resolveProject.ts";
 import { createViewConnection, type ViewConnection } from "./connection.ts";
 import type { ViewServer } from "./platform.ts";
 import { sessionBearer } from "./sessionBearer.ts";
@@ -26,7 +29,15 @@ import type { RexStatus } from "./status.ts";
 
 export type ViewTarget =
   | { readonly kind: "thread"; readonly threadId: ThreadId }
-  | { readonly kind: "new"; readonly cwd: string };
+  | { readonly kind: "new"; readonly cwd: string }
+  /** A daemon's tab: the launch file names the server, the thread, and a bearer. */
+  | { readonly kind: "launch"; readonly path: string };
+
+/** What a mounted view shows: a thread, or a new one in a project, launched by its first message. */
+export type MountTarget =
+  | { readonly kind: "thread"; readonly threadId: ThreadId }
+  | { readonly kind: "new"; readonly cwd: string }
+  | { readonly kind: "new-in-project"; readonly threadId: ThreadId; readonly projectId: ProjectId };
 
 const SESSION_TTL = "1h";
 /** Re-mint this long before expiry, so a reconnect never presents a dying bearer. */
@@ -66,27 +77,42 @@ export async function resolveViewServer(
   };
 }
 
-/** The project rooted at `cwd`, created when the server has none. */
-async function resolveProject(
-  connection: ViewConnection,
-  cwd: string,
+const decodeIssuedSession = Schema.decodeUnknownSync(IssuedSession);
+
+/**
+ * The server and thread a daemon's launch file names. The file's bearer serves
+ * first; the daemon mints each later one, so it can revoke them all when the tab closes.
+ */
+export async function resolveLaunch(
+  path: string,
   signal: AbortSignal,
-): Promise<ProjectId> {
-  const root = NodeFS.realpathSync(cwd);
-  // The server resolves a workspace root without following symlinks, so a
-  // project made elsewhere under a symlinked path is found by that path too.
-  const roots = new Set([NodePath.resolve(cwd), root]);
-  const snapshot = await connection.shellSnapshot(signal);
-  const existing = snapshot.projects.find((project) => roots.has(project.workspaceRoot));
-  if (existing) return existing.id;
-  const projectId = ProjectId.make(NodeCrypto.randomUUID());
-  const result = await connection.createProject({
-    projectId,
-    title: NodePath.basename(root) || root,
-    workspaceRoot: root,
-  });
-  if (!result.ok) throw new Error(`Could not create a project for ${root}: ${result.error}`);
-  return projectId;
+): Promise<{ readonly server: ViewServer; readonly target: MountTarget }> {
+  const launch = await waitForLaunchFile(path, signal);
+  const threadId = ThreadId.make(launch.threadId);
+  let first: IssuedSession | null = { sessionId: "", ...launch.bearer };
+  const server: ViewServer = {
+    ...launch.server,
+    environmentId: EnvironmentId.make(launch.server.environmentId),
+    bearerToken: sessionBearer(async () => {
+      const issued = first;
+      first = null;
+      if (issued !== null) return issued;
+      return decodeIssuedSession(
+        await controlRequest(launch.controlSocket, { op: "bearer", threadId }),
+      );
+    }, SESSION_REFRESH_MS),
+  };
+  return {
+    server,
+    target:
+      launch.newThreadProjectId === undefined
+        ? { kind: "thread", threadId }
+        : {
+            kind: "new-in-project",
+            threadId,
+            projectId: ProjectId.make(launch.newThreadProjectId),
+          },
+  };
 }
 
 /** `promise`, or a rejection as soon as `signal` aborts. */
@@ -120,7 +146,7 @@ export type ViewStart =
 export async function mountView(input: {
   readonly renderer: CliRenderer;
   readonly server: ViewServer;
-  readonly target: ViewTarget;
+  readonly target: MountTarget;
   readonly signal: AbortSignal;
   readonly onStatus?: (status: RexStatus) => void;
   readonly onQuit: () => void;
@@ -156,7 +182,8 @@ export async function mountView(input: {
     });
   }
   const connection = (input.connect ?? createViewConnection)(input.server);
-  let newThread: { readonly projectId: ProjectId } | null = null;
+  let newThread: { readonly projectId: ProjectId } | null =
+    target.kind === "new-in-project" ? { projectId: target.projectId } : null;
   if (target.kind === "new") {
     startup("Loading projects…", connection);
     try {
@@ -170,8 +197,7 @@ export async function mountView(input: {
     }
   }
   if (signal.aborted) return stop(connection, { kind: "quit" });
-  const threadId =
-    target.kind === "thread" ? target.threadId : ThreadId.make(NodeCrypto.randomUUID());
+  const threadId = target.kind === "new" ? ThreadId.make(NodeCrypto.randomUUID()) : target.threadId;
   const onStatus = (status: RexStatus) => {
     try {
       renderer.setProgramStatus(status);
@@ -209,7 +235,15 @@ export async function runView(input: {
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
     process.once(signal, () => quit.abort());
   }
-  const server = await resolveViewServer(input.paths, input.env);
+  let server: ViewServer;
+  let target: MountTarget;
+  if (input.target.kind === "launch") {
+    process.stdout.write("Connecting to the tr3x server…\n");
+    ({ server, target } = await resolveLaunch(input.target.path, quit.signal));
+  } else {
+    server = await resolveViewServer(input.paths, input.env);
+    target = input.target;
+  }
   if (quit.signal.aborted) return 0;
   const renderer = await createCliRenderer({
     exitOnCtrlC: false,
@@ -219,7 +253,7 @@ export async function runView(input: {
   const start = await mountView({
     renderer,
     server,
-    target: input.target,
+    target,
     signal: quit.signal,
     onQuit: () => quit.abort(),
   });

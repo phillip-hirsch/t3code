@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off -- The daemon runs on Bun outside the Effect runtime.
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 
 import type { Tr3xPaths } from "../paths.ts";
 import { describeError, redactSecrets } from "../redact.ts";
@@ -14,7 +15,9 @@ import {
   writeDaemonState,
 } from "./daemonState.ts";
 import { describeServer, fetchRecordedEnvironment, StaleServerError } from "./health.ts";
+import { type ControlServer, startControlServer } from "./control.ts";
 import { type ManagedServer, StateDirOwnedError, startManagedServer } from "./serverLauncher.ts";
+import { startTabService, type TabService } from "./tabService.ts";
 
 export interface DaemonOptions {
   readonly paths: Tr3xPaths;
@@ -68,6 +71,7 @@ async function acquire(options: DaemonOptions): Promise<Acquired | undefined> {
       const server = await startManagedServer(
         {
           baseDir: paths.home,
+          preferredPort: readLastPort(paths),
           signal,
           onStderr: (line) => {
             stderrTail.push(redactSecrets(line));
@@ -76,6 +80,9 @@ async function acquire(options: DaemonOptions): Promise<Acquired | undefined> {
         },
         { env: options.env },
       );
+      NodeFS.writeFileSync(lastPortPath(paths), `${new URL(server.httpBaseUrl).port}\n`, {
+        mode: 0o600,
+      });
       return { kind: "owner", server, stderrTail };
     } catch (error) {
       if (signal.aborted) return undefined;
@@ -110,11 +117,26 @@ async function runOwner(
   const { paths, log, signal } = options;
   let fatal: string | undefined;
   let stopHealth = () => {};
+  let tabs: TabService | undefined;
+  let control: ControlServer | undefined;
   try {
     let written = publishState(paths, server);
     log(
       `started ${describeServer(server.environment, server.httpBaseUrl)} (server pid ${server.process.pid}, daemon pid ${process.pid})`,
     );
+    tabs = await startTabService({
+      paths,
+      env: options.env,
+      log,
+      server: {
+        environmentId: server.environment.environmentId,
+        label: server.environment.label,
+        httpBaseUrl: server.httpBaseUrl,
+        wsBaseUrl: server.wsBaseUrl,
+      },
+    });
+    control = await startControlServer(paths.controlSocketPath, tabs.handle);
+    log(`listening on ${paths.controlSocketPath}`);
     const logStderrTail = () => {
       if (stderrTail.length > 0) log(`server output:\n${stderrTail.join("\n")}`);
     };
@@ -142,6 +164,8 @@ async function runOwner(
     await Promise.race([abortPromise(signal), fatalSignal]);
   } finally {
     stopHealth();
+    await control?.close();
+    await tabs?.stop();
     if (fatal !== undefined) log(fatal);
     const pid = server.process.pid;
     log(`stopping server${pid === undefined ? "" : ` (pid ${pid})`}`);
@@ -150,6 +174,23 @@ async function runOwner(
     log("server stopped");
   }
   return fatal === undefined ? 0 : 1;
+}
+
+/**
+ * The last server's port. Tabs outlive the daemon, and their views reconnect
+ * to the URL they started with, so a restarted daemon serves there when it can.
+ */
+function lastPortPath(paths: Tr3xPaths): string {
+  return NodePath.join(paths.daemonDir, "server-port");
+}
+
+function readLastPort(paths: Tr3xPaths): number | undefined {
+  try {
+    const port = Number.parseInt(NodeFS.readFileSync(lastPortPath(paths), "utf8"), 10);
+    return port > 0 && port < 65_536 ? port : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function publishState(paths: Tr3xPaths, server: ManagedServer): DaemonState {

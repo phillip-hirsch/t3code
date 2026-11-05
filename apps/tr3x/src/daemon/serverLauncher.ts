@@ -23,6 +23,8 @@ export interface ServerEndpoint {
 export interface ManagedServerOptions {
   readonly baseDir: string;
   readonly port?: number;
+  /** A port to use if it's free, e.g. the last server's, so clients that knew it reconnect. */
+  readonly preferredPort?: number | undefined;
   /**
    * The first restart's delay. Each further rapid failure doubles it, until
    * the launcher gives up: 750 ms→6 s by default, then `fatal`.
@@ -67,7 +69,7 @@ type SpawnImpl = (
 
 export interface ManagedServerDependencies {
   readonly spawnImpl?: SpawnImpl;
-  readonly reservePort?: () => Promise<number>;
+  readonly reservePort?: (preferred: number | undefined) => Promise<number>;
   readonly env?: NodeJS.ProcessEnv;
   readonly setTimeoutImpl?: typeof setTimeout;
   readonly clearTimeoutImpl?: typeof clearTimeout;
@@ -105,11 +107,25 @@ export function stripReservedLaunchEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEn
   );
 }
 
-async function reserveLoopbackPort(): Promise<number> {
+/**
+ * `preferred` once it's free, else any free loopback port. The server that
+ * held it may still be shutting down: one whose launcher died exits within 2 s.
+ */
+async function reserveLoopbackPort(preferred: number | undefined): Promise<number> {
+  if (preferred === undefined) return await listenOnce(0);
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    const free = await listenOnce(preferred).catch(() => undefined);
+    if (free !== undefined) return free;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return await listenOnce(0);
+}
+
+async function listenOnce(requested: number): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = NodeNet.createServer();
     server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(requested, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
         server.close(() => reject(new Error("Failed to reserve loopback port.")));
@@ -382,7 +398,7 @@ export async function startManagedServer(
   let first: NodeChildProcess.ChildProcess | null = null;
   let environment: EnvironmentSummary;
   try {
-    port = options.port ?? (await reservePort());
+    port = options.port ?? (await reservePort(options.preferredPort));
     args = buildServerArgs({ entryArgs, host: HOST, port, baseDir: options.baseDir });
     httpBaseUrl = buildServerEndpoint(HOST, port).httpBaseUrl;
     if (stopped) throw new Error("Aborted while the server started.");

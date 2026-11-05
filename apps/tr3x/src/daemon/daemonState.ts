@@ -39,7 +39,7 @@ export function currentProcessStartedAt(): string {
 /** The state file or its directory could be swapped or read by someone else. */
 export class UnsafeDaemonStateError extends Error {}
 
-function assertPrivate(stats: NodeFS.Stats, path: string, kind: "directory" | "file"): void {
+export function assertPrivate(stats: NodeFS.Stats, path: string, kind: "directory" | "file"): void {
   const isKind = kind === "directory" ? stats.isDirectory() : stats.isFile();
   if (!isKind) throw new UnsafeDaemonStateError(`${path} is not a ${kind}.`);
   if (stats.uid !== process.getuid?.()) {

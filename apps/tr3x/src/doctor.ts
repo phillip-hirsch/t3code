@@ -21,16 +21,11 @@ import {
 import { issueLocalSession } from "./daemon/localSession.ts";
 import { checkBunRuntime } from "./bunRuntime.ts";
 import { checkNodeRuntime } from "./daemon/nodeRuntime.ts";
-import { findOnPath, isExecutableFile } from "./executables.ts";
 import type { Tr3xPaths } from "./paths.ts";
 import { isUsableProvider } from "./providers.ts";
 import { describeError } from "./redact.ts";
 import { fetchServerConfig } from "./serverConfig.ts";
-
-export const REX_APP_BUNDLE_CLIS = [
-  "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex",
-  "/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex",
-];
+import { REX_APP_BUNDLE_CLIS, resolveRexCli } from "./rex/rex.ts";
 
 type Status = "ok" | "fail" | "info";
 
@@ -243,14 +238,4 @@ function rexCliCheck(env: NodeJS.ProcessEnv, appBundleClis: ReadonlyArray<string
     return { status: "fail", name: "rex", detail: `\`${cli} version\` failed (${outcome})` };
   }
   return { status: "ok", name: "rex", detail: `${cli} (${firstLine})` };
-}
-
-/** `TR3X_REX_BIN`, then `rex` on PATH, then the CLI inside the macOS app bundle. */
-export function resolveRexCli(
-  env: NodeJS.ProcessEnv,
-  appBundleClis: ReadonlyArray<string> = REX_APP_BUNDLE_CLIS,
-): string | undefined {
-  const configured = env.TR3X_REX_BIN?.trim();
-  if (configured && isExecutableFile(configured)) return configured;
-  return findOnPath("rex", env) ?? appBundleClis.find(isExecutableFile);
 }

@@ -11,7 +11,7 @@ import { resolveServerCommand, stripReservedLaunchEnv } from "./serverLauncher.t
  * The token comes back on the child's stdout, never in argv.
  */
 
-const IssuedSession = Schema.Struct({
+export const IssuedSession = Schema.Struct({
   sessionId: Schema.String,
   token: Schema.String,
   expiresAt: Schema.String,
@@ -26,15 +26,13 @@ export interface IssueLocalSessionInput {
   /** Upstream's duration syntax, e.g. `2m`. */
   readonly ttl: string;
   readonly label: string;
+  /** Groups sessions, e.g. every one minted for a tab, so they can be found and revoked together. */
+  readonly subject?: string;
   readonly env: NodeJS.ProcessEnv;
 }
 
 export async function issueLocalSession(input: IssueLocalSessionInput): Promise<IssuedSession> {
-  const { command, args: entryArgs, cwd } = resolveServerCommand(input.env);
-  const args = [
-    ...entryArgs,
-    "auth",
-    "session",
+  const stdout = await runAuthSession(input.env, [
     "issue",
     "--base-dir",
     input.baseDir,
@@ -43,13 +41,48 @@ export async function issueLocalSession(input: IssueLocalSessionInput): Promise<
     input.ttl,
     "--label",
     input.label,
+    ...(input.subject === undefined ? [] : ["--subject", input.subject]),
     "--json",
-  ];
-  const stdout = await new Promise<string>((resolve, reject) => {
+  ]);
+  return decodeIssuedSession(stdout.trim());
+}
+
+const ListedSessions = Schema.Array(
+  Schema.Struct({ sessionId: Schema.String, subject: Schema.String, issuedAt: Schema.String }),
+);
+export type ListedSession = (typeof ListedSessions.Type)[number];
+const decodeListedSessions = Schema.decodeUnknownSync(Schema.fromJsonString(ListedSessions));
+
+/** The base dir's active sessions, without their tokens. */
+export async function listLocalSessions(
+  baseDir: string,
+  env: NodeJS.ProcessEnv,
+): Promise<ReadonlyArray<ListedSession>> {
+  return decodeListedSessions(
+    (await runAuthSession(env, ["list", "--base-dir", baseDir, "--json"])).trim(),
+  );
+}
+
+export async function revokeLocalSession(
+  baseDir: string,
+  sessionId: string,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  await runAuthSession(env, ["revoke", "--base-dir", baseDir, sessionId]);
+}
+
+/** Runs `t3 auth session <args>` and returns its stdout. Tokens come back there, never in argv. */
+function runAuthSession(
+  env: NodeJS.ProcessEnv,
+  sessionArgs: ReadonlyArray<string>,
+): Promise<string> {
+  const { command, args: entryArgs, cwd } = resolveServerCommand(env);
+  const args = [...entryArgs, "auth", "session", ...sessionArgs];
+  return new Promise<string>((resolve, reject) => {
     NodeChildProcess.execFile(
       command,
       args,
-      { cwd, env: stripReservedLaunchEnv(input.env), timeout: 20_000, encoding: "utf8" },
+      { cwd, env: stripReservedLaunchEnv(env), timeout: 20_000, encoding: "utf8" },
       (error, out, err) => {
         if (error) {
           // A Node that can't run says so in the spawn error, not on stderr.
@@ -61,10 +94,9 @@ export async function issueLocalSession(input: IssueLocalSessionInput): Promise<
                 ? "it took too long"
                 : undefined);
           // Not "session: …": redaction reads that as a credential and hides the reason.
-          reject(new Error(`Could not issue a session.${detail ? ` ${detail}` : ""}`));
+          reject(new Error(`Could not ${sessionArgs[0]} a session.${detail ? ` ${detail}` : ""}`));
         } else resolve(out);
       },
     );
   });
-  return decodeIssuedSession(stdout.trim());
 }

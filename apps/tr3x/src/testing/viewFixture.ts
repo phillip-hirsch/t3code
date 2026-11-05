@@ -35,7 +35,14 @@ import {
   type ViewApi,
   type ViewConnection,
 } from "../view/connection.ts";
-import type { CreateProjectInput } from "@t3tools/client-runtime/operations";
+import type {
+  ArchiveThreadInput,
+  CreateProjectInput,
+  CreateThreadInput,
+  SettleThreadInput,
+  UnarchiveThreadInput,
+} from "@t3tools/client-runtime/operations";
+import { EMPTY_SHELL_STATE } from "@t3tools/client-runtime/state/shell";
 
 /**
  * A view without a server: thread state the test sets, derived into structure,
@@ -322,6 +329,14 @@ export function createFakeView(providers: ReadonlyArray<ServerProvider>) {
   const connection: ViewConnection = {
     ...api,
     environmentId: ENVIRONMENT_ID,
+    shellStateAtom: Atom.make(EMPTY_SHELL_STATE),
+    archiveThread: new CommandStub<ArchiveThreadInput>().run,
+    unarchiveThread: new CommandStub<UnarchiveThreadInput>().run,
+    archivedShell: () => Promise.reject(new Error("No archive in view fixtures.")),
+    threadFamily: () => Promise.reject(new Error("No thread families in view fixtures.")),
+    olderSettledThreads: () => Promise.reject(new Error("No older threads in view fixtures.")),
+    createThread: new CommandStub<CreateThreadInput>().run,
+    settleThread: new CommandStub<SettleThreadInput>().run,
     shellSnapshot: () =>
       Promise.resolve({
         schemaVersion: 1,
