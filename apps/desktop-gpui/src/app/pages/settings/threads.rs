@@ -481,9 +481,7 @@ impl Workspace {
 
     fn snooze_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
-        let saved: Vec<Preset> = serde_json::from_value::<Vec<Preset>>(view.value("snoozePresets").clone())
-            .map(|presets| presets.into_iter().filter(Preset::in_range).collect())
-            .unwrap_or_else(|_| snooze::defaults());
+        let saved = snooze::saved_presets(view.value("snoozePresets"));
         let editor = window.use_keyed_state("settings-snooze-editor", cx, |_, _| SnoozeEditor::default());
         editor.update(cx, |editor, _| editor.adopt(&saved));
         let presets = editor.read(cx).presets();
@@ -494,7 +492,7 @@ impl Workspace {
         for ((key, preset), preview) in keys.iter().copied().zip(presets.iter()).zip(previews) {
             list.push(self.snooze_preset_row(&editor, key, preset, preview, window, cx));
         }
-        let full = presets.len() >= snooze::MAX_PRESETS;
+        let full = presets.len() + snooze::unreadable_count(view.value("snoozePresets")) >= snooze::MAX_PRESETS;
         let add_editor = editor.clone();
         let settle_editor = editor.clone();
         let body = v_flex()
@@ -733,7 +731,8 @@ impl Workspace {
             cx.notify();
         });
         let editor = editor.clone();
-        self.update_settings_then(json!({ "snoozePresets": presets }), window, cx, move |_, ok, cx| {
+        let list = snooze::write_value(self.settings_view().value("snoozePresets"), &presets);
+        self.update_settings_then(json!({ "snoozePresets": list }), window, cx, move |_, ok, cx| {
             if !ok {
                 editor.update(cx, |e, cx| {
                     e.written.clear();
