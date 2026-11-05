@@ -112,6 +112,49 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub auth: ProviderAuth,
+    #[serde(default)]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub runtime_paths: Option<RuntimePaths>,
+}
+
+/// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub can_logout: Option<bool>,
+    #[serde(default)]
+    pub subscription_sharing: Option<bool>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSetup {
+    pub can_authenticate: bool,
+    pub can_install: bool,
+    #[serde(default)]
+    pub documentation_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePaths {
+    pub home_path: String,
+    #[serde(default)]
+    pub shadow_home_path: Option<String>,
 }
 
 /// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
@@ -173,6 +216,9 @@ pub struct ServerInfo {
     /// `projectSettingsOverrides`, keyed by project id.
     pub project_settings_overrides: Value,
     pub new_projects_root: Option<String>,
+    /// The raw `ServerSettings`, for settings sections that patch whole maps.
+    pub settings: Value,
+    pub platform_os: Option<String>,
 }
 
 impl ServerInfo {
@@ -188,6 +234,7 @@ impl ServerInfo {
                 self.environment_label = text("/environment/label");
                 self.platform_machine = text("/environment/platform/machine");
                 self.new_projects_root = text("/newProjectsRoot");
+                self.platform_os = text("/environment/platform/os");
             }
             "providerStatuses" => self.providers = lossy(&event["payload"]["providers"])?,
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
@@ -205,6 +252,7 @@ impl ServerInfo {
         self.new_worktrees_start_from_origin = settings.get("newWorktreesStartFromOrigin").and_then(Value::as_bool);
         self.project_settings_folded = settings.get("projectSettingsFolded").and_then(Value::as_bool) == Some(true);
         self.project_settings_overrides = settings.get("projectSettingsOverrides").cloned().unwrap_or_default();
+        self.settings = settings.clone();
         Ok(())
     }
 
