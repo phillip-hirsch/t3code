@@ -135,9 +135,11 @@ impl Workspace {
     pub(super) fn stash_composer(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
         let attachments = std::mem::take(&mut self.attachments);
-        let draft = match self.question.take() {
-            Some(question) => ComposerDraft::Question(question),
-            None => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
+        let draft = match (self.question.take(), self.take_queue_edit_draft()) {
+            (Some(question), _) => ComposerDraft::Question(question),
+            // A queued message's edit ends here; the thread keeps its own draft.
+            (None, Some((prompt, attachments))) => ComposerDraft::Prompt(prompt, attachments),
+            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
         };
         self.prompt_history = None;
         self.menu = Default::default();
@@ -569,7 +571,9 @@ impl Workspace {
             v_flex()
                 .w_full()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
+                .children(self.render_environment_banner(&t, cx))
                 .children(self.render_fallback_banner(&t, cx))
+                .children(self.render_recovery_banner(&t, cx))
                 .children(self.render_question(&t, cx))
                 .child(div().relative().children(self.render_command_menu(&t, cx)).child(surface))
                 .children(self.render_context_strip(&t, cx)),
@@ -714,20 +718,23 @@ impl Workspace {
             return self.render_plan_follow_up_action(t, cx);
         }
         let sendable = !self.composer_empty || self.has_attachments();
-        if running && !sendable {
+        let editing = self.editing_queued();
+        if running && !sendable && !editing {
             return stop().into_any_element();
         }
+        let busy = self.sending || self.saving_queue_edit();
         let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
         let can_send = sendable
             && self.target.is_some()
             && self.client().is_some()
             && disabled_reason.is_none()
-            && !self.target_rewinding();
+            && !self.target_rewinding()
+            && !self.saving_queue_edit();
         // `environmentIdentificationMode`: the stage art fills the button (`StageBackdropButtonArt`).
         let stage = self.stage_art();
         let (fill, icon) = if stage.is_some() {
             (gpui_kit::transparent_black(), gpui_kit::white())
-        } else if can_send || self.sending {
+        } else if can_send || busy {
             (t.primary, t.primary_foreground)
         } else {
             (t.foreground.opacity(0.12), t.muted_foreground)
@@ -736,8 +743,10 @@ impl Workspace {
         let alternate = if follow_up == "queue" { "steer" } else { "queue" };
         let held = if self.ctrl_held { Intent::Alternate } else { Intent::Foreground };
         let queue = running && super::send::queues(follow_up, held);
-        let content: AnyElement = if self.sending {
+        let content: AnyElement = if busy {
             Spinner::new().small().color(icon).into_any_element()
+        } else if editing {
+            Icon::new(Lucide::Check).with_size(px(16.)).text_color(icon).into_any_element()
         } else if running {
             let glyph = if queue { Lucide::ListPlus } else { Lucide::CornerUpRight };
             Icon::new(glyph).with_size(px(16.)).text_color(icon).into_any_element()
@@ -746,6 +755,7 @@ impl Workspace {
         };
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
             (Some(reason), _) => Some(reason.into()),
+            (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
                 let keys = if super::send::requires_modifier(shortcut, &self.composer.read(cx).value()) {

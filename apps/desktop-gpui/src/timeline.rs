@@ -29,6 +29,8 @@ pub enum Row {
         created_at: SharedString,
         /// The checkpoint "Edit from here" rewinds to.
         revert: Option<Checkpoint>,
+        /// "Sent by T3 Code" above the bubble; not the user's own words, so it never groups.
+        sent_by_t3code: bool,
     },
     Assistant {
         id: SharedString,
@@ -76,6 +78,16 @@ pub enum Row {
     /// "Superseded attempt": the work a steer cut off, folded.
     AttemptFold {
         key: SharedString,
+        expanded: bool,
+    },
+    /// A queued follow-up, after the timeline (`QueuedRunsControl`).
+    Queued {
+        message: Rc<crate::queue::QueuedMessage>,
+        last: bool,
+    },
+    /// "Show all N queued" under a long queue.
+    QueueToggle {
+        total: usize,
         expanded: bool,
     },
 }
@@ -319,7 +331,7 @@ impl Row {
     }
 
     fn is_own_user_message(&self) -> bool {
-        matches!(self, Row::User { .. })
+        matches!(self, Row::User { sent_by_t3code: false, .. })
     }
 }
 
@@ -346,6 +358,7 @@ enum Kind {
         text: SharedString,
         steer: Option<Steer>,
         revertible: bool,
+        sent_by_t3code: bool,
     },
     Assistant {
         text: SharedString,
@@ -489,7 +502,7 @@ fn timeline_entry(item: &Rc<TurnItem>) -> Option<TimelineEntry> {
                 _ => None,
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
-            Kind::User { text: text("text"), steer, revertible }
+            Kind::User { text: text("text"), steer, revertible, sent_by_t3code: crate::queue::sent_by_t3code(item) }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
         "proposed_plan" => Kind::Plan { markdown: text("markdown") },
@@ -538,7 +551,16 @@ fn event_label(item: &TurnItem) -> String {
     match item.item_type.as_str() {
         "fork" => "Forked thread".into(),
         "handoff" => "Switched provider".into(),
-        "secret_request" => "Asked for a secret".into(),
+        // `secretRequestDisplay` for an answered request.
+        "secret_request" => {
+            let outcome = match item.str("secretStatus") {
+                Some("saved") => "Saved securely and kept private",
+                Some("declined") => "Declined",
+                Some("cancelled") => "Request ended",
+                _ => return "Asked for a secret".into(),
+            };
+            format!("{} · {outcome}", text("label").unwrap_or_else(|| "Secret".into()))
+        }
         "link_request" => "Asked to link an environment".into(),
         "subagent" => text("title")
             .or_else(|| text("prompt").and_then(|p| p.lines().next().map(str::to_owned)))
@@ -1202,7 +1224,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
             Kind::Event { subagent: Some(card), .. } => rows.push(Row::Subagent(card.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
-            Kind::User { text, steer, .. } => rows.push(Row::User {
+            Kind::User { text, steer, sent_by_t3code, .. } => rows.push(Row::User {
                 id: entry.id.clone(),
                 text: text.clone(),
                 steer: *steer,
@@ -1211,6 +1233,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                 continues_steer: false,
                 created_at: entry.created_at.clone(),
                 revert: reverts.get(&entry.id).cloned(),
+                sent_by_t3code: *sent_by_t3code,
             }),
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
                 id: entry.id.clone(),
@@ -1255,9 +1278,9 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         let previous = index.checked_sub(1).and_then(|i| flags.get(i)).copied().unwrap_or_default();
         match row {
             Row::Work(work) => work.continues = next.0,
-            Row::User { steer, grouped_with_previous, grouped_with_next, continues_steer, .. } => {
-                *grouped_with_previous = previous.1;
-                *grouped_with_next = next.1;
+            Row::User { steer, grouped_with_previous, grouped_with_next, continues_steer, sent_by_t3code, .. } => {
+                *grouped_with_previous = !*sent_by_t3code && previous.1;
+                *grouped_with_next = !*sent_by_t3code && next.1;
                 *continues_steer = previous.2 && steer.is_some();
             }
             _ => {}
@@ -1319,6 +1342,7 @@ mod tests {
             continues_steer: false,
             created_at: SharedString::default(),
             revert: None,
+            sent_by_t3code: false,
         }
     }
 
@@ -1364,6 +1388,8 @@ mod tests {
                 Row::Subagent(card) => format!("subagent {}", card.title),
                 Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
                 Row::Embed(embed) => format!("embed {}", embed.title),
+                Row::Queued { message, .. } => format!("queued {}", message.text),
+                Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
             })
             .collect()
     }
@@ -1391,6 +1417,18 @@ mod tests {
         assert!(timeline_entry(&queued).is_none());
         assert!(timeline_entry(&checkpoint).is_none());
         assert!(matches!(timeline_entry(&started).unwrap().kind, Kind::User { steer: None, .. }));
+    }
+
+    #[test]
+    fn answered_secret_requests_name_their_outcome() {
+        let label = |status: &str| {
+            let raw = json!({"id": "s", "type": "secret_request", "label": "GitHub token", "secretStatus": status});
+            event_label(&serde_json::from_value::<TurnItem>(raw).unwrap())
+        };
+        assert_eq!(label("saved"), "GitHub token · Saved securely and kept private");
+        assert_eq!(label("declined"), "GitHub token · Declined");
+        assert_eq!(label("cancelled"), "GitHub token · Request ended");
+        assert_eq!(label("pending"), "Asked for a secret");
     }
 
     fn command(id: &str, run: &str, at: &str) -> Value {
@@ -1623,6 +1661,15 @@ mod tests {
             Row::User { grouped_with_previous: true, steer: Some(Steer::Steered), continues_steer: false, .. }
         ));
         assert!(matches!(rows[2], Row::User { continues_steer: true, .. }));
+
+        // A message T3 Code sent is labeled and stands apart from the user's own.
+        let sent = json!({"text": "d", "inputIntent": "turn_start", "createdBy": "agent", "creationSource": "server"});
+        let mut items = vec![item("u4", "user_message", "r2", "2026-11-04T10:00:03.000Z", sent)];
+        items.insert(0, item("u0", "user_message", "r2", "2026-11-04T10:00:00.500Z", json!({"text": "z"})));
+        let p = projection(items, json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &mut EntryCache::default());
+        assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
+        assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
     }
 
     #[test]

@@ -7,7 +7,6 @@
 //! setting there; "Use devices" (`enableDeviceSupport`) is environment-only. Without a scope here,
 //! both go through `device.configure` like the web's environment scope.
 
-mod agent_access;
 mod sources;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};

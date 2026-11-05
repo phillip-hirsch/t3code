@@ -238,6 +238,9 @@ pub struct Session {
     pub runtime: Option<String>,
     #[serde(default)]
     pub headless: bool,
+    /// Fixed at open: the profile whose cookies the tab uses.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     #[serde(default)]
     pub reveal: Option<bool>,
     #[serde(default)]
@@ -442,7 +445,7 @@ pub fn search_template(settings: &crate::settings::Settings) -> String {
 }
 
 /// `isValidSearchUrlTemplate`: an http(s) URL whose `%s` sits after the authority.
-fn valid_search_template(template: &str) -> bool {
+pub fn valid_search_template(template: &str) -> bool {
     let fill = |query: &str| url::Url::parse(&template.replace("%s", &encode_uri_component(query))).ok();
     let authority = |url: &url::Url| {
         (url.username().to_owned(), url.password().map(str::to_owned), url.host_str().map(str::to_owned), url.port())
@@ -563,6 +566,178 @@ pub fn display_url(session: &Session) -> &str {
     session.nav_status.url().filter(|url| *url != "about:blank").unwrap_or_default()
 }
 
+/// `PREVIEW_VIEWPORT_{MIN,MAX}_DIMENSION` and `PREVIEW_VIEWPORT_MAX_AREA`.
+pub const VIEWPORT_MIN_DIMENSION: i64 = 240;
+pub const VIEWPORT_MAX_DIMENSION: i64 = 3840;
+const VIEWPORT_MAX_AREA: i64 = 3840 * 2160;
+/// The size "Responsive" starts at when switched to from "Fill panel" (`RESPONSIVE_SEED_SIZE`).
+const RESPONSIVE_SEED: (u32, u32) = (1280, 800);
+
+impl Viewport {
+    pub fn to_json(&self) -> Value {
+        match self {
+            Viewport::Fill => json!({"_tag": "fill"}),
+            Viewport::Freeform { width, height } => json!({"_tag": "freeform", "width": width, "height": height}),
+            Viewport::Preset { width, height, preset_id } => {
+                json!({"_tag": "preset", "presetId": preset_id, "width": width, "height": height})
+            }
+        }
+    }
+
+    /// The Settings select's value: `fill`, a known preset's id, else `responsive` (`viewportSelectValue`).
+    pub fn choice(&self) -> &str {
+        match self {
+            Viewport::Fill => "fill",
+            Viewport::Preset { preset_id, .. } if PRESETS.iter().any(|p| p.id == preset_id) => preset_id,
+            _ => "responsive",
+        }
+    }
+
+    /// The size the Settings fields show; "Fill panel" shows none.
+    fn shown_size(&self) -> (u32, u32) {
+        self.size().map_or(RESPONSIVE_SEED, |(w, h)| (w as u32, h as u32))
+    }
+
+    /// The viewport a Settings select pick saves (`selectViewport`): responsive keeps the size.
+    pub fn chosen(&self, choice: &str) -> Option<Viewport> {
+        let (width, height) = self.shown_size();
+        match choice {
+            "fill" => Some(Viewport::Fill),
+            "responsive" => Some(Viewport::Freeform { width, height }),
+            id => PRESETS.iter().find(|p| p.id == id).map(|p| Viewport::Preset {
+                width: p.width,
+                height: p.height,
+                preset_id: p.id.to_owned(),
+            }),
+        }
+    }
+
+    /// A typed width or height (`commitDimension`): whole, in range and under the area cap, else nothing.
+    pub fn with_dimension(&self, width_axis: bool, value: i64) -> Option<Viewport> {
+        if !(VIEWPORT_MIN_DIMENSION..=VIEWPORT_MAX_DIMENSION).contains(&value) {
+            return None;
+        }
+        let (width, height) = self.shown_size();
+        let (width, height) = if width_axis { (value as u32, height) } else { (width, value as u32) };
+        if i64::from(width) * i64::from(height) > VIEWPORT_MAX_AREA
+            || self.size() == Some((width as f32, height as f32))
+        {
+            return None;
+        }
+        Some(Viewport::Freeform { width, height })
+    }
+
+    /// Width and height swapped, keeping a preset a preset.
+    pub fn rotated(&self) -> Viewport {
+        match self.clone() {
+            Viewport::Fill => Viewport::Fill,
+            Viewport::Freeform { width, height } => Viewport::Freeform { width: height, height: width },
+            Viewport::Preset { width, height, preset_id } => {
+                Viewport::Preset { width: height, height: width, preset_id }
+            }
+        }
+    }
+}
+
+/// `packages/contracts/src/browserProfile.ts`.
+pub const DEFAULT_PROFILE_ID: &str = "default";
+pub const INCOGNITO_PROFILE_ID: &str = "incognito";
+pub const PROFILE_MAX_COUNT: usize = 24;
+pub const PROFILE_NAME_MAX_LENGTH: usize = 48;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileKind {
+    #[default]
+    Persistent,
+    Incognito,
+}
+
+/// A browser profile: its own cookies and logins, for this client's tabs and the server's browser.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: ProfileKind,
+}
+
+impl Profile {
+    pub fn built_in(&self) -> bool {
+        self.id == DEFAULT_PROFILE_ID || self.id == INCOGNITO_PROFILE_ID
+    }
+}
+
+/// The stored `browserProfiles`, the user's own.
+pub fn user_profiles(settings: &crate::settings::Settings) -> Vec<Profile> {
+    serde_json::from_value(settings.get("browserProfiles").clone()).unwrap_or_default()
+}
+
+/// `resolveBrowserProfiles`: the built-ins, then the user's without ids taken, all persistent.
+pub fn resolve_profiles(user: &[Profile]) -> Vec<Profile> {
+    let built_in = |id: &str, name: &str, kind| Profile { id: id.into(), name: name.into(), kind };
+    let mut resolved = vec![
+        built_in(DEFAULT_PROFILE_ID, "Default", ProfileKind::Persistent),
+        built_in(INCOGNITO_PROFILE_ID, "Incognito", ProfileKind::Incognito),
+    ];
+    for profile in user {
+        if resolved.iter().all(|p| p.id != profile.id) {
+            resolved.push(Profile { kind: ProfileKind::Persistent, ..profile.clone() });
+        }
+    }
+    resolved
+}
+
+/// `BrowserDefaults.profileId`: `browserDefaultProfileId` when it names a listed, non-incognito profile.
+pub fn default_profile_id(settings: &crate::settings::Settings) -> String {
+    let wanted = settings.get("browserDefaultProfileId").as_str().unwrap_or_default();
+    resolve_profiles(&user_profiles(settings))
+        .into_iter()
+        .find(|p| p.id == wanted && p.kind != ProfileKind::Incognito)
+        .map_or_else(|| DEFAULT_PROFILE_ID.to_owned(), |p| p.id)
+}
+
+/// `base`, else the first free `base 2`, `base 3`, … among `profiles`' names.
+pub fn unique_profile_name(base: &str, profiles: &[Profile]) -> String {
+    let taken = |name: &str| profiles.iter().any(|p| p.name == name);
+    if !taken(base) {
+        return base.to_owned();
+    }
+    (2..).map(|index| format!("{base} {index}")).find(|name| !taken(name)).unwrap_or_default()
+}
+
+/// Where this client's tabs of a profile keep their data, like Electron's session partitions.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Partition {
+    /// The browser's own folder, where tabs lived before profiles.
+    Default,
+    /// In memory, gone when the app closes.
+    Incognito,
+    /// A folder of its own, named by a hash so any id makes a short, valid name.
+    Folder(String),
+}
+
+pub fn partition(profile_id: Option<&str>) -> Partition {
+    use sha2::Digest as _;
+    match profile_id {
+        None | Some(DEFAULT_PROFILE_ID) => Partition::Default,
+        Some(INCOGNITO_PROFILE_ID) => Partition::Incognito,
+        Some(id) => {
+            Partition::Folder(sha2::Sha256::digest(id.as_bytes())[..16].iter().map(|b| format!("{b:02x}")).collect())
+        }
+    }
+}
+
+/// `preview.reportProfiles`' input (`BrowserProfileReporter`): the server's browser takes this
+/// client's profiles, default profile and recording frame rate for the tabs agents open.
+pub fn profile_report(settings: &crate::settings::Settings) -> Value {
+    json!({
+        "profiles": settings.get("browserProfiles"),
+        "defaultProfileId": settings.get("browserDefaultProfileId"),
+        "recordingFrameRate": settings.get("browserRecordingFrameRate"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +791,64 @@ mod tests {
         assert!(!link_opens_in_app("https://example.com/", false, &app, false), "no thread to host it");
         assert!(!link_opens_in_app("mailto:a@b.c", false, &app, true));
         assert!(!link_opens_in_app("https://example.com/", false, &settings(json!({})), true), "system default");
+    }
+
+    #[test]
+    fn settings_viewport_picks_and_typed_sizes_follow_the_web() {
+        let ipad = Viewport::Preset { width: 820, height: 1180, preset_id: "ipad-air".into() };
+        assert_eq!((Viewport::Fill.choice(), ipad.choice()), ("fill", "ipad-air"));
+        let unknown = Viewport::Preset { width: 1, height: 2, preset_id: "gone".into() };
+        assert_eq!(unknown.choice(), "responsive");
+        assert_eq!(Viewport::Fill.chosen("responsive"), Some(Viewport::Freeform { width: 1280, height: 800 }));
+        assert_eq!(ipad.chosen("responsive"), Some(Viewport::Freeform { width: 820, height: 1180 }));
+        assert_eq!(ipad.chosen("fill"), Some(Viewport::Fill));
+        assert_eq!(Viewport::Fill.chosen("ipad-air"), Some(ipad.clone()));
+        assert_eq!(Viewport::Fill.chosen("nope"), None);
+
+        assert_eq!(ipad.with_dimension(true, 900), Some(Viewport::Freeform { width: 900, height: 1180 }));
+        assert_eq!(ipad.with_dimension(false, 239), None, "below the minimum");
+        assert_eq!(ipad.with_dimension(true, 820), None, "unchanged");
+        let wide = Viewport::Freeform { width: 3840, height: 2160 };
+        assert_eq!(wide.with_dimension(false, 2161), None, "over the area cap");
+        assert_eq!(
+            ipad.rotated(),
+            Viewport::Preset { width: 1180, height: 820, preset_id: "ipad-air".into() },
+            "a rotated preset stays a preset"
+        );
+        assert_eq!(serde_json::from_value::<Viewport>(ipad.to_json()).unwrap(), ipad);
+    }
+
+    #[test]
+    fn profiles_resolve_like_the_contract_and_partition_their_tabs() {
+        let settings =
+            |patch: Value| crate::settings::Settings::layered(&crate::settings::contract().client_defaults, &patch);
+        let work = json!({"id": "profile-work", "name": "Work", "kind": "persistent"});
+        let stored = settings(json!({
+            "browserProfiles": [{"id": "default", "name": "Hijacked"}, {"id": "x", "name": "X", "kind": "incognito"}, work],
+            "browserDefaultProfileId": "profile-work",
+        }));
+        let resolved = resolve_profiles(&user_profiles(&stored));
+        let ids: Vec<&str> = resolved.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["default", "incognito", "x", "profile-work"]);
+        assert_eq!(resolved[0].name, "Default", "built-ins can't be replaced");
+        assert_eq!(resolved[2].kind, ProfileKind::Persistent, "only the built-in incognito is ephemeral");
+        assert_eq!(default_profile_id(&stored), "profile-work");
+        assert_eq!(default_profile_id(&settings(json!({"browserDefaultProfileId": "incognito"}))), "default");
+        assert_eq!(default_profile_id(&settings(json!({"browserDefaultProfileId": "gone"}))), "default");
+
+        assert_eq!(unique_profile_name("Work", &resolved), "Work 2");
+        assert_eq!(unique_profile_name("New profile", &resolved), "New profile");
+
+        assert_eq!(partition(None), Partition::Default);
+        assert_eq!(partition(Some("incognito")), Partition::Incognito);
+        let Partition::Folder(folder) = partition(Some("profile-work")) else { panic!() };
+        assert_eq!(folder.len(), 32);
+        assert_ne!(partition(Some("profile-home")), Partition::Folder(folder));
+
+        let report = profile_report(&stored);
+        assert_eq!(report["defaultProfileId"], "profile-work");
+        assert_eq!(report["recordingFrameRate"], 30);
+        assert_eq!(report["profiles"][2], work);
     }
 
     #[test]

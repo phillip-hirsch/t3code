@@ -13,6 +13,7 @@ pub(in crate::app) mod keybindings;
 mod model_select;
 
 mod providers;
+pub(in crate::app) use providers::chatgpt_usage_button;
 mod search;
 mod snap_shot;
 mod system;
@@ -404,6 +405,10 @@ impl Workspace {
         // A row inside a fold opens it first.
         if matches!(target.as_str(), "panel-animations" | "environment-identification" | "composer-context") {
             self.settings_ui.advanced_open.insert("appearance");
+        }
+        if matches!(target.as_str(), "browser-default-viewport" | "browser-default-zoom" | "browser-default-appearance")
+        {
+            self.settings_ui.advanced_open.insert("browser");
         }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());

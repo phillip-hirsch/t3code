@@ -29,6 +29,7 @@ use crate::theme::{self, Tokens};
 
 #[cfg(windows)]
 mod native;
+mod profiles;
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
@@ -96,6 +97,8 @@ pub(super) struct PreviewState {
     pub(super) menu_open: bool,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
+    /// What this connection last sent with `preview.reportProfiles`.
+    reported_profiles: Option<Value>,
     _events: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -104,6 +107,7 @@ impl PreviewState {
     /// The event stream ends with the socket; lists are refetched on reconnect.
     pub(super) fn disconnect(&mut self) {
         self._events = None;
+        self.reported_profiles = None;
     }
 }
 
@@ -137,6 +141,7 @@ impl PreviewState {
             address_tab: None,
             menu_open: false,
             stale: HashSet::new(),
+            reported_profiles: None,
             _events: None,
             _subscription: subscription,
         }
@@ -423,7 +428,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client() else { return };
-        let mut input = json!({"threadId": thread_id});
+        let profile = preview::default_profile_id(&self.client_settings.values);
+        let mut input = json!({"threadId": thread_id, "profileId": profile});
         if let Some(url) = &url {
             input["url"] = url.clone().into();
         }
@@ -545,35 +551,40 @@ impl Workspace {
             }
         };
         let (sender, events) = async_channel::unbounded();
-        let builder = wry::WebViewBuilder::new()
-            .with_url(url)
-            .with_devtools(true)
-            .with_on_page_load_handler({
-                let sender = sender.clone();
-                move |event, url| {
-                    let _ = sender.try_send(match event {
-                        wry::PageLoadEvent::Started => PageEvent::Started(url),
-                        wry::PageLoadEvent::Finished => PageEvent::Finished(url),
-                    });
-                }
-            })
-            .with_document_title_changed_handler({
-                let sender = sender.clone();
-                move |title| {
-                    let _ = sender.try_send(PageEvent::Title(title));
-                }
-            })
-            .with_new_window_req_handler({
-                let sender = sender.clone();
-                move |url, _| {
-                    let _ = sender.try_send(PageEvent::OpenLink(url));
-                    wry::NewWindowResponse::Deny
-                }
-            });
+        let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id));
+        let partition = profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref()));
         self.preview.starting.insert(tab_id.to_owned(), url.to_owned());
         let (thread_id, tab_id, url) = (thread_id.to_owned(), tab_id.to_owned(), url.to_owned());
         cx.spawn_in(window, async move |this, cx| {
-            let built = builder.build_as_child_async(&parent).await;
+            let mut context = partition.context();
+            let built = partition
+                .builder(context.as_mut())
+                .with_url(&url)
+                .with_devtools(true)
+                .with_on_page_load_handler({
+                    let sender = sender.clone();
+                    move |event, url| {
+                        let _ = sender.try_send(match event {
+                            wry::PageLoadEvent::Started => PageEvent::Started(url),
+                            wry::PageLoadEvent::Finished => PageEvent::Finished(url),
+                        });
+                    }
+                })
+                .with_document_title_changed_handler({
+                    let sender = sender.clone();
+                    move |title| {
+                        let _ = sender.try_send(PageEvent::Title(title));
+                    }
+                })
+                .with_new_window_req_handler({
+                    let sender = sender.clone();
+                    move |url, _| {
+                        let _ = sender.try_send(PageEvent::OpenLink(url));
+                        wry::NewWindowResponse::Deny
+                    }
+                })
+                .build_as_child_async(&parent)
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let latest = this.preview.starting.remove(&tab_id).unwrap_or_default();
                 let webview = match built {
