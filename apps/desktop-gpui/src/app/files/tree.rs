@@ -680,7 +680,7 @@ impl Workspace {
     }
 
     /// `shell.openInEditor` on a path, with the web's failure toast.
-    pub(super) fn open_path_in_editor(
+    pub(in crate::app) fn open_path_in_editor(
         &mut self,
         path: String,
         editor: String,

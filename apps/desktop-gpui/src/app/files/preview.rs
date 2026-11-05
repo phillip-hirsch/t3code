@@ -760,7 +760,7 @@ impl Workspace {
     }
 
     /// The editor the details card's Open in launches.
-    fn preferred_editor_id(&self) -> Option<String> {
+    pub(in crate::app) fn preferred_editor_id(&self) -> Option<String> {
         let available = &self.server_info.available_editors;
         self.preferred_editor.clone().filter(|editor| available.contains(editor)).or_else(|| available.first().cloned())
     }

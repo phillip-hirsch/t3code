@@ -661,6 +661,9 @@ impl Workspace {
         if !session.server_hosted() {
             input["runtime"] = "server".into();
         }
+        if let Some(profile) = &session.profile_id {
+            input["profileId"] = profile.clone().into();
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
             let _ = this.update_in(cx, |this, window, cx| {

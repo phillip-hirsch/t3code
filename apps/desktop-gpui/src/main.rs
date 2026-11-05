@@ -1,6 +1,7 @@
 mod app;
 mod assets;
 mod backend;
+mod browser_history;
 mod composer_markdown;
 mod composer_search;
 mod composer_text;

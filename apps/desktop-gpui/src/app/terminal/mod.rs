@@ -5,12 +5,16 @@
 mod grid;
 mod keys;
 mod layout;
+mod links;
+mod mouse;
+mod panel;
 mod session;
 
 use std::collections::HashMap;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
+use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -25,6 +29,7 @@ use self::layout::{DrawerLayout, Place, Split};
 use self::session::{Launch, SessionEvent, TerminalSession};
 use super::titlebar::icon;
 use super::{Target, Workspace};
+use crate::composer_text::Chip;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -84,7 +89,51 @@ pub(super) struct Terminals {
     /// The id a draft's thread will launch with, so its terminals carry over.
     draft_threads: HashMap<String, String>,
     focus_pending: Option<String>,
+    /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
+    pub(super) contexts: HashMap<String, Value>,
+    /// Right-panel terminal tabs, by surface id.
+    panel: HashMap<String, panel::PanelGroup>,
     _metadata: Option<Task<()>>,
+}
+
+/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS` and `clampContextText`'s marker.
+const CONTEXT_TEXT_MAX: usize = 64_000;
+const TRUNCATION_MARKER: &str = "\n… truncated …";
+
+/// `formatTerminalContextLabel`.
+fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> String {
+    if line_start == line_end {
+        format!("{terminal_label} line {line_start}")
+    } else {
+        format!("{terminal_label} lines {line_start}-{line_end}")
+    }
+}
+
+/// `terminalContextRecord`: the text clamped to the server's limit in UTF-16 units.
+fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &session::Selected) -> Value {
+    let mut text = selected.text.clone();
+    if text.encode_utf16().count() > CONTEXT_TEXT_MAX {
+        let budget = CONTEXT_TEXT_MAX - TRUNCATION_MARKER.encode_utf16().count();
+        let mut units = 0;
+        let end = text.char_indices().find(|(_, c)| {
+            units += c.len_utf16();
+            units > budget
+        });
+        text.truncate(end.map_or(text.len(), |(i, _)| i));
+        text.push_str(TRUNCATION_MARKER);
+    }
+    let label = context_label(terminal_label, selected.line_start, selected.line_end);
+    json!({
+        "version": 1,
+        "contextId": id,
+        "kind": "terminal",
+        "label": label,
+        "terminalId": terminal_id,
+        "terminalLabel": terminal_label,
+        "lineStart": selected.line_start,
+        "lineEnd": selected.line_end,
+        "text": text,
+    })
 }
 
 impl Terminals {
@@ -229,7 +278,20 @@ impl Workspace {
             if !drawer.open && shown.as_ref() != Some(thread_id) {
                 continue;
             }
-            let ids: Vec<String> = all.get(thread_id).into_iter().flatten().map(|s| s.terminal_id.clone()).collect();
+            // A panel tab's terminals stay out of the drawer.
+            let in_panel = |id: &str| {
+                self.terminals
+                    .panel
+                    .values()
+                    .any(|g| g.thread_id == *thread_id && g.terminal_ids.iter().any(|t| t == id))
+            };
+            let ids: Vec<String> = all
+                .get(thread_id)
+                .into_iter()
+                .flatten()
+                .filter(|s| !in_panel(&s.terminal_id))
+                .map(|s| s.terminal_id.clone())
+                .collect();
             drawer.reconcile(&ids);
         }
     }
@@ -329,15 +391,36 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
-        let drawer_ids = self.terminals.drawers.get(&thread_id).map(|d| d.terminal_ids.clone()).unwrap_or_default();
-        let known = self.terminals.summaries(&thread_id).iter().map(|s| s.terminal_id.as_str());
-        let suffix = self.terminals.summaries.is_none().then(super::new_id);
-        let terminal_id =
-            layout::next_terminal_id(known.chain(drawer_ids.iter().map(String::as_str)), suffix.as_deref());
+        if self.client().is_none() {
+            return;
+        }
+        let terminal_id = self.next_terminal_id(&thread_id);
         if !self.terminals.drawers.entry(thread_id.clone()).or_default().place(&terminal_id, place) {
             return;
         }
+        self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx);
+    }
+
+    /// A terminal id no drawer, panel tab or server session of the thread uses yet.
+    fn next_terminal_id(&self, thread_id: &str) -> String {
+        let drawer_ids = self.terminals.drawers.get(thread_id).map(|d| d.terminal_ids.clone()).unwrap_or_default();
+        let panel_ids = self.terminals.panel_ids(thread_id);
+        let known = self.terminals.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
+        let suffix = self.terminals.summaries.is_none().then(super::new_id);
+        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
+        layout::next_terminal_id(taken, suffix.as_deref())
+    }
+
+    /// `terminal.open` (then an optional write) for a terminal already placed.
+    fn open_terminal_session(
+        &mut self,
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        then_write: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client() else { return };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
@@ -394,6 +477,7 @@ impl Workspace {
 
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+        self.close_panel_terminal(thread_id, terminal_id);
         if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
             drawer.close(terminal_id);
             if drawer.open {
@@ -426,7 +510,10 @@ impl Workspace {
                 .filter(|d| d.open)
                 .and_then(|d| d.active_group())
                 .map(|group| group.terminal_ids.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .chain(self.shown_panel_terminals(thread_id))
+                .collect(),
             _ => Vec::new(),
         };
         let thread_id = thread_id.unwrap_or_default();
@@ -446,22 +533,12 @@ impl Workspace {
             let client = self.client();
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
             let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, window, cx));
-            let _events = cx.subscribe(&session, |this, session, event: &SessionEvent, cx| {
+            let _events = cx.subscribe_in(&session, window, |this, session, event: &SessionEvent, window, cx| {
                 let (thread_id, terminal_id) = {
                     let session = session.read(cx);
                     (session.thread_id.clone(), session.terminal_id.clone())
                 };
-                match event {
-                    SessionEvent::Exited => this.close_terminal(&thread_id, &terminal_id, cx),
-                    SessionEvent::Activated => {
-                        if let Some(drawer) = this.terminals.drawers.get_mut(&thread_id) {
-                            if drawer.active_id != terminal_id {
-                                drawer.set_active(&terminal_id);
-                                cx.notify();
-                            }
-                        }
-                    }
-                }
+                this.on_session_event(&thread_id, &terminal_id, event, window, cx);
             });
             self.terminals.panes.insert(terminal_id.clone(), Pane { session, _events });
         }
@@ -486,6 +563,102 @@ impl Workspace {
         let focus = pane.session.read(cx).focus.clone();
         focus.focus(window, cx);
         true
+    }
+
+    fn on_session_event(
+        &mut self,
+        thread_id: &str,
+        terminal_id: &str,
+        event: &SessionEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SessionEvent::Exited => self.close_terminal(thread_id, terminal_id, cx),
+            SessionEvent::Activated => {
+                self.activate_panel_terminal(thread_id, terminal_id, cx);
+                if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
+                    if drawer.active_id != terminal_id {
+                        drawer.set_active(terminal_id);
+                        cx.notify();
+                    }
+                }
+            }
+            SessionEvent::AddToChat(selected) => {
+                self.add_terminal_context(thread_id, terminal_id, selected, window, cx)
+            }
+            // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
+            SessionEvent::OpenUrl { url, force_browser } => {
+                let thread = self.preview_thread_id().filter(|id| *id == thread_id).map(str::to_owned);
+                let in_app = crate::preview::link_opens_in_app(
+                    url,
+                    *force_browser,
+                    &self.client_settings.values,
+                    thread.is_some(),
+                );
+                match thread.filter(|_| in_app) {
+                    Some(thread) => self.request_preview_tab(thread, Some(url.clone()), true, window, cx),
+                    None => cx.open_url(url),
+                }
+            }
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id() {
+                Some(editor) => {
+                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx)
+                }
+                None => {
+                    self.error = Some("No editor is available to open this path.".into());
+                    cx.notify();
+                }
+            },
+        }
+    }
+
+    /// `addTerminalContext`: a chip for the selection at the composer's cursor; its record
+    /// goes with the message that keeps the chip.
+    fn add_terminal_context(
+        &mut self,
+        thread_id: &str,
+        terminal_id: &str,
+        selected: &session::Selected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.question.is_some() {
+            return;
+        }
+        let terminal_label = self.terminals.label(thread_id, terminal_id);
+        let id = format!("terminal_{}", super::new_id());
+        let record = context_record(&id, terminal_id, &terminal_label, selected);
+        let label = record["label"].as_str().unwrap_or_default().to_owned();
+        let chip = Chip::Context { kind: "terminal".into(), id: id.clone(), label: label.clone() };
+        let link = crate::composer_text::context_link("terminal", &id, &label);
+        self.terminals.contexts.insert(id, record);
+        self.composer.update(cx, |state, cx| {
+            let at = state.cursor();
+            if at > 0 && !state.value()[..at].ends_with(char::is_whitespace) {
+                state.insert(" ", window, cx);
+            }
+            let at = state.cursor();
+            let token = InlineToken::new(chip.id(), link).with_label(label);
+            if state.replace_range_with_token(at..at, token, window, cx).is_ok() {
+                state.insert(" ", window, cx);
+            }
+        });
+        self.sync_composer_empty(cx);
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// The terminal records the prompt's chips name (`buildMessageContext` puts them first).
+    pub(super) fn terminal_context_records(&self, text: &str) -> Vec<Value> {
+        let mut found: Vec<(usize, &Value)> = self
+            .terminals
+            .contexts
+            .iter()
+            .filter_map(|(id, record)| Some((text.find(&format!("/terminal/{id})"))?, record)))
+            .collect();
+        found.sort_by_key(|(at, _)| *at);
+        found.into_iter().map(|(_, record)| record.clone()).collect()
     }
 
     /// Wires the terminal actions onto the workspace root.
@@ -582,7 +755,7 @@ impl Workspace {
                 }))
                 .child(body)
                 .when(!has_sidebar && !drawer.terminal_ids.is_empty(), |el| {
-                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, &tokens, cx))
+                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, cx))
                 })
                 .child(handle)
                 .into_any_element(),
@@ -593,9 +766,14 @@ impl Workspace {
         let group = drawer.active_group();
         let vertical = group.is_some_and(|g| g.split == Split::Vertical);
         let ids = group.map(|g| g.terminal_ids.as_slice()).unwrap_or_default();
+        self.render_pane_group(ids, &drawer.active_id, vertical, tokens)
+    }
+
+    /// A group's mounted panes side by side, or stacked when split vertically.
+    fn render_pane_group(&self, ids: &[String], active: &str, vertical: bool, tokens: &Tokens) -> Div {
         let panes = ids.iter().enumerate().filter_map(|(index, id)| {
             let pane = self.terminals.panes.get(id)?;
-            let color = if *id == drawer.active_id { tokens.border } else { tokens.border.opacity(0.7) };
+            let color = if *id == active { tokens.border } else { tokens.border.opacity(0.7) };
             let view = AnyView::from(pane.session.clone()).cached(StyleRefinement::default().size_full());
             Some(
                 div()
@@ -613,10 +791,11 @@ impl Workspace {
     }
 
     /// The split/new/close buttons over a lone terminal's top-right corner.
-    fn render_floating_actions(
+    pub(super) fn render_floating_actions(
         &self,
         active: String,
         limit: bool,
+        panel: Option<String>,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -640,6 +819,7 @@ impl Workspace {
                     button("terminal-split", "icons/square-split-horizontal.svg", limit),
                     Split::Horizontal,
                     limit,
+                    panel.clone(),
                     cx,
                 ))
                 .child(separator())
@@ -647,16 +827,24 @@ impl Workspace {
                     button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
                     Split::Vertical,
                     limit,
+                    panel.clone(),
                     cx,
                 ))
                 .child(separator())
-                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), cx))
+                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, cx))
                 .child(separator())
                 .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, cx)),
         )
     }
 
-    fn wire_split(&self, button: Stateful<Div>, split: Split, limit: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn wire_split(
+        &self,
+        button: Stateful<Div>,
+        split: Split,
+        limit: bool,
+        panel: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let (name, command) = match split {
             Split::Horizontal => ("Split Terminal Horizontally", "terminal.split"),
             Split::Vertical => ("Split Terminal Vertically", "terminal.splitVertical"),
@@ -666,15 +854,21 @@ impl Workspace {
         } else {
             self.with_terminal_shortcut(name, command)
         };
-        button
-            .tooltip(tooltip(label.into()))
-            .when(!limit, |el| el.on_click(cx.listener(move |this, _, _, cx| this.split_terminal(split, cx))))
+        button.tooltip(tooltip(label.into())).when(!limit, |el| {
+            el.on_click(cx.listener(move |this, _, window, cx| match &panel {
+                Some(surface) => this.split_panel_terminal(surface, split, window, cx),
+                None => this.split_terminal(split, cx),
+            }))
+        })
     }
 
-    fn wire_new(&self, button: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
-        button
-            .tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into()))
-            .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx)))
+    fn wire_new(&self, button: Stateful<Div>, panel: Option<String>, cx: &mut Context<Self>) -> Stateful<Div> {
+        button.tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into())).on_click(
+            cx.listener(move |this, _, window, cx| match panel {
+                Some(_) => this.add_terminal_surface(window, cx),
+                None => this.new_terminal(cx),
+            }),
+        )
     }
 
     fn wire_close(&self, button: Stateful<Div>, active: String, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -708,15 +902,17 @@ impl Workspace {
                     header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
                     Split::Horizontal,
                     limit,
+                    None,
                     cx,
                 ))
                 .child(self.wire_split(
                     header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
                     Split::Vertical,
                     limit,
+                    None,
                     cx,
                 ))
-                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), cx))
+                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, cx))
                 .child(self.wire_close(header_button("terminal-close", "icons/trash-2.svg", false, false), active, cx)),
         );
         let groups = drawer.sorted_groups();
@@ -911,4 +1107,23 @@ fn action_button(id: &'static str, path: &'static str, disabled: bool, tokens: &
         .text_color(tokens.foreground.opacity(0.9))
         .map(|el| if disabled { el.opacity(0.64).cursor_not_allowed() } else { el.cursor_pointer() })
         .child(icon(path).with_size(px(13.)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_records_label_the_lines_and_clamp_the_text() {
+        let selected = session::Selected { line_start: 4, line_end: 4, text: "ls".into() };
+        let record = context_record("terminal_a", "default", "Terminal 1", &selected);
+        assert_eq!(record["label"], "Terminal 1 line 4");
+        assert_eq!(record["contextId"], "terminal_a");
+        let long = session::Selected { line_start: 2, line_end: 9, text: "x".repeat(CONTEXT_TEXT_MAX + 5) };
+        let record = context_record("terminal_b", "default", "Terminal 1", &long);
+        assert_eq!(record["label"], "Terminal 1 lines 2-9");
+        let text = record["text"].as_str().unwrap();
+        assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
+        assert!(text.ends_with(TRUNCATION_MARKER));
+    }
 }

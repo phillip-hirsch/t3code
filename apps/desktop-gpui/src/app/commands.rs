@@ -102,6 +102,8 @@ impl Workspace {
                 }
                 window.dispatch_action(Box::new(terminal::ToggleTerminal), cx);
             }
+            "terminal.split" | "terminal.splitVertical" | "terminal.new" | "terminal.close"
+                if chat && self.panel_terminal_command(command, held, window, cx) => {}
             "terminal.split" if chat => window.dispatch_action(Box::new(terminal::SplitTerminal), cx),
             "terminal.splitVertical" if chat => window.dispatch_action(Box::new(terminal::SplitTerminalVertical), cx),
             "terminal.new" if chat => window.dispatch_action(Box::new(terminal::NewTerminal), cx),

@@ -1,8 +1,11 @@
 //! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
 //! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
 //! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
-//! The Files and file surfaces render in `files/`. The web's other surfaces (terminal, pull
-//! requests, devices, side chats) are not native yet, so the launcher offers Browser, Files and Diff.
+//! Other surfaces render in their own modules (files, terminal, pull requests, side chats); the
+//! device surface is not native, so the launcher leaves it out.
+
+mod diff_base;
+mod diff_tree;
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,10 +18,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, Context, DragMoveEvent, Element, ElementId, Empty, Entity,
-    GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, MouseButton,
-    ParentElement as _, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Task, Window, WindowControlArea, deferred, div, px,
+    AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
+    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
+    MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, WindowControlArea, deferred, div, px,
 };
 use serde_json::{Value, json};
 
@@ -111,6 +114,8 @@ pub(super) enum Surface {
     PullRequest(crate::pull_request_detail::Reference),
     /// The thread's linked pull requests.
     PullRequests,
+    /// A group of the thread's terminals, by its surface id.
+    Terminal(String),
 }
 
 /// A target's panel (`ThreadRightPanelState`).
@@ -134,11 +139,23 @@ impl PanelState {
             return false;
         }
         self.proactive_diff_run = Some(run.to_owned());
-        if self.user_revision != revision || (self.open && self.active == Some(Surface::Diff)) {
+        let shown = self.active.as_ref().filter(|_| self.open);
+        let pull_request = matches!(shown, Some(Surface::PullRequest(_) | Surface::PullRequests));
+        if self.user_revision != revision || shown == Some(&Surface::Diff) || pull_request {
             return false;
         }
         self.upsert(Surface::Diff);
         self.scope = DiffScope::Branch;
+        true
+    }
+
+    /// `openProactive` for a pull request surface: refused after a panel choice made since
+    /// `revision`, and an existing tab stays where the user left it unless `activate_existing`.
+    fn open_proactive(&mut self, surface: Surface, revision: u64, activate_existing: bool) -> bool {
+        if self.user_revision != revision || (!activate_existing && self.surfaces.contains(&surface)) {
+            return false;
+        }
+        self.upsert(surface);
         true
     }
 
@@ -223,6 +240,7 @@ struct DiffKey {
     target: Target,
     cwd: Option<String>,
     scope: DiffScope,
+    base_ref: Option<String>,
     ignore_whitespace: bool,
     /// The turn count, or the git status totals, so new work refetches.
     version: (u64, u64, u64),
@@ -250,6 +268,8 @@ pub(super) struct RightPanel {
     width: f32,
     /// The "+" menu is open; a native browser view must not cover it.
     pub(super) add_menu_open: bool,
+    /// A tab's right-click menu, at its window position.
+    tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     diff: Entity<DiffState>,
     loaded: Option<DiffKey>,
     load: DiffLoad,
@@ -269,6 +289,18 @@ pub(super) struct RightPanel {
     tabs_scroll: ScrollHandle,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
+    /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
+    observed_pull_requests: HashMap<String, Option<crate::pull_request_detail::Reference>>,
+    /// The branch diff's picked comparison target per thread; none is Automatic.
+    base_refs: HashMap<Target, String>,
+    base_picker: diff_base::BasePicker,
+    /// Every file of the loaded selection; the patch shows them less hidden test files.
+    all_diff_files: Vec<DiffFile>,
+    hide_test_files: bool,
+    tree_open: bool,
+    /// Folded tree folders (with their trailing `/`) and the file picked in the tree.
+    tree_folded: HashSet<String>,
+    tree_selected: Option<String>,
     _diff_events: Subscription,
 }
 
@@ -284,6 +316,7 @@ impl RightPanel {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
             add_menu_open: false,
+            tab_menu: None,
             diff,
             loaded: None,
             load: DiffLoad::Idle,
@@ -298,6 +331,14 @@ impl RightPanel {
             tabs_scroll: ScrollHandle::new(),
             revealed_tab: None,
             observation: None,
+            observed_pull_requests: HashMap::new(),
+            base_refs: HashMap::new(),
+            base_picker: Default::default(),
+            all_diff_files: Vec::new(),
+            hide_test_files: false,
+            tree_open: false,
+            tree_folded: HashSet::new(),
+            tree_selected: None,
             _diff_events: diff_events,
         }
     }
@@ -386,8 +427,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes a tab; a browser tab's session closes with it.
+    /// Removes a tab without the side effects of closing it (its terminals already closed).
+    pub(super) fn drop_surface(&mut self, target: &Target, surface: &Surface) {
+        if let Some(panel) = self.right_panel.panels.get_mut(target) {
+            panel.close(surface);
+        }
+    }
+
+    /// Closes a tab; a browser tab's session closes with it, a terminal tab's after confirming.
     pub(super) fn close_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
+        if let Surface::Terminal(id) = surface {
+            return self.request_close_terminal_surface(id, window, cx);
+        }
         if let Some(panel) = self.user_panel_state() {
             panel.close(&surface);
         }
@@ -418,6 +469,111 @@ impl Workspace {
             self.close_right_panel(cx);
         } else if self.diff_available() {
             self.open_surface(Surface::Diff, window, cx);
+        }
+    }
+
+    /// The tab menu's Close others / Close to the right / Close all (`closeOtherSurfaces` and
+    /// friends): each tab closes as its own close would, then `keep` stays active.
+    fn close_surfaces(
+        &mut self,
+        close: Vec<Surface>,
+        keep: Option<Surface>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.panel_state().and_then(|panel| panel.active.clone());
+        for surface in close {
+            self.close_surface(surface, window, cx);
+        }
+        if let Some(panel) = self.panel_state_mut().filter(|panel| !panel.surfaces.is_empty()) {
+            panel.open = true;
+            panel.active = active.filter(|active| panel.surfaces.contains(active)).or(keep);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// Opens a tab's menu at `position`; the browser view hides while it is open.
+    fn open_tab_menu(
+        &mut self,
+        surface: &Surface,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let build = self.tab_menu(surface, cx);
+        let view = PopupMenu::build(window, cx, move |menu, window, cx| build(menu.min_w(px(180.)), window, cx));
+        let previous = window.focused(cx);
+        view.focus_handle(cx).focus(window, cx);
+        let dismiss = cx.subscribe_in(&view, window, move |this, _, _: &DismissEvent, window, cx| {
+            this.right_panel.tab_menu = None;
+            if let Some(previous) = &previous {
+                previous.focus(window, cx);
+            }
+            cx.notify();
+        });
+        self.right_panel.tab_menu = Some((view, position, dismiss));
+        cx.notify();
+    }
+
+    pub(super) fn tab_menu_open(&self) -> bool {
+        self.right_panel.tab_menu.is_some()
+    }
+
+    /// The right-click menu on a tab (`handleTabContextMenu`).
+    fn tab_menu(
+        &self,
+        surface: &Surface,
+        cx: &mut Context<Self>,
+    ) -> impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity();
+        let surfaces = self.panel_state().map(|panel| panel.surfaces.clone()).unwrap_or_default();
+        let index = surfaces.iter().position(|s| s == surface).unwrap_or(0);
+        let surface = surface.clone();
+        let copy_path = match &surface {
+            Surface::File(path) => {
+                let host = self.git_cwd().or_else(|| self.target_project().map(|p| p.workspace_root.clone()));
+                let windows =
+                    host.as_deref().is_some_and(|h| h.as_bytes().get(1) == Some(&b':') || h.starts_with("\\\\"));
+                Some(if windows { path.replace('/', "\\") } else { path.clone() })
+            }
+            _ => None,
+        };
+        move |mut menu, window, _| {
+            if let Some(path) = copy_path.clone() {
+                menu = menu.item(PopupMenuItem::new("Copy path").on_click(move |_, window, cx| {
+                    use gpui_kit::component::WindowExt as _;
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path.clone()));
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::success(path.clone()).title("Path copied"),
+                        cx,
+                    );
+                }));
+            }
+            let others: Vec<Surface> = surfaces.iter().filter(|s| **s != surface).cloned().collect();
+            let right: Vec<Surface> = surfaces.iter().skip(index + 1).cloned().collect();
+            let all = surfaces.clone();
+            let (close, keep, keep_right) = (surface.clone(), surface.clone(), surface.clone());
+            menu.item(PopupMenuItem::new("Close").on_click(
+                window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
+            ))
+            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx)
+                }),
+            ))
+            .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx)
+                }),
+            ))
+            .item(
+                PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
+                    window.listener_for(&view, move |this, _, window, cx| {
+                        this.close_surfaces(all.clone(), None, window, cx)
+                    }),
+                ),
+            )
         }
     }
 
@@ -518,7 +674,7 @@ impl Workspace {
 
     /// `useProactivePanels` for turn diffs: with proactive panels on, a turn that just completed
     /// with enough changes opens the branch diff, unless the user chose a panel since it started.
-    /// Change-request panels are not native, so their half of the hook is not ported.
+    /// A thread's pull requests take precedence (`observe_proactive_pull_requests`).
     pub(super) fn observe_proactive_panels(&mut self, cx: &mut Context<Self>) {
         let Some(Target::Thread(thread_id)) = self.target.clone() else {
             self.right_panel.observation = None;
@@ -529,6 +685,8 @@ impl Workspace {
         let projection = self.open_projection();
         let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
         let mut observation = observe(self.right_panel.observation.as_ref(), &thread_id, running.as_deref(), revision);
+        let pull_requests = self.observe_proactive_pull_requests(&thread_id, &mut observation, cx);
+        let projection = self.open_projection();
         let Some(projection) = projection else {
             self.right_panel.observation = Some(observation);
             return;
@@ -545,7 +703,8 @@ impl Workspace {
             turn_just_completed(observation.running.as_ref().map(Option::as_deref), running.as_deref(), run, completed)
         });
         let offer = match &newly {
-            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") => {
+            // A thread with pull requests offers those instead of its turn diffs.
+            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") && !pull_requests => {
                 let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
                 turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
             }
@@ -560,6 +719,51 @@ impl Workspace {
         if self.right_panel.panels.entry(target).or_default().open_proactive_diff(&run, revision) {
             cx.notify();
         }
+    }
+
+    /// The pull request half of `useProactivePanels`: a Pull request tab follows the thread's
+    /// pull request when it changes, and with proactive panels on, newly linked pull requests
+    /// open (the list when there are several). `true` while the thread has any.
+    fn observe_proactive_pull_requests(
+        &mut self,
+        thread_id: &str,
+        observation: &mut Observation,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let linked = self.thread_pull_request_target();
+        let previous = self.right_panel.observed_pull_requests.insert(thread_id.to_owned(), linked.clone()).flatten();
+        let shown = self.active_surface().cloned();
+        // `shouldRetargetThreadPullRequestPanel`.
+        let follow = match (&previous, &linked, &shown) {
+            (Some(previous), Some(linked), Some(Surface::PullRequest(open))) => previous != linked && open == previous,
+            _ => false,
+        };
+        let visible = self.thread_pull_request_keys();
+        let key = match visible.len() {
+            0 => linked.as_ref().map(|r| format!("{}:{}#{}", r.project_id, r.repository.to_lowercase(), r.number)),
+            _ => Some(visible.join("\n")),
+        };
+        let eligible = self.client_settings.values.bool("proactivePanelsEnabled")
+            && key.is_some()
+            && observation.target_key.as_ref() != Some(&key);
+        observation.target_key = Some(key.clone());
+        let revision = observation.revision;
+        let panel = self.right_panel.panels.entry(Target::Thread(thread_id.to_owned())).or_default();
+        let mut changed = false;
+        if let (true, Some(linked)) = (follow, &linked) {
+            changed |= panel.open_proactive(Surface::PullRequest(linked.clone()), revision, true);
+        }
+        if eligible && !follow {
+            if !visible.is_empty() && (visible.len() > 1 || linked.is_none()) {
+                changed |= panel.open_proactive(Surface::PullRequests, revision, false);
+            } else if let Some(linked) = linked {
+                changed |= panel.open_proactive(Surface::PullRequest(linked), revision, false);
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        key.is_some()
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -603,10 +807,13 @@ impl Workspace {
                 .unwrap_or_default(),
         };
         let ignore_whitespace = self.diff_ignore_whitespace();
+        let remembered_base = self.diff_base_ref().map(str::to_owned);
+        let base_ref = remembered_base.clone().filter(|_| matches!(scope, DiffScope::Branch | DiffScope::Commit(_)));
         let key = DiffKey {
             target: target.clone(),
             cwd: cwd.clone(),
             scope: scope.clone(),
+            base_ref: base_ref.clone(),
             ignore_whitespace,
             version,
             mutation,
@@ -631,19 +838,22 @@ impl Workspace {
                     self.clear_diff(cx);
                     return;
                 };
-                (
-                    "orchestration.getTurnDiff",
-                    json!({
-                        "threadId": thread_id,
-                        "fromTurnCount": turn.turn_count.saturating_sub(1),
-                        "toTurnCount": turn.turn_count,
-                        "ignoreWhitespace": ignore_whitespace,
-                    }),
-                )
+                // `useCheckpointDiff`: a range from the start is the full thread diff.
+                let from = turn.turn_count.saturating_sub(1);
+                let mut input = json!({"threadId": thread_id, "toTurnCount": turn.turn_count, "ignoreWhitespace": ignore_whitespace});
+                if from == 0 {
+                    ("orchestration.getFullThreadDiff", input)
+                } else {
+                    input["fromTurnCount"] = from.into();
+                    ("orchestration.getTurnDiff", input)
+                }
             }
             scope => {
                 let Some(cwd) = cwd.clone() else { return };
                 let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace});
+                if let Some(base) = &base_ref {
+                    input["baseRef"] = base.clone().into();
+                }
                 match scope {
                     DiffScope::Unstaged => input["sourceKind"] = "working-tree".into(),
                     DiffScope::Commit(sha) => input["commitSha"] = sha.clone().into(),
@@ -658,7 +868,13 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| json!({"cwd": cwd}));
+        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| {
+            let mut input = json!({"cwd": cwd});
+            if let Some(base) = remembered_base {
+                input["baseRef"] = base.into();
+            }
+            input
+        });
         self.right_panel.load = DiffLoad::Loading;
         let diff = self.right_panel.diff.clone();
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -683,10 +899,12 @@ impl Workspace {
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
+                        this.right_panel.all_diff_files.clear();
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No patch available for this selection.")
                     }
                     Ok(Some(parsed)) if parsed.files.is_empty() => {
+                        this.right_panel.all_diff_files.clear();
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No net changes in this selection.")
                     }
@@ -699,8 +917,10 @@ impl Workspace {
                             this.client_settings.values.bool("diffFilesCollapsed"),
                             &paths,
                         );
+                        this.right_panel.all_diff_files = parsed.files;
+                        let shown = this.shown_diff_files();
                         diff.update(cx, |state, cx| {
-                            state.set_files(parsed.files, cx);
+                            state.set_files(shown, cx);
                             for path in &paths {
                                 state.set_file_collapsed(path, folded.contains(path), cx);
                             }
@@ -783,6 +1003,7 @@ impl Workspace {
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
+        self.right_panel.all_diff_files.clear();
         self.right_panel.diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
     }
 
@@ -798,6 +1019,7 @@ impl Workspace {
             _ => None,
         };
         self.sync_side_chat(side_chat.as_deref(), window, cx);
+        self.sync_discovered_servers(window, cx);
         let width = self.right_panel_width(window)?;
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
@@ -826,6 +1048,7 @@ impl Workspace {
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
             (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
+            (Some(Surface::Terminal(id)), _) => self.render_terminal_surface(&id.clone(), window, cx),
             _ => self.render_launcher(&tokens, cx),
         };
         let handle = div()
@@ -876,6 +1099,12 @@ impl Workspace {
                 .child(self.render_tab_bar(&panel, &tokens, cx))
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
                 .child(deferred(handle).with_priority(1))
+                .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
+                    deferred(
+                        gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
+                    )
+                    .with_priority(3)
+                }))
                 .into_any_element(),
         )
     }
@@ -888,6 +1117,8 @@ impl Workspace {
         let (diff, browser, files) = (self.diff_available(), self.browser_available(), self.project_target().is_some());
         let side_chat = self.side_chats_offered().then(|| self.side_chat_disabled_reason().is_none());
         let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
+        let profiles = self.browser_profiles();
+        let terminal = self.terminal_available();
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -925,15 +1156,28 @@ impl Workspace {
                     .flex_none()
                     .size(px(24.))
                     .rounded(px(8.))
-                    .dropdown_menu(move |menu: PopupMenu, window, _| {
+                    .dropdown_menu(move |menu: PopupMenu, window, cx| {
+                        let menu = menu.min_w(px(200.));
+                        // An available Browser lists the profiles to open it in (`MenuSub`).
+                        let menu = if browser {
+                            let (view, profiles) = (view.clone(), profiles.clone());
+                            menu.submenu_with_icon(
+                                Some(Icon::new(IconName::Globe)),
+                                "Browser",
+                                window,
+                                cx,
+                                move |menu, window, _| profile_items(menu.max_w(px(224.)), &profiles, &view, window),
+                            )
+                        } else {
+                            menu.item(PopupMenuItem::new("Browser").icon(Icon::new(IconName::Globe)).disabled(true))
+                        };
                         let menu = menu
-                            .min_w(px(200.))
                             .item(
-                                PopupMenuItem::new("Browser")
-                                    .icon(Icon::new(IconName::Globe))
-                                    .disabled(!browser)
+                                PopupMenuItem::new("Terminal")
+                                    .icon(icon("icons/square-terminal.svg"))
+                                    .disabled(!terminal)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_browser_surface(window, cx)
+                                        this.add_terminal_surface(window, cx)
                                     })),
                             )
                             .item(
@@ -1037,11 +1281,17 @@ impl Workspace {
                 "Pull requests".into(),
                 Icon::new(IconName::Link).size(px(12.)).into_any_element(),
             ),
+            Surface::Terminal(id) => (
+                format!("terminal:{id}").into(),
+                self.terminal_surface_title(id),
+                icon("icons/square-terminal.svg").with_size(px(12.)).into_any_element(),
+            ),
         };
         let group: SharedString = format!("right-panel-tab:{key}").into();
         let tooltip: SharedString = format!("Close {title}").into();
         let (accent, foreground, muted) = (tokens.accent, tokens.foreground, tokens.muted);
-        let (close, activate, middle) = (surface.clone(), surface.clone(), surface.clone());
+        let (close, activate, middle, menu_surface) =
+            (surface.clone(), surface.clone(), surface.clone(), surface.clone());
         h_flex()
             .id(ElementId::Name(group.clone()))
             .group(group.clone())
@@ -1094,6 +1344,13 @@ impl Workspace {
                 cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.activate_surface(activate.clone(), window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_menu(&menu_surface, event.position, window, cx)
+                }),
+            )
             .into_any_element()
     }
 
@@ -1136,6 +1393,49 @@ impl Workspace {
         )
         .when(browser_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
+        });
+        // "Open browser in a profile", beside the shortcut while there is more than one.
+        let profiles = self.browser_profiles();
+        let browser = match browser_available && profiles.len() > 1 {
+            true => {
+                let view = cx.entity();
+                div().relative().child(browser).child(
+                    div().absolute().top(px(4.)).right(px(32.)).child(
+                        Button::new("right-panel-browser-profiles")
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(tokens.muted_foreground)
+                                    .hover(tokens.accent)
+                                    .active(tokens.accent),
+                            )
+                            .xsmall()
+                            .size(px(24.))
+                            .rounded(px(6.))
+                            .icon(icon("icons/chevron-down.svg"))
+                            .tooltip("Open browser in a profile")
+                            .dropdown_menu(move |menu: PopupMenu, window, _| {
+                                profile_items(menu.max_w(px(224.)), &profiles, &view, window)
+                            })
+                            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                                this.right_panel.add_menu_open = *open;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            }
+            false => div().child(browser),
+        };
+        let terminal_available = self.terminal_available();
+        let terminal = row(
+            "right-panel-open-terminal",
+            icon("icons/square-terminal.svg").with_size(px(16.)).into_any_element(),
+            "Terminal",
+            "T",
+            terminal_available,
+            "Available when a project is open.",
+        )
+        .when(terminal_available, |el| {
+            el.on_click(cx.listener(|this, _, window, cx| this.add_terminal_surface(window, cx)))
         });
         let files_available = self.project_target().is_some();
         let files = row(
@@ -1225,6 +1525,7 @@ impl Workspace {
                         v_flex()
                             .gap(px(2.))
                             .child(browser)
+                            .child(terminal)
                             .child(files)
                             .child(diff)
                             .child(pull_request)
@@ -1343,15 +1644,22 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (refs, stats, truncated) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, head, base, truncated } => {
-                let refs = matches!(scope, DiffScope::Branch).then(|| {
-                    format!("{} → {}", head.as_deref().unwrap_or("HEAD"), base.as_deref().unwrap_or("Automatic"))
-                });
-                (refs, Some((*additions, *deletions)), *truncated)
-            }
-            _ => (None, None, false),
+        let (stats, truncated) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, .. } => (Some((*additions, *deletions)), *truncated),
+            _ => (None, false),
         };
+        // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
+        let refs = matches!(scope, DiffScope::Branch).then(|| {
+            let (head, base) = match &self.right_panel.load {
+                DiffLoad::Ready { head, base, .. } => (head.clone(), base.clone()),
+                _ => (None, None),
+            };
+            let head = head
+                .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()))
+                .unwrap_or_else(|| "HEAD".into());
+            let base = base.or_else(|| self.diff_base_ref().map(str::to_owned)).unwrap_or_else(|| "Automatic".into());
+            self.render_base_ref_picker(&head, &base, tokens, cx)
+        });
         let can_refresh = !matches!(scope, DiffScope::Turn(_));
         let files: Vec<SharedString> = match self.right_panel.load {
             DiffLoad::Ready { .. } => {
@@ -1362,15 +1670,16 @@ impl Workspace {
         let all_collapsed =
             !files.is_empty() && files.iter().all(|path| self.right_panel.diff.read(cx).is_file_collapsed(path));
         let (wrap, ignore_whitespace) = (self.diff_wrap(), self.diff_ignore_whitespace());
+        let (test_files, hide_tests, tree_open) =
+            (self.test_file_count(), self.right_panel.hide_test_files, self.right_panel.tree_open);
+        let has_files = !self.right_panel.all_diff_files.is_empty();
         let header = h_flex()
             .h(px(28.))
             .mb_3()
             .px_2()
             .gap_2()
             .justify_between()
-            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(
-                refs.map(|refs| div().min_w_0().truncate().text_xs().text_color(tokens.muted_foreground).child(refs)),
-            ))
+            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(refs))
             .child(
                 h_flex()
                     .flex_none()
@@ -1433,6 +1742,32 @@ impl Workspace {
                                 this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
                                 cx.notify();
                             }))
+                    })
+                    .when(test_files > 0, |el| {
+                        let label: SharedString = match (hide_tests, test_files) {
+                            (true, 1) => "Show 1 hidden test file".into(),
+                            (true, count) => format!("Show {count} hidden test files").into(),
+                            (false, _) => "Hide test files".into(),
+                        };
+                        el.child(
+                            icon_toggle("diff-hide-tests", "icons/flask-conical-off.svg", hide_tests, tokens, cx)
+                                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.right_panel.hide_test_files = !hide_tests;
+                                    this.apply_diff_files(cx);
+                                })),
+                        )
+                    })
+                    .when(has_files, |el| {
+                        let label = if tree_open { "Hide file tree" } else { "Show file tree" };
+                        el.child(
+                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, cx)
+                                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.right_panel.tree_open = !tree_open;
+                                    cx.notify();
+                                })),
+                        )
                     }),
             );
         let quiet = |text: SharedString| {
@@ -1481,22 +1816,29 @@ impl Workspace {
                             .child("This preview exceeds the size limit. Changes shown are incomplete."),
                     )
                 })
-                .child({
-                    // `--diffs-font-size`, the Code font size.
-                    let diff = Diff::new(&self.right_panel.diff)
-                        .soft_wrap(wrap)
+                .child(
+                    h_flex()
                         .flex_1()
                         .min_h_0()
-                        .text_size(px(tokens.fonts.code_size));
-                    match scheme {
-                        DiffColorScheme::RedGreen => diff.into_any_element(),
-                        DiffColorScheme::BlueOrange => DiffTint {
-                            child: diff.into_any_element(),
-                            colors: (git::addition_color(tokens, scheme), git::deletion_color(tokens, scheme)),
-                        }
-                        .into_any_element(),
-                    }
-                })
+                        .items_start()
+                        .child({
+                            // `--diffs-font-size`, the Code font size.
+                            let diff = Diff::new(&self.right_panel.diff)
+                                .soft_wrap(wrap)
+                                .flex_1()
+                                .min_h_0()
+                                .text_size(px(tokens.fonts.code_size));
+                            match scheme {
+                                DiffColorScheme::RedGreen => diff.into_any_element(),
+                                DiffColorScheme::BlueOrange => DiffTint {
+                                    child: diff.into_any_element(),
+                                    colors: (git::addition_color(tokens, scheme), git::deletion_color(tokens, scheme)),
+                                }
+                                .into_any_element(),
+                            }
+                        })
+                        .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
+                )
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
@@ -1538,6 +1880,24 @@ impl Workspace {
     }
 }
 
+/// One item per browser profile, each opening a new tab in it.
+fn profile_items(
+    mut menu: PopupMenu,
+    profiles: &[crate::preview::Profile],
+    view: &Entity<Workspace>,
+    window: &mut Window,
+) -> PopupMenu {
+    for profile in profiles {
+        let id = profile.id.clone();
+        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+            window.listener_for(view, move |this, _, window, cx| {
+                this.add_browser_surface_in(Some(id.clone()), window, cx)
+            }),
+        ));
+    }
+    menu
+}
+
 /// The files a selection shows folded: the user's folds once they changed any, else every
 /// file or none by `diffFilesCollapsed`.
 fn collapsed_files(
@@ -1575,6 +1935,8 @@ struct Observation {
     user_turn: Option<String>,
     /// The panel revision a proactive open must still find.
     revision: u64,
+    /// The pull requests the thread linked at the last read; `None` before the first.
+    target_key: Option<Option<String>>,
 }
 
 /// `observeProactivePanelUserChoice`: a panel choice made since the thread opened or its
@@ -1586,6 +1948,7 @@ fn observe(previous: Option<&Observation>, thread_id: &str, running: Option<&str
         thread_id: thread_id.to_owned(),
         running: same.and_then(|previous| previous.running.clone()),
         user_turn: running.map(str::to_owned).or_else(|| same.and_then(|previous| previous.user_turn.clone())),
+        target_key: same.and_then(|previous| previous.target_key.clone()),
         revision: match same {
             Some(previous) if !new_turn => previous.revision,
             _ => revision,
@@ -1905,6 +2268,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(workspace_mutation_id(&projection, Some("12:00")), (Some("edit".into()), Some("12:00".into())));
+    }
+
+    #[test]
+    fn proactive_pull_requests_defer_to_user_choices_and_keep_existing_tabs() {
+        let mut panel = PanelState::default();
+        assert!(panel.open_proactive(Surface::PullRequests, 0, false));
+        // Already open: left where it is, unless following the thread's pull request.
+        panel.active = Some(Surface::Diff);
+        assert!(!panel.open_proactive(Surface::PullRequests, 0, false));
+        assert!(panel.open_proactive(Surface::PullRequests, 0, true));
+        assert_eq!(panel.active, Some(Surface::PullRequests));
+        panel.user_revision = 1;
+        assert!(!panel.open_proactive(Surface::Files, 0, false));
+        // A pull request on screen keeps a turn diff from replacing it.
+        assert!(!panel.open_proactive_diff("run-1", 1));
     }
 
     #[test]
