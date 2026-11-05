@@ -413,6 +413,7 @@ pub const MAX_CAPTURE: (u32, u32) = (2_560, 1_600);
 
 #[cfg(any(windows, target_os = "macos", test))]
 /// The size a `width`×`height` capture scales down to so it fits [`MAX_CAPTURE`].
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive, rounded pixel size")]
 pub fn fit_capture(width: u32, height: u32) -> (u32, u32) {
     let scale = (f64::from(MAX_CAPTURE.0) / f64::from(width.max(1)))
         .min(f64::from(MAX_CAPTURE.1) / f64::from(height.max(1)))

@@ -222,7 +222,7 @@ fn redacted_placeholder(value: &str) -> String {
             }
             state = (state ^ (state >> 13)).wrapping_mul(0x85eb_ca6b);
             state = (state ^ (state >> 16)).wrapping_mul(0xc2b2_ae35);
-            ALPHABET[((state as i32).unsigned_abs() as usize) % ALPHABET.len()] as char
+            ALPHABET[state.cast_signed().unsigned_abs() as usize % ALPHABET.len()] as char
         })
         .collect()
 }

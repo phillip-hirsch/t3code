@@ -1555,7 +1555,10 @@ pub fn stop_subline(stop: &GuideStop) -> String {
 
 /// `noteMarker`: A to Z, then numbers.
 pub fn note_marker(index: usize) -> String {
-    if index < 26 { char::from(b'A' + index as u8).to_string() } else { (index + 1).to_string() }
+    match u8::try_from(index) {
+        Ok(letter) if letter < 26 => char::from(b'A' + letter).to_string(),
+        _ => (index + 1).to_string(),
+    }
 }
 
 /// A line number and its notes' markers and titles.

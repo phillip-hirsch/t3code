@@ -264,7 +264,7 @@ impl Workspace {
         });
         let input = self.number_field(
             "provider-health-check-interval",
-            seconds as i64,
+            i64::try_from(seconds).unwrap_or(i64::MAX),
             (0, i64::MAX, HEALTH_STEP_SECONDS),
             window,
             cx,
@@ -676,7 +676,9 @@ impl ProvidersPage {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// `a.b.c` in a JSON value.

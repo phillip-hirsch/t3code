@@ -214,7 +214,7 @@ mod tests {
     fn only_the_most_recent_projects_are_kept() {
         let mut history = BrowserHistory::default();
         for i in 0..=MAX_PROJECTS {
-            history.record_visit(&format!("p{i}"), "https://example.com/", i as i64);
+            history.record_visit(&format!("p{i}"), "https://example.com/", i64::try_from(i).unwrap());
         }
         assert!(history.recent("p0", 1).is_empty());
         assert_eq!(history.recent(&format!("p{MAX_PROJECTS}"), 1).len(), 1);

@@ -1196,6 +1196,7 @@ impl Workspace {
                     .into_any_element()
             }
             (Control::Slider { min, max, step, unit }, Some(key)) => {
+                #[expect(clippy::cast_possible_truncation, reason = "a slider position; f32 is plenty")]
                 let value = view.value(key).as_f64().unwrap_or_default() as f32;
                 let state = self.settings_slider(key, min, max, step, value, window, cx);
                 let preview = (key == "panelAnimationDurationMs").then(|| panel_preview(value, window, cx, &t));
@@ -1314,7 +1315,9 @@ impl Workspace {
             let SliderEvent::Change(value) = event else { return };
             let value = value.start().round();
             if this.settings_view().value(key).as_f64() != Some(f64::from(value)) {
-                this.update_settings(serde_json::json!({ key: value as i64 }), window, cx);
+                #[expect(clippy::cast_possible_truncation, reason = "the slider steps in whole numbers")]
+                let whole = value as i64;
+                this.update_settings(serde_json::json!({ key: whole }), window, cx);
             }
         });
         self.settings_ui.sliders.insert(key, (state.clone(), subscription));
@@ -1787,11 +1790,16 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
     let body = if toggles == 0 || duration_ms <= 0. {
         sketch(target).into_any_element()
     } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a positive animation length in ms; `as` saturates"
+        )]
+        let duration = std::time::Duration::from_millis(duration_ms as u64);
         sketch(target)
             .with_animation(
                 ElementId::NamedInteger("panel-preview".into(), toggles as u64),
-                Animation::new(std::time::Duration::from_millis(duration_ms as u64))
-                    .with_easing(|d| 1. - (1. - d) * (1. - d)),
+                Animation::new(duration).with_easing(|d| 1. - (1. - d) * (1. - d)),
                 move |_, delta| sketch(if closed { 1. - delta } else { delta }),
             )
             .into_any_element()

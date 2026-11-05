@@ -33,6 +33,11 @@ use crate::composer_text::Chip;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+/// A row count as an alacritty `Line` offset; grids hold far fewer than `i32::MAX` rows.
+fn line_count(rows: usize) -> i32 {
+    i32::try_from(rows).unwrap_or(i32::MAX)
+}
+
 gpui_kit::actions!(terminal, [ToggleTerminal, SplitTerminal, SplitTerminalVertical, NewTerminal, CloseTerminal]);
 
 /// The window root binds Ctrl+C (copy) and Tab (focus cycling); in a terminal those keys belong to

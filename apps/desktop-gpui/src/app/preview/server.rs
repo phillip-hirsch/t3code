@@ -184,6 +184,11 @@ impl Workspace {
         };
         let scale = window.scale_factor();
         let size = window.viewport_size();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "pixel math; f32 is what GPUI draws with"
+        )]
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("threadId", thread_id)
@@ -267,12 +272,19 @@ impl Workspace {
                 }
                 Some("viewport") => {
                     if let (Some(width), Some(height)) = (message["width"].as_f64(), message["height"].as_f64()) {
-                        stream.viewport = Some((width as f32, height as f32));
+                        #[expect(clippy::cast_possible_truncation, reason = "page sizes; f32 is what GPUI draws with")]
+                        let point = (width as f32, height as f32);
+                        stream.viewport = Some(point);
                     }
                 }
                 Some("pointer") => {
                     if let (Some(x), Some(y)) = (message["x"].as_f64(), message["y"].as_f64()) {
-                        stream.agent_pointer = Some((x as f32, y as f32));
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "page coordinates; f32 is what GPUI draws with"
+                        )]
+                        let point = (x as f32, y as f32);
+                        stream.agent_pointer = Some(point);
                     }
                 }
                 Some("clipboard") => {
@@ -316,6 +328,11 @@ impl Workspace {
         }
         // The page follows the panel's size while this viewer drives it (`followSize`).
         let bounds = stream.bounds.get();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "pixel math; f32 is what GPUI draws with"
+        )]
         let size = (f32::from(bounds.size.width).round() as u32, f32::from(bounds.size.height).round() as u32);
         if follow_size
             && size.0 > 0

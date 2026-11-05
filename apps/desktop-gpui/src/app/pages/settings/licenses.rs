@@ -65,7 +65,7 @@ fn bundled() -> &'static [Entry] {
                     license: entry["license"].as_str().unwrap_or_default().to_owned().into(),
                     bundles: vec![bundle.to_owned().into()],
                     source_url: entry["sourceUrl"].as_str().map(|url| url.to_owned().into()),
-                    notice: texts.get(entry["text"].as_u64()? as usize)?.clone(),
+                    notice: texts.get(usize::try_from(entry["text"].as_u64()?).ok()?)?.clone(),
                 })
             })
             .collect()

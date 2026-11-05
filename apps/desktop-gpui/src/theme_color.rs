@@ -146,7 +146,7 @@ pub fn is_color(value: &str) -> bool {
 /// `formatThemeColorNumber`: fixed precision without trailing zeros, and never `-0`.
 fn format_number(value: f64, precision: i32) -> String {
     let value = if value.abs() < 10f64.powi(-precision) / 2. { 0. } else { value };
-    let text = format!("{value:.*}", precision as usize);
+    let text = format!("{value:.*}", usize::try_from(precision).unwrap_or(0));
     if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_owned() } else { text }
 }
 
@@ -162,6 +162,7 @@ pub fn canonical(value: &str) -> Option<String> {
 }
 
 /// `themeColorToHex`: `#rrggbb`, or `#rrggbbaa` when translucent.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "alpha is below 1, so the byte fits")]
 pub fn to_hex(value: &str) -> Option<String> {
     let parsed = parse(value)?;
     let opaque = rgb_hex(oklch_to_rgb(parsed.color, true));
@@ -169,6 +170,7 @@ pub fn to_hex(value: &str) -> Option<String> {
 }
 
 /// The color in sRGB for painting: unrounded channels in 0..=1 and the alpha.
+#[expect(clippy::cast_possible_truncation, reason = "colour channels; f32 is plenty")]
 pub fn to_srgba(value: &str) -> Option<[f32; 4]> {
     let parsed = parse(value)?;
     let rgb = oklch_to_rgb(parsed.color, false);
@@ -180,6 +182,7 @@ fn rgb_of(value: &str, fallback: Rgb) -> Rgb {
 }
 
 pub fn rgb_hex(color: Rgb) -> String {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |value: f64| value.clamp(0., 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(color.r), channel(color.g), channel(color.b))
 }
@@ -263,6 +266,7 @@ fn gamut_map(color: Oklch) -> Oklch {
     }
     let (mut low, mut high) = (0., color.c);
     let resolution = 0.000001f64;
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a small, positive step count")]
     let steps = (color.c.max(resolution).log2() - resolution.log2()).ceil().max(1.) as usize;
     for _ in 0..steps {
         let mid = f64::midpoint(low, high);
@@ -615,6 +619,7 @@ pub fn hsv_to_hex([hue, saturation, value]: [f32; 3]) -> String {
         h if h < 300. => (x, 0., chroma),
         _ => (chroma, 0., x),
     };
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |c: f32| ((c + m) * 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
 }

@@ -265,6 +265,7 @@ pub(super) fn schedule_from_draft<Tz: TimeZone>(draft: &DraftState, tz: &Tz) -> 
         }
         ScheduleMode::Interval => {
             let every_ms = (js_number(&draft.interval_minutes) * 60_000.).round();
+            #[expect(clippy::cast_possible_truncation, reason = "finite, and `as` saturates out-of-range values")]
             let every_ms = if every_ms.is_finite() { json!(every_ms as i64) } else { Value::Null };
             Some(json!({"type": "interval", "everyMs": every_ms}))
         }
@@ -472,11 +473,14 @@ pub(in crate::app) fn relative_label(value: Option<&str>, now_ms: i64) -> String
     if minutes < 60 {
         return format!("in {minutes}m");
     }
+    #[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
     let hours = (minutes as f64 / 60.).round() as i64;
     if hours < 24 {
         return format!("in {hours}h");
     }
-    format!("in {}d", (hours as f64 / 24.).round() as i64)
+    #[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
+    let days = (hours as f64 / 24.).round() as i64;
+    format!("in {days}d")
 }
 
 #[cfg(test)]

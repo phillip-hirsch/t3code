@@ -418,7 +418,8 @@ mod os {
 
     /// The screen's pixels under `rect`, opaque, stitched from each monitor it covers.
     fn grab(rect: w::RECT) -> Option<RgbaImage> {
-        let (width, height) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
+        let (width, height) =
+            (u32::try_from(rect.right - rect.left).ok()?, u32::try_from(rect.bottom - rect.top).ok()?);
         let mut image = RgbaImage::new(width, height);
         let mut covered = false;
         for monitor in xcap::Monitor::all().ok()? {
@@ -435,7 +436,12 @@ mod os {
                 continue;
             }
             let part = monitor
-                .capture_region((left - x) as u32, (top - y) as u32, (right - left) as u32, (bottom - top) as u32)
+                .capture_region(
+                    (left - x).unsigned_abs(),
+                    (top - y).unsigned_abs(),
+                    (right - left).unsigned_abs(),
+                    (bottom - top).unsigned_abs(),
+                )
                 .ok()?;
             image::imageops::replace(&mut image, &part, i64::from(left - rect.left), i64::from(top - rect.top));
             covered = true;
@@ -551,7 +557,10 @@ mod os {
                     popup.SetWindowPos(
                         w::HwndPlace::Place(co::HWND_PLACE::TOPMOST),
                         w::POINT::with(origin.0, origin.1),
-                        w::SIZE::with(extent.0 as i32, extent.1 as i32),
+                        w::SIZE::with(
+                            i32::try_from(extent.0).unwrap_or(i32::MAX),
+                            i32::try_from(extent.1).unwrap_or(i32::MAX),
+                        ),
                         co::SWP::NOACTIVATE | co::SWP::SHOWWINDOW,
                     )
                 });

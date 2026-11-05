@@ -221,18 +221,15 @@ impl Workspace {
             ),
         ]
         .map(|(title, description, key)| {
-            let days = self.settings_json()["storageCleanup"][key].as_f64();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "rounded first, and `as` saturates out-of-range values"
+            )]
+            let days = self.settings_json()["storageCleanup"][key].as_f64().map(|days| days.round() as i64);
             let field = days.map(|days| {
-                self.number_field(
-                    key,
-                    days.round() as i64,
-                    (1, RETENTION_MAX_DAYS, 1),
-                    window,
-                    cx,
-                    move |this, days, window, cx| {
-                        this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx);
-                    },
-                )
+                self.number_field(key, days, (1, RETENTION_MAX_DAYS, 1), window, cx, move |this, days, window, cx| {
+                    this.update_settings(json!({ "storageCleanup": { key: days } }), window, cx);
+                })
             });
             let control = self.retention_control(key, title, field.as_ref(), &t, cx);
             RowFrame::new(title).description(text(description)).control(control).render(&t).into_any_element()

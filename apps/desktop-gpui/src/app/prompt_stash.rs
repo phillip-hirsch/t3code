@@ -616,10 +616,13 @@ impl Workspace {
             "escape" => self.close_stash_menu(cx),
             "up" | "down" if !entries.is_empty() => {
                 let current = entries.iter().position(|e| Some(&e.id) == highlighted.as_ref());
-                let len = entries.len() as isize;
-                let step = if keystroke.key == "down" { 1 } else { -1 };
-                let from = current.map_or(if step == 1 { -1 } else { 0 }, |i| i as isize);
-                let next = (from + step).rem_euclid(len) as usize;
+                let len = entries.len();
+                let next = match (current, keystroke.key == "down") {
+                    (None, true) => 0,
+                    (None, false) => len - 1,
+                    (Some(i), true) => (i + 1) % len,
+                    (Some(i), false) => (i + len - 1) % len,
+                };
                 self.prompt_stash.highlighted = Some(entries[next].id.clone());
                 cx.notify();
             }

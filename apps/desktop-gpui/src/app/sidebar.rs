@@ -358,7 +358,7 @@ fn focus_ring(element: AnyElement, tokens: &Tokens) -> AnyElement {
 }
 
 pub(super) fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn text_xs<E: gpui_kit::Styled>(el: E) -> E {
@@ -632,7 +632,7 @@ impl Workspace {
         self.sidebar.clock_at = at;
         self.sidebar._clock = at.map(|at| {
             cx.spawn(async move |this, cx| {
-                let delay = (at - now_ms()).max(0) as u64;
+                let delay = u64::try_from(at - now_ms()).unwrap_or(0);
                 cx.background_executor().timer(Duration::from_millis(delay)).await;
                 let _ = this.update(cx, |this, cx| {
                     this.sidebar.clock_at = None;
@@ -2489,6 +2489,7 @@ pub(in crate::app) fn project_icon(
     // CSS `grayscale(1)`: Rec. 709 luma.
     let luma = |hex: u32| {
         let [_, r, g, b] = hex.to_be_bytes().map(f32::from);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "luminance of 0..=255 channels")]
         let l = (0.2126 * r + 0.7152 * g + 0.0722 * b).round() as u32;
         Hsla::from(rgb(l << 16 | l << 8 | l))
     };

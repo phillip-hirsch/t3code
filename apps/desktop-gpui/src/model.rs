@@ -319,6 +319,7 @@ pub struct UsageWindow {
 
 impl UsageWindow {
     /// `remainingPercent` in `packages/shared/src/usageLimits.ts`.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a percentage clamped to 0..=100")]
     pub fn remaining_percent(&self) -> u32 {
         (100. - self.used_percent.clamp(0., 100.)).round() as u32
     }

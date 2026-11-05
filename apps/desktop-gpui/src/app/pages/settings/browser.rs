@@ -198,6 +198,7 @@ impl Workspace {
             let field = |this: &mut Self, width_axis: bool, value: f32, window: &mut Window, cx: &mut Context<Self>| {
                 let key = if width_axis { "browser-viewport-width" } else { "browser-viewport-height" };
                 let range = (preview::VIEWPORT_MIN_DIMENSION, preview::VIEWPORT_MAX_DIMENSION, 1);
+                #[expect(clippy::cast_possible_truncation, reason = "the field shows a whole number; `as` saturates")]
                 let input = this.number_field(key, value as i64, range, window, cx, move |this, value, window, cx| {
                     let current: Viewport =
                         serde::Deserialize::deserialize(this.client_settings.values.get("browserDefaultViewport"))
@@ -486,6 +487,7 @@ impl Workspace {
 }
 
 /// `1` for 100%, so the stored value matches the default the reset compares against.
+#[expect(clippy::cast_possible_truncation, reason = "only whole levels reach the cast")]
 fn zoom_value(level: f64) -> Value {
     if level.fract() == 0. { json!(level as i64) } else { json!(level) }
 }

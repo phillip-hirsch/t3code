@@ -95,7 +95,7 @@ impl Workspace {
             });
             if let Some(delay) = next {
                 self.now._clock = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(delay.max(1000) as u64)).await;
+                    cx.background_executor().timer(Duration::from_millis(delay.max(1000).unsigned_abs())).await;
                     let _ = this.update(cx, |this, cx| {
                         this.now.lines.clear();
                         this.refresh_rows(cx);

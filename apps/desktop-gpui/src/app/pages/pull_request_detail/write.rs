@@ -134,11 +134,11 @@ pub(super) fn apply_pending(reactions: &[Reaction], pending: &[(String, bool)]) 
             None if *reacted => shown.push(Reaction { content: content.clone(), count: 1, viewer_has_reacted: true }),
             None => {}
             Some(index) if shown[index].viewer_has_reacted != *reacted => {
-                let count = shown[index].count as i64 + if *reacted { 1 } else { -1 };
-                if count <= 0 {
+                let count = if *reacted { shown[index].count + 1 } else { shown[index].count.saturating_sub(1) };
+                if count == 0 {
                     shown.remove(index);
                 } else {
-                    shown[index].count = count as u64;
+                    shown[index].count = count;
                     shown[index].viewer_has_reacted = *reacted;
                 }
             }

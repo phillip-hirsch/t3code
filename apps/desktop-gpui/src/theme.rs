@@ -195,6 +195,7 @@ impl Global for Appearance {}
 
 impl Appearance {
     pub fn from_settings(settings: &Settings) -> Self {
+        #[expect(clippy::cast_possible_truncation, reason = "a font percentage; f32 is plenty")]
         let percent = |key, default| settings.get(key).as_f64().map_or(default, |value| value as f32);
         Self {
             // The contract's bounds (`AppearanceContrast`, `GlassOpacity`): a hand-edited 0 would blank the UI.
@@ -248,6 +249,7 @@ const CODE_SIZES: (f32, f32, f32) = (10., 18., 13.);
 const TERMINAL_SIZES: (f32, f32, f32) = (8., 20., 12.);
 
 impl Fonts {
+    #[expect(clippy::cast_possible_truncation, reason = "a font size; f32 is plenty")]
     pub fn from_settings(settings: &Settings) -> Self {
         let family = |key: &str| first_family(settings.get(key).as_str().unwrap_or_default());
         let size = |key: &str, (min, max, fallback): (f32, f32, f32)| {
@@ -571,6 +573,7 @@ mod tests {
 
     fn hex_of(color: Hsla) -> (u32, f32) {
         let rgb = color.to_rgb();
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a 0..=1 channel scaled to a byte")]
         let byte = |c: f32| (c * 255.).round() as u32;
         ((byte(rgb.r) << 16) | (byte(rgb.g) << 8) | byte(rgb.b), (rgb.a * 1000.).round() / 1000.)
     }

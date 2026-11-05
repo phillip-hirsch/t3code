@@ -862,13 +862,13 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
             let days_ahead = match day.as_str() {
                 "today" => 0,
                 "tomorrow" => 1,
-                weekday => match (WEEKDAYS.iter().position(|d| *d == weekday)? as i64 - today + 7) % 7 {
+                weekday => match (i64::try_from(WEEKDAYS.iter().position(|d| *d == weekday)?).ok()? - today + 7) % 7 {
                     0 => 7,
                     n => n,
                 },
             };
             // A calendar-day advance, so DST days keep their local time.
-            let date = now.date_naive().checked_add_days(chrono::Days::new(days_ahead as u64))?;
+            let date = now.date_naive().checked_add_days(chrono::Days::new(u64::try_from(days_ahead).ok()?))?;
             let local = date.and_hms_opt(*hour, *minute, 0)?;
             let zone = now.timezone();
             let wake = zone
@@ -940,6 +940,11 @@ fn pin_midpoint(a: &[u8], b: &[u8]) -> Vec<u8> {
     let digit_a = a.first().map_or(0, |c| (c - b'a') as usize);
     let digit_b = b.first().map_or(PIN_DIGITS.len(), |c| (c - b'a') as usize);
     if digit_b - digit_a > 1 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the midpoint of two digit indexes"
+        )]
         return vec![PIN_DIGITS[((digit_a + digit_b) as f32 / 2.).round() as usize]];
     }
     if b.len() > 1 {
@@ -1009,6 +1014,10 @@ pub fn resolve_custom_snooze<Tz: chrono::TimeZone>(
                 return Err(ERROR);
             }
             // `as` saturates a huge amount; anything past chrono's range is no date at all.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "rounded first, and `as` saturates out-of-range values"
+            )]
             let wake = now_ms.checked_add((amount * unit_ms).round() as i64).ok_or(ERROR)?;
             chrono::DateTime::from_timestamp_millis(wake).ok_or(ERROR)?;
             Ok(wake)

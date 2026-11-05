@@ -55,7 +55,7 @@ pub(super) fn encode(
     if x > limit || y > limit {
         return None;
     }
-    let coordinate = |v: usize| char::from_u32(32 + v as u32);
+    let coordinate = |v: usize| u32::try_from(v).ok().and_then(|v| v.checked_add(32)).and_then(char::from_u32);
     let mut out = String::from("\x1b[M");
     out.push(char::from(32 + code));
     // Legacy coordinates above 127 go out as their Latin-1 code points.

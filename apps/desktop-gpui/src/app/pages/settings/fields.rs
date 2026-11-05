@@ -166,6 +166,7 @@ impl NumberField {
 
 /// A typed number rounded to a whole one; `None` (keep the saved value) when it isn't a
 /// finite number. Out-of-range values saturate, and the field's clamp then applies.
+#[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
 fn parse_number(typed: &str) -> Option<i64> {
     let typed = typed.trim().parse::<f64>().ok().filter(|typed| typed.is_finite())?;
     Some(typed.round() as i64)

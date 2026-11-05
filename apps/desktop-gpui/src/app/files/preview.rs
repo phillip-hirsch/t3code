@@ -526,7 +526,7 @@ impl Workspace {
                     .text_color(tokens.warning_foreground)
                     .child(format!(
                         "Preview limited to the first 1 MB of a {} byte file.",
-                        logic::grouped(byte_length as usize)
+                        logic::grouped(usize::try_from(byte_length).unwrap_or(usize::MAX))
                     )),
             ),
             _ => None,

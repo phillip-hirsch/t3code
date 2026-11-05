@@ -573,8 +573,10 @@ pub struct ConnectionState {
 }
 
 /// `retryDelayMs`: exponential from 1 s to 5 min, half of it jittered by `random` in 0..=1.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a delay capped at the maximum backoff")]
 pub fn retry_delay_ms(failure_count: u32, random: f64) -> u64 {
-    let ceiling = RETRY_MAX_DELAY_MS.min(RETRY_BASE_DELAY_MS * 2f64.powi(failure_count.min(30) as i32 + 1));
+    let ceiling =
+        RETRY_MAX_DELAY_MS.min(RETRY_BASE_DELAY_MS * 2f64.powi(i32::try_from(failure_count.min(30)).unwrap_or(30) + 1));
     (ceiling / 2. + ceiling / 2. * random).round() as u64
 }
 

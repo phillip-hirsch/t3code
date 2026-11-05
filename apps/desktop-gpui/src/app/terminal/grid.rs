@@ -164,13 +164,13 @@ pub(super) struct Batched {
 /// A wide glyph ends its run, so every glyph after it still starts on its own cell.
 pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize, theme: &TerminalTheme) -> Batched {
     let mut out = Batched::default();
-    let offset = content.display_offset as i32;
+    let offset = super::line_count(content.display_offset);
     let colors = content.colors;
     let mut run: Option<PendingRun> = None;
     let mut wide = false;
     for indexed in content.display_iter {
         let cell = indexed.cell;
-        let row = (indexed.point.line.0 + offset) as usize;
+        let row = usize::try_from(indexed.point.line.0 + offset).unwrap_or(0);
         let column = indexed.point.column.0;
         if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
             continue;
@@ -217,7 +217,7 @@ pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize,
     flush(&mut run, &mut out.runs);
     if let Some(range) = content.selection {
         for row in 0..rows {
-            let line = Line(row as i32 - offset);
+            let line = Line(super::line_count(row) - offset);
             if line < range.start.line || line > range.end.line {
                 continue;
             }
@@ -273,10 +273,25 @@ impl Geometry {
     pub fn cell_at(&self, position: Point<Pixels>, display_offset: usize) -> (GridPoint, bool) {
         let x = ((position.x - self.origin.x) / self.cell_width).max(0.);
         let y = ((position.y - self.origin.y) / self.line_height).max(0.);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "non-negative cell coordinates; `as` saturates"
+        )]
         let column = (x as usize).min(self.columns.saturating_sub(1));
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "non-negative cell coordinates; `as` saturates"
+        )]
         let row = (y as usize).min(self.rows.saturating_sub(1));
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "non-negative cell coordinates; `as` saturates"
+        )]
         let right = x.fract() >= 0.5 || x as usize >= self.columns;
-        (GridPoint::new(Line(row as i32 - display_offset as i32), Column(column)), right)
+        (GridPoint::new(Line(super::line_count(row) - super::line_count(display_offset)), Column(column)), right)
     }
 }
 
@@ -365,7 +380,17 @@ impl Element for TerminalGrid {
         let fonts = theme::tokens(cx).fonts;
         let (cell_width, line_height) = cell_size(window, &fonts);
         // `terminalGridSize`.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a whole count of cells; `as` saturates"
+        )]
         let columns = (((bounds.size.width - PADDING * 2.) / cell_width).floor() as usize).max(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a whole count of cells; `as` saturates"
+        )]
         let rows = (((bounds.size.height - PADDING * 2.) / line_height).floor() as usize).max(1);
         let theme = self.theme;
         let batched = self.session.update(cx, |session, cx| {
@@ -416,7 +441,7 @@ impl Element for TerminalGrid {
             .iter()
             .map(|run| (cell_origin(run.row, run.column), shape(run.text.clone(), &run.style)))
             .collect();
-        let cursor_row = cursor_point.line.0 + display_offset as i32;
+        let cursor_row = cursor_point.line.0 + super::line_count(display_offset);
         // The glyph under a filled block cursor is redrawn in the background color.
         let cursor_glyph = (self.focused && show_cursor && cursor_shape == CursorShape::Block)
             .then(|| &term.grid()[cursor_point])
@@ -425,7 +450,7 @@ impl Element for TerminalGrid {
                 Some(shape(text.into(), &RunStyle::new(self.theme.background, cell.flags)))
             });
         let cursor = (show_cursor && cursor_shape != CursorShape::Hidden && cursor_row >= 0).then(|| {
-            let at = cell_origin(cursor_row as usize, cursor_point.column.0);
+            let at = cell_origin(usize::try_from(cursor_row).unwrap_or(0), cursor_point.column.0);
             let wide = term.grid()[cursor_point].flags.contains(Flags::WIDE_CHAR);
             let width = if wide { cell_width * 2. } else { cell_width };
             let bounds = match cursor_shape {
@@ -441,7 +466,7 @@ impl Element for TerminalGrid {
             .into_iter()
             .flat_map(|link| &link.cells)
             .filter_map(|(line, start, end)| {
-                let row = usize::try_from(line.0 + display_offset as i32).ok().filter(|row| *row < rows)?;
+                let row = usize::try_from(line.0 + super::line_count(display_offset)).ok().filter(|row| *row < rows)?;
                 let at = cell_origin(row, *start) + point(px(0.), line_height - px(1.));
                 Some(Bounds::new(at, size(cell_width * (end - start) as f32, px(1.))))
             })

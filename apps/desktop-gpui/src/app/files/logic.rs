@@ -138,7 +138,9 @@ impl ContentMatch {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|r| Some((r["start"].as_u64()? as usize, r["end"].as_u64()? as usize)))
+                .filter_map(|r| {
+                    Some((usize::try_from(r["start"].as_u64()?).ok()?, usize::try_from(r["end"].as_u64()?).ok()?))
+                })
                 .collect(),
         })
     }

@@ -390,7 +390,7 @@ impl Workspace {
             // (min, step) per `background::DURATION_KEYS`, as the web's `IntervalSecondsField`s.
             let inputs = [(0, 5), (0, 30), (5, 5), (5, 30)].into_iter().enumerate().map(|(index, (min, step))| {
                 let key = background::DURATION_KEYS[index];
-                let seconds = resolved.seconds(index) as i64;
+                let seconds = i64::try_from(resolved.seconds(index)).unwrap_or(i64::MAX);
                 view.update(cx, |this, cx| {
                     // Saved in milliseconds, so the seconds must fit `i64` times 1000.
                     let max = i64::MAX / 1000;
@@ -552,7 +552,7 @@ fn notify_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// `formatRelativeTimeLabel` (`apps/web/src/timestampFormat.ts`).

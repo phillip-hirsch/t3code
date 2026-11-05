@@ -141,11 +141,13 @@ fn parse_max_delivery_age(value: &str) -> Result<Option<u32>, ()> {
     }
     js_integer(value)
         .filter(|minutes| (1..=i64::from(MAX_WEBHOOK_DELIVERY_AGE_MINUTES)).contains(minutes))
-        .map(|minutes| Some(minutes as u32))
+        .and_then(|minutes| u32::try_from(minutes).ok())
+        .map(Some)
         .ok_or(())
 }
 
 /// `Number(text)` when it is a whole number (`Number.isInteger`).
+#[expect(clippy::cast_possible_truncation, reason = "whole and under 2^53, so exact")]
 fn js_integer(text: &str) -> Option<i64> {
     let number: f64 = text.trim().parse().ok()?;
     (number.is_finite() && number.fract() == 0.0 && number.abs() < 9.0e15).then_some(number as i64)

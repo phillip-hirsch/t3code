@@ -54,6 +54,7 @@ pub(super) struct Documents {
 /// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
 fn css_hex(color: Hsla) -> String {
     let rgba = gpui_kit::Rgba::from(color);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     let (r, g, b) = (byte(rgba.r), byte(rgba.g), byte(rgba.b));
     if rgba.a < 1. { format!("rgba({r},{g},{b},{:.3})", rgba.a) } else { format!("#{r:02x}{g:02x}{b:02x}") }

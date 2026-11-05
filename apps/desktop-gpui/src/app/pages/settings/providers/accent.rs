@@ -71,6 +71,7 @@ fn hsv_to_hex(Hsv { h, s, v }: Hsv) -> String {
         _ => (chroma, 0., x),
     };
     let m = v - chroma;
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |c: f32| ((c + m) * 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
 }

@@ -88,6 +88,7 @@ impl Desktop {
 }
 
 pub fn rect(bounds: Bounds<Pixels>) -> WindowRect {
+    #[expect(clippy::cast_possible_truncation, reason = "window positions in whole pixels")]
     let round = |value: Pixels| f32::from(value).round() as i32;
     WindowRect {
         x: round(bounds.origin.x),

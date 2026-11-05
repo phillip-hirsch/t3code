@@ -142,11 +142,12 @@ pub fn ico(pixels: &[u8], size: u32) -> Vec<u8> {
     // Mask rows are 1 bit per pixel, padded to 32 bits.
     let mask = side.div_ceil(32) * 4 * side;
     let image = 40 + pixels.len() + mask;
-    let dimension = if size >= 256 { 0 } else { size as u8 };
+    // 0 stands for 256 and up.
+    let dimension = u8::try_from(size).unwrap_or(0);
     let mut ico = Vec::with_capacity(22 + image);
     ico.extend_from_slice(&[0, 0, 1, 0, 1, 0]);
     ico.extend_from_slice(&[dimension, dimension, 0, 0, 1, 0, 32, 0]);
-    ico.extend_from_slice(&(image as u32).to_le_bytes());
+    ico.extend_from_slice(&u32::try_from(image).unwrap_or(u32::MAX).to_le_bytes());
     ico.extend_from_slice(&22u32.to_le_bytes());
     // BITMAPINFOHEADER: the height counts the color rows and the mask rows.
     ico.extend_from_slice(&40u32.to_le_bytes());
@@ -155,7 +156,7 @@ pub fn ico(pixels: &[u8], size: u32) -> Vec<u8> {
     ico.extend_from_slice(&1u16.to_le_bytes());
     ico.extend_from_slice(&32u16.to_le_bytes());
     ico.extend_from_slice(&0u32.to_le_bytes());
-    ico.extend_from_slice(&((pixels.len() + mask) as u32).to_le_bytes());
+    ico.extend_from_slice(&u32::try_from(pixels.len() + mask).unwrap_or(u32::MAX).to_le_bytes());
     ico.extend_from_slice(&[0; 16]);
     // Bitmap rows run bottom to top.
     for row in pixels.chunks_exact(side * 4).rev() {
@@ -195,7 +196,7 @@ mod windows_overlay {
             if count == 0 {
                 return list.SetOverlayIcon(&window, None, "").map_err(|e| e.to_string());
             }
-            let size = w::GetSystemMetrics(co::SM::CXSMICON).max(16) as u32;
+            let size = w::GetSystemMetrics(co::SM::CXSMICON).max(16).unsigned_abs();
             let Some(pixels) = render(&mut self.fonts, count, size) else { return Ok(()) };
             let icon = load_icon(&super::ico(&pixels, size), size)?;
             let description = format!("{count} threads with new notifications");
@@ -209,7 +210,7 @@ mod windows_overlay {
         std::fs::write(&path, ico).map_err(|e| e.to_string())?;
         let icon = w::HINSTANCE::NULL.LoadImageIcon(
             w::IdOicStr::Str(w::WString::from_str(path.to_string_lossy())),
-            w::SIZE::with(size as i32, size as i32),
+            w::SIZE::with(i32::try_from(size).unwrap_or(i32::MAX), i32::try_from(size).unwrap_or(i32::MAX)),
             co::LR::LOADFROMFILE,
         );
         let _ = std::fs::remove_file(&path);

@@ -1193,6 +1193,11 @@ impl Workspace {
                                 }
                                 let local = event.position - bounds.origin;
                                 let fraction = (local.x / bounds.size.width).clamp(0., 1.);
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_sign_loss,
+                                    reason = "an index into the periods: fraction is 0..=1"
+                                )]
                                 let index = (fraction * (period_count - 1) as f32).round() as usize;
                                 let next = Some((index, local.x, local.y));
                                 if this.usage.hover != next {
@@ -1320,6 +1325,7 @@ impl Workspace {
             }
             for (index, model) in models.iter().enumerate() {
                 let value = if tokens { model.total_tokens as f64 } else { model.cost_usd };
+                #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 share; f32 is what GPUI lays out with")]
                 let bar = (value > 0. && peak > 0.).then(|| (value / peak) as f32);
                 let share = model.share(tokens).map(logic::format_percent).unwrap_or_default();
                 table = table.child(
@@ -1552,11 +1558,13 @@ fn share_bar(
                 let text: SharedString =
                     format!("{name} · {} · {}", format(*value), logic::format_percent(value / total)).into();
                 let radius = |first: bool| if first { px(999.) } else { px(2.) };
+                #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 share; f32 is what GPUI lays out with")]
+                let share = (value / total) as f32;
                 div()
                     .id(ElementId::Name(format!("share-{label}-{name}").into()))
                     .h_full()
                     .min_w(px(4.))
-                    .flex_basis(relative((value / total) as f32))
+                    .flex_basis(relative(share))
                     .flex_shrink(1.)
                     .bg(*color)
                     .rounded_tl(radius(index == 0))

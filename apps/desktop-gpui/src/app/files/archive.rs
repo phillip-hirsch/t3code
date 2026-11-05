@@ -166,7 +166,8 @@ fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Bytes>) -> Result<Vec<A
         if path.len() > 1024 || size > MAX_BYTES || start as u64 + size > bytes.len() as u64 {
             return Err(damaged());
         }
-        let content = &bytes[start..start + size as usize];
+        let size_bytes = usize::try_from(size).map_err(|_| damaged())?;
+        let content = &bytes[start..start + size_bytes];
         match kind.as_str() {
             "L" => long_path = Some(String::from_utf8_lossy(content).split('\0').next().unwrap_or("").to_owned()),
             "x" | "g" => {
@@ -186,9 +187,13 @@ fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Bytes>) -> Result<Vec<A
                 }
             }
             "" | "0" | "5" => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a pax mtime in seconds; `as` saturates out-of-range values"
+                )]
                 let seconds = match attributes.get("mtime") {
                     Some(mtime) => mtime.parse::<f64>().map_err(|_| "The TAR metadata is damaged.".to_owned())? as i64,
-                    None => number(offset + 136, 12)? as i64,
+                    None => i64::try_from(number(offset + 136, 12)?).map_err(|_| damaged())?,
                 };
                 let directory = kind == "5";
                 if !directory {
@@ -198,7 +203,7 @@ fn tar_entries(bytes: &[u8], files: &mut HashMap<String, Bytes>) -> Result<Vec<A
             }
             _ => {}
         }
-        offset = start + size.div_ceil(512) as usize * 512;
+        offset = start + size_bytes.div_ceil(512) * 512;
     }
     if entries.is_empty() {
         return Err("This archive has no readable entries.".into());

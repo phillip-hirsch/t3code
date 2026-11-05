@@ -102,8 +102,9 @@ pub fn step_zoom(current: f64, direction: i32) -> f64 {
     if direction == 0 {
         return 1.0;
     }
-    let index = ZOOM_LEVELS.iter().position(|level| (level - current).abs() < 1e-9).unwrap_or(7) as i32;
-    ZOOM_LEVELS[(index + direction).clamp(0, ZOOM_LEVELS.len() as i32 - 1) as usize]
+    let index = ZOOM_LEVELS.iter().position(|level| (level - current).abs() < 1e-9).unwrap_or(7);
+    let next = if direction > 0 { (index + 1).min(ZOOM_LEVELS.len() - 1) } else { index.saturating_sub(1) };
+    ZOOM_LEVELS[next]
 }
 
 /// `PreviewViewportSetting`: the page fills the panel, or gets a fixed CSS size.
@@ -645,6 +646,7 @@ impl Viewport {
     }
 
     /// The size the Settings fields show; "Fill panel" shows none.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "viewport sizes are whole pixels")]
     fn shown_size(&self) -> (u32, u32) {
         self.size().map_or(RESPONSIVE_SEED, |(w, h)| (w as u32, h as u32))
     }
@@ -669,7 +671,8 @@ impl Viewport {
             return None;
         }
         let (width, height) = self.shown_size();
-        let (width, height) = if width_axis { (value as u32, height) } else { (width, value as u32) };
+        let value = u32::try_from(value).ok()?;
+        let (width, height) = if width_axis { (value, height) } else { (width, value) };
         if i64::from(width) * i64::from(height) > VIEWPORT_MAX_AREA
             || self.size() == Some((width as f32, height as f32))
         {

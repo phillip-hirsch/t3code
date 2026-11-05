@@ -68,6 +68,11 @@ impl Resolved {
         self.durations_ms == other.durations_ms && self.pauses == other.pauses
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded first, and `as` saturates out-of-range values"
+    )]
     pub(in super::super) fn seconds(&self, index: usize) -> u64 {
         (self.durations_ms[index] as f64 / 1000.).round() as u64
     }

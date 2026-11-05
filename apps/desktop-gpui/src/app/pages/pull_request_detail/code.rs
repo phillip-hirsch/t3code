@@ -635,7 +635,11 @@ impl Workspace {
             .map(|(key, group)| {
                 DiffAnnotation::line(
                     ElementId::Name(key.clone()),
-                    DiffLinePosition::new(group.path.clone(), to_viewer_side(group.side), group.line as usize),
+                    DiffLinePosition::new(
+                        group.path.clone(),
+                        to_viewer_side(group.side),
+                        usize::try_from(group.line).unwrap_or(usize::MAX),
+                    ),
                 )
             })
             .collect();

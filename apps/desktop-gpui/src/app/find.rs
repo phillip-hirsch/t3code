@@ -56,7 +56,7 @@ struct FindResult {
 
 impl FindResult {
     fn parse(value: &Value) -> Option<Self> {
-        let index = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        let index = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok());
         Some(Self {
             total: index(value, "totalMatches")?,
             active: index(value, "activeIndex").unwrap_or(0),

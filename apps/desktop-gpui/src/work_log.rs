@@ -1843,6 +1843,7 @@ pub fn format_duration(ms: i64) -> String {
         let tenths = (ms as f64 / 100.).round() / 10.;
         return format!("{}s", format!("{tenths:.1}").trim_end_matches(".0"));
     }
+    #[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
     let total = (ms as f64 / 1000.).round() as i64;
     if total < 60 {
         return format!("{total}s");

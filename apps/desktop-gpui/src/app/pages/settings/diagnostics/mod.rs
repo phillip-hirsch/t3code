@@ -2224,6 +2224,8 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                     let peak_h = 2f64.max(b.max_cpu_percent / max * 100.);
                     let avg_h = 2f64.max(b.avg_cpu_percent / max * 100.);
                     let tip = format!("Avg {:.1}%, peak {:.1}%", b.avg_cpu_percent, b.max_cpu_percent);
+                    #[expect(clippy::cast_possible_truncation, reason = "percent heights as 0..=1 shares")]
+                    let (peak_h, avg_h) = ((peak_h / 100.) as f32, (avg_h / 100.) as f32);
                     div()
                         .id(ElementId::Name(format!("cpu-{}", b.started_at).into()))
                         .relative()
@@ -2236,7 +2238,7 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .h(relative((peak_h / 100.) as f32))
+                                .h(relative(peak_h))
                                 .rounded_t(px(2.))
                                 .bg(peak),
                         )
@@ -2246,7 +2248,7 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .h(relative((avg_h / 100.) as f32))
+                                .h(relative(avg_h))
                                 .rounded_t(px(2.))
                                 .bg(average),
                         )
@@ -2264,6 +2266,7 @@ fn telemetry_chart(buckets: &[TelemetryBucket], t: &Tokens) -> AnyElement {
     let legend = |color: Hsla, label: &'static str| {
         h_flex().gap(px(6.)).child(div().h(px(6.)).w(px(12.)).rounded_full().bg(color)).child(label)
     };
+    #[expect(clippy::cast_possible_truncation, reason = "percent heights as 0..=1 shares")]
     let bar = |height: f64, color: Hsla| {
         v_flex()
             .flex_1()

@@ -74,6 +74,7 @@ impl Workspace {
         let (usage, live) = projection.context_window()?;
         let usage = usage.clone();
         let percentage = used_percentage(&usage);
+        #[expect(clippy::cast_possible_truncation, reason = "a percentage clamped to 0..=100")]
         let shown = percentage.unwrap_or(0.).clamp(0., 100.) as f32;
         let color = if shown > 90. { t.error } else { t.muted_foreground.opacity(0.72) };
         let track = t.muted_foreground.opacity(0.24);
@@ -274,6 +275,11 @@ fn ring(percentage: f32, track: Hsla, color: Hsla) -> impl IntoElement {
             let center = bounds.center();
             let at = |angle: f32| point(center.x + px(RADIUS * angle.cos()), center.y + px(RADIUS * angle.sin()));
             let arc = |from: f32, sweep: f32| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a small, positive step count"
+                )]
                 let steps = ((sweep / TAU) * 64.).ceil().max(1.) as usize;
                 let mut path = PathBuilder::stroke(px(STROKE));
                 path.move_to(at(from));

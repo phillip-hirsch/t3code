@@ -1033,13 +1033,14 @@ pub(super) fn kbd(text: &str, t: &Tokens) -> impl IntoElement {
 
 /// `adjacentModelPickerProvider`: wraps; from a tab not in the list, the first (or last).
 fn step_tab(tabs: &[Tab], current: &Tab, step: isize) -> Tab {
-    let len = tabs.len() as isize;
+    let len = tabs.len();
     let index = match tabs.iter().position(|tab| tab == current) {
-        Some(at) => (at as isize + step).rem_euclid(len),
+        Some(at) if step > 0 => (at + 1) % len,
+        Some(at) => (at + len - 1) % len,
         None if step > 0 => 0,
         None => len - 1,
     };
-    tabs[index as usize].clone()
+    tabs[index].clone()
 }
 
 fn initials(name: &str) -> String {

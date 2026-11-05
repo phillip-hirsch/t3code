@@ -289,6 +289,7 @@ pub fn class(quality: f32) -> u8 {
 }
 
 /// `threadUsageBoost` without open history: recency of the last user message.
+#[expect(clippy::cast_possible_truncation, reason = "a boost clamped to 1..=2.5")]
 pub fn usage_boost(age_ms: i64) -> f32 {
     const HALF_LIFE: f64 = 14. * 86_400_000.;
     let recency = 2f64.powf(-(age_ms.max(0) as f64) / HALF_LIFE);

@@ -524,15 +524,15 @@ pub(super) fn is_variable_name(name: &str) -> bool {
 /// `redactedPlaceholder`: a stable stand-in of the same shape, for hidden account emails.
 pub(super) fn redacted_placeholder(value: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    let mut state: i32 = 0x811c9dc5_u32 as i32;
+    let mut state: i32 = 0x811c9dc5_u32.cast_signed();
     for unit in value.encode_utf16() {
         state ^= i32::from(unit);
         state = state.wrapping_mul(0x01000193);
     }
     let mut next_char = || {
-        state = (state ^ ((state as u32) >> 13) as i32).wrapping_mul(0x85ebca6b_u32 as i32);
-        state = (state ^ ((state as u32) >> 16) as i32).wrapping_mul(0xc2b2ae35_u32 as i32);
-        ALPHABET[i64::from(state).unsigned_abs() as usize % ALPHABET.len()] as char
+        state = (state ^ (state.cast_unsigned() >> 13).cast_signed()).wrapping_mul(0x85ebca6b_u32.cast_signed());
+        state = (state ^ (state.cast_unsigned() >> 16).cast_signed()).wrapping_mul(0xc2b2ae35_u32.cast_signed());
+        ALPHABET[state.unsigned_abs() as usize % ALPHABET.len()] as char
     };
     value.chars().map(|c| if matches!(c, '@' | '.' | '-' | '_') { c } else { next_char() }).collect()
 }

@@ -1272,6 +1272,11 @@ fn limit_meters(limits: &UsageLimits, tokens: &Tokens) -> Vec<Meter> {
 /// `ThreadDetailsContext`: the bar fills as context is used; the tick marks auto-compaction.
 fn context_meter(usage: &TokenUsage, tokens: &Tokens) -> Meter {
     let max = usage.max_tokens.filter(|max| *max > 0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a percentage clamped to 0..=100 and rounded"
+    )]
     let used = max.map(|max| (usage.used_tokens as f64 / max as f64 * 100.).clamp(0., 100.).round() as u32);
     let tick = max
         .zip(usage.auto_compact_threshold)

@@ -607,11 +607,17 @@ fn thousands(value: u64) -> String {
 
 /// `Intl.NumberFormat("en-US", {style: "currency", currency: "USD"})`.
 pub fn format_usd(value: f64) -> String {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded first, and `as` saturates out-of-range values"
+    )]
     let cents = (value.abs() * 100.).round() as u64;
     let sign = if value < 0. && cents > 0 { "-" } else { "" };
     format!("{sign}${}.{:02}", thousands(cents / 100), cents % 100)
 }
 
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "rounded and non-negative; `as` saturates")]
 pub fn format_count(value: f64) -> String {
     thousands(value.round().max(0.) as u64)
 }
@@ -713,6 +719,7 @@ pub fn nice_scale(peak: f64) -> (f64, Vec<f64>) {
     (max, ticks)
 }
 
+#[expect(clippy::cast_possible_truncation, reason = "chart coordinates; f32 is what GPUI draws with")]
 pub fn value_to_y(value: f64, max: f64) -> f32 {
     if max == 0. { VIEW_HEIGHT } else { VIEW_HEIGHT - (value / max) as f32 * (VIEW_HEIGHT - PLOT_TOP) }
 }
@@ -789,6 +796,7 @@ pub fn elapsed_share(window: &UsageWindow, now: i64) -> Option<f64> {
 }
 
 /// Bars show quota remaining, so even pace is the share of time remaining.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a rounded percentage")]
 pub fn pace_remaining_percent(window: &UsageWindow, now: i64) -> Option<u32> {
     elapsed_share(window, now).map(|elapsed| ((1. - elapsed) * 100.).round() as u32)
 }
@@ -1515,6 +1523,7 @@ fn pool_windows(driver: &str, accounts: &[Account], now: i64) -> Vec<PoolWindow>
                 let n = timed.len() as f64;
                 pace_of_shares(timed.iter().map(|t| t.0).sum::<f64>() / n, timed.iter().map(|t| t.1).sum::<f64>() / n)
             });
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a rounded percentage")]
             let mut resets: Vec<(i64, u32)> = members
                 .iter()
                 .filter_map(|m| {
@@ -1522,12 +1531,14 @@ fn pool_windows(driver: &str, accounts: &[Account], now: i64) -> Vec<PoolWindow>
                 })
                 .collect();
             resets.sort_by_key(|r| r.0);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a rounded percentage")]
+            let remaining_percent = (100. - used).round() as u32;
             PoolWindow {
                 id: if driver == "codex" { key } else { first.id.clone() },
                 kind: first.kind.clone(),
                 label: first.label.clone(),
                 columns: (0..accounts.len()).map(|i| members.iter().find(|m| m.account == i).cloned()).collect(),
-                remaining_percent: (100. - used).round() as u32,
+                remaining_percent,
                 pace,
                 next_refill: resets.iter().map(|r| r.1).find(|percent| *percent > 0),
             }

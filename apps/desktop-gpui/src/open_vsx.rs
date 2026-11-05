@@ -356,8 +356,8 @@ impl<'a> Zip<'a> {
             }
             end -= 1;
         }
-        let size = u32_at(end + 12).ok_or_else(invalid)? as usize;
-        let start = u32_at(end + 16).ok_or_else(invalid)? as usize;
+        let size = usize::try_from(u32_at(end + 12).ok_or_else(invalid)?).map_err(|_| invalid())?;
+        let start = usize::try_from(u32_at(end + 16).ok_or_else(invalid)?).map_err(|_| invalid())?;
         if start + size != end {
             return Err(invalid());
         }
@@ -392,10 +392,10 @@ impl<'a> Zip<'a> {
             entries.insert(
                 name,
                 ZipEntry {
-                    method: u16_at(offset + 10).ok_or_else(invalid)? as u16,
-                    compressed: compressed as usize,
-                    uncompressed: uncompressed as usize,
-                    local_offset: u32_at(offset + 42).ok_or_else(invalid)? as usize,
+                    method: u16::try_from(u16_at(offset + 10).ok_or_else(invalid)?).map_err(|_| invalid())?,
+                    compressed: usize::try_from(compressed).map_err(|_| invalid())?,
+                    uncompressed: usize::try_from(uncompressed).map_err(|_| invalid())?,
+                    local_offset: usize::try_from(u32_at(offset + 42).ok_or_else(invalid)?).map_err(|_| invalid())?,
                 },
             );
             offset += 46 + name_length + extra + comment;
@@ -651,6 +651,7 @@ mod tests {
     use super::*;
 
     /// A ZIP with deflated entries, as `vsce` packs them.
+    #[expect(clippy::cast_possible_truncation, reason = "test archives are a few bytes")]
     fn zip(files: &[(&str, &str)]) -> Vec<u8> {
         let (mut out, mut directory) = (Vec::new(), Vec::new());
         for (name, text) in files {

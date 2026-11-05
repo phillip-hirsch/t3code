@@ -15,6 +15,7 @@ use gpui_kit::{
 };
 use serde_json::json;
 
+use super::super::line_count;
 use super::super::links::{self, LinkKind};
 use super::super::mouse::{self, MouseAction};
 use super::{Listener, SessionEvent, TerminalSession};
@@ -71,7 +72,7 @@ struct LogicalLine {
 
 fn logical_line(term: &Term<Listener>, line: Line) -> LogicalLine {
     let grid = term.grid();
-    let (top, bottom) = (Line(-(grid.history_size() as i32)), Line(grid.screen_lines() as i32 - 1));
+    let (top, bottom) = (Line(-line_count(grid.history_size())), Line(line_count(grid.screen_lines()) - 1));
     let columns = grid.columns();
     let wraps = |line: Line| grid[line][Column(columns - 1)].flags.contains(Flags::WRAPLINE);
     let mut start = line;
@@ -111,7 +112,7 @@ impl TerminalSession {
     /// The 0-based visible cell under `position`, as a tracking app counts it.
     fn screen_cell(&self, position: Point<Pixels>) -> (usize, usize) {
         let (point, _) = self.geometry.get().cell_at(position, 0);
-        (point.column.0, point.line.0.max(0) as usize)
+        (point.column.0, usize::try_from(point.line.0).unwrap_or(0))
     }
 
     fn grid_point(&self, position: Point<Pixels>) -> (GridPoint, bool) {
@@ -361,6 +362,11 @@ impl TerminalSession {
             let button = if lines > 0. { mouse::WHEEL_UP } else { mouse::WHEEL_DOWN };
             let (column, row) = self.screen_cell(event.position);
             if let Some(data) = mouse::encode(mode, MouseAction::Press, button, event.modifiers.alt, column, row) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "whole wheel lines (truncated above)"
+                )]
                 self.send_input(&data.repeat(lines.abs() as usize), cx);
             }
         } else if mode.contains(TermMode::ALT_SCREEN) {
@@ -371,8 +377,14 @@ impl TerminalSession {
                 (false, true) => "\u{1b}OB",
                 (false, false) => "\u{1b}[B",
             };
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "whole wheel lines (truncated above)"
+            )]
             self.send_input(&key.repeat(lines.abs() as usize), cx);
         } else {
+            #[expect(clippy::cast_possible_truncation, reason = "whole wheel lines (truncated above)")]
             self.term.scroll_display(Scroll::Delta(lines as i32));
             self.pointer.forget_hover();
             cx.notify();
