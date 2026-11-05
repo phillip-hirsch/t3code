@@ -261,7 +261,7 @@ impl<'a> Facts<'a> {
         })
     }
 
-    fn latest_run_status(&self) -> Option<&'a str> {
+    pub fn latest_run_status(&self) -> Option<&'a str> {
         self.thread.latest_run_id.as_ref()?;
         Some(if self.thread.status == "idle" { "completed" } else { &self.thread.status })
     }

@@ -38,6 +38,7 @@ hmac = "0.12"
 jiff = "0.2"
 log = "0.4"
 raw-window-handle = "0.6"
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 serde = { version = "1", features = ["derive", "rc"] }
 # Objects keep the server's key order, e.g. provider instances in the order they were added.

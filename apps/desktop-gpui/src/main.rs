@@ -9,8 +9,10 @@ mod keybindings;
 mod model;
 mod model_label;
 mod new_thread;
+mod notifications;
 mod preview;
 mod pull_requests;
+mod quit_shortcut;
 mod requests;
 mod rpc;
 mod search;
@@ -49,6 +51,8 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     gpui_kit::application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
+        // Windows shows OS notifications under this identity.
+        cx.set_app_identity("com.t3tools.t3code.gpui", "T3 Code");
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
