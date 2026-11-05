@@ -89,7 +89,8 @@ pub struct VcsStatus {
 impl VcsStatus {
     /// Folds one `VcsStatusStreamEvent` into the current status (`applyVcsStatusStreamEvent`).
     pub fn apply(current: Option<Self>, event: &Value) -> Option<Self> {
-        let local = || VcsLocal::deserialize(&event["local"]).ok();
+        let local =
+            || VcsLocal::deserialize(&event["local"]).inspect_err(|error| log::warn!("bad git status: {error}")).ok();
         let remote = || VcsRemote::deserialize(&event["remote"]).unwrap_or_default();
         match event.get("_tag").and_then(Value::as_str)? {
             "snapshot" => Some(Self { local: local()?, remote: remote() }),
@@ -350,7 +351,7 @@ impl Workspace {
         worktree.or_else(|| self.target_project().map(|project| project.workspace_root.clone()))
     }
 
-    /// Keeps one `subscribeVcsStatus` stream on the current cwd; reconnects resubscribe.
+    /// Keeps one `subscribeVcsStatus` stream on the current cwd; an ended stream resubscribes after a backoff.
     pub(super) fn sync_vcs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.git_cwd();
         if cwd == self.vcs.cwd && (self.vcs.task.is_some() || cwd.is_none()) {
@@ -393,8 +394,8 @@ impl Workspace {
                     break;
                 }
             }
-            // Dropped, so the next render resubscribes once the socket is back.
-            let _ = this.update(cx, |this, _| this.vcs.task = None);
+            // Waits before the next render resubscribes, so a cwd the server rejects can't loop.
+            super::details::resubscribe_after_backoff(&this, cx, |this| this.vcs.task = None).await;
         }));
     }
 
@@ -422,7 +423,7 @@ impl Workspace {
         self.vcs.running = Some("Starting source control action...".into());
         let stream = client.stream("git.runStackedAction", input);
         cx.spawn(async move |this, cx| {
-            let mut outcome: Result<Option<String>, String> = Ok(None);
+            let mut outcome: Result<(), String> = Ok(());
             while let Some(event) = stream.next().await {
                 match event {
                     StreamEvent::Item(value) => match value.get("kind").and_then(Value::as_str) {
@@ -435,10 +436,6 @@ impl Workspace {
                         }
                         Some("action_failed") => {
                             outcome = Err(value["message"].as_str().unwrap_or("Git action failed.").to_owned())
-                        }
-                        Some("action_finished") => {
-                            let toast = &value["result"]["toast"];
-                            outcome = Ok(toast["title"].as_str().map(str::to_owned));
                         }
                         _ => {}
                     },
@@ -485,15 +482,24 @@ impl Workspace {
     pub(super) fn refresh_vcs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.vcs.cwd.clone()) else { return };
         cx.spawn(async move |this, cx| {
-            let Ok(value) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
+            let value = match client.request("vcs.refreshStatus", json!({"cwd": cwd})).await {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!("vcs.refreshStatus failed: {error}");
+                    return;
+                }
+            };
             let _ = this.update(cx, |this, cx| {
                 if this.vcs.cwd.as_deref() != Some(cwd.as_str()) {
                     return;
                 }
-                if let Ok(local) = VcsLocal::deserialize(&value) {
-                    let remote = VcsRemote::deserialize(&value).unwrap_or_default();
-                    this.vcs.status = Some(VcsStatus { local, remote });
-                    cx.notify();
+                match VcsLocal::deserialize(&value) {
+                    Ok(local) => {
+                        let remote = VcsRemote::deserialize(&value).unwrap_or_default();
+                        this.vcs.status = Some(VcsStatus { local, remote });
+                        cx.notify();
+                    }
+                    Err(error) => log::warn!("bad vcs.refreshStatus reply: {error}"),
                 }
             });
         })

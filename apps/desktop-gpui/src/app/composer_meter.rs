@@ -65,7 +65,7 @@ impl Workspace {
         {
             return None;
         }
-        let provider = self.composer_model().and_then(|s| self.server_info().provider(&s.instance_id));
+        let provider = self.composer_provider();
         let Some(projection) = self.open_projection() else {
             // `shouldReserveContextWindowMeter`: keep the slot while the thread loads.
             let reserve = provider.is_none_or(|p| p.reports_context_window != Some(false));
@@ -94,7 +94,7 @@ impl Workspace {
             || self.target_rewinding()
             || !projection.pending_approvals().is_empty()
             || !projection.pending_user_inputs().is_empty()
-            || self.plan_follow_up_target().is_some()
+            || self.has_plan_follow_up()
             || !has_compactable_conversation(projection);
         let view = cx.entity();
         let tokens = *t;
@@ -261,7 +261,7 @@ impl Workspace {
 fn has_compactable_conversation(projection: &crate::model::ThreadProjection) -> bool {
     projection.visible_turn_items.iter().map(|row| &row.item).any(|item| {
         item.item_type == "user_message"
-            && (item.str("text").is_some_and(|text| text.trim().to_lowercase() != "/compact")
+            && (item.str("text").is_some_and(|text| !text.trim().eq_ignore_ascii_case("/compact"))
                 || item.raw.get("attachments").and_then(|a| a.as_array()).is_some_and(|a| !a.is_empty()))
     })
 }
