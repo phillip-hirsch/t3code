@@ -197,16 +197,21 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
     #[cfg(windows)]
     let job = contain(&child);
 
+    // Network access and Tailscale Serve, as `DesktopServerExposure` starts the server; the
+    // client still talks to it over loopback.
+    let desktop = crate::desktop::settings::DesktopSettings::load();
+    let (exposure, tailscale_serve_enabled, tailscale_serve_port) =
+        crate::desktop::exposure::for_launch(&desktop, port);
     let bootstrap = json!({
         "mode": "desktop",
         "noBrowser": true,
         "port": port,
         "t3Home": config.home,
-        "host": "127.0.0.1",
+        "host": exposure.bind_host,
         "desktopBootstrapToken": bootstrap_token(&secret, now_ms()),
         "desktopBootstrapSecret": secret,
-        "tailscaleServeEnabled": false,
-        "tailscaleServePort": 443,
+        "tailscaleServeEnabled": tailscale_serve_enabled,
+        "tailscaleServePort": tailscale_serve_port,
     });
     let mut stdin = child.stdin.take().context("server stdin")?;
     stdin.write_all(format!("{bootstrap}\n").as_bytes()).await?;

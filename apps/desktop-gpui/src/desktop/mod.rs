@@ -4,6 +4,7 @@
 
 pub mod activation;
 pub mod cli;
+pub mod exposure;
 pub mod links;
 pub mod settings;
 pub mod window_state;

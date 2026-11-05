@@ -250,7 +250,8 @@ impl Workspace {
         let (client, endpoint) = (self.client(), self.endpoint.clone());
         state.update(cx, |state, cx| state.start(client, endpoint, cx));
         let t = *theme::tokens(cx);
-        let mut sections = vec![self.environment_card(&state, window, cx, &t)];
+        let local_rows = self.local_backend_rows(window, cx, &t);
+        let mut sections = vec![self.environment_card(&state, local_rows, window, cx, &t)];
         let s = state.read(cx);
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
@@ -260,7 +261,14 @@ impl Workspace {
     }
 
     /// The `connections-environment` section: name, icon menu, policy, version, network access, permissions.
-    fn environment_card(&self, state: &Entity<AccessState>, window: &mut Window, cx: &App, t: &Tokens) -> AnyElement {
+    fn environment_card(
+        &self,
+        state: &Entity<AccessState>,
+        local_rows: Option<Vec<AnyElement>>,
+        window: &mut Window,
+        cx: &App,
+        t: &Tokens,
+    ) -> AnyElement {
         let s = state.read(cx);
         let config = &self.server_info.config;
         let has_config = config.is_object();
@@ -277,7 +285,11 @@ impl Workspace {
             let description = if version.is_none() { "Loading\u{2026}".to_owned() } else { parts.join(" · ") };
             let row = RowFrame::new("Version").description(description).status(has_config.then_some("Up to date"));
             rows.push(row.render(t).into_any_element());
-            rows.push(network_access_row(s, t));
+            // A server this app started is exposed from here (`renderNetworkAccessRow`).
+            match local_rows {
+                Some(local) => rows.extend(local),
+                None => rows.push(network_access_row(s, t)),
+            }
         }
         rows.push(permissions_details(state, s, self.client().is_some(), t));
         let more = self.icon_menu(s, window).into_any_element();

@@ -13,6 +13,7 @@
 
 mod access;
 mod environments;
+mod exposure;
 mod logic;
 mod secrets;
 mod ui;

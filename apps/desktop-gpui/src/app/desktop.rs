@@ -46,6 +46,10 @@ pub(super) struct DesktopShell {
     pub(super) cli: Option<crate::desktop::cli::CliState>,
     pub(super) cli_pending: bool,
     pub(super) _cli_task: Option<Task<()>>,
+    /// Settings > Sharing & access: this app's server exposure.
+    pub(super) exposure: Option<crate::desktop::exposure::ExposureView>,
+    pub(super) exposure_pending: bool,
+    pub(super) _exposure_task: Option<Task<()>>,
     _launches: Option<Task<()>>,
 }
 
@@ -81,6 +85,9 @@ impl DesktopShell {
             cli: None,
             cli_pending: false,
             _cli_task: None,
+            exposure: None,
+            exposure_pending: false,
+            _exposure_task: None,
             _launches: launches,
         };
         (shell, subscriptions)
