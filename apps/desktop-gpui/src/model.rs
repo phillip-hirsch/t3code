@@ -999,6 +999,9 @@ pub struct ProviderThread {
 pub struct ProviderSession {
     pub id: String,
     pub status: String,
+    /// `OrchestrationV2ProviderCapabilities`.
+    #[serde(default)]
+    pub capabilities: Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1013,6 +1016,8 @@ pub struct ProviderTurn {
     pub run_attempt_id: Option<String>,
     #[serde(default)]
     pub ordinal: i64,
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1030,6 +1035,13 @@ pub struct Run {
     pub active_attempt_id: Option<String>,
     #[serde(default)]
     pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub user_message_id: Option<String>,
+    #[serde(default)]
+    pub queue_position: Option<i64>,
+    /// Set on the run that delivers subagent results back, which the user can't edit.
+    #[serde(default)]
+    pub delegated_completion: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

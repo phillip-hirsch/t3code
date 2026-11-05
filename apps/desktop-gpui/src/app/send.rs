@@ -87,6 +87,10 @@ impl Workspace {
             self.advance_question(window, cx);
             return;
         }
+        if self.editing_queued() {
+            self.save_queue_edit(window, cx);
+            return;
+        }
         let text = self.composer.read(cx).value().trim().to_owned();
         let (plan_ui, interaction_mode) = self.interaction_mode();
         // `/plan` or `/default` alone switches modes without sending.

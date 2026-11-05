@@ -14,6 +14,7 @@ mod preview;
 mod pull_request_detail;
 mod project_groups;
 mod pull_requests;
+mod queue;
 mod quit_shortcut;
 mod requests;
 mod rpc;

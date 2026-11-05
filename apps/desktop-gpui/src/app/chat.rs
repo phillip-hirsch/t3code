@@ -511,6 +511,8 @@ fn render_row(row: &Row, this: &WeakEntity<Workspace>, lane_width: f32, _: &mut 
                 .on_click(toggle(this, key.clone()));
             lane(8., button).into_any_element()
         }
+        Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
+        Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
     }
 }
 

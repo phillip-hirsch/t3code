@@ -42,6 +42,7 @@ mod model_picker;
 mod pages;
 mod palette;
 mod preview;
+mod queue;
 mod quit;
 mod right_panel;
 mod send;
@@ -214,6 +215,7 @@ pub struct Workspace {
     /// Thread notifications: toasts, OS notifications and sounds.
     alerts: alerts::AlertState,
     quit: quit::QuitState,
+    queue: queue::QueueUi,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -332,6 +334,7 @@ impl Workspace {
             terminals: terminal::Terminals::default(),
             alerts: Default::default(),
             quit: Default::default(),
+            queue: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -635,6 +638,7 @@ impl Workspace {
                 }
                 this.refresh_rows(cx);
                 this.sync_question(window, cx);
+                this.sync_queue_edit(window, cx);
                 this.observe_proactive_panels(cx);
             },
         ));
@@ -674,10 +678,11 @@ impl Workspace {
 
     /// Rebuilds the timeline and tells the scroller which rows changed.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
-        let new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
+        let mut new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
             Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
             None => Vec::new(),
         };
+        new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
@@ -890,6 +895,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| this.undo_thread_action(cx)))
             .on_action(cx.listener(|this, _: &preview::TogglePreview, window, cx| this.toggle_preview(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| this.toggle_right_panel(window, cx)))
+            .on_action(cx.listener(Self::on_steer_queued))
+            .on_action(cx.listener(Self::on_edit_queued))
             .map(|el| self.on_terminal_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {

@@ -78,6 +78,16 @@ pub enum Row {
         key: SharedString,
         expanded: bool,
     },
+    /// A queued follow-up, after the timeline (`QueuedRunsControl`).
+    Queued {
+        message: Rc<crate::queue::QueuedMessage>,
+        last: bool,
+    },
+    /// "Show all N queued" under a long queue.
+    QueueToggle {
+        total: usize,
+        expanded: bool,
+    },
 }
 
 /// An `html_render` page or an MCP app's attachment (`htmlRenderFromToolItem`, `mcpAppFromToolItem`).
@@ -1364,6 +1374,8 @@ mod tests {
                 Row::Subagent(card) => format!("subagent {}", card.title),
                 Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
                 Row::Embed(embed) => format!("embed {}", embed.title),
+                Row::Queued { message, .. } => format!("queued {}", message.text),
+                Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
             })
             .collect()
     }
