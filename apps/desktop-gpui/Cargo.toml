@@ -101,7 +101,7 @@ keyring-core = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
-# The Dock badge and reduced motion through AppKit's safe bindings; GPUI already builds these crates.
+# The Dock badge and SnapShots' reduced motion through AppKit's safe bindings; GPUI already builds these crates.
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "std",
   "NSAccessibility",
@@ -111,6 +111,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSWorkspace",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# SnapShots' modifier-pair shortcut reads the modifier keys' state.
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGEventSource", "CGEventTypes"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
