@@ -8,6 +8,7 @@
 
 mod editor;
 mod logic;
+mod webhook_logic;
 mod webhooks;
 mod worktree_mode;
 
@@ -207,12 +208,13 @@ impl ScheduledTasksView {
         let view = cx.entity();
         let menu_task = Rc::new(task.clone());
         let client = client.clone();
+        let context = self.workspace.upgrade().map(|w| webhooks::WebhookContext::new(client.clone(), &w, cx));
         let menu = Button::new(SharedString::from(format!("scheduled-task-actions-{id}")))
             .ghost()
             .small()
             .icon(Icon::new(Lucide::Ellipsis))
             .disabled(busy)
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, cx| {
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
                 let task = menu_task.clone();
                 let edit = {
                     let (view, task) = (view.clone(), task.clone());
@@ -232,7 +234,10 @@ impl ScheduledTasksView {
                 };
                 let mut menu = menu.item(PopupMenuItem::new("Edit").icon(Icon::new(Lucide::Pencil)).on_click(edit));
                 menu = if webhook {
-                    webhooks::render_webhook_task_extras(menu, &task, &client, window, cx)
+                    match &context {
+                        Some(context) => webhooks::webhook_menu_item(menu, context, &task.to_json()),
+                        None => menu,
+                    }
                 } else {
                     menu.item(PopupMenuItem::new("Run now").icon(Icon::new(Lucide::Play)).on_click(act(Action::RunNow)))
                 };

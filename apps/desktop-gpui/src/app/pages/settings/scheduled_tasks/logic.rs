@@ -12,7 +12,7 @@ use crate::model::{ModelSelection, ProjectShell, ServerInfo};
 
 /// `ScheduledTask` (`packages/contracts/src/scheduledTask.ts`). The schedule, workspace
 /// strategy and model selection stay raw so a save sends back what it did not edit.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ScheduledTask {
     pub id: String,
@@ -33,8 +33,7 @@ pub(super) struct ScheduledTask {
     pub last_run_status: String,
     #[serde(default)]
     pub last_run_error: Option<String>,
-    /// `ScheduledTaskWebhookEndpoint`, on webhook tasks; read by the webhook port (`webhooks.rs`).
-    #[allow(dead_code)]
+    /// `ScheduledTaskWebhookEndpoint`, on webhook tasks.
     #[serde(default)]
     pub webhook: Option<Value>,
     #[serde(default)]
@@ -42,6 +41,11 @@ pub(super) struct ScheduledTask {
 }
 
 impl ScheduledTask {
+    /// The task as the server sent it, for the webhook and worktree fields.
+    pub fn to_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+
     pub fn schedule(&self) -> Schedule {
         Schedule::of(&self.schedule)
     }

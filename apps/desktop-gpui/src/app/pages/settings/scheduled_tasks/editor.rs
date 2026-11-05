@@ -22,7 +22,8 @@ use super::logic::{
     self, DraftError, DraftState, MIN_INTERVAL_MS, Schedule, ScheduleMode, ScheduledTask, WEEKDAY_LABELS,
     WEEKDAY_ORDER, WEEKDAY_SHORT, WorkspaceMode,
 };
-use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookFields};
+use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
+use super::worktree_mode::{self, NewWorktreeMode};
 use super::{ScheduledTasksView, chevron, error_message, notify_error, pick_model_control, select_trigger};
 use crate::app::Workspace;
 use crate::model::{ModelSelection, ProjectShell};
@@ -62,6 +63,9 @@ pub(super) struct TaskEditor {
     time_of_day: Entity<TimeFieldState>,
     run_at: Entity<DatePickerState>,
     webhook: Entity<WebhookFields>,
+    worktree: Entity<NewWorktreeMode>,
+    /// The stored task last handed to `webhook`, so a list refresh reaches it once.
+    webhook_task: Option<Value>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,7 +110,16 @@ impl TaskEditor {
             }
             state
         });
-        let webhook = cx.new(|cx| WebhookFields::new(task.as_ref(), window, cx));
+        let task_json = task.as_ref().map(ScheduledTask::to_json);
+        let context = match workspace.upgrade() {
+            Some(workspace) => WebhookContext::new(client.clone(), &workspace, cx),
+            None => unreachable!("the editor opens from a live workspace"),
+        };
+        let webhook = cx.new(|cx| WebhookFields::new(context, task_json.clone(), window, cx));
+        let cwd = workspace.upgrade().and_then(|w| {
+            w.read(cx).shell.projects.iter().find(|p| p.id == draft.project_id).map(|p| p.workspace_root.clone())
+        });
+        let worktree = cx.new(|cx| NewWorktreeMode::new(client.clone(), cwd, task_json.as_ref(), window, cx));
         let on_text = |field: fn(&mut DraftState) -> &mut String| {
             move |this: &mut Self,
                   state: &Entity<InputState>,
@@ -151,6 +164,8 @@ impl TaskEditor {
             time_of_day,
             run_at,
             webhook,
+            worktree,
+            webhook_task: task_json,
             _subscriptions: subscriptions,
         }
     }
@@ -158,6 +173,28 @@ impl TaskEditor {
     /// The tasks the list has loaded; `None` while it loads or failed.
     fn loaded_tasks(&self, cx: &App) -> Option<Rc<Vec<ScheduledTask>>> {
         self.list.upgrade()?.read(cx).loaded_tasks()
+    }
+
+    fn set_saving(&mut self, saving: bool, cx: &mut Context<Self>) {
+        self.saving = saving;
+        self.webhook.update(cx, |fields, cx| fields.set_disabled(saving, cx));
+        self.worktree.update(cx, |mode, cx| mode.set_disabled(saving, cx));
+    }
+
+    fn sync_worktree_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.workspace.upgrade().and_then(|w| {
+            w.read(cx).shell.projects.iter().find(|p| p.id == self.draft.project_id).map(|p| p.workspace_root.clone())
+        });
+        self.worktree.update(cx, |mode, cx| mode.set_project(cwd, window, cx));
+    }
+
+    /// Hands a refreshed copy of the edited task to the webhook fields (its URL and stored secret).
+    fn sync_webhook_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let live = self.live_task(cx).map(|task| task.to_json());
+        if live.is_some() && live != self.webhook_task {
+            self.webhook_task = live.clone();
+            self.webhook.update(cx, |fields, cx| fields.set_task(live, window, cx));
+        }
     }
 
     /// The stored version of the task being edited, as the list last saw it.
@@ -255,15 +292,15 @@ impl TaskEditor {
                 cx,
             );
         }
-        let live = self.live_task(cx);
         let schedule = if draft.schedule_mode == ScheduleMode::Webhook {
-            let webhook = self.webhook.read(cx);
-            if let Some(error) = webhook.errors().into_iter().next() {
-                return fail(error, window, cx);
-            }
-            match webhook.schedule(live.as_ref()) {
+            match self.webhook.read(cx).schedule(cx) {
                 Ok(schedule) => schedule,
-                Err(error) => return fail(error, window, cx),
+                Err(errors) => {
+                    for error in errors {
+                        fail(DraftError::new(error.title, error.description), window, cx);
+                    }
+                    return;
+                }
             }
         } else {
             match logic::schedule_from_draft(&draft, &Local) {
@@ -316,11 +353,7 @@ impl TaskEditor {
             WorkspaceMode::ExistingWorktree => {
                 json!({"type": "existing_worktree", "worktreePath": draft.existing_worktree_path.trim()})
             }
-            WorkspaceMode::Worktree => json!({
-                "type": "worktree",
-                "baseRef": if draft.base_ref.trim().is_empty() { "main" } else { draft.base_ref.trim() },
-                "startFromOrigin": draft.start_from_origin,
-            }),
+            WorkspaceMode::Worktree => self.worktree.read(cx).strategy(),
         };
         let mut input = json!({
             "title": draft.title.trim(),
@@ -340,13 +373,13 @@ impl TaskEditor {
             input["requireExisting"] = json!(true);
         }
         self.submission_pending = true;
-        self.saving = true;
+        self.set_saving(true, cx);
         cx.notify();
         let client = self.client.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("scheduledTasks.upsert", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.saving = false;
+                this.set_saving(false, cx);
                 match result {
                     Ok(_) => window.close_dialog(cx),
                     Err(error) => {
@@ -368,6 +401,7 @@ impl TaskEditor {
 
 impl Render for TaskEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_webhook_task(window, cx);
         let t = *theme::tokens(cx);
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let editor = cx.entity();
@@ -377,7 +411,6 @@ impl Render for TaskEditor {
         let projects = self.projects(cx);
         let project = self.selected_project(cx);
         let selection = self.active_selection(cx);
-        let live = self.live_task(cx);
         let (offers_once, denial, env_label, machine, destination) = {
             let workspace = workspace.read(cx);
             let info = &workspace.server_info;
@@ -438,8 +471,9 @@ impl Render for TaskEditor {
                         };
                         let id = id.clone();
                         menu = menu.item(PopupMenuItem::new(label).checked(id == selected_project_id).on_click(
-                            window.listener_for(&editor, move |this: &mut TaskEditor, _, _, cx| {
+                            window.listener_for(&editor, move |this: &mut TaskEditor, _, window, cx| {
                                 this.draft.project_id = id.clone();
+                                this.sync_worktree_project(window, cx);
                                 cx.notify();
                             }),
                         ));
@@ -514,7 +548,7 @@ impl Render for TaskEditor {
         let schedule_fields: AnyElement = match mode {
             ScheduleMode::Webhook if denial.is_some() && draft.enabled => div().into_any_element(),
             ScheduleMode::Webhook => {
-                webhooks::render_webhook_fields(&self.webhook, live.as_ref(), &self.client, window, cx)
+                webhooks::render_webhook_fields(&self.webhook).into_any_element()
             }
             ScheduleMode::Once => inline(&t)
                 .child(label("Run on", &t))
@@ -578,8 +612,7 @@ impl Render for TaskEditor {
         let editing = draft.editing_id.is_some();
         let enabled = draft.enabled;
         let new_worktree = (workspace_mode == WorkspaceMode::Worktree)
-            .then(|| super::worktree_mode::render_new_worktree_mode(self, window, cx))
-            .flatten();
+            .then(|| worktree_mode::render_new_worktree_mode(&self.worktree).into_any_element());
         let draft = &self.draft;
         let panel_max_h = (window.viewport_size().height - px(240.)).max(px(200.));
 
