@@ -525,6 +525,12 @@ pub(in crate::app) fn device_only(section: &str) -> bool {
 }
 
 impl Workspace {
+    /// The key of view state the settings environment owns (its reads, streams and inputs), so
+    /// each environment keeps its own and a scope switch never shows one's on another.
+    pub(in crate::app) fn settings_state_key(&self, name: &str) -> SharedString {
+        format!("{name}:{}", self.settings_environment().as_deref().unwrap_or_default()).into()
+    }
+
     pub(in crate::app) fn settings_view(&self) -> SettingsView {
         let groups = self.settings_project_groups();
         let scope_groups: Vec<scope::Group> = groups

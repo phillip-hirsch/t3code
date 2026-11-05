@@ -74,7 +74,8 @@ struct SourceRow {
 
 impl Workspace {
     pub(in crate::app) fn render_device_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let sources = window.use_keyed_state("device-sources", cx, |_, _| DeviceSources::default());
+        let sources =
+            window.use_keyed_state(self.settings_state_key("device-sources"), cx, |_, _| DeviceSources::default());
         let t = *tokens(cx);
         let settings = &self.settings_info().settings;
         let enabled = settings.bool("enableDeviceSupport");

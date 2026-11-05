@@ -66,7 +66,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let state = window.use_keyed_state("usage-sources", cx, |_, _| UsageSourcesState::default());
+        let state =
+            window.use_keyed_state(self.settings_state_key("usage-sources"), cx, |_, _| UsageSourcesState::default());
         let sources = self.settings_info().settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
         let cursor_enabled = self.settings_info().settings["cursorKeychainUsageEnabled"].as_bool() == Some(true);
         let darwin = self.settings_info().platform_os.as_deref() == Some("darwin");
