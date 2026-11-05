@@ -165,11 +165,19 @@ impl Workspace {
         });
     }
 
-    /// `server.getUsageSummary` for the current window. A refresh re-reads model prices first
-    /// (`server.refreshUsageRates`); an answer with slow sources still scanning is shown, then
+    /// `server.getUsageSummary` for the current window on every connected machine, combined so a
+    /// directory several machines read counts once. A refresh re-reads model prices first
+    /// (`server.refreshUsageRates`); answers with slow sources still scanning are shown, then
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let machines: Vec<(String, crate::rpc::RpcClient)> = self
+            .sessions()
+            .iter()
+            .filter_map(|session| Some((session.id.as_ref()?.to_string(), session.client.clone()?)))
+            .collect();
+        if machines.is_empty() {
+            return;
+        }
         let usage = &mut self.usage;
         usage.generation += 1;
         let generation = usage.generation;
@@ -178,26 +186,47 @@ impl Workspace {
         let input = window.to_json();
         cx.spawn(async move |this, cx| {
             if refresh_rates {
-                let _ = client.request("server.refreshUsageRates", json!({})).await;
+                let refreshes =
+                    machines.iter().map(|(_, client)| client.request("server.refreshUsageRates", json!({})));
+                futures::future::join_all(refreshes).await;
             }
             let mut input = input;
             for attempt in 0..2 {
-                let result = client.request("server.getUsageSummary", input.clone()).await;
+                let reads = machines.iter().map(|(id, client)| {
+                    let input = input.clone();
+                    async move { (id.clone(), client.request("server.getUsageSummary", input).await) }
+                });
+                let results = futures::future::join_all(reads).await;
                 let mut again = false;
                 let applied = this.update(cx, |this, cx| {
                     let usage = &mut this.usage;
                     if usage.generation != generation {
                         return;
                     }
-                    match result.map(serde_json::from_value::<Summary>) {
-                        Ok(Ok(summary)) => {
-                            again = attempt == 0 && summary.refreshing();
+                    // A machine that fails to answer leaves the others' usage showing.
+                    let mut answers = Vec::new();
+                    let mut failure = None;
+                    for (environment_id, result) in results {
+                        match result.map(serde_json::from_value::<Summary>) {
+                            Ok(Ok(summary)) => answers.push(logic::EnvironmentUsage { environment_id, summary }),
+                            Ok(Err(error)) => {
+                                failure.get_or_insert_with(|| format!("Unreadable usage summary: {error}"));
+                            }
+                            Err(error) => {
+                                failure.get_or_insert_with(|| usage_error(&error));
+                            }
+                        }
+                    }
+                    again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
+                    let answered = !answers.is_empty();
+                    match (logic::combine(answers), failure) {
+                        (Some(summary), _) => {
                             usage.error = None;
                             usage.summary = Some((Rc::new(summary), window.clone()));
                             this.remerge_usage();
                         }
-                        Ok(Err(error)) => this.usage.error = Some(format!("Unreadable usage summary: {error}").into()),
-                        Err(error) => this.usage.error = Some(usage_error(&error).into()),
+                        (None, Some(failure)) if !answered => usage.error = Some(failure.into()),
+                        (None, _) => {}
                     }
                     this.usage.loading = again;
                     if !again {

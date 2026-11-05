@@ -107,6 +107,20 @@ pub struct Bucket {
 pub struct Fingerprint {
     pub provider: String,
     pub resolved_home_path: String,
+    /// With `volume_id`, tells apart machines sharing a host name and home path.
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub volume_id: Option<String>,
+}
+
+impl Fingerprint {
+    /// `fingerprintKey`: one usage directory, whichever machine read it.
+    fn key(&self) -> String {
+        let host = self.host_id.as_deref().unwrap_or_default();
+        let volume = self.volume_id.as_deref().unwrap_or_default();
+        format!("{host} {} {} {volume}", self.provider, self.resolved_home_path)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -131,6 +145,9 @@ pub struct Source {
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
     pub contract_version: f64,
+    /// When the server read its sources; the newest read of a shared directory counts it.
+    #[serde(default)]
+    pub read_at: Option<String>,
     #[serde(deserialize_with = "forward_compatible")]
     pub buckets: Vec<Bucket>,
     #[serde(deserialize_with = "forward_compatible")]
@@ -285,6 +302,51 @@ pub struct Merged {
 
 /// `mergeUsage` for one environment, without `hidden` providers: each scanned source counts its
 /// buckets and distinct sessions once (bucket session counts double-count sessions spanning days).
+/// One machine's answer to `server.getUsageSummary`.
+pub struct EnvironmentUsage {
+    pub environment_id: String,
+    pub summary: Summary,
+}
+
+/// `claimSources` and `ownedContribution` of `mergeUsage`: every machine's answer as one summary
+/// in which a usage directory read by several machines counts once, for the newest healthy read.
+/// Incompatible answers are left out. The web's top-up from newer partial scans is not ported.
+pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
+    let mut current: Vec<EnvironmentUsage> = environments.into_iter().filter(|e| e.summary.compatible()).collect();
+    if current.is_empty() {
+        return None;
+    }
+    let read_at = |e: &EnvironmentUsage| e.summary.read_at.as_deref().and_then(crate::inbox::parse_ms).unwrap_or(0);
+    current.sort_by(|a, b| read_at(b).cmp(&read_at(a)).then_with(|| a.environment_id.cmp(&b.environment_id)));
+    let mut owners: HashMap<String, usize> = HashMap::new();
+    for status in ["ok", "partial", "failed"] {
+        for (index, environment) in current.iter().enumerate() {
+            for source in environment.summary.sources.iter().filter(|s| s.status == status) {
+                owners.entry(source.fingerprint.key()).or_insert(index);
+            }
+        }
+    }
+    let mut combined =
+        Summary { contract_version: CONTRACT_VERSION, read_at: None, buckets: Vec::new(), sources: Vec::new() };
+    for (index, environment) in current.into_iter().enumerate() {
+        let Summary { buckets, sources, .. } = environment.summary;
+        let owned: Vec<Source> = sources
+            .into_iter()
+            .filter(|s| s.status != "missing" && owners.get(&s.fingerprint.key()) == Some(&index))
+            .collect();
+        let owned_provider = |provider: &str| owned.iter().any(|s| s.fingerprint.provider == provider);
+        let owned_path = |provider: &str, path: &str| {
+            owned.iter().any(|s| s.fingerprint.provider == provider && s.fingerprint.resolved_home_path == path)
+        };
+        combined.buckets.extend(buckets.into_iter().filter(|bucket| match &bucket.source_path {
+            None => owned_provider(&bucket.provider),
+            Some(path) => owned_path(&bucket.provider, path),
+        }));
+        combined.sources.extend(owned);
+    }
+    Some(combined)
+}
+
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
     let mut merged = Merged::default();
     if !summary.compatible() {
@@ -1511,6 +1573,34 @@ mod tests {
             "totals": {"uncachedInputTokens": 10, "cachedInputTokens": 0, "cacheCreationTokens": 0, "outputTokens": output, "reasoningTokens": 0},
             "costUsd": cost, "cacheSavingsUsd": 0, "costSource": "modelPriced", "records": 2, "unpricedRecords": 0, "sessions": 9,
         })
+    }
+
+    #[test]
+    fn a_directory_two_machines_read_counts_once_for_the_newest_read() {
+        let summary = |read_at: &str, host: &str, cost: f64| -> Summary {
+            serde_json::from_value(json!({
+                "contractVersion": CONTRACT_VERSION, "readAt": read_at,
+                "buckets": [{"day": "2026-11-01", "provider": "codex", "model": "m", "sourcePath": "/home/me/.codex",
+                    "totals": {"uncachedInputTokens": 1, "cachedInputTokens": 0, "cacheCreationTokens": 0, "outputTokens": 1},
+                    "costUsd": cost, "records": 1}],
+                "sources": [{"fingerprint": {"provider": "codex", "resolvedHomePath": "/home/me/.codex", "hostId": host},
+                    "status": "ok", "distinctSessions": 2}],
+            }))
+            .unwrap()
+        };
+        let usage = |id: &str, summary: Summary| EnvironmentUsage { environment_id: id.into(), summary };
+        let shared = combine(vec![
+            usage("old", summary("2026-11-01T00:00:00Z", "box", 1.)),
+            usage("new", summary("2026-11-02T00:00:00Z", "box", 2.)),
+        ])
+        .unwrap();
+        assert_eq!((shared.buckets.len(), shared.buckets[0].cost_usd, shared.sources.len()), (1, 2., 1));
+        let separate = combine(vec![
+            usage("a", summary("2026-11-01T00:00:00Z", "box-a", 1.)),
+            usage("b", summary("2026-11-01T00:00:00Z", "box-b", 2.)),
+        ])
+        .unwrap();
+        assert_eq!(merge(&separate, &[]).sessions, 4, "different machines both count");
     }
 
     fn source(provider: &str, status: &str, sessions: u64) -> Value {
