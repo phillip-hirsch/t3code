@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 
-/// `MIN_MAIN_WINDOW_SIZE`; smaller saved bounds are ignored.
-pub const MIN_WINDOW_SIZE: (i32, i32) = (840, 620);
+/// `MIN_MAIN_WINDOW_SIZE`, small enough for half- and third-screen tiles; smaller saved bounds
+/// are ignored.
+pub const MIN_WINDOW_SIZE: (i32, i32) = (400, 360);
 /// `DEFAULT_MAIN_WINDOW_SIZE`.
 pub const DEFAULT_WINDOW_SIZE: (i32, i32) = (1100, 780);
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
@@ -268,8 +269,13 @@ mod tests {
         assert_eq!(settings.wsl_distro, None);
         // The legacy `wslMode` still turns the WSL backend on.
         assert!(settings.wsl_backend_enabled);
-        let small = json!({ "mainWindowBounds": { "x": 0, "y": 0, "width": 800, "height": 900 } });
-        assert_eq!(DesktopSettings::from_document(&small).main_window_bounds, None);
+        let bounds = |width: i32, height: i32| {
+            let document = json!({ "mainWindowBounds": { "x": 0, "y": 0, "width": width, "height": height } });
+            DesktopSettings::from_document(&document).main_window_bounds
+        };
+        assert_eq!(bounds(400, 360), Some(WindowRect { x: 0, y: 0, width: 400, height: 360 }));
+        assert_eq!(bounds(399, 360), None);
+        assert_eq!(bounds(400, 359), None);
     }
 
     #[test]

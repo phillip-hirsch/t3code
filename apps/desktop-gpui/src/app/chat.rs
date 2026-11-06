@@ -385,10 +385,12 @@ impl Workspace {
     ) -> AnyElement {
         let (lane, _) = self.chat_layout(window);
         let headline = self.render_draft_headline(project_id, lane.width, window, cx);
+        // `[@media(max-height:34rem)]:items-end`: short windows pin the composer to the bottom.
+        let short = f32::from(window.viewport_size().height) <= 544.;
         div()
             .size_full()
             .flex()
-            .items_center()
+            .map(|el| if short { el.items_end() } else { el.items_center() })
             .child(
                 div()
                     .relative()
@@ -428,6 +430,8 @@ impl Workspace {
         // Tailwind's `sm` and `lg` breakpoints, in CSS px.
         let title_size = if viewport >= 640. { rems(1.875) } else { rems(1.5) };
         let lg = viewport >= 1024.;
+        // `[@media(max-height:28rem)]`: very short windows keep only the project name.
+        let terse = f32::from(window.viewport_size().height) <= 448.;
         let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
             inline_button("draft-project-picker", label, t.foreground, t.foreground)
                 .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
@@ -439,7 +443,10 @@ impl Workspace {
         let heading = match project.filter(|_| !is_scratch) {
             Some(project) => {
                 let name = project.title.clone();
-                if lg && heading_fits_inline(&name, width, window) {
+                if terse {
+                    let size = if lg && heading_fits_inline(&name, width, window) { title_size } else { rems(1.) };
+                    title(h_flex()).text_size(size).child(picker(name.clone().into(), Some(name.into()), cx))
+                } else if lg && heading_fits_inline(&name, width, window) {
                     title(h_flex().gap(rems(0.5))).child(div().flex_none().child("What should we build in")).child(
                         h_flex()
                             .min_w_0()

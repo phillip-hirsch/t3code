@@ -30,6 +30,7 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         None => cx.set_global(PrimaryBackend::start(crate::runtime().handle())),
     }
     let (x, y) = super::TRAFFIC_LIGHTS;
+    let (min_width, min_height) = desktop::settings::MIN_WINDOW_SIZE;
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("T3 Code".into()),
@@ -37,7 +38,7 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
             traffic_light_position: Some(point(px(x), px(y))),
         }),
         window_bounds: Some(cx.global::<Desktop>().window_bounds(cx)),
-        window_min_size: Some(size(px(840.), px(620.))),
+        window_min_size: Some(size(px(min_width as f32), px(min_height as f32))),
         window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
         // Linux docks group the window under its desktop entry by this id (Wayland `app_id`, X11 `WM_CLASS`).
         app_id: Some(desktop::APP_ID.to_owned()),
