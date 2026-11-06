@@ -385,6 +385,12 @@ impl Workspace {
             .bg(t.popover)
             .shadow_lg()
             .children(body);
-        Some(deferred(anchored().snap_to_window_with_margin(px(8.)).child(popup)).with_priority(1).into_any_element())
+        // Above the comment popover it may open from.
+        let priority = gpui_kit::base::POPUP_PRIORITY + 1;
+        Some(
+            deferred(anchored().snap_to_window_with_margin(px(8.)).child(popup))
+                .with_priority(priority)
+                .into_any_element(),
+        )
     }
 }
