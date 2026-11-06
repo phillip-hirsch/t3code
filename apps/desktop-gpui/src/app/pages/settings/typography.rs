@@ -1,18 +1,23 @@
 //! The Appearance page's Typography section (`TypographySettings.tsx`).
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::diff::{Diff, DiffFile, DiffHunkSeparator, DiffState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
-use gpui_kit::component::{IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Hsla, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative, rems, rgb,
 };
 use serde_json::{Map, Value, json};
 
 use super::widgets::{SettingRow, settings_section, switch};
 use crate::app::Workspace;
+use crate::app::git::{self, DiffColorScheme};
 use crate::app::pages::settings::widgets::SettingsView;
+use crate::app::right_panel::DiffTint;
+use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS, Fonts, Tokens};
 
@@ -81,9 +86,6 @@ struct FontRow {
     monospace: bool,
     previews: &'static [Preview],
 }
-
-const PROMPT_PREVIEW_TEXT: &str = "Use $frontend-design to fix the flaky test in surface.test.ts and align the header \
-     with SettingsPanels.tsx before shipping.";
 
 impl Workspace {
     /// `TypographySection`: one interface and one monospace font, or all four set separately.
@@ -227,7 +229,10 @@ impl Workspace {
         let reset = (!family.is_empty() || size != size_default)
             .then(|| json!({ row.family_key: "", row.size_key: size_default }));
         let fonts = t.fonts;
-        let previews = v_flex().children(row.previews.iter().map(|preview| render_preview(*preview, &fonts, &t)));
+        let diff = self.settings_ui.diff_preview.get_or_insert_with(|| diff_preview_state(cx)).clone();
+        let scheme = DiffColorScheme::from_settings(&self.client_settings.values);
+        let previews =
+            v_flex().children(row.previews.iter().map(|preview| render_preview(*preview, &fonts, &t, &diff, scheme)));
         let setting = match row.title {
             Some(title) => SettingRow::titled(row.id, title),
             None => SettingRow::new(row.id),
@@ -291,7 +296,13 @@ impl Workspace {
 }
 
 /// `PromptFontPreview`, `CodeFontPreview` and `TerminalFontPreview`, as static samples.
-fn render_preview(preview: Preview, fonts: &Fonts, t: &Tokens) -> AnyElement {
+fn render_preview(
+    preview: Preview,
+    fonts: &Fonts,
+    t: &Tokens,
+    diff: &Entity<DiffState>,
+    scheme: DiffColorScheme,
+) -> AnyElement {
     let frame = || div().mt(px(4.)).mb(px(8.)).rounded(px(8.)).border_1().border_color(t.border).overflow_hidden();
     match preview {
         Preview::Prompt => frame()
@@ -302,89 +313,218 @@ fn render_preview(preview: Preview, fonts: &Fonts, t: &Tokens) -> AnyElement {
             .text_size(px(fonts.prompt_size))
             .line_height(relative(1.5))
             .text_color(t.foreground)
-            .child(PROMPT_PREVIEW_TEXT)
+            .child(prompt_preview(t))
             .into_any_element(),
         Preview::Code => {
-            let line = |sign: char, text: &'static str| {
-                let tint: Option<Hsla> = match sign {
-                    '+' => Some(t.success_foreground.opacity(0.12)),
-                    '-' => Some(t.error_foreground.opacity(0.12)),
-                    _ => None,
-                };
-                h_flex()
-                    .px(px(12.))
-                    .gap(px(12.))
-                    .whitespace_nowrap()
-                    .when_some(tint, gpui_kit::Styled::bg)
-                    .child(div().w(px(8.)).text_color(t.muted_foreground).child(sign.to_string()))
-                    .child(text)
-            };
-            frame()
-                .py(px(6.))
-                .bg(if t.dark { t.input.opacity(0.32) } else { t.secondary })
-                .font_family(fonts.mono)
+            // `render_diff` sizes rows from the rem and the code font; its file header is a 20px
+            // button inside 4px padding over a 1px border.
+            let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
+            let preview = Diff::new(diff)
+                .hunk_separator(DiffHunkSeparator::LineInfo)
+                .h(px(29. + row * DIFF_PREVIEW_ROWS))
                 .text_size(px(fonts.code_size))
-                .line_height(relative(1.6))
-                .text_color(t.foreground)
-                .child(div().px(px(12.)).pb(px(4.)).text_color(t.muted_foreground).child("src/formatUser.ts"))
-                .child(line(' ', "export function formatUser(user: User) {"))
-                .child(line('-', "  return user.name.toUpperCase();"))
-                .child(line('+', "  return `${user.name} <${user.email}>`; // 0O 1lI"))
-                .child(line(' ', "}"))
-                .into_any_element()
+                .into_any_element();
+            let preview = match scheme {
+                DiffColorScheme::RedGreen => preview,
+                DiffColorScheme::BlueOrange => DiffTint {
+                    child: preview,
+                    colors: (git::addition_color(t, scheme), git::deletion_color(t, scheme)),
+                }
+                .into_any_element(),
+            };
+            frame().child(preview).into_any_element()
         }
-        Preview::Terminal => {
-            let (green, cyan, blue, red, yellow, dim) = (
-                t.success_foreground,
-                t.info_foreground,
-                t.indigo_foreground,
-                t.error_foreground,
-                t.warning_foreground,
-                t.muted_foreground,
-            );
-            let prompt: [(&'static str, Option<Hsla>); 7] = [
-                ("→ ", Some(green)),
-                ("t3code ", Some(cyan)),
-                ("git:(", Some(blue)),
-                ("main", Some(red)),
-                (") ", Some(blue)),
-                ("✗ ", Some(yellow)),
-                ("", None),
-            ];
-            let lines: Vec<Vec<(&'static str, Option<Hsla>)>> = vec![
-                prompt.iter().copied().chain([("vpr dev", None)]).collect(),
-                vec![],
-                vec![("  VITE ", Some(green)), ("v7.1.1  ", Some(green)), ("ready in ", Some(dim)), ("1.24s", None)],
-                vec![],
-                vec![("  →  ", Some(green)), ("Local:    ", Some(dim)), ("http://127.0.0.1:5173/", Some(cyan))],
-                vec![("  →  ", Some(green)), ("Network:  ", Some(dim)), ("http://192.168.1.24:5173/", Some(cyan))],
-                vec![],
-                vec![("  ✓ 85 passed   ", Some(green)), ("△ 2 warnings   ", Some(yellow)), ("✗ 0 failed", Some(red))],
-                vec![],
-                vec![
-                    ("  READY ", Some(green)),
-                    ("watching for changes, press ", Some(dim)),
-                    ("q", None),
-                    (" to quit", Some(dim)),
-                ],
-                vec![],
-                prompt.to_vec(),
-            ];
-            frame()
-                .p(px(4.))
-                .bg(if t.dark { t.background } else { t.card })
-                .font_family(fonts.terminal)
-                .text_size(px(fonts.terminal_size))
-                .line_height(px((fonts.terminal_size * 1.35).round()))
-                .text_color(t.foreground)
-                .children(lines.into_iter().map(|segments| {
-                    h_flex().whitespace_nowrap().min_h(px((fonts.terminal_size * 1.35).round())).children(
-                        segments
-                            .into_iter()
-                            .map(|(text, color)| div().when_some(color, gpui_kit::Styled::text_color).child(text)),
-                    )
-                }))
-                .into_any_element()
+        Preview::Terminal => terminal_preview(fonts, t),
+    }
+}
+
+/// `DIFF_PREVIEW_PATCH`: one file, one hunk.
+const DIFF_PREVIEW_PATCH: &str = "diff --git a/src/formatUser.ts b/src/formatUser.ts
+--- a/src/formatUser.ts
++++ b/src/formatUser.ts
+@@ -1,3 +1,3 @@
+ export function formatUser(user: User) {
+-  return user.name.toUpperCase();
++  return `${user.name} <${user.email}>`; // 0O 1lI
+ }
+";
+
+/// The patch's rows in the unified layout.
+const DIFF_PREVIEW_ROWS: f32 = 4.;
+
+/// The code preview's diff, parsed once.
+pub(super) fn diff_preview_state(cx: &mut App) -> Entity<DiffState> {
+    let files = DiffFile::parse(DIFF_PREVIEW_PATCH).unwrap_or_default();
+    cx.new(|cx| DiffState::new(files, cx))
+}
+
+/// One piece of `PROMPT_PREVIEW_TEXT` as the composer shows it.
+enum PromptPiece {
+    Text(&'static str),
+    Skill(&'static str),
+    File(&'static str),
+}
+
+/// `PROMPT_PREVIEW_TEXT`, with its `$frontend-design` skill and two Markdown file links.
+const PROMPT_PREVIEW: &[PromptPiece] = &[
+    PromptPiece::Text("Use "),
+    PromptPiece::Skill("frontend-design"),
+    PromptPiece::Text(" to fix the flaky test in "),
+    PromptPiece::File("apps/web/src/terminal/ghostty/surface.test.ts"),
+    PromptPiece::Text(" and align the header with "),
+    PromptPiece::File("apps/web/src/components/settings/SettingsPanels.tsx"),
+    PromptPiece::Text(" before shipping."),
+];
+
+/// The prompt, wrapping word by word, with the composer's chips (`ContextChip`: a 1em icon,
+/// a 0.2em gap and a medium label in the kind's accent).
+fn prompt_preview(t: &Tokens) -> impl IntoElement {
+    let chip = |icon: Icon, accent: Hsla, label: &'static str| {
+        h_flex()
+            .gap(rems(0.2))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(accent)
+            .child(icon.size(rems(1.)).flex_none())
+            .child(label)
+            .into_any_element()
+    };
+    let mut words: Vec<AnyElement> = Vec::new();
+    for piece in PROMPT_PREVIEW {
+        match piece {
+            PromptPiece::Text(text) => {
+                words.extend(text.split_inclusive(' ').map(|word| div().child(word).into_any_element()));
+            }
+            PromptPiece::Skill(name) => words.push(chip(Icon::new(IconName::Box), rgb(0xb261be).into(), name)),
+            PromptPiece::File(path) => {
+                let (asset, color) = crate::file_icons::file_icon(path, t.dark);
+                let name = path.rsplit('/').next().unwrap_or(path);
+                words.push(chip(Icon::empty().path(asset).text_color(color), rgb(0x0096af).into(), name));
+            }
         }
     }
+    h_flex().flex_wrap().items_center().whitespace_nowrap().children(words)
+}
+
+/// A styled stretch of the terminal transcript (its SGR attributes).
+#[derive(Clone, Copy)]
+struct Run {
+    text: &'static str,
+    color: Option<Hsla>,
+    bold: bool,
+    underline: bool,
+    background: Option<Hsla>,
+}
+
+const fn plain(text: &'static str) -> Run {
+    Run { text, color: None, bold: false, underline: false, background: None }
+}
+
+const fn tint(text: &'static str, color: Hsla) -> Run {
+    Run { color: Some(color), ..plain(text) }
+}
+
+const fn bold(text: &'static str, color: Option<Hsla>) -> Run {
+    Run { bold: true, color, ..plain(text) }
+}
+
+/// `TERMINAL_PREVIEW_TRANSCRIPT` in the terminal's palette, ending at a block cursor.
+fn terminal_preview(fonts: &Fonts, t: &Tokens) -> AnyElement {
+    let theme = TerminalTheme::new(t);
+    let ansi = |index: usize| theme.palette[index];
+    let (red, green, yellow, blue, cyan) = (ansi(1), ansi(2), ansi(3), ansi(4), ansi(6));
+    // SGR 2, as the terminal grid dims its foreground.
+    let fg = theme.foreground;
+    let faint = gpui_kit::hsla(fg.h, fg.s, fg.l * 0.66, fg.a);
+    let prompt = [
+        bold("→", Some(green)),
+        plain(" "),
+        bold("t3code", Some(cyan)),
+        plain(" "),
+        bold("git:(", Some(blue)),
+        bold("main", Some(red)),
+        bold(")", Some(blue)),
+        plain(" "),
+        bold("✗", Some(yellow)),
+        plain(" "),
+    ];
+    let link = |text| Run { underline: true, ..tint(text, cyan) };
+    let lines: Vec<Vec<Run>> = vec![
+        prompt.iter().copied().chain([plain("vpr dev")]).collect(),
+        vec![],
+        vec![
+            plain("  "),
+            bold("VITE", Some(green)),
+            plain(" "),
+            tint("v7.1.1", green),
+            plain("  "),
+            tint("ready in", faint),
+            plain(" "),
+            bold("1.24s", None),
+        ],
+        vec![],
+        vec![
+            plain("  "),
+            tint("→", green),
+            plain("  "),
+            tint("Local:", faint),
+            plain("    "),
+            link("http://127.0.0.1:5173/"),
+        ],
+        vec![
+            plain("  "),
+            tint("→", green),
+            plain("  "),
+            tint("Network:", faint),
+            plain("  "),
+            link("http://192.168.1.24:5173/"),
+        ],
+        vec![],
+        vec![
+            plain("  "),
+            tint("✓ 85 passed", green),
+            plain("   "),
+            tint("△ 2 warnings", yellow),
+            plain("   "),
+            tint("✗ 0 failed", red),
+        ],
+        vec![],
+        vec![
+            plain("  "),
+            Run { background: Some(green), ..tint(" READY ", ansi(0)) },
+            plain(" "),
+            tint("watching for changes, press", faint),
+            plain(" "),
+            bold("q", None),
+            plain(" "),
+            tint("to quit", faint),
+        ],
+        vec![],
+        prompt.iter().copied().chain([Run { background: Some(theme.cursor), ..plain(" ") }]).collect(),
+    ];
+    let line_height = px((fonts.terminal_size * 1.35).round());
+    div()
+        .mt(px(4.))
+        .mb(px(8.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(t.border)
+        .overflow_hidden()
+        // `CONTENT_PADDING`.
+        .p(px(4.))
+        .bg(theme.background)
+        .font_family(fonts.terminal)
+        .text_size(px(fonts.terminal_size))
+        .line_height(line_height)
+        .text_color(fg)
+        .children(lines.into_iter().map(|runs| {
+            h_flex().whitespace_nowrap().min_h(line_height).children(runs.into_iter().map(|run| {
+                div()
+                    .when_some(run.color, gpui_kit::Styled::text_color)
+                    .when_some(run.background, gpui_kit::Styled::bg)
+                    .when(run.bold, |el| el.font_weight(FontWeight::BOLD))
+                    .when(run.underline, gpui_kit::Styled::underline)
+                    .child(run.text)
+            }))
+        }))
+        .into_any_element()
 }

@@ -182,6 +182,8 @@ pub(in crate::app) struct SettingsUi {
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
     theme_library: theme_library::LibraryUi,
+    /// The Appearance code preview's diff, made on first show.
+    diff_preview: Option<Entity<gpui_kit::component::diff::DiffState>>,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
     focus: FocusHandle,
     focus_on_render: bool,
@@ -218,6 +220,7 @@ impl SettingsUi {
             project_picker: None,
             last_grouping_mode: "repository",
             theme_library: Default::default(),
+            diff_preview: None,
             focus: cx.focus_handle(),
             focus_on_render: false,
             _search_subscription: subscription,

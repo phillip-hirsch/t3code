@@ -10,6 +10,8 @@ mod mouse;
 mod panel;
 mod session;
 
+pub(in crate::app) use self::grid::TerminalTheme;
+
 use std::collections::HashMap;
 
 use gpui_kit::component::button::Button;

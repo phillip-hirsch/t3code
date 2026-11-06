@@ -23,7 +23,7 @@ pub(super) const PADDING: Pixels = px(4.);
 
 /// `terminalThemeFromApp` in `ThreadTerminalDrawer.tsx` over the default theme.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct TerminalTheme {
+pub(in crate::app) struct TerminalTheme {
     pub background: Hsla,
     pub foreground: Hsla,
     pub cursor: Hsla,

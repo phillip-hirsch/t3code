@@ -1908,9 +1908,9 @@ fn turn_diff_offer(checkpoint: Option<&Checkpoint>, is_repo: Option<bool>) -> Di
 
 /// The blue-orange scheme's line colors while the diff lays out and paints: the component
 /// reads added and removed lines from the global theme's success and danger colors.
-struct DiffTint {
-    child: AnyElement,
-    colors: (Hsla, Hsla),
+pub(super) struct DiffTint {
+    pub(super) child: AnyElement,
+    pub(super) colors: (Hsla, Hsla),
 }
 
 impl DiffTint {
