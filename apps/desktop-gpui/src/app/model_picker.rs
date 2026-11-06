@@ -134,6 +134,8 @@ impl Workspace {
         self.picker.query.clear();
         self.picker.highlighted = 0;
         self.picker.tab = None;
+        // Focused above before it renders, which its own focus event can miss.
+        self.picker.search_focused = true;
         self.picker.open = Some(id);
         self.picker.host = host;
         cx.notify();
@@ -142,6 +144,7 @@ impl Workspace {
     pub(super) fn close_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.picker.open.take() else { return };
         self.picker.host = None;
+        self.picker.search_focused = false;
         if id.as_ref() == COMPOSER {
             self.focus_composer(window, cx);
         }
