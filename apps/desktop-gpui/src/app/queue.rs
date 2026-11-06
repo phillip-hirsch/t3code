@@ -103,7 +103,8 @@ impl Workspace {
     /// "Send now": starts a turn when idle, else steers it into the running one.
     fn send_queued(&mut self, run_id: SharedString, cx: &mut Context<Self>) {
         let state = self.queue.state.clone();
-        if !state.can_send() || self.queue.busy.is_some() {
+        let Some(message) = state.queued.iter().find(|q| q.run_id == run_id) else { return };
+        if !state.can_send(message) || self.queue.busy.is_some() {
             return;
         }
         let Some(thread_id) = self.thread.as_ref().map(|t| t.id.clone()) else { return };
@@ -291,11 +292,11 @@ impl Workspace {
 
     /// `thread.steerQueuedMessage`: sends the first queued message now.
     pub(super) fn steer_next_queued(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(next) = self.queue.state.queued.first().map(|q| q.run_id.clone()) else { return false };
-        if !matches!(self.target, Some(Target::Thread { .. })) || !self.queue.state.can_send() {
+        let Some(next) = self.queue.state.queued.first() else { return false };
+        if !matches!(self.target, Some(Target::Thread { .. })) || !self.queue.state.can_send(next) {
             return false;
         }
-        self.send_queued(next, cx);
+        self.send_queued(next.run_id.clone(), cx);
         true
     }
 
@@ -382,7 +383,7 @@ pub(super) fn queued_row(
             .group_hover(format!("queued:{id}"), |s| s.opacity(1.))
             .children(time),
     );
-    if ui.state.can_send() && !editing {
+    if ui.state.can_send(message) && !editing {
         // The first message's Send now names `thread.steerQueuedMessage`.
         let first = ui.state.queued.first().is_some_and(|q| &q.run_id == id);
         let tooltip: SharedString = match workspace.shortcut_label("thread.steerQueuedMessage").filter(|_| first) {
@@ -549,6 +550,7 @@ mod tests {
                 editable: true,
                 created_at: None,
                 sent_by_t3code: false,
+                fresh_context: false,
             })
             .collect();
         QueueState { queued, ..Default::default() }

@@ -23,6 +23,8 @@ pub struct QueuedMessage {
     pub created_at: Option<SharedString>,
     /// "Sent by T3 Code" above the bubble.
     pub sent_by_t3code: bool,
+    /// It starts a fresh provider session (`/clear`).
+    pub fresh_context: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -36,8 +38,10 @@ pub struct QueueState {
 }
 
 impl QueueState {
-    pub fn can_send(&self) -> bool {
-        self.can_send_now || self.can_promote_to_steer
+    /// `canSendRun`: a fresh message starts its own turn, so it may skip a compaction but
+    /// never steer into a turn.
+    pub fn can_send(&self, message: &QueuedMessage) -> bool {
+        self.can_send_now || (self.can_promote_to_steer && (!message.fresh_context || self.promote_skips_compaction))
     }
 
     /// The "Send now" tooltip (`QueuedRunsControl`).
@@ -122,6 +126,7 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
                     .and_then(|item| item.str("createdAt").or(item.str("startedAt")))
                     .map(|at| at.to_owned().into()),
                 sent_by_t3code: guest.is_none() && item.is_some_and(sent_by_t3code),
+                fresh_context: run.fresh_context,
             }
         })
         .collect();
@@ -218,7 +223,7 @@ mod tests {
         assert_eq!(ids, ["r3", "r2"]);
         assert_eq!(state.queued[0].text.as_ref(), "first");
         // Nothing runs, so a queued message starts a turn.
-        assert!(state.can_send_now && state.can_send());
+        assert!(state.can_send_now && state.can_send(&state.queued[0]));
         assert_eq!(state.send_tooltip(), "Start a turn with this message");
         assert!(!derive(&projection(json!([]), vec![], json!({})), true).can_send_now);
     }
@@ -242,11 +247,19 @@ mod tests {
         assert!(!state.can_send_now && state.can_promote_to_steer && !state.promote_skips_compaction);
         assert_eq!(state.active_run_id.as_deref(), Some("a"));
         assert_eq!(state.send_tooltip(), "Send into the current turn");
-        assert!(!derive(&projection(runs.clone(), items, session(false)), false).can_send());
+        assert!(state.can_send(&state.queued[0]));
+        let mut fresh_runs = runs.clone();
+        fresh_runs[1]["freshContext"] = json!(true);
+        let fresh = derive(&projection(fresh_runs.clone(), items.clone(), session(true)), false);
+        assert!(!fresh.can_send(&fresh.queued[0]), "a fresh session never steers into a turn");
+        let state = derive(&projection(runs.clone(), items, session(false)), false);
+        assert!(!state.can_send(&state.queued[0]));
 
         let compacting = vec![message("m1", " /COMPACT "), message("m2", "later")];
-        let state = derive(&projection(runs, compacting, session(false)), false);
+        let state = derive(&projection(runs, compacting.clone(), session(false)), false);
         assert!(state.can_promote_to_steer && state.promote_skips_compaction);
+        let fresh = derive(&projection(fresh_runs, compacting, session(false)), false);
+        assert!(fresh.can_send(&fresh.queued[0]), "but it may skip a compaction");
         assert_eq!(state.send_tooltip(), "Skip compaction and send this message");
     }
 

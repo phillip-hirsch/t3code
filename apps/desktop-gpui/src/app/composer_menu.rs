@@ -116,13 +116,14 @@ impl Workspace {
         let (skills, commands) = composer_search::provider_lists(provider, cwd.as_deref());
         let (plan_mode, _) = self.interaction_mode();
         let at_start = trigger.range.start == 0;
+        let fresh_session = self.fresh_session_command_available();
         let items = match trigger.kind {
             TriggerKind::Skill => composer_search::skill_items(skills, &trigger.query),
             // `getProviderSkillsForSlashMenu`: skills join `/` only when the setting allows.
             _ if !self.client_settings.values.bool("showSkillsInSlashMenu") => {
-                composer_search::slash_items(&[], commands, &trigger.query, at_start, plan_mode)
+                composer_search::slash_items(&[], commands, &trigger.query, at_start, plan_mode, fresh_session)
             }
-            _ => composer_search::slash_items(skills, commands, &trigger.query, at_start, plan_mode),
+            _ => composer_search::slash_items(skills, commands, &trigger.query, at_start, plan_mode, fresh_session),
         };
         self.menu.highlighted = self.menu.highlighted.min(items.len().saturating_sub(1));
         self.menu.items = Rc::from(items);
@@ -222,7 +223,7 @@ impl Workspace {
             MenuAction::File { path, .. } => (composer_text::file_link(path), Some(Chip::File { path: path.clone() })),
             MenuAction::Skill { name, .. } => (format!("${name}"), Some(Chip::Skill { name: name.clone() })),
             MenuAction::Command { name } => (format!("/{name} "), None),
-            MenuAction::Model | MenuAction::Mode(_) => (String::new(), None),
+            MenuAction::Model | MenuAction::Mode(_) | MenuAction::Clear => (String::new(), None),
         };
         self.menu.trigger = None;
         self.composer.update(cx, |state, cx| {
@@ -245,6 +246,7 @@ impl Workspace {
         match item.action {
             MenuAction::Model => self.open_model_picker(window, cx),
             MenuAction::Mode(mode) => self.set_interaction_mode(mode, window, cx),
+            MenuAction::Clear => self.arm_fresh_session(cx),
             _ => {}
         }
         self.sync_composer_empty(cx);

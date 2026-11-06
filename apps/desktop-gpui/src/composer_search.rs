@@ -33,6 +33,8 @@ pub enum MenuAction {
     Model,
     /// `/plan` or `/default` switches the interaction mode.
     Mode(&'static str),
+    /// `/clear` arms a fresh session for the next message.
+    Clear,
 }
 
 /// The skills and commands a provider offers from `cwd`, falling back to its global lists.
@@ -188,15 +190,16 @@ pub fn skill_items(skills: &[ProviderSkill], query: &str) -> Vec<MenuItem> {
     skills.into_iter().map(|s| skill_item(s, display_name(s).to_owned(), "Run provider skill")).collect()
 }
 
-/// The `/` menu: `/model`, `/plan` and `/default` while plan mode is on, then the
-/// provider's commands, then skills as `/skill:name`. Provider commands work only at the
-/// very start of the prompt.
+/// The `/` menu: `/model`, `/plan` and `/default` while plan mode is on, `/clear` where a
+/// fresh session can start, then the provider's commands, then skills as `/skill:name`.
+/// Provider commands and `/clear` work only at the very start of the prompt.
 pub fn slash_items(
     skills: &[ProviderSkill],
     commands: &[SlashCommand],
     query: &str,
     at_start: bool,
     plan_mode: bool,
+    fresh_session: bool,
 ) -> Vec<MenuItem> {
     let skills = invocable(skills);
     let mut items = vec![MenuItem {
@@ -219,9 +222,20 @@ pub fn slash_items(
             }),
         );
     }
+    if at_start && fresh_session {
+        items.push(MenuItem {
+            id: "slash:clear".into(),
+            label: "/clear".into(),
+            description: "Start a fresh session; earlier messages stay visible".into(),
+            action: MenuAction::Clear,
+        });
+    }
     if at_start {
         let skill_names: Vec<String> = skills.iter().map(|s| s.name.to_lowercase()).collect();
-        items.extend(commands.iter().filter(|c| !skill_names.contains(&c.name.to_lowercase())).map(|c| {
+        // T3's `/clear` replaces the provider's, which would clear a session T3 still treats as live.
+        let shown =
+            |c: &&SlashCommand| !(skill_names.contains(&c.name.to_lowercase()) || (fresh_session && c.name == "clear"));
+        items.extend(commands.iter().filter(shown).map(|c| {
             let hint = c.input.as_ref().and_then(|i| i.get("hint")).and_then(|h| h.as_str()).map(str::to_owned);
             MenuItem {
                 id: format!("provider-slash-command:{}", c.name),
@@ -269,6 +283,7 @@ pub fn slash_items(
         |item| match &item.action {
             MenuAction::Model => "0\0model".into(),
             MenuAction::Mode(mode) => format!("0\0{mode}"),
+            MenuAction::Clear => "0\0clear".into(),
             MenuAction::Command { name } => format!("1\0{name}"),
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
@@ -330,24 +345,32 @@ mod tests {
         let commands: Vec<SlashCommand> =
             serde_json::from_value(json!([{"name": "compact", "description": "Summarize"}, {"name": "review"}]))
                 .unwrap();
-        let all = slash_items(&skills, &commands, "", true, false);
+        let all = slash_items(&skills, &commands, "", true, false, false);
         assert_eq!(
             labels(&all),
             ["/model", "/compact", "/skill:review", "/skill:deploy-app"],
             "skills shadow commands"
         );
         assert_eq!(
-            labels(&slash_items(&skills, &commands, "", false, false)),
+            labels(&slash_items(&skills, &commands, "", false, false, false)),
             ["/model", "/skill:review", "/skill:deploy-app"]
         );
-        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true, false)), ["/compact"]);
-        assert_eq!(labels(&slash_items(&skills, &commands, "skill:dep", true, false)), ["/skill:deploy-app"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "/com", true, false, false)), ["/compact"]);
+        assert_eq!(labels(&slash_items(&skills, &commands, "skill:dep", true, false, false)), ["/skill:deploy-app"]);
         assert_eq!(
-            labels(&slash_items(&[], &commands, "", false, true)),
+            labels(&slash_items(&[], &commands, "", false, true, false)),
             ["/model", "/plan", "/default"],
             "plan mode adds its commands anywhere in the prompt"
         );
-        assert_eq!(labels(&slash_items(&[], &commands, "pla", true, true)), ["/plan"]);
+        assert_eq!(labels(&slash_items(&[], &commands, "pla", true, true, false)), ["/plan"]);
+        let with_clear: Vec<SlashCommand> = serde_json::from_value(json!([{"name": "clear"}])).unwrap();
+        assert_eq!(
+            labels(&slash_items(&[], &with_clear, "", true, false, true)),
+            ["/model", "/clear"],
+            "T3's /clear replaces the provider's"
+        );
+        assert_eq!(labels(&slash_items(&[], &with_clear, "", false, false, true)), ["/model"]);
+        assert_eq!(labels(&slash_items(&[], &with_clear, "", true, false, false)), ["/model", "/clear"]);
     }
 
     #[test]

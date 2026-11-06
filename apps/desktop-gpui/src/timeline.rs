@@ -182,9 +182,17 @@ pub struct SystemDivider {
     pub id: SharedString,
     pub label: SharedString,
     pub detail: Option<SharedString>,
-    pub fork: bool,
+    pub icon: DividerIcon,
     /// The action's label and the thread it opens.
     pub action: Option<(SharedString, SharedString)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DividerIcon {
+    Stop,
+    Fork,
+    /// A fresh provider session (`FreshSessionRow`).
+    Eraser,
 }
 
 /// `V2LifecycleRow`'s divider for a finished stop or a fork.
@@ -210,7 +218,7 @@ fn system_divider(item: &TurnItem) -> Option<SystemDivider> {
         id: item.id.clone().into(),
         label: label.into(),
         detail,
-        fork: item.item_type == "fork",
+        icon: if item.item_type == "fork" { DividerIcon::Fork } else { DividerIcon::Stop },
         action,
     })
 }
@@ -626,6 +634,8 @@ enum Kind {
         /// A bare `/compact` turn, which its compaction row stands in for.
         compaction: Option<Option<&'static str>>,
         sent_by_t3code: bool,
+        /// `/clear` or an automation started a new provider session with this message.
+        fresh_context: bool,
     },
     Assistant {
         text: SharedString,
@@ -782,6 +792,7 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 revertible,
                 sent_by_t3code: crate::queue::sent_by_t3code(item),
                 compaction: compaction_command(item),
+                fresh_context: item.bool("freshContext"),
             }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
@@ -1784,17 +1795,28 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, sent_by_t3code, .. } => rows.push(Row::User {
-                id: entry.id.clone(),
-                text: text.clone(),
-                steer: *steer,
-                grouped_with_previous: false,
-                grouped_with_next: false,
-                continues_steer: false,
-                created_at: entry.created_at.clone(),
-                revert: reverts.get(&entry.id).cloned(),
-                sent_by_t3code: *sent_by_t3code,
-            }),
+            Kind::User { text, steer, sent_by_t3code, fresh_context, .. } => {
+                if *fresh_context {
+                    rows.push(Row::System(Rc::new(SystemDivider {
+                        id: format!("fresh-session:{}", entry.id).into(),
+                        label: "New session".into(),
+                        detail: None,
+                        icon: DividerIcon::Eraser,
+                        action: None,
+                    })));
+                }
+                rows.push(Row::User {
+                    id: entry.id.clone(),
+                    text: text.clone(),
+                    steer: *steer,
+                    grouped_with_previous: false,
+                    grouped_with_next: false,
+                    continues_steer: false,
+                    created_at: entry.created_at.clone(),
+                    revert: reverts.get(&entry.id).cloned(),
+                    sent_by_t3code: *sent_by_t3code,
+                });
+            }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
                 id: entry.id.clone(),
                 text: text.clone(),
@@ -2318,6 +2340,15 @@ mod tests {
         let mut followed = turn();
         followed.push(follow_up);
         assert_eq!(show(followed, Zen, &ended), ["user user", "assistant final", "user follow-up", "working"]);
+    }
+
+    #[test]
+    fn a_fresh_session_message_marks_where_the_session_began() {
+        let mut items = turn("r1")[..2].to_vec();
+        items[0]["freshContext"] = json!(true);
+        let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
+        let described = describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        assert_eq!(described, ["system New session", "user go", "assistant looking"]);
     }
 
     #[test]

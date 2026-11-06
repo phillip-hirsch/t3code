@@ -1117,6 +1117,7 @@ impl Workspace {
         let banners: Vec<AnyElement> = (self.render_environment_banner(t, cx).into_iter())
             .chain(self.render_fallback_banner(t, cx))
             .chain(self.render_recovery_banner(t, cx))
+            .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_question(t, cx))
             .chain(self.render_child_approvals(t, cx))

@@ -51,7 +51,7 @@ pub(super) struct BannerUi {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Variant {
+pub(super) enum Variant {
     Error,
     Warning,
     Info,
@@ -836,7 +836,7 @@ fn alert(
 }
 
 /// One `ComposerBannerStack` card, tucked under the composer like the fallback notice.
-fn composer_banner(
+pub(super) fn composer_banner(
     variant: Variant,
     icon: Icon,
     title: impl IntoElement,

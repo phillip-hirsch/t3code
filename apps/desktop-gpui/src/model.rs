@@ -1170,6 +1170,9 @@ pub struct Run {
     /// A queued run the server holds until the thread is resumed.
     #[serde(default)]
     pub queue_held: bool,
+    /// Starts a new provider conversation; earlier runs stay visible but never reach the provider.
+    #[serde(default)]
+    pub fresh_context: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

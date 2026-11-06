@@ -43,9 +43,9 @@ pub(super) fn queues(follow_up: &str, intent: Intent) -> bool {
     (follow_up == "queue") != (intent == Intent::Alternate)
 }
 
-/// `message.dispatch`'s delivery fields.
-fn dispatch_fields(running: bool, follow_up: &str, intent: Intent) -> (Value, Option<&'static str>) {
-    match (running, queues(follow_up, intent)) {
+/// `message.dispatch`'s delivery fields; `queue` picks queueing over steering while a turn runs.
+fn dispatch_fields(running: bool, queue: bool) -> (Value, Option<&'static str>) {
+    match (running, queue) {
         (false, _) => (json!({"type": "start_immediately"}), Some("auto")),
         (true, true) => (json!({"type": "queue_after_active"}), None),
         (true, false) => (json!({"type": "start_immediately"}), Some("steer")),
@@ -64,6 +64,8 @@ struct ThreadMessage<'a> {
     model: Option<&'a ModelSelection>,
     /// The plan a build-mode follow-up implements.
     source_plan: Option<&'a str>,
+    /// Starts a new provider session without the thread's earlier context (`/clear`).
+    fresh_context: bool,
 }
 
 impl ThreadMessage<'_> {
@@ -91,6 +93,9 @@ impl ThreadMessage<'_> {
         }
         if let Some(plan_id) = self.source_plan {
             command["sourcePlanRef"] = json!({"threadId": self.thread_id, "planId": plan_id});
+        }
+        if self.fresh_context {
+            command["freshContext"] = true.into();
         }
         command
     }
@@ -128,6 +133,14 @@ impl Workspace {
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
+        let fresh_session = self.fresh_session_command_available();
+        if fresh_session && !self.has_attachments() && super::fresh_session::is_clear_command(&text) {
+            self.arm_fresh_session(cx);
+            self.set_composer_text("", window, cx);
+            return;
+        }
+        // Read once: an arm made while this send is in flight belongs to the next message.
+        let fresh_arm = self.fresh_session_arm().filter(|_| fresh_session);
         let (plan_ui, interaction_mode) = self.interaction_mode();
         // `/plan` or `/default` alone switches modes without sending.
         if let Some(mode) =
@@ -137,7 +150,7 @@ impl Workspace {
             self.set_interaction_mode(mode, window, cx);
             return;
         }
-        let follow_up = self.plan_follow_up_target();
+        let follow_up = self.plan_follow_up_target().filter(|_| fresh_arm.is_none());
         if (text.is_empty() && !self.has_attachments() && follow_up.is_none())
             || self.sending
             || self.target_rewinding()
@@ -184,12 +197,17 @@ impl Workspace {
                     text: message_text,
                     attachments,
                     context,
-                    dispatch: dispatch_fields(running, self.follow_up_behavior(), intent),
+                    // A fresh session starts its own turn, so it never steers into the running one.
+                    dispatch: dispatch_fields(
+                        running,
+                        fresh_arm.is_some() || queues(self.follow_up_behavior(), intent),
+                    ),
                     model: self.model_override.as_ref(),
                     source_plan: follow_up
                         .as_ref()
                         .filter(|_| interaction_mode == "default")
                         .map(|(plan_id, _)| plan_id.as_str()),
+                    fresh_context: fresh_arm.is_some(),
                 }
                 .command();
                 ("orchestration.dispatchCommand", command, None, None)
@@ -281,6 +299,9 @@ impl Workspace {
                 this.sending = false;
                 match result {
                     Ok(_) => {
+                        if fresh_arm.is_some() {
+                            this.disarm_fresh_session(&origin, fresh_arm);
+                        }
                         if let Some(mode) = sent_mode {
                             this.remember_interaction_mode(origin.clone(), mode);
                         }
@@ -406,14 +427,14 @@ mod tests {
         let (steer, queue) =
             ((json!({"type": "start_immediately"}), Some("steer")), (json!({"type": "queue_after_active"}), None));
         assert_eq!(
-            dispatch_fields(false, "queue", Intent::Alternate),
+            dispatch_fields(false, queues("queue", Intent::Alternate)),
             (json!({"type": "start_immediately"}), Some("auto"))
         );
-        assert_eq!(dispatch_fields(true, "steer", Intent::Foreground), steer);
-        assert_eq!(dispatch_fields(true, "steer", Intent::Alternate), queue);
-        assert_eq!(dispatch_fields(true, "steer", Intent::AndNewThread), steer);
-        assert_eq!(dispatch_fields(true, "queue", Intent::Foreground), queue);
-        assert_eq!(dispatch_fields(true, "queue", Intent::Alternate), steer);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::Foreground)), steer);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::Alternate)), queue);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::AndNewThread)), steer);
+        assert_eq!(dispatch_fields(true, queues("queue", Intent::Foreground)), queue);
+        assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate)), steer);
     }
 
     #[test]
@@ -424,9 +445,10 @@ mod tests {
                 text: "hi".into(),
                 attachments: vec![json!({"id": "a1"})],
                 context: Some(json!({"version": 1, "records": []})),
-                dispatch: dispatch_fields(true, "steer", Intent::Foreground),
+                dispatch: dispatch_fields(true, queues("steer", Intent::Foreground)),
                 model,
                 source_plan,
+                fresh_context: false,
             }
         }
         let without_ids = |mut command: Value| {
@@ -447,9 +469,15 @@ mod tests {
         let command = message(Some(&model), Some("p1")).command();
         assert_eq!(command["modelSelection"], model.to_json());
         assert_eq!(command["sourcePlanRef"], json!({"threadId": "t1", "planId": "p1"}));
-        let queued =
-            ThreadMessage { dispatch: dispatch_fields(true, "queue", Intent::Foreground), ..message(None, None) };
-        assert!(queued.command().get("deliveryIntent").is_none(), "a queued message has no delivery intent");
+        let queued = ThreadMessage {
+            dispatch: dispatch_fields(true, queues("queue", Intent::Foreground)),
+            ..message(None, None)
+        };
+        let queued = queued.command();
+        assert!(queued.get("deliveryIntent").is_none(), "a queued message has no delivery intent");
+        assert!(queued.get("freshContext").is_none());
+        let fresh = ThreadMessage { fresh_context: true, ..message(None, None) };
+        assert_eq!(fresh.command()["freshContext"], true);
     }
 
     #[test]

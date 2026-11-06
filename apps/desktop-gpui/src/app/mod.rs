@@ -41,6 +41,7 @@ mod details;
 pub(crate) mod environments;
 mod files;
 mod find;
+mod fresh_session;
 mod git;
 mod header;
 mod host_picker;
@@ -271,6 +272,7 @@ pub struct Workspace {
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
+    fresh_sessions: fresh_session::FreshSessions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
     /// Running threads synced in the background.
@@ -420,6 +422,7 @@ impl Workspace {
             requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),
+            fresh_sessions: Default::default(),
             desktop,
             keep_alive: Default::default(),
             saved_environments,
