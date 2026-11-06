@@ -13,6 +13,9 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/cursor.svg", include_bytes!("../assets/icons/cursor.svg")),
     ("icons/app/opencode.svg", include_bytes!("../assets/icons/opencode.svg")),
     ("icons/app/acp.svg", include_bytes!("../assets/icons/acp.svg")),
+    ("icons/app/muse.svg", include_bytes!("../assets/icons/muse.svg")),
+    ("icons/app/pi.svg", include_bytes!("../assets/icons/pi.svg")),
+    ("icons/app/fx.svg", include_bytes!("../assets/icons/fx.svg")),
     ("icons/app/send.svg", include_bytes!("../assets/icons/send.svg")),
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
     ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
@@ -234,9 +237,10 @@ impl AssetSource for Assets {
     }
 }
 
-/// A provider's logo and its tint, as `PROVIDER_ICON_BY_PROVIDER` in
-/// `apps/web/src/components/chat/ProviderInstanceIcon.tsx`. `None` tint means
-/// the current foreground. Unknown drivers have no logo yet.
+/// A provider's logo and its tint, as `PROVIDER_ICON_BY_PROVIDER` and the provider packages'
+/// `icon` in `apps/web/src/components/chat/ProviderInstanceIcon.tsx`. `None` tint means
+/// the current foreground. Unknown drivers have no logo yet. Muse's blue gradient draws in
+/// its flat fill.
 pub fn provider_icon(driver: &str) -> Option<(&'static str, Option<Hsla>)> {
     match driver {
         "claudeAgent" => Some(("icons/app/claude.svg", Some(rgb(0xd97757).into()))),
@@ -245,6 +249,9 @@ pub fn provider_icon(driver: &str) -> Option<(&'static str, Option<Hsla>)> {
         "cursor" => Some(("icons/app/cursor.svg", None)),
         "opencode" => Some(("icons/app/opencode.svg", None)),
         "acpRegistry" => Some(("icons/app/acp.svg", None)),
+        "muse" => Some(("icons/app/muse.svg", Some(rgb(0x0081fb).into()))),
+        "pi" => Some(("icons/app/pi.svg", None)),
+        "fx" => Some(("icons/app/fx.svg", None)),
         _ => None,
     }
 }
