@@ -11,6 +11,7 @@ mod cleanup;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
@@ -18,7 +19,6 @@ use gpui_kit::component::input::{InputState, NumberInput};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{

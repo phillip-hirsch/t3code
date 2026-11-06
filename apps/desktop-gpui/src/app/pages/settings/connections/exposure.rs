@@ -3,10 +3,10 @@
 //! Both settings live in `desktop-settings.json`; a change restarts the app, as Electron
 //! relaunches, so the server starts with the new exposure.
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogClose, DialogEntrance, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{

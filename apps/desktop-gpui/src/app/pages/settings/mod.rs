@@ -36,7 +36,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::SliderState;
-use gpui_kit::component::{Disableable as _, Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight, InteractiveElement as _,
@@ -129,15 +129,15 @@ fn nav_section(id: &str) -> &str {
     DETAIL_PAGES.iter().find(|(page, ..)| *page == id).map_or(id, |(.., parent)| parent)
 }
 
-/// `SETTINGS_SECTION_ICONS`; SnapShots uses the web's own capture glyph, drawn here as Scan.
-fn section_icon(id: &str) -> IconName {
-    match id {
+/// `SETTINGS_SECTION_ICONS`; SnapShots is the web's own `SnapShotIcon` (a window in a capture frame).
+fn section_icon(id: &str) -> Icon {
+    let name = match id {
         "general" => IconName::Settings2,
         "appearance" => IconName::Palette,
         "chat" => IconName::MessageSquareText,
         "diffs" => IconName::FileDiff,
         "keybindings" => IconName::Keyboard,
-        "snap-shot" => IconName::Scan,
+        "snap-shot" => return Icon::empty().path("icons/app/snap-shot.svg"),
         "providers" => IconName::Bot,
         "threads" => IconName::MessagesSquare,
         "browser" => IconName::Globe,
@@ -154,7 +154,8 @@ fn section_icon(id: &str) -> IconName {
         "about" => IconName::Info,
         "archived" => IconName::Archive,
         _ => IconName::Settings2,
-    }
+    };
+    Icon::new(name)
 }
 
 /// The modal's own state, kept while it is closed so the scope and folds persist.
@@ -181,6 +182,8 @@ pub(in crate::app) struct SettingsUi {
     /// The grouping mode the Project grouping switch turns back on (`readLastEnabledProjectGroupingMode`).
     last_grouping_mode: &'static str,
     theme_library: theme_library::LibraryUi,
+    /// The Appearance code preview's diff, made on first show.
+    diff_preview: Option<Entity<gpui_kit::component::diff::DiffState>>,
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
     focus: FocusHandle,
     focus_on_render: bool,
@@ -217,6 +220,7 @@ impl SettingsUi {
             project_picker: None,
             last_grouping_mode: "repository",
             theme_library: Default::default(),
+            diff_preview: None,
             focus: cx.focus_handle(),
             focus_on_render: false,
             _search_subscription: subscription,
@@ -564,7 +568,7 @@ impl Workspace {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_settings_search_result(open, window, cx);
                             }))
-                            .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
+                            .child(section_icon(&item.to).size(px(16.)).text_color(sb.icon))
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -622,7 +626,7 @@ impl Workspace {
                                 .when(active, |el| el.bg(sb.row_active))
                                 .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select_settings_section(id, cx)))
-                                .child(Icon::new(section_icon(id)).size(px(16.)).text_color(if active {
+                                .child(section_icon(id).size(px(16.)).text_color(if active {
                                     sb.foreground
                                 } else {
                                     sb.icon
@@ -653,16 +657,17 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let restore = (section == "general").then(|| {
             let changed = self.restore_defaults_changes(view);
+            // `size="xs"`: the kit's XSmall content row carries the 12px label and 4px gap; the
+            // button's `[&_svg]:-mx-0.5` outranks the icon's own `mx-1`.
             Button::new("settings-restore-defaults")
                 .ghost()
+                .xsmall()
                 .h(px(24.))
                 .px(px(7.))
-                .gap(px(4.))
                 .rounded(px(8.))
-                .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .disabled(changed.is_empty())
-                .child(Icon::new(IconName::RotateCcw).size(px(14.)).mx(px(4.)))
+                .child(Icon::new(IconName::RotateCcw).size(px(14.)).mx(px(-2.)).text_color(t.muted_foreground))
                 .child("Restore device defaults")
                 .on_click(cx.listener(|this, _, window, cx| this.confirm_restore_defaults(window, cx)))
         });

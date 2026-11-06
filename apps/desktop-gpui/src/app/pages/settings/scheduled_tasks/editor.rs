@@ -2,12 +2,12 @@
 
 use std::rc::Rc;
 
+use crate::app::pages::settings::widgets::Switch;
 use chrono::{DateTime, Local, NaiveTime, Timelike as _, Utc};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::time_field::{TimeField, TimeFieldEvent, TimeFieldState, TimePrecision};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;

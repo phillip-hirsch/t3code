@@ -2,10 +2,10 @@
 //! `WorktreeBaseBranchPicker` (`apps/web/src/components/WorktreeBaseBranchPicker.tsx`,
 //! `BranchPicker.tsx`, `usePaginatedBranches` in `apps/web/src/state/queries.ts`).
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{

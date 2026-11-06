@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Task, WeakEntity, Window, div, px,
+    Task, WeakEntity, Window, div, px, svg,
 };
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section, switch};
@@ -148,17 +148,53 @@ impl Workspace {
     }
 }
 
-/// `EmptyRemoteEnvironments cloudEnabled={false}`.
+/// `EmptyRemoteEnvironments cloudEnabled={false}`: the copy without T3 Connect, which this
+/// client doesn't have.
 fn empty_state(t: &Tokens) -> AnyElement {
     v_flex()
         .min_h(px(208.))
         .p(px(48.))
+        .gap(px(24.))
         .items_center()
         .justify_center()
+        .text_center()
+        .child(empty_media("icons/chevrons-left-right-ellipsis.svg", t))
+        .child(
+            v_flex()
+                .max_w(px(384.))
+                .items_center()
+                .child(
+                    div()
+                        .text_xl()
+                        .line_height(px(28.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("No saved remote environments"),
+                )
+                .child(
+                    text_sm(div().mt(px(4.)).text_color(t.muted_foreground))
+                        .child("Click \u{201c}Add environment\u{201d} to pair another environment."),
+                ),
+        )
+        .into_any_element()
+}
+
+/// `EmptyMedia variant="icon"`: a raised 36px card over two smaller ones tilted 10° out to
+/// each side (drawn as one shape and its outline, since a div can't rotate), then `mb-6`.
+fn empty_media(icon: &'static str, t: &Tokens) -> impl IntoElement {
+    let back = |path: &'static str, color| {
+        svg().path(path).absolute().left(px(-10.)).top(px(-10.)).w(px(56.)).h(px(50.)).text_color(color)
+    };
+    div()
+        .relative()
+        .mb(px(24.))
+        .size(px(36.))
+        .flex_none()
+        .child(back("icons/app/empty-media-back.svg", t.card))
+        .child(back("icons/app/empty-media-back-border.svg", t.border))
         .child(
             div()
-                .mb(px(24.))
-                .size(px(36.))
+                .absolute()
+                .inset_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -166,20 +202,9 @@ fn empty_state(t: &Tokens) -> AnyElement {
                 .border_1()
                 .border_color(t.border)
                 .bg(t.card)
-                .child(ui::glyph("icons/chevrons-left-right-ellipsis.svg", 18., t.foreground)),
+                .shadow_sm()
+                .child(ui::glyph(icon, 18., t.foreground)),
         )
-        .child(
-            div()
-                .text_xl()
-                .line_height(px(28.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("No saved remote environments"),
-        )
-        .child(
-            text_sm(div().mt(px(8.)).text_color(t.muted_foreground))
-                .child("Click \u{201c}Add environment\u{201d} to pair another environment."),
-        )
-        .into_any_element()
 }
 
 fn saved_row(

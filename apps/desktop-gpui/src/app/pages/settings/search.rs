@@ -63,7 +63,7 @@ pub(super) fn available(item: &SearchItem) -> bool {
         // Browser rows for surfaces this client doesn't have (see `browser.rs`).
         && !matches!(
             item.id.as_str(),
-            "browser-auto-show-floating-preview" | "browser-recording-key-presses" | "browser-recording-mouse-presses"
+            "browser-recording-key-presses" | "browser-recording-mouse-presses"
         )
 }
 

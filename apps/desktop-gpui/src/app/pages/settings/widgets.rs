@@ -27,11 +27,12 @@ use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Map, Value};
 
 use super::code::projects::icon::project_icon;
+use super::connections::logic::machine_icon;
 use crate::app::{Workspace, project_name};
 use crate::project_groups::ProjectGroup;
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
@@ -44,6 +45,10 @@ pub(in crate::app) struct SettingsView {
     pub(in crate::app) targets: Vec<Target>,
     /// Settings' project groups, archived ones included (`useSettingsProjectGroups`).
     pub(in crate::app) groups: Vec<ProjectGroup>,
+    /// The scope sentence's picks, narrowed to one environment on a single-environment page.
+    pub(in crate::app) search: scope::ScopeSearch,
+    /// Whether the page edits one environment at a time (`singleEnvironment`).
+    single_environment: bool,
     /// The environments the scope can pick, the primary first.
     environments: Vec<ViewEnvironment>,
     client: Settings,
@@ -53,6 +58,8 @@ pub(in crate::app) struct SettingsView {
 struct ViewEnvironment {
     id: String,
     label: String,
+    /// `resolveEnvironmentMachineKind`, for its `EnvironmentMachineIcon`.
+    machine: String,
     /// `None` while disconnected.
     settings: Option<Settings>,
 }
@@ -563,6 +570,7 @@ impl Workspace {
                 let info = &session.server_info;
                 Some(ViewEnvironment {
                     label: info.environment_label.clone().unwrap_or_else(|| id.clone()),
+                    machine: info.machine_kind().to_owned(),
                     settings: session.is_connected().then(|| info.settings.clone()),
                     id,
                 })
@@ -572,13 +580,21 @@ impl Workspace {
             scope: Scope { kind: ScopeKind::All, label: String::new(), environment_ids: Vec::new() },
             targets: Vec::new(),
             groups,
+            search: self.settings_ui.scope.clone(),
+            single_environment: matches!(self.settings.as_deref(), Some("providers" | "secrets")),
             environments,
             client: self.client_settings.values.clone(),
         };
         let environments = view.environments();
-        let scope = scope::resolve(&self.settings_ui.scope, &scope_groups, &environments);
+        let search = if view.single_environment {
+            scope::single_environment(&self.settings_ui.scope, &scope_groups, &environments)
+        } else {
+            self.settings_ui.scope.clone()
+        };
+        let scope = scope::resolve(&search, &scope_groups, &environments);
         let targets = scope::targets(&scope, &environments);
         drop(environments);
+        view.search = search;
         view.scope = scope;
         view.targets = targets;
         view
@@ -1185,6 +1201,8 @@ impl Workspace {
                     options.iter().find(|(v, _)| *v == current).map_or(current.clone(), |(_, l)| (*l).to_owned())
                 };
                 let workspace = cx.entity();
+                // `SelectValue` ellipsizes a label wider than the trigger.
+                let label = div().min_w_0().truncate().child(label);
                 select_trigger(id, label, width, &t)
                     .min_w(px(ROW_SELECT_MIN_WIDTH))
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
@@ -1375,7 +1393,8 @@ impl Workspace {
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
     pub(super) fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let search = self.settings_ui.scope.clone();
+        let search = view.search.clone();
+        let single = view.single_environment;
         let workspace = cx.entity();
         let selected = search.project.as_ref().and_then(|key| view.groups.iter().find(|g| &g.key == key));
         let project_label = match (&search.project, selected) {
@@ -1383,13 +1402,21 @@ impl Workspace {
             (Some(_), None) => "Unavailable project".to_owned(),
             (None, None) => "All projects".to_owned(),
         };
-        let environment_label = match &search.machine {
-            Some(id) => view.environment_by_id(id).map_or("Unavailable environment", |e| e.label).to_owned(),
-            None => "All environments".to_owned(),
+        let selected_environment =
+            search.machine.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
+        let environment_label = match (&search.machine, selected_environment) {
+            (_, Some(environment)) => environment.label.clone(),
+            (Some(_), None) => "Unavailable environment".to_owned(),
+            (None, None) if single => "No environments".to_owned(),
+            (None, None) => "All environments".to_owned(),
         };
+        let machine_glyph = |machine: &str, t: &Tokens| {
+            svg().path(machine_icon(machine)).size(px(14.)).flex_none().text_color(t.foreground).into_any_element()
+        };
+        let environment_icon = selected_environment.map(|e| machine_glyph(&e.machine, &t));
         let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
-        let environments: Vec<(String, String)> =
-            view.environments.iter().map(|e| (e.id.clone(), e.label.clone())).collect();
+        let environments: Vec<(String, String, String)> =
+            view.environments.iter().map(|e| (e.id.clone(), e.label.clone(), e.machine.clone())).collect();
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 workspace.update(cx, |this, cx| {
@@ -1456,26 +1483,28 @@ impl Workspace {
         };
         let environment_menu = {
             let (search, workspace) = (search.clone(), workspace);
-            scope_trigger("settings-scope-environment", None, environment_label, &t).dropdown_menu_with_anchor(
-                gpui_kit::Anchor::TopLeft,
-                move |menu, _, _| {
-                    let mut menu = menu
-                        .item(
-                            PopupMenuItem::new("All environments")
-                                .checked(search.machine.is_none())
-                                .on_click(pick(workspace.clone(), search.with_machine(None))),
-                        )
-                        .separator();
-                    for (id, label) in &environments {
+            scope_trigger("settings-scope-environment", environment_icon, environment_label, &t)
+                .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
+                    if !single {
+                        menu = menu
+                            .item(
+                                PopupMenuItem::new("All environments")
+                                    .icon(IconName::Layers)
+                                    .checked(search.machine.is_none())
+                                    .on_click(pick(workspace.clone(), search.with_machine(None))),
+                            )
+                            .separator();
+                    }
+                    for (id, label, machine) in &environments {
                         menu = menu.item(
                             PopupMenuItem::new(label.clone())
+                                .icon(Icon::empty().path(machine_icon(machine)))
                                 .checked(search.machine.as_deref() == Some(id.as_str()))
                                 .on_click(pick(workspace.clone(), search.with_machine(Some(id.clone())))),
                         );
                     }
                     menu
-                },
-            )
+                })
         };
         let joiner = if search.machine.is_some() { "on" } else { "across" };
         h_flex()
@@ -1555,6 +1584,90 @@ pub(in crate::app) fn switch(
             }
         })
         .child(div().size(px(14.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
+}
+
+/// The web's `Switch` as a control with its own handler: a 30×18 track and 14px thumb, or
+/// 26×16 and 12px [`Self::small`] (`size="sm"`). It keeps the kit switch's builder methods.
+#[derive(IntoElement)]
+pub(in crate::app) struct Switch {
+    id: ElementId,
+    checked: bool,
+    disabled: bool,
+    small: bool,
+    label: Option<SharedString>,
+    on_change: Option<OnToggle>,
+}
+
+/// A switch's handler, given the next checked value.
+type OnToggle = Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>;
+
+impl Switch {
+    pub(in crate::app) fn new(id: impl Into<ElementId>) -> Self {
+        Self { id: id.into(), checked: false, disabled: false, small: false, label: None, on_change: None }
+    }
+
+    pub(in crate::app) fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
+    pub(in crate::app) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub(in crate::app) fn small(mut self) -> Self {
+        self.small = true;
+        self
+    }
+
+    pub(in crate::app) fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Called with the next checked value.
+    pub(in crate::app) fn on_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut gpui_kit::App) + 'static,
+    ) -> Self {
+        self.on_change = Some(Rc::new(handler));
+        self
+    }
+
+    pub(in crate::app) fn on_click(self, handler: impl Fn(&bool, &mut Window, &mut gpui_kit::App) + 'static) -> Self {
+        self.on_change(handler)
+    }
+}
+
+impl gpui_kit::RenderOnce for Switch {
+    fn render(self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
+        let t = *theme::tokens(cx);
+        // `--thumb-size`: the track is one thumb plus 2px tall and two thumbs less 2px wide.
+        let size = if self.small { 14. } else { 16. };
+        // `disabled:opacity-64` on the track and thumb alike.
+        let fade = if self.disabled { 0.64 } else { 1. };
+        let track = if self.checked { t.primary } else { t.input };
+        let thumb = if self.checked || !t.dark { t.background } else { t.muted_foreground };
+        gpui_kit::base::Switch::new(self.id)
+            .checked(self.checked)
+            .disabled(self.disabled)
+            .when_some(self.label, gpui_kit::base::Switch::accessibility_label)
+            .when_some(self.on_change, |el, on_change| {
+                el.on_change(move |checked, _, window, cx| on_change(&checked, window, cx))
+            })
+            .flex_none()
+            .w(px(size * 2. - 2.))
+            .h(px(size + 2.))
+            .p(px(2.))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .when(self.checked, gpui_kit::Styled::justify_end)
+            .bg(track.opacity(fade))
+            .when(!self.disabled, gpui_kit::Styled::cursor_pointer)
+            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade)))
+    }
 }
 
 /// `SettingsRow` gives a select in its control at least `min-w-40`.

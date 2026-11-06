@@ -338,6 +338,28 @@ impl ThreadPreviews {
         self.sessions.iter().find(|s| s.tab_id == tab_id)
     }
 
+    /// `freshlyRevealedServerTabs`: server tabs an agent revealed since `previous`, new ones or
+    /// ones with a new reveal request, each with whether the reveal is forced. Nothing is fresh
+    /// before the first list loads: that list is the baseline, so a reload never reopens
+    /// previews the user dismissed.
+    pub fn fresh_reveals(&self, previous: &Self) -> Vec<(String, bool)> {
+        if !previous.list_loaded {
+            return Vec::new();
+        }
+        self.sessions
+            .iter()
+            .filter(|session| session.server_hosted() && session.reveal == Some(true))
+            .filter(|session| {
+                let before = previous.get(&session.tab_id);
+                match &session.reveal_request {
+                    Some(request) => before.and_then(|b| b.reveal_request.as_ref()).is_none_or(|b| b.id != request.id),
+                    None => before.is_none(),
+                }
+            })
+            .map(|session| (session.tab_id.clone(), session.reveal_request.as_ref().is_some_and(|r| r.force)))
+            .collect()
+    }
+
     /// Keeps a newer local copy when the incoming one is older (`updatedAt` is ISO-8601).
     fn upsert(&mut self, session: Session) {
         match self.sessions.iter_mut().find(|s| s.tab_id == session.tab_id) {
@@ -834,6 +856,35 @@ mod tests {
             "navStatus": {"_tag": "Success", "url": format!("https://{tab}.test/"), "title": tab},
             "canGoBack": false, "canGoForward": false,
         })
+    }
+
+    #[test]
+    fn agent_reveals_are_fresh_once_per_tab_or_request() {
+        let server = |tab: &str, request: Value| {
+            let mut value = session(tab, "2026-01-01T00:00:00Z");
+            value["runtime"] = "server".into();
+            value["reveal"] = true.into();
+            value["revealRequest"] = request;
+            serde_json::from_value::<Session>(value).expect("session")
+        };
+        let previews = |loaded: bool, sessions: Vec<Session>| ThreadPreviews {
+            sessions,
+            list_loaded: loaded,
+            ..ThreadPreviews::default()
+        };
+        let quiet = server("a", Value::Null);
+        let asked = server("b", json!({"id": "r1"}));
+        let forced = server("b", json!({"id": "r2", "force": true}));
+        let mut local = serde_json::from_value::<Session>(session("c", "2026-01-01T00:00:00Z")).expect("session");
+        local.reveal = Some(true);
+
+        let before = previews(true, vec![]);
+        let after = previews(true, vec![quiet.clone(), asked, local]);
+        assert_eq!(after.fresh_reveals(&before), [("a".to_owned(), false), ("b".to_owned(), false)]);
+        assert!(after.fresh_reveals(&previews(false, vec![])).is_empty(), "the first list is the baseline");
+        assert!(after.fresh_reveals(&after).is_empty(), "already shown");
+        let again = previews(true, vec![quiet, forced]);
+        assert_eq!(again.fresh_reveals(&after), [("b".to_owned(), true)], "a new request reveals again");
     }
 
     #[test]

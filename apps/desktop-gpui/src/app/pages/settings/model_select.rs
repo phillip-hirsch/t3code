@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{Icon, Sizable as _, h_flex};
+use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::{
     AnyElement, App, Context, Div, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div,
     px, svg,
@@ -36,14 +36,9 @@ pub(in crate::app) fn trigger(id: impl Into<ElementId>, t: &Tokens) -> Button {
         .text_color(t.foreground)
 }
 
+/// The pickers' text: `ProviderModelPicker` and `TraitsPicker` draw no chevron.
 fn trigger_label(label: SharedString) -> impl IntoElement {
-    h_flex()
-        .flex_1()
-        .min_w_0()
-        .justify_between()
-        .gap(px(6.))
-        .child(div().truncate().child(label))
-        .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).flex_none().opacity(0.7))
+    div().flex_1().min_w_0().truncate().child(label)
 }
 
 /// Text-generation providers a model row can pick from (`supportsTextGeneration !== false`).
@@ -91,7 +86,8 @@ impl Workspace {
             (None, None, Some(selection)) => selection.model.clone().into(),
             (None, None, None) => "Select a model".into(),
         };
-        let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
+        // A fixed label ("None", "Mixed") replaces the provider icon too.
+        let icon = provider.filter(|_| label.is_none()).and_then(|p| crate::assets::provider_icon(&p.driver));
         trigger(id, &t)
             .min_w(px(0.))
             .children(icon.map(|(path, tint)| {
@@ -123,6 +119,7 @@ impl Workspace {
         Some(
             trigger(id, &t)
                 .min_w(px(0.))
+                .child(Icon::new(Lucide::Gauge).with_size(px(16.)).flex_none().text_color(t.muted_foreground))
                 .child(trigger_label(label.into()))
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu: PopupMenu, window, _| {
                     if let Some(effort) = &effort {

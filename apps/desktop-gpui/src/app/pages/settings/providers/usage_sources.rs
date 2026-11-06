@@ -3,10 +3,10 @@
 //! macOS-only Cursor keychain switch. Adding a hub sends its management key
 //! once to the server's secret storage (`AddUsageLimitSourceDialog.tsx`).
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, SharedString,

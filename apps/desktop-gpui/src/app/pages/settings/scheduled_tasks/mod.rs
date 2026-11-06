@@ -15,11 +15,11 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{

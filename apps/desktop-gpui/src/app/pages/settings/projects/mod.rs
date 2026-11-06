@@ -14,13 +14,13 @@ pub(in crate::app) mod scripts;
 
 use std::rc::Rc;
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -201,10 +201,18 @@ impl Workspace {
                                 div()
                                     .truncate()
                                     .text_sm()
+                                    .line_height(px(20.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(group.display_name.clone()),
                             )
-                            .child(div().truncate().text_xs().text_color(t.muted_foreground).child(secondary)),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .line_height(px(16.))
+                                    .text_color(t.muted_foreground)
+                                    .child(secondary),
+                            ),
                     )
                     .child(Icon::new(IconName::ChevronRight).size(px(16.)).text_color(t.muted_foreground))
                     .into_any_element()

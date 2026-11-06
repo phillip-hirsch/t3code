@@ -575,6 +575,21 @@ impl Workspace {
         self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids);
     }
 
+    /// Whether the thread's panel has a tab for `tab_id`; `focus` shows it (`revealSurface`).
+    pub(super) fn reveal_browser_surface(&mut self, thread_id: &str, tab_id: &str, focus: bool) -> bool {
+        let Some(target) = self.thread_target(thread_id) else { return false };
+        let Some(panel) = self.right_panel.panels.get_mut(&target) else { return false };
+        let surface = Surface::Browser(tab_id.to_owned());
+        if !panel.surfaces.contains(&surface) {
+            return false;
+        }
+        if focus {
+            panel.open = true;
+            panel.active = Some(surface);
+        }
+        true
+    }
+
     /// `addDiffSurface`: the details card's Changes row and the launcher's Diff open the branch's changes.
     pub(super) fn open_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.diff_available() {
@@ -1908,9 +1923,9 @@ fn turn_diff_offer(checkpoint: Option<&Checkpoint>, is_repo: Option<bool>) -> Di
 
 /// The blue-orange scheme's line colors while the diff lays out and paints: the component
 /// reads added and removed lines from the global theme's success and danger colors.
-struct DiffTint {
-    child: AnyElement,
-    colors: (Hsla, Hsla),
+pub(super) struct DiffTint {
+    pub(super) child: AnyElement,
+    pub(super) colors: (Hsla, Hsla),
 }
 
 impl DiffTint {

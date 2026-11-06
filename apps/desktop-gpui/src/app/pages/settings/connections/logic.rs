@@ -373,7 +373,7 @@ pub(super) const MACHINE_KINDS: &[(&str, &str)] = &[
 ];
 
 /// `EnvironmentMachineIcon`'s glyph for a machine kind.
-pub(super) fn machine_icon(kind: &str) -> &'static str {
+pub(in crate::app::pages::settings) fn machine_icon(kind: &str) -> &'static str {
     match kind {
         "cloud" => "icons/cloud.svg",
         "linux" => "icons/app/linux.svg",
