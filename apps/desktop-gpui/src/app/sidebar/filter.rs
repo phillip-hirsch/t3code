@@ -233,9 +233,16 @@ impl Workspace {
         let trigger_icon: AnyElement = match scoped.as_slice() {
             [] => icon(IconName::ListFilter, 16., sb.icon).into_any_element(),
             [one] => project_icon(one, tokens, false, 16., self.favicon(one)),
+            // The second icon overlaps the first by 4px inside a 2px sidebar-colored ring.
             [first, second, ..] => h_flex()
                 .child(project_icon(first, tokens, false, 14., self.favicon(first)))
-                .child(div().ml(px(-6.)).child(project_icon(second, tokens, false, 14., self.favicon(second))))
+                .child(div().ml(px(-6.)).my(px(-2.)).p(px(2.)).rounded(px(5.5)).bg(sb.background).child(project_icon(
+                    second,
+                    tokens,
+                    false,
+                    14.,
+                    self.favicon(second),
+                )))
                 .into_any_element(),
         };
         let open = self.sidebar.filter.is_some();
@@ -313,42 +320,55 @@ impl Workspace {
                     .text_color(tokens.muted_foreground)
                     .hover(|s| s.bg(fg.opacity(0.06)).text_color(fg))
             };
-            let controls = group.map(|g| {
-                let pinned = g.pinned;
-                let members: Vec<String> = g.members.iter().map(|m| m.project.id.clone()).collect();
-                let name = &g.display_name;
-                let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
-                let gear_title: SharedString = format!("Project settings for {name}").into();
-                h_flex()
-                    .ml_auto()
-                    .child(
-                        small_button(format!("filter-pin-{}", g.key).into())
-                            .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.set_projects_pinned(&members, !pinned, cx);
-                            }))
-                            .child(
-                                gpui_kit::component::Icon::new(if pinned { IconName::PinOff } else { IconName::Pin })
+            // `ProjectRowActions`: settings shows only on the highlighted row; the pin keeps the
+            // far-right column, and "All projects" keeps a spacer there so every row is as tall.
+            let controls = match group {
+                None => div().ml_auto().size(px(24.)).flex_none(),
+                Some(g) => {
+                    let pinned = g.pinned;
+                    let members: Vec<String> = g.members.iter().map(|m| m.project.id.clone()).collect();
+                    let name = &g.display_name;
+                    let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
+                    let gear_title: SharedString = format!("Project settings for {name}").into();
+                    div()
+                        .ml_auto()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .child(
+                            small_button(format!("filter-gear-{}", g.key).into())
+                                .when(!highlighted, gpui_kit::Styled::invisible)
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(gear_title.clone()).build(window, cx)
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_filter(cx);
+                                    this.open_settings("projects", cx);
+                                }))
+                                .child(gpui_kit::component::Icon::new(IconName::Settings).size(px(14.))),
+                        )
+                        .child(
+                            small_button(format!("filter-pin-{}", g.key).into())
+                                .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_projects_pinned(&members, !pinned, cx);
+                                }))
+                                .child(
+                                    gpui_kit::component::Icon::new(if pinned {
+                                        IconName::PinOff
+                                    } else {
+                                        IconName::Pin
+                                    })
                                     .size(px(14.)),
-                            ),
-                    )
-                    .child(
-                        small_button(format!("filter-gear-{}", g.key).into())
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(gear_title.clone()).build(window, cx)
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_filter(cx);
-                                this.open_settings("projects", cx);
-                            }))
-                            .child(gpui_kit::component::Icon::new(IconName::Settings).size(px(14.))),
-                    )
-            });
+                                ),
+                        )
+                }
+            };
             h_flex()
                 .id(SharedString::from(format!("filter-row-{}", group.map_or("all", |g| g.key.as_str()))))
                 .min_h(px(28.))
@@ -373,12 +393,11 @@ impl Workspace {
                 .child(div().relative().flex_none().size(px(16.)).child(row_icon).children(badge))
                 .child(
                     div()
-                        .flex_1()
                         .min_w_0()
                         .truncate()
                         .child(group.map_or(SharedString::from("All projects"), |g| g.display_name.clone().into())),
                 )
-                .children(controls)
+                .child(controls)
         }));
         let popup = v_flex()
             .id("sidebar-filter-popup")
