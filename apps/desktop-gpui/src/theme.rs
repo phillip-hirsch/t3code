@@ -584,7 +584,26 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.sidebar_accent = tokens.sidebar.row_active;
         colors.sidebar_accent_foreground = tokens.sidebar.foreground;
     });
+    web_scrollbar(&tokens, cx);
     cx.set_global(tokens);
+}
+
+/// `::-webkit-scrollbar` (`index.css`): a 6px thumb with 3px corners at the edge, on no track,
+/// shown whenever the content overflows, as Chromium shows styled scrollbars. Set on the base
+/// layer after `Theme::update`, which projects its own wider, hover-only bar.
+fn web_scrollbar(tokens: &Tokens, cx: &mut App) {
+    use gpui_kit::base::{ScrollbarMode, ScrollbarStyles, ScrollbarTheme, ScrollbarThumbStyle};
+    let thumb =
+        |color: Hsla| move |style: ScrollbarThumbStyle| style.bg(color).width(px(6.)).inset(px(0.)).radius(px(3.));
+    let styles = ScrollbarStyles::default()
+        .track(|style| style.width(px(6.)))
+        .track_hover(|style| style.width(px(6.)))
+        .track_active(|style| style.width(px(6.)))
+        .thumb(thumb(tokens.scrollbar_thumb))
+        .thumb_hover(thumb(tokens.scrollbar_thumb_hover))
+        .thumb_active(thumb(tokens.scrollbar_thumb_hover));
+    gpui_kit::base::Theme::global_mut(cx).scrollbar =
+        ScrollbarTheme::new().with_mode(ScrollbarMode::Always).with_styles(styles);
 }
 
 #[cfg(test)]
