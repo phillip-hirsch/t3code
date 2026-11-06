@@ -8,9 +8,7 @@
 //! ⌘Q, which quits directly when no window has focus, like Electron's `role: "quit"`.
 
 use gpui_kit::component::input;
-use gpui_kit::{
-    AnyWindowHandle, App, Global, KeyBinding, Menu, MenuItem, OsAction, PromptLevel, SystemMenuType, WeakEntity,
-};
+use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, PromptLevel, SystemMenuType};
 
 use super::Workspace;
 
@@ -33,14 +31,6 @@ gpui_kit::actions!(
 );
 
 const APP_NAME: &str = "T3 Code";
-
-/// The window the menu acts on, and its workspace.
-pub struct MainWindow {
-    pub window: AnyWindowHandle,
-    pub workspace: WeakEntity<Workspace>,
-}
-
-impl Global for MainWindow {}
 
 /// Installs the menu bar and its handlers; nothing off macOS.
 pub fn init(cx: &mut App) {
@@ -152,19 +142,17 @@ fn with_active_window(cx: &mut App, act: impl FnOnce(&mut gpui_kit::Window) + 's
     });
 }
 
-/// Acts on the main window's workspace, after GPUI hands the active window back.
+/// Acts on the main window's workspace, after GPUI hands the active window back; opens the
+/// window again if macOS closed it.
 fn with_workspace(
     cx: &mut App,
     act: impl FnOnce(&mut Workspace, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>) + 'static,
 ) {
-    let Some(main) = cx.try_global::<MainWindow>() else { return };
-    let (window, workspace) = (main.window, main.workspace.clone());
     cx.defer(move |cx| {
-        let updated = window.update(cx, |_, window, cx| {
-            window.activate_window();
-            workspace.update(cx, |workspace, cx| act(workspace, window, cx))
-        });
-        if let Err(error) = updated.and_then(|updated| updated) {
+        let Some((window, workspace)) = super::main_window::ensure(cx) else { return };
+        if let Err(error) =
+            window.update(cx, |_, window, cx| workspace.update(cx, |workspace, cx| act(workspace, window, cx)))
+        {
             log::warn!("menu action could not reach the workspace: {error:#}");
         }
     });

@@ -25,8 +25,6 @@ pub struct Desktop {
     pub initial: InitialBounds,
     /// This launch's command line, which may carry an app link.
     pub launch_args: Vec<String>,
-    /// Later launches' command lines ([`activation`]) and, on macOS, URLs the OS opens with the app.
-    pub launches: async_channel::Receiver<Vec<String>>,
 }
 
 impl Global for Desktop {}
@@ -96,14 +94,14 @@ pub fn launch_args() -> Vec<String> {
 }
 
 impl Desktop {
-    pub fn load(launches: async_channel::Receiver<Vec<String>>, cx: &App) -> Self {
+    pub fn load(cx: &App) -> Self {
         let settings = DesktopSettings::load();
         let displays: Vec<WindowRect> = cx.displays().iter().map(|display| rect(display.bounds())).collect();
         let initial = window_state::initial_bounds(&settings, &displays);
         if settings.main_window_bounds.is_some() && matches!(initial, InitialBounds::Default { .. }) {
             log::warn!("saved main window bounds could not be restored; using defaults");
         }
-        Self { settings, initial, launch_args: launch_args(), launches }
+        Self { settings, initial, launch_args: launch_args() }
     }
 
     /// Before macOS opens the closed window again: no replay of this launch's app links, and

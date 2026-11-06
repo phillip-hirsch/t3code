@@ -53,8 +53,6 @@ mod worktree_setup;
 
 use std::sync::OnceLock;
 
-use gpui_kit::{AppContext as _, TitlebarOptions, WindowDecorations, WindowOptions, point, px, size};
-
 /// Network and process I/O run here; GPUI owns the UI thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -89,14 +87,9 @@ fn main() {
     app.on_open_urls(move |urls| {
         let _ = links.try_send(urls);
     });
-    // A Dock click with the window closed opens it again (Electron's `activate`).
+    // A Dock click brings the window forward, or opens it again when closed (Electron's `activate`).
     app.on_reopen(|cx| {
-        if cx.windows().is_empty() {
-            cx.global_mut::<desktop::Desktop>().prepare_reopen();
-            open_main_window(cx);
-        } else {
-            cx.activate(true);
-        }
+        app::main_window::ensure(cx);
     });
     app.run(move |cx| {
         gpui_kit::init(cx);
@@ -126,8 +119,9 @@ fn main() {
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         desktop::linux_url_handler::register();
-        cx.set_global(desktop::Desktop::load(launches, cx));
-        open_main_window(cx);
+        cx.set_global(desktop::Desktop::load(cx));
+        app::main_window::open(cx);
+        app::main_window::receive_launches(launches, cx);
     });
 }
 
@@ -139,38 +133,4 @@ fn stop_local_servers_before_exit() {
     if stopped.is_err() {
         log::warn!("the local server had not stopped when the app exited");
     }
-}
-
-/// Opens the app's window where it was last closed. The app draws its own titlebar: Windows
-/// keeps the native resize frame, macOS its traffic lights, and Linux draws client-side
-/// decorations like Electron's frameless `titleBarOverlay` window, on Wayland and X11, with or
-/// without a compositor.
-fn open_main_window(cx: &mut gpui_kit::App) {
-    // The window reuses the app's backend; the first window, or one after it failed or
-    // stopped, starts it.
-    if cx.try_global::<environments::PrimaryBackend>().is_none_or(environments::PrimaryBackend::ended) {
-        cx.set_global(environments::PrimaryBackend::start(runtime().handle()));
-    }
-    let (x, y) = app::TRAFFIC_LIGHTS;
-    let options = WindowOptions {
-        titlebar: Some(TitlebarOptions {
-            title: Some("T3 Code".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(x), px(y))),
-        }),
-        window_bounds: Some(cx.global::<desktop::Desktop>().window_bounds(cx)),
-        window_min_size: Some(size(px(840.), px(620.))),
-        window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
-        // Linux docks group the window under its desktop entry by this id (Wayland `app_id`, X11 `WM_CLASS`).
-        app_id: Some(desktop::APP_ID.to_owned()),
-        #[cfg(target_os = "linux")]
-        icon: desktop::window_icon(),
-        ..Default::default()
-    };
-    let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
-        theme::sync(window, cx);
-        cx.new(|cx| app::Workspace::new(window, cx))
-    })
-    .expect("failed to open window");
-    cx.set_global(app::menu::MainWindow { window, workspace: workspace.downgrade() });
 }

@@ -67,7 +67,6 @@ pub(super) struct DesktopShell {
     pub(super) exposure: Option<crate::desktop::exposure::ExposureView>,
     pub(super) exposure_pending: bool,
     pub(super) _exposure_task: Option<Task<()>>,
-    _launches: Task<()>,
 }
 
 impl DesktopShell {
@@ -76,14 +75,6 @@ impl DesktopShell {
         let desktop = cx.global::<Desktop>();
         let persistence = BoundsPersistence::new(&desktop.settings, desktop.initial, opened);
         let pending_links = desktop.launch_args.iter().filter_map(|arg| links::parse_app_link(arg)).collect();
-        let receiver = desktop.launches.clone();
-        let launches = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(args) = receiver.recv().await {
-                if this.update_in(cx, |this, window, cx| this.receive_launch(args, window, cx)).is_err() {
-                    return;
-                }
-            }
-        });
         let subscriptions = vec![
             cx.observe_window_bounds(window, super::Workspace::window_bounds_changed),
             cx.on_app_quit(|this, cx| {
@@ -104,7 +95,6 @@ impl DesktopShell {
             exposure: None,
             exposure_pending: false,
             _exposure_task: None,
-            _launches: launches,
         };
         (shell, subscriptions)
     }
@@ -137,13 +127,9 @@ impl Workspace {
         }));
     }
 
-    /// A later launch's arguments (`second-instance`): its app links open here, and the window
-    /// comes forward either way.
-    fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        // Electron's reveal: `app.focus({ steal: true })` on macOS, then the window.
-        #[cfg(target_os = "macos")]
-        cx.activate(true);
-        window.activate_window();
+    /// A later launch's arguments (`second-instance`), once [`super::main_window::ensure`]
+    /// brought this window forward: its app links open here.
+    pub(super) fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.desktop.pending_links.extend(args.iter().filter_map(|arg| links::parse_app_link(arg)));
         self.open_pending_links(window, cx);
     }
