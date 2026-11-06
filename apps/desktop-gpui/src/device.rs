@@ -28,6 +28,23 @@ pub struct HostStatusEntry {
     pub detail: Option<String>,
     #[serde(default)]
     pub android_discovery_incomplete: bool,
+    /// Platforms whose discovery reported a problem, so their listing may be missing devices.
+    #[serde(default, deserialize_with = "crate::model::lossy")]
+    pub incomplete_platforms: Vec<String>,
+}
+
+impl HostStatusEntry {
+    /// `incompleteListings`: the platforms whose latest listing on a ready host may be missing devices.
+    pub fn incomplete_listings(&self) -> Vec<&'static str> {
+        let listed = |platform: &str| self.incomplete_platforms.iter().any(|p| p == platform);
+        ["ios", "android"]
+            .into_iter()
+            .filter(|platform| {
+                self.status == HostStatus::Ready
+                    && (listed(platform) || (*platform == "android" && self.android_discovery_incomplete))
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

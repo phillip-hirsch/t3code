@@ -368,7 +368,12 @@ pub(super) fn host_status(state: Option<&DeviceState>, host_id: &str) -> Option<
     let Some(state) = state else { return Some(SourceStatus { tone: Tone::Pending, label: "Loading", detail: None }) };
     let status = state.host_statuses.get(host_id)?;
     let (tone, label) = match status.status {
-        HostStatus::Ready if status.android_discovery_incomplete => (Tone::Warning, "Android list may be incomplete"),
+        HostStatus::Ready => match status.incomplete_listings().as_slice() {
+            [] => return None,
+            ["ios"] => (Tone::Warning, "iOS list may be incomplete"),
+            [_] => (Tone::Warning, "Android list may be incomplete"),
+            _ => (Tone::Warning, "Device list may be incomplete"),
+        },
         HostStatus::Installing | HostStatus::Starting => (Tone::Pending, "Starting"),
         HostStatus::Failed => (Tone::Error, "Failed"),
         _ => return None,
@@ -584,6 +589,9 @@ mod tests {
             "hostStatuses": {
                 "ready": {"status": "ready"},
                 "partial": {"status": "ready", "androidDiscoveryIncomplete": true},
+                "ios": {"status": "ready", "incompletePlatforms": ["ios"], "detail": "xcrun: timed out"},
+                "both": {"status": "ready", "incompletePlatforms": ["ios", "android"]},
+                "idle": {"status": "idle", "incompletePlatforms": ["ios"]},
                 "boot": {"status": "starting", "detail": "Installing hub"},
                 "down": {"status": "failed", "detail": "ssh: timeout"},
             },
@@ -592,7 +600,13 @@ mod tests {
         .unwrap();
         assert_eq!(host_status(Some(&state), "ready"), None);
         assert_eq!(host_status(Some(&state), "missing"), None);
-        assert_eq!(host_status(Some(&state), "partial").unwrap().tone, Tone::Warning);
+        let label = |host_id: &str| host_status(Some(&state), host_id).map(|status| status.label);
+        assert_eq!(label("partial"), Some("Android list may be incomplete"));
+        assert_eq!(label("ios"), Some("iOS list may be incomplete"));
+        assert_eq!(label("both"), Some("Device list may be incomplete"));
+        assert_eq!(label("idle"), None);
+        let ios = host_status(Some(&state), "ios").unwrap();
+        assert_eq!((ios.tone, ios.detail.as_deref()), (Tone::Warning, Some("xcrun: timed out")));
         assert_eq!(host_status(Some(&state), "boot").unwrap().label, "Starting");
         let down = host_status(Some(&state), "down").unwrap();
         assert_eq!((down.tone, down.detail.as_deref()), (Tone::Error, Some("ssh: timeout")));

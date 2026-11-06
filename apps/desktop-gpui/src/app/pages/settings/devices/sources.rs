@@ -17,6 +17,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
@@ -158,8 +159,37 @@ impl Workspace {
             )
             .child(div().truncate().text_xs().text_color(t.muted_foreground).child(row.description.clone()));
         if let Some(problem) = problem {
-            let color = if problem.tone == Tone::Error { t.error } else { t.warning };
-            let message: SharedString = problem.detail.clone().unwrap_or_else(|| problem.label.to_owned()).into();
+            let error = problem.tone == Tone::Error;
+            let color = if error { t.error } else { t.warning };
+            // An error says what failed; a warning names itself and keeps the cause behind "Details".
+            let message: SharedString = match &problem.detail {
+                Some(detail) if error => detail.clone().into(),
+                _ => problem.label.into(),
+            };
+            let details = problem.detail.clone().filter(|_| !error).map(|detail| {
+                let t = *t;
+                Popover::new(ElementId::Name(format!("device-source-details-{key}").into()))
+                    .anchor(Anchor::TopLeft)
+                    .w(px(512.))
+                    .p(px(8.))
+                    .trigger(
+                        Button::new(ElementId::Name(format!("device-source-details-trigger-{key}").into()))
+                            .text()
+                            .xsmall()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.foreground)
+                            .label("Details"),
+                    )
+                    .content(move |_, _, _| {
+                        div()
+                            .whitespace_normal()
+                            .font_family(t.fonts.mono)
+                            .text_xs()
+                            .text_color(t.muted_foreground)
+                            .child(detail.clone())
+                    })
+            });
             text = text.child(
                 h_flex()
                     .mt(px(4.))
@@ -168,6 +198,7 @@ impl Workspace {
                     .text_xs()
                     .text_color(color)
                     .child(div().min_w_0().child(message))
+                    .children(details)
                     .when_some(row.action.clone(), |this, action| {
                         let label = match action {
                             StatusAction::Refresh => "Refresh",
