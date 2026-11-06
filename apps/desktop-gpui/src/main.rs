@@ -82,6 +82,9 @@ fn main() {
         }
         None => None,
     };
+    // `channel` stays here until the process exits, holding the single-instance lock; GPUI
+    // drops quit handlers as soon as quitting starts, so they get only the socket's removal.
+    let close_channel = channel.as_ref().map(desktop::activation::Channel::closer);
     let app = gpui_kit::application().with_assets(assets::Assets);
     // macOS hands `t3code://` links to the running app as URLs (Electron's `open-url`).
     app.on_open_urls(move |urls| {
@@ -110,9 +113,9 @@ fn main() {
         desktop::quit_on_signals(cx);
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
-        if let Some(channel) = channel {
+        if let Some(close_channel) = close_channel {
             cx.on_app_quit(move |_| {
-                channel.close();
+                close_channel();
                 async {}
             })
             .detach();
