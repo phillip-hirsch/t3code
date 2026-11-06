@@ -233,7 +233,7 @@ impl Failure {
                     "the keyring"
                 };
                 format!(
-                    "Connection credential {id} is saved, but this device could not decrypt it ({error}). It is kept: make {store} available to T3 Code, then restart it."
+                    "Connection credential {id} is saved, but this device could not decrypt it ({error}). It is kept: make {store} available to T3 Code, then retry."
                 )
             }
             Credential::Missing | Credential::Token(_) => format!("Connection credential {id} is unavailable."),
@@ -417,6 +417,17 @@ impl fmt::Debug for Credential {
             Self::Missing => f.write_str("Missing"),
             Self::Token(_) => f.write_str("Token(<redacted>)"),
             Self::Locked { error, .. } => f.debug_struct("Locked").field("error", error).finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Credential {
+    /// Tries a locked credential's decryption again, e.g. once the keyring is unlocked.
+    /// Blocks on the platform store, so it runs off the UI thread.
+    pub fn reopen(&self) -> Option<Self> {
+        match self {
+            Self::Locked { stored, .. } => Some(open_credential(stored.clone(), secure::unprotect)),
+            Self::Missing | Self::Token(_) => None,
         }
     }
 }
@@ -1321,6 +1332,11 @@ mod tests {
         assert!(!document.to_string().contains("secret-token"));
         let reread = read(&document, secure::unprotect);
         assert_eq!((reread.local_environment_enabled, reread.environments), (false, catalog.environments));
+        // A credential that was locked opens once the store works again.
+        let stored = document["environments"][0]["encryptedToken"].as_str().unwrap().to_owned();
+        let locked = Credential::Locked { stored, error: "locked".into() };
+        assert_eq!(locked.reopen(), Some(Credential::Token("secret-token".into())));
+        assert_eq!(Credential::Missing.reopen(), None);
         // A credential DPAPI cannot open is kept as stored.
         let mut tampered = document;
         tampered["environments"][0]["encryptedToken"] = json!("00ff");

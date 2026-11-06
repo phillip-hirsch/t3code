@@ -281,11 +281,12 @@ impl SavedEnvironments {
         session.state = ConnectionState::default();
         session.client = None;
         let own = environment.enabled && self.primary.as_deref().is_none_or(|id| id != environment_id);
-        session._task = own.then(|| Self::supervise(environment, 0, cx));
+        session._task = own.then(|| Self::supervise(environment, 0, false, cx));
         cx.notify();
     }
 
     /// `retryNow`: attempts at once, keeping the failure and attempt count on screen meanwhile.
+    /// A credential the keyring would not open is decrypted again first.
     pub fn retry(&mut self, environment_id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.get(environment_id).cloned().filter(|e| e.enabled) else { return };
         if self.is_primary(environment_id) {
@@ -293,7 +294,21 @@ impl SavedEnvironments {
         }
         let Some(session) = self.sessions.get_mut(environment_id) else { return };
         let failures = session.state.attempt;
-        session._task = Some(Self::supervise(environment, failures, cx));
+        session._task = Some(Self::supervise(environment, failures, true, cx));
+    }
+
+    /// Puts a credential decrypted again in place of the locked one it came from, here and
+    /// in queued writes, so a write that finishes later does not lock it again.
+    fn reopened(&mut self, environment_id: &str, locked: &Credential, opened: &Credential, cx: &mut Context<Self>) {
+        let queued = [&mut self.writes.writing, &mut self.writes.next].into_iter().flatten().map(|b| &mut b.catalog);
+        for catalog in self.catalog.iter_mut().chain(queued) {
+            if let Some(environment) = catalog.get_mut(environment_id)
+                && environment.credential == *locked
+            {
+                environment.credential = opened.clone();
+            }
+        }
+        cx.notify();
     }
 
     fn update_session(&mut self, environment_id: &str, cx: &mut Context<Self>, update: impl FnOnce(&mut Session)) {
@@ -303,9 +318,21 @@ impl SavedEnvironments {
         }
     }
 
-    fn supervise(environment: SavedEnvironment, failures: u32, cx: &mut Context<Self>) -> Task<()> {
+    /// `reopen` first decrypts a locked credential again, off the UI thread.
+    fn supervise(mut environment: SavedEnvironment, failures: u32, reopen: bool, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let id = environment.environment_id.clone();
+            if reopen && matches!(environment.credential, Credential::Locked { .. }) {
+                let locked = environment.credential.clone();
+                let opened = cx.background_executor().spawn(async move { locked.reopen() }).await;
+                if let Some(opened) = opened {
+                    let locked = std::mem::replace(&mut environment.credential, opened);
+                    let updated = this.update(cx, |this, cx| this.reopened(&id, &locked, &environment.credential, cx));
+                    if updated.is_err() {
+                        return;
+                    }
+                }
+            }
             let mut failures = failures;
             loop {
                 let attempt = failures + 1;
