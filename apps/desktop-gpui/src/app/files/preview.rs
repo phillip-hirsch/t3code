@@ -489,6 +489,9 @@ impl Workspace {
         let next = again.then(|| SAVE_DEBOUNCE.saturating_sub(state.last_change.elapsed()));
         match result {
             Ok(_) => {
+                if let Some(markdown) = &state.markdown {
+                    markdown.update(cx, |view, cx| view.set_text(&contents, cx));
+                }
                 state.table = None;
                 state.revision += 1;
                 state.saved = contents;
