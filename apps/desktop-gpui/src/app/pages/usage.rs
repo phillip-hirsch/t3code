@@ -1504,7 +1504,8 @@ pub(super) fn segmented<V: Copy + PartialEq + std::fmt::Debug + 'static>(
             .flex()
             .items_center()
             .rounded(px(6.))
-            .text_xs()
+            // `text-xs` with the base's `sm:text-sm`, which wins at desktop widths.
+            .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
             .map(|el| {
