@@ -940,6 +940,10 @@ fn destination_start(text: &str, opener: u8) -> Option<usize> {
     loop {
         match *bytes.get(at)? {
             b'\\' => at += 1,
+            b'`' => {
+                at = code_span_end(bytes, at);
+                continue;
+            }
             b'[' => depth += 1,
             b']' => {
                 depth = depth.checked_sub(1)?;
@@ -960,6 +964,26 @@ fn destination_start(text: &str, opener: u8) -> Option<usize> {
         at += 1;
     }
     Some(at + usize::from(bytes.get(at) == Some(&b'<')))
+}
+
+/// Past the code span a backtick run at `at` opens, whose brackets are text; an unclosed run is
+/// only backticks.
+fn code_span_end(bytes: &[u8], at: usize) -> usize {
+    let run_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let run = run_at(at);
+    let mut i = at + run;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let close = run_at(i);
+            if close == run {
+                return i + close;
+            }
+            i += close;
+        } else {
+            i += 1;
+        }
+    }
+    at + run
 }
 
 /// The destinations under `node` that resolve, in document order, as source ranges.
@@ -2293,10 +2317,10 @@ mod tests {
             "``![a](/x.png) ` ``, ```![b](/y)```, ![c](https://git.cafe/z.png)",
             "multi-backtick code spans keep their text"
         );
-        let written = r"![label \](/api/x)](/api/x) ![n [b](/c)](/d) ![e](&#47;api/e)";
+        let written = r"![label \](/api/x)](/api/x) ![n [b](/c)](/d) ![e](&#47;api/e) ![a `]` b](/f)";
         assert_eq!(
             resolve_media_urls(written, origin),
-            r"![label \](/api/x)](https://git.cafe/api/x) ![n [b](/c)](https://git.cafe/d) ![e](https://git.cafe&#47;api/e)",
+            r"![label \](/api/x)](https://git.cafe/api/x) ![n [b](/c)](https://git.cafe/d) ![e](https://git.cafe&#47;api/e) ![a `]` b](https://git.cafe/f)",
             "the destination after the label's own bracket, as written"
         );
     }
