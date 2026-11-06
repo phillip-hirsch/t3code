@@ -1550,7 +1550,7 @@ impl Workspace {
                     return;
                 };
                 picker.candidates = Some(result.map_err(|error| list_logic::error_message(&error)));
-                this.search_pr_reviewers(cx);
+                this.search_pr_reviewers(&key, cx);
                 cx.notify();
             });
         })
@@ -1565,7 +1565,7 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
                 picker.debounced = picker.search.read(cx).value().trim().to_owned();
-                this.search_pr_reviewers(cx);
+                this.search_pr_reviewers(&key, cx);
                 cx.notify();
             });
         });
@@ -1574,20 +1574,19 @@ impl Workspace {
         }
     }
 
-    /// Whether the shown pull request's host matches reviewer queries past the first page.
-    fn pr_reviewers_searchable(&self) -> bool {
-        self.pull_requests
-            .panel
-            .as_ref()
+    /// Whether the host of the pull request `key` names matches reviewer queries past the first page.
+    fn pr_reviewers_searchable(&self, key: &str) -> bool {
+        self.pr_panel_ref(key)
             .and_then(|p| p.detail.as_ref())
             .is_some_and(|d| d.capabilities.reviewers.search_candidates)
     }
 
-    /// Asks the host for the settled query when the loaded page cannot answer it.
-    fn search_pr_reviewers(&mut self, cx: &mut Context<Self>) {
-        let searchable = self.pr_reviewers_searchable();
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+    /// Asks the host for the settled query when the loaded page cannot answer it; the pull
+    /// request `key` names, shown or parked, owns the search.
+    fn search_pr_reviewers(&mut self, key: &str, cx: &mut Context<Self>) {
+        let searchable = self.pr_reviewers_searchable(key);
+        let Some(client) = self.pull_request_client_of(key) else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
         let (key, mut input) = (panel.reference.key(), panel.reference.to_json());
         let Some(picker) = panel.write.picker.as_mut().filter(|p| p.kind == PickerKind::Reviewers) else { return };
         let loaded = picker.candidates.as_ref().and_then(|c| c.as_ref().ok());
@@ -1725,7 +1724,7 @@ impl Workspace {
                 let (matching, pending, error, truncated) = if reviewers {
                     let input = reviewer_search::SearchInput {
                         loaded: Some(value),
-                        searchable: self.pr_reviewers_searchable(),
+                        searchable: self.shown_pr_key().is_some_and(|key| self.pr_reviewers_searchable(&key)),
                         query: &typed,
                         debounced: &picker.debounced,
                     };
