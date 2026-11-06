@@ -63,6 +63,13 @@ impl Workspace {
                 let this = cx.weak_entity();
                 let minimap = self.render_minimap(lane.left, window, cx);
                 let lane_width = lane.width;
+                // The list keeps its top row's pixel offset across a width change, so reflowed text
+                // would slide under it; anchor that row proportionally instead, as the browser keeps
+                // what was in view.
+                let previous = self.timeline_lane_width.replace(lane_width);
+                if previous > 0. && (previous - lane_width).abs() >= 0.5 {
+                    self.scroller.update(cx, |scroller, cx| scroller.remeasure(cx));
+                }
                 let composer = self.composer_height;
                 // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
                 let pill_offset = lane.left - lane.right;

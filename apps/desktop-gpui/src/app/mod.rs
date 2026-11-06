@@ -171,6 +171,8 @@ pub struct Workspace {
     /// The floating composer's height last frame: the transcript reserves it at its end, and the
     /// "Scroll to end" pill sits above it (`composerTimelineInset`).
     composer_height: f32,
+    /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
+    timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
     /// Composer text and question drafts of the targets not on screen.
@@ -360,6 +362,7 @@ impl Workspace {
             runtime_mode_override: None,
             composer_empty: true,
             composer_height: 0.,
+            timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
             composer_drafts: HashMap::new(),
             responding: None,
