@@ -581,6 +581,73 @@ fn capitalize(text: &str) -> String {
     chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
+/// One setting that reads from a secret provider (`SecretProviderUse`).
+#[derive(Debug, PartialEq)]
+pub(super) struct SecretProviderUse {
+    pub id: String,
+    pub label: String,
+}
+
+fn reads_from(value: &Value, provider: &str) -> bool {
+    value.is_object() && value["provider"] == provider && value["reference"].is_string()
+}
+
+/// `secretProviderUses`: what reads from secret provider `provider`, one readable name per
+/// field, in settings order. Provider variables arrive with the reference in `secret`.
+pub(super) fn secret_provider_uses(settings: &Value, provider: &str) -> Vec<SecretProviderUse> {
+    let mut uses = Vec::new();
+    let mut add = |id: String, label: String| uses.push(SecretProviderUse { id, label });
+    let empty = serde_json::Map::new();
+    for (instance_id, instance) in settings["providerInstances"].as_object().unwrap_or(&empty) {
+        let driver = instance["driver"].as_str().unwrap_or_default();
+        let client = super::super::providers::driver_secret_fields(driver);
+        let owner =
+            instance["displayName"].as_str().or(client.as_ref().map(|(label, _)| *label)).unwrap_or(instance_id);
+        for (key, label) in client.iter().flat_map(|(_, fields)| fields) {
+            if reads_from(&instance["config"][key], provider) {
+                add(format!("provider:{instance_id}:{key}:"), format!("{owner} · {label}"));
+            }
+        }
+        for variable in instance["environment"].as_array().into_iter().flatten() {
+            let value = variable.get("secret").filter(|s| s.is_object()).unwrap_or(&variable["value"]);
+            if reads_from(value, provider) {
+                let name = variable["name"].as_str().unwrap_or_default();
+                add(format!("provider:{instance_id}:env:{name}"), format!("{owner} · {name}"));
+            }
+        }
+    }
+    for field in super::super::code::source_control::secret_reference_fields() {
+        let (kind, host, key) = (field.kind, field.host, field.key);
+        let value = &settings["sourceControlHosts"][kind][key];
+        match field.label {
+            Some(label) if reads_from(value, provider) => {
+                add(format!("source-control:{kind}:{key}:"), format!("{host} · {label}"));
+            }
+            None => {
+                for (hostname, entry) in value.as_object().unwrap_or(&empty) {
+                    if reads_from(entry, provider) {
+                        add(format!("source-control:{kind}:{key}:{hostname}"), format!("{host} · {hostname}"));
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for (id, source) in settings["usageLimitSources"].as_object().unwrap_or(&empty) {
+        if reads_from(&source["managementKey"], provider) {
+            let owner = source["label"].as_str().or(source["url"].as_str()).unwrap_or_default();
+            add(format!("usage-limit:{id}:managementKey:"), format!("{owner} · Management Key"));
+        }
+    }
+    for host in settings["easDeviceHosts"].as_array().into_iter().flatten() {
+        if reads_from(&host["accessToken"], provider) {
+            let (id, label) = (host["id"].as_str().unwrap_or_default(), host["label"].as_str().unwrap_or_default());
+            add(format!("eas:{id}:accessToken:"), format!("{label} · Access Token"));
+        }
+    }
+    uses
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -750,5 +817,41 @@ mod tests {
             remote_clients_denial(&json!({"organization": "Acme", "limits": {"clients": ["desktop"]}})).as_deref(),
             Some("Acme's policy does not allow connecting from other devices.")
         );
+    }
+
+    #[test]
+    fn lists_what_reads_from_a_secret_provider() {
+        let op = |reference: &str| json!({"provider": "op", "reference": reference});
+        let other = json!({"provider": "vault", "reference": "x"});
+        let settings = json!({
+            "providerInstances": {
+                "opencode": {"driver": "opencode", "config": {"serverPassword": op("op://a/b/c")}, "environment": [
+                    {"name": "TOKEN", "value": "", "sensitive": true, "secret": op("op://t")},
+                    {"name": "PLAIN", "value": "x", "sensitive": false},
+                    {"name": "ELSEWHERE", "value": "", "sensitive": true, "secret": other},
+                ]},
+                "work": {"driver": "antigravity", "displayName": "Work", "config": {"apiKey": op("op://k")}},
+            },
+            "sourceControlHosts": {
+                "github": {"tokens": {"github.com": op("op://gh"), "ghe.example": "redacted"}},
+                "bitbucket": {"apiToken": op("op://bb")},
+            },
+            "usageLimitSources": {"proxy": {"kind": "cliproxy", "url": "https://proxy", "managementKey": op("op://m")}},
+            "easDeviceHosts": [{"id": "eas", "label": "EAS Simulator", "accessToken": op("op://e")}],
+        });
+        let labels: Vec<String> = secret_provider_uses(&settings, "op").into_iter().map(|u| u.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "OpenCode · Server password",
+                "OpenCode · TOKEN",
+                "Work · API key",
+                "GitHub · github.com",
+                "Bitbucket · API token",
+                "https://proxy · Management Key",
+                "EAS Simulator · Access Token",
+            ]
+        );
+        assert!(secret_provider_uses(&settings, "missing").is_empty());
     }
 }

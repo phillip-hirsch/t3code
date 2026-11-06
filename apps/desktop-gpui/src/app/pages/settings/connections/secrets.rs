@@ -135,10 +135,14 @@ impl Workspace {
                         });
                         let remove = {
                             let (client, id, label) = (client.clone(), id.clone(), label.clone());
+                            let uses: Vec<String> = logic::secret_provider_uses(self.server_settings(), &id)
+                                .into_iter()
+                                .map(|u| u.label)
+                                .collect();
                             WebButton::new(ElementId::Name(format!("secret-provider-remove-{id}").into()), "Remove")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
-                                    confirm_remove(client.clone(), id.clone(), label.clone(), window, cx);
+                                    confirm_remove(client.clone(), id.clone(), label.clone(), uses.clone(), window, cx);
                                 })
                         };
                         h_flex().gap(px(4.)).children(edit).child(remove).into_any_element()
@@ -190,14 +194,42 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
         .into_any_element()
 }
 
-fn confirm_remove(client: Option<RpcClient>, id: String, label: String, window: &mut Window, cx: &mut App) {
-    window.open_alert_dialog(cx, move |dialog, _, _| {
+/// `RemoveSecretProviderButton`; `uses` are what reads from the provider and will be unset.
+fn confirm_remove(
+    client: Option<RpcClient>,
+    id: String,
+    label: String,
+    uses: Vec<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.open_alert_dialog(cx, move |dialog, _, cx| {
         let (client, id) = (client.clone(), id.clone());
+        let t = theme::tokens(cx);
+        let description = if uses.is_empty() {
+            format!("Nothing reads from {label}. The secrets themselves are untouched.").into_any_element()
+        } else {
+            let list = v_flex()
+                .id("secret-provider-uses")
+                .max_h(px(192.))
+                .overflow_y_scroll()
+                .gap(px(2.))
+                .text_color(t.foreground)
+                .children(uses.iter().map(|use_label| {
+                    h_flex()
+                        .items_start()
+                        .child(div().w(px(20.)).flex_none().text_center().child("•"))
+                        .child(text_sm(div().min_w_0()).child(use_label.clone()))
+                }));
+            v_flex()
+                .gap(px(8.))
+                .child(format!("These read from {label} and will be unset. The secrets themselves are untouched."))
+                .child(list)
+                .into_any_element()
+        };
         dialog
             .title(format!("Remove {label}?"))
-            .description(format!(
-                "Provider variables that read from {label} stop resolving until a provider with the same name is added again. The secrets themselves are untouched."
-            ))
+            .description(description)
             .show_cancel(true)
             .ok_text("Remove provider")
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)

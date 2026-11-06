@@ -478,11 +478,13 @@ impl EnvironmentDraft {
                 .iter()
                 .map(|v| {
                     self.next_id += 1;
+                    // The wire form keeps a reference in `secret` beside an empty value; it is always sensitive.
+                    let secret = v.get("secret").filter(|s| s.is_object());
                     EnvRow {
                         id: self.next_id,
                         name: v["name"].as_str().unwrap_or_default().to_owned(),
-                        value: v.get("value").cloned().unwrap_or(json!("")),
-                        sensitive: v["sensitive"] != false,
+                        value: secret.or_else(|| v.get("value")).cloned().unwrap_or(json!("")),
+                        sensitive: secret.is_some() || v["sensitive"] != false,
                         redacted: v.get("valueRedacted").and_then(Value::as_bool),
                     }
                 })
@@ -504,7 +506,11 @@ impl EnvironmentDraft {
                 }
                 continue;
             }
-            let mut variable = json!({"name": name, "value": row.value, "sensitive": row.sensitive});
+            let mut variable = if row.value.is_object() {
+                json!({"name": name, "value": "", "secret": row.value, "sensitive": true})
+            } else {
+                json!({"name": name, "value": row.value, "sensitive": row.sensitive})
+            };
             if let Some(redacted) = row.redacted {
                 variable["valueRedacted"] = json!(redacted);
             }
@@ -1624,7 +1630,7 @@ impl Workspace {
         let value_text = if env.redacted == Some(true) { "" } else { env.value.as_str().unwrap_or_default() };
         let value_input = {
             let update = update.clone();
-            let placeholder = if env.sensitive && env.redacted == Some(true) {
+            let placeholder = if env.sensitive && (env.redacted == Some(true) || env.value.is_object()) {
                 "Stored secret, enter a new value to replace"
             } else {
                 "value"
@@ -1641,7 +1647,10 @@ impl Workspace {
                     update(
                         this,
                         &move |row: &mut EnvRow| {
-                            if row.sensitive && row.redacted == Some(true) && value.is_empty() {
+                            if row.sensitive
+                                && (row.redacted == Some(true) || row.value.is_object())
+                                && value.is_empty()
+                            {
                                 return;
                             }
                             row.value = json!(value);
@@ -1929,6 +1938,18 @@ mod tests {
         draft.rows[1].name = "1bad".into();
         assert_eq!(draft.published(), None);
         assert!(is_variable_name("_OK1") && !is_variable_name("") && !is_variable_name("A-B"));
+    }
+
+    #[test]
+    fn environment_draft_keeps_secret_references() {
+        let secret = json!({"provider": "onepassword", "reference": "op://Private/item/field"});
+        let mut draft = EnvironmentDraft::default();
+        draft.reconcile("codex", &[json!({"name": "API_KEY", "value": "", "sensitive": false, "secret": secret})]);
+        assert_eq!((&draft.rows[0].value, draft.rows[0].sensitive), (&secret, true));
+        assert_eq!(
+            draft.published(),
+            Some(vec![json!({"name": "API_KEY", "value": "", "secret": secret, "sensitive": true})])
+        );
     }
 
     #[test]

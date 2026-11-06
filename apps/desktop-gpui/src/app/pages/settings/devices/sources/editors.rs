@@ -979,10 +979,11 @@ impl SimlockEditor {
     ) -> Self {
         let is_new = host.is_none();
         let host = host.unwrap_or_else(|| hosts::new_simlock_host(new_host_id()));
-        let saved = !host.agent_token.is_empty();
+        let saved = has_token(&host.agent_token);
+        let configured = saved && host.agent_token.is_string();
         let name = text_input(window, cx, &host.label, "", false);
         let gateway = text_input(window, cx, &host.gateway_url, "https://gateway.example.ts.net:4700", false);
-        let token_input = text_input(window, cx, "", token_placeholder(saved, "Not set"), true);
+        let token_input = text_input(window, cx, "", token_placeholder(configured, "Not set"), true);
         let leases = text_input(window, cx, &host.max_leases.to_string(), "", false);
         let lease_minutes = text_input(window, cx, &host.max_lease_minutes.to_string(), "", false);
         name.update(cx, |input, cx| input.focus(window, cx));
@@ -1003,7 +1004,7 @@ impl SimlockEditor {
                     let typed = value(input, cx);
                     this.token = if !typed.is_empty() {
                         TokenEntry::New(typed)
-                    } else if !this.host.agent_token.is_empty() {
+                    } else if has_token(&this.host.agent_token) {
                         TokenEntry::Saved
                     } else {
                         TokenEntry::Cleared

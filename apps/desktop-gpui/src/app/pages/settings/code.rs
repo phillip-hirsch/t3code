@@ -6,7 +6,7 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 
 #[path = "source_control.rs"]
-mod source_control;
+pub(super) mod source_control;
 #[path = "worktrees.rs"]
 mod worktrees;
 

@@ -38,6 +38,12 @@ use crate::app::Workspace;
 use crate::settings::contract;
 use crate::theme::{self, Tokens};
 
+/// A driver's label and its settings that may name a secret reference, with their field labels.
+pub(super) fn driver_secret_fields(kind: &str) -> Option<(&'static str, Vec<(&'static str, &'static str)>)> {
+    let driver = drivers::driver(kind)?;
+    Some((driver.label, driver.fields.iter().filter(|f| f.secret).map(|f| (f.key, f.label)).collect()))
+}
+
 /// What the page keeps between frames, like the panel's React state.
 #[derive(Default)]
 pub(super) struct ProvidersPage {

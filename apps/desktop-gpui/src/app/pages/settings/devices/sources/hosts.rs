@@ -64,9 +64,9 @@ pub(super) struct SimlockHost {
     pub id: String,
     pub label: String,
     pub gateway_url: String,
-    /// Redacted once saved; sending it back keeps it.
-    #[serde(default)]
-    pub agent_token: String,
+    /// A literal (redacted once saved; sending it back keeps it) or a secret reference object.
+    #[serde(default = "empty_token")]
+    pub agent_token: Value,
     #[serde(default = "two")]
     pub max_leases: i64,
     #[serde(default = "sixty")]
@@ -264,7 +264,7 @@ pub(super) fn new_simlock_host(id: String) -> SimlockHost {
         id,
         label: "Simlock".into(),
         gateway_url: String::new(),
-        agent_token: String::new(),
+        agent_token: empty_token(),
         max_leases: 2,
         max_lease_minutes: 60,
         extra: Map::new(),
@@ -339,11 +339,11 @@ pub(super) fn plan_simlock_save(
     if let Some(problem) = simlock_problem(draft) {
         return Err(problem);
     }
-    let saved = hosts.iter().find(|host| host.id == draft.id).map(|host| host.agent_token.clone()).unwrap_or_default();
+    let saved = hosts.iter().find(|host| host.id == draft.id).map_or_else(empty_token, |host| host.agent_token.clone());
     let agent_token = match token {
         TokenEntry::Saved => saved,
-        TokenEntry::New(value) => value.trim().to_owned(),
-        TokenEntry::Cleared => String::new(),
+        TokenEntry::New(value) => value.trim().into(),
+        TokenEntry::Cleared => empty_token(),
     };
     Ok(update_simlock_hosts(hosts, &SimlockHost { agent_token, ..draft.clone() }, false))
 }
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn saves_the_shared_simlock_fields_and_the_environments_own_token() {
         let host = simlock();
-        let draft = SimlockHost { label: "Pool".into(), agent_token: String::new(), ..host.clone() };
+        let draft = SimlockHost { label: "Pool".into(), agent_token: empty_token(), ..host.clone() };
         let saved = [SimlockHost { agent_token: "<redacted>".into(), ..host }];
         assert_eq!(
             plan_simlock_save(&saved, &draft, &TokenEntry::Saved).unwrap(),
@@ -571,7 +571,10 @@ mod tests {
             plan_simlock_save(&[], &draft, &TokenEntry::New(" cups-token ".into())).unwrap(),
             [SimlockHost { agent_token: "cups-token".into(), ..draft.clone() }]
         );
-        assert_eq!(plan_simlock_save(&[], &draft, &TokenEntry::Cleared).unwrap(), [draft]);
+        assert_eq!(plan_simlock_save(&[], &draft, &TokenEntry::Cleared).unwrap(), std::slice::from_ref(&draft));
+        let reference = serde_json::json!({"provider": "homelab", "reference": "simlock#token"});
+        let referenced = [SimlockHost { agent_token: reference, ..draft.clone() }];
+        assert_eq!(plan_simlock_save(&referenced, &draft, &TokenEntry::Saved).unwrap(), referenced);
     }
 
     #[test]

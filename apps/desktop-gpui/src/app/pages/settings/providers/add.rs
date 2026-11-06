@@ -37,6 +37,11 @@ fn config_str<'a>(config: &'a Value, key: &str) -> &'a str {
     config.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// A saved credential: a non-empty (redacted) literal, or a secret reference.
+fn has_secret(config: &Value, key: &str) -> bool {
+    config.get(key).is_some_and(|value| value.as_str().map_or(value.is_object(), |text| !text.is_empty()))
+}
+
 fn with_command_args(config: &Value, args: Vec<String>) -> Value {
     let mut base = config.as_object().cloned().unwrap_or_default();
     base.insert("commandArgs".into(), args.into());
@@ -280,10 +285,10 @@ impl ConfigForm {
             let Some(input) = self.inputs.get(field.key) else { continue };
             let focused = input.read(cx).focus_handle(cx).is_focused(window);
             let saved = config_str(&config, field.key).to_owned();
+            let stored = has_secret(&config, field.key);
             input.update(cx, |input, cx| {
                 if field.secret {
-                    let placeholder =
-                        if saved.is_empty() { "Not set" } else { "Stored secret, enter a new value to replace" };
+                    let placeholder = if stored { "Stored secret, enter a new value to replace" } else { "Not set" };
                     input.set_placeholder(placeholder, window, cx);
                 } else {
                     input.set_placeholder(field.placeholder.unwrap_or_default(), window, cx);
@@ -400,7 +405,7 @@ impl ConfigForm {
             }
             _ => {
                 let input = self.inputs[field.key].clone();
-                let configured = field.secret && !config_str(&self.config, field.key).is_empty();
+                let configured = field.secret && has_secret(&self.config, field.key);
                 h_flex()
                     .w(px(224.))
                     .gap(px(8.))

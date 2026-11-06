@@ -60,6 +60,7 @@ const WRITING_STYLES: &[(&str, &str, &str)] = &[
 /// What the client knows about a host beyond discovery (`source-control-*/src/shared/definition.ts`).
 struct HostDefinition {
     kind: &'static str,
+    label: &'static str,
     icon: &'static str,
     /// Per-hostname tokens and CLI logins (`credentials`), GitHub's only.
     credentials: Option<Credentials>,
@@ -96,6 +97,7 @@ struct HostField {
 const HOSTS: &[HostDefinition] = &[
     HostDefinition {
         kind: "github",
+        label: "GitHub",
         icon: "icons/app/source-control/github.svg",
         credentials: Some(Credentials {
             cli_name: "gh",
@@ -114,9 +116,16 @@ const HOSTS: &[HostDefinition] = &[
         }),
         fields: &[],
     },
-    HostDefinition { kind: "gitlab", icon: "icons/app/source-control/gitlab.svg", credentials: None, fields: &[] },
+    HostDefinition {
+        kind: "gitlab",
+        label: "GitLab",
+        icon: "icons/app/source-control/gitlab.svg",
+        credentials: None,
+        fields: &[],
+    },
     HostDefinition {
         kind: "gitcafe",
+        label: "GitCafe",
         icon: "icons/app/source-control/gitcafe.svg",
         credentials: None,
         fields: &[HostField {
@@ -127,9 +136,16 @@ const HOSTS: &[HostDefinition] = &[
             placeholder: "",
         }],
     },
-    HostDefinition { kind: "forgejo", icon: "icons/app/source-control/forgejo.svg", credentials: None, fields: &[] },
+    HostDefinition {
+        kind: "forgejo",
+        label: "Forgejo",
+        icon: "icons/app/source-control/forgejo.svg",
+        credentials: None,
+        fields: &[],
+    },
     HostDefinition {
         kind: "bitbucket",
+        label: "Bitbucket",
         icon: "icons/app/source-control/bitbucket.svg",
         credentials: None,
         fields: &[
@@ -158,11 +174,36 @@ const HOSTS: &[HostDefinition] = &[
     },
     HostDefinition {
         kind: "azure-devops",
+        label: "Azure DevOps",
         icon: "icons/app/source-control/azure-devops.svg",
         credentials: None,
         fields: &[],
     },
 ];
+
+/// A host setting that may name a secret reference.
+pub(in crate::app::pages::settings) struct SecretField {
+    pub kind: &'static str,
+    pub host: &'static str,
+    pub key: &'static str,
+    /// `None` for a record of one value per hostname, each named by its hostname.
+    pub label: Option<&'static str>,
+}
+
+/// Each host's settings that may name a secret reference, in registry order.
+pub(in crate::app::pages::settings) fn secret_reference_fields() -> impl Iterator<Item = SecretField> {
+    HOSTS.iter().flat_map(|host| {
+        let (kind, label) = (host.kind, host.label);
+        let tokens = host.credentials.as_ref().map(|_| SecretField { kind, host: label, key: "tokens", label: None });
+        let fields = host.fields.iter().filter(|f| f.secret).map(move |f| SecretField {
+            kind,
+            host: label,
+            key: f.key,
+            label: Some(f.title),
+        });
+        tokens.into_iter().chain(fields)
+    })
+}
 
 fn host(kind: &str) -> Option<&'static HostDefinition> {
     HOSTS.iter().find(|host| host.kind == kind)
