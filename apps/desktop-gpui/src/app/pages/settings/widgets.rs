@@ -1595,8 +1595,11 @@ pub(in crate::app) struct Switch {
     disabled: bool,
     small: bool,
     label: Option<SharedString>,
-    on_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>>,
+    on_change: Option<OnToggle>,
 }
+
+/// A switch's handler, given the next checked value.
+type OnToggle = Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>;
 
 impl Switch {
     pub(in crate::app) fn new(id: impl Into<ElementId>) -> Self {
@@ -1660,9 +1663,9 @@ impl gpui_kit::RenderOnce for Switch {
             .rounded_full()
             .flex()
             .items_center()
-            .when(self.checked, |el| el.justify_end())
+            .when(self.checked, gpui_kit::Styled::justify_end)
             .bg(track.opacity(fade))
-            .when(!self.disabled, |el| el.cursor_pointer())
+            .when(!self.disabled, gpui_kit::Styled::cursor_pointer)
             .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade)))
     }
 }

@@ -879,7 +879,7 @@ mod tests {
         local.reveal = Some(true);
 
         let before = previews(true, vec![]);
-        let after = previews(true, vec![quiet.clone(), asked.clone(), local]);
+        let after = previews(true, vec![quiet.clone(), asked, local]);
         assert_eq!(after.fresh_reveals(&before), [("a".to_owned(), false), ("b".to_owned(), false)]);
         assert!(after.fresh_reveals(&previews(false, vec![])).is_empty(), "the first list is the baseline");
         assert!(after.fresh_reveals(&after).is_empty(), "already shown");
