@@ -201,10 +201,18 @@ impl Workspace {
                                 div()
                                     .truncate()
                                     .text_sm()
+                                    .line_height(px(20.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(group.display_name.clone()),
                             )
-                            .child(div().truncate().text_xs().text_color(t.muted_foreground).child(secondary)),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .line_height(px(16.))
+                                    .text_color(t.muted_foreground)
+                                    .child(secondary),
+                            ),
                     )
                     .child(Icon::new(IconName::ChevronRight).size(px(16.)).text_color(t.muted_foreground))
                     .into_any_element()
