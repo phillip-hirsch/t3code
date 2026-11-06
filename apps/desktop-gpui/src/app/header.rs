@@ -31,6 +31,7 @@ impl Workspace {
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
+        let mut link_origin: Option<SharedString> = None;
         let (project, title, parent) = match &self.target {
             Some(Target::Thread { id, .. }) => {
                 let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
@@ -44,6 +45,7 @@ impl Workspace {
                 let parent = shell
                     .and_then(|thread| thread.lineage.parent_thread_id.as_ref())
                     .and_then(|parent| self.shell.threads.iter().find(|thread| &thread.id == parent));
+                link_origin = shell.and_then(|thread| thread.link_origin.as_ref()).map(|o| o.label.clone().into());
                 (project, title, parent)
             }
             Some(Target::Draft { project_id, .. }) => {
@@ -119,7 +121,28 @@ impl Workspace {
             (Some(Target::Thread { .. }), None) => self.render_title_button(title, &tokens, cx),
             _ => div().min_w(px(40.)).flex_1().truncate().text_color(tokens.foreground).child(title).into_any_element(),
         };
-        header.child(breadcrumb.child(title)).children(self.render_title_menu())
+        // `Badge variant="info" size="sm"`: "From {origin}", hidden while renaming.
+        let origin = link_origin.filter(|_| self.title.rename.is_none()).map(|label| {
+            let tooltip: SharedString = format!("Started by an agent on {label} through a linked environment.").into();
+            div()
+                .id("thread-link-origin")
+                .flex_none()
+                .ml(px(6.))
+                .h(px(16.))
+                .px(px(3.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .bg(tokens.info.opacity(if tokens.dark { 0.16 } else { 0.08 }))
+                .text_color(tokens.info_foreground)
+                .text_size(gpui_kit::rems(0.625))
+                .line_height(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .child(format!("From {label}"))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        });
+        header.child(breadcrumb.child(title).children(origin)).children(self.render_title_menu())
     }
 
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
