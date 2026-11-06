@@ -882,19 +882,17 @@ impl Workspace {
             base.map(|base| SharedString::from(format!("vs {}", base.strip_prefix("origin/").unwrap_or(base))));
         action_row("details-changes", colors, cx)
             .child(icon("icons/file-diff.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-            // The label, base and totals share a baseline, so the smaller text sits on the label's line.
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_baseline()
-                    .gap(px(10.))
+                    .gap(px(6.))
                     .child(div().flex_none().child("Changes"))
                     .children(base_label.map(|label| {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_xs()
                             .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(colors.muted)
                             .child(label)
@@ -903,9 +901,10 @@ impl Workspace {
                         h_flex()
                             .ml_auto()
                             .flex_none()
-                            .gap(px(6.))
+                            .items_baseline()
+                            .gap(px(8.))
+                            .pl(px(8.))
                             .font_family(tokens.fonts.mono)
-                            .text_xs()
                             .child(div().text_color(addition).child(format!("+{}", git::group_thousands(insertions))))
                             .child(div().text_color(deletion).child(format!("-{}", git::group_thousands(deletions)))),
                     ),
