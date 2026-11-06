@@ -60,6 +60,8 @@ pub(super) struct PickerState {
     host: Option<PickHost>,
     tab: Option<Tab>,
     search: Option<Entity<InputState>>,
+    /// The search has focus: its underline takes the ring colour (`focus-within:border-ring`).
+    search_focused: bool,
     query: String,
     highlighted: usize,
     show_legacy: bool,
@@ -110,11 +112,16 @@ impl Workspace {
             None => {
                 let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models..."));
                 self.picker._search_changes = Some(cx.subscribe_in(&search, window, |this, search, event, _, cx| {
-                    if let InputEvent::Change = event {
-                        this.picker.query = search.read(cx).value().trim().to_owned();
-                        this.picker.highlighted = 0;
-                        cx.notify();
+                    match event {
+                        InputEvent::Change => {
+                            this.picker.query = search.read(cx).value().trim().to_owned();
+                            this.picker.highlighted = 0;
+                        }
+                        InputEvent::Focus => this.picker.search_focused = true,
+                        InputEvent::Blur => this.picker.search_focused = false,
+                        InputEvent::PressEnter { .. } => return,
                     }
+                    cx.notify();
                 }));
                 self.picker.search = Some(search.clone());
                 search
@@ -520,7 +527,7 @@ impl Workspace {
                 .pb(px(6.))
                 .mt(px(-1.))
                 .border_b_1()
-                .border_color(rule)
+                .border_color(if self.picker.search_focused { t.ring } else { rule })
                 .child(
                     Icon::new(Lucide::Search)
                         .with_size(px(16.))
@@ -577,7 +584,7 @@ impl Workspace {
                 })
         };
         let favorites = button("rail-favorites".into(), *tab == Tab::Favorites, true)
-            .child(Icon::new(Lucide::Star).with_size(px(20.)).text_color(t.foreground))
+            .child(Icon::empty().path("icons/app/star-filled.svg").with_size(px(20.)).text_color(t.foreground))
             .tooltip(|window, cx| Tooltip::new("Favorites").build(window, cx))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.picker.tab = Some(Tab::Favorites);
@@ -724,11 +731,11 @@ impl Workspace {
                             .when(!star_visible && !highlighted, |el| {
                                 el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible)
                             })
-                            .child(Icon::new(Lucide::Star).with_size(px(12.)).text_color(if row.favorite {
-                                t.warning
+                            .child(if row.favorite {
+                                Icon::empty().path("icons/app/star-filled.svg").with_size(px(12.)).text_color(t.warning)
                             } else {
-                                t.muted_foreground
-                            }))
+                                Icon::new(Lucide::Star).with_size(px(12.)).text_color(t.muted_foreground)
+                            })
                             .tooltip({
                                 let label = if row.favorite { "Remove from favorites" } else { "Add to favorites" };
                                 move |window, cx| Tooltip::new(label).build(window, cx)
