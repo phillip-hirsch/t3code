@@ -479,6 +479,12 @@ pub fn tokens(cx: &App) -> &Tokens {
     cx.global::<Tokens>()
 }
 
+/// `dialog-backdrop` (`index.css`): the background at 60% (64% dark) over a 4px blur that leaves
+/// nothing behind readable. GPUI cannot blur what lies beneath, so a denser veil hides it instead.
+pub fn dialog_backdrop(t: &Tokens) -> Hsla {
+    t.background.opacity(0.86)
+}
+
 /// The theme library pick: the appearance mode, the theme and the light/dark mix.
 #[derive(Clone, Default)]
 struct Preference(ThemeChoice);
@@ -563,6 +569,7 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.popover_foreground = tokens.foreground;
         colors.list_hover = tokens.accent;
         colors.list_active = tokens.accent;
+        colors.overlay = dialog_backdrop(&tokens);
         colors.danger = tokens.error;
         colors.danger_foreground = tokens.primary_foreground;
         colors.warning = tokens.warning;

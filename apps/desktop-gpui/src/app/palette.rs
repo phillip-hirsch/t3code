@@ -1382,7 +1382,7 @@ impl Workspace {
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(gpui_kit::black().opacity(0.64))
+                .bg(crate::theme::dialog_backdrop(crate::theme::tokens(cx)))
                 .flex()
                 .flex_col()
                 .items_center()
