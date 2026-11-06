@@ -50,6 +50,8 @@ const PROCESS_WINDOWS: [(&str, u64, u64); 4] =
 const TELEMETRY_WINDOWS: [(&str, u64, u64); 4] =
     [("5m", 300_000, 15_000), ("15m", 900_000, 30_000), ("30m", 1_800_000, 60_000), ("1h", 3_600_000, 120_000)];
 
+const TELEMETRY_HISTORY_REFRESH: Duration = Duration::from_secs(5);
+
 /// `--color-violet-500`, the server process dot.
 const VIOLET: u32 = 0x8e51ff;
 
@@ -94,6 +96,8 @@ pub(super) struct DiagnosticsState {
     export: export::ExportState,
     _session_task: Option<Task<()>>,
     _telemetry_task: Option<Task<()>>,
+    /// Re-reads the resource timeline while the page is open, as the web's query does.
+    _telemetry_history_poll: Option<Task<()>>,
     _copied_task: Option<Task<()>>,
 }
 
@@ -124,6 +128,7 @@ impl DiagnosticsState {
     fn refresh_all(&mut self, client: &RpcClient, cx: &mut Context<Self>) {
         self.subscribe_telemetry(client.clone(), cx);
         self.load_telemetry_history(client.clone(), cx);
+        self.poll_telemetry_history(client.clone(), cx);
         self.load_processes(client.clone(), cx);
         self.load_history(client.clone(), cx);
         self.load_trace(client.clone(), cx);
@@ -175,6 +180,18 @@ impl DiagnosticsState {
         let (_, window_ms, bucket_ms) = TELEMETRY_WINDOWS[self.telemetry_window];
         let input = json!({ "windowMs": window_ms, "bucketMs": bucket_ms });
         self.load(client, "server.getResourceTelemetryHistory", input, |s| &mut s.telemetry_history, cx);
+    }
+
+    /// The web's `refreshIntervalMs: 5_000` on the resource timeline query.
+    fn poll_telemetry_history(&mut self, client: RpcClient, cx: &mut Context<Self>) {
+        self._telemetry_history_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TELEMETRY_HISTORY_REFRESH).await;
+                if this.update(cx, |this, cx| this.load_telemetry_history(client.clone(), cx)).is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     /// `subscribeResourceTelemetry`; refreshing resubscribes, like refreshing the web's atom.
