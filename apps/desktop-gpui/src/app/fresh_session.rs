@@ -20,6 +20,14 @@ pub(super) struct FreshSessions {
     next: u64,
 }
 
+/// `activeMessageCount > 0`: the messages on screen, a fork's inherited ones included.
+fn has_messages(projection: &crate::model::ThreadProjection) -> bool {
+    projection
+        .visible_turn_items
+        .iter()
+        .any(|row| matches!(row.item.item_type.as_str(), "user_message" | "assistant_message"))
+}
+
 /// `isClearComposerCommand`: `/clear` as the whole message arms a fresh session instead of sending.
 pub(super) fn is_clear_command(text: &str) -> bool {
     text.trim().strip_prefix('/').is_some_and(|rest| rest.eq_ignore_ascii_case("clear"))
@@ -30,12 +38,7 @@ impl Workspace {
     pub(super) fn fresh_session_available(&self) -> bool {
         matches!(self.target, Some(Target::Thread { .. }))
             && self.server_info().capability("freshContext")
-            && self.open_projection().is_some_and(|projection| {
-                projection
-                    .turn_items
-                    .iter()
-                    .any(|item| matches!(item.item_type.as_str(), "user_message" | "assistant_message"))
-            })
+            && self.open_projection().is_some_and(has_messages)
     }
 
     /// While a question or approval owns the composer, its text answers that, not the agent.
@@ -98,6 +101,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn only_a_bare_clear_arms_a_fresh_session() {
@@ -107,5 +111,20 @@ mod tests {
         for text in ["/clear now", "clear", "/clearer", "ask /clear", "/"] {
             assert!(!is_clear_command(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_fork_counts_the_messages_it_inherited() {
+        let inherited = json!({"id": "m", "type": "assistant_message", "threadId": "parent", "ordinal": 1});
+        let fork = |rows: Vec<serde_json::Value>| -> crate::model::ThreadProjection {
+            serde_json::from_value(
+                json!({"thread": {"id": "t", "title": "T"}, "turnItems": [], "visibleTurnItems": rows}),
+            )
+            .unwrap()
+        };
+        let row =
+            json!({"visibility": "inherited", "sourceThreadId": "parent", "sourceItemId": "m", "item": inherited});
+        assert!(has_messages(&fork(vec![row])));
+        assert!(!has_messages(&fork(vec![])));
     }
 }
