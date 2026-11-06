@@ -541,6 +541,12 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         theme.radius = gpui_kit::px(8.);
         theme.radius_lg = gpui_kit::px(12.);
         theme.cursor_blink = crate::caret::blink();
+        // The toast viewport: 22.5rem wide, 2rem in from the right and below the 52px
+        // (macOS) or 40px title bar (`toast.tsx`, `--workspace-topbar-height`).
+        let titlebar = if cfg!(target_os = "macos") { 52. } else { 40. };
+        theme.notification.width = px(360.);
+        theme.notification.margins.top = px(titlebar + 32.);
+        theme.notification.margins.right = px(32.);
         let colors = &mut theme.colors;
         colors.background = tokens.background;
         colors.foreground = tokens.foreground;
