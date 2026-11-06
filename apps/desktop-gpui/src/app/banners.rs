@@ -684,6 +684,18 @@ impl Workspace {
         .detach();
     }
 
+    /// `extensionStatusBannerItem`: what a Pi extension reports about the session.
+    pub(super) fn render_extension_status_banner(&self, t: &Tokens) -> Option<AnyElement> {
+        let statuses = self.open_projection()?.provider_extension_statuses();
+        if statuses.is_empty() {
+            return None;
+        }
+        let texts: Vec<&str> = statuses.iter().map(|status| status.text.as_str()).collect();
+        let title = SharedString::from(format!("Pi \u{b7} {}", texts.join(" \u{b7} ")));
+        let lead = div().child("\u{25b8}").into_any_element();
+        Some(composer_banner_with_lead(Variant::Info, lead, title, None, None, t))
+    }
+
     pub(super) fn render_recovery_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.open_shell_thread()?;
         let state = recovery(thread, self.request_pending(), crate::timestamp::now_ms())?;
@@ -890,6 +902,19 @@ pub(super) fn composer_banner(
     actions: Option<AnyElement>,
     t: &Tokens,
 ) -> AnyElement {
+    let lead = icon.size(px(12.)).into_any_element();
+    composer_banner_with_lead(variant, lead, title, description, actions, t)
+}
+
+/// [`composer_banner`] led by any element, such as a glyph.
+fn composer_banner_with_lead(
+    variant: Variant,
+    lead: AnyElement,
+    title: impl IntoElement,
+    description: Option<SharedString>,
+    actions: Option<AnyElement>,
+    t: &Tokens,
+) -> AnyElement {
     let (outline, tint) = match variant {
         Variant::Error => (t.error.opacity(0.32), t.error.opacity(0.08)),
         Variant::Warning => (t.warning.opacity(0.28), t.warning.opacity(0.08)),
@@ -919,7 +944,8 @@ pub(super) fn composer_banner(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(icon.size(px(12.)).text_color(t.muted_foreground)),
+                        .text_color(t.muted_foreground)
+                        .child(lead),
                 )
                 .child(
                     h_flex()
