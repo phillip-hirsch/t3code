@@ -1458,6 +1458,8 @@ impl Workspace {
 
     fn render_sidebar_footer(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
+        // Settings covers these buttons; a tooltip left from the click would sit over it.
+        let covered = self.settings.is_some();
         let button = |id: &'static str, name: IconName, label: &'static str| {
             div()
                 .id(id)
@@ -1468,7 +1470,7 @@ impl Workspace {
                 .rounded(px(8.))
                 .cursor_pointer()
                 .hover(|s| s.bg(sb.row_hover))
-                .tooltip(tooltip(label))
+                .when(!covered, |el| el.tooltip(tooltip(label)))
                 .child(icon(name, 16., sb.icon))
         };
         let status: Option<(SharedString, Hsla)> = match &self.connection {

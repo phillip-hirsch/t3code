@@ -258,7 +258,11 @@ impl Workspace {
             .cursor_pointer()
             .hover(|s| s.bg(sb.row_hover))
             .when(open, |el| el.bg(sb.row_active))
-            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+            .when(!open, |el| {
+                el.tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+                })
+            })
             .on_click(cx.listener(|this, _, window, cx| {
                 // The press that closed the popup by clicking outside must not reopen it.
                 let just_closed =
