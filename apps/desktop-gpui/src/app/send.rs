@@ -312,6 +312,7 @@ impl Workspace {
                             (Some(_), true) if here => {
                                 if let Some(project_id) = project_id {
                                     this.draft_workspace = Default::default();
+                                    this.forget_open_draft();
                                     this.start_draft(project_id, window, cx);
                                 }
                             }

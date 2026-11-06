@@ -119,6 +119,11 @@ impl Workspace {
             (!prompt.trim().is_empty() || attachments > 0).then(|| preview(&prompt, attachments).into());
     }
 
+    /// The open draft was used up, so its sidebar row goes.
+    pub(in crate::app) fn forget_open_draft(&mut self) {
+        self.sidebar.open_draft_preview = None;
+    }
+
     /// `useThreadHasUnsentDraft`, for a thread that is not on screen.
     pub(super) fn has_unsent_draft(&self, thread_id: &str) -> bool {
         // Drafts are few; scanning them saves building a key per sidebar row.
