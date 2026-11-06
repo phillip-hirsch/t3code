@@ -19,7 +19,7 @@ use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::right_panel::DiffTint;
 use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
-use crate::theme::{self, FONT_MONO, FONT_SANS, Fonts, Tokens};
+use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
@@ -98,7 +98,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let separate = self.client_settings.values.bool(TYPOGRAPHY_ADVANCED_KEY);
         let interface_family: SharedString = match view.str("fontFamilySans").trim() {
-            "" => FONT_SANS.into(),
+            "" => FONT_SANS_LABEL.into(),
             family => family.to_owned().into(),
         };
         let interface = |previews| FontRow {
@@ -108,7 +108,7 @@ impl Workspace {
             family_key: "fontFamilySans",
             size_key: "fontSizeInterface",
             sizes: (12, 20),
-            default_family: FONT_SANS.into(),
+            default_family: FONT_SANS_LABEL.into(),
             monospace: false,
             previews,
         };

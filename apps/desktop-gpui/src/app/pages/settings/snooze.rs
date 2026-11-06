@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Datelike as _, Duration, NaiveTime, TimeZone, Timelike as _};
+use chrono::{DateTime, Datelike as _, Duration, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -183,12 +183,6 @@ pub(super) fn parse_time(time: &str) -> Option<NaiveTime> {
     (time.len() == 5 && time.as_bytes()[2] == b':').then(|| NaiveTime::parse_from_str(time, "%H:%M").ok())?
 }
 
-/// `snoozeTimeOfDayLabel`: "6:00 PM".
-pub(super) fn format_time<Tz: TimeZone>(date: &DateTime<Tz>) -> String {
-    let (pm, hour) = date.hour12();
-    format!("{hour}:{:02} {}", date.minute(), if pm { "PM" } else { "AM" })
-}
-
 pub(super) struct Resolved<Tz: TimeZone> {
     pub id: String,
     pub label: String,
@@ -243,7 +237,8 @@ fn label(preset: &Preset, days_ahead: i64) -> String {
 }
 
 /// `resolveSnoozePreset`: when an option wakes from `now`, or `None` for a passed "Today".
-pub(super) fn resolve<Tz: TimeZone>(preset: &Preset, now: &DateTime<Tz>) -> Option<Resolved<Tz>> {
+/// Its time reads as `formatShortTimestamp` does (`hour12`).
+pub(super) fn resolve<Tz: TimeZone>(preset: &Preset, now: &DateTime<Tz>, hour12: bool) -> Option<Resolved<Tz>> {
     let (wake, ahead) = match preset {
         Preset::After { minutes } => (now.clone().checked_add_signed(Duration::try_minutes(*minutes)?)?, 0),
         Preset::At { day, time } => {
@@ -261,7 +256,7 @@ pub(super) fn resolve<Tz: TimeZone>(preset: &Preset, now: &DateTime<Tz>) -> Opti
     let label = label(preset, ahead);
     // Durations and "Next week" don't name the wake day, so a wake on another day shows it.
     let names_day = matches!(preset, Preset::At { .. }) && label != "Next week";
-    let time = format_time(&wake);
+    let time = crate::timestamp::clock(&wake, hour12);
     let when_label = if names_day || wake.date_naive() == now.date_naive() {
         time
     } else {
@@ -275,8 +270,8 @@ fn wake_minute<Tz: TimeZone>(resolved: &Resolved<Tz>) -> i64 {
 }
 
 /// `resolveSnoozePresets`: the menu, soonest first, one row per wake minute.
-pub(super) fn resolve_all<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) -> Vec<Resolved<Tz>> {
-    let mut resolved: Vec<_> = presets.iter().filter_map(|preset| resolve(preset, now)).collect();
+pub(super) fn resolve_all<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>, hour12: bool) -> Vec<Resolved<Tz>> {
+    let mut resolved: Vec<_> = presets.iter().filter_map(|preset| resolve(preset, now, hour12)).collect();
     resolved.sort_by_key(wake_minute);
     let mut seen = HashSet::new();
     resolved.retain(|preset| seen.insert(wake_minute(preset)));
@@ -285,7 +280,7 @@ pub(super) fn resolve_all<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) 
 
 /// `sortSnoozeRows`: soonest wake first, options with no wake now last, ties in place.
 pub(super) fn sort_rows<K, Tz: TimeZone>(rows: &mut [(K, Preset)], now: &DateTime<Tz>) {
-    rows.sort_by_cached_key(|(_, preset)| resolve(preset, now).map_or(i64::MAX, |r| r.wake.timestamp_millis()));
+    rows.sort_by_cached_key(|(_, preset)| resolve(preset, now, true).map_or(i64::MAX, |r| r.wake.timestamp_millis()));
 }
 
 /// `reconcileSnoozeDraft`: `None` adopts `saved`; otherwise the writes still in flight after
@@ -302,11 +297,11 @@ pub(super) enum Preview {
     Muted(&'static str),
 }
 
-pub(super) fn previews<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) -> Vec<Preview> {
+pub(super) fn previews<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>, hour12: bool) -> Vec<Preview> {
     let (mut ids, mut wakes) = (HashSet::new(), HashSet::new());
     presets
         .iter()
-        .map(|preset| match resolve(preset, now) {
+        .map(|preset| match resolve(preset, now, hour12) {
             None => Preview::Muted("Passed for today"),
             Some(resolved) if ids.contains(&resolved.id) => Preview::Muted("Duplicate of an option above"),
             Some(resolved) if wakes.contains(&resolved.wake.timestamp_millis()) => {
@@ -322,8 +317,8 @@ pub(super) fn previews<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) -> 
 }
 
 /// "Menu now: …", naming the wake where two entries share a label.
-pub(super) fn menu_order<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>) -> String {
-    let menu = resolve_all(presets, now);
+pub(super) fn menu_order<Tz: TimeZone>(presets: &[Preset], now: &DateTime<Tz>, hour12: bool) -> String {
+    let menu = resolve_all(presets, now, hour12);
     if menu.is_empty() {
         return "Menus offer only Custom…".into();
     }
@@ -382,7 +377,7 @@ mod tests {
     fn presets_resolve_to_menu_labels() {
         let now = wednesday(10, 15);
         let shown: Vec<(String, String)> =
-            resolve_all(&defaults(), &now).into_iter().map(|r| (r.label, r.when_label)).collect();
+            resolve_all(&defaults(), &now, true).into_iter().map(|r| (r.label, r.when_label)).collect();
         assert_eq!(
             shown,
             [
@@ -395,14 +390,14 @@ mod tests {
             .map(|(a, b)| (a.to_owned(), b.to_owned()))
         );
         let late = wednesday(22, 30);
-        assert!(resolve(&at("today", "18:00"), &late).is_none(), "a passed Today is left out");
-        let day = resolve(&after(24 * 60), &late).unwrap();
+        assert!(resolve(&at("today", "18:00"), &late, true).is_none(), "a passed Today is left out");
+        let day = resolve(&after(24 * 60), &late, true).unwrap();
         assert_eq!((day.label.as_str(), day.when_label.as_str()), ("In 1 day", "Thu 10:30 PM"));
-        assert_eq!(resolve(&at("wednesday", "09:00"), &now).unwrap().label, "Next Wednesday");
-        assert_eq!(resolve(&at("friday", "09:00"), &now).unwrap().label, "Friday");
-        assert_eq!(resolve(&at("thursday", "13:00"), &now).unwrap().label, "Tomorrow");
+        assert_eq!(resolve(&at("wednesday", "09:00"), &now, true).unwrap().label, "Next Wednesday");
+        assert_eq!(resolve(&at("friday", "09:00"), &now, true).unwrap().label, "Friday");
+        assert_eq!(resolve(&at("thursday", "13:00"), &now, true).unwrap().label, "Tomorrow");
         for minutes in [i64::MAX, i64::MIN, i64::MAX / 60_000, 200_000_000_000] {
-            assert!(resolve(&after(minutes), &now).is_none(), "{minutes} minutes has no wake");
+            assert!(resolve(&after(minutes), &now, true).is_none(), "{minutes} minutes has no wake");
         }
         assert!(!after(MAX_MINUTES + 1).in_range() && !after(0).in_range() && after(MAX_MINUTES).in_range());
     }
@@ -416,7 +411,7 @@ mod tests {
         assert_eq!(rows.iter().map(|(key, _)| *key).collect::<Vec<_>>(), [2, 3, 1, 0], "passed options sort last");
         let presets: Vec<Preset> = rows.into_iter().map(|(_, preset)| preset).collect();
         assert_eq!(
-            previews(&presets, &now)[1..],
+            previews(&presets, &now, true)[1..],
             [
                 Preview::Muted("Duplicate of an option above"),
                 Preview::Menu { label: "Tomorrow".into(), when: "9:00 AM".into() },
@@ -424,11 +419,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            previews(&[after(60 * 24), at("thursday", "19:00")], &now)[1],
+            previews(&[after(60 * 24), at("thursday", "19:00")], &now, true)[1],
             Preview::Muted("Same time as an option above")
         );
-        assert_eq!(menu_order(&[at("today", "09:00")], &now), "Menus offer only Custom…");
-        assert_eq!(menu_order(&[after(60), after(24 * 60)], &now), "Menu now: In 1 hour · In 1 day");
+        assert_eq!(menu_order(&[at("today", "09:00")], &now, true), "Menus offer only Custom…");
+        assert_eq!(menu_order(&[after(60), after(24 * 60)], &now, true), "Menu now: In 1 hour · In 1 day");
     }
 
     #[test]

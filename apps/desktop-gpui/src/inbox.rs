@@ -863,17 +863,12 @@ fn capitalize(word: &str) -> String {
     chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
-/// "3:05 PM", the en-US `formatShortTimestamp`.
-pub fn clock_label<Tz: chrono::TimeZone>(at: &chrono::DateTime<Tz>) -> String {
-    use chrono::Timelike as _;
-    let suffix = if at.hour() < 12 { "AM" } else { "PM" };
-    format!("{}:{:02} {suffix}", (at.hour() + 11) % 12 + 1, at.minute())
-}
-
-/// `resolveSnoozePreset` in the zone of `now`; `None` once a set time has passed.
+/// `resolveSnoozePreset` in the zone of `now`, its time as `formatShortTimestamp`; `None` once a
+/// set time has passed.
 pub fn resolve_snooze<Tz: chrono::TimeZone>(
     setting: &SnoozeSetting,
     now: &chrono::DateTime<Tz>,
+    hour12: bool,
 ) -> Option<SnoozePreset> {
     use chrono::Datelike as _;
     let now_ms = now.timestamp_millis();
@@ -923,7 +918,7 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
             (wake, label, names_day)
         }
     };
-    let time = clock_label(&wake);
+    let time = crate::timestamp::clock(&wake, hour12);
     let when_label = if names_day || wake.date_naive() == now.date_naive() {
         time
     } else {
@@ -936,8 +931,9 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
 pub fn snooze_presets<Tz: chrono::TimeZone>(
     settings: &[SnoozeSetting],
     now: &chrono::DateTime<Tz>,
+    hour12: bool,
 ) -> Vec<SnoozePreset> {
-    let mut presets: Vec<SnoozePreset> = settings.iter().filter_map(|s| resolve_snooze(s, now)).collect();
+    let mut presets: Vec<SnoozePreset> = settings.iter().filter_map(|s| resolve_snooze(s, now, hour12)).collect();
     presets.sort_by_key(|p| p.wake_ms.div_euclid(60_000));
     presets.dedup_by_key(|p| p.wake_ms.div_euclid(60_000));
     presets
@@ -952,7 +948,7 @@ pub fn pick_snooze<Tz: chrono::TimeZone>(
     now: &chrono::DateTime<Tz>,
 ) -> Option<i64> {
     let after = settings.iter().find(|s| matches!(s, SnoozeSetting::After { .. }) && s.id() == id);
-    if let Some(preset) = after.and_then(|s| resolve_snooze(s, now)) {
+    if let Some(preset) = after.and_then(|s| resolve_snooze(s, now, true)) {
         return Some(preset.wake_ms);
     }
     shown.iter().find(|p| p.id == id).map(|p| p.wake_ms).filter(|wake| *wake > now.timestamp_millis())
@@ -1470,7 +1466,7 @@ mod tests {
         let zone = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
         let now = zone.with_ymd_and_hms(2026, 11, 3, 14, 5, 0).unwrap();
         let settings = snooze_settings(&serde_json::Value::Null);
-        let presets = snooze_presets(&settings, &now);
+        let presets = snooze_presets(&settings, &now, true);
         let rows: Vec<(&str, &str)> = presets.iter().map(|p| (p.label.as_str(), p.when_label.as_str())).collect();
         assert_eq!(
             rows,
@@ -1484,13 +1480,17 @@ mod tests {
         );
         // After 6 PM "This evening" is gone; on a Sunday Monday 9:00 folds into Tomorrow.
         let sunday = zone.with_ymd_and_hms(2026, 11, 8, 19, 0, 0).unwrap();
-        let labels: Vec<String> = snooze_presets(&settings, &sunday).into_iter().map(|p| p.label).collect();
+        let labels: Vec<String> = snooze_presets(&settings, &sunday, true).into_iter().map(|p| p.label).collect();
         assert_eq!(labels, ["In 1 hour", "In 3 hours", "Tomorrow"]);
         let late = zone.with_ymd_and_hms(2026, 11, 3, 23, 30, 0).unwrap();
-        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 90 }, &late).unwrap().when_label, "Wed 1:00 AM");
-        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: 2880 }, &late).unwrap().label, "In 2 days");
-        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: i64::MAX }, &late), None);
-        assert_eq!(resolve_snooze(&SnoozeSetting::After { minutes: i64::MAX / 60_000 }, &late), None);
+        let after = |minutes, hour12| resolve_snooze(&SnoozeSetting::After { minutes }, &late, hour12);
+        assert_eq!(after(90, true).unwrap().when_label, "Wed 1:00 AM");
+        // A 24-hour clock (`timestampFormat`, or the system's): "In 1 hour (17:21)".
+        assert_eq!(after(90, false).unwrap().when_label, "Wed 01:00");
+        assert_eq!(snooze_presets(&settings, &now, false)[0].when_label, "15:05");
+        assert_eq!(after(2880, true).unwrap().label, "In 2 days");
+        assert_eq!(after(i64::MAX, true), None);
+        assert_eq!(after(i64::MAX / 60_000, true), None);
         let later = now + chrono::Duration::minutes(10);
         assert_eq!(pick_snooze(&presets, "after:60", &settings, &later), Some(later.timestamp_millis() + 3_600_000));
         assert_eq!(pick_snooze(&presets, "at:tomorrow:09:00", &settings, &later), Some(presets[3].wake_ms));

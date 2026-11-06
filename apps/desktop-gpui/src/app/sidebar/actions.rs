@@ -13,7 +13,7 @@ use gpui_kit::component::{Icon, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    Point, PromptLevel, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    Point, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -125,8 +125,7 @@ struct Confirm {
     setting: &'static str,
     message: String,
     detail: Option<&'static str>,
-    ok: &'static str,
-    level: PromptLevel,
+    destructive: bool,
 }
 
 const UNDO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -427,8 +426,7 @@ impl Workspace {
             setting: "confirmThreadUnpin",
             message: format!("Unpin thread \"{title}\"?"),
             detail: Some("This will move the thread out of your pinned section."),
-            ok: "Unpin",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             let entry = this.undo_entry(&thread_id);
@@ -449,8 +447,7 @@ impl Workspace {
             setting: "confirmThreadUnpin",
             message: format!("Unpin {} threads?", ids.len()),
             detail: Some("This will move the threads out of your pinned section."),
-            ok: "Unpin",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             for id in &ids {
@@ -472,8 +469,7 @@ impl Workspace {
             setting: "confirmThreadArchive",
             message: format!("Archive thread \"{title}\"?"),
             detail: None,
-            ok: "Archive",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
@@ -495,8 +491,7 @@ impl Workspace {
             setting: "confirmThreadDelete",
             message: format!("Delete thread \"{title}\"?"),
             detail: Some("This permanently clears conversation history for this thread."),
-            ok: "Delete",
-            level: PromptLevel::Critical,
+            destructive: true,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             if this.thread_client(&thread_id).is_some() {
@@ -518,9 +513,19 @@ impl Workspace {
             then(self, window, cx);
             return;
         }
-        let answer = window.prompt(question.level, &question.message, question.detail, &[question.ok, "Cancel"], cx);
+        let message = question.detail.map_or_else(
+            || question.message.clone(),
+            |detail| {
+                format!(
+                    "{}
+{detail}",
+                    question.message
+                )
+            },
+        );
+        let answer = super::super::confirm::confirm(&message, question.destructive, window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
+            if answer.await == Ok(true) {
                 let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
             }
         })
@@ -736,7 +741,7 @@ pub(super) struct SnoozeItems {
 impl SnoozeItems {
     fn new(workspace: &Workspace, thread_id: &str, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
         let settings = inbox::snooze_settings(workspace.server_info().settings.get("snoozePresets"));
-        let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
+        let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), workspace.hour12());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
         let advance = origin == MenuOrigin::Sidebar;
         Self { thread_id: thread_id.to_owned(), settings, presets, inline_when, advance, muted }
@@ -811,7 +816,8 @@ impl ThreadMenu {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let item = |label: &str, icon: Lucide| PopupMenuItem::new(label.to_owned()).icon(Icon::new(icon));
+        // Electron shows this as a native menu: plain rows, a trash icon on Delete only (macOS).
+        let item = |label: &str| PopupMenuItem::new(label.to_owned());
         let origin = self.origin;
         let advance = origin == MenuOrigin::Sidebar;
         // Each item acts on this menu's thread through the workspace.
@@ -824,127 +830,103 @@ impl ThreadMenu {
                 })
             }};
         }
-        let command = |label: &str, icon: Lucide, kind: &'static str, fields: Value| {
-            act!(item(label, icon), |this, _w, cx, id| this.thread_command(kind, &id, fields.clone(), cx))
+        let command = |label: &str, kind: &'static str, fields: Value| {
+            act!(item(label), |this, _w, cx, id| this.thread_command(kind, &id, fields.clone(), cx))
         };
         if self.find {
-            menu = menu.item(act!(item("Find in thread", Lucide::TextSearch), |this, window, cx, _id| {
+            menu = menu.item(act!(item("Find in thread"), |this, window, cx, _id| {
                 this.open_thread_find(window, cx);
             }));
         }
         if let Some(branch) = &self.branch {
-            menu = menu.item(act!(
-                item(&format!("New thread on {branch}"), Lucide::MessageSquarePlus),
-                |this, window, cx, id| this.new_thread_on_branch(&id, window, cx)
-            ));
+            menu = menu.item(act!(item(&format!("New thread on {branch}")), |this, window, cx, id| this
+                .new_thread_on_branch(&id, window, cx)));
         }
         if self.loaded {
             menu = menu.item(if self.pinned {
-                act!(item("Unpin thread", Lucide::PinOff), |this, window, cx, id| this.unpin_thread(&id, window, cx))
+                act!(item("Unpin thread"), |this, window, cx, id| this.unpin_thread(&id, window, cx))
             } else {
-                act!(item("Pin thread", Lucide::Pin), |this, _w, cx, id| this.pin_thread(&id, cx))
+                act!(item("Pin thread"), |this, _w, cx, id| this.pin_thread(&id, cx))
             });
             menu = menu.item(if self.settled {
-                act!(item("Un-settle thread", Lucide::CircleCheck), |this, _w, cx, id| this.unsettle_thread(&id, cx))
+                act!(item("Un-settle thread"), |this, _w, cx, id| this.unsettle_thread(&id, cx))
             } else {
-                act!(item("Settle thread", Lucide::CircleCheck), |this, window, cx, id| this
-                    .settle_thread(&id, advance, window, cx))
+                act!(item("Settle thread"), |this, window, cx, id| this.settle_thread(&id, advance, window, cx))
             });
             menu = match (&self.snooze, self.snoozed) {
-                (_, true) => {
-                    menu.item(act!(item("Wake thread", Lucide::Clock), |this, _w, cx, id| this.wake_thread(&id, cx)))
-                }
+                (_, true) => menu.item(act!(item("Wake thread"), |this, _w, cx, id| this.wake_thread(&id, cx))),
                 (Some(snooze), false) => {
                     let (snooze, view) = (snooze.clone(), view.clone());
-                    menu.submenu_with_icon(Some(Icon::new(Lucide::Clock)), "Snooze", window, cx, move |menu, _, _| {
-                        snooze.add_to(&view, menu.min_w(px(160.)))
-                    })
+                    menu.submenu("Snooze", window, cx, move |menu, _, _| snooze.add_to(&view, menu.min_w(px(160.))))
                 }
-                (None, false) => menu.item(item("Snooze", Lucide::Clock).disabled(true)),
+                (None, false) => menu.item(item("Snooze").disabled(true)),
             };
         }
         menu = menu.separator();
-        menu = menu.item(act!(item("Rename thread", Lucide::Pencil), |this, window, cx, id| this
-            .start_rename(&id, origin, window, cx)));
+        menu =
+            menu.item(act!(item("Rename thread"), |this, window, cx, id| this.start_rename(&id, origin, window, cx)));
         if self.loaded {
             menu = menu.item(if self.regenerating {
-                item("Regenerating…", Lucide::RefreshCw).disabled(true)
+                item("Regenerating…").disabled(true)
             } else {
-                command(
-                    "Regenerate title",
-                    Lucide::RefreshCw,
-                    "thread.metadata.update",
-                    json!({"regenerateTitle": true}),
-                )
+                command("Regenerate title", "thread.metadata.update", json!({"regenerateTitle": true}))
             });
         }
-        menu = menu.item(command("Mark unread", Lucide::MailOpen, "thread.mark-unread", json!({})));
+        menu = menu.item(command("Mark unread", "thread.mark-unread", json!({})));
         if let Some((label, scope)) = self.filter {
             let view = view.clone();
-            menu = menu.item(item(&label, Lucide::FolderTree).on_click(move |_, _, cx| {
+            menu = menu.item(item(&label).on_click(move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| this.set_scope(scope.clone(), cx));
             }));
         }
         if self.turn_into_project {
             menu = menu.item(
-                act!(item("Turn into project", Lucide::FolderPlus), |this, window, cx, id| this
-                    .turn_thread_into_project(&id, window, cx))
-                .disabled(self.running),
+                act!(item("Turn into project"), |this, window, cx, id| this.turn_thread_into_project(&id, window, cx))
+                    .disabled(self.running),
             );
         }
         if let Some(enabled) = self.auto_settle {
             let (view, id) = (view.clone(), self.thread_id.clone());
-            menu = menu.submenu_with_icon(
-                Some(Icon::new(Lucide::Timer)),
-                "Auto-settle behavior",
-                window,
-                cx,
-                move |mut menu, _, _| {
-                    for (label, on) in [("Enabled", true), ("Disabled", false)] {
-                        let (view, id) = (view.clone(), id.clone());
-                        menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.thread_command("thread.auto-settle.set", &id, json!({"enabled": on}), cx)
-                            });
-                        }));
-                    }
-                    menu
-                },
-            );
+            menu = menu.submenu("Auto-settle behavior", window, cx, move |mut menu, _, _| {
+                for (label, on) in [("Enabled", true), ("Disabled", false)] {
+                    let (view, id) = (view.clone(), id.clone());
+                    menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.thread_command("thread.auto-settle.set", &id, json!({"enabled": on}), cx)
+                        });
+                    }));
+                }
+                menu
+            });
         }
         menu = menu.separator();
         let (path, branch, link, id) =
             (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread_id.clone());
-        menu = menu.submenu_with_icon(Some(Icon::new(Lucide::Copy)), "Copy", window, cx, move |mut menu, _, _| {
+        menu = menu.submenu("Copy", window, cx, move |mut menu, _, _| {
             let copy = |text: String| {
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 }
             };
             if let Some(path) = &path {
-                menu =
-                    menu.item(PopupMenuItem::new("Path").icon(Icon::new(Lucide::Folder)).on_click(copy(path.clone())));
+                menu = menu.item(PopupMenuItem::new("Path").on_click(copy(path.clone())));
             }
             if let Some(branch) = &branch {
-                menu = menu.item(
-                    PopupMenuItem::new("Branch").icon(Icon::new(Lucide::GitBranch)).on_click(copy(branch.clone())),
-                );
+                menu = menu.item(PopupMenuItem::new("Branch").on_click(copy(branch.clone())));
             }
             if let Some(link) = &link {
-                menu = menu.item(
-                    PopupMenuItem::new("Thread").icon(Icon::new(Lucide::MessageSquare)).on_click(copy(link.clone())),
-                );
+                menu = menu.item(PopupMenuItem::new("Thread").on_click(copy(link.clone())));
             }
-            menu.item(PopupMenuItem::new("Thread ID").icon(Icon::new(Lucide::Hash)).on_click(copy(id.clone())))
+            menu.item(PopupMenuItem::new("Thread ID").on_click(copy(id.clone())))
         });
-        menu = menu
-            .item(act!(item("Project settings", Lucide::Settings), |this, _w, cx, _id| this
-                .open_settings("projects", cx)));
+        menu = menu.item(act!(item("Project settings"), |this, _w, cx, _id| this.open_settings("projects", cx)));
         menu = menu.separator();
         menu = menu.item(
-            act!(item("Archive thread", Lucide::Archive), |this, window, cx, id| this.archive_thread(&id, window, cx))
+            act!(item("Archive thread"), |this, window, cx, id| this.archive_thread(&id, window, cx))
                 .disabled(self.running),
         );
-        menu.item(act!(item("Delete", Lucide::Trash), |this, window, cx, id| this.delete_thread(&id, window, cx)))
+        let delete =
+            if cfg!(target_os = "macos") { item("Delete").icon(Icon::new(Lucide::Trash)) } else { item("Delete") };
+        menu.item(act!(delete, |this, window, cx, id| this.delete_thread(&id, window, cx)))
     }
 }

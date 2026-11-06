@@ -344,17 +344,22 @@ pub(super) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// `formatAccessTimestamp` (`dateStyle: medium, timeStyle: short`) in this machine's zone.
+/// `formatAccessTimestamp` (`dateStyle: medium, timeStyle: short`) in this machine's zone and clock.
 pub(super) fn format_timestamp(iso: &str) -> String {
-    format_timestamp_in(iso, &chrono::Local)
+    format_timestamp_in(iso, &chrono::Local, crate::timestamp::hour12("locale"))
 }
 
-fn format_timestamp_in<Tz: chrono::TimeZone>(iso: &str, zone: &Tz) -> String
+fn format_timestamp_in<Tz: chrono::TimeZone>(iso: &str, zone: &Tz, hour12: bool) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .map_or_else(|_| iso.to_owned(), |at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
+    chrono::DateTime::parse_from_rfc3339(iso).map_or_else(
+        |_| iso.to_owned(),
+        |at| {
+            let at = at.with_timezone(zone);
+            format!("{}, {}", at.format("%b %-d, %Y"), crate::timestamp::clock(&at, hour12))
+        },
+    )
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
@@ -737,10 +742,11 @@ mod tests {
 
     #[test]
     fn timestamps_format_as_medium_date_and_short_time() {
-        assert_eq!(format_timestamp_in("2026-11-05T15:04:00.000Z", &chrono::Utc), "Nov 5, 2026, 3:04 PM");
-        assert_eq!(format_timestamp_in("2024-02-29T00:30:00Z", &chrono::Utc), "Feb 29, 2024, 12:30 AM");
+        assert_eq!(format_timestamp_in("2026-11-05T15:04:00.000Z", &chrono::Utc, true), "Nov 5, 2026, 3:04 PM");
+        assert_eq!(format_timestamp_in("2024-02-29T00:30:00Z", &chrono::Utc, true), "Feb 29, 2024, 12:30 AM");
+        assert_eq!(format_timestamp_in("2026-11-05T15:04:00.000Z", &chrono::Utc, false), "Nov 5, 2026, 15:04");
         let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
-        assert_eq!(format_timestamp_in("2024-02-29T20:30:00Z", &tokyo), "Mar 1, 2024, 5:30 AM");
+        assert_eq!(format_timestamp_in("2024-02-29T20:30:00Z", &tokyo, true), "Mar 1, 2024, 5:30 AM");
         assert_eq!(format_timestamp("nonsense"), "nonsense");
     }
 

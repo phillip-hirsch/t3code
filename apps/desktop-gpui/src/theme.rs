@@ -7,12 +7,16 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, rgb};
+use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, px, rgb};
 
 use crate::settings::{Settings, TYPOGRAPHY_ADVANCED_KEY};
 use crate::themes::{ThemeChoice, ThemeColors};
 
-pub const FONT_SANS: &str = "Inter";
+/// The face the web app's `--font-sans` stack renders on each OS: `-apple-system` (SF Pro) on
+/// macOS, the bundled Inter elsewhere. GPUI maps `.SystemUIFont` to the platform UI font.
+pub const FONT_SANS: &str = if cfg!(target_os = "macos") { ".SystemUIFont" } else { "Inter" };
+/// What Settings › Appearance calls that default (`resolveDefaultFamilyLabel`).
+pub const FONT_SANS_LABEL: &str = if cfg!(target_os = "macos") { "SF Pro" } else { "Inter Variable" };
 /// The first family of the web app's `--font-mono` stack each OS has by name: macOS doesn't
 /// expose SF Mono (`ui-monospace`) by name, and Linux's `monospace` is usually DejaVu Sans Mono.
 pub const FONT_MONO: &str = if cfg!(target_os = "macos") {
@@ -475,6 +479,12 @@ pub fn tokens(cx: &App) -> &Tokens {
     cx.global::<Tokens>()
 }
 
+/// `dialog-backdrop` (`index.css`): the background at 60% (64% dark) over a 4px blur that leaves
+/// nothing behind readable. GPUI cannot blur what lies beneath, so a denser veil hides it instead.
+pub fn dialog_backdrop(t: &Tokens) -> Hsla {
+    t.background.opacity(0.86)
+}
+
 /// The theme library pick: the appearance mode, the theme and the light/dark mix.
 #[derive(Clone, Default)]
 struct Preference(ThemeChoice);
@@ -531,6 +541,12 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         theme.radius = gpui_kit::px(8.);
         theme.radius_lg = gpui_kit::px(12.);
         theme.cursor_blink = crate::caret::blink();
+        // The toast viewport: 22.5rem wide, 2rem in from the right and below the 52px
+        // (macOS) or 40px title bar (`toast.tsx`, `--workspace-topbar-height`).
+        let titlebar = if cfg!(target_os = "macos") { 52. } else { 40. };
+        theme.notification.width = px(360.);
+        theme.notification.margins.top = px(titlebar + 32.);
+        theme.notification.margins.right = px(32.);
         let colors = &mut theme.colors;
         colors.background = tokens.background;
         colors.foreground = tokens.foreground;
@@ -559,6 +575,7 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.popover_foreground = tokens.foreground;
         colors.list_hover = tokens.accent;
         colors.list_active = tokens.accent;
+        colors.overlay = dialog_backdrop(&tokens);
         colors.danger = tokens.error;
         colors.danger_foreground = tokens.primary_foreground;
         colors.warning = tokens.warning;
@@ -573,7 +590,26 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.sidebar_accent = tokens.sidebar.row_active;
         colors.sidebar_accent_foreground = tokens.sidebar.foreground;
     });
+    web_scrollbar(&tokens, cx);
     cx.set_global(tokens);
+}
+
+/// `::-webkit-scrollbar` (`index.css`): a 6px thumb with 3px corners at the edge, on no track,
+/// shown whenever the content overflows, as Chromium shows styled scrollbars. Set on the base
+/// layer after `Theme::update`, which projects its own wider, hover-only bar.
+fn web_scrollbar(tokens: &Tokens, cx: &mut App) {
+    use gpui_kit::base::{ScrollbarMode, ScrollbarStyles, ScrollbarTheme, ScrollbarThumbStyle};
+    let thumb =
+        |color: Hsla| move |style: ScrollbarThumbStyle| style.bg(color).width(px(6.)).inset(px(0.)).radius(px(3.));
+    let styles = ScrollbarStyles::default()
+        .track(|style| style.width(px(6.)))
+        .track_hover(|style| style.width(px(6.)))
+        .track_active(|style| style.width(px(6.)))
+        .thumb(thumb(tokens.scrollbar_thumb))
+        .thumb_hover(thumb(tokens.scrollbar_thumb_hover))
+        .thumb_active(thumb(tokens.scrollbar_thumb_hover));
+    gpui_kit::base::Theme::global_mut(cx).scrollbar =
+        ScrollbarTheme::new().with_mode(ScrollbarMode::Always).with_styles(styles);
 }
 
 #[cfg(test)]

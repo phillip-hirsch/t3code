@@ -127,7 +127,13 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSResponder",
   "NSWorkspace",
 ] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# The system locale and forced 12/24-hour clock (`timestamp::system_locale`) read through it too.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSLocale",
+  "NSString",
+  "NSUserDefaults",
+] }
 # SnapShots' modifier-pair shortcut reads the modifier keys' state.
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
   "std",

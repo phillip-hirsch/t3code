@@ -371,7 +371,7 @@ impl Workspace {
                         .id("settings-backdrop")
                         .absolute()
                         .inset_0()
-                        .bg(t.background.opacity(0.6))
+                        .bg(theme::dialog_backdrop(&t))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
                 )
                 .child(
