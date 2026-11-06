@@ -530,6 +530,7 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         theme.mono_font_size = gpui_kit::px(fonts.code_size);
         theme.radius = gpui_kit::px(8.);
         theme.radius_lg = gpui_kit::px(12.);
+        theme.cursor_blink = crate::caret::blink();
         let colors = &mut theme.colors;
         colors.background = tokens.background;
         colors.foreground = tokens.foreground;

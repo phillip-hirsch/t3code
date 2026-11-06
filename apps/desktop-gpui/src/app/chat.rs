@@ -9,18 +9,21 @@ use std::time::Duration;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::message_scroller::MessageScroller;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontWeight, HighlightStyle, Hsla,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, WeakEntity, Window, div, linear_color_stop, linear_gradient,
+    StyleRefinement, Styled as _, Subscription, TextRun, WeakEntity, Window, div, linear_color_stop, linear_gradient,
     prelude::FluentBuilder as _, px, relative, rems,
 };
 
 use gpui_kit::assets::IconName;
 
-use super::{Target, Workspace, message_actions, project_name};
+use super::palette::View;
+use super::{Target, Workspace, message_actions};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
@@ -330,18 +333,45 @@ fn no_thread(t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-/// "What should we build in **project**?" (`DraftHeroHeadline`).
-fn draft_headline(project: Option<SharedString>, t: &Tokens) -> gpui_kit::Div {
-    let headline = match project {
-        Some(project) => h_flex()
-            .justify_center()
-            .flex_wrap()
-            .child("What should we build in\u{a0}")
-            .child(div().text_color(Hsla { a: 0.6, ..t.muted_foreground }).child(project))
-            .child("?"),
-        None => h_flex().justify_center().child("What should we work on?"),
+/// `DraftHeroProjectHeading`'s fit check: the one-line heading, measured at `text-3xl`, is
+/// no wider than the lane.
+fn heading_fits_inline(project: &str, width: f32, window: &Window) -> bool {
+    let font = window.text_style().font();
+    let size = rems(1.875).to_pixels(window.rem_size());
+    let gap = f32::from(rems(0.5).to_pixels(window.rem_size()));
+    let measure = |text: String, weight: FontWeight| {
+        let run = TextRun {
+            len: text.len(),
+            font: Font { weight, ..font.clone() },
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(window.text_system().shape_line(text.into(), size, &[run], None).width)
     };
-    div().w_full().text_3xl().line_height(px(36.)).text_color(t.foreground).child(headline)
+    measure("What should we build in".into(), FontWeight::NORMAL)
+        + gap
+        + measure(format!("{project}?"), FontWeight::MEDIUM)
+        <= width
+}
+
+/// `InlineButton` text: medium weight, underlined on hover.
+fn inline_button(id: &'static str, label: SharedString, color: Hsla, hover: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .min_w_0()
+        .max_w_full()
+        .truncate()
+        .cursor_pointer()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        .hover(move |s| s.text_color(hover).underline())
+        .child(label)
+}
+
+fn headline_tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
+    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
 }
 
 impl Workspace {
@@ -354,9 +384,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let t = *theme::tokens(cx);
         let (lane, _) = self.chat_layout(window);
-        let project = self.shell.projects.iter().find(|p| p.id == project_id).map(project_name);
+        let headline = self.render_draft_headline(project_id, lane.width, window, cx);
         div()
             .size_full()
             .flex()
@@ -374,11 +403,129 @@ impl Workspace {
                             .pl(px(lane.left))
                             .pr(px(lane.right))
                             .pb(px(16.))
-                            .child(draft_headline(project, &t)),
+                            .child(headline),
                     )
                     .child(self.render_composer(window, cx)),
             )
             .into_any_element()
+    }
+
+    /// `DraftHeroHeadline`: "What should we build in **project**?" on one line when the
+    /// window is `lg` and it fits, else "What should we build?" over the project; then
+    /// "or start without a project". A "No project" draft asks "What should we work on?".
+    fn render_draft_headline(
+        &self,
+        project_id: &str,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let project = self.shell.projects.iter().find(|p| p.id == project_id);
+        let is_scratch = self.draft_is_scratch();
+        let env = self.target.as_ref().map(Target::environment).cloned().unwrap_or_default();
+        let scratch_env = self.scratch_environment(&env);
+        let viewport = f32::from(window.viewport_size().width);
+        // Tailwind's `sm` and `lg` breakpoints, in CSS px.
+        let title_size = if viewport >= 640. { rems(1.875) } else { rems(1.5) };
+        let lg = viewport >= 1024.;
+        let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
+            inline_button("draft-project-picker", label, t.foreground, t.foreground)
+                .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
+                .on_click(cx.listener(|this, _, window, cx| this.open_palette(View::NewThreadIn, window, cx)))
+        };
+        let title = |el: gpui_kit::Div| {
+            el.w_full().text_size(title_size).line_height(rems(2.25)).text_color(t.foreground).justify_center()
+        };
+        let heading = match project.filter(|_| !is_scratch) {
+            Some(project) => {
+                let name = project.title.clone();
+                if lg && heading_fits_inline(&name, width, window) {
+                    title(h_flex().gap(rems(0.5))).child(div().flex_none().child("What should we build in")).child(
+                        h_flex()
+                            .min_w_0()
+                            .child(picker(name.clone().into(), Some(name.into()), cx))
+                            .child(div().flex_none().child("?")),
+                    )
+                } else {
+                    title(v_flex().items_center().gap(rems(0.5)))
+                        .child(div().text_center().child("What should we build?"))
+                        .child(
+                            h_flex()
+                                .max_w_full()
+                                .justify_center()
+                                .text_size(rems(1.))
+                                .line_height(rems(1.5))
+                                .child(picker(name.clone().into(), Some(name.into()), cx)),
+                        )
+                }
+            }
+            None if is_scratch => title(h_flex()).child("What should we work on?"),
+            None if !self.shell.projects.is_empty() => {
+                title(h_flex()).child(picker("Choose a project".into(), None, cx)).child("\u{a0}to start")
+            }
+            None => title(h_flex()).child("Add a project to start"),
+        };
+        let can_start_without = !is_scratch && !self.shell.projects.is_empty();
+        let subline = scratch_env.map(|scratch_env| {
+            let action = if is_scratch {
+                Some(picker("No project".into(), None, cx).into_any_element())
+            } else {
+                can_start_without.then(|| {
+                    let shortcut = self.shortcut_label("chat.newWithoutProject");
+                    inline_button(
+                        "start-without-project",
+                        "or start without a project".into(),
+                        t.muted_foreground,
+                        t.foreground,
+                    )
+                    .when_some(shortcut, |el, shortcut| el.tooltip(headline_tooltip(shortcut.into())))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_draft_without_project(scratch_env.clone(), window, cx);
+                    }))
+                    .into_any_element()
+                })
+            };
+            h_flex()
+                .mt(rems(0.5))
+                .h(rems(1.5))
+                .w_full()
+                .justify_center()
+                .text_size(rems(0.875))
+                .line_height(rems(1.25))
+                .children(action)
+        });
+        v_flex().w_full().items_center().child(heading).children(subline).into_any_element()
+    }
+
+    /// `startScratch`: an empty draft opens the "No project" draft; one with content moves there.
+    fn start_draft_without_project(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&env) else { return };
+        let origin = self.target.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("projects.ensureScratch", serde_json::json!({})).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let project_id = match result {
+                    Ok(value) => value["projectId"].as_str().map(str::to_owned),
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(error.to_string()).title("Could not start without a project"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                // A draft that moved on meanwhile stays where it is.
+                let Some(project_id) = project_id.filter(|_| this.target == origin) else { return };
+                let empty = this.composer.read(cx).value().trim().is_empty() && this.attachments.is_empty();
+                if empty {
+                    this.start_draft_in(env, project_id, window, cx);
+                } else {
+                    this.retarget_draft(env, project_id, cx);
+                }
+            });
+        })
+        .detach();
     }
 }
 
@@ -619,7 +766,7 @@ fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace
                 .bg(t.background)
                 .cursor_pointer()
                 .hover(|style| style.bg(t.accent).text_color(t.foreground))
-                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
                 .on_click(move |_, window, cx| {
                     let thread_id = thread_id.to_string();
                     let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
