@@ -227,6 +227,7 @@ impl Workspace {
         let Some(session) = self.session_mut(&environment_id) else { return };
         let Some(client) = session.client.clone() else { return };
         session.shell_retried = false;
+        self.resume_file_saves(&environment_id, cx);
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
         let id = environment_id.clone();
         let config_task = Self::pump(

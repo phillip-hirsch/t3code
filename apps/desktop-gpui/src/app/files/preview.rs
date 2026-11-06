@@ -430,10 +430,26 @@ impl Workspace {
             return;
         }
         state.last_change = Instant::now();
-        if !state.save.change() {
-            return;
+        if state.save.change() {
+            Self::schedule_save(state, key.clone(), cx);
         }
-        let key = key.clone();
+    }
+
+    /// An environment's socket is back: its files' unsaved edits write again, like the web's
+    /// `subscribeWritable` recovery, after the usual debounce.
+    pub(in crate::app) fn resume_file_saves(&mut self, env: &str, cx: &mut Context<Self>) {
+        for (key, state) in &mut self.files.previews {
+            if key.checkout.env != env || !state.save.pending() {
+                continue;
+            }
+            state.last_change = Instant::now();
+            if state.save.resume() {
+                Self::schedule_save(state, key.clone(), cx);
+            }
+        }
+    }
+
+    fn schedule_save(state: &mut PreviewState, key: FileKey, cx: &mut Context<Self>) {
         state._save = Some(cx.spawn(async move |this, cx| {
             let mut delay = SAVE_DEBOUNCE;
             loop {
