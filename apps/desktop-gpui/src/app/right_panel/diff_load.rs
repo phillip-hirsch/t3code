@@ -60,35 +60,74 @@ pub(super) fn deferred_files(source: &Value) -> Vec<FileStat> {
     files
 }
 
-/// `reviewFileQueries`' request for one file of the preview's source.
-pub(super) fn file_patch_request(
-    cwd: &str,
-    base_ref: Option<&str>,
-    commit_sha: Option<&str>,
-    source_kind: &str,
-    ignore_whitespace: bool,
-    file: &FileStat,
-) -> Value {
-    let mut input = json!({
-        "cwd": cwd,
-        "ignoreWhitespace": ignore_whitespace,
-        "file": {"path": file.path, "previousPath": file.previous_path, "sourceKind": source_kind},
-    });
-    if let Some(base) = base_ref {
-        input["baseRef"] = base.into();
-    }
-    if let Some(sha) = commit_sha {
-        input["commitSha"] = sha.into();
-    }
-    input
+/// What reads one file's patch of the preview's source (`reviewFileQueries`).
+#[derive(Clone, Debug)]
+pub(super) struct PatchRequest {
+    pub(super) cwd: String,
+    pub(super) base_ref: Option<String>,
+    pub(super) commit_sha: Option<String>,
+    pub(super) source_kind: &'static str,
+    pub(super) ignore_whitespace: bool,
 }
 
-/// The files of a one-file reply (`diffFilePatch`), from its source of the requested kind.
-pub(super) fn file_patch(value: &Value, source_kind: &str) -> Vec<DiffFile> {
-    let source = value["sources"].as_array().and_then(|s| s.iter().find(|s| s["kind"].as_str() == Some(source_kind)));
-    source.map_or_else(Vec::new, |source| {
-        parse_patch(source["diff"].as_str().unwrap_or_default(), source["truncated"].as_bool() == Some(true))
-    })
+impl PatchRequest {
+    /// The `review.getDiffPreview` input for `file`.
+    pub(super) fn input(&self, file: &FileStat) -> Value {
+        let mut input = json!({
+            "cwd": self.cwd,
+            "ignoreWhitespace": self.ignore_whitespace,
+            "file": {"path": file.path, "previousPath": file.previous_path, "sourceKind": self.source_kind},
+        });
+        if let Some(base) = &self.base_ref {
+            input["baseRef"] = base.as_str().into();
+        }
+        if let Some(sha) = &self.commit_sha {
+            input["commitSha"] = sha.as_str().into();
+        }
+        input
+    }
+}
+
+/// How one file's patch read settled (`fileStates`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileState {
+    Loaded,
+    /// The server cut the patch at its size limit; the counts still cover every change.
+    Truncated,
+    /// The read failed or left the file out; its row stays, with a retry.
+    Failed,
+}
+
+/// One file's reply (`diffFilePatch`, `None` when the request failed) as the rows it shows:
+/// the file from the requested source, or a placeholder row when it did not load.
+pub(super) fn settle_file(file: &FileStat, reply: Option<&Value>, source_kind: &str) -> (Vec<DiffFile>, FileState) {
+    let source =
+        reply.and_then(|value| value["sources"].as_array()?.iter().find(|s| s["kind"].as_str() == Some(source_kind)));
+    let Some(source) = source else { return (placeholder(file), FileState::Failed) };
+    let truncated = source["truncated"].as_bool() == Some(true);
+    let files: Vec<DiffFile> = parse_patch(source["diff"].as_str().unwrap_or_default(), truncated)
+        .into_iter()
+        .filter(|parsed| parsed.path().as_ref() == file.path)
+        .collect();
+    match (files.is_empty(), truncated) {
+        (true, _) => (placeholder(file), FileState::Failed),
+        (false, true) => (files, FileState::Truncated),
+        (false, false) => (files, FileState::Loaded),
+    }
+}
+
+/// A header-only row that names the file, for a patch that did not load.
+fn placeholder(file: &FileStat) -> Vec<DiffFile> {
+    let previous = file.previous_path.as_deref().unwrap_or(&file.path);
+    parse_patch(
+        &format!(
+            "--- a/{previous}
++++ b/{}
+",
+            file.path
+        ),
+        false,
+    )
 }
 
 /// `Intl.Collator(undefined, {numeric: true, sensitivity: "base"})`, for paths: case-insensitive,
@@ -147,24 +186,60 @@ mod tests {
     #[test]
     fn file_requests_name_the_file_and_its_source() {
         let file = FileStat { path: "b.ts".into(), previous_path: Some("a.ts".into()), additions: 1, deletions: 1 };
+        let mut request = PatchRequest {
+            cwd: "/repo".into(),
+            base_ref: Some("origin/main".into()),
+            commit_sha: None,
+            source_kind: "branch-range",
+            ignore_whitespace: true,
+        };
         assert_eq!(
-            file_patch_request("/repo", Some("origin/main"), None, "branch-range", true, &file),
+            request.input(&file),
             json!({"cwd": "/repo", "baseRef": "origin/main", "ignoreWhitespace": true,
                 "file": {"path": "b.ts", "previousPath": "a.ts", "sourceKind": "branch-range"}}),
         );
-        let commit = file_patch_request("/repo", None, Some("abc"), "commit", false, &file);
+        (request.base_ref, request.commit_sha, request.source_kind) = (None, Some("abc".into()), "commit");
+        let commit = request.input(&file);
         assert_eq!(commit["commitSha"], "abc");
         assert!(commit.get("baseRef").is_none());
     }
 
     #[test]
-    fn one_file_replies_read_their_requested_source() {
-        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n";
-        let reply = json!({"sources": [
-            {"kind": "working-tree", "diff": "", "truncated": false},
-            {"kind": "branch-range", "diff": patch, "truncated": false},
-        ]});
-        assert_eq!(file_patch(&reply, "branch-range").len(), 1);
-        assert!(file_patch(&reply, "working-tree").is_empty());
+    fn every_requested_file_keeps_a_row_with_how_its_read_went() {
+        let patch = "diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let file = |path: &str| FileStat { path: path.into(), previous_path: None, additions: 1, deletions: 1 };
+        let reply = |truncated: bool| {
+            json!({"sources": [
+                {"kind": "working-tree", "diff": "", "truncated": false},
+                {"kind": "branch-range", "diff": patch, "truncated": truncated},
+            ]})
+        };
+        let settled = |file: &FileStat, reply: Option<&Value>, kind: &str| {
+            let (files, state) = settle_file(file, reply, kind);
+            (
+                files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(),
+                files.iter().any(DiffFile::has_changes),
+                state,
+            )
+        };
+        let a = file("a.txt");
+        assert_eq!(settled(&a, Some(&reply(false)), "branch-range"), (vec!["a.txt".into()], true, FileState::Loaded));
+        assert_eq!(settled(&a, Some(&reply(true)), "branch-range").2, FileState::Truncated);
+        // A failed request, a missing source, or a reply without the file each keep a bare row to retry.
+        assert_eq!(settled(&a, None, "branch-range"), (vec!["a.txt".into()], false, FileState::Failed));
+        assert_eq!(settled(&a, Some(&reply(false)), "working-tree").2, FileState::Failed);
+        assert_eq!(settled(&file("dir/b c.txt"), Some(&reply(false)), "branch-range").0, ["dir/b c.txt"]);
+        let renamed = FileStat { previous_path: Some("old.txt".into()), ..file("new.txt") };
+        let (rows, _) = settle_file(&renamed, None, "branch-range");
+        assert_eq!(
+            rows.iter().map(|f| (f.original_path().cloned(), f.path().clone())).collect::<Vec<_>>(),
+            [(Some("old.txt".into()), "new.txt".into())]
+        );
     }
 }
