@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// `PROJECT_FILE_PICKER_RESULT_LIMIT`.
 pub(super) const PICKER_LIMIT: usize = 200;
@@ -603,9 +603,21 @@ impl SaveQueue {
     }
 }
 
+/// `projects.listEntries` for one folder. The root goes as `""` too, as the web sends it: without
+/// `directoryPath` the server answers from its search index, which leaves out ignored entries.
+pub(super) fn list_entries_input(cwd: &str, folder: &str) -> Value {
+    json!({"cwd": cwd, "directoryPath": folder})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_root_listing_names_its_folder_so_ignored_entries_come_back() {
+        assert_eq!(list_entries_input("/w", ""), json!({"cwd": "/w", "directoryPath": ""}));
+        assert_eq!(list_entries_input("/w", "src/app"), json!({"cwd": "/w", "directoryPath": "src/app"}));
+    }
 
     fn file(path: &str) -> Entry {
         Entry { path: path.into(), kind: EntryKind::File, ignored: false }

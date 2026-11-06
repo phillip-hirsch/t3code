@@ -217,10 +217,7 @@ impl Workspace {
             };
             tree.in_flight += 1;
             let root = root.clone();
-            let mut input = json!({"cwd": root.cwd});
-            if !folder.is_empty() {
-                input["directoryPath"] = folder.clone().into();
-            }
+            let input = logic::list_entries_input(&root.cwd, &folder);
             cx.spawn(async move |this, cx| {
                 let result = client.request("projects.listEntries", input).await;
                 let _ = this.update(cx, |this, cx| {
