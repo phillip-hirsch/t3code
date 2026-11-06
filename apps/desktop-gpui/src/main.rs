@@ -120,7 +120,11 @@ fn main() {
         #[cfg(all(unix, not(target_os = "macos")))]
         desktop::linux_url_handler::register();
         cx.set_global(desktop::Desktop::load(cx));
-        app::main_window::open(cx);
+        // Only macOS keeps a windowless app, which the Dock can bring back.
+        if app::main_window::open(cx).is_none() && cfg!(not(target_os = "macos")) {
+            cx.quit();
+            return;
+        }
         app::main_window::receive_launches(launches, cx);
     });
 }
