@@ -487,6 +487,19 @@ pub fn active_providers(merged: &Merged) -> Vec<&'static str> {
         .collect()
 }
 
+/// `rankProvidersByMetric`: `providers` by the metric's total, largest first; ties keep their order.
+pub fn rank_providers(providers: &[&'static str], totals: &[ProviderTotals], tokens: bool) -> Vec<&'static str> {
+    let value = |kind: &str| {
+        totals
+            .iter()
+            .find(|t| t.provider == kind)
+            .map_or(0., |t| if tokens { t.total_tokens as f64 } else { t.cost_usd })
+    };
+    let mut ranked = providers.to_vec();
+    ranked.sort_by(|l, r| value(r).total_cmp(&value(l)));
+    ranked
+}
+
 /// `sortModelsByTokens`.
 pub fn models_by_tokens(models: &[ModelTotals]) -> Vec<&ModelTotals> {
     let mut sorted: Vec<&ModelTotals> = models.iter().collect();
@@ -1951,5 +1964,19 @@ mod tests {
         assert_eq!(format_resets_in(&window(0.), now).as_deref(), Some("resets in 2h 30m"));
         let pace = |used| pace_of_shares(used, elapsed_share(&window(used), now).unwrap());
         assert_eq!((pace(80.), pace(52.), pace(20.)), (Pace::Ahead, Pace::On, Pace::Under));
+    }
+
+    #[test]
+    fn ranks_providers_by_the_selected_metric() {
+        let totals = |provider: &str, cost_usd: f64, total_tokens: u64| ProviderTotals {
+            provider: provider.into(),
+            cost_usd,
+            total_tokens,
+            ..ProviderTotals::default()
+        };
+        let totals = [totals("codex", 1., 900), totals("claude", 5., 100), totals("grok", 1., 100)];
+        let providers = ["codex", "claude", "grok", "cursor"];
+        assert_eq!(rank_providers(&providers, &totals, false), ["claude", "codex", "grok", "cursor"]);
+        assert_eq!(rank_providers(&providers, &totals, true), ["codex", "claude", "grok", "cursor"]);
     }
 }

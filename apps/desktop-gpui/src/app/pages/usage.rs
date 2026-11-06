@@ -860,8 +860,8 @@ impl Workspace {
                         }),
                 ),
         );
-        for kind in &providers {
-            let totals = merged.providers.iter().find(|p| p.provider == *kind).cloned().unwrap_or_default();
+        for kind in logic::rank_providers(&providers, &merged.providers, tokens) {
+            let totals = merged.providers.iter().find(|p| p.provider == kind).cloned().unwrap_or_default();
             let share = if tokens { totals.token_share } else { totals.cost_share };
             let sessions = format!(
                 "{} {}",
