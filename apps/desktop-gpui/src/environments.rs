@@ -7,6 +7,7 @@
 //! Bearer tokens are stored encrypted by [`crate::secure_storage`] (the guarantee Electron's
 //! `safeStorage` gives the desktop app's connection catalog).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -396,8 +397,8 @@ pub struct SavedEnvironment {
     pub credential: Credential,
 }
 
-/// A saved environment's bearer token as this device holds it.
-#[derive(Clone, Debug, PartialEq)]
+/// A saved environment's bearer token as this device holds it. `Debug` never prints the token.
+#[derive(Clone, PartialEq)]
 pub enum Credential {
     /// Nothing is stored.
     Missing,
@@ -408,6 +409,16 @@ pub enum Credential {
         stored: String,
         error: String,
     },
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Token(_) => f.write_str("Token(<redacted>)"),
+            Self::Locked { error, .. } => f.debug_struct("Locked").field("error", error).finish_non_exhaustive(),
+        }
+    }
 }
 
 impl SavedEnvironment {
@@ -1263,6 +1274,18 @@ mod tests {
         assert!(opened.read_only && opened.problem.is_some());
         assert!(path.is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_token() {
+        let environment = saved("a", Credential::Token("secret-token".into()));
+        let catalog = Catalog { environments: vec![environment.clone()], ..Catalog::default() };
+        for text in [format!("{environment:?}"), format!("{catalog:?}"), format!("{:#?}", environment.credential)] {
+            assert!(!text.contains("secret-token"), "{text}");
+        }
+        assert!(format!("{environment:?}").contains("credential: Token(<redacted>)"));
+        let locked = Credential::Locked { stored: "abcd".into(), error: "denied".into() };
+        assert_eq!(format!("{locked:?}"), r#"Locked { error: "denied", .. }"#);
     }
 
     /// DPAPI keeps its master keys in the user's profile (`%APPDATA%\Microsoft\Protect`). A
