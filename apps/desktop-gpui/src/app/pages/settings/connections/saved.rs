@@ -171,7 +171,11 @@ fn saved_row(
         && !matches!(state.presented(), Presented::Connected | Presented::Unsupported))
     .then(|| environments::diagnose(&label, &state, server_version.as_deref()))
     .flatten();
-    let (status, error_tone) = state.saved_status(environment.enabled);
+    let (mut status, error_tone) = state.saved_status(environment.enabled);
+    // Switched off, it makes no attempt that would say so.
+    if !environment.enabled && matches!(environment.credential, environments::Credential::Locked { .. }) {
+        status.push_str(" \u{b7} Credential locked");
+    }
     // The headline below names the failure in full.
     let subtitle = match &diagnosis {
         Some(_) => environment.http_base.clone(),

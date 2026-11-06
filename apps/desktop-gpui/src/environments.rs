@@ -219,9 +219,24 @@ impl Failure {
         Self::new(Reason::RemoteUnavailable, detail, Some(Hop::Server))
     }
 
-    /// `credentialMissingError`.
+    /// `credentialMissingError`, or why a stored credential could not be decrypted.
     pub fn credential_missing(environment: &SavedEnvironment) -> Self {
-        let detail = format!("Connection credential {} is unavailable.", environment.connection_id());
+        let id = environment.connection_id();
+        let detail = match &environment.credential {
+            Credential::Locked { error, .. } => {
+                let store = if cfg!(target_os = "macos") {
+                    "the Keychain"
+                } else if cfg!(windows) {
+                    "your Windows profile"
+                } else {
+                    "the keyring"
+                };
+                format!(
+                    "Connection credential {id} is saved, but this device could not decrypt it ({error}). It is kept: make {store} available to T3 Code, then restart it."
+                )
+            }
+            Credential::Missing | Credential::Token(_) => format!("Connection credential {id} is unavailable."),
+        };
         Self::new(Reason::Authentication, detail, Some(Hop::Device))
     }
 
@@ -363,7 +378,7 @@ pub async fn pair(host: String, code: String, saved: Vec<SavedEnvironment>) -> R
         label: descriptor.label,
         http_base,
         enabled: true,
-        token: Some(token),
+        credential: Credential::Token(token),
     })
 }
 
@@ -378,8 +393,21 @@ pub struct SavedEnvironment {
     /// `https://host:port`, no trailing slash.
     pub http_base: String,
     pub enabled: bool,
-    /// `None` when the stored credential could not be decrypted.
-    pub token: Option<String>,
+    pub credential: Credential,
+}
+
+/// A saved environment's bearer token as this device holds it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Credential {
+    /// Nothing is stored.
+    Missing,
+    Token(String),
+    /// Stored, but this run could not decrypt it: the keyring was locked, denied access or is
+    /// unavailable. Saving writes `stored` back unchanged, so a later run can still read it.
+    Locked {
+        stored: String,
+        error: String,
+    },
 }
 
 impl SavedEnvironment {
@@ -395,7 +423,10 @@ impl SavedEnvironment {
     }
 
     pub fn endpoint(&self) -> Option<Endpoint> {
-        Some(Endpoint::bearer(&self.http_base, self.token.clone()?))
+        match &self.credential {
+            Credential::Token(token) => Some(Endpoint::bearer(&self.http_base, token.clone())),
+            Credential::Missing | Credential::Locked { .. } => None,
+        }
     }
 }
 
@@ -440,20 +471,19 @@ impl Catalog {
         Self::path()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .map(|document| Self::from_document(&document))
+            .map(|document| Self::from_document(&document, secure::unprotect))
             .unwrap_or_default()
     }
 
-    fn from_document(document: &Value) -> Self {
+    /// `unprotect` decrypts a stored token ([`secure::unprotect`] outside tests).
+    fn from_document(document: &Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Self {
         let environments = document["environments"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|entry| serde_json::from_value::<StoredEnvironment>(entry.clone()).ok())
             .map(|stored| SavedEnvironment {
-                token: unhex(&stored.encrypted_token)
-                    .and_then(|blob| secure::unprotect(&blob).ok())
-                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+                credential: open_credential(stored.encrypted_token, &unprotect),
                 environment_id: stored.environment_id,
                 label: stored.label,
                 http_base: stored.http_base_url,
@@ -463,18 +493,20 @@ impl Catalog {
         Self { local_environment_enabled: document["localEnvironmentEnabled"] != Value::Bool(false), environments }
     }
 
-    fn document(&self) -> anyhow::Result<Value> {
+    /// `protect` encrypts a token ([`secure::protect`] outside tests).
+    fn document(&self, protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> anyhow::Result<Value> {
         let environments = self
             .environments
             .iter()
             .map(|environment| {
-                let encrypted_token = match &environment.token {
-                    Some(token) => {
-                        let sealed = secure::protect(token.as_bytes())
+                let encrypted_token = match &environment.credential {
+                    Credential::Token(token) => {
+                        let sealed = protect(token.as_bytes())
                             .map_err(|error| anyhow::anyhow!("could not encrypt a token: {error}"))?;
                         backend::hex(&sealed)
                     }
-                    None => String::new(),
+                    Credential::Locked { stored, .. } => stored.clone(),
+                    Credential::Missing => String::new(),
                 };
                 serde_json::to_value(StoredEnvironment {
                     environment_id: environment.environment_id.clone(),
@@ -493,7 +525,7 @@ impl Catalog {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().context("No T3 home directory.")?;
-        crate::settings::write_atomically(&path, &self.document()?)
+        crate::settings::write_atomically(&path, &self.document(secure::protect)?)
             .with_context(|| format!("writing {}", path.display()))
     }
 
@@ -511,6 +543,21 @@ impl Catalog {
             Some(saved) => *saved = environment,
             None => self.environments.push(environment),
         }
+    }
+}
+
+/// A stored `encryptedToken`: empty is no credential; one that does not decrypt stays as stored.
+fn open_credential(stored: String, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Credential {
+    if stored.is_empty() {
+        return Credential::Missing;
+    }
+    let opened = unhex(&stored)
+        .ok_or_else(|| "The stored credential is not valid hex.".to_owned())
+        .and_then(|blob| unprotect(&blob))
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "The stored credential is not text.".to_owned()));
+    match opened {
+        Ok(token) => Credential::Token(token),
+        Err(error) => Credential::Locked { stored, error },
     }
 }
 
@@ -885,7 +932,7 @@ mod tests {
             label: "Box".into(),
             http_base: "https://box:4000".into(),
             enabled: true,
-            token: None,
+            credential: Credential::Missing,
         };
         let missing = state(Phase::Blocked, 1, Some(Failure::credential_missing(&saved)));
         let diagnosis = diagnose("Box", &missing, None).unwrap();
@@ -897,6 +944,86 @@ mod tests {
         );
         let text = diagnosis_text("Box", &diagnosis);
         assert!(text.starts_with("T3 Code connection to Box: This device could not prepare the connection\n\nThis device: FAILED\nT3 Code on Box: not checked\n\nCause: authentication"));
+
+        // A credential the keyring would not open says so, rather than that none is saved.
+        let locked = SavedEnvironment {
+            credential: Credential::Locked { stored: "00".into(), error: "Could not use the Keychain: denied".into() },
+            ..saved
+        };
+        let detail = Failure::credential_missing(&locked).detail;
+        assert!(detail.contains("is saved, but this device could not decrypt it (Could not use the Keychain: denied)"));
+    }
+
+    /// Stand-ins for the platform store: a reversible "encryption", and a keyring that refuses.
+    #[expect(clippy::unnecessary_wraps, reason = "the signature of `secure::protect`")]
+    fn seal(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.iter().map(|byte| byte ^ 0x5a).collect())
+    }
+
+    fn denied(_: &[u8]) -> Result<Vec<u8>, String> {
+        Err("Could not use the Keychain: denied".into())
+    }
+
+    fn saved(id: &str, credential: Credential) -> SavedEnvironment {
+        SavedEnvironment {
+            environment_id: id.into(),
+            label: id.into(),
+            http_base: format!("https://{id}"),
+            enabled: true,
+            credential,
+        }
+    }
+
+    #[test]
+    fn credentials_the_keyring_cannot_open_survive_saves_of_other_changes() {
+        let catalog = Catalog {
+            local_environment_enabled: true,
+            environments: vec![saved("a", Credential::Token("token-a".into())), saved("b", Credential::Missing)],
+        };
+        let document = catalog.document(seal).unwrap();
+        assert!(!document.to_string().contains("token-a"));
+        assert_eq!(Catalog::from_document(&document, seal), catalog);
+        let stored = document["environments"][0]["encryptedToken"].clone();
+
+        // This run's keyring refuses: the token is locked, not gone.
+        let mut locked = Catalog::from_document(&document, denied);
+        let error = "Could not use the Keychain: denied".to_owned();
+        let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
+        assert_eq!(locked.environments[0].credential, expected);
+        assert_eq!(locked.environments[1].credential, Credential::Missing);
+        assert!(locked.environments[0].endpoint().is_none());
+
+        // Rename it, switch it off and pair another environment, then save.
+        locked.environments[0].label = "Renamed".into();
+        locked.environments[0].enabled = false;
+        locked.upsert(saved("c", Credential::Token("token-c".into())));
+        let saved_again = locked.document(seal).unwrap();
+        assert_eq!(saved_again["environments"][0]["encryptedToken"], stored);
+        assert_eq!(saved_again["environments"][1]["encryptedToken"], "");
+
+        // A later run whose keyring opens reads every token back.
+        let reopened = Catalog::from_document(&saved_again, seal);
+        let tokens: Vec<_> = reopened.environments.iter().map(|e| e.credential.clone()).collect();
+        assert_eq!(
+            tokens,
+            [Credential::Token("token-a".into()), Credential::Missing, Credential::Token("token-c".into())]
+        );
+        assert_eq!(reopened.environments[0].label, "Renamed");
+    }
+
+    #[test]
+    fn unreadable_stored_credentials_are_kept_as_stored() {
+        for stored in ["zz", "0", "00ff"] {
+            let document = json!({ "environments": [{
+                "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "encryptedToken": stored,
+            }] });
+            let catalog = Catalog::from_document(&document, seal);
+            assert!(
+                matches!(&catalog.environments[0].credential, Credential::Locked { stored: kept, .. } if kept == stored)
+            );
+            assert_eq!(catalog.document(seal).unwrap()["environments"][0]["encryptedToken"], stored);
+        }
+        assert_eq!(Catalog::from_document(&json!({}), seal), Catalog::default());
     }
 
     /// DPAPI keeps its master keys in the user's profile (`%APPDATA%\Microsoft\Protect`). A
@@ -924,17 +1051,17 @@ mod tests {
                 label: "Box".into(),
                 http_base: "https://box".into(),
                 enabled: false,
-                token: Some("secret-token".into()),
+                credential: Credential::Token("secret-token".into()),
             }],
         };
-        let document = catalog.document().unwrap();
+        let document = catalog.document(secure::protect).unwrap();
         assert!(!document.to_string().contains("secret-token"));
-        assert_eq!(Catalog::from_document(&document), catalog);
-        // An unreadable credential keeps the entry, without its token.
+        assert_eq!(Catalog::from_document(&document, secure::unprotect), catalog);
+        // A credential DPAPI cannot open is kept as stored.
         let mut tampered = document;
         tampered["environments"][0]["encryptedToken"] = json!("00ff");
-        assert_eq!(Catalog::from_document(&tampered).environments[0].token, None);
-        assert_eq!(Catalog::from_document(&json!({})), Catalog::default());
+        let reread = Catalog::from_document(&tampered, secure::unprotect);
+        assert!(matches!(&reread.environments[0].credential, Credential::Locked { stored, .. } if stored == "00ff"));
     }
 
     #[test]
