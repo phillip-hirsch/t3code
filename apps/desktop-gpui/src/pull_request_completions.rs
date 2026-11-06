@@ -53,7 +53,7 @@ pub fn detect(text: &str, cursor: usize, support: &Support) -> Option<Trigger> {
         text[..end].rfind(char::is_whitespace).map_or(0, |at| at + text[at..].chars().next().map_or(1, char::len_utf8));
     let token = &text[start..end];
     let sigil = token.chars().next()?;
-    let query = &token[1..];
+    let query = &token[sigil.len_utf8()..];
     let trigger = |kind| Trigger { kind, sigil, query: query.to_owned(), range: start..end };
     match sigil {
         '@' if is_login(query) => support.mentions.then(|| trigger(Kind::Mention)),
@@ -180,6 +180,9 @@ mod tests {
             ("C#", 2),
             ("![image", 7),
             ("## Heading", 2),
+            ("é", 2),
+            ("日本", 6),
+            ("hi 👋", 7),
         ] {
             assert_eq!(detect(text, cursor, &gitlab()), None, "{text:?}");
         }
