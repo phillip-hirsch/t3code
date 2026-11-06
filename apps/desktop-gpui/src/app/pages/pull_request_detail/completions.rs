@@ -140,20 +140,27 @@ impl Workspace {
                 });
             }
         }
+        let Some(pr) = self.shown_pr_key() else { return };
+        let owner = pr.clone();
         let debounce = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(completing) = this.pr_write().and_then(|w| w.completion.as_mut()) else { return };
+                let Some(completing) = this.pr_completion_of(&owner, id) else { return };
                 completing.settled = Some(key);
-                this.request_pr_completions(cx);
+                this.request_pr_completions(&owner, id, cx);
                 cx.notify();
             });
         });
-        if let Some(completing) = self.pr_write().and_then(|w| w.completion.as_mut()) {
+        if let Some(completing) = self.pr_completion_of(&pr, id) {
             completing._debounce = Some(debounce);
         }
-        self.request_pr_completions(cx);
+        self.request_pr_completions(&pr, id, cx);
         cx.notify();
+    }
+
+    /// The completion open in `input` of the pull request `pr` names, shown or parked.
+    fn pr_completion_of(&mut self, pr: &str, input: EntityId) -> Option<&mut Completing> {
+        self.pr_panel(pr)?.write.completion.as_mut().filter(|c| c.input.entity_id() == input)
     }
 
     pub(super) fn close_pr_completion(&mut self, input: EntityId, cx: &mut Context<Self>) {
@@ -164,12 +171,14 @@ impl Workspace {
         }
     }
 
-    /// Asks the host for the trigger's options, once per search.
-    fn request_pr_completions(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+    /// Asks the host for the trigger's options, once per search; the answer lands on `pr`'s panel.
+    fn request_pr_completions(&mut self, pr: &str, entity: EntityId, cx: &mut Context<Self>) {
+        let Some(client) = self.pull_request_client_of(pr) else { return };
+        let Some(panel) = self.pr_panel(pr) else { return };
         let project_id = panel.reference.project_id.clone();
-        let Some(completing) = panel.write.completion.as_mut() else { return };
+        let Some(completing) = panel.write.completion.as_mut().filter(|c| c.input.entity_id() == entity) else {
+            return;
+        };
         let (key, sent) = completing.request();
         if completing.answers.contains_key(&key) || !completing.in_flight.insert(key.clone()) {
             return;
@@ -183,15 +192,11 @@ impl Workspace {
         if let Some(sent) = sent {
             input["query"] = json!(sent);
         }
-        let entity = completing.input.entity_id();
+        let pr = pr.to_owned();
         cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.filterOptions", input).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(completing) =
-                    this.pr_write().and_then(|w| w.completion.as_mut()).filter(|c| c.input.entity_id() == entity)
-                else {
-                    return;
-                };
+                let Some(completing) = this.pr_completion_of(&pr, entity) else { return };
                 completing.in_flight.remove(&key);
                 if let Ok(value) = &result {
                     completing.last = Some(value.clone());
