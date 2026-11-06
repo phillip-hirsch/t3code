@@ -489,14 +489,7 @@ impl Workspace {
         if device {
             return PRIMARY;
         }
-        let connected = |index: &usize| self.sessions[*index].is_connected();
-        let picked = self.settings_ui.scope.machine.as_deref().and_then(|id| self.session_index(id));
-        // `selectScopedSettingsEnvironments`: the primary while connected, else the first connected.
-        picked
-            .filter(connected)
-            .or_else(|| Some(PRIMARY).filter(connected))
-            .or_else(|| (0..self.sessions.len()).find(connected))
-            .unwrap_or(PRIMARY)
+        self.scoped_settings_environment().and_then(|id| self.session_index(&id)).unwrap_or(PRIMARY)
     }
 
     pub(super) fn settings_info(&self) -> &ServerInfo {
