@@ -1749,16 +1749,44 @@ pub fn guide_stop_handoff(subject: &HandoffSubject, index: usize, stop: &GuideSt
     with_context(bounded(question), &[subject.context(&[ANSWER_INSTRUCTIONS]), lines.join("\n")])
 }
 
+/// A pull request context block's label line (`PR #7 · Title`), and whether it carries no instructions.
+fn context_block(block: &str) -> Option<(&str, bool)> {
+    let mut lines = block.trim().lines();
+    let label = lines.next().filter(|line| line.starts_with("PR #"))?;
+    let rest: Vec<&str> = lines.collect();
+    let untrusted = rest.get(2).is_some_and(|line| line.starts_with("Everything here (the title, URL, branch names"));
+    untrusted.then_some((label, rest.len() == 3))
+}
+
 /// `appendHandoff`: a handoff adds to what the composer holds, earlier findings included,
-/// and adds nothing when the same block is already there.
+/// and adds nothing when the same block is already there. A pull request's context is held once:
+/// the newer copy replaces it, except that a plain one, as a fix sends, keeps out answer-only instructions.
 pub fn append_handoff(existing: &str, incoming: &str) -> String {
+    let mut held: Vec<String> = existing.split("\n\n").map(str::to_owned).collect();
+    let mut rest = Vec::new();
+    for block in incoming.trim().split("\n\n") {
+        let Some((label, plain)) = context_block(block) else {
+            rest.push(block);
+            continue;
+        };
+        match held.iter_mut().find(|h| context_block(h).is_some_and(|(l, _)| l == label)) {
+            Some(old) => {
+                if plain || !context_block(old).is_some_and(|(_, old_plain)| old_plain) {
+                    *old = block.to_owned();
+                }
+            }
+            None => rest.push(block),
+        }
+    }
+    let existing = held.join("\n\n");
+    let incoming = rest.join("\n\n");
     let trim_lines = |text: &str| text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
-    let present = trim_lines(existing);
+    let present = trim_lines(&existing);
     let added = incoming.trim();
     let repeat = format!("\n\n{}\n\n", present.trim()).contains(&format!("\n\n{}\n\n", trim_lines(added)));
     let kept = existing.trim_end();
     if added.is_empty() || repeat {
-        existing.to_owned()
+        existing.clone()
     } else if kept.is_empty() {
         added.to_owned()
     } else {
@@ -1981,6 +2009,13 @@ mod tests {
         assert_eq!(append_handoff("mine\n\nold", "new"), "mine\n\nold\n\nnew", "earlier findings stay");
         assert_eq!(append_handoff("mine\n\nold  \nline", "old\nline"), "mine\n\nold  \nline", "a repeat adds nothing");
         assert_eq!(append_handoff("mine", ""), "mine");
+        let fix = selection_handoff(&subject, "a.rs", "L1", "Fix this");
+        let asked_then_fixed = append_handoff(&format!("Why?\n\n{ask}"), &fix);
+        assert!(!asked_then_fixed.contains(ANSWER_INSTRUCTIONS), "{asked_then_fixed}");
+        assert_eq!(asked_then_fixed.matches("PR #7 · Add").count(), 1, "{asked_then_fixed}");
+        assert!(asked_then_fixed.starts_with("Why?\n\nPR #7") && asked_then_fixed.ends_with("Fix this\n\na.rs L1"));
+        assert_eq!(append_handoff(&fix, &ask), fix, "a fix keeps out answer-only instructions");
+        assert_eq!(append_handoff(&ask, &ask), ask);
     }
 
     #[test]
