@@ -125,7 +125,7 @@ impl Workspace {
     }
 
     /// The draft is a "No project" draft (`activeProjectIsScratch`), which never auto-balances.
-    fn draft_is_scratch(&self) -> bool {
+    pub(super) fn draft_is_scratch(&self) -> bool {
         let Some(project) = self.target_project() else { return false };
         self.project_groups().iter().any(|g| g.contains(&project.id) && g.members[0].is_scratch)
     }
@@ -177,7 +177,7 @@ impl Workspace {
     }
 
     /// The draft keeps its text and moves to another checkout of its project.
-    fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
+    pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         if !matches!(self.target, Some(Target::Draft { .. })) {
             return;
         }

@@ -444,6 +444,17 @@ impl Workspace {
             .collect()
     }
 
+    /// `scratchEnvironmentId`: where "start without a project" opens its draft.
+    pub(super) fn scratch_environment(&self, fallback: &str) -> Option<SharedString> {
+        let offering: Vec<&SharedString> = self
+            .sessions
+            .iter()
+            .filter(|session| session.is_connected() && session.server_info.scratch_workspace_root.is_some())
+            .filter_map(|session| session.id.as_ref())
+            .collect();
+        pick_scratch_environment(&offering, self.primary_environment().map(SharedString::as_ref), fallback)
+    }
+
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.
     pub(super) fn scratch_roots_match(&self, cached: &[ScratchRoot]) -> bool {
         let current = self
@@ -504,5 +515,30 @@ impl Workspace {
     /// (with `env_client` and `env_info`).
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
         self.sessions[self.settings_index()].id.clone()
+    }
+}
+
+/// The primary wins when it offers a "No project" home, then `fallback`, then the only
+/// environment that offers one.
+fn pick_scratch_environment(offering: &[&SharedString], primary: Option<&str>, fallback: &str) -> Option<SharedString> {
+    let offers = |id: &str| offering.iter().find(|offered| offered.as_ref() == id).map(|id| (*id).clone());
+    primary.and_then(offers).or_else(|| offers(fallback)).or_else(|| match offering {
+        [only] => Some((*only).clone()),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_drafts_prefer_the_primary_then_the_draft_then_a_sole_offer() {
+        let (primary, remote, other) = (SharedString::from("primary"), SharedString::from("remote"), "other".into());
+        let pick = |offering: &[&SharedString], fallback| pick_scratch_environment(offering, Some("primary"), fallback);
+        assert_eq!(pick(&[&remote, &primary], "remote"), Some(primary.clone()));
+        assert_eq!(pick(&[&remote, &other], "remote"), Some(remote.clone()));
+        assert_eq!(pick(&[&other], "remote"), Some(other.clone()));
+        assert_eq!(pick(&[&remote, &other], "elsewhere"), None);
     }
 }
