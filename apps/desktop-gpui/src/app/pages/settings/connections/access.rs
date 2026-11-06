@@ -262,7 +262,11 @@ impl Workspace {
             let url = self.settings_endpoint().map(|e| e.http_base.as_str());
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
             let description = if version.is_none() { "Loading\u{2026}".to_owned() } else { parts.join(" · ") };
-            let row = RowFrame::new("Version").description(description).status(has_config.then_some("Up to date"));
+            // `LocalVersionStatusLabel`, in the row's control slot.
+            let mut row = RowFrame::new("Version").description(description);
+            if has_config {
+                row = row.control(text_xs(div().text_color(t.muted_foreground)).child("Up to date"));
+            }
             rows.push(row.render(t).into_any_element());
             // A server this app started is exposed from here (`renderNetworkAccessRow`).
             match local_rows {
