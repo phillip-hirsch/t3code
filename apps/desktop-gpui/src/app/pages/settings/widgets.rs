@@ -695,6 +695,10 @@ impl Workspace {
             self.notify_sidebar(cx);
             self.report_browser_profiles(cx);
             self.sync_snap_shot(window, cx);
+            if plan.client_patch.contains_key("toolCallVisibility") {
+                self.refresh_rows(cx);
+                self.refresh_side_chat_rows(cx);
+            }
         }
         if plan.server_writes.is_empty() {
             return done(self, true, cx);

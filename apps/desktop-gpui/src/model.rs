@@ -683,6 +683,8 @@ pub struct Lineage {
 #[serde(rename_all = "camelCase")]
 pub struct PendingRequestSummary {
     pub kind: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1123,6 +1125,17 @@ pub struct ProviderSession {
     /// `OrchestrationV2ProviderCapabilities`.
     #[serde(default)]
     pub capabilities: Value,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// Transient status lines a provider extension shows, such as Pi's.
+    #[serde(default, deserialize_with = "lossy")]
+    pub extension_statuses: Vec<ExtensionStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ExtensionStatus {
+    pub key: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1170,6 +1183,9 @@ pub struct Run {
     /// A queued run the server holds until the thread is resumed.
     #[serde(default)]
     pub queue_held: bool,
+    /// Starts a new provider conversation; earlier runs stay visible but never reach the provider.
+    #[serde(default)]
+    pub fresh_context: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1430,6 +1446,24 @@ impl ThreadProjection {
         Some((usage, false))
     }
 
+    /// `deriveProviderExtensionStatuses`: only the selected provider's current session can supply them.
+    pub fn provider_extension_statuses(&self) -> &[ExtensionStatus] {
+        let Some(instance_id) = self.thread.model_selection.as_ref().map(|s| &s.instance_id) else { return &[] };
+        let active =
+            self.provider_threads.iter().find(|t| Some(&t.id) == self.thread.active_provider_thread_id.as_ref());
+        if active.is_some_and(|t| t.provider_instance_id.as_ref() != Some(instance_id)) {
+            return &[];
+        }
+        let session = self.provider_sessions.iter().rev().find(|session| {
+            session.provider_instance_id.as_ref() == Some(instance_id)
+                && active.is_none_or(|t| t.provider_session_id.as_ref() == Some(&session.id))
+        });
+        match session {
+            Some(session) if session.status != "stopped" => &session.extension_statuses,
+            _ => &[],
+        }
+    }
+
     /// `findLatestProposedPlan` for the latest run, with the markdown a paged
     /// projection moved to the plan's turn item.
     pub fn latest_proposed_plan(&self) -> Option<(&PlanArtifact, &str)> {
@@ -1474,6 +1508,21 @@ impl ThreadProjection {
             Some(id) => self.provider_sessions.iter().find(|session| &session.id == id),
             None => self.provider_sessions.iter().rev().find(|s| !matches!(s.status.as_str(), "stopped" | "error")),
         }
+    }
+
+    /// `turnEnded`: the provider finished this active run's latest turn, though the run has not settled yet.
+    pub fn turn_ended(&self, run: &Run) -> bool {
+        let activity = matches!(run.status.as_str(), "preparing" | "starting" | "running" | "waiting");
+        let Some(attempt) = run.active_attempt_id.as_ref().filter(|_| activity) else { return false };
+        // `latestProviderTurnForAttempt`: the first turn with the highest ordinal.
+        let latest = self.provider_turns.iter().filter(|turn| turn.run_attempt_id.as_ref() == Some(attempt)).fold(
+            None,
+            |latest: Option<&ProviderTurn>, turn| match latest {
+                Some(latest) if turn.ordinal <= latest.ordinal => Some(latest),
+                _ => Some(turn),
+            },
+        );
+        latest.is_some_and(|turn| !matches!(turn.status.as_str(), "pending" | "running"))
     }
 
     pub fn is_running(&self) -> bool {
@@ -2054,5 +2103,28 @@ mod tests {
         let approvals = projection.pending_approvals();
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].1.map(|item| item.id.as_str()), Some("i"));
+    }
+
+    #[test]
+    fn extension_statuses_come_from_the_selected_providers_live_session() {
+        let mut value = projection(&[]);
+        value["thread"]["modelSelection"] = json!({"instanceId": "pi", "model": "m"});
+        value["thread"]["activeProviderThreadId"] = json!("pt");
+        let session = |id: &str, instance: &str, status: &str| {
+            json!({"id": id, "status": status, "providerInstanceId": instance,
+                   "extensionStatuses": [{"key": "k", "text": format!("{id} ready")}]})
+        };
+        value["providerSessions"] = json!([session("s1", "pi", "running"), session("s2", "pi", "running")]);
+        value["providerThreads"] = json!([{"id": "pt", "providerSessionId": "s1", "providerInstanceId": "pi"}]);
+        let texts = |value: &Value| {
+            let projection = ThreadProjection::deserialize(value).unwrap();
+            projection.provider_extension_statuses().iter().map(|s| s.text.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&value), ["s1 ready"], "the active provider thread's session");
+        value["providerSessions"][0]["status"] = json!("stopped");
+        assert!(texts(&value).is_empty(), "a stopped session shows nothing");
+        value["providerThreads"][0]["providerInstanceId"] = json!("codex");
+        value["providerSessions"][0]["status"] = json!("running");
+        assert!(texts(&value).is_empty(), "another provider's thread shows nothing");
     }
 }

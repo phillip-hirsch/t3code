@@ -182,9 +182,17 @@ pub struct SystemDivider {
     pub id: SharedString,
     pub label: SharedString,
     pub detail: Option<SharedString>,
-    pub fork: bool,
+    pub icon: DividerIcon,
     /// The action's label and the thread it opens.
     pub action: Option<(SharedString, SharedString)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DividerIcon {
+    Stop,
+    Fork,
+    /// A fresh provider session (`FreshSessionRow`).
+    Eraser,
 }
 
 /// `V2LifecycleRow`'s divider for a finished stop or a fork.
@@ -210,7 +218,7 @@ fn system_divider(item: &TurnItem) -> Option<SystemDivider> {
         id: item.id.clone().into(),
         label: label.into(),
         detail,
-        fork: item.item_type == "fork",
+        icon: if item.item_type == "fork" { DividerIcon::Fork } else { DividerIcon::Stop },
         action,
     })
 }
@@ -541,23 +549,11 @@ impl PlanText {
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkRowKind {
     /// One entry on its own: a lone tool call, an error, a notice.
-    Single {
-        entry: Rc<Entry>,
-        label: SharedString,
-        expanded: bool,
-    },
+    Single { entry: Rc<Entry>, label: SharedString, expanded: bool },
     /// A collapsed group's summary, "Ran 2 commands and read 1 file".
-    Toggle {
-        group: SharedString,
-        summary: SharedString,
-        icon: WorkIcon,
-        expanded: bool,
-        run_id: Option<SharedString>,
-    },
+    Toggle { group: SharedString, summary: SharedString, icon: WorkIcon, expanded: bool, run_id: Option<SharedString> },
     /// The open list under an expanded group header.
-    Details {
-        entries: Vec<DetailEntry>,
-    },
+    Details { entries: Vec<DetailEntry> },
     /// The running turn's latest activity.
     Live {
         group: SharedString,
@@ -570,6 +566,8 @@ pub enum WorkRowKind {
     Thinking {
         group: Option<SharedString>,
         expanded: bool,
+        /// Zen's first line of the answer being written (`liveAnswerPreview`), else "Thinking".
+        preview: Option<SharedString>,
     },
 }
 
@@ -636,6 +634,8 @@ enum Kind {
         /// A bare `/compact` turn, which its compaction row stands in for.
         compaction: Option<Option<&'static str>>,
         sent_by_t3code: bool,
+        /// `/clear` or an automation started a new provider session with this message.
+        fresh_context: bool,
     },
     Assistant {
         text: SharedString,
@@ -792,6 +792,7 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 revertible,
                 sent_by_t3code: crate::queue::sent_by_t3code(item),
                 compaction: compaction_command(item),
+                fresh_context: item.bool("freshContext"),
             }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
@@ -1299,10 +1300,266 @@ fn attempt_folds(
         .collect()
 }
 
+/// Settings › Labs › Tool calls in chat (`ToolCallVisibility`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolCallVisibility {
+    #[default]
+    ShowAll,
+    /// Keeps a call while it runs, and afterwards only if it failed.
+    HideSuccessful,
+    HideAll,
+    /// Also hides the agent's in-between messages: each turn shows its final answer.
+    Zen,
+}
+
+impl ToolCallVisibility {
+    pub fn from_setting(value: &str) -> Self {
+        match value {
+            "hideSuccessful" => Self::HideSuccessful,
+            "hideAll" => Self::HideAll,
+            "zen" => Self::Zen,
+            _ => Self::ShowAll,
+        }
+    }
+
+    /// Find shows the in-between messages while it is open.
+    #[must_use]
+    pub fn while_finding(self) -> Self {
+        if self == Self::Zen { Self::HideAll } else { self }
+    }
+}
+
+/// How the rows read: the user's tool-call visibility, and the run whose usage-limit pause the
+/// recovery notice shows, so its repeats leave the timeline (`withoutUsageLimitNoticeRows`).
+#[derive(Clone, Debug, Default)]
+pub struct RowOptions {
+    pub visibility: ToolCallVisibility,
+    pub usage_limit_run: Option<String>,
+}
+
+/// `PROVIDER_LIMIT_NOTICE`: Claude Code's own limit message, such as
+/// "You've hit your 5-hour limit · resets 7:10am (Europe/Berlin)".
+fn provider_limit_notice(text: &str) -> bool {
+    const HEADS: [&str; 7] = [
+        "you've hit your limit",
+        "you've hit your 5-hour limit",
+        "you've hit your session limit",
+        "you've hit your weekly limit",
+        "you've hit your usage limit",
+        "you're out of extra usage",
+        "claude ai usage limit reached",
+    ];
+    let text = text.trim().to_lowercase().replace('\u{2019}', "'");
+    let text = text.strip_suffix('.').unwrap_or(&text);
+    let Some(rest) = HEADS.iter().find_map(|head| text.strip_prefix(head)) else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(rest) = rest.strip_prefix(" \u{b7} resets ") else { return false };
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let hour_len = digits(rest);
+    let hour_ok = match &rest[..hour_len] {
+        "" => false,
+        hour => !hour.starts_with('0') && hour.parse::<u8>().is_ok_and(|h| (1..=12).contains(&h)),
+    };
+    if !hour_ok {
+        return false;
+    }
+    let mut rest = &rest[hour_len..];
+    if let Some(minutes) = rest.strip_prefix(':') {
+        let ok = minutes.len() >= 2
+            && minutes.as_bytes()[0].is_ascii_digit()
+            && minutes.as_bytes()[0] <= b'5'
+            && minutes.as_bytes()[1].is_ascii_digit();
+        if !ok {
+            return false;
+        }
+        rest = &minutes[2..];
+    }
+    let Some(rest) = rest.strip_prefix("am").or_else(|| rest.strip_prefix("pm")) else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(zone) = rest.strip_prefix(" (").and_then(|r| r.strip_suffix(')')) else { return false };
+    zone.split('/')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-')))
+}
+
+/// `deriveUsageLimitNoticeRows`: the run's limit failures, Claude's pause notices for the failed
+/// provider turn, and that turn's last reply when it is only the provider's limit message.
+fn usage_limit_notice_items(projection: &ThreadProjection, run_id: &str) -> HashSet<String> {
+    let Some(run) = projection.runs.iter().find(|run| run.id == run_id) else { return HashSet::new() };
+    let in_run = |item: &&Rc<TurnItem>| item.run_id.as_deref() == Some(run_id);
+    let root = |item: &TurnItem| item.node_id == run.root_node_id;
+    let failures: Vec<&Rc<TurnItem>> = projection
+        .turn_items
+        .iter()
+        .filter(in_run)
+        .filter(|item| item.item_type == "error" && item.status == "failed" && root(item))
+        .collect();
+    let usage_limit =
+        |item: &TurnItem| item.raw.pointer("/failure/class").and_then(Value::as_str) == Some("usage_limit");
+    let mut hidden: HashSet<String> =
+        failures.iter().filter(|item| usage_limit(item)).map(|item| item.id.clone()).collect();
+    // `latestRootProviderFailure`, when the run failed.
+    let updated = |item: &TurnItem| item.str("updatedAt").and_then(crate::timestamp::parse_ms).unwrap_or_default();
+    let latest = failures
+        .iter()
+        .filter(|_| run.status == "failed")
+        .max_by(|a, b| (updated(a), a.ordinal, &a.id).cmp(&(updated(b), b.ordinal, &b.id)));
+    let Some(turn) = latest.filter(|item| usage_limit(item)).and_then(|item| item.str("providerTurnId")) else {
+        return hidden;
+    };
+    let in_turn = |item: &&Rc<TurnItem>| item.str("providerTurnId") == Some(turn);
+    let top_level = |item: &TurnItem| item.raw.get("parentItemId").is_none_or(Value::is_null);
+    let notice_prefix = format!("usage-limit:{turn}:");
+    let mut reply: Option<&Rc<TurnItem>> = None;
+    for item in projection.turn_items.iter().filter(in_run).filter(in_turn) {
+        let native = |key: &str| item.raw.pointer(&format!("/nativeItemRef/{key}")).and_then(Value::as_str);
+        if item.item_type == "system_notice"
+            && root(item)
+            && top_level(item)
+            && native("driver") == Some("claudeAgent")
+            && native("nativeId").is_some_and(|id| id.starts_with(&notice_prefix))
+        {
+            hidden.insert(item.id.clone());
+        }
+        if item.item_type == "assistant_message" && top_level(item) && reply.is_none_or(|r| item.ordinal > r.ordinal) {
+            reply = Some(item);
+        }
+    }
+    if let Some(reply) = reply.filter(|reply| provider_limit_notice(reply.str("text").unwrap_or_default())) {
+        hidden.insert(reply.id.clone());
+    }
+    hidden
+}
+
+/// `workEntryHiddenByToolCallVisibility`.
+fn hidden_tool_call(entry: &Entry, visibility: ToolCallVisibility) -> bool {
+    let hideable = matches!(
+        entry.item_type.as_ref(),
+        "command_execution" | "file_change" | "file_search" | "web_search" | "dynamic_tool"
+    );
+    match visibility {
+        ToolCallVisibility::ShowAll => false,
+        _ if !hideable => false,
+        ToolCallVisibility::HideSuccessful => entry.status == Some(Status::Completed) && !entry.failed(),
+        ToolCallVisibility::HideAll | ToolCallVisibility::Zen => true,
+    }
+}
+
+/// `workShownAsFinalAnswerOnly`: what Zen keeps besides messages.
+fn shown_in_zen(entry: &TimelineEntry, is_pending: impl Fn(&Entry) -> bool) -> bool {
+    match &entry.kind {
+        Kind::Event { subagent, .. } => subagent.is_none(),
+        Kind::Work(work) => {
+            is_pending(work)
+                || work.question_answered
+                || entry.is_compaction()
+                || entry.starts_response()
+                || work.tone == Tone::Error
+                || work.activity == Some(Activity::Error)
+                || (work.item_type == "error" && work.status != Some(Status::Completed))
+        }
+        _ => true,
+    }
+}
+
+/// `deriveInFlightSteerAnswerIds`: the reply that answers a steer sent mid-turn, which Zen keeps.
+fn steer_answers(entries: &[Rc<TimelineEntry>]) -> HashSet<usize> {
+    let mut answers = HashSet::new();
+    let (mut awaiting, mut candidate) = (false, None);
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.work().is_some_and(|work| work.is_reasoning()) {
+            continue;
+        }
+        let reply = matches!(entry.kind, Kind::Assistant { .. });
+        if let (Some(candidate), true) = (candidate.take(), reply) {
+            answers.insert(candidate);
+        }
+        if entry.is_steer() {
+            awaiting = true;
+        } else if matches!(entry.kind, Kind::User { .. }) {
+            awaiting = false;
+        } else if reply && awaiting {
+            candidate = Some(index);
+            awaiting = false;
+        }
+    }
+    answers
+}
+
+/// `liveAnswerPreview`: in Zen, the Thinking row shows the first line of what the agent
+/// is writing or thinking in the running turn.
+fn live_answer_preview(entries: &[Rc<TimelineEntry>]) -> Option<String> {
+    let after = entries.iter().rposition(|entry| entry.starts_response()).map_or(0, |index| index + 1);
+    entries[after..].iter().rev().find_map(|entry| {
+        let text = match &entry.kind {
+            Kind::Assistant { text, .. } => text.as_ref(),
+            Kind::Work(work) if work.is_reasoning() => work.detail.as_deref().unwrap_or_default(),
+            _ => "",
+        };
+        Some(work_log::live_thought_line(text)).filter(|line| !line.is_empty())
+    })
+}
+
+/// `timelineRowEntries`' visibility filter. While `answering`, the latest turn's answer is not final yet.
+fn shown_entries(
+    entries: Vec<Rc<TimelineEntry>>,
+    visibility: ToolCallVisibility,
+    answering: bool,
+    answering_run: Option<&SharedString>,
+    is_pending: impl Fn(&Entry) -> bool,
+) -> Vec<Rc<TimelineEntry>> {
+    match visibility {
+        ToolCallVisibility::ShowAll => entries,
+        ToolCallVisibility::Zen => {
+            let answering_from = if answering {
+                entries.iter().rposition(|entry| entry.starts_response()).map_or(0, |index| index + 1)
+            } else {
+                entries.len()
+            };
+            let terminal = terminal_assistant_messages(&entries);
+            let steer_answers = steer_answers(&entries);
+            let shown: Vec<bool> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| match entry.kind {
+                    Kind::Assistant { .. } => {
+                        steer_answers.contains(&index)
+                            || (terminal.contains(&index)
+                                && index < answering_from
+                                && answering_run.is_none_or(|run| entry.run_id.as_ref() != Some(run)))
+                    }
+                    Kind::User { .. } => true,
+                    _ => shown_in_zen(entry, &is_pending),
+                })
+                .collect();
+            entries.into_iter().zip(shown).filter_map(|(entry, shown)| shown.then_some(entry)).collect()
+        }
+        _ => entries
+            .into_iter()
+            .filter(|entry| !entry.work().is_some_and(|work| hidden_tool_call(work, visibility)))
+            .collect(),
+    }
+}
+
 /// The chat rows for a thread. `expanded` holds the keys of open groups,
 /// folds and entries ([`group_key`], [`fold_key`], [`entry_key`]).
-pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cache: &mut EntryCache) -> Vec<Row> {
-    let entries = timeline_entries(projection, cache);
+pub fn rows(
+    projection: &ThreadProjection,
+    expanded: &HashSet<SharedString>,
+    options: &RowOptions,
+    cache: &mut EntryCache,
+) -> Vec<Row> {
+    let visibility = options.visibility;
+    let mut all = timeline_entries(projection, cache);
+    if let Some(run) = &options.usage_limit_run {
+        let hidden = usage_limit_notice_items(projection, run);
+        if !hidden.is_empty() {
+            all.retain(|entry| !hidden.contains(entry.id.as_ref()));
+        }
+    }
     let pending: HashSet<&str> =
         projection.pending_approvals().into_iter().map(|(request, _)| request.id.as_str()).collect();
     let is_pending = |entry: &Entry| entry.approval_request_id.as_deref().is_some_and(|id| pending.contains(id));
@@ -1310,8 +1567,14 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
     let is_working = projection.is_running();
     let unsettled: Option<SharedString> =
         latest_run.filter(|run| is_active_run_status(&run.status)).map(|run| run.id.clone().into());
+    let turn_ended = latest_run.is_some_and(|run| projection.turn_ended(run));
+    let reverts = revert_targets(projection, &all, unsettled.as_ref());
+    let zen = visibility == ToolCallVisibility::Zen;
+    let preview = (zen && is_working).then(|| live_answer_preview(&all)).flatten();
+    let answering = is_working && !turn_ended;
+    let answering_run = unsettled.as_ref().filter(|_| answering);
+    let entries = shown_entries(all, visibility, answering, answering_run, is_pending);
     let terminal = terminal_assistant_messages(&entries);
-    let reverts = revert_targets(projection, &entries, unsettled.as_ref());
 
     let mut failed_runs: HashSet<SharedString> = HashSet::new();
     let (mut usage_limited, mut other_failures) = (HashSet::new(), HashSet::new());
@@ -1337,7 +1600,7 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         active_responses.extend(entries[after..].iter().filter_map(|e| e.response_run().cloned()));
     }
     let unfolded: HashSet<SharedString> = active_responses.iter().chain(&failed_runs).cloned().collect();
-    let folds = turn_folds(&entries, &terminal, latest_run, &unfolded);
+    let folds = if zen { HashMap::new() } else { turn_folds(&entries, &terminal, latest_run, &unfolded) };
     let attempt_index = AttemptIndex::new(projection);
     let attempts: Vec<Option<&model::RunAttempt>> = entries.iter().map(|entry| attempt_index.of(entry)).collect();
     let attempt_folds = attempt_folds(&entries, &attempts, &failed_runs);
@@ -1482,8 +1745,16 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         });
     let running_compaction = active_compaction.filter(|_| !compaction_finished);
     // A running compaction shows only its live divider; a finished compaction-only run, nothing more.
+    let ended_run = latest_run.filter(|_| turn_ended).map(|run| run.id.as_str());
+    let zen_answer_landed = zen
+        && ended_run.is_some_and(|run| {
+            entries
+                .iter()
+                .rposition(|e| e.response_run().is_some_and(|r| r.as_ref() == run))
+                .is_some_and(|i| i >= active_header)
+        });
     let hide_working = compaction_only_finished || running_compaction.is_some();
-    let show_working = is_working && !hide_working;
+    let show_working = is_working && !hide_working && !zen_answer_landed;
     let mut index = 0;
     while index < entries.len() {
         let entry = &entries[index];
@@ -1636,17 +1907,28 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
                     });
                 }
             }
-            Kind::User { text, steer, sent_by_t3code, .. } => rows.push(Row::User {
-                id: entry.id.clone(),
-                text: text.clone(),
-                steer: *steer,
-                grouped_with_previous: false,
-                grouped_with_next: false,
-                continues_steer: false,
-                created_at: entry.created_at.clone(),
-                revert: reverts.get(&entry.id).cloned(),
-                sent_by_t3code: *sent_by_t3code,
-            }),
+            Kind::User { text, steer, sent_by_t3code, fresh_context, .. } => {
+                if *fresh_context {
+                    rows.push(Row::System(Rc::new(SystemDivider {
+                        id: format!("fresh-session:{}", entry.id).into(),
+                        label: "New session".into(),
+                        detail: None,
+                        icon: DividerIcon::Eraser,
+                        action: None,
+                    })));
+                }
+                rows.push(Row::User {
+                    id: entry.id.clone(),
+                    text: text.clone(),
+                    steer: *steer,
+                    grouped_with_previous: false,
+                    grouped_with_next: false,
+                    continues_steer: false,
+                    created_at: entry.created_at.clone(),
+                    revert: reverts.get(&entry.id).cloned(),
+                    sent_by_t3code: *sent_by_t3code,
+                });
+            }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
                 id: entry.id.clone(),
                 text: text.clone(),
@@ -1670,12 +1952,12 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         rows.push(Row::Working { started_at: latest_run.and_then(|r| r.started_at.clone()).map(Into::into) });
     }
     let compacting = hide_working || entries.iter().any(|e| compaction_active(e));
-    if is_working && !compacting && (latest_failed || (!has_activity && pending.is_empty())) {
+    if is_working && !turn_ended && !compacting && (latest_failed || (!has_activity && pending.is_empty())) {
         let group = anchor.as_ref().filter(|_| latest_failed).map(|anchor| group_key(anchor));
         let open = group.as_ref().is_some_and(|group| expanded.contains(group));
         rows.push(Row::Work(WorkRow {
             id: "live-activity-row".into(),
-            kind: WorkRowKind::Thinking { group: group.clone(), expanded: open },
+            kind: WorkRowKind::Thinking { group: group.clone(), expanded: open, preview: preview.map(Into::into) },
             continues: false,
         }));
         if let (Some(group), true) = (&group, open) {
@@ -1930,7 +2212,7 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
         let mut expanded = HashSet::new();
         expanded.insert(fold_key("r1"));
-        let described = describe(&rows(&p, &expanded, &mut EntryCache::default()));
+        let described = describe(&rows(&p, &expanded, &RowOptions::default(), &mut EntryCache::default()));
         let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
         assert!(described[reply + 1].starts_with("work"), "{described:?}");
         assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
@@ -1946,11 +2228,11 @@ mod tests {
             json!({"text": "/compact", "inputIntent": "turn_start"}),
         );
         let running = projection(vec![compact.clone()], json!([{"id": "c1", "status": "running", "ordinal": 1}]));
-        let described = describe(&rows(&running, &HashSet::new(), &mut EntryCache::default()));
+        let described = describe(&rows(&running, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(described, vec!["divider Compacting context"]);
         let done = item("c-x", "compaction", "c1", "2026-11-04T10:00:05.000Z", json!({"status": "completed"}));
         let finished = projection(vec![compact, done], json!([{"id": "c1", "status": "completed", "ordinal": 1}]));
-        let described = describe(&rows(&finished, &HashSet::new(), &mut EntryCache::default()));
+        let described = describe(&rows(&finished, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert!(described.iter().all(|row| !row.starts_with("user")), "{described:?}");
         assert_eq!(described.iter().filter(|row| row.starts_with("divider")).count(), 1, "{described:?}");
     }
@@ -1971,7 +2253,7 @@ mod tests {
         items.insert(2, agent("b", "p1", "completed"));
         items.insert(3, agent("c", "p2", "failed"));
         let p = projection(items, json!([{"id": "r1", "status": "running", "ordinal": 1}]));
-        let rows = rows(&p, &HashSet::new(), &mut EntryCache::default());
+        let rows = rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         let Some(Row::SubagentGroup { cards, expanded: false, .. }) =
             rows.iter().find(|r| matches!(r, Row::SubagentGroup { .. }))
         else {
@@ -2058,12 +2340,12 @@ mod tests {
     fn finished_turns_fold_their_work_and_expand_on_demand() {
         let p = projection(turn("r1"), json!([{"id": "r1", "status": "completed"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "fold Worked for 1m 5s", "assistant done"]
         );
         let open = HashSet::from([fold_key("r1")]);
         assert_eq!(
-            describe(&rows(&p, &open, &mut EntryCache::default())),
+            describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default())),
             [
                 "user go",
                 "fold Worked for 1m 5s",
@@ -2074,7 +2356,7 @@ mod tests {
         );
         let open = HashSet::from([fold_key("r1"), group_key("r1-c1")]);
         assert_eq!(
-            describe(&rows(&p, &open, &mut EntryCache::default()))[3..5],
+            describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default()))[3..5],
             ["toggle Ran 2 commands and read 1 file", "details 3"]
         );
     }
@@ -2088,7 +2370,7 @@ mod tests {
         items.push(running);
         let p = projection(items, json!([{"id": "r1", "status": "running", "startedAt": "2026-11-04T10:00:00.000Z"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "live Running ls"]
         );
 
@@ -2097,22 +2379,188 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "running"}]));
         // The latest tool succeeded, so the live row stays up instead of "Thinking".
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "live Read a.rs"]
         );
 
         let items = turn("r1")[..2].to_vec();
         let p = projection(items, json!([{"id": "r1", "status": "running"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "thinking"]
         );
     }
 
     #[test]
+    fn tool_call_visibility_hides_tool_calls_or_everything_but_the_final_answer() {
+        use ToolCallVisibility::{HideAll, HideSuccessful, Zen};
+        let at = |second: u32| format!("2026-11-04T10:00:{second:02}.000Z");
+        let message = |id: &str, kind: &str, second: u32, intent: &str| {
+            item(id, kind, "r", &at(second), json!({"text": id, "inputIntent": intent}))
+        };
+        let command = |id: &str, status: &str, second: u32| {
+            item(id, "command_execution", "r", &at(second), json!({"input": id, "status": status}))
+        };
+        let user = message("user", "user_message", 0, "turn_start");
+        let step = message("step", "assistant_message", 5, "");
+        let passed = command("passed", "completed", 8);
+        let failed = command("failed", "failed", 9);
+        let last = message("final", "assistant_message", 20, "");
+        let steer = message("steer", "user_message", 4, "steer");
+        let answer = message("answer", "assistant_message", 7, "");
+        let turn = || vec![user.clone(), step.clone(), passed.clone(), failed.clone(), last.clone()];
+        let settled = json!([{"id": "r", "status": "completed"}]);
+        let run = |turn: &str| {
+            json!({"runs": [{"id": "r", "status": "running", "activeAttemptId": "a"}],
+                   "providerTurns": [{"id": "pt", "runAttemptId": "a", "ordinal": 1, "status": turn}]})
+        };
+        let (running, ended) = (run("running"), run("completed"));
+        let show = |items: Vec<Value>, visibility: ToolCallVisibility, state: &Value| {
+            let mut value = projection_value(items, json!([]));
+            let state = if state.is_array() { json!({"runs": state}) } else { state.clone() };
+            value.as_object_mut().unwrap().extend(state.as_object().unwrap().clone());
+            let p: ThreadProjection = serde_json::from_value(value).unwrap();
+            describe(&rows(
+                &p,
+                &HashSet::from([fold_key("r")]),
+                &RowOptions { visibility, ..Default::default() },
+                &mut EntryCache::default(),
+            ))
+        };
+
+        assert_eq!(
+            show(turn(), HideSuccessful, &settled),
+            ["user user", "fold Worked for 20s", "assistant step", "work failed", "assistant final"]
+        );
+        assert_eq!(
+            show(vec![user.clone(), failed.clone(), last.clone()], HideAll, &settled),
+            ["user user", "assistant final"]
+        );
+        assert_eq!(show(turn(), Zen, &settled), ["user user", "assistant final"]);
+        let steered = vec![user.clone(), steer.clone(), answer.clone(), last.clone()];
+        assert_eq!(show(steered, Zen, &settled), ["user user", "user steer", "assistant answer", "assistant final"]);
+        let steered = vec![user.clone(), steer.clone(), step.clone(), passed.clone(), last.clone()];
+        assert_eq!(show(steered, Zen, &settled), ["user user", "user steer", "assistant final"]);
+        let answering = vec![user.clone(), steer, answer, step.clone()];
+        assert_eq!(
+            show(answering, Zen, &running),
+            ["user user", "working", "user steer", "assistant answer", "thinking"]
+        );
+        assert_eq!(
+            show(vec![user.clone(), step.clone(), passed.clone()], Zen, &running),
+            ["user user", "working", "thinking"]
+        );
+        assert_eq!(show(turn(), Zen, &ended), ["user user", "assistant final"]);
+        let follow_up = message("follow-up", "user_message", 30, "turn_start");
+        let mut followed = turn();
+        followed.push(follow_up);
+        assert_eq!(show(followed, Zen, &ended), ["user user", "assistant final", "user follow-up", "working"]);
+    }
+
+    #[test]
+    fn provider_limit_notices_match_claudes_own_wording_only() {
+        for text in [
+            "You've hit your limit",
+            "You\u{2019}ve hit your 5-hour limit \u{b7} resets 7:10am (Europe/Berlin).",
+            "you're out of extra usage \u{b7} resets 12pm",
+            "Claude AI usage limit reached.",
+            "You've hit your weekly limit \u{b7} resets 9:05pm (America/Argentina/Buenos_Aires)",
+        ] {
+            assert!(provider_limit_notice(text), "{text:?}");
+        }
+        for text in [
+            "You've hit your limit, so I stopped.",
+            "You've hit your daily limit",
+            "You've hit your limit \u{b7} resets 13pm",
+            "You've hit your limit \u{b7} resets 07:10am",
+            "You've hit your limit \u{b7} resets 7:60am",
+            "You've hit your limit \u{b7} resets 7am (Europe//Berlin)",
+        ] {
+            assert!(!provider_limit_notice(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_pause_drops_its_repeats_while_the_notice_shows() {
+        let at = "2026-11-04T10:00:00.000Z";
+        let items = vec![
+            item("u", "user_message", "r", at, json!({"text": "go", "inputIntent": "turn_start"})),
+            item(
+                "a",
+                "assistant_message",
+                "r",
+                at,
+                json!({"text": "working on it", "providerTurnId": "pt", "ordinal": 1}),
+            ),
+            item(
+                "n",
+                "assistant_message",
+                "r",
+                at,
+                json!({"text": "You've hit your limit", "providerTurnId": "pt", "ordinal": 2}),
+            ),
+            item(
+                "s",
+                "system_notice",
+                "r",
+                at,
+                json!({"providerTurnId": "pt", "message": "Paused",
+                "nativeItemRef": {"driver": "claudeAgent", "nativeId": "usage-limit:pt:1"}}),
+            ),
+            item(
+                "e",
+                "error",
+                "r",
+                at,
+                json!({"status": "failed", "providerTurnId": "pt", "message": "Usage limit",
+                "failure": {"class": "usage_limit"}}),
+            ),
+        ];
+        let mut value = projection_value(items.clone(), json!([{"id": "r", "status": "failed"}]));
+        value["turnItems"] = json!(items);
+        let p: ThreadProjection = serde_json::from_value(value).unwrap();
+        let notice = RowOptions { usage_limit_run: Some("r".into()), ..Default::default() };
+        let shown = describe(&rows(&p, &HashSet::new(), &notice, &mut EntryCache::default()));
+        assert_eq!(shown, ["user go", "assistant working on it"]);
+        let all = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        assert!(all.len() > shown.len(), "without the notice the rows stay: {all:?}");
+    }
+
+    #[test]
+    fn a_fresh_session_message_marks_where_the_session_began() {
+        let mut items = turn("r1")[..2].to_vec();
+        items[0]["freshContext"] = json!(true);
+        let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        assert_eq!(described, ["system New session", "user go", "assistant looking"]);
+    }
+
+    #[test]
+    fn zen_thinking_shows_the_answer_being_written() {
+        let items = turn("r1")[..3].to_vec();
+        let p = projection(items, json!([{"id": "r1", "status": "running"}]));
+        let rows = rows(
+            &p,
+            &HashSet::new(),
+            &RowOptions { visibility: ToolCallVisibility::Zen, ..Default::default() },
+            &mut EntryCache::default(),
+        );
+        let preview = rows.iter().find_map(|row| match row {
+            Row::Work(WorkRow { kind: WorkRowKind::Thinking { preview, .. }, .. }) => preview.clone(),
+            _ => None,
+        });
+        assert_eq!(preview.as_deref(), Some("looking"));
+    }
+
+    #[test]
     fn work_rows_know_when_the_next_row_continues_the_log() {
         let p = projection(turn("r1"), json!([{"id": "r1", "status": "completed"}]));
-        let rows = rows(&p, &HashSet::from([fold_key("r1"), group_key("r1-c1")]), &mut EntryCache::default());
+        let rows = rows(
+            &p,
+            &HashSet::from([fold_key("r1"), group_key("r1-c1")]),
+            &RowOptions::default(),
+            &mut EntryCache::default(),
+        );
         let continues: Vec<bool> =
             rows.iter().filter_map(|row| if let Row::Work(work) = row { Some(work.continues) } else { None }).collect();
         assert_eq!(continues, [true, false]);
@@ -2129,7 +2577,10 @@ mod tests {
             .apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection_value(items.clone(), runs)}))
             .unwrap();
         let mut live = |state: &crate::model::ThreadState| {
-            describe(&rows(state.projection.as_ref().unwrap(), &HashSet::new(), &mut cache)).last().cloned().unwrap()
+            describe(&rows(state.projection.as_ref().unwrap(), &HashSet::new(), &RowOptions::default(), &mut cache))
+                .last()
+                .cloned()
+                .unwrap()
         };
         assert_eq!(live(&state), "live Running ls");
         // Same `updatedAt` and status, new input: the revision still changes.
@@ -2168,12 +2619,17 @@ mod tests {
             {"id": "n3", "rootNodeId": "root2"}, {"id": "n4", "rootNodeId": "root2"},
         ]);
         let p: ThreadProjection = serde_json::from_value(value).unwrap();
-        let shown = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        let shown = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(
             shown,
             ["user go", "working", "attempt-fold false", "user stop", "work ls", "assistant done", "thinking"]
         );
-        let open = describe(&rows(&p, &HashSet::from([attempt_key("a1")]), &mut EntryCache::default()));
+        let open = describe(&rows(
+            &p,
+            &HashSet::from([attempt_key("a1")]),
+            &RowOptions::default(),
+            &mut EntryCache::default(),
+        ));
         assert_eq!(open[2..4], ["attempt-fold true", "toggle Ran 2 commands"]);
     }
 
@@ -2243,7 +2699,7 @@ mod tests {
             item("u3", "user_message", "r1", "2026-11-04T10:00:02.000Z", json!({"text": "c", "inputIntent": "steer"})),
         ];
         let p = projection(items, json!([]));
-        let rows = rows(&p, &HashSet::new(), &mut EntryCache::default());
+        let rows = rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         assert!(matches!(rows[0], Row::User { grouped_with_next: true, steer: None, .. }));
         // A steer under a plain message keeps its label; the second steer in a row drops it.
         assert!(matches!(
@@ -2257,7 +2713,7 @@ mod tests {
         let mut items = vec![item("u4", "user_message", "r2", "2026-11-04T10:00:03.000Z", sent)];
         items.insert(0, item("u0", "user_message", "r2", "2026-11-04T10:00:00.500Z", json!({"text": "z"})));
         let p = projection(items, json!([]));
-        let rows = super::rows(&p, &HashSet::new(), &mut EntryCache::default());
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
         assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
     }
@@ -2288,9 +2744,9 @@ mod tests {
             .unwrap()
         };
         p.runtime_requests = vec![request("pending")];
-        let pending = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        let pending = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         p.runtime_requests = vec![request("resolved")];
-        let resolved = describe(&rows(&p, &HashSet::new(), &mut EntryCache::default()));
+        let resolved = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(pending, ["user go", "working"]);
         assert_eq!(resolved, ["user go", "working", "live rm -rf build"]);
     }

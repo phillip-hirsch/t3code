@@ -588,7 +588,11 @@ pub(super) fn render_row(
 /// `TimelineSystemDivider`: icon, label and detail between hairlines; a pill when it opens a thread.
 fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
-    let icon = if divider.fork { IconName::GitFork } else { IconName::CircleStop };
+    let icon = match divider.icon {
+        timeline::DividerIcon::Stop => IconName::CircleStop,
+        timeline::DividerIcon::Fork => IconName::GitFork,
+        timeline::DividerIcon::Eraser => IconName::Eraser,
+    };
     let content = |el: gpui_kit::Stateful<gpui_kit::Div>| {
         el.flex()
             .min_w_0()
@@ -1564,7 +1568,7 @@ fn work_line(
 fn work_bottom(work: &WorkRow) -> f32 {
     let header = match &work.kind {
         WorkRowKind::Toggle { expanded, .. } | WorkRowKind::Live { expanded, .. } => *expanded,
-        WorkRowKind::Thinking { group, expanded } => group.is_some() && *expanded,
+        WorkRowKind::Thinking { group, expanded, .. } => group.is_some() && *expanded,
         _ => false,
     };
     if matches!(work.kind, WorkRowKind::Details { .. }) {
@@ -1625,8 +1629,9 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                 )
                 .into_any_element()
         }
-        WorkRowKind::Thinking { group, .. } => {
-            let line = work_line(WorkIcon::Brain, icon_color(t), "Thinking", muted, None);
+        WorkRowKind::Thinking { group, preview, .. } => {
+            let label = preview.clone().unwrap_or_else(|| "Thinking".into());
+            let line = work_line(WorkIcon::Brain, icon_color(t), label, muted, None);
             match group {
                 Some(group) => row
                     .id(ElementId::Name(work.id.clone()))

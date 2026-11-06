@@ -419,7 +419,7 @@ pub(super) struct SecretProviderEntry {
 
 /// The account of a `one_password` provider whose config still decodes, else `None`
 /// (`classifySecretProvider`: such rows are read-only, removal stays available).
-pub(super) fn one_password_account(provider: &Value) -> Option<String> {
+pub(in crate::app) fn one_password_account(provider: &Value) -> Option<String> {
     if provider["kind"] != "one_password" {
         return None;
     }

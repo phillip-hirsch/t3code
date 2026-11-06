@@ -124,8 +124,6 @@ pub(in crate::app) struct PullRequestsState {
     /// read in flight for the row it rests on now (`usePullRequestIntentPrefetch`).
     prefetched: Option<(String, Rc<crate::pull_request_detail::Detail>, Instant)>,
     prefetch: Option<(String, Task<()>)>,
-    /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
-    pub(super) last_handoff: std::collections::HashMap<String, String>,
     /// The searchable Author or Labels picker, while open.
     facet_search: Option<facets::FacetSearch>,
 }
@@ -168,7 +166,6 @@ impl PullRequestsState {
             panel: None,
             last_merge_method: "merge",
             reviews: std::collections::HashMap::new(),
-            last_handoff: std::collections::HashMap::new(),
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
             panel_width: None,

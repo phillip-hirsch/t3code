@@ -181,6 +181,7 @@
   "showSkillsInSlashMenu": true,
   "boringSidebarEnabled": false,
   "boringSidebarMultilineRows": false,
+  "toolCallVisibility": "showAll",
   "threadDetailsUsageEnabled": false,
   "threadDetailsItems": {},
   "legacySidebarEnabled": false,
@@ -547,6 +548,14 @@
    "to": "labs",
    "searchTerms": [
     "beta boring sidebar folder rows multiline branch pull request details"
+   ]
+  },
+  {
+   "id": "tool-call-visibility",
+   "title": "Tool calls in chat",
+   "to": "labs",
+   "searchTerms": [
+    "beta hide tool calls commands edits searches work log activity quiet chat zen final answers only"
    ]
   },
   {

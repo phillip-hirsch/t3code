@@ -178,6 +178,34 @@ pub fn effort_label(descriptors: &[OptionDescriptor], selection: &ModelSelection
     descriptor.options.iter().find(|o| Some(o.id.as_str()) == value.as_str()).map(|o| o.label.clone())
 }
 
+/// `withLegacyUltracodeEffort`: Ultracode was a Claude effort level before it became its own
+/// toggle, and that level ran at xhigh.
+pub fn with_legacy_ultracode(descriptors: &[OptionDescriptor], selection: ModelSelection) -> ModelSelection {
+    let explicit = |id: &str| {
+        selection
+            .options
+            .iter()
+            .flatten()
+            .find(|o| o.get("id").and_then(Value::as_str) == Some(id))
+            .map(|o| &o["value"])
+    };
+    let toggle = descriptors.iter().any(|d| d.id == "ultracode" && d.kind == "boolean");
+    if !toggle || explicit("effort").and_then(Value::as_str) != Some("ultracode") {
+        return selection;
+    }
+    let mut next = with_option(&selection, "effort", json!("xhigh"));
+    if explicit("ultracode").is_none() {
+        next = with_option(&next, "ultracode", Value::Bool(true));
+    }
+    next
+}
+
+/// Whether the boolean option `id` is on for `selection`.
+pub fn toggle_on(descriptors: &[OptionDescriptor], id: &str, selection: &ModelSelection) -> bool {
+    descriptors.iter().find(|d| d.id == id && d.kind == "boolean").and_then(|d| current_value(d, selection))
+        == Some(Value::Bool(true))
+}
+
 /// `selection` with option `id` set to `value`.
 pub fn with_option(selection: &ModelSelection, id: &str, value: Value) -> ModelSelection {
     let mut options: Vec<Value> = selection
@@ -273,6 +301,28 @@ fn token_score(value: &str, token: &str, base: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_legacy_ultracode_effort_becomes_xhigh_with_the_toggle_on() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "xhigh", "label": "Extra high"}]},
+            {"id": "ultracode", "label": "Ultracode", "type": "boolean", "currentValue": false},
+        ]))
+        .unwrap();
+        let selection = |options: Value| ModelSelection {
+            instance_id: "claudeAgent".into(),
+            model: "opus".into(),
+            options: serde_json::from_value(options).unwrap(),
+        };
+        let legacy = with_legacy_ultracode(&descriptors, selection(json!([{"id": "effort", "value": "ultracode"}])));
+        assert_eq!(effort_label(&descriptors, &legacy).as_deref(), Some("Extra high"));
+        assert!(toggle_on(&descriptors, "ultracode", &legacy));
+        let off = selection(json!([{"id": "effort", "value": "ultracode"}, {"id": "ultracode", "value": false}]));
+        assert!(!toggle_on(&descriptors, "ultracode", &with_legacy_ultracode(&descriptors, off)));
+        // Older servers still offer Ultracode as a level.
+        let old = with_legacy_ultracode(&descriptors[..1], selection(json!([{"id": "effort", "value": "ultracode"}])));
+        assert_eq!(current_value(&descriptors[0], &old), Some(json!("ultracode")));
+    }
 
     #[test]
     fn picker_search_needs_every_token_and_prefers_names() {

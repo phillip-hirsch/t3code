@@ -34,8 +34,72 @@ const ACCESS: [(&str, &str); 5] = [
 #[derive(Default)]
 pub(super) struct RequestUi {
     secrets: HashMap<SharedString, (Entity<InputState>, Subscription)>,
+    /// The secret provider each card reads its answer from; absent, the typed value is saved.
+    sources: HashMap<SharedString, SharedString>,
+    references: HashMap<SharedString, (Entity<InputState>, Subscription)>,
     busy: HashSet<SharedString>,
     errors: HashMap<SharedString, SharedString>,
+}
+
+/// A configured secret provider a pending card can read its answer from (`SecretRequestSource`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SecretSource {
+    pub id: SharedString,
+    pub label: SharedString,
+}
+
+/// 1Password's definition: `referencePlaceholder` and `invalidReferenceMessage`.
+const REFERENCE_PLACEHOLDER: &str = "op://vault/item/field";
+const INVALID_REFERENCE: &str = "Use a 1Password reference like op://vault/item/field.";
+
+/// `secretRequestSources`: empty unless the server accepts reference answers; providers this
+/// build can't read (any kind but 1Password, or a config that no longer decodes) are left out.
+pub(super) fn secret_sources(accepts_references: bool, providers: &Value) -> Vec<SecretSource> {
+    if !accepts_references {
+        return Vec::new();
+    }
+    let Some(providers) = providers.as_object() else { return Vec::new() };
+    providers
+        .iter()
+        .filter(|(_, provider)| super::pages::settings::one_password_account(provider).is_some())
+        .map(|(id, provider)| SecretSource {
+            id: id.clone().into(),
+            label: provider["label"].as_str().unwrap_or(id).to_owned().into(),
+        })
+        .collect()
+}
+
+/// 1Password's `isReference`: `op://` then three or four names, and an optional `?key=value`.
+/// Names outside this charset must be written as item ids.
+fn is_one_password_reference(reference: &str) -> bool {
+    let name_ok = |name: &str| {
+        let edge = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        name.chars().next().is_some_and(edge)
+            && name.chars().last().is_some_and(edge)
+            && name.chars().all(|c| edge(c) || c == ' ')
+    };
+    let Some(rest) = reference.strip_prefix("op://").filter(|_| reference.len() <= 1024) else { return false };
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    let names: Vec<&str> = path.split('/').collect();
+    let query_ok = query.is_none_or(|query| {
+        query.split_once('=').is_some_and(|(key, value)| {
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && !value.is_empty()
+                && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        })
+    });
+    (3..=4).contains(&names.len()) && names.iter().all(|name| name_ok(name)) && query_ok
+}
+
+/// `secretRequestReference`: the reference `text` names for `source`, or `None` when it is not
+/// that provider's syntax.
+pub(super) fn secret_reference(source: &str, text: &str) -> Option<Value> {
+    let reference = text.trim();
+    is_one_password_reference(reference).then(|| json!({"provider": source, "reference": reference}))
 }
 
 /// `secretRequestFailureMessage` / `linkRequestFailureMessage`: only errors written for the
@@ -66,9 +130,11 @@ impl Workspace {
                 .chain(side.iter().flat_map(|rows| rows.iter()))
                 .any(|row| matches!(row, crate::timeline::Row::Request(card) if card.item_id == *id))
         };
-        let (secrets, errors) = (&mut self.requests.secrets, &mut self.requests.errors);
-        secrets.retain(|id, _| shown(id));
-        errors.retain(|id, _| shown(id));
+        let ui = &mut self.requests;
+        ui.secrets.retain(|id, _| shown(id));
+        ui.references.retain(|id, _| shown(id));
+        ui.sources.retain(|id, _| shown(id));
+        ui.errors.retain(|id, _| shown(id));
     }
 
     fn secret_input(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
@@ -91,22 +157,84 @@ impl Workspace {
         input
     }
 
-    /// `secrets.answerRequest`: save the typed value, or decline.
+    /// The secret providers this environment's cards can read from.
+    fn secret_sources(&self) -> Vec<SecretSource> {
+        if !super::pages::settings::secrets_enabled() {
+            return Vec::new();
+        }
+        let info = self.server_info();
+        secret_sources(info.config["secretRequestReferences"] == true, info.settings.get("secretProviders"))
+    }
+
+    fn reference_input(
+        &mut self,
+        card: &RequestCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some((input, _)) = self.requests.references.get(&card.item_id) {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(REFERENCE_PLACEHOLDER));
+        let id = card.item_id.clone();
+        let card = card.clone();
+        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::PressEnter { .. } => this.answer_secret(&card, true, cx),
+            InputEvent::Change => {
+                this.requests.errors.remove(&card.item_id);
+                cx.notify();
+            }
+            _ => {}
+        });
+        self.requests.references.insert(id, (input.clone(), subscription));
+        input
+    }
+
+    fn set_secret_source(&mut self, item_id: &SharedString, source: Option<SharedString>, cx: &mut Context<Self>) {
+        match source {
+            Some(source) => self.requests.sources.insert(item_id.clone(), source),
+            None => self.requests.sources.remove(item_id),
+        };
+        self.requests.errors.remove(item_id);
+        cx.notify();
+    }
+
+    /// `secrets.answerRequest`: save the typed value, read it from a secret provider, or decline.
     fn answer_secret(&mut self, card: &RequestCard, save: bool, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let id = card.item_id.clone();
         if self.requests.busy.contains(&id) {
             return;
         }
-        let answer = if save {
-            let Some((input, _)) = self.requests.secrets.get(&id) else { return };
-            let secret = input.read(cx).value().trim().to_owned();
-            if secret.is_empty() {
-                return;
+        let source = self
+            .requests
+            .sources
+            .get(&id)
+            .cloned()
+            .filter(|source| self.secret_sources().iter().any(|candidate| &candidate.id == source));
+        let answer = match (save, source) {
+            (false, _) => json!({"type": "decline"}),
+            (true, Some(source)) => {
+                let Some((input, _)) = self.requests.references.get(&id) else { return };
+                let text = input.read(cx).value().to_string();
+                if text.trim().is_empty() {
+                    return;
+                }
+                let Some(reference) = secret_reference(&source, &text) else {
+                    self.requests.errors.insert(id, INVALID_REFERENCE.into());
+                    cx.notify();
+                    return;
+                };
+                json!({"type": "reference", "reference": reference})
             }
-            json!({"type": "save", "secret": secret})
-        } else {
-            json!({"type": "decline"})
+            (true, None) => {
+                let Some((input, _)) = self.requests.secrets.get(&id) else { return };
+                let secret = input.read(cx).value().trim().to_owned();
+                if secret.is_empty() {
+                    return;
+                }
+                json!({"type": "save", "secret": secret})
+            }
         };
         let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": answer});
         self.requests.busy.insert(id.clone());
@@ -120,6 +248,7 @@ impl Workspace {
                     // The row turns into its answered line once the item updates.
                     Ok(_) => {
                         this.requests.secrets.remove(&id);
+                        this.requests.references.remove(&id);
                     }
                     Err(error) => {
                         this.requests.errors.insert(id, failure_message(&error, &SECRET_TAGS));
@@ -165,8 +294,16 @@ pub(super) fn request_row(
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let body = match &card.kind {
         RequestKind::Secret { label, file, .. } => {
-            let input = workspace.update(cx, |w, cx| w.secret_input(card, window, cx));
-            secret_card(card, label, *file, &input, &workspace, t, cx)
+            let (input, sources) = workspace.update(cx, |w, cx| {
+                let sources = w.secret_sources();
+                let source = w.requests.sources.get(&card.item_id).filter(|id| sources.iter().any(|s| &s.id == *id));
+                let input = match source {
+                    Some(_) => w.reference_input(card, window, cx),
+                    None => w.secret_input(card, window, cx),
+                };
+                (input, sources)
+            });
+            secret_card(card, label, *file, &input, &sources, &workspace, t, cx)
         }
         RequestKind::Link { .. } => link_card(card, &workspace, t, cx),
     };
@@ -184,17 +321,21 @@ fn card_frame(t: &Tokens) -> gpui_kit::Div {
         .bg(t.card)
 }
 
+#[expect(clippy::too_many_arguments, reason = "one card's parts, passed once from request_row")]
 fn secret_card(
     card: &Rc<RequestCard>,
     label: &SharedString,
     file: bool,
     input: &Entity<InputState>,
+    sources: &[SecretSource],
     workspace: &Entity<Workspace>,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
     let state = workspace.read(cx);
     let busy = state.requests.busy.contains(&card.item_id);
+    let source = state.requests.sources.get(&card.item_id).and_then(|id| sources.iter().find(|s| &s.id == id));
+    let picker = (!sources.is_empty()).then(|| source_picker(card, label, source, sources, workspace, t));
     let error = state.requests.errors.get(&card.item_id).cloned();
     let empty = input.read(cx).value().trim().is_empty();
     let privacy = if file {
@@ -218,6 +359,7 @@ fn secret_card(
             h_flex()
                 .min_w_0()
                 .gap(px(8.))
+                .children(picker)
                 .child(div().flex_1().min_w_0().child(Input::new(input).disabled(busy)))
                 .child(Button::new("secret-save").primary().label("Save securely").disabled(busy || empty).on_click(
                     move |_, _, cx| {
@@ -252,6 +394,48 @@ fn secret_card(
                         }),
                 ),
         )
+        .into_any_element()
+}
+
+/// `SecretSourceSelect`: where the answer comes from, the typed value or a secret provider.
+fn source_picker(
+    card: &Rc<RequestCard>,
+    label: &SharedString,
+    source: Option<&SecretSource>,
+    sources: &[SecretSource],
+    workspace: &Entity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let icon = match source {
+        Some(_) => Icon::empty().path("icons/app/onepassword.svg"),
+        None => Icon::new(IconName::Type),
+    };
+    let title: SharedString = source.map_or_else(|| "Value".into(), |s| s.label.clone());
+    let (view, item_id, sources) = (workspace.downgrade(), card.item_id.clone(), sources.to_vec());
+    Button::new("secret-source")
+        .outline()
+        .small()
+        .icon(icon.size(px(14.)).text_color(t.muted_foreground))
+        .tooltip(format!("{label} source: {title}"))
+        .dropdown_menu(move |menu, _, _| {
+            let pick = |source: Option<SharedString>| {
+                let (view, item_id) = (view.clone(), item_id.clone());
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |w, cx| w.set_secret_source(&item_id, source.clone(), cx));
+                }
+            };
+            let entry = |icon: Icon, text: SharedString| {
+                PopupMenuItem::element(move |_, _| {
+                    h_flex().gap(px(8.)).child(icon.clone().size(px(14.))).child(text.clone())
+                })
+            };
+            let mut menu = menu.item(entry(Icon::new(IconName::Type), "Value".into()).on_click(pick(None)));
+            for source in &sources {
+                let item = entry(Icon::empty().path("icons/app/onepassword.svg"), source.label.clone());
+                menu = menu.item(item.on_click(pick(Some(source.id.clone()))));
+            }
+            menu
+        })
         .into_any_element()
 }
 
@@ -547,4 +731,36 @@ fn open_link_dialog(card: &Rc<RequestCard>, client: Option<RpcClient>, window: &
             )
             .child(dialog.clone())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_reads_only_from_one_password_providers_the_server_accepts() {
+        let providers = json!({
+            "work": {"kind": "one_password", "label": "Work", "config": {"account": "acme.1password.com"}},
+            "broken": {"kind": "one_password", "label": "Broken", "config": {"account": "has space"}},
+            "vault": {"kind": "vault", "label": "Vault", "config": {}},
+        });
+        assert_eq!(secret_sources(true, &providers), [SecretSource { id: "work".into(), label: "Work".into() }]);
+        assert!(secret_sources(false, &providers).is_empty(), "older servers drop references");
+    }
+
+    #[test]
+    fn references_follow_one_passwords_syntax() {
+        for good in ["op://vault/item/field", " op://My Vault/item/section/field ", "op://v/i/f?attribute=otp"] {
+            assert_eq!(
+                secret_reference("work", good),
+                Some(json!({"provider": "work", "reference": good.trim()})),
+                "{good:?}"
+            );
+        }
+        for bad in
+            ["op://vault/item", "op://vault/ item/field", "vault/item/field", "op://v/i/f?Key=x", "op://a/b/c/d/e"]
+        {
+            assert_eq!(secret_reference("work", bad), None, "{bad:?}");
+        }
+    }
 }

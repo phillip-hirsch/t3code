@@ -41,6 +41,7 @@ mod details;
 pub(crate) mod environments;
 mod files;
 mod find;
+mod fresh_session;
 mod git;
 mod header;
 mod host_picker;
@@ -271,6 +272,7 @@ pub struct Workspace {
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
+    fresh_sessions: fresh_session::FreshSessions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
     /// Running threads synced in the background.
@@ -420,6 +422,7 @@ impl Workspace {
             requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),
+            fresh_sessions: Default::default(),
             desktop,
             keep_alive: Default::default(),
             saved_environments,
@@ -727,10 +730,21 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// This device's Settings › Labs › Tool calls in chat.
+    fn tool_call_visibility(&self) -> timeline::ToolCallVisibility {
+        let value = self.client_settings.values.get("toolCallVisibility");
+        timeline::ToolCallVisibility::from_setting(value.as_str().unwrap_or_default())
+    }
+
     /// Rebuilds the timeline and tells the scroller which rows changed.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         let mut new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
-            Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
+            Some(projection) => {
+                let visibility = self.tool_call_visibility();
+                let visibility = if self.find.is_some() { visibility.while_finding() } else { visibility };
+                let options = timeline::RowOptions { visibility, usage_limit_run: self.usage_limit_notice_run() };
+                timeline::rows(projection, &self.expanded, &options, &mut self.entry_cache)
+            }
             None => Vec::new(),
         };
         self.apply_workflow_opening(&mut new_rows, cx);
@@ -842,6 +856,17 @@ impl Workspace {
 
     /// The model the next message runs on.
     fn composer_model(&self) -> Option<ModelSelection> {
+        let selection = self.stored_composer_model()?;
+        let descriptors = self.server_info().model(&selection).and_then(|m| m.capabilities.as_ref());
+        Some(match descriptors {
+            Some(capabilities) => {
+                crate::model_label::with_legacy_ultracode(&capabilities.option_descriptors, selection)
+            }
+            None => selection,
+        })
+    }
+
+    fn stored_composer_model(&self) -> Option<ModelSelection> {
         if let Some(selection) = &self.model_override {
             return Some(selection.clone());
         }
