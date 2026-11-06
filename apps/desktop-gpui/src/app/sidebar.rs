@@ -192,13 +192,19 @@ fn scoped_groups<'g>(groups: &'g [ProjectGroup], scope: &[String]) -> Vec<&'g Pr
 }
 
 /// `resolveSidebarStageBackdropVariant`: the stage art behind the sidebar header and on the
-/// send button. This build has no Dev or Nightly stage of its own, so `artwork` follows a
-/// Nightly server (`resolveServerBackedAppStageLabel`) and shows nothing otherwise.
+/// send button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StageArt {
     Nightly,
     Dev,
 }
+
+/// The version this build ships as: release packaging sets `T3CODE_APP_VERSION` (a Nightly
+/// build is `<version>-nightly.<yyyymmdd>.<n>`), as Electron's version comes from its release.
+const APP_VERSION: &str = match option_env!("T3CODE_APP_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// `NIGHTLY_SERVER_VERSION_PATTERN`: `<version>-nightly.<yyyymmdd>.<n>` (or `-preview.`).
 fn is_nightly_version(version: &str) -> bool {
@@ -213,12 +219,51 @@ fn is_nightly_version(version: &str) -> bool {
         && parts.next().is_none()
 }
 
-fn stage_art(mode: &str, server_version: Option<&str>) -> Option<StageArt> {
-    match mode {
-        "nightly-artwork" => Some(StageArt::Nightly),
-        "dev-artwork" => Some(StageArt::Dev),
-        "artwork" if server_version.is_some_and(is_nightly_version) => Some(StageArt::Nightly),
+/// `resolveDesktopAppStageLabel`: this build's own stage (`APP_STAGE_LABEL`).
+fn build_stage(development: bool, app_version: &str) -> &'static str {
+    if development {
+        "Dev"
+    } else if is_nightly_version(app_version) {
+        "Nightly"
+    } else {
+        "Beta"
+    }
+}
+
+/// `resolveServerBackedAppStageLabel`: a Nightly server wins, else the build's own stage.
+fn stage_label(server_version: Option<&str>, build: &'static str) -> &'static str {
+    if server_version.is_some_and(is_nightly_version) { "Nightly" } else { build }
+}
+
+fn stage_art(mode: &str, stage_label: &str) -> Option<StageArt> {
+    match (mode, stage_label) {
+        ("nightly-artwork", _) | ("artwork", "Nightly") => Some(StageArt::Nightly),
+        ("dev-artwork", _) | ("artwork", "Dev") => Some(StageArt::Dev),
         _ => None,
+    }
+}
+
+/// `resolveEnvironmentIdentificationPillLabel`, shown in `pill` mode.
+fn stage_pill(mode: &str, stage_label: &'static str) -> Option<&'static str> {
+    (mode == "pill" && matches!(stage_label, "Dev" | "Nightly")).then_some(stage_label)
+}
+
+/// `environmentIdentificationOptions`: `artwork` is named after the art this stage shows.
+pub(super) fn identification_options(stage_label: &str) -> &'static [(&'static str, &'static str)] {
+    match stage_art("artwork", stage_label) {
+        Some(StageArt::Dev) => &[
+            ("artwork", "Dev artwork"),
+            ("nightly-artwork", "Nightly artwork"),
+            ("pill", "Version pill"),
+            ("none", "None"),
+        ],
+        Some(StageArt::Nightly) => &[
+            ("artwork", "Nightly artwork"),
+            ("dev-artwork", "Dev artwork"),
+            ("pill", "Version pill"),
+            ("none", "None"),
+        ],
+        None => &[("artwork", "None"), ("nightly-artwork", "Nightly artwork"), ("dev-artwork", "Dev artwork")],
     }
 }
 
@@ -591,19 +636,29 @@ impl Workspace {
         values.bool("boringSidebarEnabled") || values.bool("legacySidebarEnabled")
     }
 
-    /// The stage art the sidebar header and send button show (`environmentIdentificationMode`).
-    pub(super) fn stage_art(&self) -> Option<StageArt> {
-        let mode = self.client_settings.values.get("environmentIdentificationMode").as_str().unwrap_or("artwork");
-        // The primary server's stage, as the web's `primaryServerConfigAtom`.
-        let version = self.primary_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
-        stage_art(mode, version)
+    /// Whether times read on a 12-hour clock (`timestampFormat`, "System default" by the OS).
+    pub(super) fn hour12(&self) -> bool {
+        crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or_default())
     }
 
-    /// The "Nightly" pill of `pill` mode, shown only on a Nightly server.
-    fn stage_pill(&self) -> Option<&'static str> {
-        let mode = self.client_settings.values.get("environmentIdentificationMode").as_str();
+    fn identification_mode(&self) -> &str {
+        self.client_settings.values.get("environmentIdentificationMode").as_str().unwrap_or("artwork")
+    }
+
+    /// `useEnvironmentStageLabel`: the primary server's stage (`primaryServerConfigAtom`), else the build's.
+    pub(super) fn stage_label(&self) -> &'static str {
         let version = self.primary_info().config.pointer("/environment/serverVersion").and_then(|v| v.as_str());
-        (mode == Some("pill") && version.is_some_and(is_nightly_version)).then_some("Nightly")
+        stage_label(version, build_stage(cfg!(debug_assertions), APP_VERSION))
+    }
+
+    /// The stage art the sidebar header and send button show (`environmentIdentificationMode`).
+    pub(super) fn stage_art(&self) -> Option<StageArt> {
+        stage_art(self.identification_mode(), self.stage_label())
+    }
+
+    /// The stage pill of `pill` mode.
+    fn stage_pill(&self) -> Option<&'static str> {
+        stage_pill(self.identification_mode(), self.stage_label())
     }
 
     fn toggle_folder(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -2554,16 +2609,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_art_follows_the_mode_and_a_nightly_server() {
-        assert_eq!(stage_art("dev-artwork", None), Some(StageArt::Dev));
-        assert_eq!(stage_art("nightly-artwork", Some("0.0.20")), Some(StageArt::Nightly));
-        // This build has no stage of its own: `artwork` shows art only for a Nightly server.
-        assert_eq!(stage_art("artwork", Some("0.0.20")), None);
-        assert_eq!(stage_art("artwork", Some("0.0.20-nightly.20261104.3")), Some(StageArt::Nightly));
-        assert_eq!(stage_art("artwork", Some("0.0.20-preview.20261104.12")), Some(StageArt::Nightly));
-        assert_eq!(stage_art("artwork", Some("0.0.20-nightly.2026114.3")), None);
-        assert_eq!(stage_art("artwork", Some("0.0.20-beta.1")), None);
-        assert_eq!(stage_art("pill", Some("0.0.20-nightly.20261104.3")), None);
-        assert_eq!(stage_art("none", None), None);
+    fn stage_art_follows_the_mode_a_nightly_server_and_the_build() {
+        // `resolveDesktopAppStageLabel`: a dev build is Dev, a nightly or preview version Nightly.
+        assert_eq!(build_stage(true, "0.1.0"), "Dev");
+        assert_eq!(build_stage(false, "0.1.8-nightly.20261106.4288"), "Nightly");
+        assert_eq!(build_stage(false, "0.1.8-preview.20261106.12"), "Nightly");
+        assert_eq!(build_stage(false, "0.1.0"), "Beta");
+        assert_eq!(build_stage(false, "0.1.8-nightly.2026116.3"), "Beta");
+        // A Nightly server wins over the build's stage; otherwise the build's stage shows.
+        assert_eq!(stage_label(Some("0.0.20-nightly.20261104.3"), "Beta"), "Nightly");
+        assert_eq!(stage_label(Some("0.0.20-nightly.20261104.3"), "Dev"), "Nightly");
+        assert_eq!(stage_label(Some("0.1.7"), "Dev"), "Dev");
+        assert_eq!(stage_label(Some("0.0.20-beta.1"), "Beta"), "Beta");
+        assert_eq!(stage_label(None, "Nightly"), "Nightly");
+
+        assert_eq!(stage_art("artwork", "Nightly"), Some(StageArt::Nightly));
+        assert_eq!(stage_art("artwork", "Dev"), Some(StageArt::Dev));
+        assert_eq!(stage_art("artwork", "Beta"), None);
+        assert_eq!(stage_art("dev-artwork", "Beta"), Some(StageArt::Dev));
+        assert_eq!(stage_art("nightly-artwork", "Dev"), Some(StageArt::Nightly));
+        assert_eq!(stage_art("pill", "Nightly"), None);
+        assert_eq!(stage_art("none", "Dev"), None);
+
+        assert_eq!(stage_pill("pill", "Dev"), Some("Dev"));
+        assert_eq!(stage_pill("pill", "Beta"), None);
+        assert_eq!(stage_pill("artwork", "Nightly"), None);
+        assert_eq!(identification_options("Dev")[0], ("artwork", "Dev artwork"));
+        assert_eq!(identification_options("Beta")[0], ("artwork", "None"));
     }
 }

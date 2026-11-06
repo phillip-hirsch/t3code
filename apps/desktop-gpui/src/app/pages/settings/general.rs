@@ -24,9 +24,6 @@ const TIMESTAMP_FORMATS: &[(&str, &str)] =
     &[("locale", "System default"), ("12-hour", "12-hour"), ("24-hour", "24-hour")];
 const CHAT_WIDTHS: &[(&str, &str)] = &[("comfortable", "Comfortable"), ("wide", "Wide"), ("full", "Full")];
 const EFFORT_DISPLAYS: &[(&str, &str)] = &[("label", "Word"), ("bars", "Bars")];
-/// `environmentIdentificationOptions` for a build without Dev or Nightly artwork of its own.
-const ENVIRONMENT_IDENTIFICATIONS: &[(&str, &str)] =
-    &[("artwork", "None"), ("nightly-artwork", "Nightly artwork"), ("dev-artwork", "Dev artwork")];
 
 impl Workspace {
     /// `GeneralSettingsPanel`. Desktop notifications need no permission prompt in a desktop app.
@@ -155,6 +152,8 @@ impl Workspace {
                 .setting("mathRenderingEnabled")
                 .switch()),
         ];
+        let stage = self.stage_label();
+        let staged = crate::app::sidebar::identification_options(stage)[0].1 != "None";
         let advanced = [
             row(
                 self,
@@ -166,9 +165,13 @@ impl Workspace {
             row(
                 self,
                 SettingRow::new("environment-identification")
-                    .description("Show Dev or Nightly artwork in the sidebar header.")
+                    .description(if staged {
+                        "Choose how Dev and Nightly environments are identified."
+                    } else {
+                        "Show Dev or Nightly artwork in the sidebar header."
+                    })
                     .setting("environmentIdentificationMode")
-                    .select(ENVIRONMENT_IDENTIFICATIONS, 160.),
+                    .select(crate::app::sidebar::identification_options(stage), 160.),
             ),
             row(
                 self,
