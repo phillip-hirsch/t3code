@@ -171,6 +171,7 @@ export default defineConfig({
       // crates.io copies kept byte-identical apart from their patches.
       "apps/desktop-gpui/vendor/gpui-base/**",
       "apps/desktop-gpui/vendor/gpui-pre-windows/**",
+      "apps/desktop-gpui/vendor/gpui-pre-linux/**",
       // Macroscope requires one glob per line; Markdown formatting corrupts it.
       ".macroscope/ignore.md",
       ".alchemy",

@@ -1,7 +1,7 @@
 // Writes src/themes.json from `BUILT_IN_THEMES` and src/theme_standard.json from the role list,
 // the reserved ids and the standard palettes in packages/shared/src/themePalettes.ts.
 // Regenerate with Node 23+ (it strips the TypeScript types): node apps/desktop-gpui/tools/theme_data.mjs
-import { writeFileSync } from "node:fs";
+import * as NodeFS from "node:fs";
 import {
   BUILT_IN_THEMES,
   RESERVED_THEME_IDS,
@@ -11,7 +11,10 @@ import {
 } from "../../../packages/shared/src/themePalettes.ts";
 
 const write = (file, value) =>
-  writeFileSync(new URL(`../src/${file}`, import.meta.url), `${JSON.stringify(value, null, 1)}\n`);
+  NodeFS.writeFileSync(
+    new URL(`../src/${file}`, import.meta.url),
+    `${JSON.stringify(value, null, 1)}\n`,
+  );
 write("themes.json", BUILT_IN_THEMES);
 write("theme_standard.json", {
   roles: THEME_COLOR_ROLES,
