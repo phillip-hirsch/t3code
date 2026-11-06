@@ -3,10 +3,11 @@
 //! The workspace runs each connected environment's streams on that socket (`super::sessions`).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::channel::oneshot;
-use gpui_kit::{Context, Task};
+use gpui_kit::{Context, Subscription, Task};
 
 use crate::environments::{self, Catalog, ConnectionState, Credential, Failure, Phase, SavedEnvironment};
 use crate::rpc::{self, ConnectOptions, RpcClient};
@@ -37,6 +38,7 @@ pub(crate) struct SavedEnvironments {
     /// (`EnvironmentRegistry.register` ignores platform environments), so it gets no socket here.
     primary: Option<String>,
     _load: Task<()>,
+    _quit: Subscription,
 }
 
 /// Saves run one at a time off the UI thread. Edits made during one are written next as a
@@ -45,12 +47,100 @@ pub(crate) struct SavedEnvironments {
 struct Writes {
     writing: Option<Batch>,
     next: Option<Batch>,
+    unsaved: Unsaved,
 }
 
 /// A catalog to write, and the edits waiting for it to be on disk.
 struct Batch {
+    version: u64,
     catalog: Catalog,
     waiters: Vec<oneshot::Sender<Result<(), String>>>,
+}
+
+/// A started write, to run off the UI thread.
+struct Attempt {
+    unsaved: Unsaved,
+    version: u64,
+    catalog: Catalog,
+}
+
+impl Attempt {
+    fn run(&self, save: impl FnOnce(&Catalog) -> Result<(), String>) -> Result<(), String> {
+        self.unsaved.write(self.version, &self.catalog, save)
+    }
+}
+
+/// How long quitting waits for the last catalog write; the keyring may be slow or ask the user.
+const QUIT_SAVE_WAIT: Duration = Duration::from_secs(2);
+
+/// The newest queued catalog that no write has tried yet, shared with the quit handler, which
+/// writes it. Writes hold the lock, so they never overlap and an older catalog never lands over
+/// a newer one.
+#[derive(Clone, Default)]
+struct Unsaved(Arc<Mutex<Slot>>);
+
+#[derive(Default)]
+struct Slot {
+    newest: Option<(u64, Catalog)>,
+    queued: u64,
+    /// The newest version on disk.
+    written: u64,
+}
+
+impl Unsaved {
+    fn lock(&self) -> MutexGuard<'_, Slot> {
+        self.0.lock().expect("a catalog write panicked")
+    }
+
+    /// Records a queued catalog; returns its version.
+    fn queue(&self, catalog: &Catalog) -> u64 {
+        let mut slot = self.lock();
+        slot.queued += 1;
+        slot.newest = Some((slot.queued, catalog.clone()));
+        slot.queued
+    }
+
+    /// Writes `catalog` unless the same or a newer version is on disk. Once tried, the quit
+    /// handler leaves it alone: a failed write already answered its edits.
+    fn write(
+        &self,
+        version: u64,
+        catalog: &Catalog,
+        save: impl FnOnce(&Catalog) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut slot = self.lock();
+        if slot.newest.as_ref().is_some_and(|(newest, _)| *newest <= version) {
+            slot.newest = None;
+        }
+        if version <= slot.written {
+            return Ok(());
+        }
+        let result = save(catalog);
+        if result.is_ok() {
+            slot.written = version;
+        }
+        result
+    }
+
+    /// Writes the newest catalog no write has tried yet, after any write still running.
+    fn flush(&self, save: impl FnOnce(&Catalog) -> Result<(), String>) {
+        let Some((version, catalog)) = self.lock().newest.take() else { return };
+        drop(self.write(version, &catalog, save));
+    }
+
+    /// Writes run in a detached task, which quitting would cut short.
+    fn save_before_quit(&self) {
+        let unsaved = self.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            unsaved.flush(write);
+            // The quit handler may have stopped waiting.
+            let _ = done.send(());
+        });
+        if finished.recv_timeout(QUIT_SAVE_WAIT).is_err() {
+            log::warn!("saved environments were still being written when the app quit");
+        }
+    }
 }
 
 impl Writes {
@@ -62,23 +152,26 @@ impl Writes {
     /// Queues the newest catalog; the receiver resolves once it is on disk.
     fn queue(&mut self, catalog: Catalog) -> oneshot::Receiver<Result<(), String>> {
         let (sender, receiver) = oneshot::channel();
+        let version = self.unsaved.queue(&catalog);
         match &mut self.next {
             Some(next) => {
+                next.version = version;
                 next.catalog = catalog;
                 next.waiters.push(sender);
             }
-            None => self.next = Some(Batch { catalog, waiters: vec![sender] }),
+            None => self.next = Some(Batch { version, catalog, waiters: vec![sender] }),
         }
         receiver
     }
 
-    /// The catalog to write now, unless a write is running.
-    fn start(&mut self) -> Option<Catalog> {
+    /// The write to run now, unless one is running.
+    fn start(&mut self) -> Option<Attempt> {
         if self.writing.is_some() {
             return None;
         }
         self.writing = self.next.take();
-        self.writing.as_ref().map(|batch| batch.catalog.clone())
+        let batch = self.writing.as_ref()?;
+        Some(Attempt { unsaved: self.unsaved.clone(), version: batch.version, catalog: batch.catalog.clone() })
     }
 
     /// Records how the running write went; returns the catalog it put on disk.
@@ -132,6 +225,10 @@ impl SavedEnvironments {
             sessions: HashMap::new(),
             primary: None,
             _load: load,
+            _quit: cx.on_app_quit(|this, _| {
+                this.writes.unsaved.save_before_quit();
+                async {}
+            }),
         }
     }
 
@@ -246,10 +343,10 @@ impl SavedEnvironments {
     }
 
     fn write_next(&mut self, cx: &mut Context<Self>) {
-        let Some(catalog) = self.writes.start() else { return };
+        let Some(attempt) = self.writes.start() else { return };
         // Detached: a started write finishes even if the list is dropped meanwhile.
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { write(&catalog) }).await;
+            let result = cx.background_executor().spawn(async move { attempt.run(write) }).await;
             drop(this.update(cx, |this, cx| {
                 if let Some(saved) = this.writes.finish(result) {
                     this.commit(saved, cx);
@@ -509,7 +606,7 @@ mod tests {
         let mut writes = Writes::default();
         let mut first = writes.queue(catalog(&[environment("a", true)]));
         let started = writes.start().unwrap();
-        assert_eq!(labels(&started), ["a"]);
+        assert_eq!(labels(&started.catalog), ["a"]);
 
         // Two edits while it runs: only the newest is written next, for both.
         let mut second = writes.queue(catalog(&[environment("a", true), environment("b", true)]));
@@ -520,7 +617,7 @@ mod tests {
         // The first write fails, but the next one carries its edit, so it waits for that.
         assert!(writes.finish(Err("disk full".into())).is_none());
         assert_eq!(first.try_recv(), Ok(None));
-        assert_eq!(labels(&writes.start().unwrap()), ["c"]);
+        assert_eq!(labels(&writes.start().unwrap().catalog), ["c"]);
         assert!(writes.start().is_none());
         assert_eq!(labels(&writes.finish(Ok(())).unwrap()), ["c"]);
         for receiver in [&mut first, &mut second, &mut third] {
@@ -534,6 +631,53 @@ mod tests {
         assert!(writes.finish(Err("denied".into())).is_none());
         assert_eq!(failed.try_recv(), Ok(Some(Err("denied".into()))));
         assert!(writes.newest().is_none());
+    }
+
+    /// What quitting writes: the newest catalog no write has tried, never an older one after it.
+    #[test]
+    fn quitting_writes_the_newest_queued_catalog_once() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let saved = &log;
+        let save = move |result: Result<(), String>| {
+            move |catalog: &Catalog| {
+                saved.borrow_mut().push(labels(catalog).join(","));
+                result
+            }
+        };
+        let mut writes = Writes::default();
+        drop(writes.queue(catalog(&[environment("a", true)])));
+        let first = writes.start().unwrap();
+        drop(writes.queue(catalog(&[environment("b", true)])));
+        drop(writes.queue(catalog(&[environment("c", true)])));
+
+        // The running write finishes, then quitting writes the queued one.
+        assert_eq!(first.run(save(Ok(()))), Ok(()));
+        writes.unsaved.flush(save(Ok(())));
+        assert_eq!(*saved.borrow(), ["a", "c"]);
+
+        // Its own write, starting after, does not write it again; nothing is left to flush.
+        writes.finish(Ok(()));
+        assert_eq!(writes.start().unwrap().run(save(Err("unexpected".into()))), Ok(()));
+        writes.unsaved.flush(save(Err("unexpected".into())));
+        assert_eq!(*saved.borrow(), ["a", "c"]);
+
+        // A write still running when quitting flushed a newer one leaves the newer on disk.
+        writes.finish(Ok(()));
+        drop(writes.queue(catalog(&[environment("d", true)])));
+        let stale = writes.start().unwrap();
+        drop(writes.queue(catalog(&[environment("e", true)])));
+        writes.unsaved.flush(save(Ok(())));
+        assert_eq!(stale.run(save(Ok(()))), Ok(()));
+        assert_eq!(*saved.borrow(), ["a", "c", "e"]);
+
+        // A failed write already answered its edit, so quitting does not retry it.
+        writes.finish(Ok(()));
+        writes.start().unwrap();
+        writes.finish(Ok(()));
+        drop(writes.queue(catalog(&[environment("f", true)])));
+        assert!(writes.start().unwrap().run(save(Err("denied".into()))).is_err());
+        writes.unsaved.flush(save(Ok(())));
+        assert_eq!(*saved.borrow(), ["a", "c", "e", "f"]);
     }
 
     #[test]
