@@ -206,10 +206,17 @@ pub(crate) struct Recovery {
     pub scheduled: bool,
     pub snoozed: bool,
     pub reset_passed: bool,
+    /// `limitRecoveryOwnsSnooze`: the thread's snooze is this recovery's, so the banner offers Wake now.
+    pub owns_snooze: bool,
+    /// The thread resumes on its own at `display_at`, rather than only resetting then.
+    pub resumes: bool,
+    /// When the description says it resets or resumes: a later snooze delays the resume.
+    pub display_at: Option<String>,
 }
 
 /// `usageLimitRecoveryBannerItem` + `RecoveryActions`, for a thread whose latest run hit a limit.
-pub(crate) fn recovery(thread: &ThreadShell, now_ms: i64) -> Option<Recovery> {
+/// The server refuses recovery changes while a request is pending.
+pub(crate) fn recovery(thread: &ThreadShell, request_pending: bool, now_ms: i64) -> Option<Recovery> {
     if thread.status != "failed" || thread.last_error_class.as_deref() != Some("usage_limit") {
         return None;
     }
@@ -217,28 +224,53 @@ pub(crate) fn recovery(thread: &ThreadShell, now_ms: i64) -> Option<Recovery> {
     let reset_at = thread.usage_limit_reset_at.clone();
     let stopped_at = thread.latest_run_completed_at.clone().flatten().unwrap_or_else(|| thread.updated_at.clone());
     let reset_ms = reset_at.as_deref().and_then(parse_ms);
-    let can_schedule = matches!((reset_ms, parse_ms(&stopped_at)), (Some(reset), Some(stopped)) if reset > stopped);
+    let settled = thread.settled_override.as_deref() == Some("settled");
+    let can_schedule = !settled
+        && !request_pending
+        && matches!((reset_ms, parse_ms(&stopped_at)), (Some(reset), Some(stopped)) if reset > stopped);
     let recovery = thread.limit_recovery.as_ref();
     let field = |key: &str| recovery.and_then(|r| r.get(key));
     let same = field("runId").and_then(Value::as_str) == Some(run_id.as_str())
         && field("resetAt").and_then(Value::as_str) == reset_at.as_deref();
     let reset_passed = reset_ms.is_some_and(|reset| reset <= now_ms);
-    let snoozed = same
-        && field("snooze").and_then(Value::as_bool) == Some(true)
-        && reset_ms.is_some()
-        && thread.snoozed_until.as_deref().and_then(parse_ms) == reset_ms
-        && !reset_passed;
+    let snoozed_ms = thread.snoozed_until.as_deref().and_then(parse_ms);
+    let owns_snooze =
+        same && field("snooze").and_then(Value::as_bool) == Some(true) && reset_ms.is_some() && snoozed_ms == reset_ms;
+    let scheduled = same && field("autoResume").and_then(Value::as_bool) == Some(true);
+    let resumes = can_schedule && scheduled;
+    let display_at = match (resumes, reset_ms, snoozed_ms) {
+        (true, Some(reset), Some(snoozed)) if snoozed > reset => thread.snoozed_until.clone(),
+        _ => reset_at.clone(),
+    };
     Some(Recovery {
-        scheduled: same && field("autoResume").and_then(Value::as_bool) == Some(true),
+        scheduled,
         run_id,
         reset_at,
         can_schedule,
-        snoozed,
+        snoozed: owns_snooze && !reset_passed,
         reset_passed,
+        owns_snooze,
+        resumes,
+        display_at,
     })
 }
 
 impl Workspace {
+    /// A question or approval waits in the open thread.
+    fn request_pending(&self) -> bool {
+        self.open_projection().is_some_and(|p| !p.pending_approvals().is_empty() || !p.pending_user_inputs().is_empty())
+    }
+
+    /// The usage-limit notice shows the thread's snooze and its Wake now (`limitRecoveryHoldsSnooze`).
+    pub(super) fn limit_recovery_holds_snooze(&self) -> bool {
+        self.open_shell_thread().and_then(|thread| recovery(thread, false, 0)).is_some_and(|state| state.owns_snooze)
+    }
+
+    /// The run whose usage-limit pause the recovery notice shows, so the timeline drops its repeats.
+    pub(super) fn usage_limit_notice_run(&self) -> Option<String> {
+        self.open_shell_thread().and_then(|thread| recovery(thread, false, 0)).map(|state| state.run_id)
+    }
+
     fn open_shell_thread(&self) -> Option<&ThreadShell> {
         let Some(Target::Thread { id, .. }) = &self.target else { return None };
         self.shell.threads.iter().find(|thread| &thread.id == id)
@@ -654,15 +686,16 @@ impl Workspace {
 
     pub(super) fn render_recovery_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.open_shell_thread()?;
-        let state = recovery(thread, crate::timestamp::now_ms())?;
+        let state = recovery(thread, self.request_pending(), crate::timestamp::now_ms())?;
         let code = thread.last_error_code.as_deref();
         let workspace_limit = code == Some(CHATGPT_WORKSPACE_USAGE_LIMIT_CODE);
         let chatgpt_limit = workspace_limit || code == Some(CHATGPT_USAGE_LIMIT_CODE);
         let hour12 =
             crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));
-        let reset = match state.reset_at.as_deref() {
+        let verb = if state.resumes { "Resumes" } else { "Resets" };
+        let reset = match state.display_at.as_deref() {
             Some(at) => crate::timestamp::upcoming_local(at, hour12)
-                .map_or_else(|| "Reset time unavailable; retry manually".into(), |at| format!("Resets {at}")),
+                .map_or_else(|| "Reset time unavailable; retry manually".into(), |at| format!("{verb} {at}")),
             None => "Reset time unavailable; retry manually".into(),
         };
         let (title, description) = match (chatgpt_limit, workspace_limit) {
@@ -675,6 +708,7 @@ impl Workspace {
         };
         let mut actions = h_flex().gap(px(2.));
         if state.can_schedule {
+            let (fg, workspace) = (t.foreground, cx.weak_entity());
             let pending = self.banners.recovery_pending;
             let resume = if pending {
                 "Saving..."
@@ -697,22 +731,34 @@ impl Workspace {
                 (update("autoResume", !state.scheduled), update("snooze", !state.snoozed));
             let (resume_thread, snooze_thread) = (thread_id.clone(), thread_id);
             let snooze_blocked = state.reset_passed && !state.snoozed;
-            actions = actions
-                .child(Button::new("recovery-resume").ghost().xsmall().label(resume).disabled(pending).on_click(
-                    cx.listener(move |this, _, window, cx| {
-                        this.update_limit_recovery(&resume_thread, resume_update.clone(), false, window, cx);
-                    }),
-                ))
-                .child(
-                    Button::new("recovery-snooze")
-                        .ghost()
-                        .xsmall()
-                        .label(snooze)
-                        .disabled(pending || snooze_blocked)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.update_limit_recovery(&snooze_thread, snooze_update.clone(), true, window, cx);
-                        })),
-                );
+            let resume_view = workspace.clone();
+            let on_resume = move |window: &mut Window, cx: &mut gpui_kit::App| {
+                let _ = resume_view.update(cx, |this, cx| {
+                    this.update_limit_recovery(&resume_thread, resume_update.clone(), false, window, cx);
+                });
+            };
+            let on_snooze = move |window: &mut Window, cx: &mut gpui_kit::App| {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.update_limit_recovery(&snooze_thread, snooze_update.clone(), true, window, cx);
+                });
+            };
+            // `InlineButton`s that wrap, so the title keeps its room.
+            actions = actions.child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_x(px(12.))
+                    .gap_y(px(4.))
+                    .px(px(4.))
+                    .child(super::thread_now::inline_button("recovery-resume", resume, fg, fg, pending, on_resume))
+                    .child(super::thread_now::inline_button(
+                        "recovery-snooze",
+                        snooze,
+                        fg,
+                        fg,
+                        pending || snooze_blocked,
+                        on_snooze,
+                    )),
+            );
         }
         if workspace_limit {
             actions = actions.child(
@@ -958,21 +1004,33 @@ mod tests {
     #[test]
     fn recovery_reads_the_runs_auto_resume_and_snooze() {
         let before_reset = parse_ms("2026-01-01T11:00:00Z").unwrap();
-        let state = recovery(&shell(json!({})), before_reset).unwrap();
+        let state = recovery(&shell(json!({})), false, before_reset).unwrap();
         assert!(state.can_schedule && !state.scheduled && !state.snoozed && !state.reset_passed);
         let set = shell(json!({"snoozedUntil": "2026-01-01T12:00:00.000Z",
             "limitRecovery": {"runId": "r", "resetAt": "2026-01-01T12:00:00Z", "autoResume": true, "snooze": true}}));
-        let state = recovery(&set, before_reset).unwrap();
+        let state = recovery(&set, false, before_reset).unwrap();
         assert!(state.scheduled && state.snoozed);
         // Past the reset the snooze has woken, though the server keeps `snoozedUntil`.
-        let after = recovery(&set, parse_ms("2026-01-01T13:00:00Z").unwrap()).unwrap();
+        let after = recovery(&set, false, parse_ms("2026-01-01T13:00:00Z").unwrap()).unwrap();
         assert!(after.scheduled && !after.snoozed && after.reset_passed);
         // Another run's recovery doesn't count, and a reset before the stop can't be scheduled.
         let other =
             shell(json!({"limitRecovery": {"runId": "old", "resetAt": "2026-01-01T12:00:00Z", "autoResume": true}}));
-        assert!(!recovery(&other, before_reset).unwrap().scheduled);
+        assert!(!recovery(&other, false, before_reset).unwrap().scheduled);
         let early = shell(json!({"usageLimitResetAt": "2026-01-01T09:00:00Z"}));
-        assert!(!recovery(&early, before_reset).unwrap().can_schedule);
-        assert!(recovery(&shell(json!({"lastErrorClass": "provider"})), before_reset).is_none());
+        assert!(!recovery(&early, false, before_reset).unwrap().can_schedule);
+        assert!(recovery(&shell(json!({"lastErrorClass": "provider"})), false, before_reset).is_none());
+        // A settled thread or a pending request can't be scheduled.
+        assert!(!recovery(&shell(json!({"settledOverride": "settled"})), false, before_reset).unwrap().can_schedule);
+        assert!(!recovery(&shell(json!({})), true, before_reset).unwrap().can_schedule);
+        // Auto-resume says when it resumes, and a later snooze delays that.
+        let state = recovery(&set, false, before_reset).unwrap();
+        assert!(state.resumes && state.owns_snooze);
+        assert_eq!(state.display_at.as_deref(), Some("2026-01-01T12:00:00Z"));
+        let later = shell(json!({"snoozedUntil": "2026-01-01T14:00:00.000Z",
+            "limitRecovery": {"runId": "r", "resetAt": "2026-01-01T12:00:00Z", "autoResume": true}}));
+        let state = recovery(&later, false, before_reset).unwrap();
+        assert!(state.resumes && !state.owns_snooze);
+        assert_eq!(state.display_at.as_deref(), Some("2026-01-01T14:00:00.000Z"));
     }
 }

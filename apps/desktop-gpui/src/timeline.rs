@@ -1329,6 +1329,111 @@ impl ToolCallVisibility {
     }
 }
 
+/// How the rows read: the user's tool-call visibility, and the run whose usage-limit pause the
+/// recovery notice shows, so its repeats leave the timeline (`withoutUsageLimitNoticeRows`).
+#[derive(Clone, Debug, Default)]
+pub struct RowOptions {
+    pub visibility: ToolCallVisibility,
+    pub usage_limit_run: Option<String>,
+}
+
+/// `PROVIDER_LIMIT_NOTICE`: Claude Code's own limit message, such as
+/// "You've hit your 5-hour limit · resets 7:10am (Europe/Berlin)".
+fn provider_limit_notice(text: &str) -> bool {
+    const HEADS: [&str; 7] = [
+        "you've hit your limit",
+        "you've hit your 5-hour limit",
+        "you've hit your session limit",
+        "you've hit your weekly limit",
+        "you've hit your usage limit",
+        "you're out of extra usage",
+        "claude ai usage limit reached",
+    ];
+    let text = text.trim().to_lowercase().replace('\u{2019}', "'");
+    let text = text.strip_suffix('.').unwrap_or(&text);
+    let Some(rest) = HEADS.iter().find_map(|head| text.strip_prefix(head)) else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(rest) = rest.strip_prefix(" \u{b7} resets ") else { return false };
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let hour_len = digits(rest);
+    let hour_ok = match &rest[..hour_len] {
+        "" => false,
+        hour => !hour.starts_with('0') && hour.parse::<u8>().is_ok_and(|h| (1..=12).contains(&h)),
+    };
+    if !hour_ok {
+        return false;
+    }
+    let mut rest = &rest[hour_len..];
+    if let Some(minutes) = rest.strip_prefix(':') {
+        let ok = minutes.len() >= 2
+            && minutes.as_bytes()[0].is_ascii_digit()
+            && minutes.as_bytes()[0] <= b'5'
+            && minutes.as_bytes()[1].is_ascii_digit();
+        if !ok {
+            return false;
+        }
+        rest = &minutes[2..];
+    }
+    let Some(rest) = rest.strip_prefix("am").or_else(|| rest.strip_prefix("pm")) else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(zone) = rest.strip_prefix(" (").and_then(|r| r.strip_suffix(')')) else { return false };
+    zone.split('/')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-')))
+}
+
+/// `deriveUsageLimitNoticeRows`: the run's limit failures, Claude's pause notices for the failed
+/// provider turn, and that turn's last reply when it is only the provider's limit message.
+fn usage_limit_notice_items(projection: &ThreadProjection, run_id: &str) -> HashSet<String> {
+    let Some(run) = projection.runs.iter().find(|run| run.id == run_id) else { return HashSet::new() };
+    let in_run = |item: &&Rc<TurnItem>| item.run_id.as_deref() == Some(run_id);
+    let root = |item: &TurnItem| item.node_id == run.root_node_id;
+    let failures: Vec<&Rc<TurnItem>> = projection
+        .turn_items
+        .iter()
+        .filter(in_run)
+        .filter(|item| item.item_type == "error" && item.status == "failed" && root(item))
+        .collect();
+    let usage_limit =
+        |item: &TurnItem| item.raw.pointer("/failure/class").and_then(Value::as_str) == Some("usage_limit");
+    let mut hidden: HashSet<String> =
+        failures.iter().filter(|item| usage_limit(item)).map(|item| item.id.clone()).collect();
+    // `latestRootProviderFailure`, when the run failed.
+    let updated = |item: &TurnItem| item.str("updatedAt").and_then(crate::timestamp::parse_ms).unwrap_or_default();
+    let latest = failures
+        .iter()
+        .filter(|_| run.status == "failed")
+        .max_by(|a, b| (updated(a), a.ordinal, &a.id).cmp(&(updated(b), b.ordinal, &b.id)));
+    let Some(turn) = latest.filter(|item| usage_limit(item)).and_then(|item| item.str("providerTurnId")) else {
+        return hidden;
+    };
+    let in_turn = |item: &&Rc<TurnItem>| item.str("providerTurnId") == Some(turn);
+    let top_level = |item: &TurnItem| item.raw.get("parentItemId").is_none_or(Value::is_null);
+    let notice_prefix = format!("usage-limit:{turn}:");
+    let mut reply: Option<&Rc<TurnItem>> = None;
+    for item in projection.turn_items.iter().filter(in_run).filter(in_turn) {
+        let native = |key: &str| item.raw.pointer(&format!("/nativeItemRef/{key}")).and_then(Value::as_str);
+        if item.item_type == "system_notice"
+            && root(item)
+            && top_level(item)
+            && native("driver") == Some("claudeAgent")
+            && native("nativeId").is_some_and(|id| id.starts_with(&notice_prefix))
+        {
+            hidden.insert(item.id.clone());
+        }
+        if item.item_type == "assistant_message" && top_level(item) && reply.is_none_or(|r| item.ordinal > r.ordinal) {
+            reply = Some(item);
+        }
+    }
+    if let Some(reply) = reply.filter(|reply| provider_limit_notice(reply.str("text").unwrap_or_default())) {
+        hidden.insert(reply.id.clone());
+    }
+    hidden
+}
+
 /// `workEntryHiddenByToolCallVisibility`.
 fn hidden_tool_call(entry: &Entry, visibility: ToolCallVisibility) -> bool {
     let hideable = matches!(
@@ -1444,10 +1549,17 @@ fn shown_entries(
 pub fn rows(
     projection: &ThreadProjection,
     expanded: &HashSet<SharedString>,
-    visibility: ToolCallVisibility,
+    options: &RowOptions,
     cache: &mut EntryCache,
 ) -> Vec<Row> {
-    let all = timeline_entries(projection, cache);
+    let visibility = options.visibility;
+    let mut all = timeline_entries(projection, cache);
+    if let Some(run) = &options.usage_limit_run {
+        let hidden = usage_limit_notice_items(projection, run);
+        if !hidden.is_empty() {
+            all.retain(|entry| !hidden.contains(entry.id.as_ref()));
+        }
+    }
     let pending: HashSet<&str> =
         projection.pending_approvals().into_iter().map(|(request, _)| request.id.as_str()).collect();
     let is_pending = |entry: &Entry| entry.approval_request_id.as_deref().is_some_and(|id| pending.contains(id));
@@ -2100,7 +2212,7 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
         let mut expanded = HashSet::new();
         expanded.insert(fold_key("r1"));
-        let described = describe(&rows(&p, &expanded, ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let described = describe(&rows(&p, &expanded, &RowOptions::default(), &mut EntryCache::default()));
         let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
         assert!(described[reply + 1].starts_with("work"), "{described:?}");
         assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
@@ -2116,13 +2228,11 @@ mod tests {
             json!({"text": "/compact", "inputIntent": "turn_start"}),
         );
         let running = projection(vec![compact.clone()], json!([{"id": "c1", "status": "running", "ordinal": 1}]));
-        let described =
-            describe(&rows(&running, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let described = describe(&rows(&running, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(described, vec!["divider Compacting context"]);
         let done = item("c-x", "compaction", "c1", "2026-11-04T10:00:05.000Z", json!({"status": "completed"}));
         let finished = projection(vec![compact, done], json!([{"id": "c1", "status": "completed", "ordinal": 1}]));
-        let described =
-            describe(&rows(&finished, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let described = describe(&rows(&finished, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert!(described.iter().all(|row| !row.starts_with("user")), "{described:?}");
         assert_eq!(described.iter().filter(|row| row.starts_with("divider")).count(), 1, "{described:?}");
     }
@@ -2143,7 +2253,7 @@ mod tests {
         items.insert(2, agent("b", "p1", "completed"));
         items.insert(3, agent("c", "p2", "failed"));
         let p = projection(items, json!([{"id": "r1", "status": "running", "ordinal": 1}]));
-        let rows = rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default());
+        let rows = rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         let Some(Row::SubagentGroup { cards, expanded: false, .. }) =
             rows.iter().find(|r| matches!(r, Row::SubagentGroup { .. }))
         else {
@@ -2230,12 +2340,12 @@ mod tests {
     fn finished_turns_fold_their_work_and_expand_on_demand() {
         let p = projection(turn("r1"), json!([{"id": "r1", "status": "completed"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "fold Worked for 1m 5s", "assistant done"]
         );
         let open = HashSet::from([fold_key("r1")]);
         assert_eq!(
-            describe(&rows(&p, &open, ToolCallVisibility::ShowAll, &mut EntryCache::default())),
+            describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default())),
             [
                 "user go",
                 "fold Worked for 1m 5s",
@@ -2246,7 +2356,7 @@ mod tests {
         );
         let open = HashSet::from([fold_key("r1"), group_key("r1-c1")]);
         assert_eq!(
-            describe(&rows(&p, &open, ToolCallVisibility::ShowAll, &mut EntryCache::default()))[3..5],
+            describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default()))[3..5],
             ["toggle Ran 2 commands and read 1 file", "details 3"]
         );
     }
@@ -2260,7 +2370,7 @@ mod tests {
         items.push(running);
         let p = projection(items, json!([{"id": "r1", "status": "running", "startedAt": "2026-11-04T10:00:00.000Z"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "live Running ls"]
         );
 
@@ -2269,14 +2379,14 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "running"}]));
         // The latest tool succeeded, so the live row stays up instead of "Thinking".
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "live Read a.rs"]
         );
 
         let items = turn("r1")[..2].to_vec();
         let p = projection(items, json!([{"id": "r1", "status": "running"}]));
         assert_eq!(
-            describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default())),
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "thinking"]
         );
     }
@@ -2310,7 +2420,12 @@ mod tests {
             let state = if state.is_array() { json!({"runs": state}) } else { state.clone() };
             value.as_object_mut().unwrap().extend(state.as_object().unwrap().clone());
             let p: ThreadProjection = serde_json::from_value(value).unwrap();
-            describe(&rows(&p, &HashSet::from([fold_key("r")]), visibility, &mut EntryCache::default()))
+            describe(&rows(
+                &p,
+                &HashSet::from([fold_key("r")]),
+                &RowOptions { visibility, ..Default::default() },
+                &mut EntryCache::default(),
+            ))
         };
 
         assert_eq!(
@@ -2343,11 +2458,80 @@ mod tests {
     }
 
     #[test]
+    fn provider_limit_notices_match_claudes_own_wording_only() {
+        for text in [
+            "You've hit your limit",
+            "You\u{2019}ve hit your 5-hour limit \u{b7} resets 7:10am (Europe/Berlin).",
+            "you're out of extra usage \u{b7} resets 12pm",
+            "Claude AI usage limit reached.",
+            "You've hit your weekly limit \u{b7} resets 9:05pm (America/Argentina/Buenos_Aires)",
+        ] {
+            assert!(provider_limit_notice(text), "{text:?}");
+        }
+        for text in [
+            "You've hit your limit, so I stopped.",
+            "You've hit your daily limit",
+            "You've hit your limit \u{b7} resets 13pm",
+            "You've hit your limit \u{b7} resets 07:10am",
+            "You've hit your limit \u{b7} resets 7:60am",
+            "You've hit your limit \u{b7} resets 7am (Europe//Berlin)",
+        ] {
+            assert!(!provider_limit_notice(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_pause_drops_its_repeats_while_the_notice_shows() {
+        let at = "2026-11-04T10:00:00.000Z";
+        let items = vec![
+            item("u", "user_message", "r", at, json!({"text": "go", "inputIntent": "turn_start"})),
+            item(
+                "a",
+                "assistant_message",
+                "r",
+                at,
+                json!({"text": "working on it", "providerTurnId": "pt", "ordinal": 1}),
+            ),
+            item(
+                "n",
+                "assistant_message",
+                "r",
+                at,
+                json!({"text": "You've hit your limit", "providerTurnId": "pt", "ordinal": 2}),
+            ),
+            item(
+                "s",
+                "system_notice",
+                "r",
+                at,
+                json!({"providerTurnId": "pt", "message": "Paused",
+                "nativeItemRef": {"driver": "claudeAgent", "nativeId": "usage-limit:pt:1"}}),
+            ),
+            item(
+                "e",
+                "error",
+                "r",
+                at,
+                json!({"status": "failed", "providerTurnId": "pt", "message": "Usage limit",
+                "failure": {"class": "usage_limit"}}),
+            ),
+        ];
+        let mut value = projection_value(items.clone(), json!([{"id": "r", "status": "failed"}]));
+        value["turnItems"] = json!(items);
+        let p: ThreadProjection = serde_json::from_value(value).unwrap();
+        let notice = RowOptions { usage_limit_run: Some("r".into()), ..Default::default() };
+        let shown = describe(&rows(&p, &HashSet::new(), &notice, &mut EntryCache::default()));
+        assert_eq!(shown, ["user go", "assistant working on it"]);
+        let all = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        assert!(all.len() > shown.len(), "without the notice the rows stay: {all:?}");
+    }
+
+    #[test]
     fn a_fresh_session_message_marks_where_the_session_began() {
         let mut items = turn("r1")[..2].to_vec();
         items[0]["freshContext"] = json!(true);
         let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
-        let described = describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(described, ["system New session", "user go", "assistant looking"]);
     }
 
@@ -2355,7 +2539,12 @@ mod tests {
     fn zen_thinking_shows_the_answer_being_written() {
         let items = turn("r1")[..3].to_vec();
         let p = projection(items, json!([{"id": "r1", "status": "running"}]));
-        let rows = rows(&p, &HashSet::new(), ToolCallVisibility::Zen, &mut EntryCache::default());
+        let rows = rows(
+            &p,
+            &HashSet::new(),
+            &RowOptions { visibility: ToolCallVisibility::Zen, ..Default::default() },
+            &mut EntryCache::default(),
+        );
         let preview = rows.iter().find_map(|row| match row {
             Row::Work(WorkRow { kind: WorkRowKind::Thinking { preview, .. }, .. }) => preview.clone(),
             _ => None,
@@ -2369,7 +2558,7 @@ mod tests {
         let rows = rows(
             &p,
             &HashSet::from([fold_key("r1"), group_key("r1-c1")]),
-            ToolCallVisibility::ShowAll,
+            &RowOptions::default(),
             &mut EntryCache::default(),
         );
         let continues: Vec<bool> =
@@ -2388,15 +2577,10 @@ mod tests {
             .apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection_value(items.clone(), runs)}))
             .unwrap();
         let mut live = |state: &crate::model::ThreadState| {
-            describe(&rows(
-                state.projection.as_ref().unwrap(),
-                &HashSet::new(),
-                ToolCallVisibility::ShowAll,
-                &mut cache,
-            ))
-            .last()
-            .cloned()
-            .unwrap()
+            describe(&rows(state.projection.as_ref().unwrap(), &HashSet::new(), &RowOptions::default(), &mut cache))
+                .last()
+                .cloned()
+                .unwrap()
         };
         assert_eq!(live(&state), "live Running ls");
         // Same `updatedAt` and status, new input: the revision still changes.
@@ -2435,7 +2619,7 @@ mod tests {
             {"id": "n3", "rootNodeId": "root2"}, {"id": "n4", "rootNodeId": "root2"},
         ]);
         let p: ThreadProjection = serde_json::from_value(value).unwrap();
-        let shown = describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let shown = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(
             shown,
             ["user go", "working", "attempt-fold false", "user stop", "work ls", "assistant done", "thinking"]
@@ -2443,7 +2627,7 @@ mod tests {
         let open = describe(&rows(
             &p,
             &HashSet::from([attempt_key("a1")]),
-            ToolCallVisibility::ShowAll,
+            &RowOptions::default(),
             &mut EntryCache::default(),
         ));
         assert_eq!(open[2..4], ["attempt-fold true", "toggle Ran 2 commands"]);
@@ -2515,7 +2699,7 @@ mod tests {
             item("u3", "user_message", "r1", "2026-11-04T10:00:02.000Z", json!({"text": "c", "inputIntent": "steer"})),
         ];
         let p = projection(items, json!([]));
-        let rows = rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default());
+        let rows = rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         assert!(matches!(rows[0], Row::User { grouped_with_next: true, steer: None, .. }));
         // A steer under a plain message keeps its label; the second steer in a row drops it.
         assert!(matches!(
@@ -2529,7 +2713,7 @@ mod tests {
         let mut items = vec![item("u4", "user_message", "r2", "2026-11-04T10:00:03.000Z", sent)];
         items.insert(0, item("u0", "user_message", "r2", "2026-11-04T10:00:00.500Z", json!({"text": "z"})));
         let p = projection(items, json!([]));
-        let rows = super::rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default());
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
         assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
     }
@@ -2560,9 +2744,9 @@ mod tests {
             .unwrap()
         };
         p.runtime_requests = vec![request("pending")];
-        let pending = describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let pending = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         p.runtime_requests = vec![request("resolved")];
-        let resolved = describe(&rows(&p, &HashSet::new(), ToolCallVisibility::ShowAll, &mut EntryCache::default()));
+        let resolved = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(pending, ["user go", "working"]);
         assert_eq!(resolved, ["user go", "working", "live rm -rf build"]);
     }

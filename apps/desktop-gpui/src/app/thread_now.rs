@@ -67,10 +67,12 @@ impl Workspace {
         let now = super::sidebar::now_ms();
         let facts = Facts::new(shell, &Default::default());
         let status = if facts.is_snoozed(now) {
+            // The usage-limit notice shows this snooze and its Wake now.
             shell
                 .snoozed_until
                 .as_deref()
                 .and_then(crate::timestamp::parse_ms)
+                .filter(|_| !self.limit_recovery_holds_snooze())
                 .map(|until_ms| StatusLine::Snoozed { until_ms })
         } else if shell.settled_override.as_deref() == Some("settled") {
             Some(StatusLine::Settled { at_ms: shell.settled_at.as_deref().and_then(crate::timestamp::parse_ms) })
@@ -301,7 +303,7 @@ fn force_stop_notice(result: &Value) -> Option<Notification> {
 }
 
 /// `InlineButton`: medium text that underlines on hover.
-fn inline_button(
+pub(super) fn inline_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     color: Hsla,

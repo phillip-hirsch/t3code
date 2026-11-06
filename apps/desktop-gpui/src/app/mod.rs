@@ -742,7 +742,8 @@ impl Workspace {
             Some(projection) => {
                 let visibility = self.tool_call_visibility();
                 let visibility = if self.find.is_some() { visibility.while_finding() } else { visibility };
-                timeline::rows(projection, &self.expanded, visibility, &mut self.entry_cache)
+                let options = timeline::RowOptions { visibility, usage_limit_run: self.usage_limit_notice_run() };
+                timeline::rows(projection, &self.expanded, &options, &mut self.entry_cache)
             }
             None => Vec::new(),
         };
