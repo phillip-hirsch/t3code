@@ -19,7 +19,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{
-    self, DraftError, DraftState, MIN_INTERVAL_MS, Schedule, ScheduleMode, ScheduledTask, WEEKDAY_LABELS,
+    self, DraftError, DraftState, MIN_INTERVAL_MS, Schedule, ScheduleMode, ScheduledTask, ThreadMode, WEEKDAY_LABELS,
     WEEKDAY_ORDER, WEEKDAY_SHORT, WorkspaceMode,
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
@@ -389,6 +389,9 @@ impl TaskEditor {
             "interactionMode": draft.interaction_mode,
             "creationSource": "web",
         });
+        if self.offers_thread_modes(cx) {
+            input["threadMode"] = json!(draft.thread_mode.wire());
+        }
         if let Some(id) = &draft.editing_id {
             input["id"] = json!(id);
             input["requireExisting"] = json!(true);
@@ -414,6 +417,16 @@ impl TaskEditor {
         .detach();
     }
 
+    /// Servers before thread modes ignore `threadMode`, so the picker is offered only where it saves.
+    fn offers_thread_modes(&self, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|workspace| {
+            workspace
+                .read(cx)
+                .env_info(&self.environment)
+                .is_some_and(|info| info.capability("scheduledTaskThreadModes"))
+        })
+    }
+
     /// Older servers reject one-time schedules, so Once is offered only where it can save.
     fn offers_once(&self, capability: bool) -> bool {
         capability || self.task.as_ref().is_some_and(|task| matches!(task.schedule(), Schedule::Once { .. }))
@@ -434,16 +447,17 @@ impl Render for TaskEditor {
         let (offers_once, denial, env_label, machine, destination) = {
             let workspace = workspace.read(cx);
             let Some(info) = workspace.env_info(&self.environment) else { return div().into_any_element() };
-            let destination = (!self.draft.thread_id.is_empty()).then(|| {
-                workspace
-                    .shell
-                    .threads
-                    .iter()
-                    .find(|thread| thread.id == self.draft.thread_id)
-                    .map(|thread| thread.title.trim().to_owned())
-                    .filter(|title| !title.is_empty())
-                    .unwrap_or_else(|| format!("Thread {}", self.draft.thread_id))
-            });
+            let destination = (!self.draft.thread_id.is_empty() && self.draft.thread_mode != ThreadMode::NewThread)
+                .then(|| {
+                    workspace
+                        .shell
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == self.draft.thread_id)
+                        .map(|thread| thread.title.trim().to_owned())
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or_else(|| format!("Thread {}", self.draft.thread_id))
+                });
             (
                 self.offers_once(info.capability("oneTimeSchedules")),
                 logic::webhook_denial(&info.managed_policy),
@@ -454,6 +468,26 @@ impl Render for TaskEditor {
         };
         let disabled = self.saving;
         let draft = &self.draft;
+        let thread_mode = draft.thread_mode;
+        let thread_mode_select = self.offers_thread_modes(cx).then(|| {
+            select_trigger(&"scheduled-task-destination".into(), thread_mode.label(), 0., &t)
+                .w_full()
+                .disabled(disabled)
+                .dropdown_menu({
+                    let editor = editor.clone();
+                    move |mut menu, window, _| {
+                        for mode in ThreadMode::ALL {
+                            menu = menu.item(PopupMenuItem::new(mode.label()).checked(mode == thread_mode).on_click(
+                                window.listener_for(&editor, move |this: &mut TaskEditor, _, _, cx| {
+                                    this.draft.thread_mode = mode;
+                                    cx.notify();
+                                }),
+                            ));
+                        }
+                        menu
+                    }
+                })
+        });
 
         // Runs on: the one environment this client is connected to.
         let environment = h_flex()
@@ -686,17 +720,20 @@ impl Render for TaskEditor {
                     .child(field(
                         "Destination",
                         None,
-                        match destination {
-                            None => div()
+                        div().flex().flex_col().gap(px(6.)).children(thread_mode_select).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
                                 .text_sm()
-                                .text_color(t.muted_foreground)
-                                .child("Each run starts a new thread with the workspace and model below."),
-                            Some(title) => div().flex().flex_col().gap(px(4.)).text_sm().child(title).child(
-                                div()
-                                    .text_color(t.muted_foreground)
-                                    .child("Each run continues this conversation, in its workspace and with its current model."),
-                            ),
-                        },
+                                .children(destination.as_ref().map(|title| div().child(title.clone())))
+                                .child(div().text_color(t.muted_foreground).child(thread_mode.detail(destination.is_some())))
+                                .when(thread_mode != ThreadMode::NewThread, |this| {
+                                    this.child(
+                                        div().text_color(t.muted_foreground).child("Deleting the thread also deletes this task."),
+                                    )
+                                }),
+                        ),
                         &t,
                     ))
                     .child(

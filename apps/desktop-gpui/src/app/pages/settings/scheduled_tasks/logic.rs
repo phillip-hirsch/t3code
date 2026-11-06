@@ -23,6 +23,9 @@ pub(in crate::app) struct ScheduledTask {
     pub project_id: String,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// `ScheduledTaskThreadMode`; servers before thread modes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_mode: Option<String>,
     pub workspace_strategy: Value,
     pub model_selection: Value,
     pub runtime_mode: String,
@@ -48,6 +51,65 @@ impl ScheduledTask {
 
     pub fn schedule(&self) -> Schedule {
         Schedule::of(&self.schedule)
+    }
+
+    /// `scheduledTaskThreadMode`: older servers' bound tasks continue the conversation.
+    pub fn thread_mode(&self) -> ThreadMode {
+        match self.thread_mode.as_deref() {
+            Some("new_thread") => ThreadMode::NewThread,
+            Some("continue") => ThreadMode::Continue,
+            Some("fresh_session") => ThreadMode::FreshSession,
+            _ if self.thread_id.is_none() => ThreadMode::NewThread,
+            _ => ThreadMode::Continue,
+        }
+    }
+}
+
+/// `ScheduledTaskThreadMode`: where runs go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ThreadMode {
+    NewThread,
+    Continue,
+    FreshSession,
+}
+
+impl ThreadMode {
+    pub const ALL: [ThreadMode; 3] = [ThreadMode::NewThread, ThreadMode::Continue, ThreadMode::FreshSession];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            ThreadMode::NewThread => "new_thread",
+            ThreadMode::Continue => "continue",
+            ThreadMode::FreshSession => "fresh_session",
+        }
+    }
+
+    /// `THREAD_MODE_LABELS`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThreadMode::NewThread => "New thread each run",
+            ThreadMode::Continue => "One thread, continuing the conversation",
+            ThreadMode::FreshSession => "One thread, fresh session each run",
+        }
+    }
+
+    /// The Destination field's explanation; `bound` when the task already has its thread.
+    pub fn detail(self, bound: bool) -> &'static str {
+        match (self, bound) {
+            (ThreadMode::NewThread, _) => "Each run starts a new thread with the workspace and model below.",
+            (ThreadMode::Continue, false) => {
+                "The first run starts a thread with the workspace and model below. Later runs continue that conversation."
+            }
+            (ThreadMode::FreshSession, false) => {
+                "The first run starts a thread with the workspace and model below. Later runs post there, each in a fresh session without earlier runs' context."
+            }
+            (ThreadMode::Continue, true) => {
+                "Each run continues this conversation, in its workspace and with its current model."
+            }
+            (ThreadMode::FreshSession, true) => {
+                "Each run starts a fresh session in this thread, without earlier runs' context."
+            }
+        }
     }
 }
 
@@ -154,6 +216,7 @@ pub(super) struct DraftState {
     pub weekdays: BTreeSet<u8>,
     pub project_id: String,
     pub thread_id: String,
+    pub thread_mode: ThreadMode,
     pub workspace_mode: WorkspaceMode,
     pub base_ref: String,
     pub start_from_origin: bool,
@@ -182,6 +245,7 @@ impl Default for DraftState {
             weekdays: BTreeSet::from([1, 2, 3, 4, 5]),
             project_id: String::new(),
             thread_id: String::new(),
+            thread_mode: ThreadMode::NewThread,
             workspace_mode: WorkspaceMode::Worktree,
             base_ref: "main".into(),
             start_from_origin: true,
@@ -331,6 +395,7 @@ pub(super) fn task_to_draft<Tz: TimeZone>(task: &ScheduledTask, tz: &Tz) -> Draf
         },
         project_id: task.project_id.clone(),
         thread_id: task.thread_id.clone().unwrap_or_default(),
+        thread_mode: task.thread_mode(),
         workspace_mode,
         base_ref: if worktree { strategy["baseRef"].as_str().unwrap_or("main").to_owned() } else { "main".into() },
         start_from_origin: if worktree { strategy["startFromOrigin"].as_bool().unwrap_or(false) } else { true },
@@ -608,6 +673,17 @@ mod tests {
         );
         assert_eq!(split_model_key("codex:gpt-5:mini").map(|s| s.model), Some("gpt-5:mini".into()));
         assert_eq!(split_model_key(":gpt"), None);
+    }
+
+    #[test]
+    fn thread_mode_falls_back_to_the_binding_on_older_servers() {
+        let mut task = task(json!({"type": "interval", "everyMs": 60_000}));
+        assert_eq!(task.thread_mode(), ThreadMode::NewThread);
+        task.thread_id = Some("thread-1".into());
+        assert_eq!(task_to_draft(&task, &zone()).thread_mode, ThreadMode::Continue);
+        task.thread_mode = Some("fresh_session".into());
+        assert_eq!(task.thread_mode(), ThreadMode::FreshSession);
+        assert_eq!(task.to_json()["threadMode"], "fresh_session");
     }
 
     #[test]

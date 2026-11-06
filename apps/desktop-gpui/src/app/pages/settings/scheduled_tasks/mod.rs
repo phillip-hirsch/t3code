@@ -23,8 +23,9 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    AnyElement, AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    WeakEntity, Window, div, px,
 };
 use serde_json::json;
 
@@ -201,6 +202,40 @@ impl ScheduledTasksView {
         }
     }
 
+    /// `ScheduledTaskThreadLink`: a one-thread task's thread, by its title.
+    fn thread_link(&self, task: &ScheduledTask, t: &Tokens, cx: &App) -> Option<AnyElement> {
+        let thread_id = task.thread_id.clone().filter(|_| task.thread_mode() != logic::ThreadMode::NewThread)?;
+        let (environment, _) = self.following.clone()?;
+        let workspace = self.workspace.upgrade()?;
+        let title = workspace
+            .read(cx)
+            .shell
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.title.trim().to_owned())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "Open thread".into());
+        let fg = t.foreground;
+        Some(
+            div()
+                .id(SharedString::from(format!("scheduled-task-thread-{}", task.id)))
+                .max_w(px(256.))
+                .truncate()
+                .underline()
+                .cursor_pointer()
+                .hover(move |style| style.text_color(fg))
+                .on_click(move |_, window, cx| {
+                    workspace.update(cx, |this, cx| {
+                        this.close_settings(cx);
+                        this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
+                    });
+                })
+                .child(title)
+                .into_any_element(),
+        )
+    }
+
     fn render_row(&self, task: &Rc<ScheduledTask>, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
         let busy = self.busy.contains(&task.id);
         let schedule = task.schedule();
@@ -223,6 +258,7 @@ impl ScheduledTasksView {
             .when(task.last_run_status != "never" && !task.last_run_status.is_empty(), |this| {
                 this.child(badge(&task.last_run_status, t))
             })
+            .children(self.thread_link(task, t, cx))
             .children(task.last_run_error.clone().map(|error| div().text_color(t.error_foreground).child(error)));
 
         let id = task.id.clone();
