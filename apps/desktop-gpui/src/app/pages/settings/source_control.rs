@@ -415,7 +415,7 @@ impl Workspace {
                 .map(|(id, label)| (if *id == "last" { Value::Null } else { json!(id) }, (*label).into()))
                 .collect(),
             MERGE_METHODS.iter().find(|(id, _)| *id == method).map_or("", |(_, label)| label),
-            208.,
+            0.,
             cx,
         );
         let discovery = self.discovery_sections(&state, client.is_some(), window, cx);
@@ -650,12 +650,13 @@ impl Workspace {
             .items_center()
             .justify_center()
             .children(icon.map(|path| source_control_icon(path, &t)))
+            // `size-2 ring-2 ring-background` at `-left-0.5 -top-0.5`: the ring sits outside the dot.
             .child(
                 div()
                     .absolute()
-                    .left(px(-2.))
-                    .top(px(-2.))
-                    .size(px(8.))
+                    .left(px(-4.))
+                    .top(px(-4.))
+                    .size(px(12.))
                     .rounded_full()
                     .border_2()
                     .border_color(t.background)
