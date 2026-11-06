@@ -1286,7 +1286,8 @@ impl Workspace {
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
         let in_submenu = !palette.stack.is_empty();
-        let highlight = palette.highlight;
+        // `autoHighlight="always"`: the first row paints highlighted until the arrows move, except while browsing.
+        let highlight = palette.highlight.or((!browsing).then_some(0));
         let groups = self.palette_groups(&query);
         let input = palette.input.clone();
         let fg = tokens.foreground;
