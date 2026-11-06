@@ -7,12 +7,16 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, rgb};
+use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, px, rgb};
 
 use crate::settings::{Settings, TYPOGRAPHY_ADVANCED_KEY};
 use crate::themes::{ThemeChoice, ThemeColors};
 
-pub const FONT_SANS: &str = "Inter";
+/// The face the web app's `--font-sans` stack renders on each OS: `-apple-system` (SF Pro) on
+/// macOS, the bundled Inter elsewhere. GPUI maps `.SystemUIFont` to the platform UI font.
+pub const FONT_SANS: &str = if cfg!(target_os = "macos") { ".SystemUIFont" } else { "Inter" };
+/// What Settings › Appearance calls that default (`resolveDefaultFamilyLabel`).
+pub const FONT_SANS_LABEL: &str = if cfg!(target_os = "macos") { "SF Pro" } else { "Inter Variable" };
 /// The first family of the web app's `--font-mono` stack each OS has by name: macOS doesn't
 /// expose SF Mono (`ui-monospace`) by name, and Linux's `monospace` is usually DejaVu Sans Mono.
 pub const FONT_MONO: &str = if cfg!(target_os = "macos") {
