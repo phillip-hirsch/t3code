@@ -81,6 +81,8 @@ pub(super) struct DraftWorkspaceState {
     refs: Option<Value>,
     _load: Option<Task<()>>,
     branch_open: bool,
+    /// The open branch picker hangs off the details card's branch row, not the strip's.
+    pub(super) branch_in_card: bool,
     branch_search: Option<Entity<InputState>>,
     branch_query: String,
     _branch_search_changes: Option<Subscription>,
@@ -204,7 +206,7 @@ impl Workspace {
         Some(new_thread::launch_strategy(mode, &state.choice, refs, self.draft_start_from_origin()))
     }
 
-    fn is_git_repo(&self) -> bool {
+    pub(super) fn is_git_repo(&self) -> bool {
         self.draft_workspace.refs.as_ref().and_then(|r| r.get("isRepo")).and_then(Value::as_bool).unwrap_or(true)
     }
 
@@ -536,16 +538,62 @@ impl Workspace {
         )
     }
 
-    fn render_env_mode_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let choice = &self.draft_workspace.choice;
-        let (icon, label) = match (&choice.existing_worktree, self.draft_env_mode()) {
+    /// The draft's workspace choice as the selectors show it (`resolveEnvModeLabel`).
+    pub(super) fn env_mode_choice(&self) -> (Lucide, &'static str) {
+        match (&self.draft_workspace.choice.existing_worktree, self.draft_env_mode()) {
             (Some(_), _) => (Lucide::FolderGit, "Previous worktree"),
             (None, EnvMode::Worktree) => (Lucide::FolderGit2, "New worktree"),
             (None, EnvMode::Local) => (Lucide::Folder, "Current checkout"),
-        };
+        }
+    }
+
+    /// The Workspace menu: current checkout, a new worktree, or the previous worktree.
+    pub(super) fn env_mode_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let (_, label) = self.env_mode_choice();
         let previous = self.previous_worktree();
         let view = cx.entity();
+        move |menu, window, _| {
+            let mut menu = menu
+                .label("Workspace")
+                .item(
+                    PopupMenuItem::new("Current checkout")
+                        .icon(Icon::new(Lucide::Folder))
+                        .checked(label == "Current checkout")
+                        .on_click(window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Local, cx))),
+                )
+                .item(
+                    PopupMenuItem::new("New worktree")
+                        .icon(Icon::new(Lucide::FolderGit2))
+                        .checked(label == "New worktree")
+                        .on_click(
+                            window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Worktree, cx)),
+                        ),
+                );
+            if let Some((path, branch)) = previous.clone() {
+                let text = match &branch {
+                    Some(branch) => format!("Previous worktree · {branch}"),
+                    None => "Previous worktree".into(),
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(text)
+                        .icon(Icon::new(Lucide::RotateCcwClock))
+                        .checked(label == "Previous worktree")
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                            this.pick_previous_worktree(path.clone(), branch.clone(), cx);
+                        })),
+                );
+            }
+            menu
+        }
+    }
+
+    fn render_env_mode_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, label) = self.env_mode_choice();
         let path = self.composer_cwd();
+        let menu = self.env_mode_menu(cx);
         let button = strip_button("env-mode", t)
             .child(Icon::new(icon).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label))
@@ -553,46 +601,14 @@ impl Workspace {
                 Some(keys) => format!("{label} · {keys}"),
                 None => label.to_owned(),
             })
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |menu, window, _| {
-                let mut menu = menu
-                    .label("Workspace")
-                    .item(
-                        PopupMenuItem::new("Current checkout")
-                            .icon(Icon::new(Lucide::Folder))
-                            .checked(label == "Current checkout")
-                            .on_click(
-                                window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Local, cx)),
-                            ),
-                    )
-                    .item(
-                        PopupMenuItem::new("New worktree")
-                            .icon(Icon::new(Lucide::FolderGit2))
-                            .checked(label == "New worktree")
-                            .on_click(
-                                window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Worktree, cx)),
-                            ),
-                    );
-                if let Some((path, branch)) = previous.clone() {
-                    let text = match &branch {
-                        Some(branch) => format!("Previous worktree · {branch}"),
-                        None => "Previous worktree".into(),
-                    };
-                    menu = menu.item(
-                        PopupMenuItem::new(text)
-                            .icon(Icon::new(Lucide::RotateCcwClock))
-                            .checked(label == "Previous worktree")
-                            .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                this.pick_previous_worktree(path.clone(), branch.clone(), cx);
-                            })),
-                    );
-                }
-                menu
-            });
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, menu);
         let wrap = div().id("env-mode-wrap").min_w_0().child(button);
         with_copy_menu(wrap, path.map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
     }
 
-    fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The branch the selectors show, whether it is a new worktree's base, and the trigger
+    /// label (`resolveBranchTriggerLabel`).
+    pub(super) fn branch_trigger(&self) -> (Option<&str>, bool, SharedString) {
         let state = &self.draft_workspace;
         let thread = matches!(self.target, Some(Target::Thread { .. }));
         let worktree_base =
@@ -621,18 +637,34 @@ impl Workspace {
             (Some(b), true) => format!("From {b}").into(),
             (Some(b), false) => b.to_owned().into(),
         };
-        let trigger = strip_button("branch-selector", t)
-            .disabled(!thread && state.refs.is_none())
-            .selected(state.branch_open)
-            .child(Icon::new(Lucide::GitBranch).with_size(px(12.)))
-            .child(div().max_w(px(240.)).truncate().child(label));
+        (branch, worktree_base, label)
+    }
+
+    /// Whether the branch picker can open: a draft waits for its refs.
+    pub(super) fn branch_picker_ready(&self) -> bool {
+        matches!(self.target, Some(Target::Thread { .. })) || self.draft_workspace.refs.is_some()
+    }
+
+    /// The branch picker as a popover on `trigger`; `in_card` places it under the details card's row.
+    pub(super) fn branch_popover<T: gpui_kit::component::Selectable + IntoElement + 'static>(
+        &self,
+        id: &'static str,
+        trigger: T,
+        in_card: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let state = &self.draft_workspace;
+        let open = state.branch_open && state.branch_in_card == in_card;
+        let (branch, worktree_base, _) = self.branch_trigger();
         let view = cx.entity();
-        let mut popover = Popover::new("branch-popover")
-            .anchor(gpui_kit::Anchor::BottomRight)
-            .open(state.branch_open)
+        let mut popover = Popover::new(id)
+            .anchor(if in_card { gpui_kit::Anchor::TopLeft } else { gpui_kit::Anchor::BottomRight })
+            .open(open)
             .on_open_change(move |open, window, cx| {
                 view.update(cx, |this, cx| {
                     if *open {
+                        this.draft_workspace.branch_in_card = in_card;
                         this.open_branch_picker(window, cx);
                     } else {
                         this.draft_workspace.branch_open = false;
@@ -646,9 +678,21 @@ impl Workspace {
         if let Some(search) = &state.branch_search {
             popover = popover.track_focus(&search.focus_handle(cx));
         }
-        if state.branch_open {
+        if open {
             popover = popover.child(self.render_branch_popover(branch, worktree_base, t, cx));
         }
+        popover
+    }
+
+    fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let state = &self.draft_workspace;
+        let (branch, _, label) = self.branch_trigger();
+        let trigger = strip_button("branch-selector", t)
+            .disabled(!self.branch_picker_ready())
+            .selected(state.branch_open && !state.branch_in_card)
+            .child(Icon::new(Lucide::GitBranch).with_size(px(12.)))
+            .child(div().max_w(px(240.)).truncate().child(label));
+        let popover = self.branch_popover("branch-popover", trigger, false, t, cx);
         let wrap = div().id("branch-selector-wrap").min_w_0().child(popover);
         with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied")
     }

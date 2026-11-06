@@ -96,6 +96,7 @@ impl Workspace {
                 self.preview_command(command, window, cx);
             }
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
+            "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),
             "rightPanel.close" if chat => return held || self.close_active_surface(window, cx),
             "diff.toggle" if chat => self.toggle_diff(window, cx),
             "terminal.toggle" if chat => {

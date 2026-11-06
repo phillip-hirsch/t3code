@@ -4,6 +4,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -190,7 +191,9 @@ impl Workspace {
         &self,
         head: &str,
         base: &str,
+        narrow: bool,
         tokens: &Tokens,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let picker = &self.right_panel.base_picker;
@@ -201,6 +204,7 @@ impl Workspace {
             .h(px(24.))
             .px(px(6.))
             .gap_1()
+            .min_w(px(36.))
             .max_w(px(192.))
             .text_xs()
             .text_color(tokens.muted_foreground)
@@ -228,51 +232,54 @@ impl Workspace {
             popover = popover.track_focus(&search.focus_handle(cx));
         }
         if picker.open {
-            popover = popover.child(self.render_base_ref_list(head, tokens, cx));
+            popover = popover.child(self.render_base_ref_list(head, tokens, window, cx));
         }
+        // Too narrow for both refs, the target stays readable and the head drops out.
+        let lead = if narrow {
+            div().id("diff-refs-vs").flex_none().child("vs")
+        } else {
+            div()
+                .id("diff-refs-head")
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w(px(48.))
+                .child(div().min_w_0().max_w(px(192.)).truncate().child(SharedString::from(head.to_owned())))
+                .child(icon("icons/arrow-right.svg").with_size(px(14.)).flex_none().opacity(0.7))
+        };
         h_flex()
             .id("diff-refs")
             .min_w_0()
-            .gap_1()
-            .child(
-                div()
-                    .id("diff-refs-head")
-                    .flex_none()
-                    .max_w(px(160.))
-                    .truncate()
-                    .text_xs()
-                    .text_color(tokens.muted_foreground)
-                    .child(format!("{head} →"))
-                    .tooltip(move |window, cx| Tooltip::new(comparison.clone()).build(window, cx)),
-            )
+            .gap_2()
+            .overflow_hidden()
+            .text_xs()
+            .text_color(tokens.muted_foreground)
+            .child(lead.tooltip(move |window, cx| Tooltip::new(comparison.clone()).build(window, cx)))
             .child(div().min_w_0().overflow_hidden().child(popover))
             .into_any_element()
     }
 
-    fn render_base_ref_list(&self, head: &str, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_base_ref_list(&self, head: &str, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let picker = &self.right_panel.base_picker;
         let local: Vec<Ref> = picker.local.iter().filter(|r| r.name != head).cloned().collect();
         let all = choices(&local, &picker.remote);
         let selected = self.diff_base_ref().map(str::to_owned);
         let shown: Vec<&Choice> = all.iter().filter(|c| matches(c, &picker.query)).collect();
-        let row = |id: ElementId, checked: bool| {
+        // `ComboboxItem`: the picked row keeps a faint fill; hover takes a stronger one.
+        let (picked_bg, hover_bg) = (tokens.foreground.opacity(0.06), tokens.foreground.opacity(0.09));
+        let row = |id: ElementId, picked: bool| {
             h_flex()
                 .id(id)
-                .h(px(28.))
+                .min_h(px(28.))
                 .flex_none()
-                .pl(px(8.))
-                .pr(px(10.))
+                .px(px(8.))
+                .py(px(4.))
                 .gap(px(8.))
                 .rounded(px(4.))
                 .text_sm()
                 .cursor_pointer()
-                .hover(|s| s.bg(tokens.accent))
-                .child(
-                    div()
-                        .w(px(16.))
-                        .flex_none()
-                        .when(checked, |el| el.child(icon("icons/check.svg").with_size(px(14.)))),
-                )
+                .when(picked, |el| el.bg(picked_bg))
+                .hover(move |s| s.bg(hover_bg))
         };
         let automatic = picker.query.is_empty().then(|| {
             row("diff-base-automatic".into(), selected.is_none())
@@ -314,18 +321,27 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, _, cx| this.select_base_ref(Some(pick.clone()), cx)))
         });
         let empty = automatic.is_none() && shown.is_empty() && !picker.loading;
+        // `ComboboxSearchInput`: a search glyph and an underline that turns the ring color on focus.
+        let focused = picker.search.as_ref().is_some_and(|search| search.focus_handle(cx).is_focused(window));
+        let underline = if focused { tokens.ring } else { tokens.border.opacity(0.7) };
         v_flex()
             .id("diff-base-ref-body")
             .w(px(288.))
             .bg(tokens.popover)
-            .child(
-                div().px(px(12.)).pt(px(10.)).pb(px(6.)).border_b_1().border_color(tokens.border).children(
-                    picker
-                        .search
-                        .clone()
-                        .map(|search| div().child(Input::new(&search).appearance(false).small().text_sm())),
-                ),
-            )
+            .child(div().px(px(12.)).pt(px(10.)).children(picker.search.clone().map(|search| {
+                h_flex()
+                    .pb(px(6.))
+                    .gap(px(4.))
+                    .border_b_1()
+                    .border_color(underline)
+                    .child(
+                        icon("icons/search.svg")
+                            .with_size(px(16.))
+                            .flex_none()
+                            .text_color(tokens.muted_foreground.opacity(0.55)),
+                    )
+                    .child(div().flex_1().min_w_0().child(Input::new(&search).appearance(false).small().text_sm()))
+            })))
             .child(
                 h_flex()
                     .pl(px(12.))
@@ -346,7 +362,7 @@ impl Workspace {
                 v_flex()
                     .id("diff-base-ref-list")
                     .max_h(px(256.))
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .p(px(4.))
                     .when(empty, |el| {
                         el.child(

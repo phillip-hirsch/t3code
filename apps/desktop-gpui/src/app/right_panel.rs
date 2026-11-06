@@ -5,6 +5,7 @@
 //! device surface is not native, so the launcher leaves it out.
 
 mod diff_base;
+mod diff_load;
 mod diff_tree;
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +16,7 @@ use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
@@ -107,6 +108,8 @@ struct PanelState {
     user_revision: u64,
     /// The turn whose diff was last offered on its own (`proactiveDiffTurnId`).
     proactive_diff_run: Option<String>,
+    /// The panel fills the row and the chat column steps aside (`maximized`), kept per thread.
+    maximized: bool,
 }
 
 impl PanelState {
@@ -230,7 +233,15 @@ struct DiffKey {
 enum DiffLoad {
     Idle,
     Loading,
-    Ready { additions: usize, deletions: usize, head: Option<String>, base: Option<String>, truncated: bool },
+    Ready {
+        additions: usize,
+        deletions: usize,
+        head: Option<String>,
+        base: Option<String>,
+        truncated: bool,
+        /// Files whose patches are still loading.
+        pending: usize,
+    },
     Empty(&'static str),
     Failed(SharedString),
 }
@@ -265,6 +276,8 @@ pub(super) struct RightPanel {
     commits: Vec<Commit>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
+    /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
+    diff_refs: ScrollHandle,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
     /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
@@ -311,6 +324,7 @@ impl RightPanel {
             refresh: 0,
             commits: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
+            diff_refs: ScrollHandle::new(),
             revealed_tab: None,
             observation: None,
             observed_pull_requests: HashMap::new(),
@@ -357,14 +371,34 @@ impl Workspace {
         self.panel_state().filter(|panel| panel.open && self.page.is_none())?.active.as_ref()
     }
 
-    /// The panel's laid-out width while it is open.
+    /// The panel's laid-out width while it is open; maximized, the whole row.
     pub(super) fn right_panel_width(&self, window: &Window) -> Option<f32> {
         if !self.right_panel_open() {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
         let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        if self.right_panel_maximized() {
+            return Some(viewport - sidebar - f32::from(RIGHT_RESIZE_INSET));
+        }
         Some(clamp_width(self.right_panel.width, viewport, viewport - sidebar))
+    }
+
+    /// `rightPanelMaximized`: only an open panel counts as maximized.
+    pub(super) fn right_panel_maximized(&self) -> bool {
+        self.right_panel_open() && self.panel_state().is_some_and(|panel| panel.maximized)
+    }
+
+    /// `rightPanel.toggleMaximized` and the titlebar's maximize toggle; not a panel choice.
+    pub(super) fn toggle_right_panel_maximized(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.right_panel_open() {
+            return false;
+        }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.maximized = !panel.maximized;
+            cx.notify();
+        }
+        true
     }
 
     /// `toggleRightPanel` (Ctrl+Alt+B and the titlebar toggle).
@@ -852,7 +886,8 @@ impl Workspace {
             }
             scope => {
                 let Some(cwd) = cwd.clone() else { return };
-                let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace});
+                // Stats only; the patches follow one file at a time, as the web reads them.
+                let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace, "metadataOnly": true});
                 if let Some(base) = &base_ref {
                     input["baseRef"] = base.clone().into();
                 }
@@ -870,13 +905,17 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| {
+        let commits_request = cwd.clone().filter(|_| source_kind.is_some()).map(|cwd| {
             let mut input = json!({"cwd": cwd});
-            if let Some(base) = remembered_base {
+            if let Some(base) = remembered_base.clone() {
                 input["baseRef"] = base.into();
             }
             input
         });
+        let commit_sha = match &scope {
+            DiffScope::Commit(sha) => Some(sha.clone()),
+            _ => None,
+        };
         self.right_panel.load = DiffLoad::Loading;
         let diff = self.right_panel.diff.clone();
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -892,7 +931,11 @@ impl Workspace {
                         result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind))
                     })
                     .await;
-            let _ = this.update(cx, |this, cx| {
+            let (deferred, source_base) = match &parsed {
+                Ok(Some(parsed)) => (parsed.deferred.clone(), parsed.base.clone()),
+                _ => (Vec::new(), None),
+            };
+            let shown = this.update(cx, |this, cx| {
                 if let Some(commits) = commits {
                     this.right_panel.commits = commits["commits"]
                         .as_array()
@@ -910,43 +953,101 @@ impl Workspace {
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No patch available for this selection.")
                     }
-                    Ok(Some(parsed)) if parsed.files.is_empty() => {
+                    Ok(Some(parsed)) if parsed.files.is_empty() && parsed.deferred.is_empty() => {
                         this.store_diff_files(Vec::new());
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No net changes in this selection.")
                     }
                     Ok(Some(parsed)) => {
-                        let additions = parsed.files.iter().map(DiffFile::additions).sum();
-                        let deletions = parsed.files.iter().map(DiffFile::deletions).sum();
-                        let paths: Vec<SharedString> = parsed.files.iter().map(|file| file.path().clone()).collect();
-                        let folded = collapsed_files(
-                            this.right_panel.collapsed.get(&selection),
-                            this.client_settings.values.bool("diffFilesCollapsed"),
-                            &paths,
-                        );
-                        this.store_diff_files(parsed.files);
-                        let shown = this.shown_diff_files();
-                        diff.update(cx, |state, cx| {
-                            state.set_files(shown, cx);
-                            for path in &paths {
-                                state.set_file_collapsed(path, folded.contains(path), cx);
-                            }
+                        let (additions, deletions) = parsed.totals.unwrap_or_else(|| {
+                            let sum = |count: fn(&DiffFile) -> usize| parsed.files.iter().map(count).sum::<usize>();
+                            (sum(DiffFile::additions), sum(DiffFile::deletions))
                         });
-                        this.right_panel.shown = Some(selection);
+                        this.show_diff_files(&selection, parsed.files, cx);
                         DiffLoad::Ready {
                             additions,
                             deletions,
                             head: parsed.head,
                             base: parsed.base,
                             truncated: parsed.truncated,
+                            pending: parsed.deferred.len(),
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
                 cx.notify();
             });
+            if shown.is_err() || deferred.is_empty() {
+                return;
+            }
+            // `useReviewFilePatches`: each file's patch on its own, a few at a time, in path order.
+            let (Some(kind), Some(cwd)) = (source_kind, cwd) else { return };
+            let base = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
+            let mut loaded: Vec<DiffFile> = Vec::new();
+            let mut pending = deferred.len();
+            for batch in deferred.chunks(diff_load::PATCH_READS) {
+                let requests = batch.iter().map(|file| {
+                    let input = diff_load::file_patch_request(
+                        &cwd,
+                        base.as_deref(),
+                        commit_sha.as_deref(),
+                        kind,
+                        ignore_whitespace,
+                        file,
+                    );
+                    client.request("review.getDiffPreview", input)
+                });
+                let replies = futures::future::join_all(requests).await;
+                let files = cx
+                    .background_executor()
+                    .spawn(async move {
+                        replies
+                            .into_iter()
+                            .flat_map(|reply| match reply {
+                                Ok(value) => diff_load::file_patch(&value, kind),
+                                Err(error) => {
+                                    log::warn!("diff file patch failed: {error}");
+                                    Vec::new()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                loaded.extend(files);
+                pending -= batch.len();
+                let shown = this.update(cx, |this, cx| {
+                    this.show_diff_files(&selection, loaded.clone(), cx);
+                    if let DiffLoad::Ready { pending: left, .. } = &mut this.right_panel.load {
+                        *left = pending;
+                    }
+                    this.rebuild_tree_rows(cx);
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
         }));
         cx.notify();
+    }
+
+    /// Puts a selection's loaded files in the patch, folded as the user left them.
+    fn show_diff_files(&mut self, selection: &(Target, DiffScope), files: Vec<DiffFile>, cx: &mut Context<Self>) {
+        let paths: Vec<SharedString> = files.iter().map(|file| file.path().clone()).collect();
+        let folded = collapsed_files(
+            self.right_panel.collapsed.get(selection),
+            self.client_settings.values.bool("diffFilesCollapsed"),
+            &paths,
+        );
+        self.store_diff_files(files);
+        let shown = self.shown_diff_files();
+        self.right_panel.diff.update(cx, |state, cx| {
+            state.set_files(shown, cx);
+            for path in &paths {
+                state.set_file_collapsed(path, folded.contains(path), cx);
+            }
+        });
+        self.right_panel.shown = Some(selection.clone());
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -987,7 +1088,7 @@ impl Workspace {
             }
         }
         let content = match (&panel.active, self.target.clone()) {
-            (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, cx),
+            (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, window, cx),
             (Some(Surface::Browser(tab)), Some(Target::Thread { id: thread_id, .. })) => {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
@@ -1044,7 +1145,12 @@ impl Workspace {
                     this.right_panel.width = clamp_width(this.right_panel.width, viewport, viewport - sidebar);
                     cx.notify();
                 }))
-                .child(self.render_tab_bar(&panel, &tokens, cx))
+                .child({
+                    // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
+                    let inset = (panel.maximized && !self.sidebar_open)
+                        .then(|| super::titlebar::collapsed_content_left(window));
+                    self.render_tab_bar(&panel, inset, &tokens, cx)
+                })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
                 .child(deferred(handle).with_priority(1))
                 .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
@@ -1058,7 +1164,13 @@ impl Workspace {
     }
 
     /// The 40px tab strip, a drag region clear of the panel toggles and caption buttons.
-    fn render_tab_bar(&self, panel: &PanelState, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(
+        &self,
+        panel: &PanelState,
+        left_inset: Option<Pixels>,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // `wco:pr-(--workspace-native-controls-inset)` plus the `w-24` spacer for the toggles.
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
@@ -1067,13 +1179,20 @@ impl Workspace {
         let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
         let profiles = self.browser_profiles();
         let terminal = self.terminal_available();
+        let add_menu_open = self.right_panel.add_menu_open;
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
             .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, cx))
             .collect();
-        let tab_bar =
-            h_flex().id("right-panel-tabbar").h(TITLEBAR_HEIGHT).flex_none().min_w_0().pl_2().pr(reserve).gap_1();
+        let tab_bar = h_flex()
+            .id("right-panel-tabbar")
+            .h(TITLEBAR_HEIGHT)
+            .flex_none()
+            .min_w_0()
+            .pl(left_inset.unwrap_or(px(8.)))
+            .pr(reserve)
+            .gap_1();
         super::titlebar::drag_region(tab_bar)
             .child(
                 h_flex()
@@ -1098,45 +1217,41 @@ impl Workspace {
                     .flex_none()
                     .size(px(24.))
                     .rounded(px(8.))
+                    // `ghost-muted`: the open menu keeps its trigger's accent fill (`data-pressed`).
+                    .selected(add_menu_open)
                     .dropdown_menu(move |menu: PopupMenu, window, cx| {
                         let menu = menu.min_w(px(200.));
                         // An available Browser lists the profiles to open it in (`MenuSub`).
                         let menu = if browser {
                             let (view, profiles) = (view.clone(), profiles.clone());
                             menu.submenu_with_icon(
-                                Some(Icon::new(IconName::Globe)),
+                                Some(menu_icon(Icon::new(IconName::Globe))),
                                 "Browser",
                                 window,
                                 cx,
                                 move |menu, window, _| profile_items(menu.max_w(px(224.)), &profiles, &view, window),
                             )
                         } else {
-                            menu.item(PopupMenuItem::new("Browser").icon(Icon::new(IconName::Globe)).disabled(true))
+                            menu.item(surface_item(Icon::new(IconName::Globe), "Browser", "B").disabled(true))
                         };
                         let menu = menu
                             .item(
-                                PopupMenuItem::new("Terminal")
-                                    .icon(icon("icons/square-terminal.svg"))
+                                surface_item(icon("icons/square-terminal.svg"), "Terminal", "T")
                                     .disabled(!terminal)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.add_terminal_surface(window, cx);
                                     })),
                             )
+                            .item(surface_item(Icon::new(IconName::Files), "Files", "F").disabled(!files).on_click(
+                                window.listener_for(&view, |this, _, window, cx| {
+                                    this.open_surface(Surface::Files, window, cx);
+                                }),
+                            ))
+                            .item(surface_item(icon("icons/file-diff.svg"), "Diff", "D").disabled(!diff).on_click(
+                                window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
+                            ))
                             .item(
-                                PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
-                                    window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::Files, window, cx);
-                                    }),
-                                ),
-                            )
-                            .item(
-                                PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
-                                    window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
-                                ),
-                            )
-                            .item(
-                                PopupMenuItem::new("Pull request")
-                                    .icon(Icon::new(IconName::GitPullRequest))
+                                surface_item(Icon::new(IconName::GitPullRequest), "Pull request", "P")
                                     .disabled(pull_request.is_none())
                                     .on_click(window.listener_for(&view, move |this, _, window, cx| {
                                         if let Some(reference) = this.thread_pull_request_target() {
@@ -1145,8 +1260,7 @@ impl Workspace {
                                     })),
                             )
                             .item(
-                                PopupMenuItem::new("Linked pull requests")
-                                    .icon(Icon::new(IconName::Link))
+                                surface_item(Icon::new(IconName::Link), "Linked pull requests", "L")
                                     .disabled(!linked)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.open_surface(Surface::PullRequests, window, cx);
@@ -1154,8 +1268,7 @@ impl Workspace {
                             );
                         match side_chat {
                             Some(available) => menu.item(
-                                PopupMenuItem::new("Side chat")
-                                    .icon(Icon::new(IconName::MessagesSquare))
+                                surface_item(Icon::new(IconName::MessagesSquare), "Side chat", "S")
                                     .disabled(!available)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.add_side_chat_surface(window, cx);
@@ -1479,7 +1592,13 @@ impl Workspace {
     }
 
     /// `DiffPanel` embedded in the inline panel: the scope menu and view toggles, then the patch.
-    fn render_diff_surface(&self, scope: &DiffScope, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_diff_surface(
+        &self,
+        scope: &DiffScope,
+        tokens: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let turns = self.open_projection().map(turn_summaries).unwrap_or_default();
         let latest = turns.first().map(|t| t.run_id.clone());
         let scope = match scope {
@@ -1586,9 +1705,11 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (stats, truncated) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, truncated, .. } => (Some((*additions, *deletions)), *truncated),
-            _ => (None, false),
+        let (stats, truncated, pending) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, pending, .. } => {
+                (Some((*additions, *deletions)), *truncated, *pending)
+            }
+            _ => (None, false, 0),
         };
         // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
         let refs = matches!(scope, DiffScope::Branch).then(|| {
@@ -1600,7 +1721,13 @@ impl Workspace {
                 .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()))
                 .unwrap_or_else(|| "HEAD".into());
             let base = base.or_else(|| self.diff_base_ref().map(str::to_owned)).unwrap_or_else(|| "Automatic".into());
-            self.render_base_ref_picker(&head, &base, tokens, cx)
+            // Under 20rem the head drops out and the base reads "vs …"; unmeasured, wait a frame.
+            let refs_width = self.right_panel.diff_refs.bounds().size.width;
+            if refs_width <= px(0.) {
+                window.request_animation_frame();
+            }
+            let narrow = refs_width < window.rem_size() * 20.;
+            self.render_base_ref_picker(&head, &base, narrow, tokens, window, cx)
         });
         let can_refresh = !matches!(scope, DiffScope::Turn(_));
         let (shows_files, all_collapsed) = {
@@ -1618,7 +1745,16 @@ impl Workspace {
             .px_2()
             .gap_2()
             .justify_between()
-            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(refs))
+            .child(
+                h_flex()
+                    .id("diff-refs-area")
+                    .track_scroll(&self.right_panel.diff_refs)
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .child(scope_menu)
+                    .children(refs),
+            )
             .child(
                 h_flex()
                     .flex_none()
@@ -1778,6 +1914,19 @@ impl Workspace {
                         })
                         .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
                 )
+                // `DiffFileLoadingBoundary` while file patches are still on their way.
+                .when(pending > 0, |el| {
+                    el.child(
+                        div()
+                            .px_3()
+                            .py(px(6.))
+                            .border_t_1()
+                            .border_color(tokens.border.opacity(0.4))
+                            .text_size(px(11.))
+                            .text_color(tokens.muted_foreground)
+                            .child("Loading diff…"),
+                    )
+                })
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
@@ -1817,6 +1966,30 @@ impl Workspace {
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
     }
+}
+
+/// A menu row's 16px icon (`sm:size-4`, `-mx-0.5`): the menu lays icons out in a 12px box, so
+/// the glyph is scaled up and nudged left to clear the label.
+fn menu_icon(icon: Icon) -> Icon {
+    icon.transform(
+        gpui_kit::Transformation::scale(gpui_kit::size(4. / 3., 4. / 3.))
+            .with_translation(gpui_kit::point(px(-2.), px(0.))),
+    )
+}
+
+/// A "+" menu row (`SurfaceMenuItem`): icon, label, and its shortcut letter at the right.
+fn surface_item(icon: Icon, label: &'static str, shortcut: &'static str) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        h_flex().w_full().gap_2().child(label).child(
+            div()
+                .ml_auto()
+                .text_xs()
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(theme::tokens(cx).muted_foreground)
+                .child(shortcut),
+        )
+    })
+    .icon(menu_icon(icon))
 }
 
 /// One item per browser profile, each opening a new tab in it.
@@ -2002,25 +2175,38 @@ impl Element for DiffTint {
 /// `{sources, ...}` from `review.getDiffPreview` or `{diff}` from `getTurnDiff`, parsed.
 struct ParsedDiff {
     files: Vec<DiffFile>,
+    /// Files whose patches load one by one (`lazySource`); `files` is empty then.
+    deferred: Vec<diff_load::FileStat>,
+    /// `sourceLineStat`: the totals of every file, when the source lists them.
+    totals: Option<(usize, usize)>,
     head: Option<String>,
     base: Option<String>,
     truncated: bool,
 }
 
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
-    let (patch, head, base, truncated) = match source_kind {
-        Some(kind) => {
-            let source = value["sources"].as_array()?.iter().find(|s| s["kind"].as_str() == Some(kind))?;
-            let text = |key: &str| source[key].as_str().map(str::to_owned);
-            (source["diff"].as_str()?, text("headRef"), text("baseRef"), source["truncated"].as_bool() == Some(true))
-        }
-        None => (value["diff"].as_str()?, None, None, false),
+    let Some(kind) = source_kind else {
+        let files = diff_load::parse_patch(value["diff"].as_str()?, false);
+        return Some(ParsedDiff {
+            files,
+            deferred: Vec::new(),
+            totals: None,
+            head: None,
+            base: None,
+            truncated: false,
+        });
     };
-    let files = DiffFile::parse(patch).unwrap_or_else(|error| {
-        log::warn!("unparseable diff: {error}");
-        Vec::new()
-    });
-    Some(ParsedDiff { files, head, base, truncated })
+    let source = value["sources"].as_array()?.iter().find(|s| s["kind"].as_str() == Some(kind))?;
+    let text = |key: &str| source[key].as_str().map(str::to_owned);
+    let truncated = source["truncated"].as_bool() == Some(true);
+    let deferred = diff_load::deferred_files(source);
+    let files =
+        if deferred.is_empty() { diff_load::parse_patch(source["diff"].as_str()?, truncated) } else { Vec::new() };
+    let totals = diff_load::file_stats(source)
+        .map(|stats| stats.iter().fold((0, 0), |(a, d), file| (a + file.additions, d + file.deletions)));
+    // A lazily loaded source shows every file, so the size notice no longer applies.
+    let truncated = truncated && deferred.is_empty();
+    Some(ParsedDiff { files, deferred, totals, head: text("headRef"), base: text("baseRef"), truncated })
 }
 
 /// `HH:MM` from an ISO timestamp, as the turn menu labels completion.
@@ -2256,5 +2442,17 @@ mod tests {
         assert!(parsed.truncated);
         assert!(parse_diff(&value, Some("working-tree")).unwrap().files.is_empty());
         assert!(parse_diff(&value, Some("commit")).is_none());
+    }
+
+    #[test]
+    fn a_patch_cut_at_the_size_limit_keeps_its_files() {
+        // The server stops at its byte cap mid-hunk and appends its marker.
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,10 +1,10 @@\n-old\n+new\n context\n\n\n[truncated]";
+        let value = json!({"sources": [
+            {"kind": "branch-range", "diff": patch, "headRef": "main", "baseRef": "origin/main", "truncated": true},
+        ]});
+        let parsed = parse_diff(&value, Some("branch-range")).unwrap();
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!((parsed.files[0].additions(), parsed.files[0].deletions()), (1, 1));
     }
 }

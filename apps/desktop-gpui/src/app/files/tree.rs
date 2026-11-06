@@ -217,10 +217,7 @@ impl Workspace {
             };
             tree.in_flight += 1;
             let root = root.clone();
-            let mut input = json!({"cwd": root.cwd});
-            if !folder.is_empty() {
-                input["directoryPath"] = folder.clone().into();
-            }
+            let input = logic::list_entries_input(&root.cwd, &folder);
             cx.spawn(async move |this, cx| {
                 let result = client.request("projects.listEntries", input).await;
                 let _ = this.update(cx, |this, cx| {
@@ -495,7 +492,8 @@ impl Workspace {
                             cx.stop_propagation();
                         }
                     }))
-                    .child(Input::new(&query).appearance(false).text_xs().h(px(28.)).px(px(8.))),
+                    // `InputGroupInput size="sm"` in a `sm:text-sm` group.
+                    .child(Input::new(&query).appearance(false).text_sm().h(px(28.)).px(px(8.))),
             )
             .when(has_folders, |el| {
                 el.child(

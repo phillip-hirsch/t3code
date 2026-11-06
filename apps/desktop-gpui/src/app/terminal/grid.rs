@@ -9,10 +9,10 @@ use alacritty_terminal::term::{RenderableContent, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, ElementInputHandler, Entity, Font,
-    FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline, point, px,
-    relative, rgb, size,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine,
+    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline,
+    point, px, relative, rgb, size,
 };
 
 use super::session::TerminalSession;
@@ -295,9 +295,24 @@ impl Geometry {
     }
 }
 
+/// `TERMINAL_GLYPH_FALLBACKS`: installed Nerd Fonts draw prompt glyphs the chosen font lacks.
+const GLYPH_FALLBACKS: [&str; 9] = [
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "JetBrainsMono Nerd Font",
+    "JetBrainsMono NF",
+    "FiraCode Nerd Font",
+    "Hack Nerd Font",
+    "MesloLGS NF",
+    "CaskaydiaCove Nerd Font",
+    "PowerlineSymbols",
+];
+
 /// The Terminal font setting, which follows the code font unless set separately.
 fn terminal_font(fonts: &Fonts) -> (Font, Pixels) {
-    (font(fonts.terminal), px(fonts.terminal_size))
+    static FALLBACKS: std::sync::OnceLock<FontFallbacks> = std::sync::OnceLock::new();
+    let fallbacks = FALLBACKS.get_or_init(|| FontFallbacks::from_fonts(GLYPH_FALLBACKS.map(str::to_owned).to_vec()));
+    (Font { fallbacks: Some(fallbacks.clone()), ..font(fonts.terminal) }, px(fonts.terminal_size))
 }
 
 /// `measureGhosttyCell`: the advance of "M", and 1.35× the font size or the glyph height.

@@ -24,8 +24,9 @@ use crate::theme;
 
 /// `--workspace-topbar-height`: 52px beside macOS's traffic lights, else Electron's 40px titlebar overlay.
 pub(super) const TITLEBAR_HEIGHT: Pixels = px(if cfg!(target_os = "macos") { 52. } else { 40. });
-/// `#root` keeps this much free at the right so the resize edge stays grabbable (`index.css:1764`).
-pub(super) const RIGHT_RESIZE_INSET: Pixels = px(6.);
+/// `#root` keeps this much free at the right so the resize edge stays grabbable; only
+/// `.electron-windows` sets `--desktop-window-right-resize-inset` (`index.css`).
+pub(super) const RIGHT_RESIZE_INSET: Pixels = px(if cfg!(windows) { 6. } else { 0. });
 /// The three caption buttons, 46px each; macOS draws traffic lights at the left instead.
 const CAPTION_BUTTONS: f32 = if cfg!(target_os = "macos") { 0. } else { 138. };
 pub(super) const CAPTION_BUTTONS_WIDTH: Pixels = px(CAPTION_BUTTONS);
@@ -213,9 +214,13 @@ impl Workspace {
     }
 
     /// `WorkspaceTitlebarControls` + `PanelLayoutControls`: thread details, terminal, right panel.
+    /// With the panel open, maximize takes the details toggle's place and the details toggle
+    /// moves to the chat header's right edge (`ThreadPanelHeaderControl`).
     fn render_panel_toggles(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
         let details = self.details_shown(window);
+        let panel_width = self.right_panel_width(window);
+        let maximized = self.right_panel_maximized();
         let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool| {
             let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
             control(id)
@@ -223,7 +228,34 @@ impl Workspace {
                 .when(enabled, |el| el.cursor_pointer().hover(|style| style.bg(tokens.accent)))
                 .child(icon(path).with_size(px(16.)).text_color(color))
         };
-        div()
+        let details_toggle = toggle("toggle-thread-details", "icons/square-menu.svg", details, true)
+            .tooltip(tooltip(self.with_shortcut("Toggle thread details", "threadPanel.toggle")))
+            // Acts on press, like a popover trigger: the popover's outside-press
+            // dismissal runs first, so a press that already closed it must not reopen it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    if this.details_shown(window) == details {
+                        this.toggle_details(window, cx);
+                    }
+                }),
+            );
+        let (header_details, bar_details) = match panel_width {
+            Some(_) if maximized => (None, None),
+            Some(_) => (Some(details_toggle), None),
+            None => (None, Some(details_toggle)),
+        };
+        let maximize = panel_width.map(|_| {
+            let label = if maximized { "Restore panel size" } else { "Maximize panel" };
+            let path = if maximized { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" };
+            toggle("toggle-right-panel-maximized", path, maximized, true).tooltip(tooltip(label)).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.toggle_right_panel_maximized(cx);
+                }),
+            )
+        });
+        let bar = div()
             .absolute()
             .top_0()
             .right(CONTROLS_RIGHT)
@@ -231,20 +263,8 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1()
-            .child(
-                toggle("toggle-thread-details", "icons/square-menu.svg", details, true)
-                    .tooltip(tooltip(self.with_shortcut("Toggle thread details", "threadPanel.toggle")))
-                    // Acts on press, like a popover trigger: the popover's outside-press
-                    // dismissal runs first, so a press that already closed it must not reopen it.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            if this.details_shown(window) == details {
-                                this.toggle_details(window, cx);
-                            }
-                        }),
-                    ),
-            )
+            .children(maximize)
+            .children(bar_details)
             .child({
                 let available = self.terminal_available();
                 toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available)
@@ -267,7 +287,19 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
                         window.dispatch_action(Box::new(ToggleRightPanel), cx);
                     }),
-            )
+            );
+        // `right-[calc(env(safe-area-inset-right)+0.75rem)]` of the chat header, left of the panel.
+        let header = header_details.zip(panel_width).map(|(toggle, width)| {
+            div()
+                .absolute()
+                .top_0()
+                .right(px(width) + RIGHT_RESIZE_INSET + px(12.))
+                .h(TITLEBAR_HEIGHT)
+                .flex()
+                .items_center()
+                .child(toggle)
+        });
+        div().children(header).child(bar)
     }
 }
 
