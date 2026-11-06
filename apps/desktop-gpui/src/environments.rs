@@ -711,7 +711,11 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<LocalServer>)> {
     let overridden = std::env::var_os("T3_SERVER_URL").is_some() && std::env::var_os("T3_SERVER_TOKEN").is_some();
     if !overridden {
-        let catalog = Catalog::load();
+        // File IO and decrypting every token would block one of the runtime's two workers.
+        let catalog = tokio::task::spawn_blocking(Catalog::load).await.map_err(|error| {
+            log::error!("reading saved environments failed: {error}");
+            anyhow::anyhow!("Saved environments could not be read: {error}")
+        })?;
         if !catalog.local_environment_enabled {
             let endpoint = catalog
                 .environments
