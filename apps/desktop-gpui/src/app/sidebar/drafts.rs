@@ -65,20 +65,26 @@ pub(super) fn order_drafts(order: &mut Vec<String>, live: &[String]) {
     }
 }
 
-/// One draft row: its project, and the preview of a draft that is off screen.
+/// One draft row: its project and its preview.
 pub(super) struct DraftRow {
     pub(super) project_id: String,
-    pub(super) preview: Option<SharedString>,
+    pub(super) preview: SharedString,
+    /// The draft on screen.
+    pub(super) active: bool,
 }
 
 impl Workspace {
-    /// The draft rows in sidebar order: the open draft, and the other drafts with content.
+    /// The draft rows in sidebar order: the other drafts with content, and the open draft
+    /// only when it had content as it was opened, with that preview. A draft that gets
+    /// content while open stays out of the list until it is left.
     pub(super) fn draft_rows(&mut self) -> Vec<DraftRow> {
         let route = match &self.target {
-            Some(Target::Draft { project_id, .. }) => Some(project_id.clone()),
+            Some(Target::Draft { project_id, .. }) => {
+                self.sidebar.open_draft_preview.clone().map(|p| (project_id.clone(), p))
+            }
             _ => None,
         };
-        let mut previews: Vec<(String, SharedString)> = self
+        let mut rows: Vec<(String, SharedString)> = self
             .composer_drafts
             .iter()
             .filter(|(_, draft)| has_content(draft))
@@ -90,16 +96,27 @@ impl Workspace {
                 Target::Thread { .. } => None,
             })
             .collect();
-        let live: Vec<String> = route.iter().cloned().chain(previews.iter().map(|(id, _)| id.clone())).collect();
+        let active = route.as_ref().map(|(id, _)| id.clone());
+        rows.extend(route);
+        let live: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
         order_drafts(&mut self.sidebar.draft_order, &live);
         self.sidebar
             .draft_order
             .iter()
-            .map(|project_id| {
-                let preview = previews.iter().position(|(id, _)| id == project_id).map(|at| previews.remove(at).1);
-                DraftRow { project_id: project_id.clone(), preview }
+            .filter_map(|project_id| {
+                let at = rows.iter().position(|(id, _)| id == project_id)?;
+                let preview = rows.swap_remove(at).1;
+                Some(DraftRow { project_id: project_id.clone(), preview, active: active.as_ref() == Some(project_id) })
             })
             .collect()
+    }
+
+    /// Freezes the open draft's row as it is now; call when a draft becomes the target.
+    pub(in crate::app) fn freeze_open_draft(&mut self, cx: &Context<Self>) {
+        let prompt = self.composer.read(cx).value();
+        let attachments = self.attachments.len();
+        self.sidebar.open_draft_preview =
+            (!prompt.trim().is_empty() || attachments > 0).then(|| preview(&prompt, attachments).into());
     }
 
     /// `useThreadHasUnsentDraft`, for a thread that is not on screen.
@@ -116,6 +133,7 @@ impl Workspace {
             let prompt = self.composer.read(cx).value().to_string();
             let attachments = std::mem::take(&mut self.attachments);
             self.set_composer_text("", window, cx);
+            self.sidebar.open_draft_preview = None;
             (prompt, attachments)
         } else {
             match self.composer_drafts.remove(&target) {
@@ -151,6 +169,9 @@ impl Workspace {
         if self.target.as_ref() == Some(&target) {
             self.attachments = attachments;
             self.set_composer_text(prompt, window, cx);
+            if matches!(target, Target::Draft { .. }) {
+                self.freeze_open_draft(cx);
+            }
         } else {
             match self.composer_drafts.get_mut(&target) {
                 Some(ComposerDraft::Question(question)) => question.prompt = prompt,
@@ -213,7 +234,7 @@ impl Workspace {
         }
     }
 
-    /// A draft row (`SidebarDraftRow`): the open draft reads "New thread", another one its preview.
+    /// A draft row (`SidebarDraftRow`).
     pub(super) fn render_draft(
         &self,
         row: &DraftRow,
@@ -222,7 +243,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let sb = tokens.sidebar;
-        let active = row.preview.is_none();
+        let active = row.active;
         let project_id = row.project_id.clone();
         let target = self.draft_target(&project_id);
         let discard = div()
@@ -283,7 +304,7 @@ impl Workspace {
                                     .truncate()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(sb.foreground.opacity(0.9))
-                                    .child(row.preview.clone().unwrap_or_else(|| "New thread".into())),
+                                    .child(row.preview.clone()),
                             ),
                     )
                     .context_menu(self.draft_menu(project, &row.project_id, cx)),

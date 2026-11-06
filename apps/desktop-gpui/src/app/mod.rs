@@ -810,13 +810,18 @@ impl Workspace {
     fn start_draft_in(&mut self, env: SharedString, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
         self.stash_composer(cx);
-        let leaving = self.target.replace(Target::Draft { env, project_id });
+        let target = Target::Draft { env, project_id };
+        let opened = self.target.as_ref() != Some(&target);
+        let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
         self.model_override = None;
         self.runtime_mode_override = None;
         self.restore_composer(window, cx);
+        if opened {
+            self.freeze_open_draft(cx);
+        }
         self.reset_timeline(cx);
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);

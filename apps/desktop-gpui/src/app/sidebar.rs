@@ -81,6 +81,9 @@ pub(super) struct SidebarState {
     selection: selection::Selection,
     /// Draft rows by project, newest first.
     draft_order: Vec<String>,
+    /// The open draft's row as it was when opened; `None` when it had no content then
+    /// (`SidebarDraftBlock`'s `frozenActive`).
+    open_draft_preview: Option<SharedString>,
     provider_pill: provider_update::PillState,
     /// Each local checkout's current branch, read when a hover card opens, by workspace root.
     checkout_branches: HashMap<String, String>,
@@ -149,6 +152,7 @@ impl SidebarState {
             thread_order: Vec::new(),
             selection: Default::default(),
             draft_order: Vec::new(),
+            open_draft_preview: None,
             provider_pill: Default::default(),
             checkout_branches: HashMap::new(),
             filter: None,
