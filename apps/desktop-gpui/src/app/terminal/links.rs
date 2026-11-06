@@ -115,7 +115,7 @@ fn match_path(chars: &[char], at: usize) -> Option<usize> {
     }
     let mut segments = 0;
     while chars.get(at + len).copied().is_some_and(is_sep) {
-        let next = take_while(chars, at + len + 1, is_word);
+        let next = path_segment(chars, at + len + 1);
         if next == 0 {
             break;
         }
@@ -123,6 +123,34 @@ fn match_path(chars: &[char], at: usize) -> Option<usize> {
         segments += 1;
     }
     (segments > 0).then(|| len + position_suffix(chars, at + len))
+}
+
+/// One segment after a separator in `FILE_PATH_PATTERN`: word chars and `$+@` (`posts.$id`,
+/// `.pnpm/react@18`), `[id]` or `[[...]]` groups, and `(group)` only before another separator,
+/// so `src/foo.ts(3,10)` stays a compiler location. A `]` needs its `[`.
+fn path_segment(chars: &[char], at: usize) -> usize {
+    let mut i = at;
+    loop {
+        let group = match chars.get(i) {
+            Some(&c) if is_word(c) || matches!(c, '$' | '+' | '@') => Some(1),
+            Some('[') => {
+                let open = take_while(chars, i, |c| c == '[').min(2);
+                let word = take_while(chars, i + open, is_word);
+                let close = take_while(chars, i + open + word, |c| c == ']').min(2);
+                (word > 0 && close > 0).then_some(open + word + close)
+            }
+            Some('(') => {
+                let word = take_while(chars, i + 1, is_word);
+                let closes = word > 0 && chars.get(i + 1 + word) == Some(&')');
+                (closes && chars.get(i + 2 + word).copied().is_some_and(is_sep)).then_some(word + 2)
+            }
+            _ => None,
+        };
+        match group {
+            Some(len) => i += len,
+            None => return i - at,
+        }
+    }
 }
 
 /// `QUOTED_FILE_PATH_PATTERN` at an opening quote: (path, position, whole match) lengths.
@@ -389,6 +417,15 @@ mod tests {
         for p in ["src/żółć.ts:12:7", "żółć/main.ts:12", "src/cafe\u{301}.ts:12", "src/𐐀.ts:12"] {
             assert_eq!(links(&format!("see {p} for details")), [path(p, 4)], "{p}");
         }
+        for p in [
+            "src/app/[id]/page.tsx:3:10",
+            "src/routes/(app)/+page.svelte:12:4",
+            "node_modules/.pnpm/react@18.3.1/node_modules/react/index.js:12:5",
+            "app/routes/posts.$id.tsx:5",
+        ] {
+            assert_eq!(links(&format!("see {p} for details")), [path(p, 4)], "{p}");
+        }
+        assert_eq!(links("see src/foo.ts(3,10) here"), [path("src/foo.ts", 4)]);
         for (line, p) in [
             ("./main.go:10:5: undefined: x", "./main.go:10:5"),
             ("C:\\dev\\app\\src\\main.c:10:5: error: expected ';'", "C:\\dev\\app\\src\\main.c:10:5"),
