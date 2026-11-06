@@ -537,6 +537,7 @@ impl Workspace {
         panel.pending = Some(action);
         panel.armed = None;
         let key = panel.reference.key();
+        let reference = panel.reference.clone();
         let term = logic::terminology(panel.provider()).0;
         let mut input = panel.reference.to_json();
         input["action"] = json!(action);
@@ -576,7 +577,7 @@ impl Workspace {
                             this.refresh_pr_from_host_of(&key, cx);
                             this.read_pull_requests(false, cx);
                         } else {
-                            this.apply_pr_action_reply(&key, &reply, cx);
+                            this.apply_pr_action_reply(&key, &reference, &reply, cx);
                         }
                     }
                 }
@@ -589,25 +590,27 @@ impl Workspace {
 
     /// Shows an action's reply in the panel and the list instead of reading them again; without
     /// one, as from an older server, both are read.
-    fn apply_pr_action_reply(&mut self, key: &str, reply: &Value, cx: &mut Context<Self>) {
+    fn apply_pr_action_reply(&mut self, key: &str, reference: &Reference, reply: &Value, cx: &mut Context<Self>) {
         let Some(reply) = pull_request_reply::Reply::read(reply) else {
             self.read_pr_detail_of(key, cx);
             self.read_pull_requests(false, cx);
             return;
         };
-        let Some(panel) = self.pr_panel(key) else { return };
-        let reference = panel.reference.clone();
-        let (patched, reread) = match panel.detail.as_deref() {
-            Some(detail) => pull_request_reply::patch_detail(detail, &reply),
-            None => (None, true),
-        };
-        if let Some(patched) = patched {
-            panel.detail = Some(Rc::new(patched));
-            panel.rebuild_timeline();
+        self.patch_pull_request_list(reference, &reply, cx);
+        if let Some(panel) = self.pr_panel(key) {
+            let (patched, reread) = match panel.detail.as_deref() {
+                Some(detail) => pull_request_reply::patch_detail(detail, &reply),
+                None => (None, true),
+            };
+            if let Some(patched) = patched {
+                panel.detail = Some(Rc::new(patched));
+                panel.rebuild_timeline();
+            }
+            // A read still in flight may predate the action and would land its old state over the patch.
+            let reread = reread || panel.detail_loading;
+            self.read_pr_reads_of(key, reread, cx);
+            self.read_pr_extras_of(key, cx);
         }
-        self.read_pr_reads_of(key, reread, cx);
-        self.read_pr_extras_of(key, cx);
-        self.patch_pull_request_list(&reference, &reply, cx);
         cx.notify();
     }
 
