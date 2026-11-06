@@ -168,6 +168,13 @@ impl Workspace {
             && self.server_info().capability("sideChats")
     }
 
+    /// `/side` and `/btw` in the slash menu: `None` unless the open thread can host side chats
+    /// (`sideChat.available`), else why one can't start yet.
+    pub(super) fn side_chat_menu_state(&self) -> Option<Option<&'static str>> {
+        (self.side_chats_offered() && self.side_chat_origin() == Some(Origin::Thread))
+            .then(|| self.side_chat_disabled_reason())
+    }
+
     pub(super) fn side_chat_disabled_reason(&self) -> Option<&'static str> {
         let origin = self.side_chat_origin()?;
         let capability = self.client().map(|_| self.server_info().capability("sideChats"));
