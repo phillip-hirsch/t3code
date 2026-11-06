@@ -1523,7 +1523,7 @@ impl Workspace {
                     ),
             })
             .children(self.render_undo_notice(cx))
-            .children(self.render_update_button(tokens, cx))
+            .child(self.render_update_button(tokens, cx))
             .children(status.map(|(label, color)| {
                 text_xs(h_flex())
                     .ml_auto()
@@ -1534,10 +1534,11 @@ impl Workspace {
             }))
     }
 
-    /// The footer's update control without a desktop updater: the web's "update
-    /// everything" for providers, shown only while one can be updated in one click
-    /// (`SidebarUpdatePill.tsx`, `isProviderUpdateCandidate`).
-    fn render_update_button(&self, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The footer's update control (`SidebarUpdatePill.tsx`): "update everything" while a
+    /// provider can be updated in one click (`isProviderUpdateCandidate`), else the desktop
+    /// app's "Check for updates", which this build always shows as unavailable since it has
+    /// no update feed (`getDesktopUpdateIdleTooltip`).
+    fn render_update_button(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let candidates: Vec<(String, String)> = self
             .server_info()
             .providers
@@ -1545,19 +1546,11 @@ impl Workspace {
             .filter(|p| inbox::is_provider_update_candidate(p))
             .map(|p| (p.driver.clone(), p.instance_id.clone()))
             .collect();
-        if candidates.is_empty() {
-            return None;
-        }
         let sb = tokens.sidebar;
-        let label: SharedString = match candidates.len() {
-            1 => "Update 1 provider".into(),
-            n => format!("Update {n} providers").into(),
-        };
-        let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
-        let tip = label.clone();
-        Some(
-            div()
-                .id("sidebar-update")
+        if candidates.is_empty() {
+            let detail: SharedString = self.about_update_description().into();
+            return div()
+                .id("sidebar-check-updates")
                 .ml_auto()
                 .size(px(32.))
                 .flex_none()
@@ -1565,16 +1558,45 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .cursor_pointer()
-                .bg(surface)
-                .hover(|s| s.bg(sb.row_hover))
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.update_providers(label.clone(), candidates.clone(), window, cx);
-                }))
-                .child(icon(IconName::CircleArrowUp, 16., sb.foreground))
-                .into_any_element(),
-        )
+                .cursor_not_allowed()
+                .opacity(0.6)
+                .tooltip(move |window, cx| {
+                    let detail = detail.clone();
+                    Tooltip::element(move |_, cx| {
+                        let t = crate::theme::tokens(cx);
+                        v_flex()
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Updates unavailable"))
+                            .child(div().text_color(t.muted_foreground).child(detail.clone()))
+                    })
+                    .build(window, cx)
+                })
+                .child(icon(IconName::RefreshCw, 16., sb.icon))
+                .into_any_element();
+        }
+        let label: SharedString = match candidates.len() {
+            1 => "Update 1 provider".into(),
+            n => format!("Update {n} providers").into(),
+        };
+        let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
+        let tip = label.clone();
+        div()
+            .id("sidebar-update")
+            .ml_auto()
+            .size(px(32.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .bg(surface)
+            .hover(|s| s.bg(sb.row_hover))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.update_providers(label.clone(), candidates.clone(), window, cx);
+            }))
+            .child(icon(IconName::CircleArrowUp, 16., sb.foreground))
+            .into_any_element()
     }
 
     /// Confirms (`UpdateEverythingDialog`), then `server.updateProvider` for each candidate.
