@@ -23,10 +23,11 @@ impl Global for MainWindow {}
 /// decorations like Electron's frameless `titleBarOverlay` window, on Wayland and X11, with or
 /// without a compositor.
 pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
-    // The window reuses the app's backend; the first window, or one after it failed or
-    // stopped, starts it.
-    if cx.try_global::<PrimaryBackend>().is_none_or(PrimaryBackend::ended) {
-        cx.set_global(PrimaryBackend::start(crate::runtime().handle()));
+    // The window reuses the app's backend: the first window starts it, a later one restarts
+    // it at once when it is down.
+    match cx.try_global::<PrimaryBackend>() {
+        Some(backend) => backend.restart(),
+        None => cx.set_global(PrimaryBackend::start(crate::runtime().handle())),
     }
     let (x, y) = super::TRAFFIC_LIGHTS;
     let options = WindowOptions {

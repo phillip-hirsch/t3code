@@ -517,8 +517,10 @@ impl Workspace {
         Some(composer_banner(variant, Icon::new(IconName::WifiOff), SharedString::from(title), reason, actions, t))
     }
 
-    /// Starts the connection over after the server stopped.
+    /// Starts the connection over, and the backend too when it is down, without waiting out
+    /// its restart backoff.
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.global::<crate::environments::PrimaryBackend>().restart();
         self.connection = Connection::Starting;
         self._connection_task = Self::connect(window, cx);
         cx.notify();

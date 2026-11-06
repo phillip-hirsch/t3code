@@ -5,18 +5,43 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// How long a launch waits for a running app that has not answered yet (starting or busy).
+const OWNER_WAIT: Duration = Duration::from_secs(3);
+const OWNER_POLL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Instance {
     /// This process is the app; other launches' arguments arrive on the sender given to [`claim`].
-    /// `socket` is the Unix socket it listens on, for [`remove_socket`] at quit.
-    Primary { socket: Option<PathBuf> },
+    /// `channel` is what it listens on, for [`Channel::close`] at quit.
+    Primary { channel: Option<Channel> },
     /// The running app took the arguments.
     Forwarded,
+}
+
+/// The channel the app owns. On Unix the socket is a file, so a lock held for the app's life
+/// tells a running app's socket from one a crash left behind.
+#[derive(Debug)]
+pub struct Channel {
+    #[cfg(unix)]
+    socket: PathBuf,
+    #[cfg(unix)]
+    _lock: std::fs::File,
+}
+
+impl Channel {
+    /// Removes the socket, so a clean quit leaves nothing in the temp folder. The next launch
+    /// takes over once this is dropped.
+    pub fn close(&self) {
+        #[cfg(unix)]
+        if let Err(error) = std::fs::remove_file(&self.socket) {
+            log::warn!("could not remove the single-instance socket {}: {error}", self.socket.display());
+        }
+    }
 }
 
 /// Forwards `args` to a running app for `home`, or starts listening as the app, sending later
@@ -28,24 +53,24 @@ pub fn claim(
     runtime: &tokio::runtime::Handle,
 ) -> Instance {
     let address = address(home);
-    if forward(&address, args).is_ok() {
-        return Instance::Forwarded;
-    }
-    match listen(&address, launches, runtime) {
-        Ok(()) => Instance::Primary { socket: cfg!(unix).then(|| PathBuf::from(&address)) },
-        // Another launch started listening between our attempts.
-        Err(_) if forward(&address, args).is_ok() => Instance::Forwarded,
-        Err(error) => {
-            log::warn!("could not take the single-instance channel {address}: {error}");
-            Instance::Primary { socket: None }
+    let deadline = Instant::now() + OWNER_WAIT;
+    loop {
+        if forward(&address, args).is_ok() {
+            return Instance::Forwarded;
         }
-    }
-}
-
-/// Removes the socket this app listened on, so a clean quit leaves nothing in the temp folder.
-pub fn remove_socket(socket: &Path) {
-    if let Err(error) = std::fs::remove_file(socket) {
-        log::warn!("could not remove the single-instance socket {}: {error}", socket.display());
+        match listen(&address, launches.clone(), runtime) {
+            Ok(Some(channel)) => return Instance::Primary { channel: Some(channel) },
+            // A running app owns the channel but did not answer: it is starting, busy or quitting.
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(OWNER_POLL),
+            Ok(None) => {
+                log::warn!("the app running for this T3 home did not answer on {address}");
+                return Instance::Primary { channel: None };
+            }
+            Err(error) => {
+                log::warn!("could not take the single-instance channel {address}: {error}");
+                return Instance::Primary { channel: None };
+            }
+        }
     }
 }
 
@@ -89,15 +114,21 @@ fn forward(address: &str, args: &[String]) -> std::io::Result<()> {
     pipe.write_all(&message(args))
 }
 
+/// Listens as the app; `None` when a running app owns the channel.
 #[cfg(windows)]
 fn listen(
     address: &str,
     sender: async_channel::Sender<Vec<String>>,
     runtime: &tokio::runtime::Handle,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<Channel>> {
     use tokio::net::windows::named_pipe::ServerOptions;
     let _guard = runtime.enter();
-    let mut server = ServerOptions::new().first_pipe_instance(true).create(address)?;
+    // The pipe lasts while its owner runs, so a first instance is refused only then.
+    let mut server = match ServerOptions::new().first_pipe_instance(true).create(address) {
+        Ok(server) => server,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let address = address.to_owned();
     runtime.spawn(async move {
         loop {
@@ -118,7 +149,7 @@ fn listen(
             }
         }
     });
-    Ok(())
+    Ok(Some(Channel {}))
 }
 
 #[cfg(unix)]
@@ -126,18 +157,31 @@ fn forward(address: &str, args: &[String]) -> std::io::Result<()> {
     std::os::unix::net::UnixStream::connect(address)?.write_all(&message(args))
 }
 
+/// Listens as the app; `None` when a running app owns the channel.
 #[cfg(unix)]
 fn listen(
     address: &str,
     sender: async_channel::Sender<Vec<String>>,
     runtime: &tokio::runtime::Handle,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+) -> std::io::Result<Option<Channel>> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let _guard = runtime.enter();
     if let Some(dir) = Path::new(address).parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // Nothing answered on it, so the socket is left over from a crash.
+    // Kept on disk: removing it could let two launches lock different files.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(format!("{address}.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
+    // No app holds the lock, so a socket here is left over from a crash.
     let _ = std::fs::remove_file(address);
     let listener = tokio::net::UnixListener::bind(address)?;
     std::fs::set_permissions(address, std::fs::Permissions::from_mode(0o600))?;
@@ -146,7 +190,7 @@ fn listen(
             tokio::spawn(read_one(stream, sender.clone()));
         }
     });
-    Ok(())
+    Ok(Some(Channel { socket: PathBuf::from(address), _lock: lock }))
 }
 
 async fn read_one(stream: impl tokio::io::AsyncRead + Unpin, sender: async_channel::Sender<Vec<String>>) {
@@ -191,17 +235,39 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let home = std::env::temp_dir().join(format!("t3-activation-test-{}", std::process::id()));
         let (sender, receiver) = async_channel::unbounded();
-        let Instance::Primary { socket } = claim(&home, &["first".into()], sender, runtime.handle()) else {
+        let Instance::Primary { channel: Some(channel) } = claim(&home, &["first".into()], sender, runtime.handle())
+        else {
             panic!("the first launch is the app");
         };
         let args = vec!["second".to_owned(), "t3code://new?prompt=x".to_owned()];
         let (unused, _) = async_channel::unbounded();
-        assert_eq!(claim(&home, &args, unused, runtime.handle()), Instance::Forwarded);
+        assert!(matches!(claim(&home, &args, unused, runtime.handle()), Instance::Forwarded));
         assert_eq!(runtime.block_on(receiver.recv()).unwrap(), args);
-        if let Some(socket) = socket {
-            remove_socket(&socket);
-            assert!(!socket.exists(), "a clean quit removes the socket");
-        }
+        #[cfg(unix)]
+        let socket = channel.socket.clone();
+        channel.close();
+        #[cfg(unix)]
+        assert!(!socket.exists(), "a clean quit removes the socket");
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A crash leaves the socket file but releases the lock, so the next launch takes over.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_apps_socket_is_replaced() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let home = std::env::temp_dir().join(format!("t3-activation-crash-test-{}", std::process::id()));
+        let address = address(&home);
+        drop(std::os::unix::net::UnixListener::bind(&address).unwrap());
+        assert!(Path::new(&address).exists(), "the dead app's socket is left");
+        let (sender, receiver) = async_channel::unbounded();
+        let Instance::Primary { channel: Some(channel) } = claim(&home, &[], sender, runtime.handle()) else {
+            panic!("the launch after a crash is the app");
+        };
+        let (unused, _) = async_channel::unbounded();
+        assert!(matches!(claim(&home, &["again".into()], unused, runtime.handle()), Instance::Forwarded));
+        assert_eq!(runtime.block_on(receiver.recv()).unwrap(), ["again"]);
+        channel.close();
+        let _ = std::fs::remove_file(format!("{address}.lock"));
     }
 }

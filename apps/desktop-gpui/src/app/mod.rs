@@ -2,20 +2,23 @@
 //! timeline, pending approvals, and the composer.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
 
+use futures::future::{self, Either};
 use gpui_kit::component::input::{InputEvent, TextareaMode, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div,
+    AppContext as _, AsyncWindowContext, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div,
 };
 use serde_json::{Value, json};
 
 use crate::backend;
+use crate::environments::{BackendStatus, PrimaryBackend};
 use crate::model::{ModelSelection, ProjectShell, ShellState, ThreadState};
 use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
@@ -131,8 +134,6 @@ struct OpenThread {
 pub struct Workspace {
     /// The primary environment's socket; see [`sessions`] for every environment's.
     connection: Connection,
-    /// Watches this app's own server for why it stops; `None` while the primary is elsewhere.
-    local_server: Option<Task<()>>,
     /// One per connected environment, the primary first.
     sessions: Vec<sessions::EnvironmentSession>,
     /// Every environment's projects and threads.
@@ -329,7 +330,6 @@ impl Workspace {
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
         let mut workspace = Self {
             connection: Connection::Starting,
-            local_server: None,
             sessions: vec![sessions::EnvironmentSession::default()],
             shell: ShellState::default(),
             target: None,
@@ -430,124 +430,135 @@ impl Workspace {
         workspace
     }
 
-    /// Waits for the app's backend ([`crate::environments::PrimaryBackend`]), then keeps one
-    /// socket open, reconnecting after drops.
+    /// Follows the app's backend ([`PrimaryBackend`]): while it is ready, keeps one socket open
+    /// to it, reconnecting after drops. A restarted server gets a new socket.
     fn connect(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
-        let backend = cx.global::<crate::environments::PrimaryBackend>().clone();
+        let mut backend = cx.global::<PrimaryBackend>().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let endpoint = match backend.ready().await {
-                Ok(endpoint) => endpoint,
-                Err(error) => {
-                    log::error!("could not reach the server: {error}");
-                    let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(error.into()), cx));
-                    return;
-                }
-            };
-            if endpoint.renewable() {
-                let _ = this.update(cx, |this, cx| this.watch_server(backend, cx));
-            }
-            let mut endpoint = endpoint;
-            // Set by a renewal, so a session the server rejects again waits a beat before the next one.
-            let mut renewed = false;
             loop {
-                if this.update(cx, |this, cx| this.set_connection(Connection::Connecting, cx)).is_err() {
+                let status = backend.status();
+                let shown = this.update(cx, |this, cx| match &status {
+                    BackendStatus::Starting => {
+                        this.connection = Connection::Starting;
+                        this.set_connection(Connection::Starting, cx);
+                    }
+                    // A new start replaces why the last one failed.
+                    BackendStatus::Ready(_) if matches!(this.connection, Connection::Failed(_)) => {
+                        this.connection = Connection::Starting;
+                    }
+                    BackendStatus::Ready(_) => {}
+                    BackendStatus::Restarting(reason) => {
+                        this.set_connection(Connection::Disconnected(reason.clone().into()), cx);
+                    }
+                    BackendStatus::Failed(reason) => {
+                        this.set_connection(Connection::Failed(reason.clone().into()), cx);
+                    }
+                });
+                if shown.is_err() {
                     return;
                 }
-                // The environment's id keys its threads, so it is read before the socket opens.
-                let known = this.update(cx, |this, _| this.primary_environment().is_some()).unwrap_or(true);
-                if !known {
-                    let http_base = endpoint.http_base.clone();
-                    let descriptor =
-                        runtime().spawn(async move { crate::environments::fetch_descriptor(&http_base).await }).await;
-                    let failure: Option<SharedString> = match descriptor {
-                        Ok(Ok(descriptor)) => {
-                            let id = SharedString::from(descriptor.environment_id);
-                            if this.update(cx, |this, cx| this.set_primary_environment(id, cx)).is_err() {
-                                return;
-                            }
-                            None
-                        }
-                        Ok(Err(failure)) => Some(failure.detail.into()),
-                        Err(error) => Some(error.to_string().into()),
-                    };
-                    if let Some(failure) = failure {
-                        let disconnected = Connection::Disconnected(failure);
-                        if this.update(cx, |this, cx| this.set_connection(disconnected, cx)).is_err() {
-                            return;
-                        }
-                        cx.background_executor().timer(RECONNECT_DELAY).await;
-                        continue;
-                    }
+                let BackendStatus::Ready(endpoint) = status else {
+                    backend.changed().await;
+                    continue;
+                };
+                let session = pin!(Self::primary_session(&this, endpoint, cx));
+                // A session ends only for good (a rejected token); then wait for the backend.
+                if let Either::Left(((), changed)) = future::select(session, pin!(backend.changed())).await {
+                    changed.await;
                 }
-                let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
-                match RpcClient::connect(runtime().handle(), options).await {
-                    Err(error) if rpc::is_unauthorized(&error) && !endpoint.renewable() => {
-                        let message = "The server rejected T3_SERVER_TOKEN. Set a valid token and restart.";
-                        let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(message.into()), cx));
-                        return;
-                    }
-                    Err(error) if rpc::is_unauthorized(&error) && !renewed => {
-                        // The session expired or was revoked: exchange this window's bootstrap token again.
-                        log::info!("session rejected; renewing it");
-                        let message: SharedString = match runtime().spawn(endpoint.clone().renew()).await {
-                            Ok(Ok(fresh)) => {
-                                endpoint = fresh;
-                                renewed = true;
-                                continue;
-                            }
-                            Ok(Err(error)) => format!("{error:#}").into(),
-                            Err(error) => error.to_string().into(),
-                        };
-                        if this
-                            .update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(client) => {
-                        renewed = false;
-                        log::info!("connected");
-                        let current = endpoint.clone();
-                        let remote = !current.renewable();
-                        if this
-                            .update_in(cx, |this, window, cx| {
-                                this.environment_remote = remote;
-                                this.on_connected(client.clone(), current, window, cx);
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                        let reason = client.closed().await;
-                        if this
-                            .update(cx, |this, cx| this.set_connection(Connection::Disconnected(reason.into()), cx))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        renewed = false;
-                        let message: SharedString = format!("{error:#}").into();
-                        if this
-                            .update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                cx.background_executor().timer(RECONNECT_DELAY).await;
             }
         })
     }
 
-    fn watch_server(&mut self, backend: crate::environments::PrimaryBackend, cx: &mut Context<Self>) {
-        self.local_server = Some(cx.spawn(async move |this, cx| {
-            let reason = backend.stopped().await;
-            let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(reason.into()), cx));
-        }));
+    /// Keeps one socket open to `endpoint`, reconnecting after drops.
+    async fn primary_session(this: &WeakEntity<Self>, mut endpoint: backend::Endpoint, cx: &mut AsyncWindowContext) {
+        // Set by a renewal, so a session the server rejects again waits a beat before the next one.
+        let mut renewed = false;
+        loop {
+            if this.update(cx, |this, cx| this.set_connection(Connection::Connecting, cx)).is_err() {
+                return;
+            }
+            // The environment's id keys its threads, so it is read before the socket opens.
+            let known = this.update(cx, |this, _| this.primary_environment().is_some()).unwrap_or(true);
+            if !known {
+                let http_base = endpoint.http_base.clone();
+                let descriptor =
+                    runtime().spawn(async move { crate::environments::fetch_descriptor(&http_base).await }).await;
+                let failure: Option<SharedString> = match descriptor {
+                    Ok(Ok(descriptor)) => {
+                        let id = SharedString::from(descriptor.environment_id);
+                        if this.update(cx, |this, cx| this.set_primary_environment(id, cx)).is_err() {
+                            return;
+                        }
+                        None
+                    }
+                    Ok(Err(failure)) => Some(failure.detail.into()),
+                    Err(error) => Some(error.to_string().into()),
+                };
+                if let Some(failure) = failure {
+                    let disconnected = Connection::Disconnected(failure);
+                    if this.update(cx, |this, cx| this.set_connection(disconnected, cx)).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RECONNECT_DELAY).await;
+                    continue;
+                }
+            }
+            let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
+            match RpcClient::connect(runtime().handle(), options).await {
+                Err(error) if rpc::is_unauthorized(&error) && !endpoint.renewable() => {
+                    let message = "The server rejected T3_SERVER_TOKEN. Set a valid token and restart.";
+                    let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(message.into()), cx));
+                    return;
+                }
+                Err(error) if rpc::is_unauthorized(&error) && !renewed => {
+                    // The session expired or was revoked: exchange this window's bootstrap token again.
+                    log::info!("session rejected; renewing it");
+                    let message: SharedString = match runtime().spawn(endpoint.clone().renew()).await {
+                        Ok(Ok(fresh)) => {
+                            endpoint = fresh;
+                            renewed = true;
+                            continue;
+                        }
+                        Ok(Err(error)) => format!("{error:#}").into(),
+                        Err(error) => error.to_string().into(),
+                    };
+                    if this.update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx)).is_err() {
+                        return;
+                    }
+                }
+                Ok(client) => {
+                    renewed = false;
+                    log::info!("connected");
+                    let current = endpoint.clone();
+                    let remote = !current.renewable();
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.environment_remote = remote;
+                            this.on_connected(client.clone(), current, window, cx);
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let reason = client.closed().await;
+                    if this
+                        .update(cx, |this, cx| this.set_connection(Connection::Disconnected(reason.into()), cx))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    renewed = false;
+                    let message: SharedString = format!("{error:#}").into();
+                    if this.update(cx, |this, cx| this.set_connection(Connection::Disconnected(message), cx)).is_err() {
+                        return;
+                    }
+                }
+            }
+            cx.background_executor().timer(RECONNECT_DELAY).await;
+        }
     }
 
     fn set_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {

@@ -87,6 +87,10 @@ xcap = "0.9"
 [build-dependencies]
 serde_json = "1"
 
+[dev-dependencies]
+# Paused time for the backend supervisor's restart backoff tests.
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 # GPUI's Windows platform (gpui-kit already builds it, at this exact version): turns off
 # DirectComposition, which would draw over the WebView2 child window. Patched; see vendor/README.md.

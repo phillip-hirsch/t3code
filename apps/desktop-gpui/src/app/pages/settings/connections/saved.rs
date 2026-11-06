@@ -387,7 +387,8 @@ fn confirm_remove(entity: WeakEntity<SavedEnvironments>, id: String, label: Stri
     });
 }
 
-/// `setLocalEnvironmentEnabled`: saves the choice and relaunches, as the desktop app does.
+/// `setLocalEnvironmentEnabled`: saves the choice and relaunches, as the desktop app does. The
+/// new app starts once this one has exited, so it does not hand itself to this one.
 fn confirm_local_environment(saved: WeakEntity<SavedEnvironments>, enabled: bool, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |dialog, _, _| {
         let saved = saved.clone();
@@ -403,19 +404,13 @@ fn confirm_local_environment(saved: WeakEntity<SavedEnvironments>, enabled: bool
             .when(enabled, |dialog| dialog.ok_variant(gpui_kit::component::button::ButtonVariant::Danger))
             .on_ok(move |_, window, cx| {
                 let saved = saved.update(cx, |saved, _| saved.set_local_environment_enabled(!enabled)).unwrap_or_else(gone);
-                match saved.and_then(|()| relaunch()) {
-                    Ok(()) => cx.quit(),
+                match saved {
+                    Ok(()) => cx.restart(),
                     Err(error) => error_toast(window, cx, "Couldn't change this setting.", error),
                 }
                 true
             })
     });
-}
-
-/// Starts this app again with the same arguments; the caller quits.
-fn relaunch() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn().map(drop).map_err(|e| e.to_string())
 }
 
 /// `AddEnvironmentDialog` without routes, SSH or T3 Connect: a "Remote link" host and code.

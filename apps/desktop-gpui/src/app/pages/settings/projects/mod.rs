@@ -493,7 +493,7 @@ impl Workspace {
     fn can_pick_external_favicon(&self, members: &[Member]) -> bool {
         let local = |member: &Member| {
             let id = &member.project.id;
-            (self.local_server.is_some() && self.project_environment(id).as_ref() == self.primary_environment())
+            (!self.environment_remote && self.project_environment(id).as_ref() == self.primary_environment())
                 || self.project_endpoint(id).is_some_and(|endpoint| {
                     let host = endpoint.http_base.split("://").nth(1).unwrap_or_default();
                     ["127.0.0.1", "localhost", "[::1]"].iter().any(|local| host.starts_with(local))
