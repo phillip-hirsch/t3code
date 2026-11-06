@@ -73,11 +73,11 @@ fn main() {
     gpui_windows::disable_direct_composition();
     // A second launch hands its command line to the running app and exits.
     let (links, launches) = async_channel::unbounded();
-    let socket = match settings::t3_home() {
+    let channel = match settings::t3_home() {
         Some(home) => {
             match desktop::activation::claim(&home, &desktop::launch_args(), links.clone(), runtime().handle()) {
                 desktop::activation::Instance::Forwarded => return,
-                desktop::activation::Instance::Primary { socket } => socket,
+                desktop::activation::Instance::Primary { channel } => channel,
             }
         }
         None => None,
@@ -110,9 +110,9 @@ fn main() {
         desktop::quit_on_signals(cx);
         cx.bind_keys(app::terminal_key_bindings());
         app::menu::init(cx);
-        if let Some(socket) = socket {
+        if let Some(channel) = channel {
             cx.on_app_quit(move |_| {
-                desktop::activation::remove_socket(&socket);
+                channel.close();
                 async {}
             })
             .detach();
