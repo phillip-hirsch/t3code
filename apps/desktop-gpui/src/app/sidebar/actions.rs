@@ -749,15 +749,12 @@ impl SnoozeItems {
             let item = if self.inline_when {
                 PopupMenuItem::new(format!("{label} ({when})"))
             } else {
+                // `MenuItemDetail`: the wake time reads as text at the row's size.
                 PopupMenuItem::element(move |_, _| {
-                    h_flex().w_full().gap(px(8.)).child(label.clone()).child(
-                        div()
-                            .ml_auto()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .text_color(muted)
-                            .child(when.clone()),
-                    )
+                    h_flex()
+                        .w_full()
+                        .child(label.clone())
+                        .child(div().ml_auto().flex_none().pl(px(16.)).text_color(muted).child(when.clone()))
                 })
             };
             let (view, this, id) = (view.clone(), self.clone(), preset.id.clone());
