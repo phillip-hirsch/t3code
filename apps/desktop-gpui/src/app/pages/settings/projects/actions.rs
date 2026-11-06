@@ -194,7 +194,7 @@ impl Workspace {
     }
 
     /// Adds a `t3.json` script as is; a failed save reopens it in the editor with the error.
-    fn import_project_script(
+    pub(in crate::app) fn import_project_script(
         &mut self,
         project_id: &str,
         input: &ScriptInput,

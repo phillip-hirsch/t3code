@@ -25,7 +25,7 @@ pub(super) const SCRIPT_ICONS: [(&str, &str); 6] = [
 ];
 
 /// `ScriptIcon`.
-pub(super) fn script_icon(icon: &str) -> Lucide {
+pub(in crate::app) fn script_icon(icon: &str) -> Lucide {
     match icon {
         "test" => Lucide::FlaskConical,
         "lint" => Lucide::ListChecks,
@@ -38,7 +38,7 @@ pub(super) fn script_icon(icon: &str) -> Lucide {
 
 /// The editor's form (`NewProjectScriptInput`).
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct ScriptInput {
+pub(in crate::app) struct ScriptInput {
     pub name: String,
     pub command: String,
     pub icon: String,
@@ -481,7 +481,7 @@ pub(super) fn scripts_with(
 }
 
 /// Scripts `t3.json` declares that the project does not have yet, by command or name.
-pub(super) fn importable_scripts<'a>(
+pub(in crate::app) fn importable_scripts<'a>(
     file: &'a T3ProjectFile,
     scripts: &[ProjectScript],
 ) -> Vec<&'a T3ProjectFileScript> {
@@ -670,7 +670,7 @@ impl Workspace {
     }
 
     /// The checkout's `t3.json`, read once per root (`useT3ProjectFileState`).
-    pub(super) fn t3_project_file(&mut self, workspace_root: &str, cx: &mut Context<Self>) -> &T3ProjectFile {
+    pub(in crate::app) fn t3_project_file(&mut self, workspace_root: &str, cx: &mut Context<Self>) -> &T3ProjectFile {
         static LOADING: T3ProjectFile = T3ProjectFile::Loading;
         if !self.t3_project_files.contains_key(workspace_root) {
             // Without a client nothing is cached, so the read starts once one connects.

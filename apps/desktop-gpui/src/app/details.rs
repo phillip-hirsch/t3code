@@ -6,7 +6,7 @@
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
@@ -331,7 +331,7 @@ impl Workspace {
     ) -> Option<Section> {
         let rows: Vec<AnyElement> = [
             (density == Density::Full && self.details_item_shown("environment"))
-                .then(|| self.environment_row(tokens, colors))
+                .then(|| self.environment_row(tokens, colors, cx))
                 .flatten(),
             (density != Density::Essential && self.details_item_shown("openIn"))
                 .then(|| self.open_in_row(tokens, colors, cx))
@@ -349,7 +349,7 @@ impl Workspace {
     }
 
     /// The environment row: machine icon, environment label, workspace kind at the far right.
-    fn environment_row(&self, tokens: &Tokens, colors: &CardColors) -> Option<AnyElement> {
+    fn environment_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let label = self.server_info().environment_label.clone()?;
         let machine = match self.server_info().machine_kind() {
             "desktop" | "mac-studio" | "mac-mini" => "icons/monitor.svg",
@@ -359,6 +359,40 @@ impl Workspace {
         };
         let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
         let workspace_root = self.target_project().map(|project| project.workspace_root.clone());
+        // A git draft picks its workspace here (`RunContextSelector` as a select); a thread's is locked.
+        if matches!(self.target, Some(Target::Draft { .. })) && self.is_git_repo() {
+            let (workspace_icon, workspace_label) = self.env_mode_choice();
+            let build = self.env_mode_menu(cx);
+            let path = self.composer_cwd().filter(|_| workspace_label != "New worktree");
+            let tip: SharedString = path.unwrap_or_else(|| workspace_label.to_owned()).into();
+            return Some(
+                select_row("details-run-context", tokens, colors, cx)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(10.))
+                            .child(icon(machine).with_size(px(18.)).mx(px(-1.)).text_color(tokens.muted_foreground))
+                            .child(div().flex_1().min_w_0().truncate().text_left().child(label))
+                            .child(
+                                div()
+                                    .id("details-workspace")
+                                    .flex_none()
+                                    .child(
+                                        gpui_kit::component::Icon::new(workspace_icon)
+                                            .with_size(px(16.))
+                                            .text_color(tokens.muted_foreground),
+                                    )
+                                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+                            ),
+                    )
+                    .child(select_chevron(tokens))
+                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, window, cx| {
+                        build(menu.min_w(px(264.)), window, cx)
+                    })
+                    .into_any_element(),
+            );
+        }
         let (workspace_icon, workspace_path) = match worktree {
             Some(path) => ("icons/folder-git.svg", Some(path)),
             None => ("icons/folder.svg", workspace_root),
@@ -489,13 +523,29 @@ impl Workspace {
     /// `ProjectScriptsControl` in panel mode: run the first script, pick or add one from the menu,
     /// or "Add project script" while the project has none.
     fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use super::pages::settings::code::projects::scripts::{
+            ScriptInput, importable_scripts, resolve_project_scripts, script_icon,
+        };
         let project = self.target_project()?;
         let project_id = project.id.clone();
-        let scripts: Vec<(SharedString, ScriptRun)> =
-            super::pages::settings::code::projects::scripts::resolve_project_scripts(
-                &self.server_info().settings,
-                project,
-            )
+        let saved = resolve_project_scripts(&self.server_info().settings, project);
+        // `useT3ProjectFileScripts` on the thread's checkout; read on first sight.
+        let importable: Vec<ScriptInput> = match self.git_cwd() {
+            Some(root) => match self.t3_project_files.get(&root) {
+                Some(file) => importable_scripts(file, &saved).into_iter().map(ScriptInput::from_file_script).collect(),
+                None => {
+                    let view = cx.entity();
+                    cx.defer(move |cx| {
+                        view.update(cx, |this, cx| {
+                            this.t3_project_file(&root, cx);
+                        });
+                    });
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let scripts: Vec<(SharedString, ScriptRun)> = saved
             .into_iter()
             .map(|script| {
                 let stop_on_settle = script.stop_on_settle == Some(true);
@@ -503,6 +553,56 @@ impl Workspace {
             })
             .collect();
         let Some((name, run)) = scripts.first().cloned() else {
+            if !importable.is_empty() {
+                // `ProjectScriptsControl` with only `t3.json` actions: "Actions" opens the import menu.
+                let view = cx.entity();
+                let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+                    menu = menu.label("From t3.json");
+                    for input in &importable {
+                        let (pid, input) = (project_id.clone(), input.clone());
+                        let name = SharedString::from(input.name.clone());
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                h_flex().w_full().gap_2().child(name.clone()).child(
+                                    icon("icons/download.svg")
+                                        .with_size(px(14.))
+                                        .ml_auto()
+                                        .text_color(theme::tokens(cx).muted_foreground),
+                                )
+                            })
+                            .icon(gpui_kit::component::Icon::new(script_icon(&input.icon)))
+                            .on_click(window.listener_for(
+                                &view,
+                                move |this, _, window, cx| {
+                                    this.import_project_script(&pid, &input, window, cx);
+                                },
+                            )),
+                        );
+                    }
+                    let pid = project_id.clone();
+                    menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
+                        window.listener_for(&view, move |this, _, window, cx| {
+                            this.open_project_script_editor(&pid, None, window, cx);
+                        }),
+                    ))
+                };
+                return Some(
+                    select_row("details-project-actions", tokens, colors, cx)
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(10.))
+                                .child(icon("icons/wrench.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                                .child(div().flex_1().min_w_0().truncate().text_left().child("Actions")),
+                        )
+                        .child(select_chevron(tokens))
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                            build(menu.min_w(px(264.)), window, cx)
+                        })
+                        .into_any_element(),
+                );
+            }
             return Some(
                 action_row("details-add-script", colors, cx)
                     .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
@@ -575,18 +675,25 @@ impl Workspace {
         self.vcs.cwd.as_ref()?;
         let status = self.vcs.status.as_ref();
         let is_repo = status.is_none_or(|status| status.local.is_repo);
-        let branch = status
-            .and_then(|status| status.local.ref_name.clone())
-            .or_else(|| self.open_projection().and_then(|p| p.thread.branch.clone()));
+        // `BranchToolbarBranchSelector` as a select: a draft's base ("From main (remote)") or the branch.
+        let (branch, _, label) = self.branch_trigger();
         let mut rows: Vec<AnyElement> = Vec::new();
-        if is_repo
-            && self.details_item_shown("branch")
-            && let Some(branch) = branch
-        {
+        if is_repo && self.details_item_shown("branch") && branch.is_some() {
+            let trigger = select_row("details-branch", tokens, colors, cx)
+                .disabled(!self.branch_picker_ready())
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(10.))
+                        .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                        .child(div().flex_1().min_w_0().truncate().text_left().child(label)),
+                )
+                .child(select_chevron(tokens));
             rows.push(
-                row(colors)
-                    .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                    .child(div().flex_1().min_w_0().truncate().child(branch))
+                div()
+                    .w_full()
+                    .child(self.branch_popover("details-branch-popover", trigger, true, tokens, cx))
                     .into_any_element(),
             );
         }
@@ -878,8 +985,8 @@ impl Workspace {
         let scheme = git::DiffColorScheme::from_settings(&self.client_settings.values);
         let addition = if insertions > 0 { git::addition_color(tokens, scheme) } else { tokens.muted_foreground };
         let deletion = if deletions > 0 { git::deletion_color(tokens, scheme) } else { tokens.muted_foreground };
-        let base_label =
-            base.map(|base| SharedString::from(format!("vs {}", base.strip_prefix("origin/").unwrap_or(base))));
+        // `changesBaseLabel`: working-tree totals have no base.
+        let base_label: SharedString = base.map_or_else(|| "Uncommitted".into(), |base| format!("vs {base}").into());
         action_row("details-changes", colors, cx)
             .child(icon("icons/file-diff.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
             .child(
@@ -889,14 +996,17 @@ impl Workspace {
                     .items_baseline()
                     .gap(px(6.))
                     .child(div().flex_none().child("Changes"))
-                    .children(base_label.map(|label| {
+                    .child({
+                        let tip = base_label.clone();
                         div()
+                            .id("details-changes-base")
                             .min_w_0()
                             .truncate()
                             .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(colors.muted)
-                            .child(label)
-                    }))
+                            .child(base_label)
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    })
                     .child(
                         h_flex()
                             .ml_auto()
@@ -1214,6 +1324,38 @@ fn split_primary(
 fn split_hairline(group: &'static str, colors: &CardColors) -> impl IntoElement {
     let line = colors.divider;
     div().w(px(1.)).h(px(16.)).flex_none().group_hover(group, move |style| style.bg(line))
+}
+
+/// `ThreadDetailsControl part="select"`: one trigger holding the row's label and its chevron.
+fn select_row(id: &'static str, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Workspace>) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(tokens.background.opacity(0.))
+                .foreground(colors.label)
+                .hover(colors.hover)
+                .active(colors.hover),
+        )
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .pl(px(10.))
+        .pr_0()
+        .gap_0()
+        .rounded(px(8.))
+        .text_size(px(13.))
+        .font_weight(gpui_kit::FontWeight::MEDIUM)
+}
+
+/// The select's 32px chevron box (`[data-slot=select-icon]`).
+fn select_chevron(tokens: &Tokens) -> gpui_kit::Div {
+    div()
+        .w(px(32.))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon("icons/chevron-down.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
 }
 
 /// The 32px chevron half that opens the row's menu.
