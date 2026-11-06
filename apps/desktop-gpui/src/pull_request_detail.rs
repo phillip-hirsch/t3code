@@ -915,71 +915,50 @@ fn resolve_media_url(url: &str, origin: &str) -> Option<String> {
 }
 
 /// `remarkChangeRequestMediaUrls` on the source: image destinations and link reference
-/// definitions resolve against `origin`, outside code fences and code spans.
+/// definitions resolve against `origin`; code is left alone, since the parser never reads images in it.
 pub fn resolve_media_urls(markdown: &str, origin: &str) -> String {
+    let Ok(root) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else { return markdown.to_owned() };
+    let mut edits = Vec::new();
+    media_edits(&root, markdown, origin, &mut edits);
     let mut out = String::with_capacity(markdown.len());
-    let mut fenced = false;
-    for line in markdown.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-        }
-        if fenced || trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            out.push_str(line);
-            continue;
-        }
-        if let Some(resolved) = resolve_definition(line, origin) {
-            out.push_str(&resolved);
-            continue;
-        }
-        for (index, segment) in line.split('`').enumerate() {
-            if index > 0 {
-                out.push('`');
-            }
-            if index % 2 == 1 {
-                out.push_str(segment);
-            } else {
-                resolve_images(segment, origin, &mut out);
-            }
-        }
+    let mut at = 0;
+    for (range, resolved) in edits {
+        out.push_str(&markdown[at..range.start]);
+        out.push_str(&resolved);
+        at = range.end;
     }
+    out.push_str(&markdown[at..]);
     out
 }
 
-/// `[label]: /path`, indented at most three spaces.
-fn resolve_definition(line: &str, origin: &str) -> Option<String> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    let rest = line[indent..].strip_prefix('[').filter(|_| indent <= 3)?;
-    let close = rest.find("]:")?;
-    let after = &rest[close + 2..];
-    let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
-    let destination = &after[gap..];
-    let angled = destination.starts_with('<');
-    let url = destination[usize::from(angled)..].split(|c: char| c.is_whitespace() || c == '>').next()?;
-    let resolved = resolve_media_url(url, origin)?;
-    let at = indent + 1 + close + 2 + gap + usize::from(angled);
-    Some(format!("{}{resolved}{}", &line[..at], &line[at + url.len()..]))
-}
-
-/// Rewrites the root-relative destinations of `![alt](dest)` images in `text` into `out`.
-fn resolve_images(text: &str, origin: &str, out: &mut String) {
-    let mut rest = text;
-    while let Some(start) = rest.find("![") {
-        let Some(close) = rest[start + 2..].find("](") else { break };
-        let at = start + 2 + close + 2;
-        let after = &rest[at..];
-        let gap = after.len() - after.trim_start().len();
-        let angled = after[gap..].starts_with('<');
-        let skip = at + gap + usize::from(angled);
-        let url = rest[skip..].split(|c: char| c.is_whitespace() || c == ')' || c == '>').next().unwrap_or_default();
-        out.push_str(&rest[..skip]);
-        match resolve_media_url(url, origin) {
-            Some(resolved) => out.push_str(&resolved),
-            None => out.push_str(url),
+/// The destinations under `node` that resolve, in document order, as source ranges.
+fn media_edits(
+    node: &markdown::mdast::Node,
+    source: &str,
+    origin: &str,
+    edits: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    use markdown::mdast::Node;
+    let target = match node {
+        Node::Image(image) => Some((&image.url, "](")),
+        Node::Definition(definition) => Some((&definition.url, "]:")),
+        _ => None,
+    };
+    if let (Some((url, marker)), Some(position)) = (target, node.position()) {
+        let span = position.start.offset..position.end.offset;
+        let text = &source[span.clone()];
+        // The destination as written: after the label's close, where the parsed URL appears verbatim.
+        let found = text.find(marker).and_then(|close| {
+            let from = close + marker.len();
+            text[from..].find(url.as_str()).map(|at| span.start + from + at)
+        });
+        if let (Some(at), Some(resolved)) = (found, resolve_media_url(url, origin)) {
+            edits.push((at..at + url.len(), resolved));
         }
-        rest = &rest[skip + url.len()..];
     }
-    out.push_str(rest);
+    for child in node.children().map(Vec::as_slice).unwrap_or_default() {
+        media_edits(child, source, origin, edits);
+    }
 }
 
 /// One conversation: a loose comment, or a review thread and its replies.
@@ -2271,15 +2250,21 @@ mod tests {
         ] {
             assert_eq!(resolve_media_urls(&format!("![shot]({url})"), origin), format!("![shot]({expected})"), "{url}");
         }
-        let body = "Before ![a](</api/attachments/x> \"t\") and `![b](/api/y)`\n[ref]: /api/attachments/z\r\n```\n![c](/api/w)\n```\n";
+        let body = "Before ![a](</api/attachments/x> \"t\") and `![b](/api/y)`\n\n[ref]: /api/attachments/z\r\n```\n![c](/api/w)\n```\n";
         assert_eq!(
             resolve_media_urls(body, origin),
-            "Before ![a](<https://git.cafe/api/attachments/x> \"t\") and `![b](/api/y)`\n[ref]: https://git.cafe/api/attachments/z\r\n```\n![c](/api/w)\n```\n",
+            "Before ![a](<https://git.cafe/api/attachments/x> \"t\") and `![b](/api/y)`\n\n[ref]: https://git.cafe/api/attachments/z\r\n```\n![c](/api/w)\n```\n",
             "definitions and angled images resolve; code is left alone"
         );
         assert_eq!(
             resolve_media_urls("[link](/docs) ![](/a.png)", origin),
             "[link](/docs) ![](https://git.cafe/a.png)"
+        );
+        let spans = "``![a](/x.png) ` ``, ```![b](/y)```, ![c](/z.png)";
+        assert_eq!(
+            resolve_media_urls(spans, origin),
+            "``![a](/x.png) ` ``, ```![b](/y)```, ![c](https://git.cafe/z.png)",
+            "multi-backtick code spans keep their text"
         );
     }
 }
