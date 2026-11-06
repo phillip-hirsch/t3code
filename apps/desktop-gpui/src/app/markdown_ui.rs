@@ -18,6 +18,7 @@ use gpui_kit::component::notification::Notification;
 use serde_json::json;
 
 use super::Workspace;
+use crate::file_links;
 use crate::theme::Tokens;
 
 /// The skill a `t3-skill:` link names; [`skill_links`] writes them.
@@ -426,6 +427,131 @@ impl MarkdownPlugin for SkillChips {
                 let position = event.position();
                 let _ = workspace.update(cx, |w, cx| w.open_skill_menu(&name, position, window, cx));
             })
+    }
+}
+
+/// What a file chip opens: the path as written (with any position) and the path its icon reads.
+struct FileChip {
+    path: String,
+    line: Option<u32>,
+    icon_path: String,
+}
+
+/// `MarkdownFileLink`: inline code that names a file, and a link whose text is its own path,
+/// draw as a chip with the file's icon. A click previews it in the panel (an editor with the
+/// platform modifier, or outside the workspace); a right click opens the file menu.
+pub(super) struct FileChips {
+    pub workspace: WeakEntity<Workspace>,
+    pub dark: bool,
+}
+
+impl MarkdownPlugin for FileChips {
+    fn name(&self) -> &'static str {
+        "t3-file"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        use gpui_kit::component::text::markdown_ast::Node;
+        let (path, file) = match node {
+            Node::InlineCode(code) => {
+                let candidate = file_links::inline_code_candidate(&code.value)?;
+                let file = file_links::split_position(&candidate, "");
+                (candidate, file)
+            }
+            Node::Link(link) if !link.url.starts_with(SKILL_SCHEME) && !link.url.starts_with("t3-thread:") => {
+                let file = file_links::parse_file_link(&link.url)?;
+                let text: String = link
+                    .children
+                    .iter()
+                    .map(|child| match child {
+                        Node::Text(text) => text.value.as_str(),
+                        Node::InlineCode(code) => code.value.as_str(),
+                        _ => "",
+                    })
+                    .collect();
+                if !file_links::is_file_link_label(&text, &link.url) {
+                    return None;
+                }
+                (file_links::with_position(&file), file)
+            }
+            _ => return None,
+        };
+        let paths = file_links::document_paths(cx.source());
+        let label = file_links::chip_label(&file, &file_links::parent_suffixes(paths.iter().map(String::as_str)));
+        let markdown = cx.node_source(node).unwrap_or_default().to_owned();
+        let chip = FileChip { path, line: file.line, icon_path: file.path };
+        Some(MarkdownNode::new("t3-file", chip).text(label).markdown(markdown))
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let Some(chip) = node.data::<FileChip>() else { return div().into_any_element() };
+        let (asset, icon_color) = crate::file_icons::file_icon(&chip.icon_path, self.dark);
+        // `documentChipKindForFileName`: documents take their kind's ink, everything else `mention`.
+        let ink = match asset.rsplit('/').next().unwrap_or_default() {
+            "t3-file-icon-pdf.svg" => rgb(0xd55755),
+            "t3-file-icon-word.svg" => rgb(0x368bd3),
+            "t3-file-icon-spreadsheet.svg" => rgb(0x449c56),
+            "t3-file-icon-slides.svg" => rgb(0xc26e27),
+            "t3-file-icon-epub.svg" => rgb(0x8871de),
+            _ => rgb(0x0096af),
+        };
+        let (path, line) = (chip.path.clone(), chip.line);
+        let (open, menu) = (self.workspace.clone(), self.workspace.clone());
+        let menu_path = path.clone();
+        let tooltip: SharedString = path.clone().into();
+        h_flex()
+            .id(SharedString::from(format!("file-chip:{path}")))
+            .max_w_full()
+            .gap(px(3.))
+            .rounded(px(4.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ink)
+            .cursor_pointer()
+            .child(Icon::empty().path(asset).size(px(14.)).flex_none().text_color(icon_color))
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(move |event, window, cx| {
+                let editor = event.modifiers().secondary(cx);
+                let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
+            })
+            .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                let position = event.position;
+                let _ = menu.update(cx, |w, cx| {
+                    let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
+                    if let Some(target) = target {
+                        w.open_file_menu(target, position, window, cx);
+                    }
+                });
+            })
+            .into_any_element()
+    }
+}
+
+impl Workspace {
+    /// `handleOpenInFilePreview`: a file in the workspace opens in the thread's panel; the
+    /// platform modifier, or a file outside it, opens the preferred editor.
+    fn open_file_chip(
+        &mut self,
+        path: &str,
+        line: Option<u32>,
+        editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.git_cwd();
+        let Some(target) = file_links::resolve_target(path, cwd.as_deref()) else { return };
+        let relative = workspace_relative(without_position(&target), cwd.as_deref());
+        match relative {
+            Some(relative) if !editor && matches!(self.target, Some(super::Target::Thread { .. })) => {
+                self.open_file(&relative, line, window, cx);
+            }
+            _ => self.open_file_link(&target, window, cx),
+        }
     }
 }
 

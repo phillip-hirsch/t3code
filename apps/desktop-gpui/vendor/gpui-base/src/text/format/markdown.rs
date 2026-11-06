@@ -1041,11 +1041,20 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             }
         }
         Node::List(list) => {
-            let children = list
+            let mut children: Vec<BlockNode> = list
                 .children
                 .into_iter()
                 .map(|c| ast_to_node(source, c, cx))
                 .collect();
+            // Items of a loose list (blank lines between them) are spread too,
+            // as HTML renders every item of such a list as paragraphs.
+            if list.spread {
+                for child in &mut children {
+                    if let BlockNode::ListItem { spread, .. } = child {
+                        *spread = true;
+                    }
+                }
+            }
             BlockNode::List {
                 ordered: list.ordered,
                 start: list.start,

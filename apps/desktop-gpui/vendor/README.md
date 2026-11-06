@@ -69,3 +69,23 @@ the stack deferred at `TOAST_PRIORITY` (50): above dialogs, below popups (100) a
 Files:
 
 - `src/toast.rs`: `TOAST_PRIORITY` and the deferred stack in `ToastStack::render`.
+
+**Inline code wraps at its spaces.** The chat's inline code wraps like browser text
+(`white-space: normal`): a span breaks at its spaces and hyphens and keeps the paragraph's width.
+0.9.0 hands a span that fits the line to the line wrapper as one element, so the whole span moves
+to the next line. The patch hands its spaces and hyphens over as text, so they are break
+opportunities, and its words as measured elements, with the code insets on the span's ends.
+Files:
+
+- `src/text/inline_flow.rs`: `push_text_wrap_fragments`.
+
+**List spacing like HTML lists.** The chat's markdown CSS gives lists, and the paragraphs of a
+loose list's items, a paragraph gap. 0.9.0 spaces every item by the tight-list gap only, puts no
+gap around a nested list, and draws a marker for a paragraph that follows a nested list inside the
+same item. The patch marks every item of a loose list (`list.spread`) as spread; a loose list's
+items add the paragraph gap to the item gap, a nested list keeps the paragraph gap from what comes
+before it, and a paragraph after a nested list continues the item, indented and without a marker.
+Files:
+
+- `src/text/format/markdown.rs`: loose lists in `ast_to_node`.
+- `src/text/node.rs`: `render_list_item` and the list loop that calls it.

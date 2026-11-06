@@ -30,6 +30,9 @@ pub enum Row {
         revert: Option<Checkpoint>,
         /// "Sent by T3 Code" above the bubble; not the user's own words, so it never groups.
         sent_by_t3code: bool,
+        /// Another agent sent it (`attribution === "agent"`): it folds to one line, and names the
+        /// thread it came from when it has one.
+        from_agent: Option<FromAgent>,
     },
     Assistant {
         id: SharedString,
@@ -577,7 +580,7 @@ impl Row {
     }
 
     fn is_own_user_message(&self) -> bool {
-        matches!(self, Row::User { sent_by_t3code: false, .. })
+        matches!(self, Row::User { sent_by_t3code: false, from_agent: None, .. })
     }
 }
 
@@ -625,6 +628,12 @@ fn compacting_label(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// The thread an agent-sent message came from (`senderThreadId`), if it names one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FromAgent {
+    pub sender_thread: Option<SharedString>,
+}
+
 enum Kind {
     /// `revertible`: a turn start or queued turn, which "Edit from here" can rewind.
     User {
@@ -634,6 +643,7 @@ enum Kind {
         /// A bare `/compact` turn, which its compaction row stands in for.
         compaction: Option<Option<&'static str>>,
         sent_by_t3code: bool,
+        from_agent: Option<FromAgent>,
         /// `/clear` or an automation started a new provider session with this message.
         fresh_context: bool,
     },
@@ -791,6 +801,8 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 steer,
                 revertible,
                 sent_by_t3code: crate::queue::sent_by_t3code(item),
+                from_agent: crate::queue::sent_by_agent(item)
+                    .then(|| FromAgent { sender_thread: item.str("senderThreadId").map(SharedString::from) }),
                 compaction: compaction_command(item),
                 fresh_context: item.bool("freshContext"),
             }
@@ -1544,6 +1556,35 @@ fn shown_entries(
     }
 }
 
+/// `settleSupersededReasoning`: a reasoning item still in progress with anything after it has
+/// been superseded, so it reads as finished; only the last entry can still be thinking.
+fn settle_superseded_reasoning(entries: Vec<Rc<TimelineEntry>>) -> Vec<Rc<TimelineEntry>> {
+    let last = entries.len().saturating_sub(1);
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| match entry.work() {
+            Some(work) if index < last && work.is_reasoning() && work.status == Some(Status::InProgress) => {
+                let settled = Entry { status: Some(Status::Completed), ..(**work).clone() };
+                Rc::new(TimelineEntry {
+                    id: entry.id.clone(),
+                    run_id: entry.run_id.clone(),
+                    created_at: entry.created_at.clone(),
+                    end: entry.end.clone(),
+                    failure: entry.failure.clone(),
+                    status: entry.status.clone(),
+                    source_thread_id: entry.source_thread_id.clone(),
+                    inherited: entry.inherited,
+                    node_id: entry.node_id.clone(),
+                    completed_at: entry.completed_at.clone(),
+                    kind: Kind::Work(Rc::new(settled)),
+                })
+            }
+            _ => entry,
+        })
+        .collect()
+}
+
 /// The chat rows for a thread. `expanded` holds the keys of open groups,
 /// folds and entries ([`group_key`], [`fold_key`], [`entry_key`]).
 pub fn rows(
@@ -1573,7 +1614,7 @@ pub fn rows(
     let preview = (zen && is_working).then(|| live_answer_preview(&all)).flatten();
     let answering = is_working && !turn_ended;
     let answering_run = unsettled.as_ref().filter(|_| answering);
-    let entries = shown_entries(all, visibility, answering, answering_run, is_pending);
+    let entries = settle_superseded_reasoning(shown_entries(all, visibility, answering, answering_run, is_pending));
     let terminal = terminal_assistant_messages(&entries);
 
     let mut failed_runs: HashSet<SharedString> = HashSet::new();
@@ -1907,7 +1948,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, sent_by_t3code, fresh_context, .. } => {
+            Kind::User { text, steer, sent_by_t3code, from_agent, fresh_context, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -1927,6 +1968,7 @@ pub fn rows(
                     created_at: entry.created_at.clone(),
                     revert: reverts.get(&entry.id).cloned(),
                     sent_by_t3code: *sent_by_t3code,
+                    from_agent: from_agent.clone(),
                 });
             }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
@@ -1975,9 +2017,18 @@ pub fn rows(
         let previous = index.checked_sub(1).and_then(|i| flags.get(i)).copied().unwrap_or_default();
         match row {
             Row::Work(work) => work.continues = next.0,
-            Row::User { steer, grouped_with_previous, grouped_with_next, continues_steer, sent_by_t3code, .. } => {
-                *grouped_with_previous = !*sent_by_t3code && previous.1;
-                *grouped_with_next = !*sent_by_t3code && next.1;
+            Row::User {
+                steer,
+                grouped_with_previous,
+                grouped_with_next,
+                continues_steer,
+                sent_by_t3code,
+                from_agent,
+                ..
+            } => {
+                let own = !*sent_by_t3code && from_agent.is_none();
+                *grouped_with_previous = own && previous.1;
+                *grouped_with_next = own && next.1;
                 *continues_steer = previous.2 && steer.is_some();
             }
             _ => {}
@@ -2110,6 +2161,7 @@ mod tests {
             created_at: SharedString::default(),
             revert: None,
             sent_by_t3code: false,
+            from_agent: None,
         }
     }
 
@@ -2388,6 +2440,25 @@ mod tests {
         assert_eq!(
             describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "thinking"]
+        );
+    }
+
+    #[test]
+    fn reasoning_superseded_by_later_work_is_settled() {
+        let mut items = turn("r1")[..2].to_vec();
+        items.push(item(
+            "r1-t",
+            "reasoning",
+            "r1",
+            "2026-11-04T10:00:02.000Z",
+            json!({"text": "hmm", "status": "running"}),
+        ));
+        items.push(command("r1-c1", "r1", "2026-11-04T10:00:03.000Z"));
+        let p = projection(items, json!([{"id": "r1", "status": "running"}]));
+        // A thought still marked in progress under a finished command no longer holds the live row.
+        assert_eq!(
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
+            ["user go", "working", "assistant looking", "live Running ls"]
         );
     }
 
@@ -2740,6 +2811,20 @@ mod tests {
         let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
         assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
         assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
+
+        // Another agent's message (a subagent's task) folds and names the thread that sent it.
+        let task = json!({"text": "e", "inputIntent": "turn_start", "createdBy": "agent", "senderThreadId": "parent"});
+        let items = vec![
+            item("u5", "user_message", "r3", "2026-11-04T10:00:00.000Z", task),
+            item("u6", "user_message", "r3", "2026-11-04T10:00:01.000Z", json!({"text": "f"})),
+        ];
+        let p = projection(items, json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
+        let Row::User { from_agent: Some(from), grouped_with_next: false, .. } = &rows[0] else {
+            panic!("an agent's message folds: {:?}", describe(&rows))
+        };
+        assert_eq!(from.sender_thread.as_deref(), Some("parent"));
+        assert!(matches!(rows[1], Row::User { from_agent: None, grouped_with_previous: false, .. }));
     }
 
     #[test]

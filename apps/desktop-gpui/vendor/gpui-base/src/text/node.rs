@@ -3781,6 +3781,7 @@ impl BlockNode {
     fn render_list_item(
         item: &BlockNode,
         ix: usize,
+        loose: bool,
         options: NodeRenderOptions,
         node_cx: &NodeContext,
         window: &mut Window,
@@ -3795,11 +3796,17 @@ impl BlockNode {
             } => {
                 let body = body_font_size(node_cx, window);
                 let indent = body * 1.4;
+                // The paragraph gap a nested list keeps from its neighbours, and
+                // the paragraphs of a loose list's items keep apart.
+                let gap = node_cx.style.paragraph_gap().to_pixels(window.rem_size());
                 div()
                     .w_full()
                     .min_w_0()
-                    // Items breathe a little apart, less than paragraphs do.
-                    .when(ix > 0, |this| this.pt(body * 0.25))
+                    // Items breathe a little apart, less than paragraphs do; a
+                    // loose list's items also keep their paragraphs' gap.
+                    .when(ix > 0, |this| {
+                        this.pt(body * 0.25 + if loose { gap } else { Pixels::ZERO })
+                    })
                     .when(*spread, |this| this.child(div()))
                     .children({
                         let mut items: Vec<Div> = Vec::with_capacity(children.len());
@@ -3835,12 +3842,27 @@ impl BlockNode {
                                                     div()
                                                         .w_full()
                                                         .pl(indent)
+                                                        .when(*spread, |this| this.pt(gap))
                                                         .overflow_hidden()
                                                         .child(text),
                                                 ),
                                             );
                                             continue;
                                         }
+                                    }
+                                    // A paragraph after a nested list continues the
+                                    // item too: no marker of its own.
+                                    if child_ix > 0 {
+                                        items.push(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .pl(indent)
+                                                .pt(gap)
+                                                .overflow_hidden()
+                                                .child(text),
+                                        );
+                                        continue;
                                     }
 
                                     items.push(Self::render_list_item_row(
@@ -3854,7 +3876,7 @@ impl BlockNode {
                                     ));
                                 }
                                 BlockNode::List { .. } => {
-                                    items.push(div().ml(indent).child(child.render_block(
+                                    items.push(div().ml(indent).when(child_ix > 0, |this| this.pt(gap)).child(child.render_block(
                                         NodeRenderOptions {
                                             depth: options.depth + 1,
                                             todo: checked.is_some(),
@@ -4376,12 +4398,16 @@ impl BlockNode {
                 .children({
                     let mut items = Vec::with_capacity(children.len());
                     let mut item_index = 0;
+                    let loose = children
+                        .iter()
+                        .any(|item| matches!(item, BlockNode::ListItem { spread: true, .. }));
                     for (ix, item) in children.into_iter().enumerate() {
                         let is_item = item.is_list_item();
 
                         items.push(Self::render_list_item(
                             item,
                             item_index,
+                            loose,
                             NodeRenderOptions {
                                 ix,
                                 ordered: *ordered,

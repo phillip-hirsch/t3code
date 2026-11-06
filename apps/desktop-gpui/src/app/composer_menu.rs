@@ -10,9 +10,9 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
-    relative,
+    AnyElement, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, Keystroke,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative,
 };
 use serde_json::json;
 
@@ -35,6 +35,7 @@ pub(super) struct MenuState {
     dismissed: Option<(TriggerKind, usize)>,
     items: Rc<[MenuItem]>,
     highlighted: usize,
+    scroll: ScrollHandle,
     loading: bool,
     _search: Option<Task<()>>,
     /// Provider/checkout pairs already asked for a workspace skills snapshot.
@@ -117,13 +118,20 @@ impl Workspace {
         let (plan_mode, _) = self.interaction_mode();
         let at_start = trigger.range.start == 0;
         let fresh_session = self.fresh_session_command_available();
+        let side_chat = self.side_chat_menu_state();
+        // `getProviderSkillsForSlashMenu`: skills join `/` only when the setting allows.
+        let slash_skills = if self.client_settings.values.bool("showSkillsInSlashMenu") { skills } else { &[] };
         let items = match trigger.kind {
             TriggerKind::Skill => composer_search::skill_items(skills, &trigger.query),
-            // `getProviderSkillsForSlashMenu`: skills join `/` only when the setting allows.
-            _ if !self.client_settings.values.bool("showSkillsInSlashMenu") => {
-                composer_search::slash_items(&[], commands, &trigger.query, at_start, plan_mode, fresh_session)
-            }
-            _ => composer_search::slash_items(skills, commands, &trigger.query, at_start, plan_mode, fresh_session),
+            _ => composer_search::slash_items(
+                slash_skills,
+                commands,
+                &trigger.query,
+                at_start,
+                plan_mode,
+                side_chat,
+                fresh_session,
+            ),
         };
         self.menu.highlighted = self.menu.highlighted.min(items.len().saturating_sub(1));
         self.menu.items = Rc::from(items);
@@ -223,6 +231,9 @@ impl Workspace {
             MenuAction::File { path, .. } => (composer_text::file_link(path), Some(Chip::File { path: path.clone() })),
             MenuAction::Skill { name, .. } => (format!("${name}"), Some(Chip::Skill { name: name.clone() })),
             MenuAction::Command { name } => (format!("/{name} "), None),
+            // `/side` waits for its prompt; it does nothing while side chats can't start.
+            MenuAction::SideChat(_) if self.side_chat_disabled_reason().is_some() => return,
+            MenuAction::SideChat(command) => (format!("/{command} "), None),
             MenuAction::Model | MenuAction::Mode(_) | MenuAction::Clear => (String::new(), None),
         };
         self.menu.trigger = None;
@@ -259,6 +270,7 @@ impl Workspace {
         let trigger = self.menu.trigger.as_ref()?;
         let items = self.menu.items.clone();
         let outline = if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.08) };
+        let surface = t.background.blend(t.card.opacity(t.glass));
         let body: AnyElement = if items.is_empty() {
             let text = match (self.menu.loading, trigger.kind) {
                 (true, TriggerKind::Path) => "Searching workspace files...",
@@ -278,8 +290,12 @@ impl Workspace {
         } else {
             let highlighted = self.menu.highlighted;
             let kind = trigger.kind;
-            v_flex()
+            // `ScrollArea scrollFade`: the list fades out at an edge with more rows past it.
+            let (offset, max) = (self.menu.scroll.offset().y, self.menu.scroll.max_offset().y);
+            let fades = (offset < px(-1.), max > px(1.) && offset > -max + px(1.));
+            let list = v_flex()
                 .id("composer-menu-list")
+                .track_scroll(&self.menu.scroll)
                 .max_h(px(288.))
                 .overflow_y_scroll()
                 .p(px(8.))
@@ -294,7 +310,12 @@ impl Workspace {
                         .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| window.prevent_default())
                         .on_click(cx.listener(move |this, _, window, cx| this.pick_menu_item(index, window, cx)))
                         .into_any_element()
-                }))
+                }));
+            div()
+                .relative()
+                .child(list)
+                .when(fades.0, |el| el.child(edge_fade(surface, true)))
+                .when(fades.1, |el| el.child(edge_fade(surface, false)))
                 .into_any_element()
         };
         Some(
@@ -312,7 +333,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(outline)
-                        .bg(t.background.blend(t.card.opacity(t.glass)))
+                        .bg(surface)
                         .child(body),
                 )
                 .into_any_element(),
@@ -320,10 +341,25 @@ impl Workspace {
     }
 }
 
+/// `--fade-size: 1.5rem` of the list's edge, faded into the menu's own surface.
+fn edge_fade(surface: Hsla, top: bool) -> gpui_kit::Div {
+    let (from, to) = if top { (surface, surface.opacity(0.)) } else { (surface.opacity(0.), surface) };
+    let fade = div().absolute().left_0().right_0().h(px(24.)).bg(linear_gradient(
+        180.,
+        linear_color_stop(from, 0.),
+        linear_color_stop(to, 1.),
+    ));
+    if top { fade.top_0() } else { fade.bottom_0() }
+}
+
 fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     let icon = match &item.action {
-        MenuAction::File { directory: true, .. } => Some(Lucide::Folder),
-        MenuAction::File { .. } => Some(Lucide::File),
+        MenuAction::File { directory: true, .. } => Some(Icon::new(Lucide::Folder).text_color(t.muted_foreground)),
+        // `PierreEntryIcon`: the file tree's per-type glyph.
+        MenuAction::File { path, .. } => {
+            let (asset, color) = crate::file_icons::file_icon(path, t.dark);
+            Some(Icon::empty().path(asset).text_color(color))
+        }
         _ => None,
     };
     let badge = match (&item.action, kind) {
@@ -347,7 +383,7 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
         .rounded(px(8.))
         .cursor_pointer()
         .when(active, |el| el.bg(t.accent))
-        .children(icon.map(|icon| Icon::new(icon).with_size(px(16.)).flex_none().text_color(t.muted_foreground)))
+        .children(icon.map(|icon| icon.with_size(px(16.)).flex_none()))
         .child(
             h_flex()
                 .flex_1()

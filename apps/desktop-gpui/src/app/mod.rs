@@ -169,6 +169,11 @@ pub struct Workspace {
     runtime_mode_override: Option<String>,
     /// Tracked so typing only re-renders when the send button's state flips.
     composer_empty: bool,
+    /// The floating composer's height last frame: the transcript reserves it at its end, and the
+    /// "Scroll to end" pill sits above it (`composerTimelineInset`).
+    composer_height: f32,
+    /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
+    timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
     /// Composer text and question drafts of the targets not on screen.
@@ -357,6 +362,8 @@ impl Workspace {
             model_override: None,
             runtime_mode_override: None,
             composer_empty: true,
+            composer_height: 0.,
+            timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
             composer_drafts: HashMap::new(),
             responding: None,
@@ -1115,21 +1122,21 @@ impl Render for Workspace {
                                                 .children(self.render_details_card(window, cx)),
                                             _ => el
                                                 .child(
-                                                    v_flex()
+                                                    div()
+                                                        .relative()
                                                         .size_full()
                                                         .child(
                                                             // A click on the timeline leaves the editor, as in a
                                                             // browser, so a question card's 1-9 keys reach it.
                                                             v_flex()
-                                                                .flex_1()
-                                                                .min_h_0()
+                                                                .size_full()
                                                                 .on_mouse_down(
                                                                     gpui_kit::MouseButton::Left,
                                                                     |_, window, cx| window.blur(cx),
                                                                 )
                                                                 .child(self.render_body(window, cx)),
                                                         )
-                                                        .child(self.render_composer(window, cx)),
+                                                        .child(self.render_floating_composer(window, cx)),
                                                 )
                                                 .children(self.render_find_bar(cx))
                                                 .children(self.render_details_card(window, cx)),

@@ -47,18 +47,38 @@ impl Workspace {
             (None, _) => no_thread(&t),
             // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
             (Some(Target::Draft { .. }), _) => div().into_any_element(),
-            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => {
-                centered_note("Loading thread…", &t)
-            }
-            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => {
-                centered_note("Send a message to start the conversation.", &t)
-            }
+            // `emptyPlaceholderInset`: the notes center in the space the composer leaves.
+            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Loading thread…", &t))
+                .into_any_element(),
+            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Send a message to start the conversation.", &t))
+                .into_any_element(),
             (Some(Target::Thread { .. }), _) => {
                 let rows = self.rows.clone();
                 let this = cx.weak_entity();
-                let background = t.background;
                 let minimap = self.render_minimap(lane.left, window, cx);
                 let lane_width = lane.width;
+                // The list keeps its top row's pixel offset across a width change, so reflowed text
+                // would slide under it; anchor that row proportionally instead, as the browser keeps
+                // what was in view.
+                let previous = self.timeline_lane_width.replace(lane_width);
+                if previous > 0. && (previous - lane_width).abs() >= 0.5 {
+                    self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::remeasure);
+                }
+                let composer = self.composer_height;
+                // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
+                let pill_offset = lane.left - lane.right;
+                let mut jump_style = StyleRefinement::default().mb(px(composer - 6.));
+                if pill_offset > 0. {
+                    jump_style = jump_style.ml(px(pill_offset));
+                } else if pill_offset < 0. {
+                    jump_style = jump_style.mr(px(-pill_offset));
+                }
                 div()
                     .flex_1()
                     .min_h_0()
@@ -73,12 +93,16 @@ impl Workspace {
                         // Top spacer `h-4`; rows carry their own bottom space.
                         // The list's side padding becomes every row's inset: that is the lane.
                         .with_list_style(
-                            StyleRefinement::default().pt(px(16.)).pb(px(16.)).pl(px(lane.left)).pr(px(lane.right)),
+                            StyleRefinement::default()
+                                .pt(px(16.))
+                                .pb(px(16. + composer))
+                                .pl(px(lane.left))
+                                .pr(px(lane.right)),
                         )
                         .with_row_style(StyleRefinement::default().pb(px(0.)))
                         .with_jump_button_label("Scroll to end")
-                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t))
-                        .with_bottom_fade(background),
+                        .with_jump_button_style(jump_style)
+                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
                     )
                     .children(minimap)
                     .children(self.render_chat_menu())
@@ -583,9 +607,19 @@ pub(super) fn render_row(
             created_at,
             revert,
             sent_by_t3code,
+            from_agent,
         } => {
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
+            // `senderShell?.title || "Agent"`.
+            let agent = from_agent.as_ref().map(|from| {
+                let title = from.sender_thread.as_ref().and_then(|sender| {
+                    let workspace = this.upgrade()?;
+                    let title = workspace.read(cx).shell_thread(sender)?.title.trim().to_owned();
+                    (!title.is_empty()).then_some(title)
+                });
+                AgentFold { label: title.unwrap_or_else(|| "Agent".into()).into(), sender: from.sender_thread.clone() }
+            });
             let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
             let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
             user_row(
@@ -599,6 +633,7 @@ pub(super) fn render_row(
                     grouped_with_next: *grouped_with_next,
                     expanded,
                     sent_by_t3code: *sent_by_t3code,
+                    agent,
                 },
                 this,
                 &t,
@@ -1157,6 +1192,13 @@ struct UserRowLook {
     grouped_with_next: bool,
     expanded: bool,
     sent_by_t3code: bool,
+    agent: Option<AgentFold>,
+}
+
+/// An agent's message folds to one line: who sent it, then its first line (`FoldedMessageHeader`).
+struct AgentFold {
+    label: SharedString,
+    sender: Option<SharedString>,
 }
 
 fn user_row(
@@ -1169,7 +1211,10 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code } = look;
+    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code, agent } = look;
+    if let Some(agent) = agent {
+        return agent_row(id, text, body, actions, agent, expanded, this, t);
+    }
     let collapsible = should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
@@ -1240,6 +1285,89 @@ fn user_row(
     lane(if grouped_with_next { 4. } else { 16. }, column).into_any_element()
 }
 
+/// `UserTimelineRow` with `attribution === "agent"`: a one-line header (`FoldedMessageHeader`)
+/// that opens to the message, capped at `max-h-96`, plus "Open thread" when a thread sent it.
+fn agent_row(
+    id: &SharedString,
+    text: &SharedString,
+    body: AnyElement,
+    actions: gpui_kit::Div,
+    agent: AgentFold,
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let summary = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_owned();
+    let header = h_flex()
+        .id(ElementId::Name(format!("agent-fold:{id}").into()))
+        .w_full()
+        .min_w_0()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(16.))
+        .line_height(px(20.))
+        .cursor_pointer()
+        .child(Icon::new(IconName::MessagesSquare).size(px(16.)).flex_none().text_color(muted))
+        .child(div().flex_none().max_w(relative(0.5)).truncate().text_color(muted).child(agent.label))
+        .child(div().flex_1().min_w_0().truncate().child(summary))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .flex_none()
+                .text_color(muted),
+        )
+        .on_click(toggle(this, timeline::entry_key(id)));
+    let bubble = v_flex()
+        .min_w_0()
+        .max_w(relative(0.8))
+        .rounded(px(16.))
+        .bg(t.message_surface)
+        .text_color(t.foreground)
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .when(expanded, gpui_kit::Styled::w_full)
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                div()
+                    .id(ElementId::Name(format!("agent-fold-body:{id}").into()))
+                    .px(px(12.))
+                    .pb(px(12.))
+                    .max_h(px(384.))
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+        });
+    let open_thread = agent.sender.map(|sender| {
+        let this = this.clone();
+        div()
+            .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(muted)
+            .cursor_pointer()
+            .hover(|s| s.text_color(t.foreground).underline())
+            .child("Open thread")
+            .on_click(move |_, window, cx| {
+                let _ = this.update(cx, |workspace, cx| workspace.select_thread(sender.to_string(), window, cx));
+            })
+    });
+    let actions = h_flex()
+        .w_full()
+        .max_w(relative(0.8))
+        .justify_end()
+        .gap(px(8.))
+        .pr(px(4.))
+        .opacity(0.)
+        .group_hover("timeline-row", |style| style.opacity(1.))
+        .children(open_thread)
+        .child(actions);
+    let column = v_flex().group("timeline-row").items_end().gap(px(4.)).child(bubble).child(actions);
+    lane(16., column).into_any_element()
+}
+
 fn markdown_view(
     state: &Entity<TextViewState>,
     kind: MarkdownKind,
@@ -1269,6 +1397,7 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::FileChips { workspace: this.clone(), dark: t.dark })
         .on_link_click(move |url, event, window, cx| {
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);

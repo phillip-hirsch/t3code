@@ -672,6 +672,12 @@ impl T3ProjectFile {
     }
 }
 
+/// `OrchestrationV2LinkOrigin`: the linked environment whose agent started a thread.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LinkOrigin {
+    pub label: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lineage {
@@ -771,6 +777,9 @@ pub struct ThreadShell {
     pub created_at: String,
     #[serde(default)]
     pub provider_instance_id: Option<String>,
+    /// `linkOrigin`: an agent on a linked environment started this thread.
+    #[serde(default)]
+    pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]

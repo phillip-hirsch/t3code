@@ -12,6 +12,7 @@ mod desktop;
 mod device;
 mod environments;
 mod file_icons;
+mod file_links;
 mod hex;
 mod inbox;
 mod keybindings;

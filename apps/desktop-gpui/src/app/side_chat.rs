@@ -145,7 +145,7 @@ fn worktree_pending(worktree_path: Option<&str>, runs: &[Run]) -> bool {
 }
 
 impl Workspace {
-    fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
+    pub(super) fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
@@ -166,6 +166,13 @@ impl Workspace {
     pub(super) fn side_chats_offered(&self) -> bool {
         matches!(self.side_chat_origin(), Some(Origin::Thread | Origin::Draft))
             && self.server_info().capability("sideChats")
+    }
+
+    /// `/side` and `/btw` in the slash menu: `None` unless the open thread can host side chats
+    /// (`sideChat.available`), else why one can't start yet.
+    pub(super) fn side_chat_menu_state(&self) -> Option<Option<&'static str>> {
+        (self.side_chats_offered() && self.side_chat_origin() == Some(Origin::Thread))
+            .then(|| self.side_chat_disabled_reason())
     }
 
     pub(super) fn side_chat_disabled_reason(&self) -> Option<&'static str> {

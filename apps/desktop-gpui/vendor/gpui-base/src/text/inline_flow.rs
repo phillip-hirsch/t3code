@@ -1646,22 +1646,32 @@ fn push_text_wrap_fragments<'a>(
                 .width
         };
         let insets = highlight.code_insets(measured_font_size, rem_size);
-        let padding = insets.left + insets.right;
-        let width = measure(span) + padding;
-        if width <= wrap_width {
-            fragments.push(WrapLineFragment::element(width, span.len()));
-        } else {
-            for word in span.split_word_bounds() {
-                let width = measure(word) + padding;
-                if width <= wrap_width {
-                    fragments.push(WrapLineFragment::element(width, word.len()));
-                } else {
-                    for grapheme in word.graphemes(true) {
-                        fragments.push(WrapLineFragment::element(
-                            measure(grapheme) + padding,
-                            grapheme.len(),
-                        ));
-                    }
+        // A span wraps at its spaces and hyphens like browser text: those enter
+        // the wrapper as text, so they are break opportunities, and the words
+        // between them as measured elements. The insets pad the span's ends.
+        let words: Vec<&str> = span.split_word_bounds().collect();
+        let last = words.len().saturating_sub(1);
+        for (ix, word) in words.iter().enumerate() {
+            if ix > 0 && word.chars().all(|c| c == ' ' || c == '-') {
+                fragments.push(WrapLineFragment::text(word));
+                continue;
+            }
+            let mut edge = Pixels::ZERO;
+            if ix == 0 {
+                edge += insets.left;
+            }
+            if ix == last {
+                edge += insets.right;
+            }
+            let width = measure(word) + edge;
+            if width <= wrap_width {
+                fragments.push(WrapLineFragment::element(width, word.len()));
+            } else {
+                for grapheme in word.graphemes(true) {
+                    fragments.push(WrapLineFragment::element(
+                        measure(grapheme) + edge,
+                        grapheme.len(),
+                    ));
                 }
             }
         }
