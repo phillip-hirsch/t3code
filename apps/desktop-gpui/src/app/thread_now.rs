@@ -109,9 +109,10 @@ impl Workspace {
         self.now.lines.iter().map(|line| Row::Now(line.clone())).collect()
     }
 
-    /// Recomputes the footer after a shell update and splices it in when it changed.
+    /// Recomputes the footer after a shell update and splices it in when it changed, or when the
+    /// recovery notice moved to another run and the limit rows it hides change with it.
     pub(super) fn sync_now(&mut self, cx: &mut Context<Self>) {
-        if self.now_lines() != self.now.lines {
+        if self.now_lines() != self.now.lines || self.usage_limit_notice_run() != self.rows_notice_run {
             self.refresh_rows(cx);
         }
     }

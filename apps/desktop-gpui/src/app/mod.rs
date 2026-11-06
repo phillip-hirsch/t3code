@@ -145,6 +145,8 @@ pub struct Workspace {
     /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
     expanded: HashSet<SharedString>,
     entry_cache: timeline::EntryCache,
+    /// The run whose limit rows the last rebuild left to the recovery notice; it is read from the shell.
+    rows_notice_run: Option<String>,
     markdown: chat::MarkdownStates,
     /// Output of the open tool entries.
     details: inspector::Details,
@@ -339,6 +341,7 @@ impl Workspace {
             rows: Rc::default(),
             expanded: HashSet::new(),
             entry_cache: timeline::EntryCache::default(),
+            rows_notice_run: None,
             markdown: chat::MarkdownStates::default(),
             details: inspector::Details::default(),
             copy_feedback: message_actions::CopyFeedback::default(),
@@ -738,11 +741,12 @@ impl Workspace {
 
     /// Rebuilds the timeline and tells the scroller which rows changed.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+        self.rows_notice_run = self.usage_limit_notice_run();
         let mut new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
             Some(projection) => {
                 let visibility = self.tool_call_visibility();
                 let visibility = if self.find.is_some() { visibility.while_finding() } else { visibility };
-                let options = timeline::RowOptions { visibility, usage_limit_run: self.usage_limit_notice_run() };
+                let options = timeline::RowOptions { visibility, usage_limit_run: self.rows_notice_run.clone() };
                 timeline::rows(projection, &self.expanded, &options, &mut self.entry_cache)
             }
             None => Vec::new(),
