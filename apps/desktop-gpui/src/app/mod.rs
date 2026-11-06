@@ -15,7 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use crate::backend::{self, ServerHandle};
+use crate::backend;
 use crate::model::{ModelSelection, ProjectShell, ShellState, ThreadState};
 use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
@@ -130,7 +130,8 @@ struct OpenThread {
 pub struct Workspace {
     /// The primary environment's socket; see [`sessions`] for every environment's.
     connection: Connection,
-    server: Option<ServerHandle>,
+    /// Watches this app's own server for why it stops; `None` while the primary is elsewhere.
+    local_server: Option<Task<()>>,
     /// One per connected environment, the primary first.
     sessions: Vec<sessions::EnvironmentSession>,
     /// Every environment's projects and threads.
@@ -327,7 +328,7 @@ impl Workspace {
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
         let mut workspace = Self {
             connection: Connection::Starting,
-            server: None,
+            local_server: None,
             sessions: vec![sessions::EnvironmentSession::default()],
             shell: ShellState::default(),
             target: None,
@@ -428,34 +429,22 @@ impl Workspace {
         workspace
     }
 
-    /// Starts or finds the server, then keeps one socket open, reconnecting after drops.
+    /// Waits for the app's backend ([`crate::environments::PrimaryBackend`]), then keeps one
+    /// socket open, reconnecting after drops.
     fn connect(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let backend = cx.global::<crate::environments::PrimaryBackend>().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let resolved = runtime().spawn(crate::environments::resolve_workspace_endpoint()).await;
-            let endpoint = match resolved {
-                Ok(Ok((endpoint, server))) => {
-                    log::info!("server ready at {}", endpoint.http_base);
-                    let handle = server.map(|server| server.supervise(runtime().handle()));
-                    let _ = this.update(cx, |this, cx| {
-                        if let Some(handle) = handle {
-                            this.watch_server(handle, cx);
-                        }
-                    });
-                    endpoint
-                }
-                Ok(Err(error)) => {
-                    log::error!("could not reach the server: {error:#}");
-                    let _ = this.update(cx, |this, cx| {
-                        this.set_connection(Connection::Failed(format!("{error:#}").into()), cx);
-                    });
-                    return;
-                }
+            let endpoint = match backend.ready().await {
+                Ok(endpoint) => endpoint,
                 Err(error) => {
-                    let _ = this
-                        .update(cx, |this, cx| this.set_connection(Connection::Failed(error.to_string().into()), cx));
+                    log::error!("could not reach the server: {error}");
+                    let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(error.into()), cx));
                     return;
                 }
             };
+            if endpoint.renewable() {
+                let _ = this.update(cx, |this, cx| this.watch_server(backend, cx));
+            }
             let mut endpoint = endpoint;
             // Set by a renewal, so a session the server rejects again waits a beat before the next one.
             let mut renewed = false;
@@ -553,16 +542,11 @@ impl Workspace {
         })
     }
 
-    fn watch_server(&mut self, mut handle: ServerHandle, cx: &mut Context<Self>) {
-        let exited = std::mem::replace(&mut handle.exited, futures::channel::oneshot::channel().1);
-        self.server = Some(handle);
-        cx.spawn(async move |this, cx| {
-            if let Ok(reason) = exited.await {
-                log::warn!("{reason}");
-                let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(reason.into()), cx));
-            }
-        })
-        .detach();
+    fn watch_server(&mut self, backend: crate::environments::PrimaryBackend, cx: &mut Context<Self>) {
+        self.local_server = Some(cx.spawn(async move |this, cx| {
+            let reason = backend.stopped().await;
+            let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(reason.into()), cx));
+        }));
     }
 
     fn set_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {

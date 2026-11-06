@@ -146,6 +146,11 @@ fn stop_local_servers_before_exit() {
 /// decorations like Electron's frameless `titleBarOverlay` window, on Wayland and X11, with or
 /// without a compositor.
 fn open_main_window(cx: &mut gpui_kit::App) {
+    // The window reuses the app's backend; the first window, or one after it failed or
+    // stopped, starts it.
+    if cx.try_global::<environments::PrimaryBackend>().is_none_or(environments::PrimaryBackend::ended) {
+        cx.set_global(environments::PrimaryBackend::start(runtime().handle()));
+    }
     let (x, y) = app::TRAFFIC_LIGHTS;
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {

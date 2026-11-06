@@ -595,6 +595,73 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
     backend::resolve_endpoint().await
 }
 
+/// The workspace's environment for the whole app run, started once and shared by every
+/// window, as Electron's backend manager outlives its windows: closing the window leaves this
+/// app's server and its agents running. The server stops when the app quits.
+#[derive(Clone)]
+pub struct PrimaryBackend(tokio::sync::watch::Receiver<BackendStatus>);
+
+#[derive(Clone)]
+enum BackendStatus {
+    Starting,
+    Ready(Endpoint),
+    /// It could not be started or reached.
+    Failed(String),
+    /// This app's server exited on its own.
+    Stopped(String),
+}
+
+impl gpui_kit::Global for PrimaryBackend {}
+
+impl PrimaryBackend {
+    pub fn start(runtime: &tokio::runtime::Handle) -> Self {
+        let (status, receiver) = tokio::sync::watch::channel(BackendStatus::Starting);
+        runtime.spawn(async move {
+            let (endpoint, server) = match resolve_workspace_endpoint().await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    status.send_replace(BackendStatus::Failed(format!("{error:#}")));
+                    return;
+                }
+            };
+            log::info!("server ready at {}", endpoint.http_base);
+            status.send_replace(BackendStatus::Ready(endpoint));
+            if let Some(server) = server
+                && let Some(reason) = server.run().await
+            {
+                log::warn!("{reason}");
+                status.send_replace(BackendStatus::Stopped(reason));
+            }
+        });
+        Self(receiver)
+    }
+
+    /// A window opening now needs a new start: the last one failed or its server stopped.
+    pub fn ended(&self) -> bool {
+        matches!(*self.0.borrow(), BackendStatus::Failed(_) | BackendStatus::Stopped(_))
+    }
+
+    /// The endpoint once the backend is ready, or why it is not.
+    pub async fn ready(&self) -> Result<Endpoint, String> {
+        let mut status = self.0.clone();
+        let settled = status.wait_for(|status| !matches!(status, BackendStatus::Starting)).await;
+        match settled.as_deref() {
+            Ok(BackendStatus::Ready(endpoint)) => Ok(endpoint.clone()),
+            Ok(BackendStatus::Failed(reason) | BackendStatus::Stopped(reason)) => Err(reason.clone()),
+            Ok(BackendStatus::Starting) | Err(_) => Err("The backend stopped before it was ready.".into()),
+        }
+    }
+
+    /// Resolves with why this app's server stopped; never for a server it did not start.
+    pub async fn stopped(&self) -> String {
+        let mut status = self.0.clone();
+        match status.wait_for(|status| matches!(status, BackendStatus::Stopped(_))).await.as_deref() {
+            Ok(BackendStatus::Stopped(reason)) => reason.clone(),
+            _ => std::future::pending().await,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Supervisor state and presentation
 

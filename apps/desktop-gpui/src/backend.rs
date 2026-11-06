@@ -123,12 +123,6 @@ pub fn stop_local_servers() -> impl Future<Output = ()> + 'static {
     }
 }
 
-/// Keeps a [`LocalServer`] alive on the runtime. Dropping the handle stops it.
-pub struct ServerHandle {
-    pub exited: futures::channel::oneshot::Receiver<String>,
-    _stop: futures::channel::oneshot::Sender<()>,
-}
-
 impl LocalServer {
     fn new(child: Child) -> Self {
         Self {
@@ -153,29 +147,21 @@ impl LocalServer {
         let _ = self.child.kill().await;
     }
 
-    pub fn supervise(self, runtime: &tokio::runtime::Handle) -> ServerHandle {
-        let (exited_tx, exited) = futures::channel::oneshot::channel();
-        let (stop, stop_rx) = futures::channel::oneshot::channel::<()>();
-        runtime.spawn(async move {
-            // Move the whole server in: capturing only `child` would drop the
-            // Windows job here, and closing the job kills the server.
-            let mut server = self;
-            tokio::select! {
-                status = server.child.wait() => {
-                    let reason = match status {
-                        Ok(status) => format!("The local server stopped ({status})."),
-                        Err(error) => format!("Lost track of the local server: {error}"),
-                    };
-                    let _ = exited_tx.send(reason);
-                    return;
-                }
-                // Sender dropped: the app is done with the server.
-                _ = stop_rx => {}
-                () = quitting() => {}
+    /// Runs until the server exits, with why, or until the app quits and it has stopped.
+    pub async fn run(self) -> Option<String> {
+        // Owns the whole server: dropping the Windows job early would kill it.
+        let mut server = self;
+        tokio::select! {
+            status = server.child.wait() => {
+                return Some(match status {
+                    Ok(status) => format!("The local server stopped ({status})."),
+                    Err(error) => format!("Lost track of the local server: {error}"),
+                });
             }
-            server.stop().await;
-        });
-        ServerHandle { exited, _stop: stop }
+            () = quitting() => {}
+        }
+        server.stop().await;
+        None
     }
 }
 
