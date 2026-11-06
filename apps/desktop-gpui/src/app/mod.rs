@@ -856,6 +856,17 @@ impl Workspace {
 
     /// The model the next message runs on.
     fn composer_model(&self) -> Option<ModelSelection> {
+        let selection = self.stored_composer_model()?;
+        let descriptors = self.server_info().model(&selection).and_then(|m| m.capabilities.as_ref());
+        Some(match descriptors {
+            Some(capabilities) => {
+                crate::model_label::with_legacy_ultracode(&capabilities.option_descriptors, selection)
+            }
+            None => selection,
+        })
+    }
+
+    fn stored_composer_model(&self) -> Option<ModelSelection> {
         if let Some(selection) = &self.model_override {
             return Some(selection.clone());
         }

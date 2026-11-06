@@ -380,10 +380,8 @@ impl Workspace {
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
-        let fast = current.as_ref().is_some_and(|s| {
-            descriptors.iter().find(|d| d.id == "fastMode").and_then(|d| model_label::current_value(d, s))
-                == Some(Value::Bool(true))
-        });
+        let fast = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "fastMode", s));
+        let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
@@ -402,14 +400,15 @@ impl Workspace {
                     .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
                     .child(name.clone()),
             )
-            .when(effort.is_some() || fast, |el| {
+            .when(effort.is_some() || fast || ultracode, |el| {
                 el.child(
                     h_flex()
                         .ml(px(-2.))
                         .gap(px(6.))
                         .text_color(suffix_color)
                         .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
-                        .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.)))),
+                        .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
+                        .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
                 )
             });
         let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
@@ -757,7 +756,8 @@ impl Workspace {
         let others: Vec<&OptionDescriptor> = descriptors
             .iter()
             .filter(|d| {
-                Some(d.id.as_str()) != effort.map(|e| e.id.as_str()) && d.id != "fastMode" && d.id != "serviceTier"
+                Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
+                    && !matches!(d.id.as_str(), "fastMode" | "serviceTier" | "ultracode")
             })
             .collect();
         let heading = match (effort, others.is_empty()) {
@@ -972,6 +972,28 @@ impl Workspace {
                 .child(segment("Standard", !on, false))
                 .child(segment("Fast", on, true))
         });
+        // `UltracodeControl`: one segment that toggles it.
+        let ultracode = descriptors.iter().find(|d| d.id == "ultracode" && d.kind == "boolean");
+        let ultracode = ultracode.zip(current).map(|(descriptor, selection)| {
+            let on = model_label::current_value(descriptor, selection) == Some(Value::Bool(true));
+            h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).child(
+                h_flex()
+                    .id("ultracode")
+                    .h(px(24.))
+                    .px(px(8.))
+                    .gap(px(4.))
+                    .rounded(px(6.))
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(if on { t.foreground } else { t.muted_foreground })
+                    .when(on, |el| el.bg(t.foreground.opacity(0.079)))
+                    .child(Icon::new(Lucide::Workflow).with_size(px(12.)))
+                    .child(descriptor.label.clone())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_model_option("ultracode", Value::Bool(!on), cx)),
+                    ),
+            )
+        });
         let mode = self.runtime_mode();
         let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
         h_flex()
@@ -983,6 +1005,7 @@ impl Workspace {
             .border_color(rule)
             .bg(t.foreground.opacity(0.012))
             .children(speed)
+            .children(ultracode)
             .child(div().flex_1())
             .child(self.render_permissions_control("picker-permissions", icon, label, true, t, cx))
             .into_any_element()
