@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::component::input::TextareaState;
-use gpui_kit::{EntityId, Focusable as _, Keystroke, MouseButton, anchored, deferred};
+use gpui_kit::{EntityId, Focusable as _, Keystroke, MouseButton, MouseDownEvent, anchored, deferred};
 
 use super::avatars::avatar_or;
 use super::*;
@@ -366,8 +366,15 @@ impl Workspace {
                 })
                 .collect()
         };
+        let owner = input.clone();
         let popup = v_flex()
             .id("pr-completions")
+            // A click outside the list and its textarea closes it, even where nothing takes focus.
+            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                if !owner.read(cx).input_bounds().contains(&event.position) {
+                    this.close_pr_completion(owner.entity_id(), cx);
+                }
+            }))
             .w(px(if kind == Kind::Reference { 320. } else { 256. }))
             .mt(px(4.))
             .py(px(8.))
