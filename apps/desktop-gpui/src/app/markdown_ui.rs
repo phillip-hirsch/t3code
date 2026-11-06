@@ -512,7 +512,7 @@ impl MarkdownPlugin for FileChips {
             .text_color(ink)
             .cursor_pointer()
             .child(Icon::empty().path(asset).size(px(14.)).flex_none().text_color(icon_color))
-            .child(div().min_w_0().truncate().hover(|s| s.underline()).child(node.as_text().to_owned()))
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(move |event, window, cx| {
                 let editor = event.modifiers().secondary(cx);

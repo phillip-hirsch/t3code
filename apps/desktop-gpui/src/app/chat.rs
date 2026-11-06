@@ -68,7 +68,7 @@ impl Workspace {
                 // what was in view.
                 let previous = self.timeline_lane_width.replace(lane_width);
                 if previous > 0. && (previous - lane_width).abs() >= 0.5 {
-                    self.scroller.update(cx, |scroller, cx| scroller.remeasure(cx));
+                    self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::remeasure);
                 }
                 let composer = self.composer_height;
                 // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
@@ -1327,7 +1327,7 @@ fn agent_row(
         .text_color(t.foreground)
         .text_size(px(TEXT))
         .line_height(px(LINE))
-        .when(expanded, |el| el.w_full())
+        .when(expanded, gpui_kit::Styled::w_full)
         .child(header)
         .when(expanded, |el| {
             el.child(
