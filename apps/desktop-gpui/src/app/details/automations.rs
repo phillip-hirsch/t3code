@@ -34,7 +34,7 @@ const SECTION: &str = "scheduled-tasks";
 pub(in crate::app) struct AutomationsWatch {
     /// The environment the tasks are scheduled on.
     environment: Option<SharedString>,
-    tasks: Rc<Vec<ScheduledTask>>,
+    tasks: Rc<[ScheduledTask]>,
     error: Option<SharedString>,
     task: Option<Task<()>>,
     busy: Option<String>,
@@ -79,7 +79,7 @@ impl Workspace {
                 let applied = this.update(cx, |this, cx| {
                     match event {
                         StreamEvent::Item(value) => {
-                            this.automations.tasks = Rc::new(decode_tasks(&value));
+                            this.automations.tasks = Rc::from(decode_tasks(&value));
                             this.automations.error = None;
                         }
                         StreamEvent::End(Err(error)) => this.automations.error = Some(error.to_string().into()),
@@ -212,7 +212,7 @@ impl Workspace {
                                 .when(busy || running, |el| el.opacity(0.5))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if !running {
-                                        this.automation_action(run_id.clone(), None, window, cx)
+                                        this.automation_action(run_id.clone(), None, window, cx);
                                     }
                                 })),
                         )
@@ -223,7 +223,7 @@ impl Workspace {
                             .small()
                             .disabled(busy)
                             .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                this.automation_action(toggle_id.clone(), Some(*checked), window, cx)
+                                this.automation_action(toggle_id.clone(), Some(*checked), window, cx);
                             })),
                     )
                     .into_any_element()

@@ -174,8 +174,11 @@ impl Workspace {
                 };
                 settings_commands.extend(self.interaction_mode_command(&thread_id, interaction_mode));
                 sent_mode = Some(interaction_mode);
-                let running =
-                    self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).is_some_and(|p| p.is_running());
+                let running = self
+                    .thread
+                    .as_ref()
+                    .and_then(|t| t.state.projection.as_ref())
+                    .is_some_and(super::super::model::ThreadProjection::is_running);
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
@@ -415,12 +418,6 @@ mod tests {
 
     #[test]
     fn a_thread_message_carries_what_the_server_reads() {
-        let without_ids = |mut command: Value| {
-            let object = command.as_object_mut().unwrap();
-            assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
-            assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
-            command
-        };
         fn message<'a>(model: Option<&'a ModelSelection>, source_plan: Option<&'a str>) -> ThreadMessage<'a> {
             ThreadMessage {
                 thread_id: "t1",
@@ -432,6 +429,12 @@ mod tests {
                 source_plan,
             }
         }
+        let without_ids = |mut command: Value| {
+            let object = command.as_object_mut().unwrap();
+            assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
+            assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
+            command
+        };
         assert_eq!(
             without_ids(message(None, None).command()),
             json!({

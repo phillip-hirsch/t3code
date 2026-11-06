@@ -440,7 +440,8 @@ pub(super) fn user_actions(
     let (can_rewind, working) = this.upgrade().map_or((false, false), |workspace| {
         let workspace = workspace.read(cx);
         let working = workspace.thread.as_ref().is_some_and(|thread| {
-            workspace.rewinding.contains(&thread.id) || thread.state.projection.as_ref().is_some_and(|p| p.is_running())
+            workspace.rewinding.contains(&thread.id)
+                || thread.state.projection.as_ref().is_some_and(super::super::model::ThreadProjection::is_running)
         });
         (workspace.supports_rollback(), working)
     });
@@ -536,7 +537,7 @@ fn confirm_rewind(
             Button::new(id).label(label).on_click(move |_, window, cx| {
                 window.close_dialog(cx);
                 let _ = this.update(cx, |workspace, cx| {
-                    workspace.rewind(message_id.clone(), checkpoint.clone(), restore_files, window, cx)
+                    workspace.rewind(message_id.clone(), checkpoint.clone(), restore_files, window, cx);
                 });
             })
         };

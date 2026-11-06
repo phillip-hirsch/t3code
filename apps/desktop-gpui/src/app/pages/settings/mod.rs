@@ -51,9 +51,12 @@ use crate::theme::{self, Tokens};
 use crate::themes::ThemeChoice;
 use widgets::SettingsView;
 
+/// A sidebar group: its heading, then each section's key and label.
+pub(in crate::app) type Group = (Option<&'static str>, &'static [(&'static str, &'static str)]);
+
 /// The sections in sidebar order (`SETTINGS_NAV_GROUPS`, `SETTINGS_SECTION_LABELS` in
 /// `apps/web/src/components/settings/settingsSearch.ts`). A `None` heading is set apart by space alone.
-pub(in crate::app) const SETTINGS: &[(Option<&str>, &[(&str, &str)])] = &[
+pub(in crate::app) const SETTINGS: &[Group] = &[
     (
         None,
         &[
@@ -558,7 +561,7 @@ impl Workspace {
                                 }
                             }))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_settings_search_result(open, window, cx)
+                                this.open_settings_search_result(open, window, cx);
                             }))
                             .child(Icon::new(section_icon(&item.to)).size(px(16.)).text_color(sb.icon))
                             .child(

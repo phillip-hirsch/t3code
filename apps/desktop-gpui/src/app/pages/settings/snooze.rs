@@ -211,7 +211,7 @@ fn days_ahead<Tz: TimeZone>(day: &str, now: &DateTime<Tz>) -> i64 {
         "today" => 0,
         "tomorrow" => 1,
         _ => {
-            let target = WEEKDAYS.iter().position(|d| *d == day).unwrap_or(0) as i64;
+            let target = WEEKDAYS.iter().position(|d| *d == day).and_then(|d| i64::try_from(d).ok()).unwrap_or(0);
             match (target - i64::from(now.weekday().num_days_from_sunday()) + 7) % 7 {
                 0 => 7,
                 ahead => ahead,
@@ -249,7 +249,7 @@ pub(super) fn resolve<Tz: TimeZone>(preset: &Preset, now: &DateTime<Tz>) -> Opti
         Preset::At { day, time } => {
             let ahead = days_ahead(day, now);
             // Calendar days, so a DST day of 23 or 25 hours still lands on the right date.
-            let date = now.date_naive().checked_add_days(chrono::Days::new(ahead as u64))?;
+            let date = now.date_naive().checked_add_days(chrono::Days::new(u64::try_from(ahead).ok()?))?;
             let local = date.and_time(parse_time(time)?);
             let wake = now.timezone().from_local_datetime(&local).earliest()?;
             if wake <= *now {

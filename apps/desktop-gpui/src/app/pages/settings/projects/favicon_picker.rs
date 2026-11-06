@@ -62,7 +62,7 @@ pub(super) struct FaviconPicker {
     images: Entity<Images>,
     query: Entity<InputState>,
     /// Image file paths in server rank order.
-    entries: Rc<Vec<String>>,
+    entries: Rc<[String]>,
     pending: bool,
     error: Option<SharedString>,
     /// Drops responses to queries typed over.
@@ -76,7 +76,6 @@ pub(super) struct FaviconPicker {
 }
 
 impl FaviconPicker {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         cwd: String,
         project_name: SharedString,
@@ -144,13 +143,11 @@ impl FaviconPicker {
                     Ok(value) => {
                         this.error = None;
                         let entries = value["entries"].as_array().into_iter().flatten();
-                        this.entries = Rc::new(
-                            entries
-                                .filter(|entry| entry["kind"] == "file")
-                                .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
-                                .take(RESULT_LIMIT)
-                                .collect(),
-                        );
+                        this.entries = entries
+                            .filter(|entry| entry["kind"] == "file")
+                            .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
+                            .take(RESULT_LIMIT)
+                            .collect();
                     }
                     Err(error) => {
                         this.entries = Rc::default();
@@ -383,7 +380,7 @@ mod tests {
         assert!(is_favicon_path("C:\\art\\logo.SVG"));
         assert!(!is_favicon_path("C:\\art\\notes.txt"));
         assert!(!is_favicon_path("png"));
-        assert_eq!(can_pick_external("C:\\src\\app"), true);
+        assert!(can_pick_external("C:\\src\\app"));
         assert_eq!(can_pick_external("/home/me/app"), !cfg!(windows));
     }
 }

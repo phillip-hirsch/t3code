@@ -337,7 +337,7 @@ pub(super) fn format_count(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);
@@ -377,6 +377,7 @@ pub(super) fn format_duration_micros(value: f64) -> String {
 }
 
 /// `formatSampleInterval`.
+#[expect(clippy::float_cmp, reason = "the web compares exactly: `seconds === 1`")]
 pub(super) fn format_sample_interval(ms: f64) -> String {
     if ms < 1_000. {
         return format!("{} ms", ms.round().max(0.));

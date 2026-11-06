@@ -281,10 +281,10 @@ impl TerminalSession {
                             StreamEvent::Item(value) => this.apply(&value, cx),
                             StreamEvent::End(result) => {
                                 ended = true;
-                                if let (Err(error), false) = (&result, this.exited) {
-                                    if !matches!(error, RpcError::Disconnected(_)) {
-                                        this.system_message(&error.to_string());
-                                    }
+                                if let (Err(error), false) = (&result, this.exited)
+                                    && !matches!(error, RpcError::Disconnected(_))
+                                {
+                                    this.system_message(&error.to_string());
                                 }
                             }
                         }
@@ -349,9 +349,14 @@ impl TerminalSession {
                 Event::PtyWrite(text) if reply => self.send_input(&text, cx),
                 Event::TextAreaSizeRequest(format) if reply => {
                     let geometry = self.geometry.get();
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "cell sizes in whole pixels"
+                    )]
                     let text = format(WindowSize {
-                        num_lines: self.term.screen_lines() as u16,
-                        num_cols: self.term.columns() as u16,
+                        num_lines: u16::try_from(self.term.screen_lines()).unwrap_or(u16::MAX),
+                        num_cols: u16::try_from(self.term.columns()).unwrap_or(u16::MAX),
                         cell_width: f32::from(geometry.cell_width) as u16,
                         cell_height: f32::from(geometry.line_height) as u16,
                     });
@@ -427,7 +432,7 @@ impl TerminalSession {
         self.term.resize(size);
         self._resize = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESIZE_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.send_size(cx));
+            let _ = this.update(cx, TerminalSession::send_size);
         }));
     }
 
@@ -455,11 +460,11 @@ impl TerminalSession {
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         let grid = self.term.grid();
         let top = alacritty_terminal::index::Point::new(
-            alacritty_terminal::index::Line(-(grid.history_size() as i32)),
+            alacritty_terminal::index::Line(-super::line_count(grid.history_size())),
             alacritty_terminal::index::Column(0),
         );
         let bottom = alacritty_terminal::index::Point::new(
-            alacritty_terminal::index::Line(grid.screen_lines() as i32 - 1),
+            alacritty_terminal::index::Line(super::line_count(grid.screen_lines()) - 1),
             grid.last_column(),
         );
         let mut selection = Selection::new(SelectionType::Simple, top, Side::Left);
@@ -483,9 +488,9 @@ impl TerminalSession {
         if text.is_empty() {
             return None;
         }
-        let history = self.term.grid().history_size() as i32;
-        let line_start = (range.start.line.0 + history + 1).max(1) as usize;
-        let line_end = ((range.end.line.0 + history + 1).max(1) as usize).max(line_start);
+        let history = super::line_count(self.term.grid().history_size());
+        let line_start = usize::try_from(range.start.line.0 + history + 1).unwrap_or(0).max(1);
+        let line_end = usize::try_from(range.end.line.0 + history + 1).unwrap_or(0).max(1).max(line_start);
         Some(Selected { line_start, line_end, text })
     }
 
@@ -599,8 +604,9 @@ impl EntityInputHandler for TerminalSession {
         let geometry = self.geometry.get();
         let grid = self.term.grid();
         let cursor = grid.cursor.point;
-        let row =
-            usize::try_from(cursor.line.0 + grid.display_offset() as i32).ok().filter(|row| *row < geometry.rows)?;
+        let row = usize::try_from(cursor.line.0 + super::line_count(grid.display_offset()))
+            .ok()
+            .filter(|row| *row < geometry.rows)?;
         let origin =
             geometry.origin + point(geometry.cell_width * cursor.column.0 as f32, geometry.line_height * row as f32);
         Some(Bounds::new(origin, size(geometry.cell_width, geometry.line_height)))

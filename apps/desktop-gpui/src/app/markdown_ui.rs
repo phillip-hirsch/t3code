@@ -212,7 +212,7 @@ fn without_position(target: &str) -> &str {
     for _ in 0..2 {
         match path.rsplit_once(':') {
             Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && head.len() > 2 => {
-                path = head
+                path = head;
             }
             _ => break,
         }
@@ -252,7 +252,7 @@ impl Workspace {
         cx.spawn_in(window, async move |_, cx| {
             if let Err(error) = client.request("shell.openInEditor", input).await {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(error.to_string()).title(failure), cx)
+                    window.push_notification(Notification::error(error.to_string()).title(failure), cx);
                 });
             }
         })
@@ -322,7 +322,7 @@ impl Workspace {
             if let Some(relative) = relative.clone() {
                 menu = menu.item(PopupMenuItem::new("Copy relative path").on_click(copy(relative, "Relative path")));
             }
-            menu.item(PopupMenuItem::new("Copy full path").on_click(copy(target.clone(), "Full path")))
+            menu.item(PopupMenuItem::new("Copy full path").on_click(copy(target, "Full path")))
         });
     }
 }
@@ -388,7 +388,7 @@ pub(super) struct SkillChips {
 }
 
 impl MarkdownPlugin for SkillChips {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "t3-skill"
     }
 
@@ -433,7 +433,7 @@ impl MarkdownPlugin for SkillChips {
 pub(super) struct InlineMath;
 
 impl MarkdownPlugin for InlineMath {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "t3-inline-math"
     }
 
@@ -463,7 +463,7 @@ impl MarkdownPlugin for DisplayMath {
         true
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "t3-display-math"
     }
 

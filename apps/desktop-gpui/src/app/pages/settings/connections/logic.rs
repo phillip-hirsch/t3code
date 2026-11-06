@@ -287,11 +287,12 @@ impl AccessSnapshot {
     pub fn summary(&self) -> String {
         let sessions = self.client_sessions.len();
         let links = self.pairing_links.len();
-        let mut summary = format!("{sessions} {}", if sessions == 1 { "client" } else { "clients" });
-        if links > 0 {
-            summary.push_str(&format!(" · {links} {}", if links == 1 { "pairing link" } else { "pairing links" }));
+        let clients = format!("{sessions} {}", if sessions == 1 { "client" } else { "clients" });
+        match links {
+            0 => clients,
+            1 => format!("{clients} · 1 pairing link"),
+            _ => format!("{clients} · {links} pairing links"),
         }
-        summary
     }
 
     /// `canRevokeOtherClients`.
@@ -353,8 +354,7 @@ where
     Tz::Offset: std::fmt::Display,
 {
     chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
-        .unwrap_or_else(|_| iso.to_owned())
+        .map_or_else(|_| iso.to_owned(), |at| at.with_timezone(zone).format("%b %-d, %Y, %-I:%M %p").to_string())
 }
 
 pub(super) fn ms(iso: &str) -> i64 {
@@ -469,7 +469,7 @@ pub(super) fn secret_provider_from_draft(
         match &id {
             None => issues.name = Some("The name needs at least one letter or digit.".into()),
             Some(id) if editing.is_none() && existing_ids.contains(id) => {
-                issues.name = Some("A secret provider with this name exists.".into())
+                issues.name = Some("A secret provider with this name exists.".into());
             }
             _ => {}
         }
@@ -504,7 +504,7 @@ pub(super) fn redacted_placeholder(value: &str) -> String {
             }
             state = (state ^ (state >> 13)).wrapping_mul(0x85eb_ca6b);
             state = (state ^ (state >> 16)).wrapping_mul(0xc2b2_ae35);
-            let index = i64::from(state as i32).unsigned_abs() as usize % ALPHABET.len();
+            let index = state.cast_signed().unsigned_abs() as usize % ALPHABET.len();
             ALPHABET[index] as char
         })
         .collect()
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn toggling_terminal_scopes_keeps_read_with_operate() {
-        let scopes = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let scopes = |list: &[&str]| list.iter().map(std::string::ToString::to_string).collect::<Vec<_>>();
         assert_eq!(toggle_scope(&[], TERMINAL_OPERATE, true), scopes(&[TERMINAL_OPERATE, TERMINAL_READ]));
         assert_eq!(
             toggle_scope(&scopes(&[TERMINAL_OPERATE, TERMINAL_READ, ACCESS_READ]), TERMINAL_READ, false),

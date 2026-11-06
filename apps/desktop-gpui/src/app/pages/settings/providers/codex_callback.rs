@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn accepts_openai_loopback_requests_only() {
         assert!(authorization_request(&authorization_url(REDIRECT)).is_ok());
-        let duplicated = authorization_url(REDIRECT) + "&redirect_uri=http://localhost:1/auth/callback";
+        let duplicated = format!("{}&redirect_uri=http://localhost:1/auth/callback", authorization_url(REDIRECT));
         assert!(authorization_request(&duplicated).is_err());
         for redirect in ["http://localhost:54213/auth/callback", "https://attacker.example/auth/callback"] {
             assert!(authorization_request(&authorization_url(redirect)).is_err());

@@ -88,15 +88,15 @@ impl Workspace {
             view
         };
         let t = *theme::tokens(cx);
-        let group = self.scoped_project_group(&view);
+        let group = self.scoped_project_group(view);
         let detail = group.is_some();
         let content = match (group, &view.scope.kind) {
-            (Some(group), _) => self.render_project_detail(&panel, &view, &group, window, cx),
+            (Some(group), _) => self.render_project_detail(&panel, view, &group, window, cx),
             (None, ScopeKind::Unavailable { message }) => vec![self.render_scope_unavailable(message, &t, cx)],
-            (None, _) => vec![self.render_project_choices(&view, &t, cx)],
+            (None, _) => vec![self.render_project_choices(view, &t, cx)],
         };
         // `SettingsPageContainer`, with `gap-6` around a project's detail.
-        self.settings_page_with_gap("projects", &view, if detail { 24. } else { 32. }, content, cx)
+        self.settings_page_with_gap("projects", view, if detail { 24. } else { 32. }, content, cx)
     }
 
     /// Settings' project groups (`useSettingsProjectGroups`), grouped by this device's rule.
@@ -547,7 +547,7 @@ impl Workspace {
             let update = groups::default_icon_update(representative.is_scratch);
             reset_button(&"reset-project-icon".into(), "Reset to default", cx).disabled(saving_icon).on_click(
                 cx.listener(move |this, _, window, cx| {
-                    this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx)
+                    this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx);
                 }),
             )
         });
@@ -666,7 +666,7 @@ impl Workspace {
             };
             let archived = group.archived;
             let archive = {
-                let (panel, all_ids) = (panel.clone(), ids.clone());
+                let (panel, all_ids) = (panel.clone(), ids);
                 Button::new("archive-project")
                     .outline()
                     .small()
@@ -789,7 +789,7 @@ impl Workspace {
                     .small()
                     .label("Remove")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.remove_group_members(&key, Some(&checkout), window, cx)
+                        this.remove_group_members(&key, Some(&checkout), window, cx);
                     }))
             });
             rows.push(
@@ -835,7 +835,7 @@ impl Workspace {
             "danger",
             "Danger",
             vec![
-                RowFrame::new(title.clone())
+                RowFrame::new(title)
                     .description(description)
                     .control(remove.into_any_element())
                     .render(&tokens)

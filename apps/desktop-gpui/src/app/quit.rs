@@ -26,7 +26,7 @@ impl Default for QuitState {
 }
 
 /// Ctrl on Windows and Linux, ⌘ on macOS: the desktop app's quit modifier.
-fn quit_modifier(modifiers: &Modifiers) -> bool {
+fn quit_modifier(modifiers: Modifiers) -> bool {
     if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control }
 }
 
@@ -37,7 +37,7 @@ impl Workspace {
         let m = keystroke.modifiers;
         let is_q = keystroke.key.eq_ignore_ascii_case("q");
         let others = m.alt || m.shift || m.function || if cfg!(target_os = "macos") { m.control } else { m.platform };
-        let shortcut = is_q && quit_modifier(&m) && !others;
+        let shortcut = is_q && quit_modifier(m) && !others;
         let mode = Mode::parse(self.client_settings.values.get("confirmQuit"));
         let outcome = self.quit.gate.key_down(shortcut, is_q, event.is_held, mode, Instant::now());
         self.apply_quit(outcome, cx)
@@ -51,7 +51,7 @@ impl Workspace {
     }
 
     pub(super) fn quit_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
-        if !quit_modifier(&event.modifiers) {
+        if !quit_modifier(event.modifiers) {
             self.quit.gate.modifier_up(Instant::now());
             self.apply_quit(Outcome::Handled, cx);
         }

@@ -211,14 +211,14 @@ impl Workspace {
                     })
                     .when(has_projects, |el| {
                         el.on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                            this.new_thread(event.modifiers().shift, window, cx)
+                            this.new_thread(event.modifiers().shift, window, cx);
                         }))
                     })
                     .child(icon(IconName::SquarePen, 16., sb.icon)),
             )
     }
 
-    /// The ListFilter trigger (or the scoped projects' icons) and its popup.
+    /// The `ListFilter` trigger (or the scoped projects' icons) and its popup.
     fn render_filter(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
         let groups = self.project_groups();
@@ -323,7 +323,7 @@ impl Workspace {
                     .ml_auto()
                     .child(
                         small_button(format!("filter-pin-{}", g.key).into())
-                            .when(!pinned && !highlighted, |el| el.invisible())
+                            .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
                             .tooltip(move |window, cx| {
                                 gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
                             })
@@ -368,7 +368,7 @@ impl Workspace {
                     }
                 }))
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    this.pick_scope(pick.clone(), event.modifiers().shift, cx)
+                    this.pick_scope(pick.clone(), event.modifiers().shift, cx);
                 }))
                 .child(div().relative().flex_none().size(px(16.)).child(row_icon).children(badge))
                 .child(

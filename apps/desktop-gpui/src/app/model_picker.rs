@@ -378,7 +378,7 @@ impl Workspace {
             (None, None) => "Choose model".into(),
         };
         let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or(&[]);
+            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
         let fast = current.as_ref().is_some_and(|s| {
             descriptors.iter().find(|d| d.id == "fastMode").and_then(|d| model_label::current_value(d, s))
@@ -451,7 +451,7 @@ impl Workspace {
                 let (id, host) = (id.clone(), host.clone());
                 view.update(cx, |this, cx| {
                     if *open { this.open_picker(id, host, window, cx) } else { this.close_model_picker(window, cx) }
-                })
+                });
             })
             .trigger(trigger)
             .p_0()
@@ -723,7 +723,7 @@ impl Workspace {
                             .rounded(px(8.))
                             .hover(|s| s.bg(t.accent))
                             .when(!star_visible && !highlighted, |el| {
-                                el.invisible().group_hover(group.clone(), |s| s.visible())
+                                el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible)
                             })
                             .child(Icon::new(Lucide::Star).with_size(px(12.)).text_color(if row.favorite {
                                 t.warning
@@ -873,7 +873,7 @@ impl Workspace {
                                         PopupMenuItem::new(text)
                                             .checked(current.as_deref() == Some(option.as_str()))
                                             .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                                this.set_model_option(&id, Value::String(option.clone()), cx)
+                                                this.set_model_option(&id, Value::String(option.clone()), cx);
                                             })),
                                     );
                                 }
@@ -1033,13 +1033,14 @@ pub(super) fn kbd(text: &str, t: &Tokens) -> impl IntoElement {
 
 /// `adjacentModelPickerProvider`: wraps; from a tab not in the list, the first (or last).
 fn step_tab(tabs: &[Tab], current: &Tab, step: isize) -> Tab {
-    let len = tabs.len() as isize;
+    let len = tabs.len();
     let index = match tabs.iter().position(|tab| tab == current) {
-        Some(at) => (at as isize + step).rem_euclid(len),
+        Some(at) if step > 0 => (at + 1) % len,
+        Some(at) => (at + len - 1) % len,
         None if step > 0 => 0,
         None => len - 1,
     };
-    tabs[index as usize].clone()
+    tabs[index].clone()
 }
 
 fn initials(name: &str) -> String {

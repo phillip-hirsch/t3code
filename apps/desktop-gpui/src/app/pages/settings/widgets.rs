@@ -170,7 +170,7 @@ enum Control {
 impl SettingRow {
     /// A row titled and anchored by its search item (`searchableSetting(id)`).
     pub(in crate::app) fn new(id: &'static str) -> Self {
-        let title = contract().search_item(id).map(|item| item.title.clone()).unwrap_or_else(|| id.to_owned());
+        let title = contract().search_item(id).map_or_else(|| id.to_owned(), |item| item.title.clone());
         Self::titled(id, title)
     }
 
@@ -545,7 +545,11 @@ impl Workspace {
                         id: m.project.id.clone(),
                         environment_id: m.project.environment_id.to_string(),
                         name: project_name(&m.project).to_string(),
-                        legacy_model_selection: m.project.default_model_selection.as_ref().map(|m| m.to_json()),
+                        legacy_model_selection: m
+                            .project
+                            .default_model_selection
+                            .as_ref()
+                            .map(crate::model::ModelSelection::to_json),
                         legacy_thread_env_mode: m.project.default_thread_env_mode.clone(),
                     })
                     .collect(),
@@ -883,7 +887,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(quiet_marker, |el| el.invisible().group_hover(group.clone(), |s| s.visible()))
+                .when(quiet_marker, |el| el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
                 .child(marker)
                 .into_any_element()
         });
@@ -964,7 +968,6 @@ impl Workspace {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_inheritance(
         &self,
         view: &SettingsView,
@@ -1105,7 +1108,7 @@ impl Workspace {
                                                 .id("inheritance-reset-overrides")
                                                 .cursor_pointer()
                                                 .text_color(t.foreground)
-                                                .hover(|s| s.underline())
+                                                .hover(gpui_kit::Styled::underline)
                                                 .child(if overriding.len() == 1 { "Reset it" } else { "Reset all" })
                                                 .on_click(clear.clone()),
                                         ),
@@ -1123,7 +1126,7 @@ impl Workspace {
                                                 .min_w_0()
                                                 .truncate()
                                                 .cursor_pointer()
-                                                .hover(|s| s.underline())
+                                                .hover(gpui_kit::Styled::underline)
                                                 .child(name.clone())
                                                 .on_click(open_project(group.clone())),
                                         )
@@ -1141,7 +1144,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_control(
         &mut self,
         view: &SettingsView,
@@ -1194,6 +1196,7 @@ impl Workspace {
                     .into_any_element()
             }
             (Control::Slider { min, max, step, unit }, Some(key)) => {
+                #[expect(clippy::cast_possible_truncation, reason = "a slider position; f32 is plenty")]
                 let value = view.value(key).as_f64().unwrap_or_default() as f32;
                 let state = self.settings_slider(key, min, max, step, value, window, cx);
                 let preview = (key == "panelAnimationDurationMs").then(|| panel_preview(value, window, cx, &t));
@@ -1228,7 +1231,6 @@ impl Workspace {
 
     /// A select over JSON values that writes `key` through the scope; `trigger` is what the
     /// closed select shows.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn value_select(
         &self,
         id: impl Into<SharedString>,
@@ -1242,7 +1244,7 @@ impl Workspace {
         let current = current.clone();
         let options = options.into_iter().map(|(value, label)| (value.clone(), label, value == current)).collect();
         self.menu_select(id, options, trigger, width, cx, move |this, value, window, cx| {
-            this.update_settings(serde_json::json!({ key: value }), window, cx)
+            this.update_settings(serde_json::json!({ key: value }), window, cx);
         })
     }
 
@@ -1265,7 +1267,7 @@ impl Workspace {
                     let (value, on_pick) = (value.clone(), on_pick.clone());
                     menu = menu.item(PopupMenuItem::new(label.clone()).checked(*checked).on_click(
                         window.listener_for(&workspace, move |this, _, window, cx| {
-                            on_pick(this, value.clone(), window, cx)
+                            on_pick(this, value.clone(), window, cx);
                         }),
                     ));
                 }
@@ -1275,7 +1277,6 @@ impl Workspace {
     }
 
     /// The text field of a `.text()` or `.textarea()` row, writing through the scope.
-    #[allow(clippy::too_many_arguments)]
     fn setting_field(
         &mut self,
         id: &SharedString,
@@ -1287,12 +1288,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> super::fields::FieldInput {
         self.text_field(id, saved, placeholder, multiline, None, window, cx, move |this, text, window, cx| {
-            this.update_settings(serde_json::json!({ key: text }), window, cx)
+            this.update_settings(serde_json::json!({ key: text }), window, cx);
         })
     }
 
     /// The slider entity for `key`, kept in sync with the setting while it is not being dragged.
-    #[allow(clippy::too_many_arguments)]
     fn settings_slider(
         &mut self,
         key: &'static str,
@@ -1314,8 +1314,10 @@ impl Workspace {
         let subscription = cx.subscribe_in(&state, window, move |this, _, event: &SliderEvent, window, cx| {
             let SliderEvent::Change(value) = event else { return };
             let value = value.start().round();
-            if this.settings_view().value(key).as_f64() != Some(value as f64) {
-                this.update_settings(serde_json::json!({ key: value as i64 }), window, cx);
+            if this.settings_view().value(key).as_f64() != Some(f64::from(value)) {
+                #[expect(clippy::cast_possible_truncation, reason = "the slider steps in whole numbers")]
+                let whole = value as i64;
+                this.update_settings(serde_json::json!({ key: whole }), window, cx);
             }
         });
         self.settings_ui.sliders.insert(key, (state.clone(), subscription));
@@ -1336,7 +1338,7 @@ impl Workspace {
                 let centered = viewport.center().y - bounds.center().y;
                 scroll.set_offset(gpui_kit::point(offset.x, (offset.y + centered).min(px(0.))));
             },
-            |_, _, _, _| {},
+            |_, (), _, _| {},
         )
         .absolute()
         .size_full()
@@ -1425,7 +1427,7 @@ impl Workspace {
                 .into_any_element()
         };
         let environment_menu = {
-            let (search, workspace) = (search.clone(), workspace.clone());
+            let (search, workspace) = (search.clone(), workspace);
             scope_trigger("settings-scope-environment", None, environment_label, &t).dropdown_menu_with_anchor(
                 gpui_kit::Anchor::TopLeft,
                 move |menu, _, _| {
@@ -1788,11 +1790,16 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
     let body = if toggles == 0 || duration_ms <= 0. {
         sketch(target).into_any_element()
     } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a positive animation length in ms; `as` saturates"
+        )]
+        let duration = std::time::Duration::from_millis(duration_ms as u64);
         sketch(target)
             .with_animation(
                 ElementId::NamedInteger("panel-preview".into(), toggles as u64),
-                Animation::new(std::time::Duration::from_millis(duration_ms as u64))
-                    .with_easing(|d| 1. - (1. - d) * (1. - d)),
+                Animation::new(duration).with_easing(|d| 1. - (1. - d) * (1. - d)),
                 move |_, delta| sketch(if closed { 1. - delta } else { delta }),
             )
             .into_any_element()
@@ -1817,7 +1824,7 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
                 preview.closed = !preview.closed;
                 preview.toggles += 1;
                 cx.notify();
-            })
+            });
         })
         .child(body)
         .into_any_element()

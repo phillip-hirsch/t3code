@@ -18,6 +18,9 @@ use super::{Target, Workspace};
 use crate::inbox::Status;
 use crate::notifications::{Alert, Kind, Mode, ThreadAlerts};
 
+/// A click that needs the window, shared by the toast and the system notification.
+type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// In-app thread toasts. Each has its own id, so several stack as the web's do.
 struct ThreadToast;
 /// OS notifications, one per thread.
@@ -62,7 +65,7 @@ impl Workspace {
         }
         let workspace = cx.weak_entity();
         let thread_id = alert.thread_id.clone();
-        let open_thread: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+        let open_thread: Callback = Rc::new(move |window, cx| {
             let _ = workspace.update(cx, |this, cx| {
                 this.close_settings(cx);
                 this.select_thread(thread_id.clone(), window, cx);

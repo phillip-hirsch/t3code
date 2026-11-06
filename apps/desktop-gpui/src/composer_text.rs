@@ -3,6 +3,7 @@
 //! (`packages/shared/src/composerTrigger.ts`, `composerInlineTokens.ts`) and
 //! prompt history (`composerPromptHistory.ts`). Offsets are UTF-8 bytes.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub fn is_currency(c: char) -> bool {
 /// The completion the caret is in, if any.
 pub fn detect(text: &str, cursor: usize) -> Option<Trigger> {
     let cursor = text.floor_char_boundary(cursor);
-    let start = text[..cursor].rfind(is_space).map(|i| i + 1).unwrap_or(0);
+    let start = text[..cursor].rfind(is_space).map_or(0, |i| i + 1);
     let token = &text[start..cursor];
     let trigger = |kind, query: &str| Some(Trigger { kind, query: query.to_owned(), range: start..cursor });
     if let Some(query) = token.strip_prefix('/') {
@@ -97,7 +98,7 @@ fn encode_destination(path: &str) -> String {
         if byte.is_ascii_alphanumeric() || ";,/:@&=+$-_.!~*'".contains(c) {
             out.push(c);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -363,7 +364,7 @@ fn group_thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

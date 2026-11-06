@@ -60,7 +60,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
     cx.on_action(|_: &QuitApp, cx| cx.quit());
     cx.on_action(|_: &BringAllToFront, cx| cx.activate(true));
-    cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
+    cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, gpui_kit::Window::remove_window));
     cx.on_action(|_: &ToggleFullScreen, cx| with_active_window(cx, |window| window.toggle_fullscreen()));
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
@@ -78,7 +78,7 @@ pub fn init(cx: &mut App) {
                 &["OK"],
                 cx,
             ));
-        })
+        });
     });
     cx.set_menus(menus());
 }

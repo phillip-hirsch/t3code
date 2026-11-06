@@ -34,7 +34,8 @@ fn running(status: &str) -> bool {
 
 /// `isDetailDone`: the thread's own stream is live and has no run in flight.
 fn settled(state: &ThreadState) -> bool {
-    state.deleted || (state.live && !state.projection.as_ref().is_some_and(|p| p.is_running()))
+    state.deleted
+        || (state.live && !state.projection.as_ref().is_some_and(super::super::model::ThreadProjection::is_running))
 }
 
 impl Workspace {

@@ -889,18 +889,21 @@ pub fn conversations(comments: &[Comment], threads: &[ReviewThread]) -> Vec<Conv
             .comments
             .iter()
             .map(|c| {
-                by_id.get(c.id.as_str()).map(|c| (*c).clone()).unwrap_or_else(|| Comment {
-                    id: c.id.clone(),
-                    kind: "review-comment".into(),
-                    author: c.author.clone(),
-                    body: c.body.clone(),
-                    created_at: c.created_at.clone(),
-                    url: c.url.clone(),
-                    path: Some(thread.path.clone()),
-                    review_state: None,
-                    reactions: c.reactions.clone(),
-                    can_edit: c.can_edit,
-                })
+                by_id.get(c.id.as_str()).map_or_else(
+                    || Comment {
+                        id: c.id.clone(),
+                        kind: "review-comment".into(),
+                        author: c.author.clone(),
+                        body: c.body.clone(),
+                        created_at: c.created_at.clone(),
+                        url: c.url.clone(),
+                        path: Some(thread.path.clone()),
+                        review_state: None,
+                        reactions: c.reactions.clone(),
+                        can_edit: c.can_edit,
+                    },
+                    |c| (*c).clone(),
+                )
             })
             .collect();
         ordered.sort_by_key(|c| instant(&c.created_at).unwrap_or(0));
@@ -1075,7 +1078,7 @@ pub fn build_timeline(detail: &Detail, activity: &Activity, term: &str) -> Vec<E
 /// A Timeline row: one event, or a run of plain comments folded together.
 #[derive(Clone, Debug)]
 pub enum TimelineRow {
-    Event(Event),
+    Event(Box<Event>),
     Comments(Vec<Event>),
 }
 
@@ -1089,7 +1092,7 @@ pub fn group_timeline(events: Vec<Event>) -> Vec<TimelineRow> {
         match (plain, rows.last_mut()) {
             (true, Some(TimelineRow::Comments(run))) => run.push(event),
             (true, _) => rows.push(TimelineRow::Comments(vec![event])),
-            (false, _) => rows.push(TimelineRow::Event(event)),
+            (false, _) => rows.push(TimelineRow::Event(Box::new(event))),
         }
     }
     rows
@@ -1552,15 +1555,21 @@ pub fn stop_subline(stop: &GuideStop) -> String {
 
 /// `noteMarker`: A to Z, then numbers.
 pub fn note_marker(index: usize) -> String {
-    if index < 26 { char::from(b'A' + index as u8).to_string() } else { (index + 1).to_string() }
+    match u8::try_from(index) {
+        Ok(letter) if letter < 26 => char::from(b'A' + letter).to_string(),
+        _ => (index + 1).to_string(),
+    }
 }
 
+/// A line number and its notes' markers and titles.
+pub type NoteLine = (u64, Vec<(String, String)>);
+
 /// `letterStopNotes`' per-excerpt half: for each excerpt, the lines that carry notes and their markers.
-pub fn excerpt_note_lines(stop: &GuideStop) -> Vec<Vec<(u64, Vec<(String, String)>)>> {
+pub fn excerpt_note_lines(stop: &GuideStop) -> Vec<Vec<NoteLine>> {
     stop.excerpts
         .iter()
         .map(|excerpt| {
-            let mut lines: Vec<(u64, Vec<(String, String)>)> = Vec::new();
+            let mut lines: Vec<NoteLine> = Vec::new();
             for (index, note) in stop.notes.iter().enumerate() {
                 if note.path != excerpt.path || note.line < excerpt.start || note.line > excerpt.end {
                     continue;
@@ -1743,12 +1752,12 @@ mod tests {
     #[test]
     fn editing_follows_the_hosts_answer_then_authorship() {
         let caps = json!({"actions": [], "mergeMethods": [], "edit": {"changeRequest": true, "comment": true}});
-        let mine = detail(json!({"capabilities": caps.clone(), "viewer": "OctoCat", "author": {"login": "octocat"}}));
+        let mine = detail(json!({"capabilities": caps, "viewer": "OctoCat", "author": {"login": "octocat"}}));
         assert!(can_edit_change_request(&mine), "the author, in any case");
-        let theirs = detail(json!({"capabilities": caps.clone(), "viewer": "me", "author": {"login": "you"}}));
+        let theirs = detail(json!({"capabilities": caps, "viewer": "me", "author": {"login": "you"}}));
         assert!(can_edit_change_request(&theirs), "someone who may merge");
         let refused = detail(json!({
-            "capabilities": caps.clone(), "viewer": "octocat", "author": {"login": "octocat"},
+            "capabilities": caps, "viewer": "octocat", "author": {"login": "octocat"},
             "viewerPermissions": {"actions": ["merge"], "editChangeRequest": false},
         }));
         assert!(!can_edit_change_request(&refused), "the host's own answer wins");

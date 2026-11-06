@@ -47,7 +47,7 @@ fn preview(prompt: &str, attachments: usize) -> String {
             text.replace_range(range, &label);
         }
     }
-    let line = text.trim().split('\n').next().unwrap_or_default().to_owned();
+    let line = text.trim().lines().next().unwrap_or_default().to_owned();
     if !line.is_empty() {
         return line;
     }
@@ -205,7 +205,7 @@ impl Workspace {
                 move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
                         if let Some(target) = target.clone() {
-                            this.discard_draft(target, window, cx)
+                            this.discard_draft(target, window, cx);
                         }
                     });
                 },
@@ -233,15 +233,15 @@ impl Workspace {
             .rounded(px(6.))
             .cursor_pointer()
             .invisible()
-            .group_hover(ROW_GROUP, |s| s.visible())
+            .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
             .text_color(tokens.muted_foreground)
             .hover(|s| s.text_color(tokens.foreground))
             .tooltip(tooltip("Discard draft"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 if let Some(target) = target.clone() {
-                    this.discard_draft(target, window, cx)
-                };
+                    this.discard_draft(target, window, cx);
+                }
             }))
             .child(Icon::new(IconName::X).size(px(12.)));
         let open_id = project_id.clone();

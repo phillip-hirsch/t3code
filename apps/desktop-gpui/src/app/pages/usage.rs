@@ -55,7 +55,7 @@ pub(in crate::app) struct UsageState {
     chart: RefCell<Option<Rc<ChartData>>>,
     /// The limit pools and what they were built from: each environment's config revision,
     /// the hidden drivers, `limits_now`.
-    pools: Option<(PoolsKey, Rc<Vec<Pool>>)>,
+    pools: Option<(PoolsKey, Rc<[Pool]>)>,
 }
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
@@ -71,7 +71,7 @@ pub(in crate::app) struct ChartData {
     ticks: Vec<f64>,
     step_x: f32,
     /// Each provider's slot, curve and total, the largest total first.
-    series: Rc<Vec<(usize, Vec<logic::Segment>, f64)>>,
+    series: Rc<[(usize, Vec<logic::Segment>, f64)]>,
 }
 
 impl ChartData {
@@ -108,7 +108,7 @@ impl ChartData {
             max,
             ticks,
             step_x,
-            series: Rc::new(series),
+            series: Rc::from(series),
         }
     }
 }
@@ -598,7 +598,7 @@ impl Workspace {
             .child(provider_label)
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.6, ..t.muted_foreground }))
             .dropdown_menu({
-                let view = view.clone();
+                let view = view;
                 move |mut menu, window, _| {
                     let none_hidden = hidden.is_empty();
                     menu =
@@ -609,7 +609,7 @@ impl Workspace {
                                 } else {
                                     Vec::new()
                                 };
-                                this.set_hidden_usage_providers(next, cx)
+                                this.set_hidden_usage_providers(next, cx);
                             }),
                         ))
                         .separator();
@@ -628,7 +628,7 @@ impl Workspace {
                                 }
                                 None => next.push(kind.to_owned()),
                             }
-                            this.set_hidden_usage_providers(next, cx)
+                            this.set_hidden_usage_providers(next, cx);
                         })));
                     }
                     menu
@@ -641,7 +641,7 @@ impl Workspace {
             usage.days,
             t,
             cx,
-            |this, days, cx| this.select_usage_window(days, cx),
+            super::super::Workspace::select_usage_window,
         );
         let metrics = segmented(
             "usage-metric",
@@ -649,7 +649,7 @@ impl Workspace {
             usage.metric,
             t,
             cx,
-            |this, metric, cx| this.select_usage_metric(metric, cx),
+            super::super::Workspace::select_usage_metric,
         );
         let disabled = usage.refreshing || (!limits && !usage.environment_selected);
         h_flex()
@@ -712,7 +712,7 @@ impl Workspace {
     }
 
     /// The limit pools, rebuilt only when the server config, the hidden drivers or the clock moved.
-    fn limit_pools(&mut self) -> Rc<Vec<Pool>> {
+    fn limit_pools(&mut self) -> Rc<[Pool]> {
         let environments = self.limit_environments();
         let revisions = environments.iter().map(|(id, _, info)| (id.clone(), info.revision)).collect();
         let key = (revisions, self.usage.hidden.clone(), self.usage.limits_now);
@@ -722,7 +722,7 @@ impl Workspace {
             return pools.clone();
         }
         let accounts = logic::limit_accounts(&limit_inputs(&environments), &self.usage.hidden_drivers());
-        let pools = Rc::new(logic::limit_pools(accounts, self.usage.limits_now));
+        let pools: Rc<[Pool]> = Rc::from(logic::limit_pools(accounts, self.usage.limits_now));
         self.usage.pools = Some((key, pools.clone()));
         pools
     }
@@ -1040,7 +1040,7 @@ impl Workspace {
                 let cell = bounds_cell.clone();
                 move |bounds, _, _| cell.set(Some(bounds))
             },
-            move |bounds, _, window, _| {
+            move |bounds, (), window, _| {
                 let at = |x: f32, y: f32| {
                     point(
                         bounds.origin.x + bounds.size.width * (x / logic::VIEW_WIDTH),
@@ -1185,7 +1185,7 @@ impl Workspace {
                         .child(plot)
                         .children(tooltip)
                         .on_mouse_move({
-                            let cell = bounds_cell.clone();
+                            let cell = bounds_cell;
                             cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                                 let Some(bounds) = cell.get() else { return };
                                 if period_count == 0 || !bounds.contains(&event.position) {
@@ -1193,6 +1193,11 @@ impl Workspace {
                                 }
                                 let local = event.position - bounds.origin;
                                 let fraction = (local.x / bounds.size.width).clamp(0., 1.);
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_sign_loss,
+                                    reason = "an index into the periods: fraction is 0..=1"
+                                )]
                                 let index = (fraction * (period_count - 1) as f32).round() as usize;
                                 let next = Some((index, local.x, local.y));
                                 if this.usage.hover != next {
@@ -1256,7 +1261,52 @@ impl Workspace {
         };
         let row_border = Hsla { a: t.border.a * 0.5, ..t.border };
         let mut table = v_flex().text_sm();
-        if !by_time {
+        if by_time {
+            let periods: Vec<&logic::Period> =
+                if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
+            let cell = |child: String| div().flex_1().flex().justify_end().pl(px(16.)).child(child);
+            table = table.child(
+                h_flex()
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(head_cell(if hourly { "Hour" } else { "Day" }.into()).w(relative(0.4)).pl(px(8.)))
+                    .children(providers.iter().map(|p| {
+                        cell(logic::provider_label(p).to_owned()).py(px(8.)).text_xs().text_color(t.muted_foreground)
+                    }))
+                    .child(cell("Total".into()).py(px(8.)).text_xs().text_color(t.muted_foreground))
+                    .child(cell("Tokens".into()).pr(px(8.)).py(px(8.)).text_xs().text_color(t.muted_foreground)),
+            );
+            if periods.is_empty() {
+                table = table.child(empty());
+            }
+            for period in periods {
+                let label = match period.hour_ms {
+                    Some(ms) => logic::format_hour_short(ms, &Local),
+                    None => logic::format_day_short(&period.day),
+                };
+                table =
+                    table.child(
+                        h_flex()
+                            .id(ElementId::Name(
+                                format!("usage-period-{}-{}", period.day, period.hour_ms.unwrap_or(0)).into(),
+                            ))
+                            .py(px(8.))
+                            .border_b_1()
+                            .border_color(row_border)
+                            .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
+                            .child(div().w(relative(0.4)).pl(px(8.)).text_color(t.foreground).child(label))
+                            .children(providers.iter().map(|p| {
+                                cell(logic::format_usd(period.value(p, false))).text_color(t.muted_foreground)
+                            }))
+                            .child(cell(logic::format_usd(period.cost_usd)).text_color(t.foreground))
+                            .child(
+                                cell(logic::format_tokens(period.total_tokens as f64))
+                                    .pr(px(8.))
+                                    .text_color(t.muted_foreground),
+                            ),
+                    );
+            }
+        } else {
             let models = if tokens { logic::models_by_tokens(&merged.models) } else { merged.models.iter().collect() };
             let peak =
                 models.iter().fold(0f64, |max, m| max.max(if tokens { m.total_tokens as f64 } else { m.cost_usd }));
@@ -1275,6 +1325,7 @@ impl Workspace {
             }
             for (index, model) in models.iter().enumerate() {
                 let value = if tokens { model.total_tokens as f64 } else { model.cost_usd };
+                #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 share; f32 is what GPUI lays out with")]
                 let bar = (value > 0. && peak > 0.).then(|| (value / peak) as f32);
                 let share = model.share(tokens).map(logic::format_percent).unwrap_or_default();
                 table = table.child(
@@ -1326,51 +1377,6 @@ impl Workspace {
                                 .child(logic::format_tokens(model.total_tokens as f64)),
                         ),
                 );
-            }
-        } else {
-            let periods: Vec<&logic::Period> =
-                if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
-            let cell = |child: String| div().flex_1().flex().justify_end().pl(px(16.)).child(child);
-            table = table.child(
-                h_flex()
-                    .border_b_1()
-                    .border_color(t.border)
-                    .child(head_cell(if hourly { "Hour" } else { "Day" }.into()).w(relative(0.4)).pl(px(8.)))
-                    .children(providers.iter().map(|p| {
-                        cell(logic::provider_label(p).to_owned()).py(px(8.)).text_xs().text_color(t.muted_foreground)
-                    }))
-                    .child(cell("Total".into()).py(px(8.)).text_xs().text_color(t.muted_foreground))
-                    .child(cell("Tokens".into()).pr(px(8.)).py(px(8.)).text_xs().text_color(t.muted_foreground)),
-            );
-            if periods.is_empty() {
-                table = table.child(empty());
-            }
-            for period in periods {
-                let label = match period.hour_ms {
-                    Some(ms) => logic::format_hour_short(ms, &Local),
-                    None => logic::format_day_short(&period.day),
-                };
-                table =
-                    table.child(
-                        h_flex()
-                            .id(ElementId::Name(
-                                format!("usage-period-{}-{}", period.day, period.hour_ms.unwrap_or(0)).into(),
-                            ))
-                            .py(px(8.))
-                            .border_b_1()
-                            .border_color(row_border)
-                            .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
-                            .child(div().w(relative(0.4)).pl(px(8.)).text_color(t.foreground).child(label))
-                            .children(providers.iter().map(|p| {
-                                cell(logic::format_usd(period.value(p, false))).text_color(t.muted_foreground)
-                            }))
-                            .child(cell(logic::format_usd(period.cost_usd)).text_color(t.foreground))
-                            .child(
-                                cell(logic::format_tokens(period.total_tokens as f64))
-                                    .pr(px(8.))
-                                    .text_color(t.muted_foreground),
-                            ),
-                    );
             }
         }
         v_flex().gap(px(12.)).child(header).child(table)
@@ -1552,11 +1558,13 @@ fn share_bar(
                 let text: SharedString =
                     format!("{name} · {} · {}", format(*value), logic::format_percent(value / total)).into();
                 let radius = |first: bool| if first { px(999.) } else { px(2.) };
+                #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 share; f32 is what GPUI lays out with")]
+                let share = (value / total) as f32;
                 div()
                     .id(ElementId::Name(format!("share-{label}-{name}").into()))
                     .h_full()
                     .min_w(px(4.))
-                    .flex_basis(relative((value / total) as f32))
+                    .flex_basis(relative(share))
                     .flex_shrink(1.)
                     .bg(*color)
                     .rounded_tl(radius(index == 0))
@@ -1725,7 +1733,6 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
-#[expect(clippy::too_many_arguments, reason = "render helper; the arguments are its render context")]
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
@@ -1841,7 +1848,7 @@ fn pool_segment(
             let (view, key, name) = (view.clone(), account.key.clone(), account.name());
             el.on_click(move |_, window, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx)
+                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx);
                 });
             })
         })

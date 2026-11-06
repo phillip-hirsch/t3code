@@ -38,6 +38,11 @@ use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
+/// Runs with the new account's instance id and label once it is created.
+type OnCreated = Rc<dyn Fn(String, String, &mut Window, &mut App)>;
+/// A click that needs the window.
+type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
+
 pub(in crate::app) const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/#settings/Usage";
 const MULTIPLE_ACCOUNTS_FAQ_URL: &str =
     "https://github.com/pingdotgg/t3code/blob/main/docs/user/faq.md#can-i-add-a-bunch-of-accounts-for-one-provider";
@@ -217,7 +222,7 @@ fn redacted_placeholder(value: &str) -> String {
             }
             state = (state ^ (state >> 13)).wrapping_mul(0x85eb_ca6b);
             state = (state ^ (state >> 16)).wrapping_mul(0xc2b2_ae35);
-            ALPHABET[((state as i32).unsigned_abs() as usize) % ALPHABET.len()] as char
+            ALPHABET[state.cast_signed().unsigned_abs() as usize % ALPHABET.len()] as char
         })
         .collect()
 }
@@ -463,7 +468,7 @@ impl Workspace {
     pub(in crate::app) fn open_add_codex_account_dialog(
         &mut self,
         scope: Option<SharedString>,
-        on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+        on_created: Option<OnCreated>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -655,7 +660,7 @@ enum FollowUp {
 
 /// Options of the managed setup shown inside the add-account wizard.
 struct WizardSetup {
-    on_cancelled: Rc<dyn Fn(&mut Window, &mut App)>,
+    on_cancelled: Callback,
 }
 
 pub(in crate::app) struct AccountSection {
@@ -998,14 +1003,14 @@ impl AccountSection {
                         div()
                             .min_w_0()
                             .font_weight(FontWeight::MEDIUM)
-                            .when(bold_break, |el| el.truncate())
+                            .when(bold_break, gpui_kit::Styled::truncate)
                             .child(label),
                     )
                     .on_click(move |_, _, cx| {
                         picked.update(cx, |this, cx| {
                             this.picker_selection = Some(value.clone());
                             cx.notify();
-                        })
+                        });
                     })
             };
             let confirm = section.clone();
@@ -1066,7 +1071,7 @@ impl AccountSection {
             "response": response,
         });
         self.run("provider.auth.respond", payload, "Provider sign-in failed. Try again.", cx, move |this, _, cx| {
-            on_sent(this, cx)
+            on_sent(this, cx);
         });
     }
 
@@ -1147,7 +1152,7 @@ impl AccountSection {
                 (field.name.clone(), Value::String(value))
             })
             .collect();
-        self.respond(json!({ "type": "credentials", "values": values }), cx, |this, cx| this.clear_drafts(cx));
+        self.respond(json!({ "type": "credentials", "values": values }), cx, AccountSection::clear_drafts);
     }
 
     fn submit_callback(&mut self, cx: &mut Context<Self>) {
@@ -1544,7 +1549,7 @@ impl AccountSection {
                             .ghost()
                             .disabled(read_only || view.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_setup_mode("existing", &instance, &driver, cx)
+                                this.set_setup_mode("existing", &instance, &driver, cx);
                             })),
                     )
                 })
@@ -1731,7 +1736,7 @@ impl AccountSection {
 
         let mut control = h_flex().gap_1p5().flex_wrap();
         if !active && methods.as_ref().is_some_and(|m| m.len() > 1) {
-            let methods = methods.clone().unwrap_or_default();
+            let methods = methods.unwrap_or_default();
             let current = methods
                 .iter()
                 .find(|m| m.id == self.method_id)
@@ -1757,7 +1762,7 @@ impl AccountSection {
                                 section.update(cx, |this, cx| {
                                     this.method_id = id.clone();
                                     cx.notify();
-                                })
+                                });
                             }));
                         }
                         menu
@@ -1933,7 +1938,7 @@ impl AccountSection {
             || error.is_some();
 
         settings_row(&t, "Account", Some(description), Some(control.into_any_element()))
-            .when(has_details, |el| el.pb_1())
+            .when(has_details, gpui_kit::Styled::pb_1)
             .when_some(status_message, |el, status| {
                 el.child(div().px_4().pt_0p5().text_xs().text_color(t.muted_foreground).child(status))
             })
@@ -2031,7 +2036,7 @@ struct AddCodexAccount {
     name: Entity<InputState>,
     pending: bool,
     created: Option<(String, Entity<AccountSection>)>,
-    on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+    on_created: Option<OnCreated>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2039,7 +2044,7 @@ impl AddCodexAccount {
     fn new(
         workspace: WeakEntity<Workspace>,
         scope: Option<SharedString>,
-        on_created: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+        on_created: Option<OnCreated>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2094,8 +2099,7 @@ impl AddCodexAccount {
                             window.close_dialog(cx);
                         }
                         None => {
-                            let close: Rc<dyn Fn(&mut Window, &mut App)> =
-                                Rc::new(|window, cx| window.close_dialog(cx));
+                            let close: Callback = Rc::new(gpui_kit::component::WindowExt::close_dialog);
                             let (workspace, scope) = (this.workspace.clone(), this.scope.clone());
                             let section_id = id.clone();
                             let wizard = Some(WizardSetup { on_cancelled: close });

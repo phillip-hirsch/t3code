@@ -62,14 +62,14 @@ pub(in crate::app) struct FileOverlay {
     target: Option<ProjectTarget>,
     search: Search,
     highlight: usize,
-    picks: Rc<Vec<PickerMatch>>,
+    picks: Rc<[PickerMatch]>,
     picker_scroll: UniformListScrollHandle,
     case_sensitive: bool,
     whole_word: bool,
     use_regex: bool,
-    matches: Rc<Vec<ContentMatch>>,
-    groups: Rc<Vec<(String, Vec<usize>)>>,
-    rows: Rc<Vec<ContentRow>>,
+    matches: Rc<[ContentMatch]>,
+    groups: Rc<[(String, Vec<usize>)]>,
+    rows: Rc<[ContentRow]>,
     truncated: bool,
     invalid_regex: bool,
     content_list: ListState,
@@ -90,9 +90,9 @@ impl FileOverlay {
             rows.push(ContentRow::Gap);
         }
         self.content_list.reset(rows.len());
-        self.matches = Rc::new(matches);
-        self.groups = Rc::new(groups);
-        self.rows = Rc::new(rows);
+        self.matches = Rc::from(matches);
+        self.groups = Rc::from(groups);
+        self.rows = Rc::from(rows);
         self.highlight = 0;
     }
 
@@ -243,7 +243,8 @@ impl Workspace {
                         overlay.search.error = None;
                         match overlay.mode {
                             OverlayMode::Files => {
-                                overlay.picks = Rc::new(logic::picker_matches(&logic::entries_from_json(&value), &raw));
+                                overlay.picks =
+                                    Rc::from(logic::picker_matches(&logic::entries_from_json(&value), &raw));
                                 overlay.highlight = 0;
                                 overlay.picker_scroll.scroll_to_item(0, ScrollStrategy::Top);
                             }
@@ -319,7 +320,7 @@ impl Workspace {
                 };
                 match overlay.mode {
                     OverlayMode::Files => {
-                        overlay.picker_scroll.scroll_to_item(overlay.highlight, ScrollStrategy::Nearest)
+                        overlay.picker_scroll.scroll_to_item(overlay.highlight, ScrollStrategy::Nearest);
                     }
                     OverlayMode::Content => {
                         if let Some(row) = overlay.row_of_match(overlay.highlight) {

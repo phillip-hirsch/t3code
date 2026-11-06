@@ -58,13 +58,17 @@ impl Render for CustomSnoozeForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *crate::theme::tokens(cx);
         let toggle = |id: &'static str, label: &'static str, on: bool, duration: bool, cx: &mut Context<Self>| {
-            Button::new(id).label(label).small().flex_1().selected(on).when(!on, |b| b.ghost()).on_click(cx.listener(
-                move |this, _, _, cx| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .flex_1()
+                .selected(on)
+                .when(!on, gpui_kit::component::button::ButtonVariants::ghost)
+                .on_click(cx.listener(move |this, _, _, cx| {
                     this.duration = duration;
                     this.error = None;
                     cx.notify();
-                },
-            ))
+                }))
         };
         let field = |label: &'static str, input: gpui_kit::AnyElement| {
             v_flex()
@@ -79,7 +83,7 @@ impl Render for CustomSnoozeForm {
                 .label(unit.label())
                 .small()
                 .selected(unit == current)
-                .when(unit != current, |b| b.ghost())
+                .when(unit != current, gpui_kit::component::button::ButtonVariants::ghost)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.unit = unit;
                     this.error = None;

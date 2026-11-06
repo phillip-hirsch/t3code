@@ -493,7 +493,8 @@ impl Catalog {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().context("No T3 home directory.")?;
-        crate::settings::write_atomically(&path, &self.document()?).with_context(|| format!("writing {path:?}"))
+        crate::settings::write_atomically(&path, &self.document()?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn get(&self, environment_id: &str) -> Option<&SavedEnvironment> {
@@ -520,7 +521,7 @@ pub fn validate_label(label: &str) -> Result<String, &'static str> {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.is_empty() || text.len() % 2 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
@@ -572,8 +573,10 @@ pub struct ConnectionState {
 }
 
 /// `retryDelayMs`: exponential from 1 s to 5 min, half of it jittered by `random` in 0..=1.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a delay capped at the maximum backoff")]
 pub fn retry_delay_ms(failure_count: u32, random: f64) -> u64 {
-    let ceiling = RETRY_MAX_DELAY_MS.min(RETRY_BASE_DELAY_MS * 2f64.powi(failure_count.min(30) as i32 + 1));
+    let ceiling =
+        RETRY_MAX_DELAY_MS.min(RETRY_BASE_DELAY_MS * 2f64.powi(i32::try_from(failure_count.min(30)).unwrap_or(30) + 1));
     (ceiling / 2. + ceiling / 2. * random).round() as u64
 }
 
@@ -928,7 +931,7 @@ mod tests {
         assert!(!document.to_string().contains("secret-token"));
         assert_eq!(Catalog::from_document(&document), catalog);
         // An unreadable credential keeps the entry, without its token.
-        let mut tampered = document.clone();
+        let mut tampered = document;
         tampered["environments"][0]["encryptedToken"] = json!("00ff");
         assert_eq!(Catalog::from_document(&tampered).environments[0].token, None);
         assert_eq!(Catalog::from_document(&json!({})), Catalog::default());

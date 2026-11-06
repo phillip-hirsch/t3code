@@ -106,7 +106,7 @@ pub struct Extension {
 }
 
 fn short_hash(value: &str) -> String {
-    Sha256::digest(value.as_bytes())[..6].iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::hex::lower_hex(&Sha256::digest(value.as_bytes())[..6])
 }
 
 fn theme_id(extension_id: &str, source: &str) -> String {
@@ -347,7 +347,7 @@ impl<'a> Zip<'a> {
     fn open(bytes: &'a [u8]) -> Result<Self, String> {
         let invalid = || "That extension package has an invalid ZIP directory.".to_owned();
         let u16_at = |at: usize| bytes.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
-        let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64);
+        let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])));
         let minimum = bytes.len().saturating_sub(65_557);
         let mut end = bytes.len().checked_sub(22).ok_or("That extension package has no ZIP directory.")?;
         while u32_at(end) != Some(0x06054b50) || end + 22 + u16_at(end + 20).unwrap_or(0) != bytes.len() {
@@ -356,8 +356,8 @@ impl<'a> Zip<'a> {
             }
             end -= 1;
         }
-        let size = u32_at(end + 12).ok_or_else(invalid)? as usize;
-        let start = u32_at(end + 16).ok_or_else(invalid)? as usize;
+        let size = usize::try_from(u32_at(end + 12).ok_or_else(invalid)?).map_err(|_| invalid())?;
+        let start = usize::try_from(u32_at(end + 16).ok_or_else(invalid)?).map_err(|_| invalid())?;
         if start + size != end {
             return Err(invalid());
         }
@@ -392,10 +392,10 @@ impl<'a> Zip<'a> {
             entries.insert(
                 name,
                 ZipEntry {
-                    method: u16_at(offset + 10).ok_or_else(invalid)? as u16,
-                    compressed: compressed as usize,
-                    uncompressed: uncompressed as usize,
-                    local_offset: u32_at(offset + 42).ok_or_else(invalid)? as usize,
+                    method: u16::try_from(u16_at(offset + 10).ok_or_else(invalid)?).map_err(|_| invalid())?,
+                    compressed: usize::try_from(compressed).map_err(|_| invalid())?,
+                    uncompressed: usize::try_from(uncompressed).map_err(|_| invalid())?,
+                    local_offset: usize::try_from(u32_at(offset + 42).ok_or_else(invalid)?).map_err(|_| invalid())?,
                 },
             );
             offset += 46 + name_length + extra + comment;
@@ -633,7 +633,7 @@ pub async fn import(extension: Extension) -> Result<Vec<ThemeDefinition>, String
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("That Open VSX theme has an invalid checksum.".to_owned());
         }
-        let actual: String = Sha256::digest(&package).iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual = crate::hex::lower_hex(&Sha256::digest(&package));
         if !actual.eq_ignore_ascii_case(&expected) {
             return Err("That Open VSX theme failed its integrity check.".to_owned());
         }
@@ -651,6 +651,7 @@ mod tests {
     use super::*;
 
     /// A ZIP with deflated entries, as `vsce` packs them.
+    #[expect(clippy::cast_possible_truncation, reason = "test archives are a few bytes")]
     fn zip(files: &[(&str, &str)]) -> Vec<u8> {
         let (mut out, mut directory) = (Vec::new(), Vec::new());
         for (name, text) in files {

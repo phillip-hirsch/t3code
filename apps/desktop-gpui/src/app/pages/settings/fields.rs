@@ -20,7 +20,6 @@ impl Workspace {
     /// A text field kept across frames, synced to `saved` and committing trimmed text on blur
     /// or Enter when it was edited (`DraftInput` and the uncontrolled `Textarea`s in the web).
     /// `normalize` rewrites each change from the previous text, as `resolvePastedPath` does.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn text_field(
         &mut self,
         key: &str,
@@ -49,7 +48,6 @@ impl Workspace {
         self.field(key, "", placeholder, FieldKind::Secret, None, window, cx, on_commit)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn field(
         &mut self,
         key: &str,
@@ -84,7 +82,6 @@ impl Workspace {
 
     /// A whole-number stepper kept across frames (`NumberField`): typing stays local until
     /// blur, Enter or a `step` commits it, clamped to `min..=max`; anything else reverts.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn number_field(
         &mut self,
         key: &str,
@@ -169,6 +166,7 @@ impl NumberField {
 
 /// A typed number rounded to a whole one; `None` (keep the saved value) when it isn't a
 /// finite number. Out-of-range values saturate, and the field's clamp then applies.
+#[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
 fn parse_number(typed: &str) -> Option<i64> {
     let typed = typed.trim().parse::<f64>().ok().filter(|typed| typed.is_finite())?;
     Some(typed.round() as i64)
@@ -246,14 +244,14 @@ impl TextField {
         let (input, subscription) = if matches!(kind, FieldKind::Area) {
             let input = cx.new(|cx| TextareaState::new(window, cx).rows(4).placeholder(placeholder));
             let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                this.on_event(event, window, cx)
+                this.on_event(event, window, cx);
             });
             (FieldInput::Area(input), subscription)
         } else {
             let masked = matches!(kind, FieldKind::Secret);
             let input = cx.new(|cx| InputState::new(window, cx).masked(masked).placeholder(placeholder));
             let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                this.on_event(event, window, cx)
+                this.on_event(event, window, cx);
             });
             (FieldInput::Line(input), subscription)
         };

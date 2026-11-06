@@ -3,6 +3,7 @@
 //! custom models saved in the instance's `config.customModels`.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::InputEvent;
@@ -705,10 +706,10 @@ impl Workspace {
         // Toolbar: filter, bulk toggle and counts, add.
         let mut counts = format!("{} model{}", view.models.len(), if view.models.len() == 1 { "" } else { "s" });
         if favorite_count > 0 {
-            counts += &format!(" · {favorite_count} favorite{}", if favorite_count == 1 { "" } else { "s" });
+            let _ = write!(counts, " · {favorite_count} favorite{}", if favorite_count == 1 { "" } else { "s" });
         }
         if hidden_count > 0 {
-            counts += &format!(" · {hidden_count} hidden");
+            let _ = write!(counts, " · {hidden_count} hidden");
         }
         let bulk_id = row.id.clone();
         let add_page = page.clone();
@@ -716,7 +717,7 @@ impl Workspace {
             .flex_wrap()
             .justify_between()
             .gap_2()
-            .when_some(filter_input.clone(), |el, input| el.child(text_input(&input, Some(224.))))
+            .when_some(filter_input, |el, input| el.child(text_input(&input, Some(224.))))
             .child(
                 h_flex()
                     .gap_2()
@@ -750,7 +751,7 @@ impl Workspace {
                                 page.models.adding = true;
                                 page.models.focus_add = true;
                                 cx.notify();
-                            })
+                            });
                         })),
                 )
             });
@@ -868,7 +869,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::fn_params_excessive_bools, reason = "row facts its one caller computes per model")]
     fn render_model_row(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -1033,7 +1034,7 @@ impl Workspace {
                                 .size(px(20.))
                                 .tooltip("Edit name and options")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_custom_model_editor(&edit_page, &edit_id, &edit_slug, cx)
+                                    this.toggle_custom_model_editor(&edit_page, &edit_id, &edit_slug, cx);
                                 })),
                         )
                         .child(
@@ -1041,7 +1042,7 @@ impl Workspace {
                                 .size(px(20.))
                                 .tooltip("Remove custom model")
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.remove_custom_model(&remove_page, &remove_id, &remove_slug, window, cx)
+                                    this.remove_custom_model(&remove_page, &remove_id, &remove_slug, window, cx);
                                 })),
                         )
                     }),
@@ -1265,7 +1266,7 @@ impl Workspace {
                                 Some(preset) => descriptor_from_preset(preset, &mut || next_key()),
                                 None => EditorDescriptor { key: next_key(), id: String::new(), ..slot.clone() },
                             };
-                        })
+                        });
                     },
                 ));
             }
@@ -1287,7 +1288,7 @@ impl Workspace {
                             if let Some(d) = draft.descriptors.iter_mut().find(|d| d.key == key) {
                                 d.boolean = value.as_ref() == "boolean";
                             }
-                        })
+                        });
                     },
                 ))
                 .child(
@@ -1300,8 +1301,8 @@ impl Workspace {
                     .tooltip(format!("Remove option {}", index + 1))
                     .on_click(move |_, _, cx| {
                         Workspace::edit_draft(&remove_page, &remove_id, cx, |draft, _| {
-                            draft.descriptors.retain(|d| d.key != key)
-                        })
+                            draft.descriptors.retain(|d| d.key != key);
+                        });
                     }),
                 );
             let mut block = v_flex()
@@ -1352,7 +1353,7 @@ impl Workspace {
                                                             }
                                                         }
                                                     }
-                                                })
+                                                });
                                             },
                                         ),
                                     )
@@ -1371,7 +1372,7 @@ impl Workspace {
                                         if let Some(d) = draft.descriptors.iter_mut().find(|d| d.key == key) {
                                             d.choices.retain(|c| c.key != ckey);
                                         }
-                                    })
+                                    });
                                 }),
                             ),
                     );
@@ -1392,7 +1393,7 @@ impl Workspace {
                                         description: None,
                                     });
                                 }
-                            })
+                            });
                         }),
                 );
                 block = block.child(choices);
@@ -1408,8 +1409,8 @@ impl Workspace {
                     .icon(Icon::new(gpui_kit::assets::IconName::Plus).size(px(12.)))
                     .on_click(move |_, _, cx| {
                         Workspace::edit_draft(&add_page, &add_id, cx, |draft, next_key| {
-                            draft.descriptors.push(descriptor_from_preset(preset, &mut || next_key()))
-                        })
+                            draft.descriptors.push(descriptor_from_preset(preset, &mut || next_key()));
+                        });
                     }),
             );
         }
@@ -1427,8 +1428,8 @@ impl Workspace {
                             choices: vec![],
                             current_boolean: None,
                             description: None,
-                        })
-                    })
+                        });
+                    });
                 }),
         );
 
@@ -1442,12 +1443,12 @@ impl Workspace {
                 Workspace::edit_draft(&copy_page, &copy_id, cx, |draft, next_key| {
                     draft.descriptors =
                         descriptors_from_capabilities(model.capabilities.as_ref(), &driver, &mut || next_key());
-                })
+                });
             })
         });
 
         let (save_page, save_id, cancel_page, cancel_id, escape_page, escape_id) =
-            (page.clone(), instance_id.clone(), page.clone(), instance_id.clone(), page.clone(), instance_id.clone());
+            (page.clone(), instance_id.clone(), page.clone(), instance_id.clone(), page.clone(), instance_id);
         v_flex()
             .mx_2()
             .mt_1()
@@ -1498,7 +1499,7 @@ impl Workspace {
                 h_flex()
                     .gap_2()
                     .child(outline_button("cm-save", "Save").on_click(cx.listener(move |this, _, window, cx| {
-                        this.save_custom_model_editor(&save_page, &save_id, window, cx)
+                        this.save_custom_model_editor(&save_page, &save_id, window, cx);
                     })))
                     .child(
                         super::Button::new("cm-cancel").ghost().small().h(px(28.)).label("Cancel").on_click(

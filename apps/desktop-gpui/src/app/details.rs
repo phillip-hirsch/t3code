@@ -506,7 +506,7 @@ impl Workspace {
                     .child(div().ml(px(2.)).truncate().child("Add project script"))
                     .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_project_script_editor(&project_id, None, window, cx)
+                        this.open_project_script_editor(&project_id, None, window, cx);
                     }))
                     .into_any_element(),
             );
@@ -517,14 +517,14 @@ impl Workspace {
                 let command = command.clone();
                 menu = menu.item(PopupMenuItem::new(name.clone()).icon(icon("icons/play.svg")).on_click(
                     window.listener_for(&view, move |this, _, window, cx| {
-                        this.run_project_script(command.clone(), window, cx)
+                        this.run_project_script(command.clone(), window, cx);
                     }),
                 ));
             }
             let project_id = project_id.clone();
             menu.separator().item(PopupMenuItem::new("Add action").icon(icon("icons/plus.svg")).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.open_project_script_editor(&project_id, None, window, cx)
+                    this.open_project_script_editor(&project_id, None, window, cx);
                 }),
             ))
         };
@@ -536,11 +536,9 @@ impl Workspace {
                         .child(icon("icons/play.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
                         .child(div().min_w_0().truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.run_project_script(command.clone(), window, cx)
-                            }),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_project_script(command.clone(), window, cx);
+                        })),
                 )
                 .child(split_hairline("details-scripts", colors))
                 .child(
@@ -581,15 +579,16 @@ impl Workspace {
             .and_then(|status| status.local.ref_name.clone())
             .or_else(|| self.open_projection().and_then(|p| p.thread.branch.clone()));
         let mut rows: Vec<AnyElement> = Vec::new();
-        if is_repo && self.details_item_shown("branch") {
-            if let Some(branch) = branch {
-                rows.push(
-                    row(colors)
-                        .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().child(branch))
-                        .into_any_element(),
-                );
-            }
+        if is_repo
+            && self.details_item_shown("branch")
+            && let Some(branch) = branch
+        {
+            rows.push(
+                row(colors)
+                    .child(icon("icons/git-branch.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(div().flex_1().min_w_0().truncate().child(branch))
+                    .into_any_element(),
+            );
         }
         let Some(status) = status else {
             return (!rows.is_empty()).then(|| Section {
@@ -600,7 +599,21 @@ impl Workspace {
         };
         let (actions_shown, changes_shown) =
             (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
-        if !status.local.is_repo {
+        if status.local.is_repo {
+            let quick = git::quick_action(Some(status), self.vcs.running.is_some());
+            let (insertions, deletions, _) = git::changes_totals(status);
+            let quiet_empty_draft = matches!(self.target, Some(Target::Draft { .. }))
+                && self.vcs.running.is_none()
+                && quick.disabled()
+                && insertions == 0
+                && deletions == 0;
+            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
+                rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
+            }
+            if changes_shown && !quiet_empty_draft {
+                rows.push(self.changes_row(status, tokens, colors, cx));
+            }
+        } else {
             if !actions_shown {
                 return (!rows.is_empty()).then(|| Section {
                     height: rows.len() as f32 * ROW_HEIGHT,
@@ -621,20 +634,6 @@ impl Workspace {
                     })
                     .into_any_element(),
             );
-        } else {
-            let quick = git::quick_action(Some(status), self.vcs.running.is_some());
-            let (insertions, deletions, _) = git::changes_totals(status);
-            let quiet_empty_draft = matches!(self.target, Some(Target::Draft { .. }))
-                && self.vcs.running.is_none()
-                && quick.disabled()
-                && insertions == 0
-                && deletions == 0;
-            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
-                rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
-            }
-            if changes_shown && !quiet_empty_draft {
-                rows.push(self.changes_row(status, tokens, colors, cx));
-            }
         }
         (!rows.is_empty()).then(|| Section {
             height: rows.len() as f32 * ROW_HEIGHT,
@@ -670,7 +669,7 @@ impl Workspace {
         let can_publish = status.local.is_repo && !status.local.has_primary_remote;
         let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
             // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
-            view.update(cx, |this, cx| this.refresh_vcs(cx));
+            view.update(cx, super::Workspace::refresh_vcs);
             for item in &items {
                 let action = item.action;
                 menu = menu.item(
@@ -1273,6 +1272,11 @@ fn limit_meters(limits: &UsageLimits, tokens: &Tokens) -> Vec<Meter> {
 /// `ThreadDetailsContext`: the bar fills as context is used; the tick marks auto-compaction.
 fn context_meter(usage: &TokenUsage, tokens: &Tokens) -> Meter {
     let max = usage.max_tokens.filter(|max| *max > 0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a percentage clamped to 0..=100 and rounded"
+    )]
     let used = max.map(|max| (usage.used_tokens as f64 / max as f64 * 100.).clamp(0., 100.).round() as u32);
     let tick = max
         .zip(usage.auto_compact_threshold)
@@ -1401,9 +1405,9 @@ pub(super) fn format_context_tokens(value: u64) -> String {
     let trim = |text: String| text.strip_suffix(".0").map(str::to_owned).unwrap_or(text);
     match value {
         0..1_000 => value.to_string(),
-        1_000..10_000 => trim(format!("{:.1}", value as f64 / 1_000.)) + "k",
+        1_000..10_000 => format!("{}k", trim(format!("{:.1}", value as f64 / 1_000.))),
         10_000..999_500 => format!("{}k", (value as f64 / 1_000.).round()),
-        _ => trim(format!("{:.1}", value as f64 / 1_000_000.)) + "m",
+        _ => format!("{}m", trim(format!("{:.1}", value as f64 / 1_000_000.))),
     }
 }
 

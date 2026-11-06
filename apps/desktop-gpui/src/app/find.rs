@@ -56,7 +56,7 @@ struct FindResult {
 
 impl FindResult {
     fn parse(value: &Value) -> Option<Self> {
-        let index = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        let index = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok());
         Some(Self {
             total: index(value, "totalMatches")?,
             active: index(value, "activeIndex").unwrap_or(0),
@@ -160,10 +160,10 @@ pub(super) fn query_for_message(snippet: &str, query: &str) -> String {
         .map(|w| w.replace('’', "'").to_lowercase())
         .collect();
     let chars: Vec<char> = snippet.chars().map(|c| if c == '’' || c == '‘' { '\'' } else { c }).collect();
-    if words.len() > 1 {
-        if let Some(range) = phrase_at(&chars, &words) {
-            return chars[range].iter().collect();
-        }
+    if words.len() > 1
+        && let Some(range) = phrase_at(&chars, &words)
+    {
+        return chars[range].iter().collect();
     }
     let word = words
         .iter()
@@ -434,14 +434,14 @@ impl Workspace {
     pub(super) fn step_find(&mut self, delta: i64, _: &mut Window, cx: &mut Context<Self>) {
         let Some(find) = &mut self.find else { return };
         let Some(result) = find.result.as_ref().filter(|r| r.total > 0 && r.complete) else { return };
-        if !find.loading {
-            if let Some(next) = result.stepped(delta) {
-                find.start = next.matched.clone();
-                find.result = Some(next);
-                self.reveal_find_match(cx);
-                cx.notify();
-                return;
-            }
+        if !find.loading
+            && let Some(next) = result.stepped(delta)
+        {
+            find.start = next.matched.clone();
+            find.result = Some(next);
+            self.reveal_find_match(cx);
+            cx.notify();
+            return;
         }
         if !find.loading {
             find.start = result.matched.clone();
@@ -569,7 +569,7 @@ impl Workspace {
         let Some(find) = &mut self.find else { return };
         for key in std::mem::take(&mut find.painted).into_keys() {
             if let Some(view) = self.markdown_view(&key) {
-                view.update(cx, |view, cx| view.clear_range_highlights(cx));
+                view.update(cx, gpui_kit::base::TextViewState::clear_range_highlights);
             }
         }
     }
@@ -723,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list of one range is the expected value")]
     fn occurrences_fold_case_and_apostrophes_without_overlap() {
         assert_eq!(occurrences("Find the find, FIND", "find"), [0..4, 9..13, 15..19]);
         assert_eq!(occurrences("aaaa", "aa"), [0..2, 2..4]);

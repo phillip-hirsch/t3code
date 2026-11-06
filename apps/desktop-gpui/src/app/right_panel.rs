@@ -78,28 +78,6 @@ pub(super) fn turn_summaries(projection: &ThreadProjection) -> Vec<TurnSummary> 
     turns
 }
 
-/// `revertThreadCheckpoint`: roll the thread back to the checkpoint that closes
-/// `turn_count` (0 is the scope's base snapshot). `None` when it is not ready.
-pub(super) fn rollback_command(projection: &ThreadProjection, turn_count: u32, restore_files: bool) -> Option<Value> {
-    let checkpoint = projection.checkpoints.iter().rev().find(|c| {
-        if turn_count == 0 {
-            c.ordinal_within_scope == 0 && c.app_run_ordinal.is_none()
-        } else {
-            c.app_run_ordinal == Some(i64::from(turn_count))
-        }
-    })?;
-    (checkpoint.status == "ready").then(|| {
-        json!({
-            "type": "checkpoint.rollback",
-            "restoreFiles": restore_files,
-            "commandId": super::new_id(),
-            "threadId": projection.thread.id,
-            "scopeId": checkpoint.scope_id,
-            "checkpointId": checkpoint.id,
-        })
-    })
-}
-
 /// One tab of the panel (`RightPanelSurface`): the Diff, one browser tab by its preview tab id,
 /// the Files tree, or a file (or folder) by its workspace path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -563,23 +541,22 @@ impl Workspace {
             menu.item(PopupMenuItem::new("Close").on_click(
                 window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
             ))
-            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(
-                window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx)
-                }),
-            ))
+            .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(window.listener_for(
+                &view,
+                move |this, _, window, cx| {
+                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                },
+            )))
             .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx)
+                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
                 }),
             ))
-            .item(
-                PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
-                    window.listener_for(&view, move |this, _, window, cx| {
-                        this.close_surfaces(all.clone(), None, window, cx)
-                    }),
-                ),
-            )
+            .item(PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
+                window.listener_for(&view, move |this, _, window, cx| {
+                    this.close_surfaces(all.clone(), None, window, cx);
+                }),
+            ))
         }
     }
 
@@ -801,7 +778,9 @@ impl Workspace {
         };
         let cwd = self.git_cwd();
         let version = match &scope {
-            DiffScope::Turn(run) => (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| t.turn_count as u64), 0, 0),
+            DiffScope::Turn(run) => {
+                (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| u64::from(t.turn_count)), 0, 0)
+            }
             _ => self.vcs.status.as_ref().map_or((0, 0, 0), |s| {
                 let (ins, del, _) = git::changes_totals(s);
                 (ins, del, s.local.working_tree.insertions + s.local.working_tree.deletions)
@@ -955,67 +934,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// "Edit from here?" (`RevertConfirmHost`): rewind the thread to before a user message,
-    /// optionally restoring files, and put the message back in the composer. The timeline's
-    /// per-message revert button calls this with the message's turn count and text.
-    #[allow(dead_code)]
-    pub(super) fn confirm_revert(
-        &mut self,
-        turn_count: u32,
-        prompt: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use gpui_kit::component::WindowExt as _;
-        use gpui_kit::component::dialog::{DialogClose, DialogFooter};
-        if self.open_projection().is_some_and(ThreadProjection::is_running) {
-            self.error = Some("Interrupt the current turn before reverting checkpoints.".into());
-            cx.notify();
-            return;
-        }
-        let view = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let choice = |id: &'static str, label: &'static str, restore_files: bool| {
-                let (view, prompt) = (view.clone(), prompt.clone());
-                let button = Button::new(id).label(label);
-                let button = if restore_files { button.outline().text_color(gpui_kit::red()) } else { button.primary() };
-                button.on_click(move |_, window, cx| {
-                    window.close_dialog(cx);
-                    let prompt = prompt.clone();
-                    view.update(cx, |this, cx| this.revert_to_turn(turn_count, restore_files, prompt, window, cx));
-                })
-            };
-            alert
-                .title("Edit from here?")
-                .description(
-                    "Rewind chat to before this message. Your prompt and attachments return to the composer.                      “Revert files too” also undoes your own edits.",
-                )
-                .footer(
-                    DialogFooter::new()
-                        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
-                        .child(choice("revert-files", "Revert files too", true))
-                        .child(choice("revert-keep", "Revert and keep changes", false)),
-                )
-        });
-    }
-
-    fn revert_to_turn(
-        &mut self,
-        turn_count: u32,
-        restore_files: bool,
-        prompt: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(command) = self.open_projection().and_then(|p| rollback_command(p, turn_count, restore_files)) else {
-            self.error = Some(format!("Checkpoint for turn {turn_count} is unavailable.").into());
-            cx.notify();
-            return;
-        };
-        self.dispatch(command, cx);
-        self.set_composer_text(prompt, window, cx);
-    }
-
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
         self.store_diff_files(Vec::new());
         self.right_panel.diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
@@ -1090,7 +1008,7 @@ impl Workspace {
                     .left(px(3.))
                     .w(px(2.))
                     .invisible()
-                    .group_hover("right-panel-resize", |s| s.visible())
+                    .group_hover("right-panel-resize", gpui_kit::Styled::visible)
                     .bg(tokens.border),
             );
         Some(
@@ -1186,13 +1104,13 @@ impl Workspace {
                                     .icon(icon("icons/square-terminal.svg"))
                                     .disabled(!terminal)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_terminal_surface(window, cx)
+                                        this.add_terminal_surface(window, cx);
                                     })),
                             )
                             .item(
                                 PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
                                     window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::Files, window, cx)
+                                        this.open_surface(Surface::Files, window, cx);
                                     }),
                                 ),
                             )
@@ -1216,7 +1134,7 @@ impl Workspace {
                                     .icon(Icon::new(IconName::Link))
                                     .disabled(!linked)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::PullRequests, window, cx)
+                                        this.open_surface(Surface::PullRequests, window, cx);
                                     })),
                             );
                         match side_chat {
@@ -1225,7 +1143,7 @@ impl Workspace {
                                     .icon(Icon::new(IconName::MessagesSquare))
                                     .disabled(!available)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                        this.add_side_chat_surface(window, cx)
+                                        this.add_side_chat_surface(window, cx);
                                     })),
                             ),
                             None => menu,
@@ -1334,12 +1252,12 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(4.))
                     .hover(move |style| style.bg(muted))
-                    .child(div().group_hover(group.clone(), |style| style.invisible()).child(glyph))
+                    .child(div().group_hover(group.clone(), gpui_kit::Styled::invisible).child(glyph))
                     .child(
                         div()
                             .absolute()
                             .invisible()
-                            .group_hover(group, |style| style.visible())
+                            .group_hover(group, gpui_kit::Styled::visible)
                             .child(icon("icons/x.svg").with_size(px(12.))),
                     )
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -1358,7 +1276,7 @@ impl Workspace {
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.open_tab_menu(&menu_surface, event.position, window, cx)
+                    this.open_tab_menu(&menu_surface, event.position, window, cx);
                 }),
             )
             .into_any_element()
@@ -1406,34 +1324,33 @@ impl Workspace {
         });
         // "Open browser in a profile", beside the shortcut while there is more than one.
         let profiles = self.browser_profiles();
-        let browser = match browser_available && profiles.len() > 1 {
-            true => {
-                let view = cx.entity();
-                div().relative().child(browser).child(
-                    div().absolute().top(px(4.)).right(px(32.)).child(
-                        Button::new("right-panel-browser-profiles")
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .foreground(tokens.muted_foreground)
-                                    .hover(tokens.accent)
-                                    .active(tokens.accent),
-                            )
-                            .xsmall()
-                            .size(px(24.))
-                            .rounded(px(6.))
-                            .icon(icon("icons/chevron-down.svg"))
-                            .tooltip("Open browser in a profile")
-                            .dropdown_menu(move |menu: PopupMenu, window, _| {
-                                profile_items(menu.max_w(px(224.)), &profiles, &view, window)
-                            })
-                            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                                this.right_panel.add_menu_open = *open;
-                                cx.notify();
-                            })),
-                    ),
-                )
-            }
-            false => div().child(browser),
+        let browser = if browser_available && profiles.len() > 1 {
+            let view = cx.entity();
+            div().relative().child(browser).child(
+                div().absolute().top(px(4.)).right(px(32.)).child(
+                    Button::new("right-panel-browser-profiles")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(tokens.muted_foreground)
+                                .hover(tokens.accent)
+                                .active(tokens.accent),
+                        )
+                        .xsmall()
+                        .size(px(24.))
+                        .rounded(px(6.))
+                        .icon(icon("icons/chevron-down.svg"))
+                        .tooltip("Open browser in a profile")
+                        .dropdown_menu(move |menu: PopupMenu, window, _| {
+                            profile_items(menu.max_w(px(224.)), &profiles, &view, window)
+                        })
+                        .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                            this.right_panel.add_menu_open = *open;
+                            cx.notify();
+                        })),
+                ),
+            )
+        } else {
+            div().child(browser)
         };
         let terminal_available = self.terminal_available();
         let terminal = row(
@@ -1480,7 +1397,7 @@ impl Workspace {
         )
         .when_some(target, |el, reference| {
             el.on_click(cx.listener(move |this, _, window, cx| {
-                this.open_surface(Surface::PullRequest(reference.clone()), window, cx)
+                this.open_surface(Surface::PullRequest(reference.clone()), window, cx);
             }))
         });
         let linked = self.thread_links_pull_requests();
@@ -1567,8 +1484,7 @@ impl Workspace {
             DiffScope::Commit(sha) => commits
                 .iter()
                 .find(|c| &c.sha == sha)
-                .map(|c| c.subject.clone())
-                .unwrap_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]))
+                .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
                 .into(),
         };
         let view = cx.entity();
@@ -1627,11 +1543,12 @@ impl Workspace {
                                 )
                             })
                             .checked(checked)
-                            .on_click(
-                                window.listener_for(&turn_view, move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx)
-                                }),
-                            ),
+                            .on_click(window.listener_for(
+                                &turn_view,
+                                move |this, _, _, cx| {
+                                    this.set_diff_scope(value.clone(), cx);
+                                },
+                            )),
                         );
                     }
                     menu
@@ -1646,7 +1563,7 @@ impl Workspace {
                         let checked = scope == value;
                         menu = menu.item(PopupMenuItem::new(commit.subject.clone()).checked(checked).on_click(
                             window.listener_for(&commit_view, move |this, _, _, cx| {
-                                this.set_diff_scope(value.clone(), cx)
+                                this.set_diff_scope(value.clone(), cx);
                             }),
                         ));
                     }
@@ -1896,11 +1813,12 @@ fn profile_items(
 ) -> PopupMenu {
     for profile in profiles {
         let id = profile.id.clone();
-        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
-            window.listener_for(view, move |this, _, window, cx| {
-                this.add_browser_surface_in(Some(id.clone()), window, cx)
-            }),
-        ));
+        menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(window.listener_for(
+            view,
+            move |this, _, window, cx| {
+                this.add_browser_surface_in(Some(id.clone()), window, cx);
+            },
+        )));
     }
     menu
 }
@@ -2043,7 +1961,7 @@ impl Element for DiffTint {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        _: &mut (),
+        (): &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2056,8 +1974,8 @@ impl Element for DiffTint {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
+        (): &mut (),
+        (): &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2226,28 +2144,6 @@ mod tests {
         let turns = turn_summaries(state.projection.as_ref().unwrap());
         assert_eq!(turns.iter().map(|t| t.turn_count).collect::<Vec<_>>(), [2, 1]);
         assert_eq!(short_time(&turns[0].completed_at), "00:02");
-    }
-
-    #[test]
-    fn rollback_targets_the_ready_checkpoint_closing_the_turn() {
-        let mut state = ThreadState::default();
-        let checkpoint = |id: &str, ordinal: u32, run: Option<u32>, status: &str| {
-            json!({"id": id, "threadId": "t", "scopeId": "s", "runId": run.map(|r| format!("r{r}")), "nodeId": "n",
-                "parentCheckpointId": null, "ordinalWithinScope": ordinal, "appRunOrdinal": run, "ref": "r",
-                "status": status, "files": [], "capturedAt": "2026-01-01T00:00:00Z"})
-        };
-        state
-            .apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": {
-                "thread": {"id": "t", "title": "T"},
-                "checkpoints": [checkpoint("c0", 0, None, "ready"), checkpoint("c1", 1, Some(1), "ready"), checkpoint("c2", 2, Some(2), "missing")],
-            }}))
-            .unwrap();
-        let projection = state.projection.as_ref().unwrap();
-        let command = rollback_command(projection, 1, true).unwrap();
-        assert_eq!((command["checkpointId"].as_str(), command["scopeId"].as_str()), (Some("c1"), Some("s")));
-        assert_eq!(command["restoreFiles"], true);
-        assert_eq!(rollback_command(projection, 0, false).unwrap()["checkpointId"], "c0");
-        assert!(rollback_command(projection, 2, false).is_none(), "a missing checkpoint cannot be restored");
     }
 
     #[test]

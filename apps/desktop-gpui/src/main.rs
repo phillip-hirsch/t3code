@@ -11,6 +11,7 @@ mod desktop;
 mod device;
 mod environments;
 mod file_icons;
+mod hex;
 mod inbox;
 mod keybindings;
 mod load_balancing;

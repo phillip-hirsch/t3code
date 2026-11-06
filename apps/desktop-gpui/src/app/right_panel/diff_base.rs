@@ -219,7 +219,7 @@ impl Workspace {
                         this.right_panel.base_picker.open = false;
                         cx.notify();
                     }
-                })
+                });
             })
             .trigger(trigger)
             .p_0()

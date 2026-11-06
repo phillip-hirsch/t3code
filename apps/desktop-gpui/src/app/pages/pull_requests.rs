@@ -96,7 +96,7 @@ pub(in crate::app) struct PullRequestsState {
     refreshing: bool,
     error: Option<SharedString>,
     stats: Stats,
-    rows: Rc<Vec<Row>>,
+    rows: Rc<[Row]>,
     list_state: ListState,
     _debounce: Option<Task<()>>,
     _search_subscription: Subscription,
@@ -226,7 +226,7 @@ impl Workspace {
     fn debounce_pull_request_search(&mut self, cx: &mut Context<Self>) {
         self.pull_requests._debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.send_pull_request_search(cx));
+            let _ = this.update(cx, super::super::Workspace::send_pull_request_search);
         }));
     }
 
@@ -508,7 +508,7 @@ impl Workspace {
             }
         }
         state.list_state.reset(rows.len());
-        state.rows = Rc::new(rows);
+        state.rows = Rc::from(rows);
     }
 
     pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -608,11 +608,11 @@ impl Workspace {
             .child(Icon::new(Lucide::Plug2).with_size(px(16.)).text_color(t.muted_foreground))
             .when(host.is_none(), |b| b.child("All"))
             .dropdown_menu({
-                let view = view.clone();
+                let view = view;
                 move |mut menu, window, _| {
                     menu = menu.item(PopupMenuItem::new("All").icon(Lucide::Plug2).checked(host.is_none()).on_click(
                         window.listener_for(&view, |this, _, _, cx| {
-                            this.set_pull_request_scope(cx, |state| state.host = None)
+                            this.set_pull_request_scope(cx, |state| state.host = None);
                         }),
                     ));
                     for (name, kind, unavailable) in &hosts {
@@ -628,7 +628,7 @@ impl Workspace {
                                 .disabled(unavailable.is_some())
                                 .on_click(window.listener_for(&view, move |this, _, _, cx| {
                                     let host = picked.clone();
-                                    this.set_pull_request_scope(cx, |state| state.host = Some(host))
+                                    this.set_pull_request_scope(cx, |state| state.host = Some(host));
                                 })),
                         );
                     }
@@ -696,7 +696,7 @@ impl Workspace {
                         menu = menu.item(
                             PopupMenuItem::new(*option).icon(option_icon(value)).checked(value == current).on_click(
                                 window.listener_for(&view, move |this, _, _, cx| {
-                                    this.set_pull_request_scope(cx, |state| apply(state, value))
+                                    this.set_pull_request_scope(cx, |state| apply(state, value));
                                 }),
                             ),
                         );
@@ -718,16 +718,16 @@ impl Workspace {
                 window,
                 cx,
                 move |mut menu, window, _| {
-                    menu = menu
-                        .item(PopupMenuItem::new("Search authors…").icon(Lucide::Search).on_click(
+                    menu =
+                        menu.item(PopupMenuItem::new("Search authors…").icon(Lucide::Search).on_click(
                             window.listener_for(&author_view, |this, _, window, cx| {
-                                this.open_facet_search(FacetKind::Authors, window, cx)
+                                this.open_facet_search(FacetKind::Authors, window, cx);
                             }),
                         ))
                         .separator();
                     menu = menu.item(PopupMenuItem::new("Anyone").checked(picked_author.is_none()).on_click(
                         window.listener_for(&author_view, |this, _, _, cx| {
-                            this.set_pull_request_scope(cx, |state| state.menu.author = None)
+                            this.set_pull_request_scope(cx, |state| state.menu.author = None);
                         }),
                     ));
                     for login in author_choices.iter() {
@@ -737,7 +737,7 @@ impl Workspace {
                                 .checked(picked_author.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(login)))
                                 .on_click(window.listener_for(&author_view, move |this, _, _, cx| {
                                     let author = value.clone();
-                                    this.set_pull_request_scope(cx, |state| state.menu.author = Some(author))
+                                    this.set_pull_request_scope(cx, |state| state.menu.author = Some(author));
                                 })),
                         );
                     }
@@ -751,11 +751,12 @@ impl Workspace {
                 if selected.is_empty() { "Any".to_owned() } else { format!("{} selected", selected.len()) };
             root = root.submenu(format!("Labels  {label_summary}"), window, cx, move |mut menu, window, _| {
                 menu = menu
-                    .item(PopupMenuItem::new("Search labels…").icon(Lucide::Search).on_click(
-                        window.listener_for(&label_view, |this, _, window, cx| {
-                            this.open_facet_search(FacetKind::Labels, window, cx)
-                        }),
-                    ))
+                    .item(PopupMenuItem::new("Search labels…").icon(Lucide::Search).on_click(window.listener_for(
+                        &label_view,
+                        |this, _, window, cx| {
+                            this.open_facet_search(FacetKind::Labels, window, cx);
+                        },
+                    )))
                     .separator();
                 if label_choices.is_empty() && selected.is_empty() {
                     return menu.label("No labels found");
@@ -780,7 +781,7 @@ impl Workspace {
                                     None => picked.push(label),
                                 }
                                 state.menu.labels = picked.into_iter().take(10).map(|l| vec![l]).collect();
-                            })
+                            });
                         },
                     )));
                 }
@@ -798,7 +799,7 @@ impl Workspace {
                         menu = menu.item(
                             PopupMenuItem::new(*option).icon(option_icon(value)).checked(value == draft).on_click(
                                 window.listener_for(&draft_view, move |this, _, window, cx| {
-                                    this.pick_draft_filter(value, window, cx)
+                                    this.pick_draft_filter(value, window, cx);
                                 }),
                             ),
                         );
@@ -807,10 +808,10 @@ impl Workspace {
                 },
             );
             root = submenu(root, "Review", REVIEWS, as_static(menu.review.as_ref(), REVIEWS), window, cx, |s, v| {
-                s.menu.review = (v != "all").then(|| v.to_owned())
+                s.menu.review = (v != "all").then(|| v.to_owned());
             });
             root = submenu(root, "Checks", CHECKS, as_static(menu.checks.as_ref(), CHECKS), window, cx, |s, v| {
-                s.menu.checks = (v != "all").then(|| v.to_owned())
+                s.menu.checks = (v != "all").then(|| v.to_owned());
             });
             root = root.separator();
             let project_view = view.clone();
@@ -823,7 +824,7 @@ impl Workspace {
             root.submenu(format!("Project  {project_label}"), window, cx, move |mut menu, window, _| {
                 menu = menu.item(PopupMenuItem::new("All projects").checked(picked_project.is_none()).on_click(
                     window.listener_for(&project_view, |this, _, _, cx| {
-                        this.set_pull_request_scope(cx, |state| state.project = None)
+                        this.set_pull_request_scope(cx, |state| state.project = None);
                     }),
                 ));
                 for (id, title, unavailable) in project_choices.iter() {
@@ -836,7 +837,7 @@ impl Workspace {
                             .checked(picked_project.as_ref() == Some(id))
                             .on_click(window.listener_for(&project_view, move |this, _, _, cx| {
                                 let project = value.clone();
-                                this.set_pull_request_scope(cx, |state| state.project = Some(project))
+                                this.set_pull_request_scope(cx, |state| state.project = Some(project));
                             })),
                     );
                 }
@@ -1236,7 +1237,6 @@ fn mix(a: Hsla, b: Hsla, share: f32) -> Hsla {
     gpui_kit::Rgba { r: lerp(a.r, b.r), g: lerp(a.g, b.g), b: lerp(a.b, b.b), a: 1. }.into()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pull_request_row(
     entry: &Rc<Entry>,
     stat: Option<(u64, u64)>,
@@ -1265,7 +1265,6 @@ fn pull_request_row(
         .text_color(t.muted_foreground)
         .child(format!("#{}", entry.number))
         .context_menu({
-            let url = url.clone();
             move |menu, _, _| {
                 let (copy, open) = (url.clone(), url.clone());
                 menu.item(
@@ -1407,7 +1406,7 @@ fn pull_request_row(
         )
         .child(v_flex().flex_1().min_w_0().child(title_line).child(meta_line))
         .on_click(window.listener_for(view, move |this, _, _, cx| {
-            this.open_pull_request_panel(reference_of(&picked), Some(picked.clone()), cx)
+            this.open_pull_request_panel(reference_of(&picked), Some(picked.clone()), cx);
         }))
         .into_any_element()
 }

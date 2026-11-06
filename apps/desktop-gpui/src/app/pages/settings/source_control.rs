@@ -194,7 +194,7 @@ fn redacted(value: &str) -> String {
             }
             state = (state ^ (state >> 13)).wrapping_mul(0x85eb_ca6b);
             state = (state ^ (state >> 16)).wrapping_mul(0xc2b2_ae35);
-            ALPHABET[((state as i32).unsigned_abs() % ALPHABET.len() as u32) as usize] as char
+            ALPHABET[state.cast_signed().unsigned_abs() as usize % ALPHABET.len()] as char
         })
         .collect()
 }
@@ -378,9 +378,9 @@ impl Workspace {
             cx,
         );
         let discovery = self.discovery_sections(&state, client.is_some(), window, cx);
-        let writing = self.writing_rows(&view, window, cx);
+        let writing = self.writing_rows(view, window, cx);
         let project_scope = view.scope.is_project();
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let repositories = [
             row(
                 self,
@@ -415,7 +415,7 @@ impl Workspace {
         let mut sections = vec![settings_section("repositories", "Repositories", repositories, &t)];
         sections.extend(discovery);
         sections.push(settings_section("writing-review", "Writing & review", writing, &t));
-        self.settings_page("source-control", &view, sections, cx)
+        self.settings_page("source-control", view, sections, cx)
     }
 
     fn scan_button(&self, state: &Entity<SourceControlState>, cx: &mut Context<Self>) -> AnyElement {
@@ -684,7 +684,7 @@ impl Workspace {
                                             state.expanded.insert(toggle_kind.clone());
                                         }
                                         cx.notify();
-                                    })
+                                    });
                                 }),
                         )
                     })
@@ -756,7 +756,7 @@ impl Workspace {
                                         state.revealed.insert(reveal_kind.clone());
                                     }
                                     cx.notify();
-                                })
+                                });
                             })
                             .into_any_element(),
                     );
@@ -870,7 +870,7 @@ impl Workspace {
                                     reveal.update(cx, |state, cx| {
                                         state.signed_in_revealed = !state.signed_in_revealed;
                                         cx.notify();
-                                    })
+                                    });
                                 }),
                         )
                         .into_any_element()
@@ -880,7 +880,7 @@ impl Workspace {
                 }
                 _ => div().child("Signed in").into_any_element(),
             };
-            let (state, sign_ins) = (state.clone(), sign_ins.clone());
+            let (state, sign_ins) = (state.clone(), sign_ins);
             action = Button::new("source-control-sign-out")
                 .outline()
                 .xsmall()
@@ -904,7 +904,7 @@ impl Workspace {
                 .into_any_element();
         } else if let SignIn::Waiting { .. } = sign_in {
             subtitle = div().child("Approve the app on GitHub to finish signing in.").into_any_element();
-            let (state, input) = (state.clone(), input.clone());
+            let (state, input) = (state.clone(), input);
             let client = self.settings_client();
             action = Button::new("source-control-sign-in-cancel")
                 .ghost()
@@ -1040,7 +1040,7 @@ impl Workspace {
             let prompt = match started {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    let _ = state.update(cx, |state, cx| {
+                    let () = state.update(cx, |state, cx| {
                         state.sign_in = SignIn::Failed(error.message());
                         cx.notify();
                     });
@@ -1048,16 +1048,21 @@ impl Workspace {
                 }
             };
             let user_code = prompt["userCode"].as_str().unwrap_or_default().to_owned();
-            let _ = state.update(cx, |state, cx| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "epoch milliseconds; `as` saturates out-of-range values"
+            )]
+            let expires_at = prompt["expiresAt"].as_f64().unwrap_or_default() as i64;
+            let () = state.update(cx, |state, cx| {
                 state.sign_in = SignIn::Waiting {
                     user_code: user_code.clone(),
                     verification_uri: prompt["verificationUri"].as_str().unwrap_or_default().to_owned(),
-                    expires_at: prompt["expiresAt"].as_f64().unwrap_or_default() as i64,
+                    expires_at,
                 };
                 cx.notify();
             });
             let finished = client.request("sourceControl.signInWait", input).await;
-            let _ = state.update(cx, |state, cx| {
+            let () = state.update(cx, |state, cx| {
                 // A newer attempt, a cancel, or a sign-out owns the state by now.
                 if matches!(&state.sign_in, SignIn::Waiting { user_code: code, .. } if *code == user_code) {
                     state.sign_in = match &finished {
@@ -1210,7 +1215,7 @@ impl Workspace {
             .unwrap_or_default();
         let link_host = if typed_host.is_empty() { credentials.public_host.to_owned() } else { typed_host.clone() };
         let save = {
-            let (state, tokens_map) = (state.clone(), tokens_map.clone());
+            let (state, tokens_map) = (state.clone(), tokens_map);
             move |this: &mut Self, host: String, token: String, cx: &mut Context<Self>| {
                 state.update(cx, |state, cx| {
                     state.saving = true;
@@ -1302,7 +1307,7 @@ impl Workspace {
                                         .label("Remove")
                                         .disabled(saving)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            remove(this, remove_host.clone(), String::new(), cx)
+                                            remove(this, remove_host.clone(), String::new(), cx);
                                         })),
                                 )
                             })
@@ -1314,7 +1319,7 @@ impl Workspace {
                                     .disabled(!can_save)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if can_save {
-                                            save(this, typed_host.clone(), draft.clone(), cx)
+                                            save(this, typed_host.clone(), draft.clone(), cx);
                                         }
                                     })),
                             ),
@@ -1415,7 +1420,7 @@ impl Workspace {
                             reveal_state.update(cx, |state, cx| {
                                 state.accounts_revealed = !state.accounts_revealed;
                                 cx.notify();
-                            })
+                            });
                         }),
                 ),
         );
@@ -1648,7 +1653,11 @@ impl Workspace {
             window,
             cx,
             |this, text, window, cx| {
-                this.update_settings(json!({ "sourceControlWritingStyle": { "customInstructions": text } }), window, cx)
+                this.update_settings(
+                    json!({ "sourceControlWritingStyle": { "customInstructions": text } }),
+                    window,
+                    cx,
+                );
             },
         );
         let typed = instructions_field.clone();
@@ -1667,7 +1676,7 @@ impl Workspace {
                 if custom {
                     style["customInstructions"] = json!(typed.value(cx).trim());
                 }
-                this.update_settings(json!({ "sourceControlWritingStyle": style }), window, cx)
+                this.update_settings(json!({ "sourceControlWritingStyle": style }), window, cx);
             },
         );
 
@@ -1759,7 +1768,7 @@ impl Workspace {
                     json!({ "sourceControlWritingStyle": { "followChangeRequestTemplates": !follow } }),
                     window,
                     cx,
-                )
+                );
             },
         ));
         let writer_control = writer_control.unwrap_or_else(|| {
@@ -1787,7 +1796,6 @@ impl Workspace {
 
     /// A model a feature can dedicate: the picker while on, and a switch that turns it on with
     /// `enable_with` or off (null), so the feature falls back to its parent model.
-    #[allow(clippy::too_many_arguments)]
     fn dedicated_model_control(
         &self,
         id: &'static str,
@@ -1801,7 +1809,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *tokens(cx);
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
-            this.update_settings(json!({ key: value }), window, cx)
+            this.update_settings(json!({ key: value }), window, cx);
         };
         let traits_id: &'static str = if id == "writer-model" { "writer-traits" } else { "review-guide-traits" };
         h_flex()
@@ -1817,7 +1825,7 @@ impl Workspace {
                     generates_text,
                     cx,
                     move |this, pick, window, cx| {
-                        set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx)
+                        set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx);
                     },
                 ))
                 .children(self.traits_picker(
@@ -1897,7 +1905,7 @@ fn external_link(id: &'static str, label: &'static str, url: &str, t: &Tokens) -
         .gap(px(4.))
         .cursor_pointer()
         .text_color(t.foreground)
-        .hover(|el| el.underline())
+        .hover(gpui_kit::Styled::underline)
         .child(label)
         .child(Icon::new(Lucide::ExternalLink).with_size(px(12.)))
         .on_click(move |_, _, cx| cx.open_url(&url))

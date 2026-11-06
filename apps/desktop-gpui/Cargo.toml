@@ -143,3 +143,52 @@ gpui-base = { path = "vendor/gpui-base" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+
+# BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
+# no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# GPUI's `Context<'_, Self>` is in nearly every method signature; the elided form reads better.
+elided_lifetimes_in_paths = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+missing_assert_message = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+# Noise for GPUI view code.
+too_many_lines = "allow" # render builders are long by nature
+too_many_arguments = "allow" # render helpers take their render context
+needless_pass_by_value = "allow" # GPUI listener and callback signatures
+unused_self = "allow" # view methods keep `&self` for a uniform call shape
+used_underscore_binding = "allow" # `_task` / `_subscription` keep-alive fields are reassigned
+struct_excessive_bools = "allow" # view state and wire-format mirrors are flag sets
+cast_precision_loss = "allow" # layout and display math
+unreadable_literal = "allow" # `rgb(0x252525)` colour constants
+similar_names = "allow" # `state` / `stale`, `stats` / `state`
+single_match_else = "allow" # a `match` with a fallback arm reads as well as `if let … else`
+option_option = "allow" # tri-state patches: absent, cleared, set
+assert_is_empty = "allow" # its fix, `assert_eq!(x, [] as [T; 0])`, reads worse
+default_trait_access = "allow" # `field: Default::default()` in struct literals, whose types are declared
+assigning_clones = "allow" # `x = y.clone()` reads plainer than `x.clone_from(&y)` off hot paths
+many_single_char_names = "allow" # colour math names its channels: r, g, b, h, s, l
+struct_field_names = "allow" # fields mirror the wire format: `Question::question`, `checkpoint_id`
+case_sensitive_file_extension_comparisons = "allow" # fires on names already lowercased
+maybe_infinite_iter = "allow" # `(2..).find(..)` and `take_while` end
+match_same_arms = "allow" # explicit arms document cases a wildcard also covers
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"

@@ -2,6 +2,8 @@
 //! engine, so formulas read as their Unicode form: Greek and operator symbols, scripts as
 //! superscript and subscript characters where Unicode has them, fractions and roots inline.
 
+use std::fmt::Write as _;
+
 const SYMBOLS: &[(&str, &str)] = &[
     ("alpha", "α"),
     ("beta", "β"),
@@ -234,7 +236,7 @@ fn group(rest: &str) -> (&str, &str) {
         return (inner, "");
     }
     if let Some(command) = rest.strip_prefix('\\') {
-        let len = command.chars().take_while(|c| c.is_ascii_alphabetic()).map(char::len_utf8).sum::<usize>().max(1);
+        let len = command.chars().take_while(char::is_ascii_alphabetic).map(char::len_utf8).sum::<usize>().max(1);
         let end = (1 + len).min(rest.len());
         return (&rest[..end], &rest[end..]);
     }
@@ -274,13 +276,15 @@ fn convert(tex: &str) -> String {
                         out.push(c);
                         out.push_str(&body);
                     }
-                    None => out.push_str(&format!("{c}({body})")),
+                    None => {
+                        let _ = write!(out, "{c}({body})");
+                    }
                 }
                 rest = after;
             }
             '{' | '}' => rest = &rest[1..],
             '\\' => {
-                let command: String = rest[1..].chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                let command: String = rest[1..].chars().take_while(char::is_ascii_alphabetic).collect();
                 let after = &rest[1 + command.len()..];
                 match command.as_str() {
                     "frac" | "dfrac" | "tfrac" => {
@@ -288,14 +292,18 @@ fn convert(tex: &str) -> String {
                         let (bottom, after) = group(after.trim_start());
                         let (top, bottom) = (convert(top), convert(bottom));
                         let wrap = |s: String| if s.chars().count() > 1 { format!("({s})") } else { s };
-                        out.push_str(&format!("{}/{}", wrap(top), wrap(bottom)));
+                        let _ = write!(out, "{}/{}", wrap(top), wrap(bottom));
                         rest = after;
                     }
                     "sqrt" => {
                         let (body, after) = group(after.trim_start());
                         let body = convert(body);
                         out.push('√');
-                        out.push_str(&if body.chars().count() > 1 { format!("({body})") } else { body });
+                        if body.chars().count() > 1 {
+                            let _ = write!(out, "({body})");
+                        } else {
+                            out.push_str(&body);
+                        }
                         rest = after;
                     }
                     "text" | "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt" | "operatorname" | "textbf"

@@ -750,8 +750,8 @@ pub fn is_provider_update_candidate(provider: &crate::model::Provider) -> bool {
     provider.enabled
         && !matches!(latest_status, Some("broken" | "unsupported"))
         && field("status").and_then(|s| s.as_str()) == Some("behind_latest")
-        && field("latestVersion").is_some_and(|v| v.is_string())
-        && field("canUpdate").and_then(|v| v.as_bool()) == Some(true)
+        && field("latestVersion").is_some_and(serde_json::Value::is_string)
+        && field("canUpdate").and_then(serde_json::Value::as_bool) == Some(true)
         && !matches!(updating, Some("queued" | "running"))
 }
 
@@ -858,17 +858,17 @@ pub fn resolve_snooze<Tz: chrono::TimeZone>(
             (wake, format!("In {duration}"), false)
         }
         SnoozeSetting::At { day, hour, minute } => {
-            let today = now.weekday().num_days_from_sunday() as i64;
+            let today = i64::from(now.weekday().num_days_from_sunday());
             let days_ahead = match day.as_str() {
                 "today" => 0,
                 "tomorrow" => 1,
-                weekday => match (WEEKDAYS.iter().position(|d| *d == weekday)? as i64 - today + 7) % 7 {
+                weekday => match (i64::try_from(WEEKDAYS.iter().position(|d| *d == weekday)?).ok()? - today + 7) % 7 {
                     0 => 7,
                     n => n,
                 },
             };
             // A calendar-day advance, so DST days keep their local time.
-            let date = now.date_naive().checked_add_days(chrono::Days::new(days_ahead as u64))?;
+            let date = now.date_naive().checked_add_days(chrono::Days::new(u64::try_from(days_ahead).ok()?))?;
             let local = date.and_hms_opt(*hour, *minute, 0)?;
             let zone = now.timezone();
             let wake = zone
@@ -940,6 +940,11 @@ fn pin_midpoint(a: &[u8], b: &[u8]) -> Vec<u8> {
     let digit_a = a.first().map_or(0, |c| (c - b'a') as usize);
     let digit_b = b.first().map_or(PIN_DIGITS.len(), |c| (c - b'a') as usize);
     if digit_b - digit_a > 1 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the midpoint of two digit indexes"
+        )]
         return vec![PIN_DIGITS[((digit_a + digit_b) as f32 / 2.).round() as usize]];
     }
     if b.len() > 1 {
@@ -1009,6 +1014,10 @@ pub fn resolve_custom_snooze<Tz: chrono::TimeZone>(
                 return Err(ERROR);
             }
             // `as` saturates a huge amount; anything past chrono's range is no date at all.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "rounded first, and `as` saturates out-of-range values"
+            )]
             let wake = now_ms.checked_add((amount * unit_ms).round() as i64).ok_or(ERROR)?;
             chrono::DateTime::from_timestamp_millis(wake).ok_or(ERROR)?;
             Ok(wake)
@@ -1244,12 +1253,12 @@ mod tests {
     fn resuming_cancels_a_hold_and_the_next_finish_gets_a_fresh_grace() {
         let mut tracker = ReturnTracker::default();
         let (idle, busy) = (running("a", false, json!({})), running("a", true, json!({})));
-        observe(&mut tracker, &[busy.clone()], 10_000);
-        observe(&mut tracker, &[idle.clone()], 10_000);
-        observe(&mut tracker, &[busy.clone()], 11_500);
+        observe(&mut tracker, std::slice::from_ref(&busy), 10_000);
+        observe(&mut tracker, std::slice::from_ref(&idle), 10_000);
+        observe(&mut tracker, std::slice::from_ref(&busy), 11_500);
         observe(&mut tracker, &[busy], 12_500);
         assert_eq!(tracker.returned_at("a"), None);
-        observe(&mut tracker, &[idle.clone()], 12_500);
+        observe(&mut tracker, std::slice::from_ref(&idle), 12_500);
         observe(&mut tracker, &[idle], 14_500);
         assert_eq!(tracker.returned_at("a"), Some(14_500));
     }
@@ -1288,7 +1297,7 @@ mod tests {
         observe(&mut tracker, &[a.clone(), b.clone()], 10_500);
         observe(&mut tracker, &[a.clone(), b.clone()], 12_000);
         assert_eq!((tracker.returned_at("a"), tracker.returned_at("b")), (Some(12_000), None));
-        let threads = [a.clone(), b.clone()];
+        let threads = [a, b];
         let sections = partition(&threads, 12_500, true, false, &mut tracker, |_| true);
         assert_eq!(ids(&sections.active), ["b", "a"]);
         // The b hold ended at this partition, so it no longer reads as working.

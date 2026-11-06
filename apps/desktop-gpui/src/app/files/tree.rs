@@ -60,7 +60,7 @@ pub(super) struct TreeState {
     expand_all: bool,
     query: Entity<InputState>,
     search: PathSearch,
-    rows: Rc<Vec<TreeRow>>,
+    rows: Rc<[TreeRow]>,
     rows_dirty: bool,
     /// Derived with the rows: the first folder error still in the tree, whether every folder
     /// "Expand all" would open is open, and whether any folder shows.
@@ -105,7 +105,7 @@ impl TreeState {
         self.all_open =
             self.expand_all || (!expandable.is_empty() && expandable.iter().all(|p| self.expanded.contains(p)));
         self.has_folders = folders.len() > 1;
-        self.rows = Rc::new(if self.search.query.is_empty() {
+        self.rows = Rc::from(if self.search.query.is_empty() {
             logic::tree_rows(&entries, &self.expanded, None)
         } else {
             let hits: &[Entry] = if self.search.pending { &[] } else { &self.search.hits };
@@ -731,7 +731,7 @@ impl Workspace {
             let open_in = |editor: String, reveal: bool, title: String| {
                 let absolute = absolute.clone();
                 window.listener_for(&view, move |this: &mut Workspace, _, window, cx| {
-                    this.open_path_in_editor(absolute.clone(), editor.clone(), reveal, title.clone(), window, cx)
+                    this.open_path_in_editor(absolute.clone(), editor.clone(), reveal, title.clone(), window, cx);
                 })
             };
             if file_manager {
@@ -768,7 +768,7 @@ impl Workspace {
                                     title.clone(),
                                     window,
                                     cx,
-                                )
+                                );
                             },
                         )));
                     }
@@ -781,11 +781,12 @@ impl Workspace {
                 cx.write_to_clipboard(ClipboardItem::new_string(mention.clone()));
                 window.push_notification(Notification::success(copy_path.clone()).title("Mention copied"), cx);
             }))
-            .item(PopupMenuItem::new("Add to chat").on_click(
-                window.listener_for(&view, move |this: &mut Workspace, _, window, cx| {
-                    this.add_file_to_chat(&add_path, window, cx)
-                }),
-            ))
+            .item(PopupMenuItem::new("Add to chat").on_click(window.listener_for(
+                &view,
+                move |this: &mut Workspace, _, window, cx| {
+                    this.add_file_to_chat(&add_path, window, cx);
+                },
+            )))
         }
     }
 
@@ -807,7 +808,7 @@ impl Workspace {
         cx.spawn_in(window, async move |_, cx| {
             if client.request("shell.openInEditor", input).await.is_err() {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(path.clone()).title(failure.clone()), cx)
+                    window.push_notification(Notification::error(path.clone()).title(failure.clone()), cx);
                 });
             }
         })

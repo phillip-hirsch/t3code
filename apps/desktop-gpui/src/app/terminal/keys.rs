@@ -54,6 +54,7 @@ pub(super) fn key_action(
 
 /// [`key_action`] as on macOS, where ⌘ (not Ctrl) copies, pastes, selects all and jumps
 /// through history, and every Ctrl chord reaches the shell (`isTerminalCopyShortcut`).
+#[expect(clippy::fn_params_excessive_bools, reason = "the terminal's modes, and the platform as a test seam")]
 fn key_action_on(
     keystroke: &Keystroke,
     app_cursor: bool,
@@ -113,6 +114,7 @@ fn key_action_on(
     encode(key, ctrl, alt, shift, app_cursor, keystroke.key_char.as_deref()).map(KeyAction::Send)
 }
 
+#[expect(clippy::fn_params_excessive_bools, reason = "xterm's modifier bits and cursor-key mode")]
 fn encode(
     key: &str,
     ctrl: bool,
@@ -122,7 +124,7 @@ fn encode(
     key_char: Option<&str>,
 ) -> Option<Cow<'static, str>> {
     // xterm's modifier parameter: 1 + shift + 2·alt + 4·ctrl.
-    let modifier = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
     let alt_prefix = |s: &'static str| -> Cow<'static, str> { if alt { format!("\x1b{s}").into() } else { s.into() } };
     let cursor = |letter: char| -> Cow<'static, str> {
         match (modifier, app_cursor) {

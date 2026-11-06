@@ -369,7 +369,7 @@ impl AcpRegistrySearch {
                         Button::new(row_id("add"))
                             .xsmall()
                             .with_variant(if preparing { ButtonVariant::Secondary } else { ButtonVariant::Default })
-                            .when(!preparing, |b| b.outline())
+                            .when(!preparing, gpui_kit::component::button::Button::outline)
                             .label(if added {
                                 "Added"
                             } else if preparing {
@@ -976,7 +976,7 @@ impl AcpSessions {
                                             })
                                             .disabled(!can_import || imported || self.importing.is_some())
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.import_session(import_target.clone(), window, cx)
+                                                this.import_session(import_target.clone(), window, cx);
                                             })),
                                     )
                                     .when(can_delete, |row| {
@@ -991,7 +991,7 @@ impl AcpSessions {
                                                 })
                                                 .disabled(imported || self.deleting.is_some())
                                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                                    this.confirm_delete_session(delete_target.clone(), window, cx)
+                                                    this.confirm_delete_session(delete_target.clone(), window, cx);
                                                 })),
                                         )
                                     }),
@@ -1008,7 +1008,7 @@ impl AcpSessions {
                             .label(if self.loading { "Loading" } else { "Load more" })
                             .disabled(self.loading)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.load_sessions(Some(cursor.clone()), window, cx)
+                                this.load_sessions(Some(cursor.clone()), window, cx);
                             })),
                     ),
                 )
@@ -1104,7 +1104,7 @@ impl AcpSessions {
                                             || base_url_empty,
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.save_provider(save_id.clone(), window, cx)
+                                        this.save_provider(save_id.clone(), window, cx);
                                     })),
                             )
                             .when(!provider.required && provider.current.is_some(), |row| {
@@ -1115,7 +1115,7 @@ impl AcpSessions {
                                         .label("Disable")
                                         .disabled(read_only || saving || self.loading_providers)
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.confirm_disable_provider(disable_id.clone(), window, cx)
+                                            this.confirm_disable_provider(disable_id.clone(), window, cx);
                                         })),
                                 )
                             }),

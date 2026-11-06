@@ -94,7 +94,7 @@ impl Workspace {
             .child("Add source")
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)))
             .dropdown_menu_with_anchor(Anchor::TopRight, {
-                let view = view.clone();
+                let view = view;
                 move |menu, window, _| {
                     let mut menu = menu.item(PopupMenuItem::new("Machine over SSH").on_click(
                         window.listener_for(&view, |this, _, window, cx| this.open_ssh_editor(None, window, cx)),
@@ -105,12 +105,12 @@ impl Workspace {
                         ));
                     }
                     if supports_simlock {
-                        menu =
-                            menu.item(PopupMenuItem::new("Simlock pool (alpha)").on_click(
-                                window.listener_for(&view, |this, _, window, cx| {
-                                    this.open_simlock_editor(None, window, cx)
-                                }),
-                            ));
+                        menu = menu.item(PopupMenuItem::new("Simlock pool (alpha)").on_click(window.listener_for(
+                            &view,
+                            |this, _, window, cx| {
+                                this.open_simlock_editor(None, window, cx);
+                            },
+                        )));
                     }
                     menu
                 }
@@ -179,7 +179,7 @@ impl Workspace {
                                 .cursor_pointer()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(t.foreground)
-                                .hover(|style| style.underline())
+                                .hover(gpui_kit::Styled::underline)
                                 .child(label)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let input = match &action {
@@ -211,7 +211,7 @@ impl Workspace {
             .py(px(12.))
             .child(text)
             .child(side)
-            .when_some(self.row_actions(&row, sources, disabled, t, cx), |this, actions| this.child(actions))
+            .when_some(self.row_actions(&row, sources, disabled, t, cx), gpui_kit::ParentElement::child)
             .into_any_element()
     }
 
@@ -255,17 +255,18 @@ impl Workspace {
                 if let RowHost::Ssh(ssh) = &host {
                     let ssh = ssh.clone();
                     let sources = sources.clone();
-                    menu = menu.item(PopupMenuItem::new("Test connection").on_click(
-                        window.listener_for(&view, move |this, _, window, cx| {
-                            this.test_ssh_from_row(ssh.clone(), &sources, window, cx)
-                        }),
-                    ));
+                    menu = menu.item(PopupMenuItem::new("Test connection").on_click(window.listener_for(
+                        &view,
+                        move |this, _, window, cx| {
+                            this.test_ssh_from_row(ssh.clone(), &sources, window, cx);
+                        },
+                    )));
                 }
                 let host = host.clone();
                 let sources = sources.clone();
                 menu.item(PopupMenuItem::element(move |_, _| div().text_color(error).child("Remove")).on_click(
                     window.listener_for(&view, move |this, _, window, cx| {
-                        this.remove_source(host.clone(), &sources, window, cx)
+                        this.remove_source(host.clone(), &sources, window, cx);
                     }),
                 ))
             });

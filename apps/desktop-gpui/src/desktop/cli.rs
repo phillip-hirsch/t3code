@@ -213,8 +213,8 @@ mod platform {
     use anyhow::{Context as _, Result, bail};
     use base64::Engine as _;
 
-    /// `WINDOWS_USER_PATH_SCRIPT`: keeps REG_EXPAND_SZ and `%VAR%`s, tells Explorer with
-    /// WM_SETTINGCHANGE, and a failed read exits nonzero so PATH is never replaced wholesale.
+    /// `WINDOWS_USER_PATH_SCRIPT`: keeps `REG_EXPAND_SZ` and `%VAR%`s, tells Explorer with
+    /// `WM_SETTINGCHANGE`, and a failed read exits nonzero so PATH is never replaced wholesale.
     const USER_PATH_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 if ($env:T3_SET -eq '1') {

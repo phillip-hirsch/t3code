@@ -92,7 +92,6 @@ impl Workspace {
 }
 
 impl ScriptEditor {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         workspace: WeakEntity<Workspace>,
         project_id: &str,
@@ -314,7 +313,7 @@ impl ScriptEditor {
                                 this.icon = (*id).to_owned();
                                 this.icon_picker_open = false;
                                 cx.notify();
-                            })
+                            });
                         })
                         .child(Icon::new(script_icon(id)).with_size(px(16.)))
                         .child(*label)
@@ -353,7 +352,7 @@ fn set(
         view.update(cx, |this, cx| {
             apply(this, *checked);
             cx.notify();
-        })
+        });
     }
 }
 
@@ -480,7 +479,7 @@ impl Render for EditorFooter {
         let on_editor = move |run: fn(&mut ScriptEditor, &mut Window, &mut Context<ScriptEditor>)| {
             let editor = editor.clone();
             move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
-                editor.update(cx, |form, cx| run(form, window, cx))
+                editor.update(cx, |form, cx| run(form, window, cx));
             }
         };
         h_flex()

@@ -414,7 +414,8 @@ impl Workspace {
             };
             if let Err(error) = written {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(format!("{error:#}")).title("Could not save file"), cx)
+                    window
+                        .push_notification(Notification::error(format!("{error:#}")).title("Could not save file"), cx);
                 });
             }
         })
@@ -477,7 +478,7 @@ impl Workspace {
                 state.saved = contents;
             }
             Err(error) => {
-                self.error = Some(format!("Could not save {}: {}", key.path, logic::error_message(&error)).into())
+                self.error = Some(format!("Could not save {}: {}", key.path, logic::error_message(&error)).into());
             }
         }
         cx.notify();
@@ -525,7 +526,7 @@ impl Workspace {
                     .text_color(tokens.warning_foreground)
                     .child(format!(
                         "Preview limited to the first 1 MB of a {} byte file.",
-                        logic::grouped(byte_length as usize)
+                        logic::grouped(usize::try_from(byte_length).unwrap_or(usize::MAX))
                     )),
             ),
             _ => None,

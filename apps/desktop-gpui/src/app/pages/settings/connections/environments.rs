@@ -82,7 +82,7 @@ impl Workspace {
             sections.push(self.linked_environments(&state, cx, &t));
         }
         sections.extend(self.load_balancing_section(cx));
-        self.settings_page("connections", &view, sections, cx)
+        self.settings_page("connections", view, sections, cx)
     }
 
     fn linked_environments(&self, state: &Entity<EnvironmentsState>, cx: &App, t: &Tokens) -> AnyElement {
@@ -163,7 +163,7 @@ fn linked_row(
         .variant(Variant::DestructiveOutline)
         .disabled(busy)
         .on_click(move |_, window, cx| {
-            confirm_forget(state.clone(), client.clone(), id.clone(), label.clone(), window, cx)
+            confirm_forget(state.clone(), client.clone(), id.clone(), label.clone(), window, cx);
         })
         .into_any_element()
     });

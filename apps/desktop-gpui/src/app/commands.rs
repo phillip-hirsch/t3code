@@ -169,10 +169,10 @@ impl Workspace {
                 }
                 match command {
                     "composer.mode" if matches!(self.target, Some(Target::Draft { .. })) => {
-                        self.draft_workspace_open_permissions(cx)
+                        self.draft_workspace_open_permissions(cx);
                     }
                     "modelPicker.toggle" | "composer.effort" if self.composer_picker_open() => {
-                        self.close_model_picker(window, cx)
+                        self.close_model_picker(window, cx);
                     }
                     _ => self.open_model_picker(window, cx),
                 }
@@ -285,6 +285,7 @@ impl Workspace {
 
     /// `appearance.cycle`: System → Light → Dark, with a short toast.
     fn cycle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        struct AppearanceCycle;
         let mut choice = self.client_settings.theme_choice();
         let (mode, label) = match choice.mode {
             ThemePreference::System => (ThemePreference::Light, "Light"),
@@ -293,7 +294,6 @@ impl Workspace {
         };
         choice.mode = mode;
         self.set_theme_choice(choice, window, cx);
-        struct AppearanceCycle;
         window.push_notification(Notification::new().title(format!("Appearance: {label}")).id::<AppearanceCycle>(), cx);
     }
 }

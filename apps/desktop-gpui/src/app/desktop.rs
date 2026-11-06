@@ -85,7 +85,7 @@ impl DesktopShell {
             }
         });
         let subscriptions = vec![
-            cx.observe_window_bounds(window, |this, window, cx| this.window_bounds_changed(window, cx)),
+            cx.observe_window_bounds(window, super::Workspace::window_bounds_changed),
             cx.on_app_quit(|this, cx| {
                 this.desktop.flush_bounds(cx);
                 async {}

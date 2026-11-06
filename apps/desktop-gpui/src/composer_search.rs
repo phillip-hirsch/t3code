@@ -70,7 +70,7 @@ fn score(value: &str, query: &str, bases: Bases, markers: &[char]) -> Option<u32
     if value.is_empty() || query.is_empty() {
         return None;
     }
-    let penalty = value.len().saturating_sub(query.len()).min(64) as u32;
+    let penalty = u32::try_from(value.len().saturating_sub(query.len()).min(64)).unwrap_or(64);
     if value == query {
         return Some(bases.exact);
     }
@@ -79,10 +79,10 @@ fn score(value: &str, query: &str, bases: Bases, markers: &[char]) -> Option<u32
     }
     let boundary = markers.iter().filter_map(|m| value.find(&format!("{m}{query}")).map(|i| i + m.len_utf8())).min();
     if let Some(index) = boundary {
-        return Some(bases.boundary + index as u32 * 2 + penalty);
+        return Some(bases.boundary + u32::try_from(index).ok()? * 2 + penalty);
     }
     if let Some(index) = value.find(query) {
-        return Some(bases.includes + index as u32 * 2 + penalty);
+        return Some(bases.includes + u32::try_from(index).ok()? * 2 + penalty);
     }
     bases.fuzzy.and_then(|base| subsequence(value, query).map(|s| base + s))
 }
@@ -104,7 +104,7 @@ fn subsequence(value: &str, query: &str) -> Option<u32> {
         if matched == query.len() {
             let span = index - start + 1 - query.len();
             let length = (value.chars().count() - query.len()).min(64);
-            return Some((start * 2 + gaps * 3 + span + length) as u32);
+            return u32::try_from(start * 2 + gaps * 3 + span + length).ok();
         }
     }
     None

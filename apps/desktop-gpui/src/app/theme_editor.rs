@@ -299,9 +299,9 @@ impl ThemeEditor {
         let mut colors = [themes::standard_roles(false).clone(), themes::standard_roles(true).clone()];
         let mut dark = session.dark;
         if let Some(source) = &source {
-            colors[source.dark as usize] = source.roles.clone();
+            colors[usize::from(source.dark)] = source.roles.clone();
             if let Some(variant) = &source.variant_roles {
-                colors[!source.dark as usize] = variant.clone();
+                colors[usize::from(!source.dark)] = variant.clone();
             }
             if source.colors_for(dark).is_none() {
                 dark = source.dark;
@@ -331,7 +331,7 @@ impl ThemeEditor {
                 continue;
             }
             let input =
-                cx.new(|cx| InputState::new(window, cx).default_value(field_text(colors[dark as usize].get(role))));
+                cx.new(|cx| InputState::new(window, cx).default_value(field_text(colors[usize::from(dark)].get(role))));
             subscriptions.push(cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
                 match event {
                     InputEvent::Change => {
@@ -425,13 +425,13 @@ impl ThemeEditor {
     /// `applyThemeColorPreview`: the draft paints the app while the editor is open.
     fn preview(&self, window: &mut Window, cx: &mut App) {
         let fallback = ThemeColors::from_roles(themes::standard_roles(self.dark), None);
-        let colors = ThemeColors::from_roles(&self.colors[self.dark as usize], fallback.as_ref());
+        let colors = ThemeColors::from_roles(&self.colors[usize::from(self.dark)], fallback.as_ref());
         theme::set_editor_preview(colors.map(|colors| (self.dark, colors)), window, cx);
     }
 
     /// The fields and the open picker show the draft, except where the person is typing.
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let colors = &self.colors[self.dark as usize];
+        let colors = &self.colors[usize::from(self.dark)];
         for (role, input) in &self.fields {
             let text = field_text(colors.get(role));
             let focused = input.read(cx).focus_handle(cx).is_focused(window);
@@ -451,7 +451,7 @@ impl ThemeEditor {
 
     /// `updateColor`.
     fn update_color(&mut self, role: &'static str, value: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let index = self.dark as usize;
+        let index = usize::from(self.dark);
         let current = &self.colors[index];
         let simple = !self.advanced && SIMPLE_ROLES.contains(&role) && theme_color::is_color(value.trim());
         self.colors[index] = if self.advanced {
@@ -494,8 +494,8 @@ impl ThemeEditor {
                 let both = self.editing.as_ref().is_some_and(|theme| theme.modes().len() > 1);
                 let appearances: Vec<bool> = if both { vec![false, true] } else { vec![self.dark] };
                 for dark in appearances {
-                    self.simple_dirty[dark as usize] = true;
-                    self.colors[dark as usize] = managed(dark, &self.colors[dark as usize]);
+                    self.simple_dirty[usize::from(dark)] = true;
+                    self.colors[usize::from(dark)] = managed(dark, &self.colors[usize::from(dark)]);
                 }
                 self.regenerate = false;
             }
@@ -519,7 +519,8 @@ impl ThemeEditor {
         self.snapshot = Some((self.colors.clone(), self.simple_dirty, self.regenerate));
         self.select_role(role, cx);
         self.selected = Some(role);
-        let hex = theme_color::to_hex(self.colors[self.dark as usize].get(role)).unwrap_or_else(|| "#000000".into());
+        let hex =
+            theme_color::to_hex(self.colors[usize::from(self.dark)].get(role)).unwrap_or_else(|| "#000000".into());
         let opaque = hex.get(..7).unwrap_or("#000000").to_owned();
         let alpha = hex.get(7..9).filter(|alpha| *alpha != "ff").unwrap_or_default().to_owned();
         let hex_input = cx.new(|cx| InputState::new(window, cx).default_value(opaque.clone()));
@@ -648,8 +649,8 @@ impl ThemeEditor {
             self.colors.clone()
         } else {
             [false, true].map(|dark| {
-                let colors = &self.colors[dark as usize];
-                if self.simple_dirty[dark as usize] { managed(dark, colors) } else { colors.clone() }
+                let colors = &self.colors[usize::from(dark)];
+                if self.simple_dirty[usize::from(dark)] { managed(dark, colors) } else { colors.clone() }
             })
         };
         let file =
@@ -696,7 +697,7 @@ impl ThemeEditor {
                 }
                 let mut variants = variants_of(&target);
                 for dark in &edited {
-                    variants.insert(mode(*dark).into(), colors[*dark as usize].to_json());
+                    variants.insert(mode(*dark).into(), colors[usize::from(*dark)].to_json());
                 }
                 variants.remove(mode(target.dark));
                 let managed = target.managed && !self.advanced;
@@ -711,10 +712,10 @@ impl ThemeEditor {
                 let base = editing.dark;
                 let mut variants = Map::new();
                 if editing.modes().len() > 1 {
-                    variants.insert(mode(!base).into(), colors[!base as usize].to_json());
+                    variants.insert(mode(!base).into(), colors[usize::from(!base)].to_json());
                 }
                 let saved = keep(
-                    file(Some(&editing.id), name, base, &colors[base as usize], variants, !self.advanced)?,
+                    file(Some(&editing.id), name, base, &colors[usize::from(base)], variants, !self.advanced)?,
                     &editing.collection,
                 );
                 Ok((library.update(saved.clone())?, saved, Saved::Edited))
@@ -724,7 +725,7 @@ impl ThemeEditor {
                     return Err(format!("“{}” already has light and dark palettes. Pick another name.", target.label));
                 }
                 let mut variants = variants_of(&target);
-                variants.insert(mode(self.dark).into(), colors[self.dark as usize].to_json());
+                variants.insert(mode(self.dark).into(), colors[usize::from(self.dark)].to_json());
                 let managed = target.managed && !self.advanced;
                 let saved = keep(
                     file(Some(&target.id), &target.label, target.dark, &target.roles, variants, managed)?,
@@ -733,7 +734,7 @@ impl ThemeEditor {
                 Ok((library.update(saved.clone())?, saved, Saved::Merged(self.dark)))
             }
             (None, None) => {
-                let saved = file(None, name, self.dark, &colors[self.dark as usize], Map::new(), !self.advanced)?;
+                let saved = file(None, name, self.dark, &colors[usize::from(self.dark)], Map::new(), !self.advanced)?;
                 Ok((library.install(saved.clone())?, saved, Saved::Created))
             }
         }
@@ -850,11 +851,11 @@ impl Render for ThemeEditor {
         let dragging = self.drag.is_some();
         let tracker = canvas(
             move |element_bounds, _, _| bounds.set(element_bounds),
-            move |_, _, window, _| {
+            move |_, (), window, _| {
                 if !dragging {
                     return;
                 }
-                let (moved, released) = (entity.clone(), entity.clone());
+                let (moved, released) = (entity.clone(), entity);
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Capture {
                         return;
@@ -1100,7 +1101,7 @@ impl ThemeEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let value = self.colors[self.dark as usize].get(role);
+        let value = self.colors[usize::from(self.dark)].get(role);
         let valid = theme_color::is_color(value);
         let swatch = if valid { theme_color::to_srgba(value) } else { None }
             .map_or(Hsla::black(), |[r, g, b, a]| gpui_kit::Rgba { r, g, b, a }.into());
@@ -1201,7 +1202,7 @@ impl ThemeEditor {
                 linear_color_stop(gpui_kit::black(), 0.),
                 linear_color_stop(gpui_kit::black().opacity(0.), 1.),
             )))
-            .child(canvas(move |bounds, _, _| plane_bounds.set(bounds), |_, _, _, _| {}).absolute().size_full())
+            .child(canvas(move |bounds, _, _| plane_bounds.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .child(thumb(12.).left(gpui_kit::relative(s)).top(gpui_kit::relative(1. - v)).ml(px(-6.)).mt(px(-6.)))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1228,7 +1229,7 @@ impl ThemeEditor {
             .items_center()
             .cursor_pointer()
             .child(track)
-            .child(canvas(move |bounds, _, _| hue_bounds.set(bounds), |_, _, _, _| {}).absolute().size_full())
+            .child(canvas(move |bounds, _, _| hue_bounds.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .child(thumb(16.).left(gpui_kit::relative(h / 360.)).ml(px(-8.)).bg(hue_color))
             .on_mouse_down(
                 MouseButton::Left,

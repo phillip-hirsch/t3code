@@ -85,7 +85,7 @@ pub(super) fn menu_open_change(view: Entity<Workspace>) -> impl Fn(&bool, &mut g
         view.update(cx, |this, cx| {
             this.files.menu_open = *open;
             cx.notify();
-        })
+        });
     }
 }
 

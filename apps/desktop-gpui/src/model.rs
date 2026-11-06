@@ -319,6 +319,7 @@ pub struct UsageWindow {
 
 impl UsageWindow {
     /// `remainingPercent` in `packages/shared/src/usageLimits.ts`.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a percentage clamped to 0..=100")]
     pub fn remaining_percent(&self) -> u32 {
         (100. - self.used_percent.clamp(0., 100.)).round() as u32
     }
@@ -362,7 +363,7 @@ pub struct ServerInfo {
     /// `environment.capabilities` from the config snapshot.
     pub capabilities: Value,
     /// `config.keybindings`, the server's resolved rules (defaults not merged in).
-    pub keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    pub keybindings: Rc<[crate::keybindings::Rule]>,
     pub keybindings_config_path: Option<String>,
     /// `config.availableEditors`, editor ids that can open a path on the server's host.
     pub available_editors: Vec<String>,
@@ -393,7 +394,7 @@ impl ServerInfo {
                 self.new_projects_root = text("/newProjectsRoot");
                 self.platform_os = text("/environment/platform/os");
                 self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
-                self.keybindings = Rc::new(crate::keybindings::decode_rules(&config["keybindings"]));
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(&config["keybindings"]));
                 self.keybindings_config_path = text("/keybindingsConfigPath");
                 self.available_editors = config["availableEditors"]
                     .as_array()
@@ -404,7 +405,7 @@ impl ServerInfo {
             }
             "keybindingsUpdated" => {
                 let keybindings = &event["payload"]["keybindings"];
-                self.keybindings = Rc::new(crate::keybindings::decode_rules(keybindings));
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(keybindings));
                 if let Some(config) = self.config.as_object_mut() {
                     config.insert("keybindings".into(), keybindings.clone());
                 }
@@ -498,10 +499,10 @@ impl ServerInfo {
     /// Mirrors `resolveDefaultProviderModelSelection`.
     pub fn new_thread_model(&self, project: Option<&ProjectShell>) -> Option<ModelSelection> {
         let preferred = ModelSelection::deserialize(self.project_setting(project, "defaultModelSelection")).ok();
-        if let Some(selection) = preferred {
-            if self.provider(&selection.instance_id).is_some_and(Provider::is_selectable) {
-                return Some(selection);
-            }
+        if let Some(selection) = preferred
+            && self.provider(&selection.instance_id).is_some_and(Provider::is_selectable)
+        {
+            return Some(selection);
         }
         self.automatic_model()
     }
@@ -913,10 +914,10 @@ impl ShellState {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
         let sequence = item.get("sequence").and_then(Value::as_u64);
         let cursor = self.cursors.entry(environment_id.clone()).or_default();
-        if let Some(sequence) = sequence {
-            if sequence <= cursor.sequence || cursor.needs_snapshot {
-                return Ok(());
-            }
+        if let Some(sequence) = sequence
+            && (sequence <= cursor.sequence || cursor.needs_snapshot)
+        {
+            return Ok(());
         }
         self.revision += 1;
         let ours = |id: &SharedString| id == environment_id;
@@ -1536,7 +1537,7 @@ impl ThreadProjection {
                 self.refilter_visible();
             }
             "runtime-request.updated" => {
-                upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id)
+                upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id);
             }
             "turn-item.updated" => {
                 let mut item = TurnItem::deserialize(payload)?;
@@ -1544,7 +1545,7 @@ impl ThreadProjection {
                 self.apply_turn_item(item);
             }
             "provider-thread.updated" => {
-                upsert(&mut self.provider_threads, ProviderThread::deserialize(payload)?, |t| &t.id)
+                upsert(&mut self.provider_threads, ProviderThread::deserialize(payload)?, |t| &t.id);
             }
             "provider-turn.updated" => {
                 let mut turn = ProviderTurn::deserialize(payload)?;
@@ -1558,7 +1559,7 @@ impl ThreadProjection {
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
             "plan.updated" => upsert(&mut self.plans, PlanArtifact::deserialize(payload)?, |p| &p.id),
             "provider-session.attached" | "provider-session.updated" => {
-                upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id)
+                upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
             }
             "provider-session.detached" => {
                 let id = payload["providerSessionId"].as_str().unwrap_or_default();
@@ -1608,19 +1609,19 @@ impl ThreadProjection {
         {
             return false;
         }
-        if item.item_type == "run_interrupt_result" {
-            if let (Some(run_id), Some(node_id)) = (&item.run_id, &item.node_id) {
-                let superseded = self.attempts.iter().any(|attempt| {
-                    &attempt.run_id == run_id
-                        && attempt.root_node_id.as_ref() == Some(node_id)
-                        && attempt.status == "superseded"
-                });
-                let has_request = self.turn_items.iter().any(|candidate| {
-                    candidate.item_type == "run_interrupt_request" && candidate.run_id.as_ref() == Some(run_id)
-                });
-                if superseded && !has_request {
-                    return false;
-                }
+        if item.item_type == "run_interrupt_result"
+            && let (Some(run_id), Some(node_id)) = (&item.run_id, &item.node_id)
+        {
+            let superseded = self.attempts.iter().any(|attempt| {
+                &attempt.run_id == run_id
+                    && attempt.root_node_id.as_ref() == Some(node_id)
+                    && attempt.status == "superseded"
+            });
+            let has_request = self.turn_items.iter().any(|candidate| {
+                candidate.item_type == "run_interrupt_request" && candidate.run_id.as_ref() == Some(run_id)
+            });
+            if superseded && !has_request {
+                return false;
             }
         }
         true
@@ -1695,7 +1696,7 @@ impl ThreadState {
                 match ThreadProjection::deserialize(&item["projection"]) {
                     Ok(mut projection) => {
                         // Freshly decoded, so every item is still unique and can be stamped.
-                        for item in projection.turn_items.iter_mut() {
+                        for item in &mut projection.turn_items {
                             if let Some(item) = Rc::get_mut(item) {
                                 item.revision = sequence;
                             }
@@ -1835,7 +1836,7 @@ mod tests {
         // A fresh snapshot of a replaces only a's part.
         shell.apply(&a, &snapshot(9, "t4")).unwrap();
         let mut ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, ["t2", "t3", "t4"]);
         shell.remove_environment("env-b");
         assert_eq!((shell.projects.len(), shell.threads.len(), shell.sequence("env-b")), (1, 1, 0));

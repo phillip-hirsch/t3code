@@ -34,7 +34,7 @@ pub(in crate::app) struct CodeTab {
     /// The shown patch indexed by path, for anchoring threads and comments.
     patches: Rc<HashMap<String, FilePatch>>,
     /// Shown files in the viewer's order.
-    shown: Rc<Vec<String>>,
+    shown: Rc<[String]>,
     test_files: usize,
     hidden_tests: usize,
     ignore_whitespace: bool,
@@ -58,8 +58,7 @@ pub(in crate::app) struct CodeTab {
 }
 
 impl CodeTab {
-    fn new(ignore_whitespace: bool, wrap: bool, folded: bool, split: bool, cx: &mut Context<Workspace>) -> Self {
-        let mode = if split { DiffMode::Split } else { DiffMode::Unified };
+    fn new(ignore_whitespace: bool, wrap: bool, folded: bool, mode: DiffMode, cx: &mut Context<Workspace>) -> Self {
         Self {
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx).with_mode(mode)),
             commit: None,
@@ -261,10 +260,11 @@ impl Workspace {
         let settings = &self.client_settings.values;
         let (ignore, wrap, folded) =
             (settings.bool("diffIgnoreWhitespace"), settings.bool("wordWrap"), settings.bool("diffFilesCollapsed"));
-        let split = settings.get("diffLayout").as_str() == Some("split");
+        let mode =
+            if settings.get("diffLayout").as_str() == Some("split") { DiffMode::Split } else { DiffMode::Unified };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         if panel.code.is_none() {
-            panel.code = Some(CodeTab::new(ignore, wrap, folded, split, cx));
+            panel.code = Some(CodeTab::new(ignore, wrap, folded, mode, cx));
         }
         let code = panel.code.as_ref().expect("made above");
         let viewed_files = panel.detail.as_ref().is_some_and(|d| d.capabilities.viewed_files.is_some());
@@ -379,7 +379,7 @@ impl Workspace {
         let order = diff_logic::order_files(&kept);
         let mut by_path: HashMap<String, DiffFile> = files.into_iter().map(|f| (f.path().to_string(), f)).collect();
         let ordered: Vec<DiffFile> = order.iter().filter_map(|&i| by_path.remove(&kept[i])).collect();
-        code.shown = Rc::new(order.iter().map(|&i| kept[i].clone()).collect());
+        code.shown = order.iter().map(|&i| kept[i].clone()).collect();
         code.patches = Rc::new(diff_logic::index_patch(&text).into_iter().map(|f| (f.path.clone(), f)).collect());
         let fresh: Vec<String> = code.shown.iter().filter(|p| !code.seen.contains(*p)).cloned().collect();
         code.seen.extend(fresh.iter().cloned());
@@ -635,7 +635,11 @@ impl Workspace {
             .map(|(key, group)| {
                 DiffAnnotation::line(
                     ElementId::Name(key.clone()),
-                    DiffLinePosition::new(group.path.clone(), to_viewer_side(group.side), group.line as usize),
+                    DiffLinePosition::new(
+                        group.path.clone(),
+                        to_viewer_side(group.side),
+                        usize::try_from(group.line).unwrap_or(usize::MAX),
+                    ),
                 )
             })
             .collect();
@@ -689,7 +693,7 @@ impl Workspace {
                     let path = range.path().to_string();
                     let start = (from_viewer_side(range.side()), range.start() as u64);
                     let end = (from_viewer_side(range.end_side()), range.end() as u64);
-                    let _ = add_view.update(cx, |this, cx| this.begin_pr_line_comment(path, start, end, window, cx));
+                    let () = add_view.update(cx, |this, cx| this.begin_pr_line_comment(path, start, end, window, cx));
                 })
             })
             .render_header_suffix(move |file, _, _| {
@@ -719,8 +723,8 @@ impl Workspace {
                                     .on_click(move |checked, window, cx| {
                                         let extend = window.modifiers().shift;
                                         let (path, checked) = (toggle_path.clone(), *checked);
-                                        let _ = toggle_view.update(cx, |this, cx| {
-                                            this.set_pr_file_viewed(path, checked, extend, window, cx)
+                                        let () = toggle_view.update(cx, |this, cx| {
+                                            this.set_pr_file_viewed(path, checked, extend, window, cx);
                                         });
                                     }),
                             )
@@ -834,63 +838,62 @@ impl Workspace {
             selected.map_or_else(|| "All commits".into(), |c| c.message_headline.clone()).into();
         let view = cx.entity();
         let current = code.commit.clone();
-        let scope =
-            (!activity.commits.is_empty()).then(|| {
-                Button::new("pr-code-scope")
-                    .custom(
-                        gpui_kit::component::button::ButtonCustomVariant::new(cx)
-                            .color(t.secondary)
-                            .foreground(t.foreground)
-                            .hover(t.secondary.opacity(0.9))
-                            .active(t.secondary.opacity(0.8)),
-                    )
-                    .xsmall()
-                    .h(px(24.))
-                    .px(px(7.))
-                    .gap(px(4.))
-                    .rounded(px(8.))
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(div().max_w(px(256.)).truncate().child(scope_label))
-                    .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
-                    .dropdown_menu(move |menu: PopupMenu, window, _| {
-                        let pick =
-                            |label: SharedString, oid: Option<String>, short: Option<String>, window: &mut Window| {
-                                let checked = current == oid;
-                                let item = match short {
-                                    Some(short) => PopupMenuItem::element(move |_, cx| {
-                                        h_flex()
-                                            .w_full()
-                                            .gap(px(8.))
-                                            .child(div().min_w_0().max_w(px(320.)).truncate().child(label.clone()))
-                                            .child(
-                                                div()
-                                                    .ml_auto()
-                                                    .flex_none()
-                                                    .font_family(FONT_MONO)
-                                                    .text_xs()
-                                                    .text_color(theme::tokens(cx).muted_foreground)
-                                                    .child(short.clone()),
-                                            )
-                                    }),
-                                    None => PopupMenuItem::new(label),
-                                };
-                                item.checked(checked).on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                    this.set_pr_code_commit(oid.clone(), cx)
-                                }))
+        let scope = (!activity.commits.is_empty()).then(|| {
+            Button::new("pr-code-scope")
+                .custom(
+                    gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                        .color(t.secondary)
+                        .foreground(t.foreground)
+                        .hover(t.secondary.opacity(0.9))
+                        .active(t.secondary.opacity(0.8)),
+                )
+                .xsmall()
+                .h(px(24.))
+                .px(px(7.))
+                .gap(px(4.))
+                .rounded(px(8.))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .child(div().max_w(px(256.)).truncate().child(scope_label))
+                .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
+                .dropdown_menu(move |menu: PopupMenu, window, _| {
+                    let pick =
+                        |label: SharedString, oid: Option<String>, short: Option<String>, window: &mut Window| {
+                            let checked = current == oid;
+                            let item = match short {
+                                Some(short) => PopupMenuItem::element(move |_, cx| {
+                                    h_flex()
+                                        .w_full()
+                                        .gap(px(8.))
+                                        .child(div().min_w_0().max_w(px(320.)).truncate().child(label.clone()))
+                                        .child(
+                                            div()
+                                                .ml_auto()
+                                                .flex_none()
+                                                .font_family(FONT_MONO)
+                                                .text_xs()
+                                                .text_color(theme::tokens(cx).muted_foreground)
+                                                .child(short.clone()),
+                                        )
+                                }),
+                                None => PopupMenuItem::new(label),
                             };
-                        let mut menu = menu.min_w(px(220.)).item(pick("All commits".into(), None, None, window));
-                        for commit in newest_first.iter().map(|&i| &activity.commits[i]) {
-                            menu = menu.item(pick(
-                                commit.message_headline.clone().into(),
-                                Some(commit.oid.clone()),
-                                Some(logic::short_oid(&commit.oid).to_owned()),
-                                window,
-                            ));
-                        }
-                        menu.max_h(px(360.)).scrollable(true)
-                    })
-            });
+                            item.checked(checked).on_click(window.listener_for(&view, move |this, _, _, cx| {
+                                this.set_pr_code_commit(oid.clone(), cx);
+                            }))
+                        };
+                    let mut menu = menu.min_w(px(220.)).item(pick("All commits".into(), None, None, window));
+                    for commit in newest_first.iter().map(|&i| &activity.commits[i]) {
+                        menu = menu.item(pick(
+                            commit.message_headline.clone().into(),
+                            Some(commit.oid.clone()),
+                            Some(logic::short_oid(&commit.oid).to_owned()),
+                            window,
+                        ));
+                    }
+                    menu.max_h(px(360.)).scrollable(true)
+                })
+        });
 
         let shown = code.shown.len();
         let partial = code.next_cursor().is_some();
@@ -925,7 +928,7 @@ impl Workspace {
                     .flex_none()
                     .cursor_pointer()
                     .text_color(t.foreground)
-                    .hover(|s| s.underline())
+                    .hover(gpui_kit::Styled::underline)
                     .child(format!("{hidden} test {} hidden", if hidden == 1 { "file" } else { "files" }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(code) = this.pr_code() {
@@ -1219,7 +1222,7 @@ impl Workspace {
             None => thread.next_comments_cursor.clone(),
         };
         let count = thread.comment_count.unwrap_or(comments.len());
-        let expanded = !thread.is_resolved != code.toggled.contains(&thread.id);
+        let expanded = thread.is_resolved == code.toggled.contains(&thread.id);
         let loading_more = code.loading_more.as_deref() == Some(thread.id.as_str());
         let id = thread.id.clone();
         let success = t.success_foreground;
@@ -1308,7 +1311,7 @@ impl Workspace {
                         .disabled(loading_more)
                         .child(if loading_more { "Loading..." } else { "Load more comments" })
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.load_more_thread_comments(thread_id.clone(), cursor.clone(), window, cx)
+                            this.load_more_thread_comments(thread_id.clone(), cursor.clone(), window, cx);
                         }))
                         .into_any_element(),
                 );

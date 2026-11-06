@@ -22,6 +22,7 @@ pub struct WindowRect {
 
 impl WindowRect {
     /// `normalizeMainWindowBounds`: integers at least the minimum size, else nothing.
+    #[expect(clippy::cast_possible_truncation, reason = "whole and within i32, so exact")]
     fn parse(value: &Value) -> Option<Self> {
         let int = |key: &str| {
             let number = value.get(key)?.as_f64()?;

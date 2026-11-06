@@ -85,6 +85,7 @@ gpui_kit::actions!(
 /// Runs a shell command in the thread's terminal, as a project script does.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, gpui_kit::Action)]
 #[action(namespace = workspace, no_json)]
+#[expect(clippy::unsafe_derive_deserialize, reason = "the unsafe is in `gpui_kit::Action`'s derive, not this type")]
 pub struct RunInTerminal {
     pub cwd: String,
     pub command: String,
@@ -136,7 +137,7 @@ pub struct Workspace {
     shell: ShellState,
     target: Option<Target>,
     thread: Option<OpenThread>,
-    rows: Rc<Vec<Row>>,
+    rows: Rc<[Row]>,
     /// Open work groups, turn folds and entries in the timeline (`timeline::*_key`).
     expanded: HashSet<SharedString>,
     entry_cache: timeline::EntryCache,
@@ -226,9 +227,9 @@ pub struct Workspace {
     history: pages::History,
     devices: crate::device::Devices,
     /// The server's keybindings `keymap` was merged from; see [`keymap`].
-    installed_keybindings: Rc<Vec<crate::keybindings::Rule>>,
+    installed_keybindings: Rc<[crate::keybindings::Rule]>,
     /// The server's rules merged with the defaults, which every keystroke resolves against.
-    keymap: Rc<Vec<crate::keybindings::Rule>>,
+    keymap: Rc<[crate::keybindings::Rule]>,
     /// The keystroke whose command last ran, until a key is released: a repeat of it is held.
     held_key: Option<gpui_kit::Keystroke>,
     reload_toasts: keymap::ReloadToasts,
@@ -390,7 +391,7 @@ impl Workspace {
             history: pages::History::default(),
             devices: Default::default(),
             installed_keybindings: Rc::default(),
-            keymap: Rc::new(crate::keybindings::merge_with_defaults(&[])),
+            keymap: Rc::from(crate::keybindings::merge_with_defaults(&[])),
             held_key: None,
             reload_toasts: Default::default(),
             pending_reload: None,
@@ -445,7 +446,7 @@ impl Workspace {
                 Ok(Err(error)) => {
                     log::error!("could not reach the server: {error:#}");
                     let _ = this.update(cx, |this, cx| {
-                        this.set_connection(Connection::Failed(format!("{error:#}").into()), cx)
+                        this.set_connection(Connection::Failed(format!("{error:#}").into()), cx);
                     });
                     return;
                 }
@@ -522,7 +523,7 @@ impl Workspace {
                         if this
                             .update_in(cx, |this, window, cx| {
                                 this.environment_remote = remote;
-                                this.on_connected(client.clone(), current, window, cx)
+                                this.on_connected(client.clone(), current, window, cx);
                             })
                             .is_err()
                         {
@@ -589,7 +590,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.connection = Connection::Connected;
-        self.set_primary_connection(Some(client.clone()), Some(endpoint));
+        self.set_primary_connection(Some(client), Some(endpoint));
         // Read per connection: the files may have changed, or never loaded while down.
         self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
@@ -627,10 +628,10 @@ impl Workspace {
                             }
                             StreamEvent::End(result) => {
                                 ended = true;
-                                if let Err(error) = result {
-                                    if !matches!(error, RpcError::Disconnected(_)) {
-                                        this.error = Some(error.to_string().into());
-                                    }
+                                if let Err(error) = result
+                                    && !matches!(error, RpcError::Disconnected(_))
+                                {
+                                    this.error = Some(error.to_string().into());
                                 }
                             }
                         }
@@ -747,7 +748,7 @@ impl Workspace {
         self.sync_child_approvals(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
-        self.rows = Rc::new(new_rows);
+        self.rows = Rc::from(new_rows);
         self.sync_details(cx);
         self.prune_requests();
         self.scroller.update(cx, |scroller, cx| {
@@ -1045,11 +1046,11 @@ impl Render for Workspace {
             }))
             .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| {
                 this.held_key = None;
-                this.quit_key_up(event, cx)
+                this.quit_key_up(event, cx);
             }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
                 this.snap_shot_record_modifiers(event, cx);
-                this.quit_modifiers_changed(event, cx)
+                this.quit_modifiers_changed(event, cx);
             }))
             .child(
                 h_flex()
@@ -1102,7 +1103,7 @@ impl Render for Workspace {
                                     .children(mini_player)
                                     .children(self.render_banner_lane(cx))
                                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
-                                        this.drop_paths(paths, window, cx)
+                                        this.drop_paths(paths, window, cx);
                                     }))
                                     .on_drag_move(cx.listener(Self::on_file_drag_move))
                                     .when(self.dragging_files && cx.has_active_drag(), |el| {

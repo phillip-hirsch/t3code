@@ -183,7 +183,7 @@ fn linked_row(link: &PullRequestLink, project_id: &str, t: &Tokens, cx: &mut Con
                 ),
         )
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_surface(Surface::PullRequest(reference.clone()), window, cx)
+            this.open_surface(Surface::PullRequest(reference.clone()), window, cx);
         }))
         .into_any_element()
 }

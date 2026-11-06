@@ -35,6 +35,7 @@ struct Hsv {
 }
 
 /// `hexToHsv` in `apps/web/src/lib/color.ts`.
+#[expect(clippy::float_cmp, reason = "`max` is one of r, g and b, so equality is exact")]
 fn hex_to_hsv(hex: &str) -> Hsv {
     let numeric = u32::from_str_radix(hex.get(1..).unwrap_or_default(), 16).unwrap_or(0);
     let [r, g, b] = [16, 8, 0].map(|shift| ((numeric >> shift) & 255) as f32 / 255.);
@@ -70,6 +71,7 @@ fn hsv_to_hex(Hsv { h, s, v }: Hsv) -> String {
         _ => (chroma, 0., x),
     };
     let m = v - chroma;
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |c: f32| ((c + m) * 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
 }
@@ -120,7 +122,7 @@ pub(super) fn accent_color_picker(
     cx: &mut App,
 ) -> AnyElement {
     let on_commit: Commit = Rc::new(on_commit);
-    let picker = window.use_keyed_state(id, cx, |window, cx| AccentPicker::new(window, cx));
+    let picker = window.use_keyed_state(id, cx, AccentPicker::new);
     let value = value.unwrap_or_default().to_owned();
     let display_name: SharedString = display_name.to_owned().into();
     picker.update(cx, |picker, _| {
@@ -390,7 +392,7 @@ fn thumb(size: Pixels, fill: Option<Hsla>) -> gpui_kit::Div {
         .rounded_full()
         .border_2()
         .border_color(hsla(0., 0., 1., 1.))
-        .when_some(fill, |el, fill| el.bg(fill))
+        .when_some(fill, gpui_kit::Styled::bg)
         .shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), hsla(0., 0., 0., 0.4)).spread_radius(px(1.))])
 }
 
@@ -420,7 +422,7 @@ impl Render for AccentPicker {
                 picker.update(cx, |this, cx| this.set_open(*open, window, cx));
             })
             .trigger(trigger)
-            .content(move |_, _, cx| content_picker.update(cx, |this, cx| this.panel(cx)))
+            .content(move |_, _, cx| content_picker.update(cx, AccentPicker::panel))
     }
 }
 

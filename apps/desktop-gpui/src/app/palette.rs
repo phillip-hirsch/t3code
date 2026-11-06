@@ -963,10 +963,10 @@ impl Workspace {
         let (directory, leaf) = split_browse(query);
         let browse = &palette.browse;
         let mut rows = Vec::new();
-        if leaf.is_empty() {
-            if let Some(parent) = up_path(directory) {
-                rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
-            }
+        if leaf.is_empty()
+            && let Some(parent) = up_path(directory)
+        {
+            rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
         }
         if browse.directory == directory {
             for (name, _) in filter_entries(&browse.entries, leaf) {
@@ -1165,7 +1165,7 @@ impl Workspace {
                             i + 1
                         }
                     }
-                    (_, None) | (_, Some(0)) => last,
+                    (_, None | Some(0)) => last,
                     (_, Some(i)) => i - 1,
                 };
                 if let Some(palette) = &mut self.palette {
@@ -1195,7 +1195,7 @@ impl Workspace {
                 }
             }
             "backspace" if query.is_empty() && !self.palette.as_ref().is_some_and(|p| p.stack.is_empty()) => {
-                self.pop_palette_view(window, cx)
+                self.pop_palette_view(window, cx);
             }
             key if modifiers.secondary(cx)
                 && view == View::NewThreadIn
@@ -1444,13 +1444,12 @@ impl Workspace {
             .cursor_pointer()
             .when(highlighted, |el| el.bg(tokens.foreground.opacity(0.04)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered {
-                    if let Some(palette) = &mut this.palette {
-                        if palette.highlight != Some(index) {
-                            palette.highlight = Some(index);
-                            cx.notify();
-                        }
-                    }
+                if *hovered
+                    && let Some(palette) = &mut this.palette
+                    && palette.highlight != Some(index)
+                {
+                    palette.highlight = Some(index);
+                    cx.notify();
                 }
             }))
             .on_click(

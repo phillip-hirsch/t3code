@@ -108,7 +108,10 @@ struct TokenMatch {
 }
 
 fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
-    if left.len().abs_diff(right.len()) > if swap_only { 0 } else { 1 } {
+    fn tail(s: &[char]) -> &[char] {
+        s.get(1..).unwrap_or_default()
+    }
+    if left.len().abs_diff(right.len()) > usize::from(!swap_only) {
         return false;
     }
     let i = left.iter().zip(right).take_while(|(a, b)| a == b).count();
@@ -116,9 +119,6 @@ fn within_one_edit(left: &[char], right: &[char], swap_only: bool) -> bool {
     let swapped = l.len() > 1 && r.len() > 1 && l[0] == r[1] && l[1] == r[0] && l[2..] == r[2..];
     if swap_only {
         return swapped;
-    }
-    fn tail(s: &[char]) -> &[char] {
-        s.get(1..).unwrap_or_default()
     }
     swapped || l == r || tail(l) == tail(r) || tail(l) == r || l == tail(r)
 }
@@ -283,14 +283,13 @@ pub fn class(quality: f32) -> u8 {
         3
     } else if quality >= 0.7 {
         2
-    } else if quality >= 0.4 {
-        1
     } else {
-        0
+        u8::from(quality >= 0.4)
     }
 }
 
 /// `threadUsageBoost` without open history: recency of the last user message.
+#[expect(clippy::cast_possible_truncation, reason = "a boost clamped to 1..=2.5")]
 pub fn usage_boost(age_ms: i64) -> f32 {
     const HALF_LIFE: f64 = 14. * 86_400_000.;
     let recency = 2f64.powf(-(age_ms.max(0) as f64) / HALF_LIFE);
@@ -401,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list of one range is the expected value")]
     fn snippet_ranges_skip_short_and_mid_word_tokens() {
         assert_eq!(token_ranges("Rename sidebar row", "the side row"), vec![7..11, 15..18]);
         assert_eq!(token_ranges("another", "the"), Vec::<Range<usize>>::new(), "short tokens need a word start");

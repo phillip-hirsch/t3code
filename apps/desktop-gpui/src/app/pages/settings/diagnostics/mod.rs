@@ -25,7 +25,14 @@ use gpui_kit::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use self::logic::*;
+use self::logic::{
+    Aggregate, CpuBucket, Identity, ProcessDiagnostics, ProcessHistory, SourceHealth, Telemetry, TelemetryBucket,
+    TelemetryHistory, Tone, TraceDiagnostics, bar_height, boolean_state, can_signal, category_label,
+    expected_outside_desktop, format_count, format_cpu_time, format_duration, format_duration_micros, format_rate,
+    format_sample_interval, history_visual_depths, io_semantics_label, is_stale_signal_message, percent, process_name,
+    process_type, relative_label, scale_max, short_process_name, shorten_trace_id, should_show_monitor_retry, some,
+    source_status_tone, telemetry_process_name, visible_process_tree, visible_telemetry_processes,
+};
 use super::connections::logic::{DIAGNOSTICS_READ, ENVIRONMENT_MAINTAIN, ORCHESTRATION_OPERATE};
 use super::connections::ui::{WebButton, tooltip};
 use super::connections::{SessionLoad, check_session};
@@ -194,7 +201,7 @@ impl DiagnosticsState {
                                 // Everything reloads on the next connection.
                                 Err(RpcError::Disconnected(_)) => this.started = None,
                                 Err(error) => this.telemetry_error = Some(error.message().into()),
-                                Ok(_) => {}
+                                Ok(()) => {}
                             }
                             true
                         }
@@ -706,7 +713,7 @@ fn expandable(
                             s.expanded.insert(key);
                         }
                         cx.notify();
-                    })
+                    });
                 },
             )))
         })
@@ -746,17 +753,20 @@ fn trace_id_cell(state: &Entity<DiagnosticsState>, row: &str, trace_id: &str, co
                         });
                     }));
                     cx.notify();
-                })
+                });
             },
         ))
         .into_any_element()
 }
 
+/// Whether a process row is expanded, and the click that flips it.
+type Toggle = (bool, Box<dyn Fn(&mut App)>);
+
 /// The indent, chevron and dot in front of a process name.
 fn tree_name(
     id: ElementId,
     depth: u32,
-    toggle: Option<(bool, Box<dyn Fn(&mut App)>)>,
+    toggle: Option<Toggle>,
     dot: Hsla,
     name: String,
     full: String,
@@ -818,7 +828,7 @@ impl Workspace {
             (None, Some(client)) => {
                 let mut sections = self.telemetry_sections(&state, &client, &t, cx);
                 sections.extend(self.diagnostics_sections(&state, &client, &t, cx));
-                sections.push(self.telemetry_export_section(&state, &view, window, cx));
+                sections.push(self.telemetry_export_section(&state, view, window, cx));
                 sections
             }
             (message, _) => {
@@ -831,7 +841,7 @@ impl Workspace {
                 ]
             }
         };
-        self.settings_page_sized("diagnostics", &view, 1152., 40., content, cx)
+        self.settings_page_sized("diagnostics", view, 1152., 40., content, cx)
     }
 
     /// The `ResourceTelemetryDiagnostics` sections.
@@ -1206,7 +1216,7 @@ impl Workspace {
                             s.telemetry_window = index;
                             s.load_telemetry_history(pick_client.clone(), cx);
                             cx.notify();
-                        })
+                        });
                     },
                 ))
                 .child(icon_button(
@@ -1313,7 +1323,7 @@ impl Workspace {
                                 s.collapsed_keys.insert(key);
                             }
                             cx.notify();
-                        })
+                        });
                     });
                     (open, on_toggle)
                 });
@@ -1329,7 +1339,7 @@ impl Workspace {
                     signal_actions(&format!("tree-{key}"), disabled, t, move |signal, window, cx| {
                         let (state, client, handle) = (state.clone(), client.clone(), window.window_handle());
                         let send = move |cx: &mut App| {
-                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, handle, cx))
+                            state.update(cx, |s, cx| s.signal_telemetry(client.clone(), identity, signal, handle, cx));
                         };
                         if signal == "SIGKILL" {
                             confirm_kill(identity.pid, window, cx, send);
@@ -1500,7 +1510,7 @@ impl Workspace {
              load: fn(&mut DiagnosticsState, RpcClient, &mut Context<DiagnosticsState>)| {
                 let (state, client) = (state.clone(), client.clone());
                 icon_button(id, IconName::RefreshCw, label, pending, t, move |_, cx| {
-                    state.update(cx, |s, cx| load(s, client.clone(), cx))
+                    state.update(cx, |s, cx| load(s, client.clone(), cx));
                 })
             };
 
@@ -1557,7 +1567,7 @@ impl Workspace {
                                 s.collapsed_pids.insert(pid);
                             }
                             cx.notify();
-                        })
+                        });
                     });
                     (!s.collapsed_pids.contains(&pid), on_toggle)
                 });
@@ -1566,7 +1576,7 @@ impl Workspace {
                 let actions = signal_actions(&format!("proc-{pid}"), disabled, t, move |signal, window, cx| {
                     let (state, client, handle) = (signal_state.clone(), signal_client.clone(), window.window_handle());
                     let send = move |cx: &mut App| {
-                        state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, handle, cx))
+                        state.update(cx, |s, cx| s.signal_live(client.clone(), pid, signal, handle, cx));
                     };
                     if signal == "SIGKILL" {
                         confirm_kill(pid, window, cx, send);
@@ -1635,7 +1645,7 @@ impl Workspace {
                             s.history_window = index;
                             s.load_history(pick_client.clone(), cx);
                             cx.notify();
-                        })
+                        });
                     },
                 ))
                 .child(last_checked(data.map(|d| d.read_at.as_str()), now, t))
@@ -1780,7 +1790,7 @@ impl Workspace {
                     })
                     .detach();
                     cx.notify();
-                })
+                });
             })
         };
         let action = h_flex()
@@ -2214,6 +2224,8 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                     let peak_h = 2f64.max(b.max_cpu_percent / max * 100.);
                     let avg_h = 2f64.max(b.avg_cpu_percent / max * 100.);
                     let tip = format!("Avg {:.1}%, peak {:.1}%", b.avg_cpu_percent, b.max_cpu_percent);
+                    #[expect(clippy::cast_possible_truncation, reason = "percent heights as 0..=1 shares")]
+                    let (peak_h, avg_h) = ((peak_h / 100.) as f32, (avg_h / 100.) as f32);
                     div()
                         .id(ElementId::Name(format!("cpu-{}", b.started_at).into()))
                         .relative()
@@ -2226,7 +2238,7 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .h(relative((peak_h / 100.) as f32))
+                                .h(relative(peak_h))
                                 .rounded_t(px(2.))
                                 .bg(peak),
                         )
@@ -2236,7 +2248,7 @@ fn cpu_chart(buckets: &[CpuBucket], t: &Tokens) -> AnyElement {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .h(relative((avg_h / 100.) as f32))
+                                .h(relative(avg_h))
                                 .rounded_t(px(2.))
                                 .bg(average),
                         )
@@ -2254,6 +2266,7 @@ fn telemetry_chart(buckets: &[TelemetryBucket], t: &Tokens) -> AnyElement {
     let legend = |color: Hsla, label: &'static str| {
         h_flex().gap(px(6.)).child(div().h(px(6.)).w(px(12.)).rounded_full().bg(color)).child(label)
     };
+    #[expect(clippy::cast_possible_truncation, reason = "percent heights as 0..=1 shares")]
     let bar = |height: f64, color: Hsla| {
         v_flex()
             .flex_1()

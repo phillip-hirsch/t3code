@@ -190,7 +190,7 @@ pub struct LaunchConfig {
 impl LaunchConfig {
     /// `T3_NODE_BIN`, `T3_SERVER_ENTRY` and `T3CODE_HOME` override the defaults.
     pub fn from_env() -> Result<Self> {
-        let node = std::env::var_os("T3_NODE_BIN").map(PathBuf::from).unwrap_or_else(|| "node".into());
+        let node = std::env::var_os("T3_NODE_BIN").map_or_else(|| "node".into(), PathBuf::from);
         // Electron runs the server in the user's home when packaged and in the repo root
         // from source. The in-repo server entry is our source run.
         let (server_entry, cwd) = match std::env::var_os("T3_SERVER_ENTRY") {

@@ -28,7 +28,7 @@ fn format_percentage(value: f64) -> String {
     if value < 10. {
         // `toFixed` rounds ties up, where `{:.1}` rounds them to even.
         let text = format!("{:.1}", (value * 10.).round() / 10.);
-        text.strip_suffix(".0").map(str::to_owned).unwrap_or(text) + "%"
+        format!("{}%", text.strip_suffix(".0").unwrap_or(&text))
     } else {
         format!("{}%", value.round())
     }
@@ -74,6 +74,7 @@ impl Workspace {
         let (usage, live) = projection.context_window()?;
         let usage = usage.clone();
         let percentage = used_percentage(&usage);
+        #[expect(clippy::cast_possible_truncation, reason = "a percentage clamped to 0..=100")]
         let shown = percentage.unwrap_or(0.).clamp(0., 100.) as f32;
         let color = if shown > 90. { t.error } else { t.muted_foreground.opacity(0.72) };
         let track = t.muted_foreground.opacity(0.24);
@@ -196,7 +197,7 @@ impl Workspace {
                                     .icon(Icon::new(Lucide::Minimize2))
                                     .label("Compact context")
                                     .disabled(compact_blocked)
-                                    .on_click(move |_, _, cx| view.update(cx, |this, cx| this.compact_context(cx))),
+                                    .on_click(move |_, _, cx| view.update(cx, super::Workspace::compact_context)),
                             )
                             .when(compact_blocked, |el| {
                                 el.child(
@@ -270,10 +271,15 @@ fn has_compactable_conversation(projection: &crate::model::ThreadProjection) -> 
 fn ring(percentage: f32, track: Hsla, color: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        move |bounds, _, window, _| {
+        move |bounds, (), window, _| {
             let center = bounds.center();
             let at = |angle: f32| point(center.x + px(RADIUS * angle.cos()), center.y + px(RADIUS * angle.sin()));
             let arc = |from: f32, sweep: f32| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a small, positive step count"
+                )]
                 let steps = ((sweep / TAU) * 64.).ceil().max(1.) as usize;
                 let mut path = PathBuilder::stroke(px(STROKE));
                 path.move_to(at(from));

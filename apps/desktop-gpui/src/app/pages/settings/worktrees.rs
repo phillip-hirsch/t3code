@@ -72,8 +72,8 @@ impl Workspace {
             cx,
         );
         let mode = view.str("branchNamingMode").to_owned();
-        let cleanup = self.cleanup_rows(&view, window, cx);
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let cleanup = self.cleanup_rows(view, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let mut creation = Vec::new();
         if let Some(directory) = directory {
             creation.push(row(
@@ -132,7 +132,7 @@ impl Workspace {
             settings_section("branches", "Branches", branches, &t),
             settings_section("cleanup", "Cleanup", cleanup, &t),
         ];
-        self.settings_page("worktrees", &view, sections, cx)
+        self.settings_page("worktrees", view, sections, cx)
     }
 
     /// `WorktreeCleanupSection`: the environment's rules, or at project scope its cleanup mode and,
@@ -199,7 +199,7 @@ impl Workspace {
             let on = cleanup[field] == true;
             switch(&field.into(), on, false, &t)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.update_settings(cleanup_patch(project_scope, field, json!(!on)), window, cx)
+                    this.update_settings(cleanup_patch(project_scope, field, json!(!on)), window, cx);
                 }))
                 .into_any_element()
         };
@@ -214,7 +214,7 @@ impl Workspace {
             let options = KEEP_WHEN.iter().map(|(id, label)| (*id, (*label).into(), *id == keep)).collect();
             let label = KEEP_WHEN.iter().find(|(id, _)| *id == keep).map_or("", |(_, label)| label);
             self.menu_select("keep-when", options, label, 208., cx, move |this, value: &str, window, cx| {
-                this.update_settings(cleanup_patch(project_scope, "worktreeKeepWhen", json!(value)), window, cx)
+                this.update_settings(cleanup_patch(project_scope, "worktreeKeepWhen", json!(value)), window, cx);
             })
         });
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
@@ -285,7 +285,7 @@ impl Workspace {
             Some(days) => {
                 let input =
                     self.number_field(field, days, (minimum, 3650, 1), window, cx, move |this, days, window, cx| {
-                        this.update_settings(cleanup_patch(project_scope, field, json!(days)), window, cx)
+                        this.update_settings(cleanup_patch(project_scope, field, json!(days)), window, cx);
                     });
                 div()
                     .w(px(128.))
@@ -304,7 +304,7 @@ impl Workspace {
             .child(value)
             .child(switch(&field.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
                 let days = if on { Value::Null } else { json!(8) };
-                this.update_settings(cleanup_patch(project_scope, field, days), window, cx)
+                this.update_settings(cleanup_patch(project_scope, field, days), window, cx);
             })))
             .into_any_element()
     }

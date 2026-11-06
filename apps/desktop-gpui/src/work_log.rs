@@ -346,7 +346,7 @@ pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
             let label = if entry.question_answered { "Answered questions" } else { "Input requested" };
             entry.label = fallback(&title, label);
         }
-        other => entry.label = title.clone().unwrap_or_else(|| other.replace('_', " ").into()),
+        other => entry.label = title.unwrap_or_else(|| other.replace('_', " ").into()),
     }
     entry.t3 = t3_call(&entry, raw);
     entry.action = compute_action(&entry);
@@ -509,10 +509,11 @@ fn collect_paths(value: &Value) -> Vec<SharedString> {
             return;
         }
         for key in ["path", "filePath", "file_path", "relativePath", "filename", "fileName", "newPath", "oldPath"] {
-            if let Some(path) = trimmed(value, key) {
-                if paths.len() < 8 && !paths.iter().any(|p| p == path) {
-                    paths.push(path.to_owned().into());
-                }
+            if let Some(path) = trimmed(value, key)
+                && paths.len() < 8
+                && !paths.iter().any(|p| p == path)
+            {
+                paths.push(path.to_owned().into());
             }
         }
         for key in ["locations", "item", "input", "result", "rawInput", "data", "changes"] {
@@ -538,7 +539,7 @@ fn format_search_label(data: &Value) -> Option<String> {
     let query = first(&["pattern", "query", "searchTerm", "regex", "grep", "needle"]);
     let glob = first(&["glob", "globPattern", "glob_pattern", "include", "filePattern", "file_pattern"]);
     let target = first(&["path", "target_directory", "targetDirectory", "directory", "cwd", "root"])
-        .and_then(|t| t.split(['\\', '/']).filter(|part| !part.is_empty() && *part != ".").next_back());
+        .and_then(|t| t.split(['\\', '/']).rfind(|part| !part.is_empty() && *part != "."));
     Some(match (query, glob, target) {
         (Some(query), _, Some(target)) => format!("Searched {query} in {target}"),
         (None, Some(glob), Some(target)) => format!("Searched files {glob} in {target}"),
@@ -965,7 +966,7 @@ fn t3_display_name(call: &T3Call, status: Option<Status>) -> String {
     let [action, running, completed, detail] = call.tool.labels;
     let status = if call.result_failed { Some(Status::Failed) } else { status };
     let verb = match status {
-        Some(Status::InProgress) | Some(Status::Idle) | None => running.to_owned(),
+        Some(Status::InProgress | Status::Idle) | None => running.to_owned(),
         Some(Status::Completed) => completed.to_owned(),
         Some(Status::Failed) => format!("Failed to {}", action.to_lowercase()),
         Some(Status::Declined) => format!("Declined to {}", action.to_lowercase()),
@@ -1216,7 +1217,7 @@ impl Entry {
     pub fn succeeded(&self) -> bool {
         self.is_tool_like()
             && !self.failed()
-            && !(self.tone == Tone::Thinking && !self.is_reasoning())
+            && (self.tone != Tone::Thinking || self.is_reasoning())
             && !matches!(
                 self.status,
                 Some(Status::Failed | Status::Declined | Status::InProgress | Status::Stopped | Status::Idle)
@@ -1481,16 +1482,16 @@ fn lowercase_first(text: &str) -> String {
 /// `summarizeToolGroup`: "Ran 2 commands and read 1 file". Returns the
 /// summary and whether any summarized call failed.
 pub fn summarize_tool_group(entries: &[&Entry]) -> (String, bool) {
-    let tools: Vec<&Entry> = entries.iter().copied().filter(|e| !e.is_reasoning()).collect();
-    if !entries.is_empty() && tools.is_empty() {
-        let summary = if entries.len() == 1 { "Thought".into() } else { format!("Thought (×{})", entries.len()) };
-        return (summary, false);
-    }
     struct Group<'a> {
         key: &'static str,
         action: Action,
         t3: bool,
         entries: Vec<&'a Entry>,
+    }
+    let tools: Vec<&Entry> = entries.iter().copied().filter(|e| !e.is_reasoning()).collect();
+    if !entries.is_empty() && tools.is_empty() {
+        let summary = if entries.len() == 1 { "Thought".into() } else { format!("Thought (×{})", entries.len()) };
+        return (summary, false);
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut sources: Vec<&ToolSource> = Vec::new();
@@ -1622,10 +1623,10 @@ pub fn display_label(entry: &Entry) -> String {
         }
     }
     let read_paths: &[SharedString] = if entry.changed_files.is_empty() { &entry.paths } else { &entry.changed_files };
-    if action == Action::Read {
-        if let Some(first) = read_paths.first() {
-            return format_read_label(first, read_paths.len() - 1);
-        }
+    if action == Action::Read
+        && let Some(first) = read_paths.first()
+    {
+        return format_read_label(first, read_paths.len() - 1);
     }
     if let Some(title) = &entry.dynamic_title {
         return title.to_string();
@@ -1811,7 +1812,7 @@ pub fn command_program_name(command: &str) -> Option<String> {
     for segment in segments {
         let tokens = shell_tokens(segment).unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
         let program = tokens.iter().map(String::as_str).find(|t| {
-            !(t.contains('=') && !t.starts_with('=')) && !matches!(*t, "sudo" | "env" | "time" | "exec" | "command")
+            (!t.contains('=') || t.starts_with('=')) && !matches!(*t, "sudo" | "env" | "time" | "exec" | "command")
         });
         let Some(program) = program else { continue };
         let name = program_basename(program);
@@ -1842,6 +1843,7 @@ pub fn format_duration(ms: i64) -> String {
         let tenths = (ms as f64 / 100.).round() / 10.;
         return format!("{}s", format!("{tenths:.1}").trim_end_matches(".0"));
     }
+    #[expect(clippy::cast_possible_truncation, reason = "rounded first, and `as` saturates out-of-range values")]
     let total = (ms as f64 / 1000.).round() as i64;
     if total < 60 {
         return format!("{total}s");

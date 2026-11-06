@@ -3,6 +3,7 @@
 //! the file's signed asset URL. Also "Open file in preview browser".
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
@@ -53,6 +54,7 @@ pub(super) struct Documents {
 /// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
 fn css_hex(color: Hsla) -> String {
     let rgba = gpui_kit::Rgba::from(color);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     let (r, g, b) = (byte(rgba.r), byte(rgba.g), byte(rgba.b));
     if rgba.a < 1. { format!("rgba({r},{g},{b},{:.3})", rgba.a) } else { format!("#{r:02x}{g:02x}{b:02x}") }
@@ -184,14 +186,13 @@ fn font_mime(bytes: &[u8]) -> Option<&'static str> {
 /// `FontViewer`'s specimen, its font served beside it.
 fn font_specimen(background: &str, foreground: &str, dark: bool) -> String {
     let scheme = if dark { "dark" } else { "light" };
-    let sizes: String = [12, 16, 24, 40, 64]
-        .iter()
-        .map(|size| {
-            format!(
-                "<p style=\"font-size:{size}px\"><small>{size} px</small>The quick brown fox jumps over the lazy dog.</p>"
-            )
-        })
-        .collect();
+    let mut sizes = String::new();
+    for size in [12, 16, 24, 40, 64] {
+        let _ = write!(
+            sizes,
+            "<p style=\"font-size:{size}px\"><small>{size} px</small>The quick brown fox jumps over the lazy dog.</p>"
+        );
+    }
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
          content=\"default-src 'none'; font-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">\
@@ -587,7 +588,7 @@ impl Workspace {
                     window.push_notification(
                         Notification::error(logic::error_message(&error)).title("Unable to open file in browser"),
                         cx,
-                    )
+                    );
                 });
             }
         })

@@ -65,7 +65,7 @@ fn bundled() -> &'static [Entry] {
                     license: entry["license"].as_str().unwrap_or_default().to_owned().into(),
                     bundles: vec![bundle.to_owned().into()],
                     source_url: entry["sourceUrl"].as_str().map(|url| url.to_owned().into()),
-                    notice: texts.get(entry["text"].as_u64()? as usize)?.clone(),
+                    notice: texts.get(usize::try_from(entry["text"].as_u64()?).ok()?)?.clone(),
                 })
             })
             .collect()
@@ -185,9 +185,9 @@ enum ServerNotices {
 }
 
 pub(super) struct LicensesState {
-    entries: Rc<Vec<Entry>>,
+    entries: Rc<[Entry]>,
     /// Indexes into `entries` matching the search.
-    visible: Rc<Vec<usize>>,
+    visible: Rc<[usize]>,
     server: ServerNotices,
     search: Entity<InputState>,
     search_open: bool,
@@ -210,9 +210,9 @@ impl LicensesState {
         });
         let entries: Vec<Entry> = merge(&[]);
         let mut state = Self {
-            visible: Rc::new((0..entries.len()).collect()),
+            visible: (0..entries.len()).collect(),
             list: ListState::new(entries.len(), ListAlignment::Top, px(600.)),
-            entries: Rc::new(entries),
+            entries: Rc::from(entries),
             server: ServerNotices::Loading,
             search,
             search_open: false,
@@ -232,7 +232,7 @@ impl LicensesState {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(server) => {
-                        this.entries = Rc::new(merge(&server));
+                        this.entries = Rc::from(merge(&server));
                         this.server = ServerNotices::Ready;
                     }
                     Err(error) => this.server = ServerNotices::Failed(error.into()),
@@ -244,7 +244,7 @@ impl LicensesState {
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.search.read(cx).value().to_string();
-        self.visible = Rc::new(filter_entries(&self.entries, &query));
+        self.visible = Rc::from(filter_entries(&self.entries, &query));
         self.list.reset(self.visible.len());
         cx.notify();
     }
@@ -299,7 +299,7 @@ fn notice_row(state: &Entity<LicensesState>, entry: &Entry, open: bool, t: &Toke
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     let key = key.clone();
-                    toggle_state.update(cx, |s, cx| s.toggle(key, cx))
+                    toggle_state.update(cx, |s, cx| s.toggle(key, cx));
                 })
                 .child(
                     Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
@@ -434,7 +434,7 @@ impl Workspace {
                                 let focus = s.search.read(cx).focus_handle(cx);
                                 window.focus(&focus, cx);
                                 cx.notify();
-                            })
+                            });
                         }),
                 )
                 .into_any_element()
@@ -473,7 +473,7 @@ impl Workspace {
                         )
                         .child(WebButton::new("license-retry", "Try again").on_click(move |_, _, cx| {
                             let endpoint = endpoint.clone();
-                            retry.update(cx, |s, cx| s.load_server(endpoint, cx))
+                            retry.update(cx, |s, cx| s.load_server(endpoint, cx));
                         }))
                         .into_any_element(),
                 )
@@ -541,7 +541,7 @@ impl Workspace {
             .pt(px(24.))
             .pb(px(24.))
             .gap(px(32.))
-            .child(self.render_scope_sentence(&view, cx))
+            .child(self.render_scope_sentence(view, cx))
             .child(section)
             .into_any_element()
     }

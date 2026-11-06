@@ -409,8 +409,7 @@ mod tests {
 
     #[test]
     fn tool_version_label_prefers_running_then_required_then_newest() {
-        let tools =
-            |version: Value| ToolVersions::deserialize(json!({"hub": version.clone(), "agent": version})).unwrap();
+        let tools = |version: Value| ToolVersions::deserialize(json!({"hub": version, "agent": version})).unwrap();
         let running =
             tools(json!({"requiredVersion": "2.0.0", "installedVersions": ["2.0.0"], "runningVersion": "1.9.0"}));
         assert_eq!(tool_version_label(Some(&running), Tool::Hub), "v1.9.0");

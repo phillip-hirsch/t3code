@@ -135,7 +135,7 @@ impl Workspace {
                                 PopupMenuItem::new(option.label.clone())
                                     .checked(value.as_ref().and_then(Value::as_str) == Some(&option.id))
                                     .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                        on_pick(this, pick.clone(), window, cx)
+                                        on_pick(this, pick.clone(), window, cx);
                                     })),
                             );
                         }
@@ -147,7 +147,7 @@ impl Workspace {
                         let on_pick = on_pick.clone();
                         menu = menu.separator().item(PopupMenuItem::new(toggle.label.clone()).checked(on).on_click(
                             window.listener_for(&view, move |this, _, window, cx| {
-                                on_pick(this, pick.clone(), window, cx)
+                                on_pick(this, pick.clone(), window, cx);
                             }),
                         ));
                     }

@@ -184,6 +184,11 @@ impl Workspace {
         };
         let scale = window.scale_factor();
         let size = window.viewport_size();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "pixel math; f32 is what GPUI draws with"
+        )]
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("threadId", thread_id)
@@ -193,7 +198,7 @@ impl Workspace {
             .finish();
         let ws_base = endpoint.http_base.replacen("http", "ws", 1);
         let url = format!("{ws_base}/api/preview-stream/ws?{query}");
-        let token = endpoint.bearer_token.clone();
+        let token = endpoint.bearer_token;
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = async_channel::unbounded();
         crate::runtime().spawn(run_stream(url, token, events_tx, outgoing_rx));
@@ -267,12 +272,19 @@ impl Workspace {
                 }
                 Some("viewport") => {
                     if let (Some(width), Some(height)) = (message["width"].as_f64(), message["height"].as_f64()) {
-                        stream.viewport = Some((width as f32, height as f32));
+                        #[expect(clippy::cast_possible_truncation, reason = "page sizes; f32 is what GPUI draws with")]
+                        let point = (width as f32, height as f32);
+                        stream.viewport = Some(point);
                     }
                 }
                 Some("pointer") => {
                     if let (Some(x), Some(y)) = (message["x"].as_f64(), message["y"].as_f64()) {
-                        stream.agent_pointer = Some((x as f32, y as f32));
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "page coordinates; f32 is what GPUI draws with"
+                        )]
+                        let point = (x as f32, y as f32);
+                        stream.agent_pointer = Some(point);
                     }
                 }
                 Some("clipboard") => {
@@ -316,6 +328,11 @@ impl Workspace {
         }
         // The page follows the panel's size while this viewer drives it (`followSize`).
         let bounds = stream.bounds.get();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "pixel math; f32 is what GPUI draws with"
+        )]
         let size = (f32::from(bounds.size.width).round() as u32, f32::from(bounds.size.height).round() as u32);
         if follow_size
             && size.0 > 0
@@ -376,7 +393,7 @@ impl Workspace {
             .min_h_0()
             .overflow_hidden()
             .track_focus(&stream.focus)
-            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {}).absolute().size_full())
+            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .children(frame)
             .children(cursor)
             .on_mouse_down(
@@ -562,14 +579,14 @@ impl Workspace {
         stream.buttons |= bit;
         stream.send(json!({
             "type": "mouse", "action": "down", "x": x, "y": y, "button": button, "buttons": stream.buttons,
-            "clickCount": event.click_count, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": event.click_count, "modifiers": modifier_bits(event.modifiers),
         }));
         cx.stop_propagation();
     }
 
     fn server_mouse_up(&mut self, tab_id: &str, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        if !self.preview.server.streams.get(tab_id).is_some_and(|s| s.buttons & bit != 0) {
+        if self.preview.server.streams.get(tab_id).is_none_or(|s| s.buttons & bit == 0) {
             return;
         }
         let Some((x, y)) = self.server_point(tab_id, event.position, true) else { return };
@@ -577,7 +594,7 @@ impl Workspace {
         stream.buttons &= !bit;
         stream.send(json!({
             "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": stream.buttons,
-            "clickCount": event.click_count, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": event.click_count, "modifiers": modifier_bits(event.modifiers),
         }));
         cx.stop_propagation();
     }
@@ -597,7 +614,7 @@ impl Workspace {
         };
         stream.send(json!({
             "type": "mouse", "action": "move", "x": x, "y": y, "button": button, "buttons": held,
-            "clickCount": 0, "modifiers": modifier_bits(&event.modifiers),
+            "clickCount": 0, "modifiers": modifier_bits(event.modifiers),
         }));
     }
 
@@ -610,7 +627,7 @@ impl Workspace {
         // GPUI's deltas point where the content moves; the DOM's where the page scrolls.
         self.send_server_input(
             tab_id,
-            json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(&event.modifiers)}),
+            json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(event.modifiers)}),
         )
     }
 
@@ -630,7 +647,7 @@ impl Workspace {
         let Some(key) = dom_key(keystroke) else { return false };
         let mut input = json!({
             "type": "key", "action": action, "key": key.key, "code": key.code, "keyCode": key.key_code,
-            "modifiers": modifier_bits(m),
+            "modifiers": modifier_bits(*m),
         });
         if action == "down"
             && let Some(text) = key.text
@@ -707,7 +724,7 @@ fn viewport_json(viewport: &Viewport) -> Value {
 }
 
 /// `previewStreamModifiers`: alt 1, ctrl 2, meta 4, shift 8.
-fn modifier_bits(m: &Modifiers) -> u8 {
+fn modifier_bits(m: Modifiers) -> u8 {
     u8::from(m.alt) | u8::from(m.control) << 1 | u8::from(m.platform) << 2 | u8::from(m.shift) << 3
 }
 
@@ -744,17 +761,17 @@ fn page_fit(area: Bounds<Pixels>, frame: (u32, u32), viewport: Option<(f32, f32)
 
 impl PageFit {
     /// A window point as page px; outside the frame only while a button is held (`captured`).
-    fn to_page(&self, point: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
+    fn to_page(self, point: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
         let x = (f32::from(point.x) - self.origin.0) / self.size.0;
         let y = (f32::from(point.y) - self.origin.1) / self.size.1;
-        if !captured && !((0. ..=1.).contains(&x) && (0. ..=1.).contains(&y)) {
+        if !(captured || ((0. ..=1.).contains(&x) && (0. ..=1.).contains(&y))) {
             return None;
         }
         Some((x.clamp(0., 1.) * self.viewport.0, y.clamp(0., 1.) * self.viewport.1))
     }
 
     /// A page point relative to the frame area, for overlays drawn in it.
-    fn to_local(&self, x: f32, y: f32) -> (f32, f32) {
+    fn to_local(self, x: f32, y: f32) -> (f32, f32) {
         (
             self.origin.0 - f32::from(self.area.origin.x) + x / self.viewport.0 * self.size.0,
             self.origin.1 - f32::from(self.area.origin.y) + y / self.viewport.1 * self.size.1,
@@ -933,7 +950,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<(Arc<RenderImage>, (u32, u32))> {
     let mut rgba = decoded.into_rgba8();
     let size = rgba.dimensions();
     // GPUI textures are BGRA.
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some((Arc::new(RenderImage::new([image::Frame::new(rgba)])), size))
@@ -990,7 +1007,7 @@ mod tests {
         assert_eq!(key("left").key, "ArrowLeft");
         assert_eq!(key("space").text.as_deref(), Some(" "));
         assert!(dom_key(&Keystroke::parse("f13").ok().unwrap()).is_none());
-        assert_eq!(modifier_bits(&Modifiers { shift: true, control: true, ..Default::default() }), 10);
+        assert_eq!(modifier_bits(Modifiers { shift: true, control: true, ..Default::default() }), 10);
     }
 
     #[test]

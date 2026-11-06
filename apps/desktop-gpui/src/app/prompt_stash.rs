@@ -99,7 +99,7 @@ impl PendingStash {
 pub(super) fn read_blobs(paths: Vec<PathBuf>) -> Vec<Option<Vec<u8>>> {
     paths
         .into_iter()
-        .map(|path| std::fs::read(&path).inspect_err(|error| log::warn!("stash file {path:?}: {error}")).ok())
+        .map(|path| std::fs::read(&path).inspect_err(|error| log::warn!("stash file {}: {error}", path.display())).ok())
         .collect()
 }
 
@@ -168,13 +168,13 @@ impl Store {
                 return Self { dir: Some(dir), file: StashFile::default() };
             }
             Err(error) => {
-                log::warn!("prompt stash {path:?} could not be read, so stashing is off: {error}");
+                log::warn!("prompt stash {} could not be read, so stashing is off: {error}", path.display());
                 return closed();
             }
         };
         let file = StashFile::parse(&raw).unwrap_or_else(|error| {
             let aside = dir.join(format!("stash.corrupt-{}.json", crate::timestamp::now_ms()));
-            log::warn!("prompt stash {path:?} is damaged ({error}); moved it to {aside:?}");
+            log::warn!("prompt stash {} is damaged ({error}); moved it to {}", path.display(), aside.display());
             if let Err(error) = std::fs::rename(&path, &aside) {
                 log::warn!("could not move the damaged prompt stash aside: {error}");
             }
@@ -616,10 +616,13 @@ impl Workspace {
             "escape" => self.close_stash_menu(cx),
             "up" | "down" if !entries.is_empty() => {
                 let current = entries.iter().position(|e| Some(&e.id) == highlighted.as_ref());
-                let len = entries.len() as isize;
-                let step = if keystroke.key == "down" { 1 } else { -1 };
-                let from = current.map_or(if step == 1 { -1 } else { 0 }, |i| i as isize);
-                let next = (from + step).rem_euclid(len) as usize;
+                let len = entries.len();
+                let next = match (current, keystroke.key == "down") {
+                    (None, true) => 0,
+                    (None, false) => len - 1,
+                    (Some(i), true) => (i + 1) % len,
+                    (Some(i), false) => (i + len - 1) % len,
+                };
                 self.prompt_stash.highlighted = Some(entries[next].id.clone());
                 cx.notify();
             }
@@ -934,7 +937,7 @@ mod tests {
             assert_eq!(stash(&mut store, &format!("p{i}"), &[]), None);
         }
         let evicted = stash(&mut store, "newest", &[]);
-        assert_eq!(evicted.map(|e| e.id), Some(first.clone()), "the oldest goes first");
+        assert_eq!(evicted.map(|e| e.id), Some(first), "the oldest goes first");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "its bytes went with it");
 
         let reloaded = Store::open(Some(dir.clone()));

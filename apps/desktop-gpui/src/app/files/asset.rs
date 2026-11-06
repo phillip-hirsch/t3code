@@ -193,7 +193,7 @@ impl Workspace {
             };
             if let Err(error) = written {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(error).title("Could not save file"), cx)
+                    window.push_notification(Notification::error(error).title("Could not save file"), cx);
                 });
             }
         })

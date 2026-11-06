@@ -80,13 +80,12 @@ impl TerminalSession {
         let session = cx.entity();
         let view = PopupMenu::build(window, cx, move |menu, window, _| {
             menu.min_w(px(140.))
-                .item(
-                    PopupMenuItem::new("Add to chat").on_click(
-                        window.listener_for(&session, |this: &mut TerminalSession, _, _, cx| {
-                            this.add_selection_to_chat(cx)
-                        }),
-                    ),
-                )
+                .item(PopupMenuItem::new("Add to chat").on_click(window.listener_for(
+                    &session,
+                    |this: &mut TerminalSession, _, _, cx| {
+                        this.add_selection_to_chat(cx);
+                    },
+                )))
                 .item(
                     PopupMenuItem::new("Copy")
                         .on_click(window.listener_for(&session, |this: &mut TerminalSession, _, _, cx| this.copy(cx))),

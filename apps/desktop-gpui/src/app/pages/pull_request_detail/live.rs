@@ -8,7 +8,7 @@ use super::*;
 use crate::rpc::StreamEvent;
 
 /// `LIVE_REFRESH_INTERVAL_MS`: an open pull request is read again this often while the app is in front.
-const LIVE_REFRESH: Duration = Duration::from_secs(5 * 60);
+const LIVE_REFRESH: Duration = Duration::from_mins(5);
 /// A refresh stream the server ended is asked for again after this long, never in a hot loop.
 const RESUBSCRIBE_AFTER: Duration = Duration::from_secs(60);
 const MIN_WIDTH: f32 = 360.;
@@ -235,7 +235,7 @@ impl Workspace {
                     .left(px(3.))
                     .w(px(2.))
                     .invisible()
-                    .group_hover("pr-panel-resize", |s| s.visible())
+                    .group_hover("pr-panel-resize", gpui_kit::Styled::visible)
                     .bg(t.border),
             );
         v_flex()
@@ -319,14 +319,14 @@ impl Workspace {
                             .hover(move |s| s.bg(muted))
                             .child(
                                 div()
-                                    .group_hover(group.clone(), |s| s.invisible())
+                                    .group_hover(group.clone(), gpui_kit::Styled::invisible)
                                     .child(Icon::new(icon).with_size(px(12.)).text_color(color)),
                             )
                             .child(
                                 div()
                                     .absolute()
                                     .invisible()
-                                    .group_hover(group.clone(), |s| s.visible())
+                                    .group_hover(group, gpui_kit::Styled::visible)
                                     .child(Icon::new(Lucide::X).with_size(px(12.))),
                             )
                             .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))

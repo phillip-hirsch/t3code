@@ -51,7 +51,7 @@ impl Workspace {
             }),
         );
 
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let notifications = [
             row(self, SettingRow::new("thread-notifications")
                 .description("System alerts when a thread finishes, fails, or needs input or approval. Applies to this device while T3 Code is open.")
@@ -119,7 +119,7 @@ impl Workspace {
             settings_section("confirmations", "Confirmations", confirmations, &t),
             settings_section("display", "Display", display, &t),
         ];
-        self.settings_page("general", &view, sections, cx)
+        self.settings_page("general", view, sections, cx)
     }
 
     /// `AppearanceSettingsPanel`: the theme library, the Interface rows and Typography.
@@ -131,7 +131,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let details_row = self.thread_details_row(&t, cx);
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let interface = [
             row(self, SettingRow::new("setting-appearance-contrast")
                 .description("Adjust the contrast of colors and borders across the interface.")
@@ -181,7 +181,7 @@ impl Workspace {
         let fold = self.advanced_fold("appearance", advanced, cx);
         let interface = settings_section("appearance-interface", "Interface", interface.into_iter().chain([fold]), &t);
         let sections = [self.render_theme_library(cx), interface, self.render_typography(view, window, cx)];
-        self.settings_page("appearance", &view, sections, cx)
+        self.settings_page("appearance", view, sections, cx)
     }
 
     /// `ThreadDetailsItemsRow`: "N of 12 on" opens the card's own items menu.

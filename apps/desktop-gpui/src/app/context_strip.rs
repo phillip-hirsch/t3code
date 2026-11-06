@@ -582,7 +582,7 @@ impl Workspace {
                             .icon(Icon::new(Lucide::RotateCcwClock))
                             .checked(label == "Previous worktree")
                             .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                this.pick_previous_worktree(path.clone(), branch.clone(), cx)
+                                this.pick_previous_worktree(path.clone(), branch.clone(), cx);
                             })),
                     );
                 }
@@ -638,7 +638,7 @@ impl Workspace {
                         this.draft_workspace.branch_open = false;
                         cx.notify();
                     }
-                })
+                });
             })
             .trigger(trigger)
             .p_0()
@@ -809,7 +809,7 @@ impl Workspace {
                     this.draft_workspace.permissions_open = open.then_some(id);
                     this.draft_workspace.permissions_preview = None;
                     cx.notify();
-                })
+                });
             })
             .trigger(trigger)
             .p_0()
@@ -827,7 +827,7 @@ impl Workspace {
             .and_then(|s| self.server_info().provider(&s.instance_id))
             .map(|p| p.supported_runtime_modes.clone())
             .unwrap_or_default();
-        let shown = self.draft_workspace.permissions_preview.map(str::to_owned).unwrap_or_else(|| current.clone());
+        let shown = self.draft_workspace.permissions_preview.map_or_else(|| current.clone(), str::to_owned);
         let index = runtime_modes().iter().position(|(id, ..)| *id == shown).unwrap_or(0);
         let (_, shown_label, _) = runtime_modes()[index];
         let segments = runtime_modes().into_iter().enumerate().map(|(i, (mode, label, icon))| {

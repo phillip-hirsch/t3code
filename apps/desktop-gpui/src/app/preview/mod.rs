@@ -208,7 +208,7 @@ impl Workspace {
     }
 
     /// Tabs this client draws: its own pages and the agents' streamed ones.
-    fn hosted_sessions<'a>(previews: &'a ThreadPreviews) -> impl Iterator<Item = &'a Session> {
+    fn hosted_sessions(previews: &ThreadPreviews) -> impl Iterator<Item = &Session> {
         previews.sessions.iter()
     }
 
@@ -319,8 +319,8 @@ impl Workspace {
             stream,
             window,
             cx,
-            |this, value| this.apply_preview_event(value),
-            |this, window, cx| this.after_preview_change(window, cx),
+            super::Workspace::apply_preview_event,
+            super::Workspace::after_preview_change,
         );
         self.after_preview_change(window, cx);
         task
@@ -660,7 +660,6 @@ impl Workspace {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adopt_view(
         &mut self,
         thread_id: String,
@@ -1034,7 +1033,7 @@ impl Workspace {
                         el.child(
                             icon_button("preview-open-external", IconName::ExternalLink, true, tokens)
                                 .invisible()
-                                .group_hover("preview-address", |style| style.visible())
+                                .group_hover("preview-address", gpui_kit::Styled::visible)
                                 .tooltip(tooltip("Open in system browser"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let url = this.active_url();
@@ -1139,7 +1138,7 @@ impl Workspace {
             .when(!server, |menu| {
                 menu.child(item("menu-devtools".into(), "Open DevTools".into(), false, has_page).when(has_page, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.with_active_view(cx, |view| view.open_devtools());
+                        this.with_active_view(cx, wry::WebView::open_devtools);
                         close(this, cx);
                     }))
                 }))
@@ -1257,7 +1256,7 @@ impl Workspace {
         let view = self.preview.tabs.get(&tab_id).map(|tab| tab.view.clone());
         let title = self.browser_tab_title(&tab_id);
         let (expand_thread, expand_tab) = (thread_id.clone(), tab_id);
-        let close_thread = thread_id.clone();
+        let close_thread = thread_id;
         Some(
             v_flex()
                 .id("preview-mini-player")

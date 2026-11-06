@@ -435,9 +435,8 @@ pub(super) fn scripts_after_save(
     input: &ScriptInput,
 ) -> (String, Vec<ProjectScript>) {
     let ids = known_script_ids(settings, projects, project);
-    let id = script_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| next_project_script_id(&input.name, ids.iter().map(String::as_str)));
+    let id =
+        script_id.map_or_else(|| next_project_script_id(&input.name, ids.iter().map(String::as_str)), str::to_owned);
     let saved = build_project_script(&id, input);
     let mut scripts: Vec<ProjectScript> = resolve_project_scripts(settings, project)
         .into_iter()
@@ -557,8 +556,10 @@ impl Workspace {
         self.settings_project_groups()
             .into_iter()
             .find(|group| group.members.iter().any(|m| m.project.id == project_id))
-            .map(|group| group.members.into_iter().map(|m| m.project.id).collect())
-            .unwrap_or_else(|| vec![project_id.to_owned()])
+            .map_or_else(
+                || vec![project_id.to_owned()],
+                |group| group.members.into_iter().map(|m| m.project.id).collect(),
+            )
     }
 
     /// Runs one write per target in turn; each reads the settings the previous one left.
@@ -676,7 +677,7 @@ impl Workspace {
                 let result = client.request("projects.readFile", input).await;
                 let file = match result {
                     Ok(read) if read["exists"] != false && read["truncated"] != true => {
-                        read["contents"].as_str().map(T3ProjectFile::parse).unwrap_or(T3ProjectFile::Missing)
+                        read["contents"].as_str().map_or(T3ProjectFile::Missing, T3ProjectFile::parse)
                     }
                     _ => T3ProjectFile::Missing,
                 };

@@ -73,7 +73,7 @@ impl FolderMenu {
                 let (root, folder) = (self.root.clone(), folder.to_owned());
                 return menu.item(PopupMenuItem::new("Retry loading folder").icon(IconName::RefreshCw).on_click(
                     window.listener_for(view, move |this: &mut Workspace, _, _, cx| {
-                        this.load_folder(&root, folder.clone(), true, cx)
+                        this.load_folder(&root, folder.clone(), true, cx);
                     }),
                 ));
             }
@@ -97,11 +97,12 @@ impl FolderMenu {
                     );
                 }
                 (EntryKind::Directory, Level::Submenu) => {
-                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Folder).on_click(
-                        window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
-                            this.open_file(&path, None, window, cx)
-                        }),
-                    ));
+                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Folder).on_click(window.listener_for(
+                        view,
+                        move |this: &mut Workspace, _, window, cx| {
+                            this.open_file(&path, None, window, cx);
+                        },
+                    )));
                 }
                 (EntryKind::File, _) => {
                     let (asset, color) = crate::file_icons::file_icon(&path, dark);
@@ -111,7 +112,7 @@ impl FolderMenu {
                             .icon(Icon::empty().path(asset).text_color(color))
                             .checked(current)
                             .on_click(window.listener_for(view, move |this: &mut Workspace, _, window, cx| {
-                                this.open_file(&path, None, window, cx)
+                                this.open_file(&path, None, window, cx);
                             })),
                     );
                 }

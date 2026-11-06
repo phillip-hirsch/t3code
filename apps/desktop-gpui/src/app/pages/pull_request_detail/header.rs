@@ -140,7 +140,7 @@ impl Workspace {
                                 .on_click(move |_, window, cx| {
                                     let method = if rebase { "rebase" } else { "merge" };
                                     view.update(cx, |this, cx| {
-                                        this.perform_pr_action_with("update-branch", None, Some(method), window, cx)
+                                        this.perform_pr_action_with("update-branch", None, Some(method), window, cx);
                                     });
                                 })
                         })))
@@ -178,7 +178,7 @@ impl Workspace {
             .content(move |_, _, cx| {
                 let t = *theme::tokens(cx);
                 let (attention, running, completed) = logic::group_checks(&checks);
-                let collapsible = !(attention.is_empty() && running.is_empty()) && !completed.is_empty();
+                let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
                 let visible: Vec<&Check> = attention
                     .iter()
                     .chain(running.iter())
@@ -208,7 +208,7 @@ impl Workspace {
                                     .flex_none()
                                     .cursor_pointer()
                                     .text_color(t.primary)
-                                    .hover(|s| s.underline())
+                                    .hover(gpui_kit::Styled::underline)
                                     .child("Details")
                                     .on_click(move |_, _, cx| cx.open_url(&url))
                             }))
@@ -253,7 +253,7 @@ impl Workspace {
                                                 panel.checks_all = !panel.checks_all;
                                             }
                                             cx.notify();
-                                        })
+                                        });
                                     }),
                             ),
                         )
@@ -282,7 +282,7 @@ impl Workspace {
                         menu =
                             menu.item(PopupMenuItem::new(thread.title.clone()).icon(Lucide::MessageSquare).on_click(
                                 window.listener_for(&view, move |this, _, window, cx| {
-                                    this.select_thread(id.clone(), window, cx)
+                                    this.select_thread(id.clone(), window, cx);
                                 }),
                             ));
                     }
@@ -307,7 +307,7 @@ impl Workspace {
             panel._picker_search = Some(refresh);
         }
         let projects: HashMap<String, String> =
-            self.shell.projects.iter().map(|p| (p.id.clone(), p.title.to_string())).collect();
+            self.shell.projects.iter().map(|p| (p.id.clone(), p.title.clone())).collect();
         let mut threads: Vec<(String, String, String, String)> = self
             .shell
             .threads
@@ -486,7 +486,7 @@ impl Workspace {
                         menu = menu.item(PopupMenuItem::new(label).icon(icon).checked(number == current).on_click(
                             window.listener_for(&view, move |this, _, _, cx| {
                                 let seed = this.pull_requests.entry_for(&reference);
-                                this.open_pull_request_panel(reference.clone(), seed, cx)
+                                this.open_pull_request_panel(reference.clone(), seed, cx);
                             }),
                         ));
                     }
@@ -500,7 +500,7 @@ impl Workspace {
                                 .icon(Lucide::GitMerge)
                                 .disabled(merge_disabled)
                                 .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                    this.confirm_pr_stack(stack.clone(), "merge", method, window, cx)
+                                    this.confirm_pr_stack(stack.clone(), "merge", method, window, cx);
                                 })),
                         );
                     }
@@ -511,7 +511,7 @@ impl Workspace {
                                 .icon(Lucide::RefreshCw)
                                 .disabled(rebase_disabled)
                                 .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                    this.confirm_pr_stack(stack.clone(), "update-branch", method, window, cx)
+                                    this.confirm_pr_stack(stack.clone(), "update-branch", method, window, cx);
                                 })),
                         );
                     }
@@ -543,7 +543,7 @@ impl Workspace {
                     .child(Icon::new(Lucide::GitMerge).with_size(px(14.)))
                     .child("Merge stack")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.confirm_pr_stack(stack.clone(), "merge", method, window, cx)
+                        this.confirm_pr_stack(stack.clone(), "merge", method, window, cx);
                     }))
                     .into_any_element(),
             );
@@ -563,7 +563,7 @@ impl Workspace {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let plan = logic::stack_plan(&stack, detail.number);
         let merge = action == "merge";
-        let layers = if merge { plan.merge.clone() } else { plan.rebase.clone() };
+        let layers = if merge { plan.merge } else { plan.rebase };
         let term = logic::terminology(&detail.provider).0;
         let noun = if layers.len() == 1 { term.to_owned() } else { format!("{term}s") };
         let host = list_logic::open_on_host_label(&detail.provider).trim_start_matches("Open on ").to_owned();

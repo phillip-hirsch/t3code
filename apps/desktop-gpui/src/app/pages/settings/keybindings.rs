@@ -239,7 +239,7 @@ fn group_rows<'a>(rows: &[&'a KeyRow]) -> Vec<(&'static str, &'static str, Vec<&
 
 /// `buildKeybindingCommandOptions`: every static command plus the server's, by label.
 fn command_options(rules: &[Rule]) -> Vec<String> {
-    let mut commands: Vec<String> = STATIC_COMMANDS.iter().map(|c| c.to_string()).collect();
+    let mut commands: Vec<String> = STATIC_COMMANDS.iter().map(std::string::ToString::to_string).collect();
     for rule in rules {
         if !commands.contains(&rule.command) {
             commands.push(rule.command.clone());
@@ -308,7 +308,7 @@ const DEFAULT_WHEN_VARIABLE: &str = "terminalFocus";
 /// `buildWhenVariableOptions`: the core variables first, then every one the defaults use.
 fn when_variables() -> &'static [String] {
     static VARIABLES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let mut names: Vec<String> = CORE_WHEN_VARIABLES.iter().map(|n| n.to_string()).collect();
+        let mut names: Vec<String> = CORE_WHEN_VARIABLES.iter().map(std::string::ToString::to_string).collect();
         for rule in defaults() {
             collect_identifiers(rule.when_ast.as_ref(), &mut names);
         }
@@ -479,7 +479,7 @@ fn edit_at(node: &When, path: &[usize], edit: &WhenEdit) -> Option<When> {
     let Some((&index, rest)) = path.split_first() else { return apply_edit(node, edit) };
     match node {
         When::Not { node: inner } if condition_parts(node).is_none() => {
-            Some(edit_at(inner, rest, edit).map(When::not).unwrap_or_else(|| node.clone()))
+            Some(edit_at(inner, rest, edit).map_or_else(|| node.clone(), When::not))
         }
         When::And { .. } | When::Or { .. } => {
             let or = is_or(node);
@@ -548,13 +548,13 @@ struct NewDraft {
 }
 
 struct Catalog {
-    source: Rc<Vec<Rule>>,
+    source: Rc<[Rule]>,
     rows: Vec<KeyRow>,
     commands: Vec<String>,
 }
 
 impl Catalog {
-    fn new(source: Rc<Vec<Rule>>) -> Self {
+    fn new(source: Rc<[Rule]>) -> Self {
         let merged = keybindings::merge_with_defaults(&source);
         Self { rows: build_rows(&merged, MAC), commands: command_options(&merged), source }
     }
@@ -584,7 +584,7 @@ impl KeybindingsPanel {
     fn new(
         workspace: Entity<Workspace>,
         environment: Option<SharedString>,
-        source: Rc<Vec<Rule>>,
+        source: Rc<[Rule]>,
         connected: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -657,7 +657,7 @@ impl KeybindingsPanel {
         self.when_open = None;
     }
 
-    fn set_catalog(&mut self, source: Rc<Vec<Rule>>) {
+    fn set_catalog(&mut self, source: Rc<[Rule]>) {
         self.catalog = Catalog::new(source);
         let ids: HashSet<&str> = self.catalog.rows.iter().map(|row| row.id.as_str()).collect();
         self.drafts.retain(|id, _| ids.contains(id.as_str()));
@@ -856,7 +856,7 @@ impl KeybindingsPanel {
                         if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
                             workspace.update(cx, |workspace, cx| {
                                 let Some(info) = workspace.env_info_mut(&environment) else { return };
-                                info.keybindings = Rc::new(keybindings::decode_rules(rules));
+                                info.keybindings = Rc::from(keybindings::decode_rules(rules));
                                 workspace.sync_keymap(cx);
                                 cx.notify();
                             });
@@ -966,7 +966,7 @@ const EDITORS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 impl Render for KeybindingsPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let rows = filter_rows(&self.catalog.rows, &self.query);
         let groups = group_rows(&rows);
@@ -982,7 +982,7 @@ impl Render for KeybindingsPanel {
         }
         let mut body = Vec::new();
         if self.adding.is_some() {
-            body.push(card([self.render_new_row(&t, window, cx)], &t));
+            body.push(card([self.render_new_row(&t, cx)], &t));
         }
         if groups.is_empty() {
             body.push(card(
@@ -998,7 +998,7 @@ impl Render for KeybindingsPanel {
             ));
         }
         for (_, title, rows) in groups {
-            let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, window, cx)).collect();
+            let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, cx)).collect();
             body.push(settings_section(SharedString::from(title), title, rendered, &t));
         }
         children.push(v_flex().gap(px(32.)).children(body).into_any_element());
@@ -1059,7 +1059,7 @@ impl KeybindingsPanel {
             .into_any_element()
     }
 
-    fn render_row(&self, row: &KeyRow, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, row: &KeyRow, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let (key, when, when_valid) = self.draft_parts(row);
         let expression = when_expression(when);
         let dirty = key != row.key || expression != row.when;
@@ -1076,7 +1076,7 @@ impl KeybindingsPanel {
             .child(label)
             .when(row.source != Source::Default, |el| el.child(badge(row.source.label(), t)))
             .tooltip(move |window, cx| Tooltip::new(command.clone()).build(window, cx));
-        let description = self.render_when_line(&row.id, &expression, when, t, window, cx);
+        let description = self.render_when_line(&row.id, &expression, when, t, cx);
         let saving = self.saving.as_deref() == Some(row.command.as_str());
         let control = h_flex()
             .flex_wrap()
@@ -1127,12 +1127,12 @@ impl KeybindingsPanel {
                             }
                             if can_remove {
                                 let id = id.clone();
-                                menu =
-                                    menu.item(PopupMenuItem::new("Remove").on_click(
-                                        window.listener_for(&panel, move |this, _, window, cx| {
-                                            this.remove(&id, window, cx)
-                                        }),
-                                    ));
+                                menu = menu.item(PopupMenuItem::new("Remove").on_click(window.listener_for(
+                                    &panel,
+                                    move |this, _, window, cx| {
+                                        this.remove(&id, window, cx);
+                                    },
+                                )));
                             }
                             menu
                         }),
@@ -1183,7 +1183,6 @@ impl KeybindingsPanel {
         expression: &str,
         when: Option<&When>,
         t: &Tokens,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.when_open.as_deref() == Some(id);
@@ -1223,7 +1222,7 @@ impl KeybindingsPanel {
                         deferred(
                             anchored()
                                 .snap_to_window_with_margin(px(8.))
-                                .child(self.render_when_builder(id, when, t, window, cx)),
+                                .child(self.render_when_builder(id, when, t, cx)),
                         )
                         .with_priority(1),
                     ),
@@ -1233,22 +1232,15 @@ impl KeybindingsPanel {
     }
 
     /// `WhenExpressionBuilder`.
-    fn render_when_builder(
-        &self,
-        id: &str,
-        when: Option<&When>,
-        t: &Tokens,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_when_builder(&self, id: &str, when: Option<&When>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let text = self.when_input.read(cx).value();
         let parsed = parse_when_draft(&text);
         let unknown = parsed.as_ref().map(|when| unknown_variables(when.as_ref())).unwrap_or_default();
         let add_button = |label: &'static str, primary: bool, group: bool, cx: &mut Context<Self>| {
             let owned = id.to_owned();
             Button::new(SharedString::from(format!("kb-when-root-{label}-{primary}")))
-                .when(primary, |b| b.primary())
-                .when(!primary, |b| b.outline())
+                .when(primary, gpui_kit::component::button::ButtonVariants::primary)
+                .when(!primary, gpui_kit::component::button::Button::outline)
                 .compact()
                 .small()
                 .h(px(28.))
@@ -1258,7 +1250,7 @@ impl KeybindingsPanel {
                 .on_click(cx.listener(move |this, _, window, cx| this.add_to_root(&owned, group, window, cx)))
         };
         let tree = match when {
-            Some(node) => self.render_when_node(id, node, Vec::new(), 0, true, t, window, cx),
+            Some(node) => self.render_when_node(id, node, Vec::new(), 0, true, t, cx),
             None => h_flex()
                 .flex_wrap()
                 .gap(px(8.))
@@ -1338,7 +1330,6 @@ impl KeybindingsPanel {
     }
 
     /// `WhenExpressionNodeEditor`, one node and its operands.
-    #[allow(clippy::too_many_arguments)]
     fn render_when_node(
         &self,
         id: &str,
@@ -1347,7 +1338,6 @@ impl KeybindingsPanel {
         depth: usize,
         removable: bool,
         t: &Tokens,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = format!("kb-node-{id}-{path:?}");
@@ -1355,7 +1345,7 @@ impl KeybindingsPanel {
         let edit = |edit: WhenEdit| {
             let (owned, path, panel) = (id.to_owned(), path.clone(), panel.clone());
             move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                panel.update(cx, |this, cx| this.edit_when(&owned, &path, edit.clone(), window, cx))
+                panel.update(cx, |this, cx| this.edit_when(&owned, &path, edit.clone(), window, cx));
             }
         };
         let remove = removable.then(|| {
@@ -1407,7 +1397,7 @@ impl KeybindingsPanel {
                 .border_color(t.border.opacity(if depth > 0 { 0.5 } else { 0.7 }))
                 .bg(if depth > 0 { t.background.opacity(0.5) } else { t.muted.opacity(0.2) })
                 .child(h_flex().gap(px(8.)).child(not_toggle(true, cx)).child(div().flex_1()).children(remove))
-                .child(branch(self.render_when_node(id, inner, inner_path, depth + 1, false, t, window, cx)))
+                .child(branch(self.render_when_node(id, inner, inner_path, depth + 1, false, t, cx)))
                 .into_any_element();
         }
         let or = is_or(node);
@@ -1421,7 +1411,7 @@ impl KeybindingsPanel {
                         menu = menu.item(PopupMenuItem::new(label).checked(next == or).on_click(window.listener_for(
                             &panel,
                             move |this, _, window, cx| {
-                                this.edit_when(&owned, &path, WhenEdit::Operator { or: next }, window, cx)
+                                this.edit_when(&owned, &path, WhenEdit::Operator { or: next }, window, cx);
                             },
                         )));
                     }
@@ -1445,7 +1435,7 @@ impl KeybindingsPanel {
             .map(|(index, child)| {
                 let mut child_path = path.clone();
                 child_path.push(index);
-                branch(self.render_when_node(id, child, child_path, depth + 1, true, t, window, cx))
+                branch(self.render_when_node(id, child, child_path, depth + 1, true, t, cx))
             })
             .collect();
         v_flex()
@@ -1499,7 +1489,7 @@ impl KeybindingsPanel {
                     let (owned, path, picked) = (owned.clone(), path.clone(), option.clone());
                     menu = menu.item(PopupMenuItem::new(option.clone()).checked(*option == current).on_click(
                         window.listener_for(&panel, move |this, _, window, cx| {
-                            this.edit_when(&owned, &path, WhenEdit::Identifier(picked.clone()), window, cx)
+                            this.edit_when(&owned, &path, WhenEdit::Identifier(picked.clone()), window, cx);
                         }),
                     ));
                 }
@@ -1509,7 +1499,7 @@ impl KeybindingsPanel {
     }
 
     /// `NewKeybindingSettingsRow`.
-    fn render_new_row(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_new_row(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(adding) = &self.adding else { return div().into_any_element() };
         let draft = &adding.draft;
         let expression = when_expression(draft.when.as_ref());
@@ -1522,7 +1512,7 @@ impl KeybindingsPanel {
         let command_label_el = div()
             .truncate()
             .text_color(if current.is_some() { t.foreground } else { t.muted_foreground })
-            .child(current.as_deref().map(command_label).unwrap_or_else(|| "Command".to_owned()));
+            .child(current.as_deref().map_or_else(|| "Command".to_owned(), command_label));
         let command_select = select_trigger(&"kb-new-command".into(), command_label_el, 224., t).dropdown_menu(
             move |mut menu, window, _| {
                 for command in &commands {
@@ -1541,7 +1531,7 @@ impl KeybindingsPanel {
                 menu.max_h(px(288.)).scrollable(true)
             },
         );
-        let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, window, cx);
+        let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, cx);
         let row = RowFrame::new("New keybinding").description(description).control(
             h_flex()
                 .flex_wrap()
@@ -1729,7 +1719,7 @@ pub(in crate::app) fn open_keybindings_file(
                     window.push_notification(
                         Notification::error(error.message()).title("Unable to open keybindings file"),
                         cx,
-                    )
+                    );
                 });
             }
         })

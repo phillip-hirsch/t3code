@@ -844,7 +844,7 @@ impl Render for EasEditor {
         let next = self.next(cx);
         let valid = hosts::valid_eas_draft(&next);
         // Why Save is off, for the limits the fields' ranges do not show.
-        let problem = (!valid).then(|| {
+        let problem = (!valid).then_some({
             if next.max_session_minutes > 0 && next.idle_minutes >= next.max_session_minutes {
                 "Idle minutes must be smaller than session minutes."
             } else {

@@ -220,20 +220,19 @@ impl AccountSection {
             ),
             _ => None,
         };
-        let remove =
-            installation.as_ref().is_some_and(|i| i.can_remove && !install_active).then(|| {
-                let environment = environment.clone();
-                Button::new("antigravity-remove-runtime")
-                    .ghost()
-                    .size(px(28.))
-                    .p_0()
-                    .disabled(actions_disabled || auth_active)
-                    .child(Icon::empty().path("icons/trash-2.svg").size(px(14.)))
-                    .tooltip("Remove downloaded runtime")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.confirm_remove_runtime(environment.clone(), window, cx)
-                    }))
-            });
+        let remove = installation.as_ref().is_some_and(|i| i.can_remove && !install_active).then(|| {
+            let environment = environment.clone();
+            Button::new("antigravity-remove-runtime")
+                .ghost()
+                .size(px(28.))
+                .p_0()
+                .disabled(actions_disabled || auth_active)
+                .child(Icon::empty().path("icons/trash-2.svg").size(px(14.)))
+                .tooltip("Remove downloaded runtime")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.confirm_remove_runtime(environment.clone(), window, cx);
+                }))
+        });
         let runtime_control = v_flex()
             .w(px(224.))
             .gap_2()

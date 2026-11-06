@@ -126,7 +126,7 @@ pub fn tailscale_https(serve_enabled: bool, serve_port: u16) -> Option<Tailscale
 
 /// `probeTailscaleHttpsEndpoint`.
 fn probe(base_url: &str) -> bool {
-    let url = format!("{}.well-known/t3/environment", base_url);
+    let url = format!("{base_url}.well-known/t3/environment");
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return false };
     runtime.block_on(async {
         let Ok(client) = reqwest::Client::builder().timeout(TAILSCALE_PROBE_TIMEOUT).build() else { return false };

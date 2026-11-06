@@ -84,7 +84,7 @@ fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
 
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
 fn card_height(window: &Window) -> f32 {
-    (f32::from(window.viewport_size().height) - 176.).min(704.).max(512.)
+    (f32::from(window.viewport_size().height) - 176.).clamp(512., 704.)
 }
 
 impl Workspace {
@@ -238,7 +238,7 @@ impl Workspace {
             .child(
                 ghost_text_button("providers-refresh", "", t)
                     .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw).size(px(14.)))
-                    .when_some(label, |button, label| button.label(label))
+                    .when_some(label, gpui_kit::component::button::Button::label)
                     .disabled(refreshing)
                     .tooltip("Refresh provider status")
                     .on_click(
@@ -264,7 +264,7 @@ impl Workspace {
         });
         let input = self.number_field(
             "provider-health-check-interval",
-            seconds as i64,
+            i64::try_from(seconds).unwrap_or(i64::MAX),
             (0, i64::MAX, HEALTH_STEP_SECONDS),
             window,
             cx,
@@ -309,7 +309,7 @@ impl Workspace {
                             .checked(!mixed && current == *value)
                             .disabled(*value == "off" && !never_available)
                             .on_click(window.listener_for(&workspace, move |this, _, window, cx| {
-                                this.update_settings(json!({ "idleCompaction": value }), window, cx)
+                                this.update_settings(json!({ "idleCompaction": value }), window, cx);
                             })),
                     );
                 }
@@ -533,7 +533,6 @@ impl Workspace {
         self.providers_request_on(environment, method, payload, failure, window, cx, done);
     }
 
-    #[expect(clippy::too_many_arguments, reason = "providers_request_then with its environment")]
     fn providers_request_on(
         &mut self,
         environment: SharedString,
@@ -568,7 +567,6 @@ impl Workspace {
 
     /// A text field that commits like the web's `DraftInput`: on blur or Enter, when it differs from
     /// the saved `value`, which it follows while unfocused.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn draft_input(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -618,7 +616,6 @@ impl Workspace {
     }
 
     /// Gets or creates the page's input under `key`; `on_event` sees all of its events.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn page_input(
         &mut self,
         page: &Entity<ProvidersPage>,
@@ -650,7 +647,7 @@ impl Workspace {
                 .default_value(value.to_owned())
         });
         let subscription = cx.subscribe_in(&state, window, move |this, input, event, window, cx| {
-            on_event(this, input, event, window, cx)
+            on_event(this, input, event, window, cx);
         });
         page.update(cx, |page, _| {
             page.inputs.insert(
@@ -679,7 +676,9 @@ impl ProvidersPage {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// `a.b.c` in a JSON value.

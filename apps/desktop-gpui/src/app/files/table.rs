@@ -49,7 +49,17 @@ pub(super) struct Table {
 
 /// The columns in view at horizontal `offset` (zero or negative), with one spare each side.
 pub(super) fn visible_columns(offset: f32, viewport: f32, column_width: f32, columns: usize) -> Range<usize> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a non-negative column count; `as` saturates"
+    )]
     let count = (viewport / column_width).ceil() as usize + 3;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a non-negative column index; `as` saturates"
+    )]
     let first = ((-offset - ROW_HEADER).max(0.) / column_width) as usize;
     let first = first.saturating_sub(1).min(columns.saturating_sub(count));
     first..(first + count).min(columns)
@@ -135,7 +145,7 @@ pub(super) fn parse_delimited(
 pub(super) fn column_label(mut column: usize) -> String {
     let mut label = String::new();
     loop {
-        label.insert(0, (b'A' + (column % 26) as u8) as char);
+        label.insert(0, char::from(b'A' + u8::try_from(column % 26).unwrap_or(0)));
         if column < 26 {
             return label;
         }
@@ -279,7 +289,7 @@ mod tests {
         assert!(!parse_delimited("1\n2\r\n", ',', 2, 30, 2000).1, "the bound met at the end cuts nothing");
         assert_eq!(
             parse_delimited("a\n\nb", ',', 10, 10, 10).0,
-            [vec!["a".to_owned()], vec!["".into()], vec!["b".into()]]
+            [vec!["a".to_owned()], vec![String::new()], vec!["b".into()]]
         );
         assert!(parse_delimited("\"open", ',', 10, 10, 10).1, "an unclosed quote is truncation");
         assert_eq!(parse_delimited("abcdef", ',', 10, 10, 3).0, [vec!["abc".to_owned()]]);

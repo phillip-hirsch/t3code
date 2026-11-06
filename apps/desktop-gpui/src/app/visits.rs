@@ -121,8 +121,8 @@ impl Workspace {
             Visit::Skip => {}
             Visit::Later(delay) => {
                 self.visit._timer = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(delay.max(0) as u64)).await;
-                    let _ = this.update(cx, |this, cx| this.track_visit(cx));
+                    cx.background_executor().timer(Duration::from_millis(u64::try_from(delay).unwrap_or(0))).await;
+                    let _ = this.update(cx, super::Workspace::track_visit);
                 }));
             }
             Visit::Send { visited_at, opened } => {

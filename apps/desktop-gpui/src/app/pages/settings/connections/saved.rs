@@ -223,7 +223,7 @@ fn saved_row(
                             ui.details.insert(id.clone());
                         }
                         cx.notify();
-                    })
+                    });
                 })
         };
         details = details.child(
@@ -349,7 +349,7 @@ fn row_menu(entity: WeakEntity<SavedEnvironments>, environment: &SavedEnvironmen
                 );
             }))
             .item(PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
-                open_rename_dialog(rename_entity.clone(), rename_id.clone(), rename_label.clone(), window, cx)
+                open_rename_dialog(rename_entity.clone(), rename_id.clone(), rename_label.clone(), window, cx);
             }))
             .separator()
             .item(
@@ -357,7 +357,7 @@ fn row_menu(entity: WeakEntity<SavedEnvironments>, environment: &SavedEnvironmen
                     div().text_color(theme::tokens(cx).error_foreground).child("Remove from this device\u{2026}")
                 })
                 .on_click(move |_, window, cx| {
-                    confirm_remove(remove_entity.clone(), remove_id.clone(), remove_label.clone(), window, cx)
+                    confirm_remove(remove_entity.clone(), remove_id.clone(), remove_label.clone(), window, cx);
                 }),
             )
         })

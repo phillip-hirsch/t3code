@@ -225,7 +225,8 @@ pub fn search_score(
     fields.push(fields.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" "));
     let mut total = 0;
     for token in &tokens {
-        total += fields.iter().enumerate().filter_map(|(i, f)| token_score(f, token, i as i64 * 10)).min()?;
+        total +=
+            fields.iter().enumerate().filter_map(|(i, f)| token_score(f, token, i64::try_from(i).ok()? * 10)).min()?;
     }
     Some(if favorite { total - 24 } else { total })
 }
@@ -263,7 +264,7 @@ fn token_score(value: &str, token: &str, base: i64) -> Option<i64> {
         previous = index;
         matched += 1;
         if matched == token.len() {
-            return Some(base + 100 + (gaps * 3 + index - start + 1 - token.len()) as i64);
+            return Some(base + 100 + i64::try_from(gaps * 3 + index - start + 1 - token.len()).ok()?);
         }
     }
     None

@@ -87,7 +87,7 @@ pub(crate) fn driver_label(driver: &str) -> String {
     words.join(" ")
 }
 
-fn advisory<'a>(provider: &'a Provider) -> (Option<&'a str>, Option<&'a str>) {
+fn advisory(provider: &Provider) -> (Option<&str>, Option<&str>) {
     let advisory = provider.compatibility_advisory.as_ref();
     let field = |key: &str| advisory.and_then(|a| a.get(key)).and_then(Value::as_str);
     (field("status"), field("message"))
@@ -141,17 +141,17 @@ fn provider_name(provider: &Provider) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| driver_label(&provider.driver))
+        .map_or_else(|| driver_label(&provider.driver), str::to_owned)
 }
 
 /// `getProviderStatusMessage`.
 pub(crate) fn provider_status_message(provider: &Provider) -> String {
     let (advisory_status, advisory_message) = advisory(provider);
-    if provider.auth.status != "unauthenticated" && advisory_status == Some("broken") {
-        if let Some(message) = advisory_message.filter(|m| !m.is_empty()) {
-            return message.to_owned();
-        }
+    if provider.auth.status != "unauthenticated"
+        && advisory_status == Some("broken")
+        && let Some(message) = advisory_message.filter(|m| !m.is_empty())
+    {
+        return message.to_owned();
     }
     if let Some(message) = provider.message.as_deref().filter(|m| !m.is_empty()) {
         return message.to_owned();
@@ -404,7 +404,7 @@ impl Workspace {
                                 .id("open-provider-setup")
                                 .cursor_pointer()
                                 .text_color(t.foreground)
-                                .hover(|s| s.underline())
+                                .hover(gpui_kit::Styled::underline)
                                 .child("Open provider setup")
                                 .on_click(cx.listener(|this, _, _, cx| this.open_settings("providers", cx))),
                         )
@@ -474,17 +474,17 @@ impl Workspace {
                 self.banners.reconnect_warning = false;
                 self.banners._grace = None;
             }
-            Connection::Disconnected(_) | Connection::Connecting if self.banners.was_connected => {
-                if self.banners._grace.is_none() && !self.banners.reconnect_warning {
-                    self.banners._grace = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(RECONNECT_GRACE).await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.banners.reconnect_warning = true;
-                            this.banners._grace = None;
-                            cx.notify();
-                        });
-                    }));
-                }
+            Connection::Disconnected(_) | Connection::Connecting
+                if self.banners.was_connected && self.banners._grace.is_none() && !self.banners.reconnect_warning =>
+            {
+                self.banners._grace = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(RECONNECT_GRACE).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.banners.reconnect_warning = true;
+                        this.banners._grace = None;
+                        cx.notify();
+                    });
+                }));
             }
             _ => {}
         }
@@ -585,7 +585,7 @@ impl Workspace {
                     .label(if restoring { "Restoring..." } else { "Restore branch" })
                     .disabled(restoring)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_thread_branch(restore_key.clone(), branch.clone(), window, cx)
+                        this.restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
                     })),
             )
             .child(
@@ -660,8 +660,7 @@ impl Workspace {
             crate::timestamp::hour12(self.client_settings.values.get("timestampFormat").as_str().unwrap_or(""));
         let reset = match state.reset_at.as_deref() {
             Some(at) => crate::timestamp::upcoming_local(at, hour12)
-                .map(|at| format!("Resets {at}"))
-                .unwrap_or_else(|| "Reset time unavailable; retry manually".into()),
+                .map_or_else(|| "Reset time unavailable; retry manually".into(), |at| format!("Resets {at}")),
             None => "Reset time unavailable; retry manually".into(),
         };
         let (title, description) = match (chatgpt_limit, workspace_limit) {
@@ -699,7 +698,7 @@ impl Workspace {
             actions = actions
                 .child(Button::new("recovery-resume").ghost().xsmall().label(resume).disabled(pending).on_click(
                     cx.listener(move |this, _, window, cx| {
-                        this.update_limit_recovery(&resume_thread, resume_update.clone(), false, window, cx)
+                        this.update_limit_recovery(&resume_thread, resume_update.clone(), false, window, cx);
                     }),
                 ))
                 .child(
@@ -709,7 +708,7 @@ impl Workspace {
                         .label(snooze)
                         .disabled(pending || snooze_blocked)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.update_limit_recovery(&snooze_thread, snooze_update.clone(), true, window, cx)
+                            this.update_limit_recovery(&snooze_thread, snooze_update.clone(), true, window, cx);
                         })),
                 );
         }
@@ -919,7 +918,7 @@ mod tests {
         let unsupported = provider(
             json!({"version": "1.2", "compatibilityAdvisory": {"status": "unsupported", "message": "Update it"}}),
         );
-        assert_eq!(provider_banner_key(&unsupported).as_deref(), Some("codex\0unsupported\01.2\0Update it"));
+        assert_eq!(provider_banner_key(&unsupported).as_deref(), Some("codex\0unsupported\u{0}1.2\0Update it"));
         let (title, message, variant) = provider_banner(&unsupported);
         assert_eq!(
             (title.as_str(), message.as_str(), variant),

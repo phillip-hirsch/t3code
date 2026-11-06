@@ -370,7 +370,7 @@ impl Workspace {
             );
         }
         let auto = self.auto_environment_label(&options);
-        let shown_label: SharedString = auto.map_or(label.clone(), SharedString::from);
+        let shown_label: SharedString = auto.map_or(label, SharedString::from);
         let tooltip = match self.shortcut_label("composer.host") {
             Some(keys) => format!("{shown_label} · {keys}"),
             None => shown_label.to_string(),
@@ -389,7 +389,7 @@ impl Workspace {
                 view.update(cx, |this, cx| {
                     this.host.open = *open;
                     cx.notify();
-                })
+                });
             })
             .trigger(trigger)
             .p(px(4.))

@@ -102,14 +102,13 @@ impl DrawerLayout {
         self.suppressed.remove(terminal_id);
         let place = if self.terminal_ids.is_empty() { Place::New } else { place };
         let is_new = !self.terminal_ids.iter().any(|id| id == terminal_id);
-        if let Place::Split(_) = place {
-            if is_new
-                && self.active_group().is_some_and(|group| {
-                    group.terminal_ids.len() >= MAX_PER_GROUP && !group.terminal_ids.iter().any(|id| id == terminal_id)
-                })
-            {
-                return false;
-            }
+        if let Place::Split(_) = place
+            && is_new
+            && self.active_group().is_some_and(|group| {
+                group.terminal_ids.len() >= MAX_PER_GROUP && !group.terminal_ids.iter().any(|id| id == terminal_id)
+            })
+        {
+            return false;
         }
         if is_new {
             self.terminal_ids.push(terminal_id.to_owned());

@@ -144,6 +144,9 @@ impl Embed {
 }
 
 fn embed(item: &TurnItem) -> Option<Embed> {
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())
+    }
     if item.item_type != "dynamic_tool" {
         return None;
     }
@@ -152,9 +155,6 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         return None;
     }
     let tool = item.str("toolName").unwrap_or_default();
-    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-        value.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty())
-    }
     if let Some(app) = output.get("t3McpApp") {
         let (server, name) = (text(app, "server")?, text(app, "tool")?);
         if tool != format!("{server}.{name}") && tool != format!("mcp__{server}__{name}") {
@@ -925,21 +925,6 @@ fn turn_folds(
     latest_run: Option<&Run>,
     unfolded: &HashSet<SharedString>,
 ) -> HashMap<usize, Fold> {
-    let mut interrupted: HashSet<&SharedString> = HashSet::new();
-    let mut prompt_index: HashMap<&SharedString, usize> = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.starts_response() {
-            if let Some(run) = entry.boundary_run() {
-                prompt_index.entry(run).or_insert(index);
-            }
-        }
-        if let Kind::Event { item_type, .. } = &entry.kind {
-            if matches!(item_type.as_ref(), "run_interrupt_request" | "run_interrupt_result") {
-                interrupted.extend(entry.run_id.as_ref());
-            }
-        }
-    }
-
     struct Group {
         entries: Vec<usize>,
         terminal: Option<usize>,
@@ -948,6 +933,21 @@ fn turn_folds(
         anchor: usize,
         steers: Vec<(usize, usize)>,
     }
+    let mut interrupted: HashSet<&SharedString> = HashSet::new();
+    let mut prompt_index: HashMap<&SharedString, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.starts_response()
+            && let Some(run) = entry.boundary_run()
+        {
+            prompt_index.entry(run).or_insert(index);
+        }
+        if let Kind::Event { item_type, .. } = &entry.kind
+            && matches!(item_type.as_ref(), "run_interrupt_request" | "run_interrupt_result")
+        {
+            interrupted.extend(entry.run_id.as_ref());
+        }
+    }
+
     let mut groups: Vec<(SharedString, Group)> = Vec::new();
     let mut positions: HashMap<SharedString, usize> = HashMap::new();
     let mut runless_failed: HashSet<SharedString> = HashSet::new();
@@ -964,13 +964,13 @@ fn turn_folds(
         }
         if entry.is_steer() {
             let run = entry.run_id.as_ref().or(response.as_ref());
-            if let Some((_, group)) = run.and_then(|run| positions.get(run)).map(|position| &mut groups[*position]) {
-                if !group.entries.is_empty() {
-                    if group.steers.last().is_some_and(|(start, _)| *start == group.entries.len()) {
-                        group.steers.pop();
-                    }
-                    group.steers.push((group.entries.len(), index));
+            if let Some((_, group)) = run.and_then(|run| positions.get(run)).map(|position| &mut groups[*position])
+                && !group.entries.is_empty()
+            {
+                if group.steers.last().is_some_and(|(start, _)| *start == group.entries.len()) {
+                    group.steers.pop();
                 }
+                group.steers.push((group.entries.len(), index));
             }
             continue;
         }
@@ -1490,12 +1490,12 @@ pub fn rows(projection: &ThreadProjection, expanded: &HashSet<SharedString>, cac
         if show_working && index == active_header {
             rows.push(Row::Working { started_at: latest_run.and_then(|r| r.started_at.clone()).map(Into::into) });
         }
-        if Some(index) == latest_visible {
-            if let Some((row, details)) = live_row.take() {
-                has_activity |= keeps_live;
-                rows.push(row);
-                rows.extend(details);
-            }
+        if Some(index) == latest_visible
+            && let Some((row, details)) = live_row.take()
+        {
+            has_activity |= keeps_live;
+            rows.push(row);
+            rows.extend(details);
         }
         if matches!(&entry.kind, Kind::Event { item_type, .. } if item_type == "run_interrupt_request") {
             index += 1;
@@ -1728,7 +1728,7 @@ fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
                 WorkRowKind::Toggle { run_id: Some(toggle_run), expanded: true, .. }
                     if toggle_run == run && trailing =>
                 {
-                    last = Some(candidate_index)
+                    last = Some(candidate_index);
                 }
                 WorkRowKind::Single { entry, .. } if entry.run_id.as_ref() == Some(run) => {
                     trailing |= failed_or_tool(entry);
@@ -1739,7 +1739,7 @@ fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
                 WorkRowKind::Details { entries }
                     if trailing && entries.iter().any(|d| d.entry.run_id.as_ref() == Some(run)) =>
                 {
-                    last = Some(candidate_index)
+                    last = Some(candidate_index);
                 }
                 _ => {}
             }

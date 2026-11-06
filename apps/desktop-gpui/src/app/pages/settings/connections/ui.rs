@@ -182,7 +182,7 @@ impl RenderOnce for WebButton {
             .text_color(text)
             .font_weight(FontWeight::MEDIUM)
             .whitespace_nowrap()
-            .when(self.full_width, |el| el.w_full());
+            .when(self.full_width, gpui_kit::Styled::w_full);
         let base = match self.size {
             Size::Xs => text_xs(base),
             Size::Default => text_sm(base),

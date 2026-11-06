@@ -54,7 +54,7 @@ fn address(home: &Path) -> String {
     // Windows paths are case-insensitive.
     let key = if cfg!(windows) { key.to_lowercase() } else { key.into_owned() };
     let digest = Sha256::digest(key.as_bytes());
-    let id: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let id = crate::hex::lower_hex(&digest[..8]);
     if cfg!(windows) {
         format!(r"\\.\pipe\t3code-gpui-{id}")
     } else {
@@ -67,8 +67,7 @@ fn address(home: &Path) -> String {
 fn socket_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|_| cfg!(target_os = "linux"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
 fn message(args: &[String]) -> Vec<u8> {

@@ -62,30 +62,30 @@ impl Workspace {
             .description(agent_description)
             .setting("enableAgentBrowserAccess")
             .switch();
-        let agent_access = self.setting_row(&view, agent_access, window, cx);
+        let agent_access = self.setting_row(view, agent_access, window, cx);
 
-        let profiles = self.browser_profiles_row(&view, window, cx);
+        let profiles = self.browser_profiles_row(view, window, cx);
         let link_target = SettingRow::new("browser-link-target")
             .description(
                 "Where links in the chat and terminal open. Hold ⌘ or Ctrl while clicking a link to open it in your default browser either way.",
             )
             .setting("browserLinkTarget")
             .select(LINK_TARGETS, 160.);
-        let link_target = self.setting_row(&view, link_target, window, cx);
+        let link_target = self.setting_row(view, link_target, window, cx);
         let search_engine = SettingRow::new("browser-search-engine")
             .description("What the address bar searches when you type something that isn't a URL.")
             .setting("browserSearchEngine")
             .setting("browserCustomSearchUrl")
             .select(SEARCH_ENGINES, 160.);
-        let mut browsing = vec![profiles, link_target, self.setting_row(&view, search_engine, window, cx)];
+        let mut browsing = vec![profiles, link_target, self.setting_row(view, search_engine, window, cx)];
         if view.str("browserSearchEngine") == "custom" {
-            browsing.push(self.custom_search_url_row(&view, window, cx));
+            browsing.push(self.custom_search_url_row(view, window, cx));
         }
         let advanced = [
-            self.browser_viewport_row(&view, window, cx),
-            self.browser_zoom_row(&view, window, cx),
+            self.browser_viewport_row(view, window, cx),
+            self.browser_zoom_row(view, window, cx),
             self.setting_row(
-                &view,
+                view,
                 SettingRow::new("browser-default-appearance")
                     .description("The color scheme pages are told to prefer. System follows your OS setting.")
                     .setting("browserDefaultAppearance")
@@ -112,14 +112,14 @@ impl Workspace {
             .description("Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.")
             .setting("browserRecordingFrameRate")
             .control(rate_select);
-        let recordings = [self.setting_row(&view, frame_rate, window, cx)];
+        let recordings = [self.setting_row(view, frame_rate, window, cx)];
 
         let sections = [
             settings_section("browser-agent-access", "Agent access", [agent_access], &t),
             settings_section("browser", "Browsing", browsing, &t),
             settings_section("browser-recordings", "Recordings", recordings, &t),
         ];
-        self.settings_page("browser", &view, sections, cx)
+        self.settings_page("browser", view, sections, cx)
     }
 
     fn custom_search_url_row(
@@ -198,6 +198,7 @@ impl Workspace {
             let field = |this: &mut Self, width_axis: bool, value: f32, window: &mut Window, cx: &mut Context<Self>| {
                 let key = if width_axis { "browser-viewport-width" } else { "browser-viewport-height" };
                 let range = (preview::VIEWPORT_MIN_DIMENSION, preview::VIEWPORT_MAX_DIMENSION, 1);
+                #[expect(clippy::cast_possible_truncation, reason = "the field shows a whole number; `as` saturates")]
                 let input = this.number_field(key, value as i64, range, window, cx, move |this, value, window, cx| {
                     let current: Viewport =
                         serde::Deserialize::deserialize(this.client_settings.values.get("browserDefaultViewport"))
@@ -486,6 +487,7 @@ impl Workspace {
 }
 
 /// `1` for 100%, so the stored value matches the default the reset compares against.
+#[expect(clippy::cast_possible_truncation, reason = "only whole levels reach the cast")]
 fn zoom_value(level: f64) -> Value {
     if level.fract() == 0. { json!(level as i64) } else { json!(level) }
 }
@@ -539,7 +541,7 @@ fn profile_menu(
             menu = menu
                 .item(PopupMenuItem::new("Set as default").disabled(is_default).on_click(on(
                     |this, profile, window, cx| {
-                        this.update_settings(json!({"browserDefaultProfileId": profile.id}), window, cx)
+                        this.update_settings(json!({"browserDefaultProfileId": profile.id}), window, cx);
                     },
                 )))
                 .item(

@@ -188,7 +188,7 @@ impl ThemeImport {
         }
         self.debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.settle(cx));
+            let _ = this.update(cx, ThemeImport::settle);
         }));
     }
 
@@ -752,7 +752,7 @@ impl ThemeImport {
                 }
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.read_files(paths.paths().to_vec(), window, cx)
+                this.read_files(paths.paths().to_vec(), window, cx);
             }))
             .child(
                 v_flex().min_w_0().child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Theme file")).child(

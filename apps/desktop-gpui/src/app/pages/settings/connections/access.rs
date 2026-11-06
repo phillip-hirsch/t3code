@@ -206,7 +206,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        error_toast(window, cx, title, if error.is_empty() { fallback.to_owned() } else { error })
+                        error_toast(window, cx, title, if error.is_empty() { fallback.to_owned() } else { error });
                     }
                 }
             });
@@ -231,7 +231,7 @@ impl Workspace {
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
-        self.settings_page("access", &view, sections, cx)
+        self.settings_page("access", view, sections, cx)
     }
 
     /// The `connections-environment` section: name, icon menu, policy, version, network access, permissions.
@@ -333,7 +333,7 @@ impl Workspace {
                                     .spawn(cx, async move |cx| {
                                         if let Err(error) = update_settings(client, patch).await {
                                             let _ = cx.update(|window, cx| {
-                                                error_toast(window, cx, "Could not update settings", error)
+                                                error_toast(window, cx, "Could not update settings", error);
                                             });
                                         }
                                     })
@@ -347,9 +347,9 @@ impl Workspace {
     }
 
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &App, t: &Tokens) -> AnyElement {
+        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let s = state.read(cx);
         let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
-        static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =
@@ -365,7 +365,7 @@ impl Workspace {
                 state.update(cx, |s, cx| {
                     s.clients_open = !s.clients_open;
                     cx.notify();
-                })
+                });
             }
         };
         let header = h_flex()
@@ -479,7 +479,7 @@ impl Workspace {
                 let state = state.downgrade();
                 create
                     .on_click(move |_, window, cx| {
-                        open_create_link_dialog(state.clone(), endpoint.clone(), delegatable.clone(), window, cx)
+                        open_create_link_dialog(state.clone(), endpoint.clone(), delegatable.clone(), window, cx);
                     })
                     .into_any_element()
             }
@@ -559,7 +559,7 @@ fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: 
             state.update(cx, |s, cx| {
                 s.permissions_open = !s.permissions_open;
                 cx.notify();
-            })
+            });
         }
     };
     let summary = h_flex()
@@ -780,7 +780,8 @@ impl CreateLinkForm {
     }
 
     fn preset(&mut self, scopes: &[&str], cx: &mut Context<Self>) {
-        self.scopes = scopes.iter().map(|s| s.to_string()).filter(|s| self.delegatable.contains(s)).collect();
+        self.scopes =
+            scopes.iter().map(std::string::ToString::to_string).filter(|s| self.delegatable.contains(s)).collect();
         cx.notify();
     }
 
@@ -941,7 +942,7 @@ fn open_create_link_dialog(
 ) {
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Living room iPad"));
     label.update(cx, |input, cx| input.focus(window, cx));
-    let scopes = logic::STANDARD_SCOPES.iter().map(|s| s.to_string()).collect();
+    let scopes = logic::STANDARD_SCOPES.iter().map(std::string::ToString::to_string).collect();
     let form = cx.new(|_| CreateLinkForm { label, scopes, delegatable, busy: false, access, endpoint });
     window.open_dialog(cx, move |dialog, _, _| dialog.title("Create pairing link").w(px(448.)).child(form.clone()));
 }

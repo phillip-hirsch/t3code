@@ -67,7 +67,7 @@ impl LocalServer {
 pub(in crate::app) struct ServersWatch {
     /// The environment the servers run on.
     environment: Option<SharedString>,
-    servers: Rc<Vec<LocalServer>>,
+    servers: Rc<[LocalServer]>,
     task: Option<Task<()>>,
     stopping: Option<(Option<u32>, u16)>,
     visible: Option<usize>,
@@ -113,7 +113,7 @@ impl Workspace {
                 };
                 let updated = this.update(cx, |this, cx| {
                     if *this.servers.servers != servers {
-                        this.servers.servers = Rc::new(servers);
+                        this.servers.servers = Rc::from(servers);
                         cx.notify();
                     }
                 });
@@ -240,7 +240,9 @@ impl Workspace {
                                 .justify_center()
                                 .rounded(px(8.))
                                 .text_color(tokens.error)
-                                .when(!stopping, |el| el.invisible().group_hover(group.clone(), |s| s.visible()))
+                                .when(!stopping, |el| {
+                                    el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible)
+                                })
                                 .hover(|s| s.bg(tokens.error.opacity(0.1)))
                                 .child(if stopping {
                                     Spinner::new().xsmall().into_any_element()

@@ -41,6 +41,7 @@ pub(super) struct SearchResult<'a> {
 }
 
 impl Workspace {
+    #[expect(clippy::unnecessary_wraps, reason = "a `search_messages` slot, which can be missing elsewhere")]
     pub(super) fn sidebar_messages(this: &mut Workspace) -> Option<&mut MessageSearch> {
         Some(&mut this.sidebar.messages)
     }
@@ -155,7 +156,7 @@ impl Workspace {
                             i + 1
                         }
                     }
-                    (_, None) | (_, Some(0)) => last,
+                    (_, None | Some(0)) => last,
                     (_, Some(i)) => i - 1,
                 };
                 self.sidebar.search_highlight = Some(ids[next].clone());

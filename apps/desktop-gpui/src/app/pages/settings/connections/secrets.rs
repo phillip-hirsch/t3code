@@ -62,7 +62,7 @@ impl Workspace {
                 &t,
             )
         };
-        self.settings_page("secrets", &view, [section], cx)
+        self.settings_page("secrets", view, [section], cx)
     }
 
     fn secret_providers(&self, state: &Entity<SecretsState>, environment: String, cx: &App, t: &Tokens) -> AnyElement {
@@ -78,7 +78,7 @@ impl Workspace {
             WebButton::new("add-secret-provider", "Add provider")
                 .icon(IconName::Plus)
                 .on_click(move |_, window, cx| {
-                    open_provider_dialog(client.clone(), environment.clone(), ids.clone(), None, window, cx)
+                    open_provider_dialog(client.clone(), environment.clone(), ids.clone(), None, window, cx);
                 })
                 .into_any_element()
         });
@@ -130,7 +130,7 @@ impl Workspace {
                                         editing,
                                         window,
                                         cx,
-                                    )
+                                    );
                                 })
                         });
                         let remove = {
@@ -138,7 +138,7 @@ impl Workspace {
                             WebButton::new(ElementId::Name(format!("secret-provider-remove-{id}").into()), "Remove")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
-                                    confirm_remove(client.clone(), id.clone(), label.clone(), window, cx)
+                                    confirm_remove(client.clone(), id.clone(), label.clone(), window, cx);
                                 })
                         };
                         h_flex().gap(px(4.)).children(edit).child(remove).into_any_element()
@@ -184,7 +184,7 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
                     state.revealed.insert(id_owned.clone());
                 }
                 cx.notify();
-            })
+            });
         })
         .child(text)
         .into_any_element()

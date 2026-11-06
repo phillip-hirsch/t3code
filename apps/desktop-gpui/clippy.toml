@@ -1,0 +1,28 @@
+# Tests may unwrap, expect and print: a panic there is the assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+
+# Product names that read as prose in docs, not code.
+doc-valid-idents = [
+  "..",
+  "ChatGPT",
+  "CLIProxyAPI",
+  "DevTools",
+  "DirectComposition",
+  "DuckDuckGo",
+  "KaTeX",
+  "KWallet",
+  "MacRoman",
+  "AppKit",
+  "DejaVu",
+  "MagicDNS",
+  "OpenAI",
+  "SnapShot",
+  "SnapShots",
+  "WebKit",
+  "WebView",
+  "WebView2",
+  "WebViews",
+  "WindowServer",
+]

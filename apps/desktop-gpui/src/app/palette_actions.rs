@@ -24,8 +24,6 @@ pub(super) fn github_repository(identity: &RepositoryIdentity) -> Option<(String
     (owner_ok && name_ok).then(|| (owner.to_owned(), name.to_owned()))
 }
 
-/// `URLSearchParams` encoding of one value.
-
 /// `buildNewThreadLink` with its context: the repository, and the model once a provider is known.
 pub(super) fn prompt_link_with(
     prompt: &str,
@@ -180,7 +178,7 @@ impl Workspace {
                 });
                 if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
                     let _ = this.update_in(cx, |_, window, cx| {
-                        toast_error("Could not restart the agent session", error.to_string(), window, cx)
+                        toast_error("Could not restart the agent session", error.to_string(), window, cx);
                     });
                     return;
                 }
@@ -194,7 +192,7 @@ impl Workspace {
             let input = json!({"instanceId": instance, "cwd": cwd, "fresh": true, "workspaceSnapshotsOnDemand": true});
             if let Err(error) = client.request("server.refreshProviders", input).await {
                 let _ = this.update_in(cx, |_, window, cx| {
-                    toast_error("Could not restart the agent session", error.to_string(), window, cx)
+                    toast_error("Could not restart the agent session", error.to_string(), window, cx);
                 });
             }
         })

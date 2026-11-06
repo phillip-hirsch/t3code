@@ -583,7 +583,7 @@ mod tests {
             OfficeData::Word(vec![
                 Block::Paragraph("Intro".into(), 2),
                 Block::Paragraph("a\tb".into(), 0),
-                Block::Table(vec![vec!["x".into(), "".into()]]),
+                Block::Table(vec![vec!["x".into(), String::new()]]),
             ])
         );
     }
@@ -608,9 +608,9 @@ mod tests {
         assert_eq!(
             sheets[0].1,
             vec![
-                vec!["name".to_owned(), "".into(), "3.5".into()],
+                vec!["name".to_owned(), String::new(), "3.5".into()],
                 vec![],
-                vec!["".to_owned(), "Ada".into(), "TRUE".into()]
+                vec![String::new(), "Ada".into(), "TRUE".into()]
             ]
         );
         assert_eq!(column_of("AA10"), Some(26));

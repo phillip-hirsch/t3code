@@ -66,8 +66,8 @@ pub(in crate::app) struct Panel {
     detail: Option<Rc<Detail>>,
     activity: Option<Rc<Activity>>,
     /// Derived from `activity` once when it lands (`set_activity`), so render only borrows.
-    conversations: Rc<Vec<Conversation>>,
-    review_outcomes: Rc<Vec<(String, logic::ReviewOutcome)>>,
+    conversations: Rc<[Conversation]>,
+    review_outcomes: Rc<[(String, logic::ReviewOutcome)]>,
     newest_commit: Option<i64>,
     /// The detail and activity reads in flight; a newer read drops (cancels) the older one.
     _detail_read: Option<Task<()>>,
@@ -96,7 +96,7 @@ pub(in crate::app) struct Panel {
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
     summary_scroll: ScrollHandle,
     timeline: ListState,
-    timeline_rows: Rc<Vec<TimelineRow>>,
+    timeline_rows: Rc<[TimelineRow]>,
     guide: Option<Rc<Value>>,
     /// `guide["guide"]` decoded once when it lands (`set_guide`); `None` while there is none.
     guide_tour: Option<Result<Rc<logic::Guide>, SharedString>>,
@@ -190,8 +190,8 @@ impl Panel {
     }
 
     fn set_activity(&mut self, activity: Activity) {
-        self.conversations = Rc::new(logic::conversations(&activity.comments, &activity.review_threads));
-        self.review_outcomes = Rc::new(logic::latest_review_outcomes(&activity.comments, &activity.commits));
+        self.conversations = Rc::from(logic::conversations(&activity.comments, &activity.review_threads));
+        self.review_outcomes = Rc::from(logic::latest_review_outcomes(&activity.comments, &activity.commits));
         self.newest_commit = logic::newest_commit_ms(&activity.commits);
         self.activity = Some(Rc::new(activity));
     }
@@ -219,7 +219,7 @@ impl Panel {
         }
         let rows = logic::group_timeline(events);
         self.timeline.reset(rows.len());
-        self.timeline_rows = Rc::new(rows);
+        self.timeline_rows = Rc::from(rows);
     }
 
     fn provider(&self) -> &str {
@@ -394,10 +394,10 @@ impl Workspace {
                         panel.maintainer_choice = None;
                     }
                     Ok(Err(error)) => {
-                        panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false))
+                        panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false));
                     }
                     Err(error) => {
-                        panel.detail_error = Some((list_logic::error_message(&error).into(), is_not_found(&error)))
+                        panel.detail_error = Some((list_logic::error_message(&error).into(), is_not_found(&error)));
                     }
                 }
                 panel.rebuild_timeline();
@@ -896,7 +896,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_pr_header(
         &mut self,
         detail: &Rc<Detail>,
@@ -1142,7 +1141,6 @@ impl Workspace {
     }
 
     /// `PullRequestPrimaryAction`.
-    #[allow(clippy::too_many_arguments)]
     fn render_pr_primary(
         &self,
         detail: &Detail,
@@ -1202,7 +1200,7 @@ impl Workspace {
                 out.push(
                     button(if primary == Primary::Merge { "pr-merge" } else { "pr-enable-auto-merge" }, icon, label)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.press_pr_action(action, Some(method), window, cx)
+                            this.press_pr_action(action, Some(method), window, cx);
                         }))
                         .into_any_element(),
                 );
@@ -1284,7 +1282,7 @@ impl Workspace {
                     menu = menu.item(
                         PopupMenuItem::new("Link to thread")
                             .icon(Lucide::Link)
-                            .on_click(on(|this, window, cx| this.open_pr_thread_picker(window, cx))),
+                            .on_click(on(super::super::Workspace::open_pr_thread_picker)),
                     );
                 }
                 menu = menu.item(
@@ -1312,7 +1310,7 @@ impl Workspace {
                             Lucide::MessageCircleQuestionMark,
                         )
                         .disabled(busy_handoff)
-                        .on_click(on(|this, window, cx| this.ask_about_pr(window, cx))),
+                        .on_click(on(super::super::Workspace::ask_about_pr)),
                     )
                     .item(
                         two_line(
@@ -1321,7 +1319,7 @@ impl Workspace {
                             Lucide::BookOpen,
                         )
                         .disabled(busy_handoff)
-                        .on_click(on(|this, window, cx| this.explain_pr(window, cx))),
+                        .on_click(on(super::super::Workspace::explain_pr)),
                     )
                     .item(
                         PopupMenuItem::new(if handoff.as_deref() == Some("findings") {
@@ -1331,7 +1329,7 @@ impl Workspace {
                         })
                         .icon(Lucide::Hammer)
                         .disabled(busy_handoff || !can_fix)
-                        .on_click(on(|this, window, cx| this.fix_pr_findings(window, cx))),
+                        .on_click(on(super::super::Workspace::fix_pr_findings)),
                     );
                 if guides {
                     let label = if guide_running {
@@ -1345,7 +1343,7 @@ impl Workspace {
                         PopupMenuItem::new(label)
                             .icon(Lucide::Sparkles)
                             .disabled(guide_running)
-                            .on_click(on(|this, window, cx| this.write_pr_guide(window, cx))),
+                            .on_click(on(super::super::Workspace::write_pr_guide)),
                     );
                 }
                 menu = menu.separator();
@@ -1368,7 +1366,7 @@ impl Workspace {
                         };
                         menu = menu.item(PopupMenuItem::new(label).icon(icon).disabled(busy).on_click(
                             window.listener_for(&view, move |this, _, window, cx| {
-                                this.perform_pr_action(action, None, window, cx)
+                                this.perform_pr_action(action, None, window, cx);
                             }),
                         ));
                     }
@@ -1388,7 +1386,7 @@ impl Workspace {
                                         Some(method),
                                         window,
                                         cx,
-                                    )
+                                    );
                                 }),
                             ));
                     }
@@ -1396,7 +1394,7 @@ impl Workspace {
                         menu = menu.item(
                             PopupMenuItem::new("Disable auto-merge").icon(Lucide::GitMerge).disabled(busy).on_click(
                                 window.listener_for(&view, |this, _, window, cx| {
-                                    this.perform_pr_action("disable-auto-merge", None, window, cx)
+                                    this.perform_pr_action("disable-auto-merge", None, window, cx);
                                 }),
                             ),
                         );
@@ -1416,7 +1414,7 @@ impl Workspace {
                                         Some(method),
                                         window,
                                         cx,
-                                    )
+                                    );
                                 }),
                             ),
                         );
@@ -1455,7 +1453,7 @@ impl Workspace {
                     .item(
                         PopupMenuItem::new("Copy link").icon(Lucide::Link).on_click(
                             window.listener_for(&view, move |this, _, _, cx| {
-                                this.copy_pr_text("link", copy_url.clone(), cx)
+                                this.copy_pr_text("link", copy_url.clone(), cx);
                             }),
                         ),
                     )
@@ -1479,7 +1477,7 @@ impl Workspace {
                                     None,
                                     window,
                                     cx,
-                                )
+                                );
                             })),
                     );
                 } else if actions.reopen {
@@ -1488,7 +1486,7 @@ impl Workspace {
                             .icon(Lucide::GitPullRequestArrow)
                             .disabled(busy)
                             .on_click(window.listener_for(&view, |this, _, window, cx| {
-                                this.perform_pr_action("reopen", None, window, cx)
+                                this.perform_pr_action("reopen", None, window, cx);
                             })),
                     );
                 } else if actions.revert {
@@ -1504,7 +1502,7 @@ impl Workspace {
                                     None,
                                     window,
                                     cx,
-                                )
+                                );
                             }),
                         ),
                     );
@@ -1527,7 +1525,7 @@ impl Workspace {
                                 None,
                                 window,
                                 cx,
-                            )
+                            );
                             }),
                         ));
                 }
@@ -1607,8 +1605,7 @@ impl Workspace {
         let activity = panel.activity.as_ref();
         let approvals = activity
             .filter(|a| !a.comments_truncated)
-            .map(|_| panel.review_outcomes.iter().filter(|(_, e)| e.outcome == "approved" && !e.stale).count())
-            .unwrap_or(0);
+            .map_or(0, |_| panel.review_outcomes.iter().filter(|(_, e)| e.outcome == "approved" && !e.stale).count());
         let approved = outcome_color("approved", t);
         let item =
             |icon: Lucide, text: String| h_flex().gap(px(4.)).child(Icon::new(icon).with_size(px(12.))).child(text);
@@ -1943,7 +1940,7 @@ impl Workspace {
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
         let opened_body =
             if open { body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", root.id), b, cx)) } else { None };
-        let toggle_key = key.clone();
+        let toggle_key = key;
         v_flex()
             .rounded(px(8.))
             .border_1()
@@ -1979,7 +1976,7 @@ impl Workspace {
                                             .with_size(px(14.)),
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_pr_disclosure(toggle_key.clone(), cx)
+                                        this.toggle_pr_disclosure(toggle_key.clone(), cx);
                                     })),
                             ),
                     )
@@ -2155,6 +2152,7 @@ impl Workspace {
     }
 
     fn render_pr_guide(&mut self, t: &Tokens, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        const HINT: &str = "Check the review guide model in Settings → Source control.";
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let result = panel.guide.clone().unwrap_or_default();
         let tour = panel.guide_tour.clone();
@@ -2162,7 +2160,6 @@ impl Workspace {
         let current = result["currentHeadSha"].as_str();
         let failure = (result["run"]["_tag"] == "Failed" && result["run"]["headSha"].as_str() == current)
             .then(|| result["run"]["detail"].as_str().unwrap_or_default().to_owned());
-        const HINT: &str = "Check the review guide model in Settings → Source control.";
         let write_button = |label: &str, cx: &mut Context<Self>| {
             outline_button("pr-write-guide", t)
                 .disabled(running)
@@ -2190,9 +2187,9 @@ impl Workspace {
             } else {
                 (
                     "No review guide yet",
-                    panel.guide_error.as_ref().map(ToString::to_string).unwrap_or_else(|| {
+                    panel.guide_error.as_ref().map_or_else(|| {
                         "A guide is a tour of the change: stops through the code in reading order, with the calls only a maintainer can make.".into()
-                    }),
+                    }, ToString::to_string),
                 )
             };
             return v_flex()
@@ -2625,7 +2622,7 @@ fn render_checks(checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Wor
                 .rounded(px(6.))
                 .text_xs()
                 .line_height(px(20.))
-                .when(url.is_some(), |el| el.cursor_pointer())
+                .when(url.is_some(), gpui_kit::Styled::cursor_pointer)
                 .hover(|s| s.bg(Hsla { a: t.accent.a * 0.6, ..t.accent }))
                 .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.)).text_color(color)))
                 .child(div().flex_1().min_w_0().text_color(t.foreground).child(check.name.clone()))
@@ -3067,10 +3064,12 @@ fn thread_event(
                     el.child(div().flex_none().font_weight(FontWeight::MEDIUM).child("Outdated"))
                 })
                 .when(!expanded, |el| {
-                    let mut text = format!("· {}", event.actor.as_ref().map_or("ghost", |a| a.login.as_str()));
-                    if replies > 0 {
-                        text.push_str(&format!(" · {replies} {}", if replies == 1 { "reply" } else { "replies" }));
-                    }
+                    let actor = event.actor.as_ref().map_or("ghost", |a| a.login.as_str());
+                    let text = match replies {
+                        0 => format!("· {actor}"),
+                        1 => format!("· {actor} · 1 reply"),
+                        _ => format!("· {actor} · {replies} replies"),
+                    };
                     el.child(div().flex_none().child(text))
                 })
                 .child(div().ml_auto().child(

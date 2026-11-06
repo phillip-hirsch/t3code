@@ -79,7 +79,7 @@ fn parse_hex(hex: &str) -> Option<(Rgb, f64)> {
         return None;
     }
     let byte = |s: &str| u8::from_str_radix(s, 16).ok().map(f64::from);
-    let short = |i: usize| byte(&hex[i..i + 1].repeat(2));
+    let short = |i: usize| byte(&hex[i..=i].repeat(2));
     match hex.len() {
         3 | 4 => {
             Some((Rgb { r: short(0)?, g: short(1)?, b: short(2)? }, if hex.len() == 4 { short(3)? / 255. } else { 1. }))
@@ -146,7 +146,7 @@ pub fn is_color(value: &str) -> bool {
 /// `formatThemeColorNumber`: fixed precision without trailing zeros, and never `-0`.
 fn format_number(value: f64, precision: i32) -> String {
     let value = if value.abs() < 10f64.powi(-precision) / 2. { 0. } else { value };
-    let text = format!("{value:.*}", precision as usize);
+    let text = format!("{value:.*}", usize::try_from(precision).unwrap_or(0));
     if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_owned() } else { text }
 }
 
@@ -162,6 +162,7 @@ pub fn canonical(value: &str) -> Option<String> {
 }
 
 /// `themeColorToHex`: `#rrggbb`, or `#rrggbbaa` when translucent.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "alpha is below 1, so the byte fits")]
 pub fn to_hex(value: &str) -> Option<String> {
     let parsed = parse(value)?;
     let opaque = rgb_hex(oklch_to_rgb(parsed.color, true));
@@ -169,6 +170,7 @@ pub fn to_hex(value: &str) -> Option<String> {
 }
 
 /// The color in sRGB for painting: unrounded channels in 0..=1 and the alpha.
+#[expect(clippy::cast_possible_truncation, reason = "colour channels; f32 is plenty")]
 pub fn to_srgba(value: &str) -> Option<[f32; 4]> {
     let parsed = parse(value)?;
     let rgb = oklch_to_rgb(parsed.color, false);
@@ -180,6 +182,7 @@ fn rgb_of(value: &str, fallback: Rgb) -> Rgb {
 }
 
 pub fn rgb_hex(color: Rgb) -> String {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |value: f64| value.clamp(0., 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(color.r), channel(color.g), channel(color.b))
 }
@@ -263,9 +266,10 @@ fn gamut_map(color: Oklch) -> Oklch {
     }
     let (mut low, mut high) = (0., color.c);
     let resolution = 0.000001f64;
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a small, positive step count")]
     let steps = (color.c.max(resolution).log2() - resolution.log2()).ceil().max(1.) as usize;
     for _ in 0..steps {
-        let mid = (low + high) / 2.;
+        let mid = f64::midpoint(low, high);
         if in_gamut(mid) { low = mid } else { high = mid }
     }
     Oklch { c: low, ..color }
@@ -287,7 +291,7 @@ fn solve_lightness(base: Oklch, against: &[Rgb], min: f64, lighter: bool) -> Okl
     }
     let (mut low, mut high) = if lighter { (base.l, 1.) } else { (0., base.l) };
     for _ in 0..18 {
-        let mid = (low + high) / 2.;
+        let mid = f64::midpoint(low, high);
         let passes = contrast_of(Oklch { l: mid, ..base }) >= min;
         if passes == lighter { high = mid } else { low = mid }
     }
@@ -320,7 +324,7 @@ fn readable_text(background: Rgb, foreground: Rgb, amount: f64, min: f64) -> Rgb
     }
     let (mut readable, mut lower, mut upper) = (foreground, 0., amount);
     for _ in 0..12 {
-        let candidate_amount = (lower + upper) / 2.;
+        let candidate_amount = f64::midpoint(lower, upper);
         let candidate = mix(foreground, background, candidate_amount);
         if contrast(candidate, background) >= min {
             readable = candidate;
@@ -427,7 +431,7 @@ pub fn vivid(dark_appearance: bool, background: &str, accent: &str) -> Roles {
             ("mutedForeground", rgb_color(readable_text(oklch_to_rgb(muted, true), text_rgb, 1., 4.6))),
             ("placeholder", rgb_color(readable_text(oklch_to_rgb(surface_raised, true), text_rgb, 1., 4.6))),
             ("secondaryLabel", muted_text.clone()),
-            ("iconMuted", muted_text.clone()),
+            ("iconMuted", muted_text),
             ("update", accent_color.clone()),
             ("updateForeground", foreground_on(update_surface)),
             ("updateSurface", oklch_color(update_surface)),
@@ -579,6 +583,7 @@ pub fn update_family(dark_appearance: bool, colors: &Roles, role: &str, value: &
 }
 
 /// `hexToHsv` (`lib/color.ts`): hue in degrees, saturation and value in 0..=1.
+#[expect(clippy::float_cmp, reason = "`max` is one of r, g and b, so equality is exact")]
 pub fn hex_to_hsv(hex: &str) -> [f32; 3] {
     let value = u32::from_str_radix(hex.trim_start_matches('#').get(..6).unwrap_or("000000"), 16).unwrap_or(0);
     let [r, g, b] = [16, 8, 0].map(|shift| ((value >> shift) & 255) as f32 / 255.);
@@ -614,6 +619,7 @@ pub fn hsv_to_hex([hue, saturation, value]: [f32; 3]) -> String {
         h if h < 300. => (x, 0., chroma),
         _ => (chroma, 0., x),
     };
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let channel = |c: f32| ((c + m) * 255.).round() as u8;
     format!("#{:02x}{:02x}{:02x}", channel(r), channel(g), channel(b))
 }

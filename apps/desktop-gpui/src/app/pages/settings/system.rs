@@ -85,7 +85,7 @@ impl Workspace {
         let connected = self.settings_client().is_some();
         let background = self.render_background_row(cx);
         let storage = self.render_storage_sections(window, cx);
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let updates = [
             row(
                 self,
@@ -121,13 +121,13 @@ impl Workspace {
             "Inspect processes, resource use, and logs on one environment at a time."
         };
         let diagnostics = self.setting_row(
-            &view,
+            view,
             SettingRow::new("diagnostics").description(description).control(view_diagnostics),
             window,
             cx,
         );
         sections.push(settings_section("diagnostics-section", "Diagnostics", [diagnostics], &t));
-        self.settings_page("maintenance", &view, sections, cx)
+        self.settings_page("maintenance", view, sections, cx)
     }
 
     pub(super) fn render_settings_labs(
@@ -143,12 +143,12 @@ impl Workspace {
         let boring_switch = super::widgets::switch(&"boring-sidebar".into(), boring, false, &t).on_click(cx.listener(
             move |this, _, window, cx| {
                 let patch = json!({ "boringSidebarEnabled": !boring, "legacySidebarEnabled": false });
-                this.update_settings(patch, window, cx)
+                this.update_settings(patch, window, cx);
             },
         ));
         let workspace = cx.weak_entity();
         let described = |id: &'static str, parts: &'static [Part]| rich_text(id, parts, workspace.clone());
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(&view, row, window, cx);
+        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let beta = [
             row(
                 self,
@@ -205,7 +205,7 @@ impl Workspace {
             ),
         ];
         let sections = [settings_section("beta", "Beta", beta, &t), settings_section("legacy", "Legacy", legacy, &t)];
-        self.settings_page("labs", &view, sections, cx)
+        self.settings_page("labs", view, sections, cx)
     }
 
     pub(super) fn render_settings_about(
@@ -281,7 +281,7 @@ impl Workspace {
                 .into_any_element(),
         ];
         let sections = [settings_section("app", "App", app, &t), settings_section("legal", "Legal", legal, &t)];
-        self.settings_page("about", &view, sections, cx)
+        self.settings_page("about", view, sections, cx)
     }
 
     pub(super) fn render_settings_archived(
@@ -318,8 +318,8 @@ impl Workspace {
                 .on_click(move |_, window, cx| {
                     view.update(cx, |this, cx| {
                         let patch = json!({ "backgroundActivity": background::default_background() });
-                        this.update_settings(patch, window, cx)
-                    })
+                        this.update_settings(patch, window, cx);
+                    });
                 })
         });
         let info = div()
@@ -344,7 +344,7 @@ impl Workspace {
                 for profile in Profile::ALL {
                     menu = menu.item(PopupMenuItem::new(profile.label()).checked(option == Some(profile)).on_click(
                         window.listener_for(&picker_view, move |this, _, window, cx| {
-                            this.update_settings(background::profile_patch(profile), window, cx)
+                            this.update_settings(background::profile_patch(profile), window, cx);
                         }),
                     ));
                 }
@@ -390,13 +390,13 @@ impl Workspace {
             // (min, step) per `background::DURATION_KEYS`, as the web's `IntervalSecondsField`s.
             let inputs = [(0, 5), (0, 30), (5, 5), (5, 30)].into_iter().enumerate().map(|(index, (min, step))| {
                 let key = background::DURATION_KEYS[index];
-                let seconds = resolved.seconds(index) as i64;
+                let seconds = i64::try_from(resolved.seconds(index)).unwrap_or(i64::MAX);
                 view.update(cx, |this, cx| {
                     // Saved in milliseconds, so the seconds must fit `i64` times 1000.
                     let max = i64::MAX / 1000;
                     this.number_field(key, seconds, (min, max, step), window, cx, move |this, seconds, window, cx| {
                         let patch = background::override_patch(this.settings_json(), key, json!(seconds.saturating_mul(1000)));
-                        this.update_settings(patch, window, cx)
+                        this.update_settings(patch, window, cx);
                     })
                 })
             });
@@ -439,7 +439,7 @@ impl Workspace {
                             PopupMenuItem::new(profile.label()).checked(resolved.profile == profile).on_click(
                                 window.listener_for(&policy_view, move |this, _, window, cx| {
                                     let patch = background::shared_policy_patch(&settings, profile);
-                                    this.update_settings(patch, window, cx)
+                                    this.update_settings(patch, window, cx);
                                 }),
                             ),
                         );
@@ -457,15 +457,15 @@ impl Workspace {
                     .justify_between()
                     .border_t_1()
                     .border_color(t.border)
-                    .when(i % 2 == 0, |el| el.border_r_1())
+                    .when(i % 2 == 0, gpui_kit::Styled::border_r_1)
                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
                     .child(Switch::new(SharedString::from(format!("background-{key}"))).checked(resolved.pauses[i]).on_click(
                         move |checked, window, cx| {
                             let checked = *checked;
                             view.update(cx, |this, cx| {
                                 let patch = background::override_patch(this.settings_json(), key, json!(checked));
-                                this.update_settings(patch, window, cx)
-                            })
+                                this.update_settings(patch, window, cx);
+                            });
                         },
                     ))
             });
@@ -528,8 +528,8 @@ impl Workspace {
                             move |_, window, cx| {
                                 reset_view.update(cx, |this, cx| {
                                     let patch = json!({ "backgroundActivity": background::default_background() });
-                                    this.update_settings(patch, window, cx)
-                                })
+                                    this.update_settings(patch, window, cx);
+                                });
                             },
                         ))
                         .child(
@@ -552,7 +552,7 @@ fn notify_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// `formatRelativeTimeLabel` (`apps/web/src/timestampFormat.ts`).
