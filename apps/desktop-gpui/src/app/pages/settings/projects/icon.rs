@@ -333,7 +333,7 @@ impl Images {
 }
 
 /// The `project-favicon` resource for a project (`projectFaviconUrlAtom`).
-pub(super) fn favicon_resource(workspace_root: &str, favicon_path: Option<&str>) -> Value {
+pub(in crate::app) fn favicon_resource(workspace_root: &str, favicon_path: Option<&str>) -> Value {
     let mut resource = serde_json::json!({"_tag": "project-favicon", "cwd": workspace_root});
     if let Some(path) = favicon_path {
         resource["path"] = path.into();
@@ -354,7 +354,11 @@ fn asset_url(http_base: &str, relative: &str) -> Result<url::Url, url::ParseErro
     }
 }
 
-async fn fetch(client: &RpcClient, endpoint: Endpoint, resource: Value) -> anyhow::Result<Arc<Image>> {
+pub(in crate::app) async fn fetch(
+    client: &RpcClient,
+    endpoint: Endpoint,
+    resource: Value,
+) -> anyhow::Result<Arc<Image>> {
     let result = client.request("assets.createUrl", serde_json::json!({"resource": resource})).await?;
     let relative = result["relativeUrl"].as_str().unwrap_or_default().to_owned();
     // `isProjectFaviconFallbackUrl`: the server's stand-in for "no favicon".

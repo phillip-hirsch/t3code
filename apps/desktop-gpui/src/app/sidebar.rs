@@ -30,6 +30,7 @@ use gpui_kit::{
 };
 use serde_json::json;
 
+use super::pages::settings::code::projects::icon as project_icons;
 use super::titlebar::{self, TITLEBAR_HEIGHT};
 use super::{Connection, Target, Workspace, project_name};
 use crate::inbox::{self, Facts, FolderDot, Status};
@@ -2485,9 +2486,7 @@ impl Workspace {
                 continue;
             }
             let Some(session) = self.session(&project.environment_id) else { continue };
-            let (Some(client), Some(base)) =
-                (session.client.clone(), session.endpoint.as_ref().map(|e| e.http_base.clone()))
-            else {
+            let (Some(client), Some(endpoint)) = (session.client.clone(), session.endpoint.clone()) else {
                 continue;
             };
             let (environment, root, path) =
@@ -2499,35 +2498,10 @@ impl Workspace {
                 .entry(root.clone())
                 .or_default()
                 .insert(path.clone(), Favicon::Loading);
-            let mut resource = json!({"_tag": "project-favicon", "cwd": project.workspace_root});
-            if let Some(path) = &project.favicon_path {
-                resource["path"] = path.as_str().into();
-            }
+            let resource = project_icons::favicon_resource(&project.workspace_root, project.favicon_path.as_deref());
             cx.spawn(async move |this, cx| {
-                let image = async {
-                    let signed = client.request("assets.createUrl", json!({"resource": resource})).await.ok()?;
-                    let relative = signed["relativeUrl"].as_str()?.to_owned();
-                    if relative.split(['?', '#']).next()?.ends_with("/project-favicon-missing") {
-                        return None;
-                    }
-                    let url = format!("{base}{relative}");
-                    let fetched = crate::runtime()
-                        .spawn(async move {
-                            let response = reqwest::get(url).await?.error_for_status()?;
-                            let mime = response
-                                .headers()
-                                .get(reqwest::header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|v| v.split(';').next().unwrap_or_default().trim().to_owned());
-                            Ok::<_, reqwest::Error>((mime, response.bytes().await?.to_vec()))
-                        })
-                        .await
-                        .ok()?
-                        .ok()?;
-                    let format = fetched.0.as_deref().and_then(ImageFormat::from_mime_type)?;
-                    Some(Arc::new(Image::from_bytes(format, fetched.1)))
-                }
-                .await;
+                // Signed with the session token, as the web's image requests carry its cookie.
+                let image = project_icons::fetch(&client, endpoint, resource).await.ok();
                 let _ = this.update(cx, |this, cx| {
                     let state = image.map_or(Favicon::Missing, Favicon::Ready);
                     this.sidebar.favicons.entry(environment).or_default().entry(root).or_default().insert(path, state);
@@ -2539,7 +2513,7 @@ impl Workspace {
     }
 }
 
-/// `ProjectFavicon`: a custom monogram, else the repo favicon, else a
+/// `ProjectFavicon`: a custom icon, else the repo favicon, else a
 /// monogram derived from the title (`ProjectMonogram.tsx`).
 /// `grayscale` shows it in gray until the row is hovered (`grayscale` in CSS).
 pub(in crate::app) fn project_icon(
@@ -2549,8 +2523,13 @@ pub(in crate::app) fn project_icon(
     size: f32,
     favicon: Option<Arc<Image>>,
 ) -> AnyElement {
-    let custom = project.project_icon.as_ref().filter(|icon| icon["kind"] == "monogram");
-    if let Some(image) = favicon.filter(|_| custom.is_none()) {
+    let icon = project.project_icon.as_ref().filter(|icon| !icon.is_null());
+    // An emoji or Lucide override, such as No project's dashed square, draws as the web's.
+    if icon.is_some_and(|icon| icon["kind"] == "emoji" || icon["kind"] == "lucide") {
+        return project_icons::project_icon(icon, &project.title, None, size, tokens);
+    }
+    let custom = icon.filter(|icon| icon["kind"] == "monogram");
+    if let Some(image) = favicon.filter(|_| icon.is_none()) {
         return img(image)
             .size(px(size))
             .flex_none()
