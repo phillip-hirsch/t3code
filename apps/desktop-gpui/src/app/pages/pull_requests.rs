@@ -417,11 +417,19 @@ impl Workspace {
         let input = self.pull_request_input(None);
         let listing =
             Listing { state: input["state"].as_str().unwrap_or("all"), draft: input["filters"]["draft"].as_str() };
+        // `updateCached`: a read in flight may predate the action, so it restarts after the patch.
+        let in_flight = self.pull_requests.loading;
         let Some(list) = self.pull_requests.list.as_mut() else { return };
-        match patch_entries(&listing, &mut list.entries, reference, reply) {
-            ListPatch::Refresh => self.read_pull_requests(false, cx),
-            ListPatch::Patched => self.rebuild_pull_request_rows(),
-            ListPatch::Unchanged => {}
+        let reread = match patch_entries(&listing, &mut list.entries, reference, reply) {
+            ListPatch::Refresh => true,
+            ListPatch::Patched => {
+                self.rebuild_pull_request_rows();
+                in_flight
+            }
+            ListPatch::Unchanged => in_flight,
+        };
+        if reread {
+            self.read_pull_requests(false, cx);
         }
     }
 
