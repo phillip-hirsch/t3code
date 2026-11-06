@@ -76,14 +76,22 @@ pub enum StreamEvent {
     End(Result<(), RpcError>),
 }
 
+/// What a stream's channel carries: its events, each chunk's values led by a marker.
+enum Delivery {
+    /// A chunk's values follow; taking the marker acks the chunk.
+    Chunk,
+    Event(StreamEvent),
+}
+
 enum Pending {
     Unary(oneshot::Sender<Result<Value, RpcError>>),
-    Stream(async_channel::Sender<StreamEvent>),
+    Stream(async_channel::Sender<Delivery>),
 }
 
 enum Command {
     Request { id: u64, tag: String, payload: Value, pending: Pending },
     Interrupt { id: u64 },
+    Ack { id: u64 },
 }
 
 pub struct ConnectOptions {
@@ -143,7 +151,8 @@ impl RpcClient {
 
     /// Starts a stream. Dropping the returned [`RpcStream`] interrupts it on the server.
     pub fn stream(&self, tag: &str, payload: Value) -> RpcStream {
-        // Unbounded on our side: the server already waits for our Ack per chunk.
+        // The server sends a stream's next chunk only after its Ack, which goes out once the
+        // consumer starts on a chunk: at most that chunk and the next one wait here.
         let (tx, rx) = async_channel::unbounded();
         let id = self.send(tag, payload, Pending::Stream(tx));
         RpcStream { id, events: rx, commands: self.commands.clone() }
@@ -161,20 +170,39 @@ impl RpcClient {
 
 pub struct RpcStream {
     id: u64,
-    events: async_channel::Receiver<StreamEvent>,
+    events: async_channel::Receiver<Delivery>,
     commands: mpsc::UnboundedSender<Command>,
 }
 
 impl RpcStream {
     /// `None` after the stream ended and its `End` was delivered.
     pub async fn next(&self) -> Option<StreamEvent> {
-        self.events.recv().await.ok()
+        loop {
+            if let Some(event) = self.take(self.events.recv().await.ok()?) {
+                return Some(event);
+            }
+        }
     }
 
     /// An event that already arrived, without waiting. Lets callers apply a
     /// burst of events before re-rendering once.
     pub fn try_next(&self) -> Option<StreamEvent> {
-        self.events.try_recv().ok()
+        loop {
+            if let Some(event) = self.take(self.events.try_recv().ok()?) {
+                return Some(event);
+            }
+        }
+    }
+
+    /// The event a delivery carries; a chunk marker asks the server for the next chunk.
+    fn take(&self, delivery: Delivery) -> Option<StreamEvent> {
+        match delivery {
+            Delivery::Chunk => {
+                let _ = self.commands.send(Command::Ack { id: self.id });
+                None
+            }
+            Delivery::Event(event) => Some(event),
+        }
     }
 }
 
@@ -234,6 +262,10 @@ async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Comman
                         // Only interrupt what is still running; finished streams are already gone.
                         if pending.remove(&id).is_none() { continue }
                         json!({"_tag": "Interrupt", "requestId": id})
+                    }
+                    Command::Ack { id } => {
+                        if !pending.contains_key(&id) { continue }
+                        json!({"_tag": "Ack", "requestId": id})
                     }
                 };
                 if let Err(error) = sink.send(Message::text(message.to_string())).await {
@@ -317,14 +349,17 @@ fn handle_server_message(
     let request_id = message.get("requestId").and_then(request_id);
     match (tag, request_id) {
         ("Chunk", Some(id)) => {
-            // Ack even for streams we already dropped, so the server's writer never stalls.
-            acks.push(id);
-            if let Some(Pending::Stream(tx)) = pending.get(&id)
-                && let Value::Array(values) = message["values"].take()
-            {
-                for value in values {
-                    let _ = tx.try_send(StreamEvent::Item(value));
+            match pending.get(&id) {
+                // The consumer acks as it takes the chunk, so a stalled one holds the server back.
+                Some(Pending::Stream(tx)) if tx.try_send(Delivery::Chunk).is_ok() => {
+                    if let Value::Array(values) = message["values"].take() {
+                        for value in values {
+                            let _ = tx.try_send(Delivery::Event(StreamEvent::Item(value)));
+                        }
+                    }
                 }
+                // Ack streams already dropped, so the server's writer never stalls.
+                _ => acks.push(id),
             }
             None
         }
@@ -335,7 +370,7 @@ fn handle_server_message(
                     let _ = tx.send(result);
                 }
                 Some(Pending::Stream(tx)) => {
-                    let _ = tx.try_send(StreamEvent::End(result.map(|_| ())));
+                    let _ = tx.try_send(Delivery::Event(StreamEvent::End(result.map(|_| ()))));
                 }
                 None => {}
             }
@@ -385,7 +420,7 @@ fn fail_pending(pending: Pending, error: RpcError) {
             let _ = tx.send(Err(error));
         }
         Pending::Stream(tx) => {
-            let _ = tx.try_send(StreamEvent::End(Err(error)));
+            let _ = tx.try_send(Delivery::Event(StreamEvent::End(Err(error))));
         }
     }
 }
@@ -438,22 +473,31 @@ mod tests {
     }
 
     #[test]
-    fn chunks_are_acked_and_delivered_and_exit_ends_stream() {
+    fn chunks_ack_when_the_consumer_takes_them_and_exit_ends_stream() {
         let mut pending = HashMap::new();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, events) = async_channel::unbounded();
         pending.insert(7, Pending::Stream(tx));
+        let (commands, mut sent) = mpsc::unbounded_channel();
+        let stream = RpcStream { id: 7, events, commands };
         let mut acks = Vec::new();
         handle_server_message(json!({"_tag":"Chunk","requestId":7,"values":[1,2]}), &mut pending, &mut acks);
         handle_server_message(json!({"_tag":"Chunk","requestId":"9","values":[3]}), &mut pending, &mut acks);
+        assert_eq!(acks, vec![9], "only a chunk nobody reads is acked on arrival");
+        assert!(sent.try_recv().is_err(), "an untaken chunk is not acked");
+
+        assert!(matches!(stream.try_next(), Some(StreamEvent::Item(v)) if v == 1));
+        assert!(matches!(sent.try_recv(), Ok(Command::Ack { id: 7 })), "taking the chunk acks it");
+        assert!(matches!(stream.try_next(), Some(StreamEvent::Item(v)) if v == 2));
+        assert!(sent.try_recv().is_err(), "once per chunk");
+
         handle_server_message(
             json!({"_tag":"Exit","requestId":7,"exit":{"_tag":"Success","value":null}}),
             &mut pending,
             &mut acks,
         );
-        assert_eq!(acks, vec![7, 9]);
-        assert!(matches!(rx.try_recv(), Ok(StreamEvent::Item(v)) if v == 1));
-        assert!(matches!(rx.try_recv(), Ok(StreamEvent::Item(v)) if v == 2));
-        assert!(matches!(rx.try_recv(), Ok(StreamEvent::End(Ok(())))));
+        assert!(matches!(stream.try_next(), Some(StreamEvent::End(Ok(())))));
         assert!(pending.is_empty());
+        drop(stream);
+        assert!(matches!(sent.try_recv(), Ok(Command::Interrupt { id: 7 })));
     }
 }

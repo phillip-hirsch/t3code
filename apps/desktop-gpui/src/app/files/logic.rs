@@ -566,6 +566,12 @@ impl SaveQueue {
         self.revision
     }
 
+    /// Write access is back: unsaved edits queue again as a fresh edit would. True when a
+    /// write should be scheduled; a write in flight picks them up when it settles.
+    pub(super) fn resume(&mut self) -> bool {
+        self.pending() && self.change()
+    }
+
     /// Edits not yet confirmed on disk, or a write in flight.
     pub(super) fn pending(&self) -> bool {
         self.writing || self.revision != self.confirmed
@@ -758,5 +764,17 @@ mod tests {
         let failed = queue.start().unwrap();
         assert!(!queue.failed(failed), "a failed write with no newer edits is not retried");
         assert!(queue.pending(), "but its edits stay unsaved");
+        assert!(queue.resume(), "until write access returns");
+        let retried = queue.start().unwrap();
+        assert!(!queue.resume(), "a reconnect mid-write waits for the write in flight");
+        assert!(queue.written(retried), "then writes once more");
+        let last = queue.start().unwrap();
+        assert!(!queue.written(last));
+        assert!(!queue.resume(), "a clean file has nothing to resume");
+        assert_eq!(queue.start(), None);
+
+        queue.change();
+        assert!(queue.pending(), "an edit whose debounce found no socket stays unsaved");
+        assert!(queue.resume());
     }
 }

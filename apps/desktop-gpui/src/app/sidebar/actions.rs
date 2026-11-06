@@ -130,6 +130,8 @@ struct Confirm {
 }
 
 const UNDO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A batch command's environment has no socket (`chatViewSend.ts`'s wording).
+const NOT_CONNECTED: &str = "The environment is not connected.";
 
 impl Workspace {
     fn thread(&self, thread_id: &str) -> Option<&crate::model::ThreadShell> {
@@ -170,7 +172,8 @@ impl Workspace {
     }
 
     /// Dispatches `commands` in order, then reports failures as one toast titled by
-    /// `title(failed, succeeded)`. `stop_at_failure` ends the batch at the first one.
+    /// `title(failed, succeeded)`; a command whose environment is down fails too.
+    /// `stop_at_failure` ends the batch at the first one.
     pub(super) fn dispatch_batch(
         &mut self,
         commands: Vec<Value>,
@@ -183,12 +186,17 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let (mut failed, mut succeeded, mut first_error) = (0, 0, None);
             for (client, command) in routed {
-                let Some(client) = client else { continue };
-                match client.request("orchestration.dispatchCommand", command).await {
+                let result = match client {
+                    Some(client) => {
+                        client.request("orchestration.dispatchCommand", command).await.map_err(|e| e.to_string())
+                    }
+                    None => Err(NOT_CONNECTED.to_owned()),
+                };
+                match result {
                     Ok(_) => succeeded += 1,
                     Err(error) => {
                         failed += 1;
-                        first_error.get_or_insert(error.to_string());
+                        first_error.get_or_insert(error);
                         if stop_at_failure {
                             break;
                         }

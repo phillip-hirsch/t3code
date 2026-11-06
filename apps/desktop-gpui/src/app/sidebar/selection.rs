@@ -145,6 +145,9 @@ impl BulkMenu {
             } else {
                 let regenerate = self.regeneratable.clone();
                 act!(counted("Regenerate titles", regenerate.len()), |this, _window, cx| {
+                    if !this.threads_connected(&regenerate) {
+                        return;
+                    }
                     let fields = || json!({"regenerateTitle": true});
                     let commands = regenerate
                         .iter()
@@ -275,6 +278,9 @@ impl Workspace {
 
     /// Deletes the threads, asked first unless `confirmThreadDelete` is off.
     fn delete_threads(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        if !self.threads_connected(ids) {
+            return;
+        }
         let ids = ids.to_vec();
         let count = ids.len();
         let run = move |this: &mut Self, cx: &mut Context<Self>| {
