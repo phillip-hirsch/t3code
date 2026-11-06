@@ -26,6 +26,8 @@ pub(crate) struct Session {
 
 pub(crate) struct SavedEnvironments {
     catalog: Catalog,
+    /// Why saves are refused: the file could not be read, so saving would destroy it.
+    read_only: Option<String>,
     sessions: HashMap<String, Session>,
     /// The workspace's primary environment. Saved under the same id, it is that session
     /// (`EnvironmentRegistry.register` ignores platform environments), so it gets no socket here.
@@ -34,7 +36,9 @@ pub(crate) struct SavedEnvironments {
 
 impl SavedEnvironments {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut this = Self { catalog: Catalog::load(), sessions: HashMap::new(), primary: None };
+        let opened = Catalog::open();
+        let read_only = opened.read_only.then(|| opened.problem.unwrap_or_default());
+        let mut this = Self { catalog: opened.catalog, read_only, sessions: HashMap::new(), primary: None };
         let ids: Vec<String> = this.catalog.environments.iter().map(|e| e.environment_id.clone()).collect();
         for id in ids {
             this.restart(&id, cx);
@@ -71,13 +75,19 @@ impl SavedEnvironments {
     }
 
     fn save(&self) -> Result<(), String> {
+        self.writable()?;
         write(&self.catalog)
+    }
+
+    fn writable(&self) -> Result<(), String> {
+        self.read_only.clone().map_or(Ok(()), Err)
     }
 
     /// Saves a paired environment and connects it (`registerPairingConnection`). Lists it only
     /// once it is saved.
     pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Result<(), String> {
         let id = environment.environment_id.clone();
+        self.writable()?;
         let mut catalog = self.catalog.clone();
         catalog.upsert(environment);
         write(&catalog)?;

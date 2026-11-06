@@ -7,12 +7,12 @@
 //! Bearer tokens are stored encrypted by [`crate::secure_storage`] (the guarantee Electron's
 //! `safeStorage` gives the desktop app's connection catalog).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::backend::{self, Endpoint, LocalServer};
@@ -436,12 +436,33 @@ impl SavedEnvironment {
 pub struct Catalog {
     pub local_environment_enabled: bool,
     pub environments: Vec<SavedEnvironment>,
+    /// The document as read. Saving writes back its fields this build does not know and the
+    /// entries it could not decode, so an older or newer build loses nothing.
+    stored: Map<String, Value>,
 }
 
 impl Default for Catalog {
     fn default() -> Self {
-        Self { local_environment_enabled: true, environments: Vec::new() }
+        Self { local_environment_enabled: true, environments: Vec::new(), stored: Map::new() }
     }
+}
+
+/// The catalog the app shows and edits, from [`Catalog::open`].
+pub struct Opened {
+    pub catalog: Catalog,
+    /// The file could not be read, so saving would destroy it: saves are refused.
+    pub read_only: bool,
+    /// What went wrong reading the file, for Settings › Environments.
+    pub problem: Option<String>,
+}
+
+/// Why `environments.json` could not be used.
+#[derive(Debug, PartialEq)]
+enum Damage {
+    /// Not a catalog: invalid JSON, or the wrong shape.
+    Corrupt(String),
+    /// Not readable at all.
+    Unreadable(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -466,36 +487,62 @@ impl Catalog {
         Some(crate::settings::userdata_dir()?.join("environments.json"))
     }
 
-    /// Reads `<T3 home>/userdata/environments.json`; a missing or unreadable file is empty.
+    /// Reads `<T3 home>/userdata/environments.json` to look something up; a missing or
+    /// unusable file is empty. Blocks on the file and the platform store.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .map(|document| Self::from_document(&document, secure::unprotect))
+        let Some(path) = Self::path() else { return Self::default() };
+        read_at(&path, secure::unprotect)
+            .unwrap_or_else(|damage| {
+                log::warn!("{}: {damage:?}", path.display());
+                None
+            })
             .unwrap_or_default()
     }
 
-    /// `unprotect` decrypts a stored token ([`secure::unprotect`] outside tests).
-    fn from_document(document: &Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Self {
-        let environments = document["environments"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| serde_json::from_value::<StoredEnvironment>(entry.clone()).ok())
-            .map(|stored| SavedEnvironment {
-                credential: open_credential(stored.encrypted_token, &unprotect),
-                environment_id: stored.environment_id,
-                label: stored.label,
-                http_base: stored.http_base_url,
-                enabled: stored.enabled,
+    /// Reads the catalog to show and edit, once per run. A file that is not a catalog is moved
+    /// aside to `environments.corrupt-<ms>.json` first, so a save cannot destroy it; one that
+    /// cannot be read makes the catalog read-only. Blocks on the file and the platform store.
+    pub fn open() -> Opened {
+        match Self::path() {
+            Some(path) => open_at(&path, secure::unprotect, crate::timestamp::now_ms()),
+            None => Opened { catalog: Self::default(), read_only: false, problem: None },
+        }
+    }
+
+    /// `unprotect` decrypts a stored token ([`secure::unprotect`] outside tests). The error
+    /// says why `document` is not a catalog.
+    fn from_document(document: Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Result<Self, String> {
+        let Value::Object(stored) = document else { return Err("the file is not a JSON object".into()) };
+        let entries = match stored.get("environments") {
+            None => &[][..],
+            Some(Value::Array(entries)) => entries.as_slice(),
+            Some(_) => return Err("`environments` is not a list".into()),
+        };
+        let environments = entries
+            .iter()
+            .filter_map(|entry| {
+                StoredEnvironment::deserialize(entry)
+                    .inspect_err(|error| log::warn!("keeping a saved environment this build cannot read: {error}"))
+                    .ok()
+            })
+            .map(|entry| SavedEnvironment {
+                credential: open_credential(entry.encrypted_token, &unprotect),
+                environment_id: entry.environment_id,
+                label: entry.label,
+                http_base: entry.http_base_url,
+                enabled: entry.enabled,
             })
             .collect();
-        Self { local_environment_enabled: document["localEnvironmentEnabled"] != Value::Bool(false), environments }
+        let local_environment_enabled = stored.get("localEnvironmentEnabled") != Some(&Value::Bool(false));
+        Ok(Self { local_environment_enabled, environments, stored })
     }
 
     /// `protect` encrypts a token ([`secure::protect`] outside tests).
     fn document(&self, protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> anyhow::Result<Value> {
-        let environments = self
+        let read: &[Value] = self.stored.get("environments").and_then(Value::as_array).map_or(&[], Vec::as_slice);
+        let id = |entry: &Value| entry.get("environmentId").and_then(Value::as_str).map(str::to_owned);
+        let decodes = |entry: &Value| StoredEnvironment::deserialize(entry).is_ok();
+        let mut environments = self
             .environments
             .iter()
             .map(|environment| {
@@ -508,21 +555,39 @@ impl Catalog {
                     Credential::Locked { stored, .. } => stored.clone(),
                     Credential::Missing => String::new(),
                 };
-                serde_json::to_value(StoredEnvironment {
+                let known = serde_json::to_value(StoredEnvironment {
                     environment_id: environment.environment_id.clone(),
                     label: environment.label.clone(),
                     http_base_url: environment.http_base.clone(),
                     enabled: environment.enabled,
                     encrypted_token,
                 })
-                .context("could not encode an environment")
+                .context("could not encode an environment")?;
+                // Start from the entry as read, so fields this build does not know stay.
+                let mut entry = read
+                    .iter()
+                    .find(|entry| id(entry).as_ref() == Some(&environment.environment_id) && decodes(entry))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Value::Object(known) = known {
+                    entry.extend(known);
+                }
+                Ok(Value::Object(entry))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(
-            json!({ "version": 1, "localEnvironmentEnabled": self.local_environment_enabled, "environments": environments }),
-        )
+        // Entries this build could not decode stay as read, unless one it saves replaced it.
+        let undecoded =
+            read.iter().filter(|entry| !decodes(entry) && id(entry).is_none_or(|id| self.get(&id).is_none()));
+        environments.extend(undecoded.cloned());
+        let mut document = self.stored.clone();
+        document.entry("version").or_insert(json!(1));
+        document.insert("localEnvironmentEnabled".into(), json!(self.local_environment_enabled));
+        document.insert("environments".into(), Value::Array(environments));
+        Ok(Value::Object(document))
     }
 
+    /// Writes the catalog. Blocks on the file and the platform store.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().context("No T3 home directory.")?;
         crate::settings::write_atomically(&path, &self.document(secure::protect)?)
@@ -559,6 +624,47 @@ fn open_credential(stored: String, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, 
         Ok(token) => Credential::Token(token),
         Err(error) => Credential::Locked { stored, error },
     }
+}
+
+/// The catalog at `path`; `None` when there is no file.
+fn read_at(path: &Path, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Result<Option<Catalog>, Damage> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Damage::Unreadable(error.to_string())),
+    };
+    let document = serde_json::from_slice(&bytes).map_err(|error| Damage::Corrupt(error.to_string()))?;
+    Catalog::from_document(document, unprotect).map(Some).map_err(Damage::Corrupt)
+}
+
+/// [`Catalog::open`] for the file at `path`; `now_ms` names a corrupt file moved aside.
+fn open_at(path: &Path, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>, now_ms: i64) -> Opened {
+    let kept = "Changes to environments are not saved, so the file is kept.";
+    let (read_only, problem) = match read_at(path, unprotect) {
+        Ok(catalog) => return Opened { catalog: catalog.unwrap_or_default(), read_only: false, problem: None },
+        Err(Damage::Unreadable(error)) => {
+            log::warn!("could not read {}: {error}", path.display());
+            (true, format!("Saved environments could not be read ({error}). {kept}"))
+        }
+        Err(Damage::Corrupt(error)) => {
+            log::warn!("{} is not an environments catalog: {error}", path.display());
+            let aside = path.with_file_name(format!("environments.corrupt-{now_ms}.json"));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => (
+                    false,
+                    format!(
+                        "Saved environments could not be read ({error}). The file was moved to {}.",
+                        aside.display()
+                    ),
+                ),
+                Err(rename) => {
+                    log::warn!("could not move {} aside: {rename}", path.display());
+                    (true, format!("Saved environments could not be read ({error}). {kept}"))
+                }
+            }
+        }
+    };
+    Opened { catalog: Catalog::default(), read_only, problem: Some(problem) }
 }
 
 /// `prepareBearerConnectionUpdate`'s label check.
@@ -1021,6 +1127,10 @@ mod tests {
         assert!(detail.contains("is saved, but this device could not decrypt it (Could not use the Keychain: denied)"));
     }
 
+    fn read(document: &Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Catalog {
+        Catalog::from_document(document.clone(), unprotect).unwrap()
+    }
+
     /// Stand-ins for the platform store: a reversible "encryption", and a keyring that refuses.
     #[expect(clippy::unnecessary_wraps, reason = "the signature of `secure::protect`")]
     fn seal(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -1046,14 +1156,15 @@ mod tests {
         let catalog = Catalog {
             local_environment_enabled: true,
             environments: vec![saved("a", Credential::Token("token-a".into())), saved("b", Credential::Missing)],
+            ..Catalog::default()
         };
         let document = catalog.document(seal).unwrap();
         assert!(!document.to_string().contains("token-a"));
-        assert_eq!(Catalog::from_document(&document, seal), catalog);
+        assert_eq!(read(&document, seal).environments, catalog.environments);
         let stored = document["environments"][0]["encryptedToken"].clone();
 
         // This run's keyring refuses: the token is locked, not gone.
-        let mut locked = Catalog::from_document(&document, denied);
+        let mut locked = read(&document, denied);
         let error = "Could not use the Keychain: denied".to_owned();
         let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
         assert_eq!(locked.environments[0].credential, expected);
@@ -1069,7 +1180,7 @@ mod tests {
         assert_eq!(saved_again["environments"][1]["encryptedToken"], "");
 
         // A later run whose keyring opens reads every token back.
-        let reopened = Catalog::from_document(&saved_again, seal);
+        let reopened = read(&saved_again, seal);
         let tokens: Vec<_> = reopened.environments.iter().map(|e| e.credential.clone()).collect();
         assert_eq!(
             tokens,
@@ -1084,13 +1195,74 @@ mod tests {
             let document = json!({ "environments": [{
                 "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "encryptedToken": stored,
             }] });
-            let catalog = Catalog::from_document(&document, seal);
+            let catalog = read(&document, seal);
             assert!(
                 matches!(&catalog.environments[0].credential, Credential::Locked { stored: kept, .. } if kept == stored)
             );
             assert_eq!(catalog.document(seal).unwrap()["environments"][0]["encryptedToken"], stored);
         }
-        assert_eq!(Catalog::from_document(&json!({}), seal), Catalog::default());
+        assert_eq!(read(&json!({}), seal), Catalog::default());
+    }
+
+    #[test]
+    fn entries_and_fields_this_build_cannot_read_survive_a_save() {
+        let document = json!({
+            "version": 1,
+            "futureSetting": { "x": 1 },
+            "environments": [
+                { "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "routes": ["r"] },
+                { "environmentId": "b", "httpBaseUrl": "https://b", "kind": "ssh" },
+                { "environmentId": "c", "label": 7 },
+                "not an entry",
+            ],
+        });
+        let mut catalog = read(&document, seal);
+        assert_eq!(catalog.environments, [SavedEnvironment { label: "A".into(), ..saved("a", Credential::Missing) }]);
+
+        catalog.get_mut("a").unwrap().label = "Renamed".into();
+        let written = catalog.document(seal).unwrap();
+        assert_eq!(written["futureSetting"], json!({ "x": 1 }));
+        let entries = written["environments"].as_array().unwrap();
+        assert_eq!(entries[0]["label"], "Renamed");
+        assert_eq!(entries[0]["routes"], json!(["r"]));
+        assert_eq!(entries[1..], document["environments"].as_array().unwrap()[1..]);
+
+        // Pairing "c" again replaces its unreadable entry; removing "a" drops it.
+        catalog.upsert(saved("c", Credential::Missing));
+        catalog.environments.retain(|environment| environment.environment_id != "a");
+        let written = catalog.document(seal).unwrap();
+        let ids: Vec<_> =
+            written["environments"].as_array().unwrap().iter().map(|e| e["environmentId"].clone()).collect();
+        assert_eq!(ids, [json!("c"), json!("b"), Value::Null]);
+    }
+
+    #[test]
+    fn a_catalog_file_that_cannot_be_used_is_never_saved_over() {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-catalog-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("environments.json");
+
+        let opened = open_at(&path, seal, 0);
+        assert!(!opened.read_only && opened.problem.is_none());
+        assert_eq!(opened.catalog, Catalog::default());
+
+        // Not a catalog: moved aside byte for byte, and the list starts empty.
+        for (ms, corrupt) in (1..).zip(["{\"environments\": [", "[1, 2]", "{\"environments\": 3}", ""]) {
+            std::fs::write(&path, corrupt).unwrap();
+            let opened = open_at(&path, seal, ms);
+            assert!(!opened.read_only);
+            assert!(opened.problem.unwrap().contains(&format!("environments.corrupt-{ms}.json")));
+            assert!(!path.exists());
+            assert_eq!(std::fs::read_to_string(dir.join(format!("environments.corrupt-{ms}.json"))).unwrap(), corrupt);
+        }
+
+        // Unreadable (here a directory): left in place, and saves are refused.
+        std::fs::create_dir(&path).unwrap();
+        let opened = open_at(&path, seal, 9);
+        assert!(opened.read_only && opened.problem.is_some());
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// DPAPI keeps its master keys in the user's profile (`%APPDATA%\Microsoft\Protect`). A
@@ -1120,14 +1292,16 @@ mod tests {
                 enabled: false,
                 credential: Credential::Token("secret-token".into()),
             }],
+            ..Catalog::default()
         };
         let document = catalog.document(secure::protect).unwrap();
         assert!(!document.to_string().contains("secret-token"));
-        assert_eq!(Catalog::from_document(&document, secure::unprotect), catalog);
+        let reread = read(&document, secure::unprotect);
+        assert_eq!((reread.local_environment_enabled, reread.environments), (false, catalog.environments));
         // A credential DPAPI cannot open is kept as stored.
         let mut tampered = document;
         tampered["environments"][0]["encryptedToken"] = json!("00ff");
-        let reread = Catalog::from_document(&tampered, secure::unprotect);
+        let reread = read(&tampered, secure::unprotect);
         assert!(matches!(&reread.environments[0].credential, Credential::Locked { stored, .. } if stored == "00ff"));
     }
 
