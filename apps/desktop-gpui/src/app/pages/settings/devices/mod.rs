@@ -9,11 +9,11 @@
 
 mod sources;
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -86,7 +86,6 @@ impl Workspace {
                 })
                 .child(
                     Switch::new("device-hub-switch")
-                        .small()
                         .checked(enabled)
                         .accessibility_label("Device hub")
                         .disabled(!loaded || busy || pending.is_some())
@@ -114,7 +113,6 @@ impl Workspace {
                 })
                 .child(
                     Switch::new("agent-device-access-switch")
-                        .small()
                         .checked(agent_enabled)
                         .accessibility_label("Agent device access")
                         .disabled(!loaded || !enabled || busy || pending.is_some())

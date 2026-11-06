@@ -1,11 +1,11 @@
 //! `StorageCleanupSections` (`StorageSettings.tsx`) and `DatabaseStorageNotice` for the one
 //! environment this client talks to.
 
+use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::NumberInput;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,

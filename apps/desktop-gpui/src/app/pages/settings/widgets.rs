@@ -1586,6 +1586,87 @@ pub(in crate::app) fn switch(
         .child(div().size(px(14.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
 }
 
+/// The web's `Switch` as a control with its own handler: a 30×18 track and 14px thumb, or
+/// 26×16 and 12px [`Self::small`] (`size="sm"`). It keeps the kit switch's builder methods.
+#[derive(IntoElement)]
+pub(in crate::app) struct Switch {
+    id: ElementId,
+    checked: bool,
+    disabled: bool,
+    small: bool,
+    label: Option<SharedString>,
+    on_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>>,
+}
+
+impl Switch {
+    pub(in crate::app) fn new(id: impl Into<ElementId>) -> Self {
+        Self { id: id.into(), checked: false, disabled: false, small: false, label: None, on_change: None }
+    }
+
+    pub(in crate::app) fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
+    pub(in crate::app) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub(in crate::app) fn small(mut self) -> Self {
+        self.small = true;
+        self
+    }
+
+    pub(in crate::app) fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Called with the next checked value.
+    pub(in crate::app) fn on_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut gpui_kit::App) + 'static,
+    ) -> Self {
+        self.on_change = Some(Rc::new(handler));
+        self
+    }
+
+    pub(in crate::app) fn on_click(self, handler: impl Fn(&bool, &mut Window, &mut gpui_kit::App) + 'static) -> Self {
+        self.on_change(handler)
+    }
+}
+
+impl gpui_kit::RenderOnce for Switch {
+    fn render(self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
+        let t = *theme::tokens(cx);
+        // `--thumb-size`: the track is one thumb plus 2px tall and two thumbs less 2px wide.
+        let size = if self.small { 14. } else { 16. };
+        // `disabled:opacity-64` on the track and thumb alike.
+        let fade = if self.disabled { 0.64 } else { 1. };
+        let track = if self.checked { t.primary } else { t.input };
+        let thumb = if self.checked || !t.dark { t.background } else { t.muted_foreground };
+        gpui_kit::base::Switch::new(self.id)
+            .checked(self.checked)
+            .disabled(self.disabled)
+            .when_some(self.label, gpui_kit::base::Switch::accessibility_label)
+            .when_some(self.on_change, |el, on_change| {
+                el.on_change(move |checked, _, window, cx| on_change(&checked, window, cx))
+            })
+            .flex_none()
+            .w(px(size * 2. - 2.))
+            .h(px(size + 2.))
+            .p(px(2.))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .when(self.checked, |el| el.justify_end())
+            .bg(track.opacity(fade))
+            .when(!self.disabled, |el| el.cursor_pointer())
+            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade)))
+    }
+}
+
 /// `SettingsRow` gives a select in its control at least `min-w-40`.
 pub(in crate::app) const ROW_SELECT_MIN_WIDTH: f32 = 160.;
 
