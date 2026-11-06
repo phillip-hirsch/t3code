@@ -1012,6 +1012,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let tokens = self.usage.tokens();
         let tz = Local;
+        let hour12 = self.hour12();
         let data = {
             let mut held = self.usage.chart.borrow_mut();
             let fresh = |d: &&Rc<ChartData>| {
@@ -1100,8 +1101,8 @@ impl Workspace {
         let tooltip = hover.and_then(|(index, x, y)| {
             let key = periods.get(index)?;
             let label = match (key, window.hours) {
-                (PeriodKey::Hour(ms), Some((_, until))) => logic::format_relative_hour_short(*ms, until, &tz),
-                _ => key.label(&tz),
+                (PeriodKey::Hour(ms), Some((_, until))) => logic::format_relative_hour_short(*ms, until, &tz, hour12),
+                _ => key.label(&tz, hour12),
             };
             let column = columns.get(index)?;
             let total: f64 = column.iter().sum();
@@ -1172,7 +1173,8 @@ impl Workspace {
         } else {
             Vec::new()
         });
-        let label_at = |index: usize| periods.get(index).map(|key| key.label(&tz).to_uppercase()).unwrap_or_default();
+        let label_at =
+            |index: usize| periods.get(index).map(|key| key.label(&tz, hour12).to_uppercase()).unwrap_or_default();
         v_flex()
             .gap(px(4.))
             .child(
@@ -1235,6 +1237,7 @@ impl Workspace {
     ) -> gpui_kit::Div {
         let usage = &self.usage;
         let tokens = usage.tokens();
+        let hour12 = self.hour12();
         let hourly = window.hours.is_some();
         let by_time = usage.by_time;
         let toggle = segmented(
@@ -1281,7 +1284,7 @@ impl Workspace {
             }
             for period in periods {
                 let label = match period.hour_ms {
-                    Some(ms) => logic::format_hour_short(ms, &Local),
+                    Some(ms) => logic::format_hour_short(ms, &Local, hour12),
                     None => logic::format_day_short(&period.day),
                 };
                 table =

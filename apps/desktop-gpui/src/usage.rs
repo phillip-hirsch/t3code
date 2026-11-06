@@ -588,10 +588,10 @@ impl PeriodKey {
         }
     }
 
-    pub fn label<Tz: TimeZone>(&self, tz: &Tz) -> String {
+    pub fn label<Tz: TimeZone>(&self, tz: &Tz, hour12: bool) -> String {
         match self {
             PeriodKey::Day(day) => format_day_short(day),
-            PeriodKey::Hour(ms) => format_hour_short(*ms, tz),
+            PeriodKey::Hour(ms) => format_hour_short(*ms, tz, hour12),
         }
     }
 }
@@ -600,8 +600,11 @@ fn zoned<Tz: TimeZone>(ms: i64, tz: &Tz) -> Option<DateTime<Tz>> {
     Some(DateTime::from_timestamp_millis(ms)?.with_timezone(tz))
 }
 
-/// "3 PM".
-fn hour_label<Tz: TimeZone>(time: &DateTime<Tz>) -> String {
+/// "3 PM", or "15:00" on a 24-hour clock (`hourOptions`).
+fn hour_label<Tz: TimeZone>(time: &DateTime<Tz>, hour12: bool) -> String {
+    if !hour12 {
+        return format!("{:02}:00", time.hour());
+    }
     let (pm, hour) = time.hour12();
     format!("{hour} {}", if pm { "PM" } else { "AM" })
 }
@@ -681,25 +684,27 @@ pub fn format_day_short(day: &str) -> String {
     }
 }
 
-/// `formatHourShort` with a 12-hour clock: "3 PM".
-pub fn format_hour_short<Tz: TimeZone>(ms: i64, tz: &Tz) -> String {
-    zoned(ms, tz).map(|time| hour_label(&time)).unwrap_or_default()
+/// `formatHourShort`: "3 PM", or "15:00".
+pub fn format_hour_short<Tz: TimeZone>(ms: i64, tz: &Tz, hour12: bool) -> String {
+    zoned(ms, tz).map(|time| hour_label(&time, hour12)).unwrap_or_default()
 }
 
 /// `formatDateTimeShort`: "Nov 4, 3 PM".
-pub fn format_date_time_short<Tz: TimeZone>(ms: i64, tz: &Tz) -> String {
+pub fn format_date_time_short<Tz: TimeZone>(ms: i64, tz: &Tz, hour12: bool) -> String {
     let Some(time) = zoned(ms, tz) else { return String::new() };
-    format!("{} {}, {}", MONTHS[time.month0() as usize], time.day(), hour_label(&time))
+    format!("{} {}, {}", MONTHS[time.month0() as usize], time.day(), hour_label(&time, hour12))
 }
 
 /// `formatRelativeHourShort`: "3 PM today", "3 PM yesterday", else the date and hour.
-pub fn format_relative_hour_short<Tz: TimeZone>(ms: i64, reference_ms: i64, tz: &Tz) -> String {
+pub fn format_relative_hour_short<Tz: TimeZone>(ms: i64, reference_ms: i64, tz: &Tz, hour12: bool) -> String {
     let day = |ms: i64| zoned(ms, tz).map(|time| time.date_naive());
-    let (Some(at), Some(reference)) = (day(ms), day(reference_ms)) else { return format_date_time_short(ms, tz) };
+    let (Some(at), Some(reference)) = (day(ms), day(reference_ms)) else {
+        return format_date_time_short(ms, tz, hour12);
+    };
     match (reference - at).num_days() {
-        0 => format!("{} today", format_hour_short(ms, tz)),
-        1 => format!("{} yesterday", format_hour_short(ms, tz)),
-        _ => format_date_time_short(ms, tz),
+        0 => format!("{} today", format_hour_short(ms, tz, hour12)),
+        1 => format!("{} yesterday", format_hour_short(ms, tz, hour12)),
+        _ => format_date_time_short(ms, tz, hour12),
     }
 }
 
@@ -1758,11 +1763,16 @@ mod tests {
             (Some("2026-11-04T18:30:00.000Z"), Some("2026-11-05T18:30:00.000Z"))
         );
         assert_eq!(day.periods().len(), 24);
-        assert_eq!(format_hour_short(parse_ms("2026-11-05T18:00:00Z").unwrap(), &tz), "10 AM");
+        assert_eq!(format_hour_short(parse_ms("2026-11-05T18:00:00Z").unwrap(), &tz, true), "10 AM");
+        assert_eq!(format_hour_short(parse_ms("2026-11-05T18:00:00Z").unwrap(), &tz, false), "10:00");
         let reference = parse_ms("2026-11-05T18:30:00Z").unwrap();
         assert_eq!(
-            format_relative_hour_short(parse_ms("2026-11-05T07:00:00Z").unwrap(), reference, &tz),
+            format_relative_hour_short(parse_ms("2026-11-05T07:00:00Z").unwrap(), reference, &tz, true),
             "11 PM yesterday"
+        );
+        assert_eq!(
+            format_relative_hour_short(parse_ms("2026-11-05T07:00:00Z").unwrap(), reference, &tz, false),
+            "23:00 yesterday"
         );
     }
 

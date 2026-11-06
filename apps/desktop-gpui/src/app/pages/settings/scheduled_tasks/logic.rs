@@ -488,8 +488,15 @@ pub(super) fn webhook_denial(policy: &Value) -> Option<String> {
         .then(|| format!("{organization}'s policy does not allow webhook tasks."))
 }
 
-/// `scheduleLabel`.
+/// `scheduleLabel`, on the system's clock.
 pub(in crate::app) fn schedule_label<Tz: TimeZone>(schedule: &Schedule, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    schedule_label_on(schedule, tz, crate::timestamp::hour12("locale"))
+}
+
+fn schedule_label_on<Tz: TimeZone>(schedule: &Schedule, tz: &Tz, hour12: bool) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -497,7 +504,10 @@ where
         Schedule::Webhook => "On webhook".into(),
         Schedule::Once { run_at } => match parse_iso(run_at) {
             // `Intl.DateTimeFormat(undefined, {dateStyle: "medium", timeStyle: "short"})`, en-US.
-            Some(t) => format!("Once, {}", t.with_timezone(tz).format("%b %-d, %Y, %-I:%M %p")),
+            Some(t) => {
+                let t = t.with_timezone(tz);
+                format!("Once, {}, {}", t.format("%b %-d, %Y"), crate::timestamp::clock(&t, hour12))
+            }
             None => "Once".into(),
         },
         Schedule::Interval { every_ms } => {
@@ -571,7 +581,7 @@ mod tests {
 
     #[test]
     fn labels_each_schedule() {
-        let label = |schedule: Value| schedule_label(&Schedule::of(&schedule), &zone());
+        let label = |schedule: Value| schedule_label_on(&Schedule::of(&schedule), &zone(), true);
         assert_eq!(label(json!({"type": "fixed_time", "timeOfDay": "09:00"})), "Daily at 09:00");
         assert_eq!(
             label(json!({"type": "fixed_time", "timeOfDay": "09:00", "weekdays": [1, 2, 3, 4, 5]})),

@@ -736,7 +736,7 @@ pub(super) struct SnoozeItems {
 impl SnoozeItems {
     fn new(workspace: &Workspace, thread_id: &str, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
         let settings = inbox::snooze_settings(workspace.server_info().settings.get("snoozePresets"));
-        let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
+        let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), workspace.hour12());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
         let advance = origin == MenuOrigin::Sidebar;
         Self { thread_id: thread_id.to_owned(), settings, presets, inline_when, advance, muted }

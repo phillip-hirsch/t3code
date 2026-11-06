@@ -207,7 +207,7 @@ impl Workspace {
         let clicked = self.shell.threads.iter().find(|t| t.id == thread_id);
         let info = clicked.and_then(|t| self.env_info(&t.environment_id)).unwrap_or_else(|| self.server_info());
         let settings = inbox::snooze_settings(info.settings.get("snoozePresets"));
-        let presets = inbox::snooze_presets(&settings, &chrono::Local::now());
+        let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), self.hour12());
         Some(BulkMenu {
             pinned: pick(&|t| loaded && t.pinned_at.is_some()),
             settling: pick(&|t| t.settled_override.as_deref() != Some("settled")),

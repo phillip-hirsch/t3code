@@ -488,7 +488,7 @@ impl Workspace {
         editor.update(cx, |editor, _| editor.adopt(&saved));
         let presets = editor.read(cx).presets();
         let now = Local::now();
-        let previews = snooze::previews(&presets, &now);
+        let previews = snooze::previews(&presets, &now, self.hour12());
         let keys: Vec<u64> = editor.read(cx).rows.iter().map(|(key, _)| *key).collect();
         let mut list = Vec::new();
         for ((key, preset), preview) in keys.iter().copied().zip(presets.iter()).zip(previews) {
@@ -512,7 +512,11 @@ impl Workspace {
                 }
             })
             .children(list)
-            .child(div().text_xs().text_color(t.muted_foreground).child(snooze::menu_order(&presets, &now)))
+            .child(div().text_xs().text_color(t.muted_foreground).child(snooze::menu_order(
+                &presets,
+                &now,
+                self.hour12(),
+            )))
             .child(
                 h_flex()
                     .child(

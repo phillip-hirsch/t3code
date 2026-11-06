@@ -1147,11 +1147,8 @@ impl Workspace {
             }
         });
         let expiry = chrono::DateTime::from_timestamp_millis(expires_at)
-            .map(|at| {
-                let at = at.with_timezone(&chrono::Local);
-                let (pm, hour) = chrono::Timelike::hour12(&at);
-                format!("{hour}:{:02} {}", chrono::Timelike::minute(&at), if pm { "PM" } else { "AM" })
-            })
+            // `toLocaleTimeString`: the system's clock.
+            .map(|at| crate::timestamp::clock(&at.with_timezone(&chrono::Local), crate::timestamp::hour12("locale")))
             .unwrap_or_default();
         let copy = {
             let (state, code) = (state.clone(), code.to_owned());
