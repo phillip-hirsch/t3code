@@ -896,6 +896,14 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// A row's menu covers its hover card, as the native menu does; it shows again on the next hover.
+    fn hide_hover_card(&mut self, cx: &mut Context<Self>) {
+        self.sidebar._hover_card_delay = None;
+        if self.sidebar.hover_card.take().is_some() {
+            self.notify_sidebar(cx);
+        }
+    }
+
     /// A local thread's checkout may have moved to another branch since; the hover card warns
     /// then (`resolveLocalCheckoutBranchMismatch`). Read fresh each time a card opens.
     fn read_checkout_branch(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -993,7 +1001,7 @@ impl Workspace {
             .rounded(px(6.))
             .border_1()
             .border_color(tokens.foreground.opacity(0.1))
-            .bg(tokens.popover.opacity(0.96))
+            .bg(tokens.popover)
             .shadow_xl()
             .child(
                 div()
@@ -1959,6 +1967,7 @@ impl Workspace {
                             )
                             .children(meta),
                     )
+                    .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
                     .context_menu(self.row_menu(&thread.id, cx)),
             )
             .into_any_element()
@@ -2255,6 +2264,7 @@ impl Workspace {
             )
             .child(line)
             .children(meta)
+            .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
             .context_menu(self.row_menu(&thread.id, cx))
             .into_any_element()
     }
@@ -2403,6 +2413,7 @@ impl Workspace {
                     )
                     .children(action),
             )
+            .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
             .context_menu(self.row_menu(&thread.id, cx))
             .into_any_element()
     }
