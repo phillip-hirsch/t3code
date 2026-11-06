@@ -495,7 +495,8 @@ impl Workspace {
                             cx.stop_propagation();
                         }
                     }))
-                    .child(Input::new(&query).appearance(false).text_xs().h(px(28.)).px(px(8.))),
+                    // `InputGroupInput size="sm"` in a `sm:text-sm` group.
+                    .child(Input::new(&query).appearance(false).text_sm().h(px(28.)).px(px(8.))),
             )
             .when(has_folders, |el| {
                 el.child(
