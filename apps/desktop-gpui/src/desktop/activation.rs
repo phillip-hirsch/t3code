@@ -17,14 +17,16 @@ const OWNER_POLL: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub enum Instance {
     /// This process is the app; other launches' arguments arrive on the sender given to [`claim`].
-    /// `channel` is what it listens on, for [`Channel::close`] at quit.
+    /// `channel` is what it listens on; keep it until the process exits.
     Primary { channel: Option<Channel> },
     /// The running app took the arguments.
     Forwarded,
 }
 
 /// The channel the app owns. On Unix the socket is a file, so a lock held for the app's life
-/// tells a running app's socket from one a crash left behind.
+/// tells a running app's socket from one a crash left behind. Like Electron's single-instance
+/// lock it must last until the process exits (on Windows the pipe is the lock and already does),
+/// so a launch while this app quits waits for it instead of starting a second server.
 #[derive(Debug)]
 pub struct Channel {
     #[cfg(unix)]
@@ -34,12 +36,16 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Removes the socket, so a clean quit leaves nothing in the temp folder. The next launch
-    /// takes over once this is dropped.
-    pub fn close(&self) {
+    /// What quitting runs: removes the socket, so a clean quit leaves nothing in the temp folder.
+    /// The next launch takes over once the channel is dropped.
+    pub fn closer(&self) -> impl Fn() + 'static {
         #[cfg(unix)]
-        if let Err(error) = std::fs::remove_file(&self.socket) {
-            log::warn!("could not remove the single-instance socket {}: {error}", self.socket.display());
+        let socket = self.socket.clone();
+        move || {
+            #[cfg(unix)]
+            if let Err(error) = std::fs::remove_file(&socket) {
+                log::warn!("could not remove the single-instance socket {}: {error}", socket.display());
+            }
         }
     }
 }
@@ -245,9 +251,17 @@ mod tests {
         assert_eq!(runtime.block_on(receiver.recv()).unwrap(), args);
         #[cfg(unix)]
         let socket = channel.socket.clone();
-        channel.close();
+        channel.closer()();
         #[cfg(unix)]
-        assert!(!socket.exists(), "a clean quit removes the socket");
+        {
+            assert!(!socket.exists(), "a clean quit removes the socket");
+            let (unused, _) = async_channel::unbounded();
+            let quitting = listen(&address(&home), unused.clone(), runtime.handle()).unwrap();
+            assert!(quitting.is_none(), "the lock lasts until the quitting app exits");
+            drop(channel);
+            let next = listen(&address(&home), unused, runtime.handle()).unwrap();
+            next.expect("the next launch takes over once the app is gone").closer()();
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -267,7 +281,7 @@ mod tests {
         let (unused, _) = async_channel::unbounded();
         assert!(matches!(claim(&home, &["again".into()], unused, runtime.handle()), Instance::Forwarded));
         assert_eq!(runtime.block_on(receiver.recv()).unwrap(), ["again"]);
-        channel.close();
+        channel.closer()();
         let _ = std::fs::remove_file(format!("{address}.lock"));
     }
 }

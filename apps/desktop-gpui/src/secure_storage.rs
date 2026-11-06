@@ -63,7 +63,8 @@ mod imp {
     fn key() -> Result<Key, String> {
         static KEY: Mutex<Option<Key>> = Mutex::new(None);
         static LOADING: Mutex<()> = Mutex::new(());
-        // A poisoned lock still guards a whole `Copy` value.
+        // Recovering from poison is sound: `KEY` holds a whole `Copy` value, and `LOADING` guards
+        // nothing, as a `load_or_create` that panicked left the item absent or whole to read again.
         let cached = || *KEY.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(key) = cached() {
             return Ok(key);
