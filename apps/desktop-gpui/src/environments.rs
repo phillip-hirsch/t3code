@@ -8,11 +8,15 @@
 //! `safeStorage` gives the desktop app's connection catalog).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::{Notify, watch};
 use url::Url;
 
 use crate::backend::{self, Endpoint, LocalServer};
@@ -586,9 +590,10 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
                 .iter()
                 .filter(|environment| environment.enabled)
                 .find_map(SavedEnvironment::endpoint);
-            let endpoint = endpoint.context(
-                "The local environment is off. Turn it on in Settings › Environments, or add an environment there.",
-            )?;
+            let endpoint = endpoint.ok_or(backend::Unrecoverable(
+                "The local environment is off. Turn it on in Settings › Environments, or add an environment there."
+                    .into(),
+            ))?;
             return Ok((endpoint, None));
         }
     }
@@ -597,69 +602,155 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
 
 /// The workspace's environment for the whole app run, started once and shared by every
 /// window, as Electron's backend manager outlives its windows: closing the window leaves this
-/// app's server and its agents running. The server stops when the app quits.
+/// app's server and its agents running. Like `DesktopBackendManager`, a server that exits or
+/// fails to start is started again with a backoff; the server stops when the app quits.
 #[derive(Clone)]
-pub struct PrimaryBackend(tokio::sync::watch::Receiver<BackendStatus>);
+pub struct PrimaryBackend {
+    shared: Arc<Shared>,
+    status: watch::Receiver<BackendStatus>,
+}
+
+struct Shared {
+    status: watch::Sender<BackendStatus>,
+    /// Wakes a supervisor that waits to restart; see [`PrimaryBackend::restart`].
+    restart: Notify,
+}
 
 #[derive(Clone)]
-enum BackendStatus {
+pub enum BackendStatus {
     Starting,
     Ready(Endpoint),
-    /// It could not be started or reached.
+    /// It went down, with why; a restart is scheduled.
+    Restarting(String),
+    /// It keeps failing to start, or cannot be started again (another server owns the T3
+    /// home). Only the first kind is still retried on its own.
     Failed(String),
-    /// This app's server exited on its own.
-    Stopped(String),
 }
+
+/// One start of the backend, as [`supervise`] sees it.
+enum Start {
+    /// `exited` resolves with why this app's server stopped, or `None` once the app quits. It
+    /// is `None` for a server this app does not run.
+    Ready {
+        endpoint: Endpoint,
+        exited: Option<BoxFuture<'static, Option<String>>>,
+    },
+    /// `retry` is false when starting again cannot help.
+    Failed {
+        reason: String,
+        retry: bool,
+    },
+    Quit,
+}
+
+/// `INITIAL_RESTART_DELAY` and `MAX_RESTART_DELAY` in `DesktopBackendManager.ts`.
+const INITIAL_RESTART_DELAY: Duration = Duration::from_millis(500);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(10);
+/// `STARTUP_FAILURE_RESTART_ATTEMPTS`: restarts without readiness before the failure shows.
+const STARTUP_FAILURE_RESTART_ATTEMPTS: u32 = 3;
 
 impl gpui_kit::Global for PrimaryBackend {}
 
 impl PrimaryBackend {
     pub fn start(runtime: &tokio::runtime::Handle) -> Self {
-        let (status, receiver) = tokio::sync::watch::channel(BackendStatus::Starting);
-        runtime.spawn(async move {
-            let (endpoint, server) = match resolve_workspace_endpoint().await {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    status.send_replace(BackendStatus::Failed(format!("{error:#}")));
-                    return;
-                }
-            };
-            log::info!("server ready at {}", endpoint.http_base);
-            status.send_replace(BackendStatus::Ready(endpoint));
-            if let Some(server) = server
-                && let Some(reason) = server.run().await
-            {
-                log::warn!("{reason}");
-                status.send_replace(BackendStatus::Stopped(reason));
+        let backend = Self::new();
+        runtime.spawn(supervise(backend.shared.clone(), start_workspace));
+        backend
+    }
+
+    fn new() -> Self {
+        let (status, receiver) = watch::channel(BackendStatus::Starting);
+        Self { shared: Arc::new(Shared { status, restart: Notify::new() }), status: receiver }
+    }
+
+    /// The status now; [`Self::changed`] then waits for the next one.
+    pub fn status(&mut self) -> BackendStatus {
+        self.status.borrow_and_update().clone()
+    }
+
+    pub async fn changed(&mut self) {
+        // `shared` holds the sender, so the channel never closes.
+        let _ = self.status.changed().await;
+    }
+
+    /// Starts a backend that is down again now, skipping the backoff (Reconnect, a new window).
+    pub fn restart(&self) {
+        let down = self.shared.status.send_if_modified(|status| {
+            let down = matches!(status, BackendStatus::Restarting(_) | BackendStatus::Failed(_));
+            if down {
+                *status = BackendStatus::Starting;
             }
+            down
         });
-        Self(receiver)
-    }
-
-    /// A window opening now needs a new start: the last one failed or its server stopped.
-    pub fn ended(&self) -> bool {
-        matches!(*self.0.borrow(), BackendStatus::Failed(_) | BackendStatus::Stopped(_))
-    }
-
-    /// The endpoint once the backend is ready, or why it is not.
-    pub async fn ready(&self) -> Result<Endpoint, String> {
-        let mut status = self.0.clone();
-        let settled = status.wait_for(|status| !matches!(status, BackendStatus::Starting)).await;
-        match settled.as_deref() {
-            Ok(BackendStatus::Ready(endpoint)) => Ok(endpoint.clone()),
-            Ok(BackendStatus::Failed(reason) | BackendStatus::Stopped(reason)) => Err(reason.clone()),
-            Ok(BackendStatus::Starting) | Err(_) => Err("The backend stopped before it was ready.".into()),
+        if down {
+            self.shared.restart.notify_waiters();
         }
     }
+}
 
-    /// Resolves with why this app's server stopped; never for a server it did not start.
-    pub async fn stopped(&self) -> String {
-        let mut status = self.0.clone();
-        match status.wait_for(|status| matches!(status, BackendStatus::Stopped(_))).await.as_deref() {
-            Ok(BackendStatus::Stopped(reason)) => reason.clone(),
-            _ => std::future::pending().await,
+/// [`resolve_workspace_endpoint`] for [`supervise`].
+async fn start_workspace() -> Start {
+    if backend::quitting_now() {
+        return Start::Quit;
+    }
+    match resolve_workspace_endpoint().await {
+        Ok((endpoint, server)) => Start::Ready { endpoint, exited: server.map(|server| server.run().boxed()) },
+        Err(_) if backend::quitting_now() => Start::Quit,
+        Err(error) => Start::Failed {
+            retry: error.downcast_ref::<backend::Unrecoverable>().is_none(),
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
+/// Starts the backend and keeps it running: `scheduleRestart` in `DesktopBackendManager.ts`.
+async fn supervise<F, Fut>(shared: Arc<Shared>, mut start: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Start>,
+{
+    // Restarts since the server was last ready (`restartAttempt`).
+    let mut attempt = 0;
+    loop {
+        let reason = match start().await {
+            Start::Quit => return,
+            Start::Ready { endpoint, exited } => {
+                log::info!("server ready at {}", endpoint.http_base);
+                attempt = 0;
+                shared.status.send_replace(BackendStatus::Ready(endpoint));
+                let Some(exited) = exited else { return };
+                let Some(reason) = exited.await else { return };
+                reason
+            }
+            Start::Failed { reason, retry: false } => {
+                log::error!("{reason}");
+                // Created before the status changes, so a restart that sees it wakes this.
+                let restart = shared.restart.notified();
+                shared.status.send_replace(BackendStatus::Failed(reason));
+                restart.await;
+                continue;
+            }
+            Start::Failed { reason, retry: true } => reason,
+        };
+        attempt += 1;
+        let delay = restart_delay(attempt);
+        log::warn!("{reason} Restarting in {delay:?}.");
+        let restart = shared.restart.notified();
+        shared.status.send_replace(if attempt >= STARTUP_FAILURE_RESTART_ATTEMPTS {
+            BackendStatus::Failed(reason)
+        } else {
+            BackendStatus::Restarting(reason)
+        });
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = restart => {}
         }
     }
+}
+
+/// `calculateRestartDelay` for the `attempt`th restart since the server was ready.
+fn restart_delay(attempt: u32) -> Duration {
+    INITIAL_RESTART_DELAY.saturating_mul(1 << attempt.saturating_sub(1).min(5)).min(MAX_RESTART_DELAY)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -867,6 +958,106 @@ pub fn diagnosis_text(host: &str, diagnosis: &Diagnosis) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs [`supervise`] over `starts`, one per start; it panics when they run out.
+    fn supervised(starts: Vec<Start>) -> PrimaryBackend {
+        let backend = PrimaryBackend::new();
+        let mut starts = std::collections::VecDeque::from(starts);
+        tokio::spawn(supervise(backend.shared.clone(), move || {
+            std::future::ready(starts.pop_front().expect("no start left"))
+        }));
+        backend
+    }
+
+    /// A server at `http_base` that runs until `exit` sends why, or drops for a quit.
+    fn running(http_base: &str) -> (Start, tokio::sync::oneshot::Sender<String>) {
+        let (exit, exited) = tokio::sync::oneshot::channel::<String>();
+        let endpoint = Endpoint::bearer(http_base, String::new());
+        (Start::Ready { endpoint, exited: Some(async { exited.await.ok() }.boxed()) }, exit)
+    }
+
+    fn failed(reason: &str, retry: bool) -> Start {
+        Start::Failed { reason: reason.into(), retry }
+    }
+
+    /// The next status, as `ready <base>`, `restarting <why>`, `failed <why>` or `starting`.
+    async fn next(backend: &mut PrimaryBackend) -> String {
+        backend.changed().await;
+        describe(&backend.status())
+    }
+
+    fn describe(status: &BackendStatus) -> String {
+        match status {
+            BackendStatus::Starting => "starting".into(),
+            BackendStatus::Ready(endpoint) => format!("ready {}", endpoint.http_base),
+            BackendStatus::Restarting(reason) => format!("restarting {reason}"),
+            BackendStatus::Failed(reason) => format!("failed {reason}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_server_restarts_after_the_backoff() {
+        let (first, crash) = running("http://a");
+        let (second, _keep) = running("http://b");
+        let mut backend = supervised(vec![first, second]);
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        crash.send("crashed".into()).unwrap();
+        assert_eq!(next(&mut backend).await, "restarting crashed");
+        let down = tokio::time::Instant::now();
+        assert_eq!(next(&mut backend).await, "ready http://b");
+        assert_eq!(down.elapsed(), INITIAL_RESTART_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_first_starts_back_off_then_show_and_restart_on_request() {
+        let (server, _keep) = running("http://a");
+        let starts = vec![failed("no node", true), failed("no node", true), failed("no node", true), server];
+        let mut backend = supervised(starts);
+        let started = tokio::time::Instant::now();
+        assert_eq!(next(&mut backend).await, "restarting no node");
+        assert_eq!(next(&mut backend).await, "restarting no node");
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        // The third restart without readiness shows the failure, as Electron's startup failure.
+        assert_eq!(next(&mut backend).await, "failed no node");
+        assert_eq!(started.elapsed(), Duration::from_millis(1_500));
+        // Reconnect skips the 2 s still to wait.
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        assert_eq!(started.elapsed(), Duration::from_millis(1_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unrecoverable_start_waits_for_a_restart_request() {
+        let (server, _keep) = running("http://a");
+        let mut backend = supervised(vec![failed("home owned", false), server]);
+        assert_eq!(next(&mut backend).await, "failed home owned");
+        tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
+        assert_eq!(describe(&backend.status()), "failed home owned");
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        // A restart request while it runs changes nothing.
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "ready http://a");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quitting_stops_supervision() {
+        let (server, quit) = running("http://a");
+        let mut backend = supervised(vec![server]);
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        drop(quit);
+        tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
+        assert_eq!(describe(&backend.status()), "ready http://a");
+    }
+
+    #[test]
+    fn restart_delays_double_up_to_ten_seconds() {
+        let delays: Vec<_> = (1..=7).map(|attempt| restart_delay(attempt).as_millis()).collect();
+        assert_eq!(delays, [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000]);
+    }
 
     #[test]
     fn pairing_urls_fill_host_and_code() {

@@ -74,6 +74,18 @@ impl Endpoint {
     }
 }
 
+/// A start failure that starting again cannot fix, such as another server owning the T3 home.
+#[derive(Debug)]
+pub struct Unrecoverable(pub String);
+
+impl std::fmt::Display for Unrecoverable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unrecoverable {}
+
 /// A server this process started. Dropping it kills the server; [`LocalServer::stop`] lets it
 /// exit first.
 pub struct LocalServer {
@@ -106,6 +118,11 @@ impl Drop for Running {
     fn drop(&mut self) {
         SERVERS.running.send_modify(|count| *count -= 1);
     }
+}
+
+/// Whether the app is quitting (see [`stop_local_servers`]).
+pub fn quitting_now() -> bool {
+    *SERVERS.quitting.borrow()
 }
 
 /// Resolves once the app quits (see [`stop_local_servers`]).
@@ -287,7 +304,8 @@ pub async fn launch(config: LaunchConfig) -> Result<(Endpoint, LocalServer)> {
         status = server.child.wait() => {
             let code = status.ok().and_then(|s| s.code());
             if code == Some(EXIT_STATE_DIR_OWNED) {
-                bail!("another T3 server already owns {}", config.home.display());
+                let owned = format!("Another T3 server already owns {}.", config.home.display());
+                return Err(Unrecoverable(owned).into());
             }
             bail!("server exited before it was ready (code {code:?})");
         }
