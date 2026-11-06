@@ -69,6 +69,8 @@ pub(super) struct Launch {
     pub cwd: String,
     pub worktree_path: Option<String>,
     pub project_root: String,
+    /// Set by project script runs: the server closes the terminal when the thread settles.
+    pub stop_on_settle: Option<bool>,
 }
 
 impl Launch {
@@ -85,6 +87,9 @@ impl Launch {
         let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd, "env": self.env()});
         if let Some(path) = &self.worktree_path {
             input["worktreePath"] = path.clone().into();
+        }
+        if let Some(stop) = self.stop_on_settle {
+            input["stopOnSettle"] = stop.into();
         }
         input
     }

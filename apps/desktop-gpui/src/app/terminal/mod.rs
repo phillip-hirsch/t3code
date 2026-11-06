@@ -255,6 +255,7 @@ impl Workspace {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
             project_root: project.workspace_root.clone(),
+            stop_on_settle: None,
         })
     }
 
@@ -375,36 +376,25 @@ impl Workspace {
         self.launch_terminal_with(thread_id, place, launch, None, cx);
     }
 
-    /// `runProjectScript`: types `command` into an idle drawer terminal, or a new one opened in `cwd`.
-    fn run_in_terminal(&mut self, cwd: String, command: String, cx: &mut Context<Self>) {
+    /// `runProjectScript`: types the command into an idle drawer terminal, or a new one opened in
+    /// its cwd. A script that stops when the thread settles always gets a terminal of its own.
+    fn run_in_terminal(&mut self, run: &super::RunInTerminal, cx: &mut Context<Self>) {
         let Some(thread_id) = self.open_drawer_for_action() else { return };
         let Some(mut launch) = self.terminal_launch() else { return };
-        let input = format!(" {command}\r");
+        launch.cwd.clone_from(&run.cwd);
+        launch.stop_on_settle = Some(run.stop_on_settle);
+        let input = format!(" {}\r", run.command);
         let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
         let drawer = self.terminals.drawers.entry(thread_id.clone()).or_default();
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
-        match reuse {
+        match reuse.filter(|_| !run.stop_on_settle) {
+            // Reopening a live terminal only updates its launch flags, as the web's launch does.
             Some(terminal_id) => {
                 drawer.set_active(&terminal_id);
-                self.terminals.focus_pending = Some(terminal_id.clone());
-                if let Some(client) = self.thread_client(&thread_id) {
-                    let payload = json!({"threadId": thread_id, "terminalId": terminal_id, "data": input});
-                    cx.spawn(async move |this, cx| {
-                        if let Err(error) = client.request("terminal.write", payload).await {
-                            let _ = this.update(cx, |this, cx| {
-                                this.error = Some(error.to_string().into());
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .detach();
-                }
+                self.open_terminal_session(thread_id, terminal_id, launch, Some(input), cx);
             }
-            None => {
-                launch.cwd = cwd;
-                self.launch_terminal_with(thread_id, Place::New, launch, Some(input), cx);
-            }
+            None => self.launch_terminal_with(thread_id, Place::New, launch, Some(input), cx),
         }
         cx.notify();
     }
@@ -694,9 +684,7 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &SplitTerminal, _, cx| this.split_terminal(Split::Horizontal, cx)))
             .on_action(cx.listener(|this, _: &SplitTerminalVertical, _, cx| this.split_terminal(Split::Vertical, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, _, cx| this.new_terminal(cx)))
-            .on_action(cx.listener(|this, action: &super::RunInTerminal, _, cx| {
-                this.run_in_terminal(action.cwd.clone(), action.command.clone(), cx);
-            }))
+            .on_action(cx.listener(|this, action: &super::RunInTerminal, _, cx| this.run_in_terminal(action, cx)))
             .on_action(cx.listener(|this, _: &CloseTerminal, window, cx| {
                 let active =
                     this.shown_terminal_thread().and_then(|id| this.terminals.drawers.get(id)).filter(|d| d.open);

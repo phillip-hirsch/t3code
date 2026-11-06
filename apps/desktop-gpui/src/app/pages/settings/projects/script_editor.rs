@@ -38,6 +38,7 @@ pub(super) struct ScriptEditor {
     run_on_worktree_create: bool,
     wait_for_setup: bool,
     run_on_settle: bool,
+    stop_on_settle: bool,
     auto_open_preview: bool,
     error: Option<SharedString>,
     saving: bool,
@@ -145,6 +146,7 @@ impl ScriptEditor {
             run_on_worktree_create: initial.run_on_worktree_create,
             wait_for_setup: initial.wait_for_setup,
             run_on_settle: initial.run_on_settle,
+            stop_on_settle: initial.stop_on_settle,
             auto_open_preview: initial.auto_open_preview,
             error: error.map(Into::into),
             saving: false,
@@ -202,6 +204,7 @@ impl ScriptEditor {
             run_on_worktree_create: self.run_on_worktree_create,
             wait_for_setup: self.run_on_worktree_create && self.wait_for_setup,
             run_on_settle: self.run_on_settle,
+            stop_on_settle: self.stop_on_settle,
             keybinding: (self.script_id.is_none() || changes_keybinding).then_some(key),
             auto_open_preview: preview_url.is_some() && self.auto_open_preview,
             preview_url,
@@ -452,6 +455,14 @@ impl Render for ScriptEditor {
                 !self.saving,
                 &t,
                 set(cx.entity(), |this, on| this.run_on_settle = on),
+            ))
+            .child(toggle(
+                "script-stop-on-settle",
+                "Stop this action when the thread settles",
+                self.stop_on_settle,
+                !self.saving,
+                &t,
+                set(cx.entity(), |this, on| this.stop_on_settle = on),
             ))
             .child(toggle(
                 "script-auto-open-preview",

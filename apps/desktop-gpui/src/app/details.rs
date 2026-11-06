@@ -491,15 +491,18 @@ impl Workspace {
     fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let project = self.target_project()?;
         let project_id = project.id.clone();
-        let scripts: Vec<(SharedString, SharedString)> =
+        let scripts: Vec<(SharedString, ScriptRun)> =
             super::pages::settings::code::projects::scripts::resolve_project_scripts(
                 &self.server_info().settings,
                 project,
             )
             .into_iter()
-            .map(|script| (script.name.into(), script.command.into()))
+            .map(|script| {
+                let stop_on_settle = script.stop_on_settle == Some(true);
+                (script.name.into(), ScriptRun { command: script.command.into(), stop_on_settle })
+            })
             .collect();
-        let Some((name, command)) = scripts.first().cloned() else {
+        let Some((name, run)) = scripts.first().cloned() else {
             return Some(
                 action_row("details-add-script", colors, cx)
                     .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
@@ -513,12 +516,10 @@ impl Workspace {
         };
         let view = cx.entity();
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            for (name, command) in &scripts {
-                let command = command.clone();
+            for (name, run) in &scripts {
+                let run = run.clone();
                 menu = menu.item(PopupMenuItem::new(name.clone()).icon(icon("icons/play.svg")).on_click(
-                    window.listener_for(&view, move |this, _, window, cx| {
-                        this.run_project_script(command.clone(), window, cx);
-                    }),
+                    window.listener_for(&view, move |this, _, window, cx| this.run_project_script(&run, window, cx)),
                 ));
             }
             let project_id = project_id.clone();
@@ -536,9 +537,7 @@ impl Workspace {
                         .child(icon("icons/play.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
                         .child(div().min_w_0().truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.run_project_script(command.clone(), window, cx);
-                        })),
+                        .on_click(cx.listener(move |this, _, window, cx| this.run_project_script(&run, window, cx))),
                 )
                 .child(split_hairline("details-scripts", colors))
                 .child(
@@ -552,9 +551,10 @@ impl Workspace {
     }
 
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
-    fn run_project_script(&mut self, command: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.git_cwd() else { return };
-        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: command.to_string() }), cx);
+        let (command, stop_on_settle) = (run.command.to_string(), run.stop_on_settle);
+        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command, stop_on_settle }), cx);
     }
 
     fn version_control_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
@@ -1416,6 +1416,13 @@ pub(super) fn format_context_tokens(value: u64) -> String {
         10_000..999_500 => format!("{}k", (value as f64 / 1_000.).round()),
         _ => format!("{}m", trim(format!("{:.1}", value as f64 / 1_000_000.))),
     }
+}
+
+/// A project script's run from the details card.
+#[derive(Clone)]
+struct ScriptRun {
+    command: SharedString,
+    stop_on_settle: bool,
 }
 
 #[cfg(test)]

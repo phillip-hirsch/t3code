@@ -94,6 +94,8 @@ gpui_kit::actions!(
 pub struct RunInTerminal {
     pub cwd: String,
     pub command: String,
+    /// The script's `stopOnSettle`.
+    pub stop_on_settle: bool,
 }
 pub use terminal::key_bindings as terminal_key_bindings;
 pub use titlebar::TRAFFIC_LIGHTS;

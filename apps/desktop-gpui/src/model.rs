@@ -604,6 +604,8 @@ pub struct ProjectScript {
     pub run_on_worktree_create: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_on_settle: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_on_settle: Option<bool>,
     #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
     pub run_async: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,6 +639,8 @@ pub struct T3ProjectFileScript {
     pub run_on_worktree_create: Option<bool>,
     #[serde(default)]
     pub run_on_settle: Option<bool>,
+    #[serde(default)]
+    pub stop_on_settle: Option<bool>,
     #[serde(default, rename = "async")]
     pub run_async: Option<bool>,
     #[serde(default)]

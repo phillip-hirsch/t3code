@@ -45,6 +45,7 @@ pub(super) struct ScriptInput {
     pub run_on_worktree_create: bool,
     pub wait_for_setup: bool,
     pub run_on_settle: bool,
+    pub stop_on_settle: bool,
     /// `None` keeps the current shortcut; `Some(None)` clears it.
     pub keybinding: Option<Option<String>>,
     pub preview_url: Option<String>,
@@ -61,6 +62,7 @@ impl Default for ScriptInput {
             run_on_worktree_create: false,
             wait_for_setup: false,
             run_on_settle: false,
+            stop_on_settle: false,
             keybinding: Some(None),
             preview_url: None,
             auto_open_preview: false,
@@ -79,6 +81,7 @@ impl ScriptInput {
             run_on_worktree_create: script.run_on_worktree_create,
             wait_for_setup: script.run_on_worktree_create && script.run_async == Some(false),
             run_on_settle: script.run_on_settle == Some(true),
+            stop_on_settle: script.stop_on_settle == Some(true),
             keybinding: Some(keybinding_value_for_command(keybindings, command.as_deref())),
             preview_url: script.preview_url.clone(),
             auto_open_preview: script.auto_open_preview == Some(true),
@@ -95,6 +98,7 @@ impl ScriptInput {
             run_on_worktree_create: setup,
             wait_for_setup: setup && script.run_async == Some(false),
             run_on_settle: script.run_on_settle == Some(true),
+            stop_on_settle: script.stop_on_settle == Some(true),
             keybinding: Some(None),
             preview_url: script.preview_url.clone(),
             auto_open_preview: script.preview_url.is_some() && script.auto_open_preview == Some(true),
@@ -110,6 +114,7 @@ fn build_project_script(id: &str, input: &ScriptInput) -> ProjectScript {
         icon: input.icon.clone(),
         run_on_worktree_create: input.run_on_worktree_create,
         run_on_settle: input.run_on_settle.then_some(true),
+        stop_on_settle: input.stop_on_settle.then_some(true),
         run_async: (input.run_on_worktree_create && input.wait_for_setup).then_some(false),
         preview_url: input.preview_url.clone(),
         auto_open_preview: input.preview_url.as_ref().map(|_| input.auto_open_preview),
@@ -704,6 +709,7 @@ mod tests {
             icon: "play".into(),
             run_on_worktree_create: false,
             run_on_settle: None,
+            stop_on_settle: None,
             run_async: None,
             preview_url: None,
             auto_open_preview: None,
@@ -777,10 +783,17 @@ mod tests {
             json!({"id": "dev", "name": "Dev", "command": "bun dev", "icon": "play", "runOnWorktreeCreate": false,
                 "previewUrl": "http://localhost:5173", "autoOpenPreview": true})
         );
-        let setup = ScriptInput { run_on_worktree_create: true, wait_for_setup: true, run_on_settle: true, ..input };
+        let setup = ScriptInput {
+            run_on_worktree_create: true,
+            wait_for_setup: true,
+            run_on_settle: true,
+            stop_on_settle: true,
+            ..input
+        };
         let built = serde_json::to_value(build_project_script("dev", &setup)).unwrap();
         assert_eq!(built["async"], false);
         assert_eq!(built["runOnSettle"], true);
+        assert_eq!(built["stopOnSettle"], true);
     }
 
     #[test]
@@ -903,7 +916,7 @@ mod tests {
     #[test]
     fn t3_file_scripts_already_present_are_not_importable() {
         let file = T3ProjectFile::parse(
-            r#"{"scripts": [{"name": "Lint", "command": "bun lint"}, {"name": "Dev", "command": "bun dev", "icon": "debug"}]}"#,
+            r#"{"scripts": [{"name": "Lint", "command": "bun lint"}, {"name": "Dev", "command": "bun dev", "icon": "debug", "stopOnSettle": true}]}"#,
         );
         let mut lint = script("lint");
         lint.name = "lint".into();
@@ -916,5 +929,6 @@ mod tests {
         assert_eq!(T3ProjectFile::parse("{oops"), T3ProjectFile::Invalid);
         let imported = ScriptInput::from_file_script(&file.scripts()[1]);
         assert_eq!((imported.icon.as_str(), imported.keybinding), ("debug", Some(None)));
+        assert!(imported.stop_on_settle);
     }
 }

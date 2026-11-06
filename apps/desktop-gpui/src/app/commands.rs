@@ -279,7 +279,8 @@ impl Workspace {
         let (Some(script), Some(cwd)) = (scripts.into_iter().find(|s| s.id == script_id), self.git_cwd()) else {
             return false;
         };
-        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: script.command }), cx);
+        let stop_on_settle = script.stop_on_settle == Some(true);
+        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: script.command, stop_on_settle }), cx);
         true
     }
 
