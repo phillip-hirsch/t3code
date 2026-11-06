@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -125,6 +126,8 @@ struct Row {
     time: Option<String>,
     shortcut: Option<SharedString>,
     chevron: bool,
+    /// `ProjectPinButton`: the group's project ids and whether it is pinned.
+    pin: Option<(Vec<String>, bool)>,
     run: Run,
     /// Keywords that match besides the title (`searchTerms`).
     terms: &'static [&'static str],
@@ -143,6 +146,7 @@ impl Row {
             time: None,
             shortcut: None,
             chevron: false,
+            pin: None,
             run,
             terms: &[],
             quality: 0.,
@@ -477,22 +481,58 @@ impl Workspace {
         self.shell.projects.iter().find(|p| &p.id == id)
     }
 
+    /// The name of a project's group (`displayName`): the repository's name, not owner/repo.
+    fn group_name(&self, project: &ProjectShell) -> SharedString {
+        let groups = self.project_groups();
+        groups
+            .iter()
+            .find(|g| g.project_ids.contains(&project.id))
+            .map_or_else(|| project_name(project), |g| g.display_name.clone().into())
+    }
+
+    /// "New thread in...": each project group by its name, with "No project" among them.
     fn new_thread_rows(&self) -> Vec<Row> {
-        self.pickable_projects()
-            .into_iter()
+        let groups = self.project_groups();
+        let pickable = crate::project_groups::pickable(&groups);
+        let current = self.current_project().map(|p| p.id.clone());
+        let entries: Vec<NoProjectEntry> = pickable
+            .iter()
+            .map(|g| NoProjectEntry {
+                scratch: g.members[0].is_scratch,
+                pinned: g.pinned,
+                preferred: current.as_ref().is_some_and(|id| g.project_ids.contains(id)),
+            })
+            .collect();
+        let mut rows: Vec<Row> = pickable
+            .iter()
+            .filter(|g| !g.members[0].is_scratch)
             .enumerate()
-            .map(|(i, p)| {
+            .map(|(i, g)| {
+                let p = g.representative();
                 let mut row = Row::new(
                     format!("new-in-{}", p.id),
                     RowIcon::Project(p.id.clone()),
-                    project_name(p),
+                    g.display_name.clone(),
                     Run::NewThread(p.id.clone()),
                 );
                 row.description = Some(Description::Text(format!("Local · {}", p.workspace_root).into()));
                 row.shortcut = (i < 9).then(|| self.shortcut(&format!("thread.jump.{}", i + 1))).flatten();
+                row.pin = Some((g.project_ids.clone(), g.pinned));
                 row
             })
-            .collect()
+            .collect();
+        if self.server_info().scratch_workspace_root.is_some() && self.client().is_some() {
+            let mut row = Row::new(
+                "new-thread-no-project",
+                RowIcon::Lucide(IconName::MessageSquareDashed),
+                "No project",
+                Run::ScratchThread,
+            );
+            row.terms = &["no project", "without project", "none"];
+            row.shortcut = self.shortcut("chat.newWithoutProject");
+            rows.insert(no_project_index(&entries), row);
+        }
+        rows
     }
 
     /// The live shortcut label of `command` (`shortcutCommand`), as tooltips show it.
@@ -511,7 +551,7 @@ impl Workspace {
         if let Some(project) = current {
             let mut row =
                 lucide("new-thread-here", IconName::SquarePen, "New thread in", Run::NewThread(project.id.clone()));
-            row.strong = Some(project_name(project));
+            row.strong = Some(self.group_name(project));
             row.terms = &["new thread", "chat", "create", "draft"];
             row.shortcut = self.shortcut("chat.newLocal");
             rows.push(row);
@@ -636,7 +676,7 @@ impl Workspace {
         }
         if let Some(project) = current {
             let mut row = lucide("project-settings", IconName::Folder, "Project settings", Run::Settings("projects"));
-            row.description = Some(Description::Text(project_name(project)));
+            row.description = Some(Description::Text(self.group_name(project)));
             row.terms = &[
                 "project",
                 "settings",
@@ -769,6 +809,7 @@ impl Workspace {
         } else {
             self.new_thread_rows()
                 .into_iter()
+                .filter(|row| matches!(row.run, Run::NewThread(_)))
                 .map(|mut row| {
                     row.title = format!("New thread in {}", row.title).into();
                     row
@@ -781,7 +822,7 @@ impl Workspace {
                 let mut row = Row::new(
                     format!("project-{}", p.id),
                     RowIcon::Project(p.id.clone()),
-                    project_name(p),
+                    self.group_name(p),
                     Run::Project(p.id.clone()),
                 );
                 row.description = Some(Description::Text(format!("Local · {}", p.workspace_root).into()));
@@ -1339,7 +1380,8 @@ impl Workspace {
         let hint = |keys: Vec<SharedString>, label: &'static str| {
             h_flex().gap(px(4.)).children(keys.into_iter().map(kbd)).child(label)
         };
-        let footer_action = browsing.then_some(if highlight.is_some() { "Select" } else { "Add" });
+        // While browsing with nothing highlighted, Enter adds the typed path.
+        let footer_action = if browsing && highlight.is_none() { "Add" } else { "Select" };
         let file_manager = browsing && self.server_is_local();
         let footer = h_flex()
             .flex_none()
@@ -1356,7 +1398,7 @@ impl Workspace {
                 h_flex()
                     .gap(px(12.))
                     .child(hint(vec!["↑".into(), "↓".into()], "Navigate"))
-                    .children(footer_action.map(|label| hint(vec!["Enter".into()], label)))
+                    .child(hint(vec!["Enter".into()], footer_action))
                     .when(in_submenu, |el| el.child(hint(vec!["Backspace".into()], "Back")))
                     .child(hint(vec!["Esc".into()], "Close")),
             )
@@ -1397,7 +1439,6 @@ impl Workspace {
                         .id("palette")
                         .w_full()
                         .max_w(px(576.))
-                        .max_h(px(420.))
                         .overflow_hidden()
                         .rounded(px(16.))
                         .border_1()
@@ -1413,7 +1454,15 @@ impl Workspace {
                             status.map(|text| div().px(px(16.)).py(px(12.)).text_sm().text_color(muted).child(text)),
                         )
                         .child(
-                            div().id("palette-list").flex_1().min_h_0().overflow_y_scroll().child(list).children(empty),
+                            // `max-h-[min(28rem,70vh)]` on the list alone.
+                            div()
+                                .id("palette-list")
+                                .flex_1()
+                                .min_h_0()
+                                .max_h((height * 0.7).min(px(448.)))
+                                .overflow_y_scrollbar()
+                                .child(list)
+                                .children(empty),
                         )
                         .child(footer),
                 )
@@ -1541,6 +1590,43 @@ impl Workspace {
                             .map(|d| div().text_xs().line_height(px(16.)).text_color(muted.opacity(0.7)).child(d)),
                     ),
             )
+            .children(row.pin.clone().filter(|(_, pinned)| *pinned || highlighted).map(|(ids, pinned)| {
+                // `ProjectPinButton`: shown while pinned or highlighted; a pinned one offers to unpin on hover.
+                let group: SharedString = format!("pin-{}", row.key).into();
+                let glyph = |name: IconName| Icon::new(name).size(px(14.)).text_color(muted);
+                div()
+                    .id(group.clone())
+                    .group(group.clone())
+                    .flex_none()
+                    .self_center()
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(tokens.foreground.opacity(0.04)))
+                    .child(
+                        div()
+                            .when(pinned, |el| el.group_hover(group.clone(), gpui_kit::Styled::invisible))
+                            .child(glyph(IconName::Pin)),
+                    )
+                    .when(pinned, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .invisible()
+                                .group_hover(group, gpui_kit::Styled::visible)
+                                .child(glyph(IconName::PinOff)),
+                        )
+                    })
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        // The palette stays open, as the web's pin button leaves it.
+                        cx.stop_propagation();
+                        this.set_projects_pinned(&ids, !pinned, cx);
+                    }))
+            }))
             .into_any_element()
     }
 }
@@ -1602,6 +1688,24 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
     scored
 }
 
+/// A pickable project group, as `newThreadNoProjectIndex` sees it.
+struct NoProjectEntry {
+    scratch: bool,
+    pinned: bool,
+    /// It holds the open thread's or draft's project.
+    preferred: bool,
+}
+
+/// `newThreadNoProjectIndex`: "No project" keeps the scratch group's place when it is pinned
+/// or current, else it follows the pinned projects.
+fn no_project_index(entries: &[NoProjectEntry]) -> usize {
+    let projects = entries.iter().filter(|e| !e.scratch).count();
+    if let Some(at) = entries.iter().position(|e| e.scratch && (e.pinned || e.preferred)) {
+        return entries[..at].iter().filter(|e| !e.scratch).count();
+    }
+    (entries.iter().filter(|e| !e.scratch && e.pinned).count() + 1).min(projects)
+}
+
 /// Submenu rows filtered by the query, in their own order when it is empty.
 fn rank_rows(rows: Vec<Row>, tokens: &[Vec<char>]) -> Vec<Row> {
     if tokens.is_empty() {
@@ -1617,6 +1721,29 @@ fn rank_rows(rows: Vec<Row>, tokens: &[Vec<char>]) -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_project_follows_the_pinned_projects_unless_scratch_is_pinned_or_current() {
+        let entry = |scratch, pinned, preferred| NoProjectEntry { scratch, pinned, preferred };
+        let projects = |pinned: usize, total: usize| (0..total).map(move |i| entry(false, i < pinned, false));
+        assert_eq!(no_project_index(&projects(0, 3).collect::<Vec<_>>()), 1);
+        assert_eq!(no_project_index(&projects(2, 3).collect::<Vec<_>>()), 3);
+        assert_eq!(no_project_index(&projects(3, 3).collect::<Vec<_>>()), 3);
+        assert_eq!(no_project_index(&[]), 0);
+        let with_scratch = |pinned, preferred| {
+            let mut entries: Vec<_> = projects(1, 3).collect();
+            entries.insert(2, entry(true, pinned, preferred));
+            entries
+        };
+        assert_eq!(no_project_index(&with_scratch(false, false)), 2);
+        assert_eq!(no_project_index(&with_scratch(true, false)), 2);
+        let mut first: Vec<_> = projects(1, 3).collect();
+        first.insert(0, entry(true, true, false));
+        assert_eq!(no_project_index(&first), 0);
+        let mut current: Vec<_> = projects(0, 3).collect();
+        current.push(entry(true, false, true));
+        assert_eq!(no_project_index(&current), 3);
+    }
 
     #[test]
     fn browse_queries_split_into_folder_and_leaf() {
