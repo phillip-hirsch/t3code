@@ -931,6 +931,37 @@ pub fn resolve_media_urls(markdown: &str, origin: &str) -> String {
     out
 }
 
+/// Where the destination of an image or definition starts in its source: past the label's
+/// matching `]`, the `opener` (`(` or `:`), any whitespace and an angle bracket.
+fn destination_start(text: &str, opener: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = bytes.iter().position(|&b| b == b'[')?;
+    let mut depth = 0_usize;
+    loop {
+        match *bytes.get(at)? {
+            b'\\' => at += 1,
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    at += 1;
+    if *bytes.get(at)? != opener {
+        return None;
+    }
+    at += 1;
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    Some(at + usize::from(bytes.get(at) == Some(&b'<')))
+}
+
 /// The destinations under `node` that resolve, in document order, as source ranges.
 fn media_edits(
     node: &markdown::mdast::Node,
@@ -940,21 +971,17 @@ fn media_edits(
 ) {
     use markdown::mdast::Node;
     let target = match node {
-        Node::Image(image) => Some((&image.url, "](")),
-        Node::Definition(definition) => Some((&definition.url, "]:")),
+        Node::Image(image) => Some((&image.url, b'(')),
+        Node::Definition(definition) => Some((&definition.url, b':')),
         _ => None,
     };
-    if let (Some((url, marker)), Some(position)) = (target, node.position()) {
-        let span = position.start.offset..position.end.offset;
-        let text = &source[span.clone()];
-        // The destination as written: after the label's close, where the parsed URL appears verbatim.
-        let found = text.find(marker).and_then(|close| {
-            let from = close + marker.len();
-            text[from..].find(url.as_str()).map(|at| span.start + from + at)
-        });
-        if let (Some(at), Some(resolved)) = (found, resolve_media_url(url, origin)) {
-            edits.push((at..at + url.len(), resolved));
-        }
+    if let (Some((url, opener)), Some(position)) = (target, node.position())
+        && resolve_media_url(url, origin).is_some()
+        && let Some(start) = destination_start(&source[position.start.offset..position.end.offset], opener)
+    {
+        // The parsed URL decides; the written one, escapes and entities included, keeps its spelling.
+        let at = position.start.offset + start;
+        edits.push((at..at, origin.to_owned()));
     }
     for child in node.children().map(Vec::as_slice).unwrap_or_default() {
         media_edits(child, source, origin, edits);
@@ -2265,6 +2292,12 @@ mod tests {
             resolve_media_urls(spans, origin),
             "``![a](/x.png) ` ``, ```![b](/y)```, ![c](https://git.cafe/z.png)",
             "multi-backtick code spans keep their text"
+        );
+        let written = r"![label \](/api/x)](/api/x) ![n [b](/c)](/d) ![e](&#47;api/e)";
+        assert_eq!(
+            resolve_media_urls(written, origin),
+            r"![label \](/api/x)](https://git.cafe/api/x) ![n [b](/c)](https://git.cafe/d) ![e](https://git.cafe&#47;api/e)",
+            "the destination after the label's own bracket, as written"
         );
     }
 }
