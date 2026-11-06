@@ -22,7 +22,7 @@ use super::logic;
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{error_toast, success_toast};
 use crate::app::Workspace;
-use crate::app::environments::SavedEnvironments;
+use crate::app::environments::{SavedEnvironments, Saving};
 use crate::app::sidebar::now_ms;
 use crate::environments::{self, ConnectionState, HopResult, Phase, Presented, SavedEnvironment};
 use crate::theme::{self, Tokens};
@@ -35,19 +35,40 @@ pub(super) struct SavedUi {
     _tick: Option<Task<()>>,
 }
 
-/// A save through a `SavedEnvironments` that was dropped did not happen.
-fn gone(_: anyhow::Error) -> Result<(), String> {
-    Err("The environment list is no longer available.".into())
+/// Waits off the UI thread for an edit to be on disk; a dropped list saved nothing.
+async fn finished(saving: anyhow::Result<Saving>) -> Result<(), String> {
+    match saving {
+        Ok(saving) => saving.finished().await,
+        Err(_) => Err("The environment list is no longer available.".into()),
+    }
+}
+
+/// Shows an edit's save failure as a toast titled `title`.
+fn toast_failure(saving: anyhow::Result<Saving>, title: String, window: &mut Window, cx: &mut App) {
+    window
+        .spawn(cx, async move |cx| {
+            if let Err(error) = finished(saving).await {
+                drop(cx.update(|window, cx| error_toast(window, cx, title, error)));
+            }
+        })
+        .detach();
 }
 
 impl Workspace {
     /// `<SettingsSection id="this-app">` with `LocalEnvironmentSetting`.
     pub(super) fn this_app_section(&self, cx: &App, t: &Tokens) -> AnyElement {
-        let enabled = self.saved_environments.read(cx).local_environment_enabled();
+        let saved = self.saved_environments.read(cx);
+        let (enabled, editable) = (saved.local_environment_enabled(), saved.editable());
         let saved = self.saved_environments.downgrade();
-        let toggle = switch(&"local-environment".into(), enabled, false, t)
-            .on_click(move |_, window, cx| confirm_local_environment(saved.clone(), enabled, window, cx));
-        let description = if enabled {
+        // Until the catalog is read it is neither on nor off.
+        let toggle = switch(&"local-environment".into(), enabled.unwrap_or(true), enabled.is_none(), t);
+        let toggle = match enabled.filter(|_| editable) {
+            Some(enabled) => {
+                toggle.on_click(move |_, window, cx| confirm_local_environment(saved.clone(), enabled, window, cx))
+            }
+            None => toggle.cursor_default().opacity(0.5),
+        };
+        let description = if enabled.unwrap_or(true) {
             "Run agents on this computer. Turn off to use T3 Code only with remote environments."
         } else {
             "Turned off. Agents only run in remote environments."
@@ -82,19 +103,25 @@ impl Workspace {
             _ => {}
         });
         let primary_id = self.settings_info().environment_id.clone();
+        let saved = self.saved_environments.read(cx);
         let action = {
-            let saved = self.saved_environments.downgrade();
+            let entity = self.saved_environments.downgrade();
             WebButton::new("add-environment", "Add environment")
                 .variant(Variant::GhostMuted)
                 .icon(IconName::Plus)
-                .on_click(move |_, window, cx| open_add_dialog(saved.clone(), primary_id.clone(), window, cx))
+                // A redeemed pairing code is spent, so pair only when the result can be saved.
+                .disabled(!saved.editable())
+                .on_click(move |_, window, cx| open_add_dialog(entity.clone(), primary_id.clone(), window, cx))
                 .into_any_element()
         };
         let now = now_ms();
-        let saved = self.saved_environments.read(cx);
         // The app's own environment saved here runs on the workspace's socket, so it shows that.
         let primary_phase = if self.sessions[0].is_connected() { Phase::Connected } else { Phase::Connecting };
-        let rows: Vec<AnyElement> = if saved.environments().is_empty() {
+        let mut rows: Vec<AnyElement> = if saved.loading() {
+            let loading =
+                text_sm(div().px(px(16.)).py(px(10.)).text_color(t.muted_foreground)).child("Loading\u{2026}");
+            vec![loading.into_any_element()]
+        } else if saved.environments().is_empty() {
             vec![empty_state(&t)]
         } else {
             let open = &ui.read(cx).details;
@@ -113,6 +140,10 @@ impl Workspace {
                 })
                 .collect()
         };
+        if let Some(problem) = saved.problem() {
+            let notice = text_xs(div().px(px(16.)).py(px(10.)).text_color(t.error)).child(problem.to_owned());
+            rows.insert(0, notice.into_any_element());
+        }
         section_with_action("remote-environments", "Environments", Some(action), rows, &t)
     }
 }
@@ -247,11 +278,9 @@ fn saved_row(
         switch(&format!("saved-env-{id}").into(), enabled, false, t)
             .tooltip(ui::tooltip(if enabled { "Switch off" } else { "Switch on" }))
             .on_click(move |_, window, cx| {
-                let result = entity.update(cx, |saved, cx| saved.set_enabled(&id, !enabled, cx));
-                if let Ok(Err(error)) = result {
-                    let title = format!("Failed to switch the backend {}.", if enabled { "off" } else { "on" });
-                    error_toast(window, cx, title, error);
-                }
+                let saving = entity.update(cx, |saved, cx| saved.set_enabled(&id, !enabled, cx));
+                let title = format!("Failed to switch the backend {}.", if enabled { "off" } else { "on" });
+                toast_failure(saving, title, window, cx);
             })
     };
     let menu = row_menu(entity.downgrade(), environment, element_id("menu"));
@@ -379,9 +408,8 @@ fn confirm_remove(entity: WeakEntity<SavedEnvironments>, id: String, label: Stri
             .ok_text("Remove")
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
-                if let Ok(Err(error)) = entity.update(cx, |saved, cx| saved.remove(&id, cx)) {
-                    error_toast(window, cx, "Failed to remove backend.", error);
-                }
+                let saving = entity.update(cx, |saved, cx| saved.remove(&id, cx));
+                toast_failure(saving, "Failed to remove backend.".into(), window, cx);
                 true
             })
     });
@@ -402,11 +430,17 @@ fn confirm_local_environment(saved: WeakEntity<SavedEnvironments>, enabled: bool
             .ok_text(if enabled { "Restart and turn off" } else { "Restart and turn on" })
             .when(enabled, |dialog| dialog.ok_variant(gpui_kit::component::button::ButtonVariant::Danger))
             .on_ok(move |_, window, cx| {
-                let saved = saved.update(cx, |saved, _| saved.set_local_environment_enabled(!enabled)).unwrap_or_else(gone);
-                match saved.and_then(|()| relaunch()) {
-                    Ok(()) => cx.quit(),
-                    Err(error) => error_toast(window, cx, "Couldn't change this setting.", error),
-                }
+                let saving = saved.update(cx, |saved, cx| saved.set_local_environment_enabled(!enabled, cx));
+                window
+                    .spawn(cx, async move |cx| {
+                        // The new run reads the choice, so relaunch once it is on disk.
+                        let result = finished(saving).await.and_then(|()| relaunch());
+                        drop(cx.update(|window, cx| match result {
+                            Ok(()) => cx.quit(),
+                            Err(error) => error_toast(window, cx, "Couldn't change this setting.", error),
+                        }));
+                    })
+                    .detach();
                 true
             })
     });
@@ -471,28 +505,30 @@ impl AddForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let saved = if self.primary_id.as_deref() == Some(&paired.environment_id) {
+        if self.primary_id.as_deref() == Some(&paired.environment_id) {
             // The workspace's own environment is already here (`register` skips platform entries).
-            Ok(())
-        } else {
-            self.saved.update(cx, |saved, cx| saved.add(paired.clone(), cx)).unwrap_or_else(gone)
-        };
-        match saved {
-            Ok(()) => {
-                self.busy = false;
-                window.close_dialog(cx);
-                success_toast(
-                    window,
-                    cx,
-                    "Backend added",
-                    "The environment is saved and will reconnect on app startup.",
-                );
-            }
-            Err(error) => {
-                self.unsaved = Some((host, code, paired));
-                self.fail(error, window, cx);
-            }
+            return self.added(window, cx);
         }
+        let saving = self.saved.update(cx, |saved, cx| saved.add(paired.clone(), cx));
+        self.busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = finished(saving).await;
+            drop(this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => this.added(window, cx),
+                Err(error) => {
+                    this.unsaved = Some((host, code, paired));
+                    this.fail(error, window, cx);
+                }
+            }));
+        })
+        .detach();
+    }
+
+    fn added(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.busy = false;
+        window.close_dialog(cx);
+        success_toast(window, cx, "Backend added", "The environment is saved and will reconnect on app startup.");
     }
 
     fn fail(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -641,14 +677,18 @@ struct RenameForm {
 impl RenameForm {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.label.read(cx).value().to_string();
-        let result = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx)).unwrap_or_else(gone);
-        match result {
-            Ok(()) => window.close_dialog(cx),
-            Err(error) => {
-                self.error = Some(error.into());
-                cx.notify();
-            }
-        }
+        let saving = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = finished(saving).await;
+            drop(this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => window.close_dialog(cx),
+                Err(error) => {
+                    this.error = Some(error.into());
+                    cx.notify();
+                }
+            }));
+        })
+        .detach();
     }
 }
 

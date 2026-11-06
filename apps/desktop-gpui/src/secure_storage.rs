@@ -39,7 +39,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, PoisonError};
 
     use super::sealed::{self, Key};
 
@@ -57,15 +57,23 @@ mod imp {
     }
 
     /// Reads the key once per run (macOS may ask the user to allow it); a refusal is not
-    /// cached, so unlocking the keyring later works without a restart.
+    /// cached, so unlocking the keyring later works without a restart. The cache's lock is
+    /// never held across keyring I/O; `LOADING` only keeps two first reads from each storing
+    /// a different new key.
     fn key() -> Result<Key, String> {
         static KEY: Mutex<Option<Key>> = Mutex::new(None);
-        let mut cached = KEY.lock().expect("safe storage key lock poisoned");
-        if let Some(key) = *cached {
+        static LOADING: Mutex<()> = Mutex::new(());
+        // A poisoned lock still guards a whole `Copy` value.
+        let cached = || *KEY.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(key) = cached() {
+            return Ok(key);
+        }
+        let _loading = LOADING.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(key) = cached() {
             return Ok(key);
         }
         let key = load_or_create()?;
-        *cached = Some(key);
+        *KEY.lock().unwrap_or_else(PoisonError::into_inner) = Some(key);
         Ok(key)
     }
 

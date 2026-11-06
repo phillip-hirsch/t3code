@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use futures::channel::oneshot;
 use gpui_kit::{Context, Task};
 
-use crate::environments::{self, Catalog, ConnectionState, Failure, Phase, SavedEnvironment};
+use crate::environments::{self, Catalog, ConnectionState, Credential, Failure, Phase, SavedEnvironment};
 use crate::rpc::{self, ConnectOptions, RpcClient};
 use crate::runtime;
 
@@ -25,29 +26,137 @@ pub(crate) struct Session {
 }
 
 pub(crate) struct SavedEnvironments {
-    catalog: Catalog,
-    /// Why saves are refused: the file could not be read, so saving would destroy it.
-    read_only: Option<String>,
+    /// `None` until the file is read off the UI thread; nothing connects before.
+    catalog: Option<Catalog>,
+    /// The file could not be read, so saving would destroy it.
+    read_only: bool,
+    problem: Option<String>,
+    writes: Writes,
     sessions: HashMap<String, Session>,
     /// The workspace's primary environment. Saved under the same id, it is that session
     /// (`EnvironmentRegistry.register` ignores platform environments), so it gets no socket here.
     primary: Option<String>,
+    _load: Task<()>,
+}
+
+/// Saves run one at a time off the UI thread. Edits made during one are written next as a
+/// single catalog (newest wins), and the shown catalog changes only once its write succeeded.
+#[derive(Default)]
+struct Writes {
+    writing: Option<Batch>,
+    next: Option<Batch>,
+}
+
+/// A catalog to write, and the edits waiting for it to be on disk.
+struct Batch {
+    catalog: Catalog,
+    waiters: Vec<oneshot::Sender<Result<(), String>>>,
+}
+
+impl Writes {
+    /// The newest catalog an edit made, if it is not on disk yet.
+    fn newest(&self) -> Option<&Catalog> {
+        self.next.as_ref().or(self.writing.as_ref()).map(|batch| &batch.catalog)
+    }
+
+    /// Queues the newest catalog; the receiver resolves once it is on disk.
+    fn queue(&mut self, catalog: Catalog) -> oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = oneshot::channel();
+        match &mut self.next {
+            Some(next) => {
+                next.catalog = catalog;
+                next.waiters.push(sender);
+            }
+            None => self.next = Some(Batch { catalog, waiters: vec![sender] }),
+        }
+        receiver
+    }
+
+    /// The catalog to write now, unless a write is running.
+    fn start(&mut self) -> Option<Catalog> {
+        if self.writing.is_some() {
+            return None;
+        }
+        self.writing = self.next.take();
+        self.writing.as_ref().map(|batch| batch.catalog.clone())
+    }
+
+    /// Records how the running write went; returns the catalog it put on disk.
+    fn finish(&mut self, result: Result<(), String>) -> Option<Catalog> {
+        let batch = self.writing.take()?;
+        let (result, waiters) = match (result, &mut self.next) {
+            // The next write carries these edits too, so they wait for it.
+            (Err(_), Some(next)) => {
+                next.waiters.extend(batch.waiters);
+                return None;
+            }
+            (result, _) => (result, batch.waiters),
+        };
+        for waiter in waiters {
+            drop(waiter.send(result.clone()));
+        }
+        result.is_ok().then_some(batch.catalog)
+    }
+}
+
+const GONE: &str = "The environment list is no longer available.";
+
+/// An edit's save: resolves once the edit is on disk, or with the message to show.
+#[must_use = "an edit can still fail to save"]
+pub(crate) struct Saving(Result<oneshot::Receiver<Result<(), String>>, String>);
+
+impl Saving {
+    pub async fn finished(self) -> Result<(), String> {
+        match self.0 {
+            Ok(receiver) => receiver.await.unwrap_or_else(|_| Err(GONE.into())),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl SavedEnvironments {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let opened = Catalog::open();
-        let read_only = opened.read_only.then(|| opened.problem.unwrap_or_default());
-        let mut this = Self { catalog: opened.catalog, read_only, sessions: HashMap::new(), primary: None };
-        let ids: Vec<String> = this.catalog.environments.iter().map(|e| e.environment_id.clone()).collect();
-        for id in ids {
-            this.restart(&id, cx);
+        let load = cx.spawn(async move |this, cx| {
+            let opened = cx.background_executor().spawn(async { Catalog::open() }).await;
+            drop(this.update(cx, |this, cx| {
+                this.read_only = opened.read_only;
+                this.problem = opened.problem;
+                this.commit(opened.catalog, cx);
+            }));
+        });
+        Self {
+            catalog: None,
+            read_only: false,
+            problem: None,
+            writes: Writes::default(),
+            sessions: HashMap::new(),
+            primary: None,
+            _load: load,
         }
-        this
     }
 
+    /// Empty until the catalog is read.
     pub fn environments(&self) -> &[SavedEnvironment] {
-        &self.catalog.environments
+        self.catalog.as_ref().map_or(&[], |catalog| &catalog.environments)
+    }
+
+    fn get(&self, environment_id: &str) -> Option<&SavedEnvironment> {
+        self.catalog.as_ref()?.get(environment_id)
+    }
+
+    /// The catalog is still being read.
+    pub fn loading(&self) -> bool {
+        self.catalog.is_none()
+    }
+
+    /// Edits can be saved: the catalog is read, and saving it destroys nothing.
+    pub fn editable(&self) -> bool {
+        self.catalog.is_some() && !self.read_only
+    }
+
+    /// Why the saved catalog could not be read, for Settings › Environments.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
 
     pub fn session(&self, environment_id: &str) -> Option<&Session> {
@@ -70,67 +179,104 @@ impl SavedEnvironments {
         }
     }
 
-    pub fn local_environment_enabled(&self) -> bool {
-        self.catalog.local_environment_enabled
-    }
-
-    fn save(&self) -> Result<(), String> {
-        self.writable()?;
-        write(&self.catalog)
-    }
-
-    fn writable(&self) -> Result<(), String> {
-        self.read_only.clone().map_or(Ok(()), Err)
+    /// `None` until the catalog is read.
+    pub fn local_environment_enabled(&self) -> Option<bool> {
+        Some(self.catalog.as_ref()?.local_environment_enabled)
     }
 
     /// Saves a paired environment and connects it (`registerPairingConnection`). Lists it only
     /// once it is saved.
-    pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Result<(), String> {
-        let id = environment.environment_id.clone();
-        self.writable()?;
-        let mut catalog = self.catalog.clone();
-        catalog.upsert(environment);
-        write(&catalog)?;
-        self.catalog = catalog;
-        self.restart(&id, cx);
-        cx.notify();
-        Ok(())
+    pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| {
+            catalog.upsert(environment);
+            Ok(())
+        })
     }
 
-    pub fn set_enabled(&mut self, environment_id: &str, enabled: bool, cx: &mut Context<Self>) -> Result<(), String> {
-        let Some(environment) = self.catalog.get_mut(environment_id) else { return Ok(()) };
-        environment.enabled = enabled;
-        self.save()?;
-        self.restart(environment_id, cx);
-        cx.notify();
-        Ok(())
+    pub fn set_enabled(&mut self, environment_id: &str, enabled: bool, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| {
+            if let Some(environment) = catalog.get_mut(environment_id) {
+                environment.enabled = enabled;
+            }
+            Ok(())
+        })
     }
 
-    pub fn rename(&mut self, environment_id: &str, label: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        let label = environments::validate_label(label)?;
-        let Some(environment) = self.catalog.get_mut(environment_id) else { return Ok(()) };
-        environment.label = label;
-        self.save()?;
-        cx.notify();
-        Ok(())
+    pub fn rename(&mut self, environment_id: &str, label: &str, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| {
+            let label = environments::validate_label(label)?;
+            if let Some(environment) = catalog.get_mut(environment_id) {
+                environment.label = label;
+            }
+            Ok(())
+        })
     }
 
     /// Forgets the pairing and credential here; the session on that machine stays until revoked there.
-    pub fn remove(&mut self, environment_id: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        self.sessions.remove(environment_id);
-        self.catalog.environments.retain(|environment| environment.environment_id != environment_id);
-        cx.notify();
-        self.save()
+    pub fn remove(&mut self, environment_id: &str, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| {
+            catalog.environments.retain(|environment| environment.environment_id != environment_id);
+            Ok(())
+        })
     }
 
-    pub fn set_local_environment_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        self.catalog.local_environment_enabled = enabled;
-        self.save()
+    pub fn set_local_environment_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| {
+            catalog.local_environment_enabled = enabled;
+            Ok(())
+        })
+    }
+
+    /// Applies `change` to the newest catalog and queues its write. The shown catalog and the
+    /// connections follow once it is on disk, so a failed save changes nothing.
+    fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Catalog) -> Result<(), &str>) -> Saving {
+        if self.read_only {
+            return Saving(Err(self.problem.clone().unwrap_or_else(|| "Saved environments are read-only.".into())));
+        }
+        let Some(newest) = self.writes.newest().or(self.catalog.as_ref()) else {
+            return Saving(Err("Saved environments are still loading.".into()));
+        };
+        let mut catalog = newest.clone();
+        if let Err(error) = change(&mut catalog) {
+            return Saving(Err(error.to_owned()));
+        }
+        let receiver = self.writes.queue(catalog);
+        self.write_next(cx);
+        Saving(Ok(receiver))
+    }
+
+    fn write_next(&mut self, cx: &mut Context<Self>) {
+        let Some(catalog) = self.writes.start() else { return };
+        // Detached: a started write finishes even if the list is dropped meanwhile.
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { write(&catalog) }).await;
+            drop(this.update(cx, |this, cx| {
+                if let Some(saved) = this.writes.finish(result) {
+                    this.commit(saved, cx);
+                }
+                this.write_next(cx);
+            }));
+        })
+        .detach();
+    }
+
+    /// Shows a catalog that is on disk, restarting the connections it changed.
+    fn commit(&mut self, catalog: Catalog, cx: &mut Context<Self>) {
+        let changed = changed_connections(self.catalog.as_ref(), &catalog);
+        self.catalog = Some(catalog);
+        for (id, saved) in changed {
+            if saved {
+                self.restart(&id, cx);
+            } else {
+                self.sessions.remove(&id);
+            }
+        }
+        cx.notify();
     }
 
     /// Starts an environment's connection loop afresh (startup, switched on, paired again).
     pub fn restart(&mut self, environment_id: &str, cx: &mut Context<Self>) {
-        let Some(environment) = self.catalog.get(environment_id).cloned() else { return };
+        let Some(environment) = self.get(environment_id).cloned() else { return };
         let session = self.sessions.entry(environment_id.to_owned()).or_default();
         session.state = ConnectionState::default();
         session.client = None;
@@ -141,7 +287,7 @@ impl SavedEnvironments {
 
     /// `retryNow`: attempts at once, keeping the failure and attempt count on screen meanwhile.
     pub fn retry(&mut self, environment_id: &str, cx: &mut Context<Self>) {
-        let Some(environment) = self.catalog.get(environment_id).cloned().filter(|e| e.enabled) else { return };
+        let Some(environment) = self.get(environment_id).cloned().filter(|e| e.enabled) else { return };
         if self.is_primary(environment_id) {
             return;
         }
@@ -242,6 +388,26 @@ impl SavedEnvironments {
     }
 }
 
+/// The environments whose connection `current` changes from `previous`: switched, readdressed,
+/// given another credential, added (`true`) or removed (`false`). A rename changes none.
+fn changed_connections(previous: Option<&Catalog>, current: &Catalog) -> Vec<(String, bool)> {
+    fn route(environment: &SavedEnvironment) -> (bool, &str, &Credential) {
+        (environment.enabled, &environment.http_base, &environment.credential)
+    }
+    let before = |id: &str| previous.and_then(|catalog| catalog.get(id)).map(route);
+    let changed = current
+        .environments
+        .iter()
+        .filter(|environment| before(&environment.environment_id) != Some(route(environment)))
+        .map(|environment| (environment.environment_id.clone(), true));
+    let removed = previous
+        .into_iter()
+        .flat_map(|catalog| &catalog.environments)
+        .filter(|environment| current.get(&environment.environment_id).is_none())
+        .map(|environment| (environment.environment_id.clone(), false));
+    changed.chain(removed).collect()
+}
+
 /// A uniform random number in 0..=1 for [`environments::retry_delay_ms`].
 fn jitter() -> f64 {
     f64::from(getrandom::u32().unwrap_or(0)) / f64::from(u32::MAX)
@@ -279,10 +445,83 @@ async fn connect(environment: SavedEnvironment) -> Result<(RpcClient, environmen
     }
 }
 
-/// Writes the catalog; the error is the message to show.
+/// Writes the catalog; the error is the message to show. Blocks on the file and the keyring.
 fn write(catalog: &Catalog) -> Result<(), String> {
     catalog.save().map_err(|error| {
         log::warn!("could not save environments: {error:#}");
         format!("Could not save environments: {error:#}")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn environment(id: &str, enabled: bool) -> SavedEnvironment {
+        SavedEnvironment {
+            environment_id: id.into(),
+            label: id.into(),
+            http_base: format!("https://{id}"),
+            enabled,
+            credential: Credential::Token(format!("token-{id}")),
+        }
+    }
+
+    fn catalog(environments: &[SavedEnvironment]) -> Catalog {
+        let mut catalog = Catalog::default();
+        catalog.environments = environments.to_vec();
+        catalog
+    }
+
+    fn labels(catalog: &Catalog) -> Vec<&str> {
+        catalog.environments.iter().map(|environment| environment.label.as_str()).collect()
+    }
+
+    #[test]
+    fn writes_run_one_at_a_time_and_the_newest_edit_wins() {
+        let mut writes = Writes::default();
+        let mut first = writes.queue(catalog(&[environment("a", true)]));
+        let started = writes.start().unwrap();
+        assert_eq!(labels(&started), ["a"]);
+
+        // Two edits while it runs: only the newest is written next, for both.
+        let mut second = writes.queue(catalog(&[environment("a", true), environment("b", true)]));
+        let mut third = writes.queue(catalog(&[environment("c", true)]));
+        assert_eq!(labels(writes.newest().unwrap()), ["c"]);
+        assert!(writes.start().is_none(), "one write at a time");
+
+        // The first write fails, but the next one carries its edit, so it waits for that.
+        assert!(writes.finish(Err("disk full".into())).is_none());
+        assert_eq!(first.try_recv(), Ok(None));
+        assert_eq!(labels(&writes.start().unwrap()), ["c"]);
+        assert!(writes.start().is_none());
+        assert_eq!(labels(&writes.finish(Ok(())).unwrap()), ["c"]);
+        for receiver in [&mut first, &mut second, &mut third] {
+            assert_eq!(receiver.try_recv(), Ok(Some(Ok(()))));
+        }
+        assert!(writes.newest().is_none() && writes.start().is_none());
+
+        // A failure with nothing queued after it is the edit's answer, and shows nothing new.
+        let mut failed = writes.queue(catalog(&[]));
+        writes.start().unwrap();
+        assert!(writes.finish(Err("denied".into())).is_none());
+        assert_eq!(failed.try_recv(), Ok(Some(Err("denied".into()))));
+        assert!(writes.newest().is_none());
+    }
+
+    #[test]
+    fn only_connection_changes_restart_a_connection() {
+        let a = environment("a", true);
+        let before = catalog(&[a.clone(), environment("b", true), environment("c", false)]);
+        assert_eq!(changed_connections(None, &before), [("a".into(), true), ("b".into(), true), ("c".into(), true)]);
+
+        let renamed = SavedEnvironment { label: "Renamed".into(), ..a.clone() };
+        let repaired = SavedEnvironment { credential: Credential::Token("new".into()), ..environment("b", true) };
+        let after = catalog(&[renamed, repaired, environment("c", true), environment("d", true)]);
+        assert_eq!(
+            changed_connections(Some(&before), &after),
+            [("b".into(), true), ("c".into(), true), ("d".into(), true)]
+        );
+        assert_eq!(changed_connections(Some(&before), &catalog(&[a])), [("b".into(), false), ("c".into(), false)]);
+    }
 }
