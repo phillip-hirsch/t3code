@@ -164,18 +164,22 @@ impl Workspace {
         if project_scope {
             let options = CLEANUP_MODES.iter().map(|(id, label)| (*id, (*label).into(), *id == mode)).collect();
             let label = CLEANUP_MODES.iter().find(|(id, _)| *id == mode).map_or("", |(_, label)| label);
-            let select =
-                self.menu_select("worktree-cleanup-mode", options, label, 0., cx, |this, mode: &str, window, cx| {
-                    match mode {
-                        "inherit" => this.clear_setting_overrides(&["worktreeCleanup"], window, cx),
-                        "off" => this.update_settings(json!({ "worktreeCleanup": { "mode": "off" } }), window, cx),
-                        _ => this.update_settings(
-                            json!({ "worktreeCleanup": { "mode": "custom", "rules": {} } }),
-                            window,
-                            cx,
-                        ),
-                    }
-                });
+            let select = self.row_menu_select(
+                "worktree-cleanup-mode",
+                options,
+                label,
+                0.,
+                cx,
+                |this, mode: &str, window, cx| match mode {
+                    "inherit" => this.clear_setting_overrides(&["worktreeCleanup"], window, cx),
+                    "off" => this.update_settings(json!({ "worktreeCleanup": { "mode": "off" } }), window, cx),
+                    _ => this.update_settings(
+                        json!({ "worktreeCleanup": { "mode": "custom", "rules": {} } }),
+                        window,
+                        cx,
+                    ),
+                },
+            );
             rows.push(
                 self.setting_row(
                     view,

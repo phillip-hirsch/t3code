@@ -11,7 +11,7 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::super::widgets::{select_trigger, switch};
+use super::super::widgets::{ROW_SELECT_MIN_WIDTH, select_trigger, switch};
 use super::ui::{text_sm, text_xs};
 use crate::app::Workspace;
 use crate::load_balancing::{self, PREFERENCES};
@@ -135,6 +135,7 @@ impl Workspace {
         let view = cx.entity();
         let (id, current) = (machine.id.clone(), weights.as_object().cloned().unwrap_or_default());
         let trigger = select_trigger(&trigger_id, load_balancing::preference_label(preference), 128., t)
+            .min_w(px(ROW_SELECT_MIN_WIDTH))
             .when(!enabled, |button| button.opacity(0.5))
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
                 for (value, label) in PREFERENCES {

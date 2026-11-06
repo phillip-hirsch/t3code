@@ -1182,6 +1182,7 @@ impl Workspace {
                 };
                 let workspace = cx.entity();
                 select_trigger(id, label, width, &t)
+                    .min_w(px(ROW_SELECT_MIN_WIDTH))
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                         for (value, label) in options {
                             let picked = (*value).to_owned();
@@ -1243,7 +1244,7 @@ impl Workspace {
     ) -> AnyElement {
         let current = current.clone();
         let options = options.into_iter().map(|(value, label)| (value.clone(), label, value == current)).collect();
-        self.menu_select(id, options, trigger, width, cx, move |this, value, window, cx| {
+        self.row_menu_select(id, options, trigger, width, cx, move |this, value, window, cx| {
             this.update_settings(serde_json::json!({ key: value }), window, cx);
         })
     }
@@ -1258,10 +1259,33 @@ impl Workspace {
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let t = *theme::tokens(cx);
+        let trigger = select_trigger(&id.into(), trigger, width, theme::tokens(cx));
+        Self::with_select_menu(trigger, options, cx, on_pick)
+    }
+
+    /// [`Self::menu_select`] in a row's control, at least [`ROW_SELECT_MIN_WIDTH`] wide.
+    pub(in crate::app) fn row_menu_select<T: Clone + 'static>(
+        &self,
+        id: impl Into<SharedString>,
+        options: Vec<(T, SharedString, bool)>,
+        trigger: impl IntoElement,
+        width: f32,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let trigger = select_trigger(&id.into(), trigger, width, theme::tokens(cx)).min_w(px(ROW_SELECT_MIN_WIDTH));
+        Self::with_select_menu(trigger, options, cx, on_pick)
+    }
+
+    fn with_select_menu<T: Clone + 'static>(
+        trigger: Button,
+        options: Vec<(T, SharedString, bool)>,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         let workspace = cx.entity();
         let on_pick = Rc::new(on_pick);
-        select_trigger(&id.into(), trigger, width, &t)
+        trigger
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                 for (value, label, checked) in &options {
                     let (value, on_pick) = (value.clone(), on_pick.clone());
@@ -1528,6 +1552,9 @@ pub(in crate::app) fn switch(
         })
         .child(div().size(px(14.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
 }
+
+/// `SettingsRow` gives a select in its control at least `min-w-40`.
+pub(in crate::app) const ROW_SELECT_MIN_WIDTH: f32 = 160.;
 
 /// The web's `SelectTrigger size="sm"`.
 pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement, width: f32, t: &Tokens) -> Button {

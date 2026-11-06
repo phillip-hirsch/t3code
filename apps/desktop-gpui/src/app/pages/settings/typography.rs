@@ -205,7 +205,7 @@ impl Workspace {
         let size_key = row.size_key;
         let sizes =
             (row.sizes.0..=row.sizes.1).map(|px| (px, SharedString::from(format!("{px} px")), px == size)).collect();
-        let size_select = self.menu_select(
+        let size_select = self.row_menu_select(
             format!("{}-size", row.id),
             sizes,
             format!("{size} px"),

@@ -36,17 +36,17 @@ use crate::theme::{self, Tokens};
 
 const GUEST_LINKS: &[Part] = &[
     Part::Text(
-        "Share a thread with a guest who watches it live in their browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
+        "Share a thread with a guest who watches it live in a browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
     ),
     Part::Section("Sharing & access", "access"),
-    Part::Text(". While it is off, every guest link stops working."),
+    Part::Text(". Turning it off stops every guest link."),
 ];
 const LINKED_ENVIRONMENTS: &[Part] = &[
     Part::Text(
         "Let agents here work on your other machines, and theirs here. Turn it on for each machine, then link them in ",
     ),
     Part::Section("Connections", "connections"),
-    Part::Text(". While it is off, nothing new starts over a link; tasks already running finish."),
+    Part::Text(". While off, nothing new starts over a link; running tasks finish."),
 ];
 const SIMLOCK: &[Part] = &[
     Part::Text("Let the Device panel lease simulators and emulators from your own "),
