@@ -108,6 +108,8 @@ struct PanelState {
     user_revision: u64,
     /// The turn whose diff was last offered on its own (`proactiveDiffTurnId`).
     proactive_diff_run: Option<String>,
+    /// The panel fills the row and the chat column steps aside (`maximized`), kept per thread.
+    maximized: bool,
 }
 
 impl PanelState {
@@ -274,6 +276,8 @@ pub(super) struct RightPanel {
     commits: Vec<Commit>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
+    /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
+    diff_refs: ScrollHandle,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
     /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
@@ -320,6 +324,7 @@ impl RightPanel {
             refresh: 0,
             commits: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
+            diff_refs: ScrollHandle::new(),
             revealed_tab: None,
             observation: None,
             observed_pull_requests: HashMap::new(),
@@ -366,14 +371,34 @@ impl Workspace {
         self.panel_state().filter(|panel| panel.open && self.page.is_none())?.active.as_ref()
     }
 
-    /// The panel's laid-out width while it is open.
+    /// The panel's laid-out width while it is open; maximized, the whole row.
     pub(super) fn right_panel_width(&self, window: &Window) -> Option<f32> {
         if !self.right_panel_open() {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
         let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        if self.right_panel_maximized() {
+            return Some(viewport - sidebar - f32::from(RIGHT_RESIZE_INSET));
+        }
         Some(clamp_width(self.right_panel.width, viewport, viewport - sidebar))
+    }
+
+    /// `rightPanelMaximized`: only an open panel counts as maximized.
+    pub(super) fn right_panel_maximized(&self) -> bool {
+        self.right_panel_open() && self.panel_state().is_some_and(|panel| panel.maximized)
+    }
+
+    /// `rightPanel.toggleMaximized` and the titlebar's maximize toggle; not a panel choice.
+    pub(super) fn toggle_right_panel_maximized(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.right_panel_open() {
+            return false;
+        }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.maximized = !panel.maximized;
+            cx.notify();
+        }
+        true
     }
 
     /// `toggleRightPanel` (Ctrl+Alt+B and the titlebar toggle).
@@ -1048,7 +1073,7 @@ impl Workspace {
             }
         }
         let content = match (&panel.active, self.target.clone()) {
-            (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, cx),
+            (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, window, cx),
             (Some(Surface::Browser(tab)), Some(Target::Thread { id: thread_id, .. })) => {
                 self.render_browser_surface(&thread_id, tab, width, window, cx)
             }
@@ -1105,7 +1130,12 @@ impl Workspace {
                     this.right_panel.width = clamp_width(this.right_panel.width, viewport, viewport - sidebar);
                     cx.notify();
                 }))
-                .child(self.render_tab_bar(&panel, &tokens, cx))
+                .child({
+                    // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
+                    let inset = (panel.maximized && !self.sidebar_open)
+                        .then(|| super::titlebar::collapsed_content_left(window));
+                    self.render_tab_bar(&panel, inset, &tokens, cx)
+                })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
                 .child(deferred(handle).with_priority(1))
                 .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
@@ -1119,7 +1149,13 @@ impl Workspace {
     }
 
     /// The 40px tab strip, a drag region clear of the panel toggles and caption buttons.
-    fn render_tab_bar(&self, panel: &PanelState, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(
+        &self,
+        panel: &PanelState,
+        left_inset: Option<Pixels>,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // `wco:pr-(--workspace-native-controls-inset)` plus the `w-24` spacer for the toggles.
         let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
         let view = cx.entity();
@@ -1133,8 +1169,14 @@ impl Workspace {
             .iter()
             .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, cx))
             .collect();
-        let tab_bar =
-            h_flex().id("right-panel-tabbar").h(TITLEBAR_HEIGHT).flex_none().min_w_0().pl_2().pr(reserve).gap_1();
+        let tab_bar = h_flex()
+            .id("right-panel-tabbar")
+            .h(TITLEBAR_HEIGHT)
+            .flex_none()
+            .min_w_0()
+            .pl(left_inset.unwrap_or(px(8.)))
+            .pr(reserve)
+            .gap_1();
         super::titlebar::drag_region(tab_bar)
             .child(
                 h_flex()
@@ -1540,7 +1582,13 @@ impl Workspace {
     }
 
     /// `DiffPanel` embedded in the inline panel: the scope menu and view toggles, then the patch.
-    fn render_diff_surface(&self, scope: &DiffScope, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_diff_surface(
+        &self,
+        scope: &DiffScope,
+        tokens: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let turns = self.open_projection().map(turn_summaries).unwrap_or_default();
         let latest = turns.first().map(|t| t.run_id.clone());
         let scope = match scope {
@@ -1663,7 +1711,13 @@ impl Workspace {
                 .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()))
                 .unwrap_or_else(|| "HEAD".into());
             let base = base.or_else(|| self.diff_base_ref().map(str::to_owned)).unwrap_or_else(|| "Automatic".into());
-            self.render_base_ref_picker(&head, &base, tokens, cx)
+            // Under 20rem the head drops out and the base reads "vs …"; unmeasured, wait a frame.
+            let refs_width = self.right_panel.diff_refs.bounds().size.width;
+            if refs_width <= px(0.) {
+                window.request_animation_frame();
+            }
+            let narrow = refs_width < window.rem_size() * 20.;
+            self.render_base_ref_picker(&head, &base, narrow, tokens, window, cx)
         });
         let can_refresh = !matches!(scope, DiffScope::Turn(_));
         let (shows_files, all_collapsed) = {
@@ -1681,7 +1735,16 @@ impl Workspace {
             .px_2()
             .gap_2()
             .justify_between()
-            .child(h_flex().flex_1().min_w_0().gap_3().child(scope_menu).children(refs))
+            .child(
+                h_flex()
+                    .id("diff-refs-area")
+                    .track_scroll(&self.right_panel.diff_refs)
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .child(scope_menu)
+                    .children(refs),
+            )
             .child(
                 h_flex()
                     .flex_none()
