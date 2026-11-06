@@ -22,7 +22,6 @@ use gpui_kit::{
 
 use gpui_kit::assets::IconName;
 
-use super::palette::View;
 use super::{Target, Workspace, message_actions};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
@@ -432,7 +431,7 @@ impl Workspace {
         let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
             inline_button("draft-project-picker", label, t.foreground, t.foreground)
                 .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
-                .on_click(cx.listener(|this, _, window, cx| this.open_palette(View::NewThreadIn, window, cx)))
+                .on_click(cx.listener(|this, _, window, cx| this.open_draft_project_picker(window, cx)))
         };
         let title = |el: gpui_kit::Div| {
             el.w_full().text_size(title_size).line_height(rems(2.25)).text_color(t.foreground).justify_center()

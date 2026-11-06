@@ -180,6 +180,8 @@ pub(super) struct Palette {
     dark: bool,
     /// The root view's Threads group, ranked once per query and shell change.
     threads: Option<ThreadRanking>,
+    /// Opened from the draft hero: a picked project takes the composed draft along.
+    moves_draft: bool,
     _subscription: Subscription,
 }
 
@@ -273,6 +275,7 @@ impl Workspace {
             placeholder: "",
             dark: crate::theme::tokens(cx).dark,
             threads: None,
+            moves_draft: false,
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -1003,6 +1006,26 @@ impl Workspace {
             .or_else(|| Some(query.trim().to_owned()))
     }
 
+    /// `DraftHeroHeadline`'s project picker.
+    pub(super) fn open_draft_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(View::NewThreadIn, window, cx);
+        if let Some(palette) = self.palette.as_mut() {
+            palette.moves_draft = true;
+        }
+    }
+
+    /// `selectProject`: a draft with content moves to the project; an empty one opens the project's draft,
+    /// since retargeting it would overwrite that one.
+    fn select_draft_project(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let composed = !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
+        match self.project_environment(&project_id) {
+            Some(env) if composed && matches!(self.target, Some(Target::Draft { .. })) => {
+                self.retarget_draft(env, project_id, cx);
+            }
+            _ => self.start_draft(project_id, window, cx),
+        }
+    }
+
     fn run_palette_row(&mut self, run: Run, window: &mut Window, cx: &mut Context<Self>) {
         match run {
             Run::Open(view) => return self.push_palette_view(view, window, cx),
@@ -1013,8 +1036,10 @@ impl Workspace {
             }
             _ => {}
         }
+        let moves_draft = self.palette.as_ref().is_some_and(|p| p.moves_draft);
         self.close_palette(window, cx);
         match run {
+            Run::NewThread(project_id) if moves_draft => self.select_draft_project(project_id, window, cx),
             Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
