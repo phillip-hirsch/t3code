@@ -597,6 +597,30 @@ impl Workspace {
         DEFAULT_PLACEHOLDER
     }
 
+    /// `data-chat-composer-overlay`: the composer floats over the transcript's end, which scrolls
+    /// on beneath it; its measured height becomes the transcript's end inset.
+    pub(super) fn render_floating_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .on_children_prepainted(move |bounds, _, cx| {
+                let Some(height) = bounds.first().map(|b| f32::from(b.size.height).ceil()) else { return };
+                let view = view.clone();
+                cx.defer(move |cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        if (this.composer_height - height).abs() >= 1. {
+                            this.composer_height = height;
+                            cx.notify();
+                        }
+                    });
+                });
+            })
+            .child(self.render_composer(window, cx))
+    }
+
     pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (lane, _) = self.chat_layout(window);
         let t = *tokens(cx);
@@ -675,9 +699,14 @@ impl Workspace {
                     }))
                     .child(self.render_footer(&t, cx))
             });
-        div().w_full().flex_none().pt(px(8.)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
+        // The draft hero centers the bare stack; under a thread the overlay keeps `sm:pt-2`.
+        let top = if matches!(self.target, Some(Target::Draft { .. })) { 0. } else { 8. };
+        div().w_full().flex_none().pt(px(top)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
             v_flex()
+                .id("composer-stack")
                 .w_full()
+                // Only the stack takes the pointer; the transcript shows and scrolls around it.
+                .occlude()
                 .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
                 .children(self.render_banner_dock(&t, cx))
                 .child(

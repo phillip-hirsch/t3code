@@ -47,18 +47,31 @@ impl Workspace {
             (None, _) => no_thread(&t),
             // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
             (Some(Target::Draft { .. }), _) => div().into_any_element(),
-            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => {
-                centered_note("Loading thread…", &t)
-            }
-            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => {
-                centered_note("Send a message to start the conversation.", &t)
-            }
+            // `emptyPlaceholderInset`: the notes center in the space the composer leaves.
+            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Loading thread…", &t))
+                .into_any_element(),
+            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Send a message to start the conversation.", &t))
+                .into_any_element(),
             (Some(Target::Thread { .. }), _) => {
                 let rows = self.rows.clone();
                 let this = cx.weak_entity();
-                let background = t.background;
                 let minimap = self.render_minimap(lane.left, window, cx);
                 let lane_width = lane.width;
+                let composer = self.composer_height;
+                // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
+                let pill_offset = lane.left - lane.right;
+                let mut jump_style = StyleRefinement::default().mb(px(composer - 6.));
+                if pill_offset > 0. {
+                    jump_style = jump_style.ml(px(pill_offset));
+                } else if pill_offset < 0. {
+                    jump_style = jump_style.mr(px(-pill_offset));
+                }
                 div()
                     .flex_1()
                     .min_h_0()
@@ -73,12 +86,16 @@ impl Workspace {
                         // Top spacer `h-4`; rows carry their own bottom space.
                         // The list's side padding becomes every row's inset: that is the lane.
                         .with_list_style(
-                            StyleRefinement::default().pt(px(16.)).pb(px(16.)).pl(px(lane.left)).pr(px(lane.right)),
+                            StyleRefinement::default()
+                                .pt(px(16.))
+                                .pb(px(16. + composer))
+                                .pl(px(lane.left))
+                                .pr(px(lane.right)),
                         )
                         .with_row_style(StyleRefinement::default().pb(px(0.)))
                         .with_jump_button_label("Scroll to end")
-                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t))
-                        .with_bottom_fade(background),
+                        .with_jump_button_style(jump_style)
+                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
                     )
                     .children(minimap)
                     .children(self.render_chat_menu())
