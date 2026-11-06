@@ -27,11 +27,12 @@ use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Map, Value};
 
 use super::code::projects::icon::project_icon;
+use super::connections::logic::machine_icon;
 use crate::app::{Workspace, project_name};
 use crate::project_groups::ProjectGroup;
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
@@ -44,6 +45,10 @@ pub(in crate::app) struct SettingsView {
     pub(in crate::app) targets: Vec<Target>,
     /// Settings' project groups, archived ones included (`useSettingsProjectGroups`).
     pub(in crate::app) groups: Vec<ProjectGroup>,
+    /// The scope sentence's picks, narrowed to one environment on a single-environment page.
+    pub(in crate::app) search: scope::ScopeSearch,
+    /// Whether the page edits one environment at a time (`singleEnvironment`).
+    single_environment: bool,
     /// The environments the scope can pick, the primary first.
     environments: Vec<ViewEnvironment>,
     client: Settings,
@@ -53,6 +58,8 @@ pub(in crate::app) struct SettingsView {
 struct ViewEnvironment {
     id: String,
     label: String,
+    /// `resolveEnvironmentMachineKind`, for its `EnvironmentMachineIcon`.
+    machine: String,
     /// `None` while disconnected.
     settings: Option<Settings>,
 }
@@ -563,6 +570,7 @@ impl Workspace {
                 let info = &session.server_info;
                 Some(ViewEnvironment {
                     label: info.environment_label.clone().unwrap_or_else(|| id.clone()),
+                    machine: info.machine_kind().to_owned(),
                     settings: session.is_connected().then(|| info.settings.clone()),
                     id,
                 })
@@ -572,13 +580,21 @@ impl Workspace {
             scope: Scope { kind: ScopeKind::All, label: String::new(), environment_ids: Vec::new() },
             targets: Vec::new(),
             groups,
+            search: self.settings_ui.scope.clone(),
+            single_environment: matches!(self.settings.as_deref(), Some("providers" | "secrets")),
             environments,
             client: self.client_settings.values.clone(),
         };
         let environments = view.environments();
-        let scope = scope::resolve(&self.settings_ui.scope, &scope_groups, &environments);
+        let search = if view.single_environment {
+            scope::single_environment(&self.settings_ui.scope, &scope_groups, &environments)
+        } else {
+            self.settings_ui.scope.clone()
+        };
+        let scope = scope::resolve(&search, &scope_groups, &environments);
         let targets = scope::targets(&scope, &environments);
         drop(environments);
+        view.search = search;
         view.scope = scope;
         view.targets = targets;
         view
@@ -1377,7 +1393,8 @@ impl Workspace {
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
     pub(super) fn render_scope_sentence(&self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let search = self.settings_ui.scope.clone();
+        let search = view.search.clone();
+        let single = view.single_environment;
         let workspace = cx.entity();
         let selected = search.project.as_ref().and_then(|key| view.groups.iter().find(|g| &g.key == key));
         let project_label = match (&search.project, selected) {
@@ -1385,13 +1402,21 @@ impl Workspace {
             (Some(_), None) => "Unavailable project".to_owned(),
             (None, None) => "All projects".to_owned(),
         };
-        let environment_label = match &search.machine {
-            Some(id) => view.environment_by_id(id).map_or("Unavailable environment", |e| e.label).to_owned(),
-            None => "All environments".to_owned(),
+        let selected_environment =
+            search.machine.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
+        let environment_label = match (&search.machine, selected_environment) {
+            (_, Some(environment)) => environment.label.clone(),
+            (Some(_), None) => "Unavailable environment".to_owned(),
+            (None, None) if single => "No environments".to_owned(),
+            (None, None) => "All environments".to_owned(),
         };
+        let machine_glyph = |machine: &str, t: &Tokens| {
+            svg().path(machine_icon(machine)).size(px(14.)).flex_none().text_color(t.foreground).into_any_element()
+        };
+        let environment_icon = selected_environment.map(|e| machine_glyph(&e.machine, &t));
         let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
-        let environments: Vec<(String, String)> =
-            view.environments.iter().map(|e| (e.id.clone(), e.label.clone())).collect();
+        let environments: Vec<(String, String, String)> =
+            view.environments.iter().map(|e| (e.id.clone(), e.label.clone(), e.machine.clone())).collect();
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 workspace.update(cx, |this, cx| {
@@ -1458,26 +1483,28 @@ impl Workspace {
         };
         let environment_menu = {
             let (search, workspace) = (search.clone(), workspace);
-            scope_trigger("settings-scope-environment", None, environment_label, &t).dropdown_menu_with_anchor(
-                gpui_kit::Anchor::TopLeft,
-                move |menu, _, _| {
-                    let mut menu = menu
-                        .item(
-                            PopupMenuItem::new("All environments")
-                                .checked(search.machine.is_none())
-                                .on_click(pick(workspace.clone(), search.with_machine(None))),
-                        )
-                        .separator();
-                    for (id, label) in &environments {
+            scope_trigger("settings-scope-environment", environment_icon, environment_label, &t)
+                .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
+                    if !single {
+                        menu = menu
+                            .item(
+                                PopupMenuItem::new("All environments")
+                                    .icon(IconName::Layers)
+                                    .checked(search.machine.is_none())
+                                    .on_click(pick(workspace.clone(), search.with_machine(None))),
+                            )
+                            .separator();
+                    }
+                    for (id, label, machine) in &environments {
                         menu = menu.item(
                             PopupMenuItem::new(label.clone())
+                                .icon(Icon::empty().path(machine_icon(machine)))
                                 .checked(search.machine.as_deref() == Some(id.as_str()))
                                 .on_click(pick(workspace.clone(), search.with_machine(Some(id.clone())))),
                         );
                     }
                     menu
-                },
-            )
+                })
         };
         let joiner = if search.machine.is_some() { "on" } else { "across" };
         h_flex()

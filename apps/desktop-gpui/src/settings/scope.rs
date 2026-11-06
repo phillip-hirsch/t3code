@@ -129,6 +129,25 @@ pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environme
     }
 }
 
+/// `selectSingleEnvironmentScope`: a page that edits one environment (Providers, Secrets)
+/// narrows "all" to the primary among the selected environments, else a connected one, else
+/// the first. `environments` lists the primary first.
+pub fn single_environment(search: &ScopeSearch, groups: &[Group], environments: &[Environment]) -> ScopeSearch {
+    let scope = resolve(search, groups, environments);
+    if search.machine.is_some() || matches!(scope.kind, ScopeKind::Unavailable { .. }) {
+        return search.clone();
+    }
+    let candidates: Vec<&Environment> =
+        environments.iter().filter(|e| scope.environment_ids.iter().any(|id| id == e.id)).collect();
+    let primary = environments.first().map(|e| e.id);
+    let selected = candidates
+        .iter()
+        .find(|e| Some(e.id) == primary)
+        .or_else(|| candidates.iter().find(|e| e.settings.is_some()))
+        .or(candidates.first());
+    selected.map_or_else(|| search.clone(), |e| search.with_machine(Some(e.id.to_owned())))
+}
+
 /// The selected environments that are connected, in the given order (`connectedEnvironments`).
 fn connected<'s, 'env>(
     scope: &'s Scope,
@@ -797,6 +816,25 @@ mod tests {
 
     fn search(project: Option<&str>, machine: Option<&str>) -> ScopeSearch {
         ScopeSearch { project: project.map(Into::into), machine: machine.map(Into::into) }
+    }
+
+    #[test]
+    fn single_environment_pages_pick_the_primary_then_a_connected_one() {
+        let s = settings(json!({}));
+        let primary = Environment { settings: None, ..env(&s) };
+        let laptop = Environment { id: "env-2", label: "Laptop", settings: Some(&s) };
+        let single = |search: &ScopeSearch, groups: &[Group], environments: &[Environment]| {
+            single_environment(search, groups, environments).machine
+        };
+        assert_eq!(single(&search(None, None), &[], &[primary, laptop]).as_deref(), Some("env-1"), "even offline");
+        assert_eq!(single(&search(None, Some("env-2")), &[], &[primary, laptop]).as_deref(), Some("env-2"));
+        let mut remote = group(&["p1"]);
+        remote.members[0].environment_id = "env-2".into();
+        let other = Environment { id: "env-3", label: "Cloud", settings: None };
+        let environments = [primary, other, laptop];
+        assert_eq!(single(&search(Some("p1"), None), &[remote], &environments).as_deref(), Some("env-2"));
+        assert_eq!(single(&search(Some("gone"), None), &[], &environments), None, "unavailable stays");
+        assert_eq!(single(&search(None, None), &[], &[]), None);
     }
 
     #[test]
