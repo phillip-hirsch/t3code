@@ -1638,7 +1638,7 @@ pub fn rows(
             let Some(work) = entry.work() else { break };
             let breaks = work.tone == Tone::Error
                 || work.activity == Some(Activity::Error)
-                || matches!(work.item_type.as_ref(), "system_notice" | "notification")
+                || matches!(work.item_type.as_ref(), "system_notice" | "notification" | "todo_list")
                 || work.question_answered
                 || is_pending(work)
                 || !is_active_response(work.run_id.as_ref())
@@ -1808,7 +1808,7 @@ pub fn rows(
                     (e.item_type == "error" && e.status == Some(Status::Failed))
                         || e.tone == Tone::Error
                         || e.activity == Some(Activity::Error)
-                        || matches!(e.item_type.as_ref(), "system_notice" | "notification")
+                        || matches!(e.item_type.as_ref(), "system_notice" | "notification" | "todo_list")
                         || e.question_answered
                         || is_pending(e)
                 };
@@ -2388,6 +2388,30 @@ mod tests {
         assert_eq!(
             describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "thinking"]
+        );
+    }
+
+    #[test]
+    fn an_unfinished_task_update_stays_static() {
+        let at = "2026-11-06T00:00:00.000Z";
+        let steps = json!({"steps": [{"text": "Inspect the captures", "status": "running"}]});
+        let mut tasks = item("tasks", "todo_list", "r", at, steps);
+        tasks["status"] = json!("running");
+        let commentary = item("commentary", "assistant_message", "r", at, json!({"text": "Checking the rendering."}));
+        let mut tool = command("tool", "r", at);
+        tool["status"] = json!("running");
+        let user = item("u", "user_message", "r", at, json!({"text": "go", "inputIntent": "turn_start"}));
+        let runs = json!([{"id": "r", "status": "running", "startedAt": at}]);
+        let derive = |items: Vec<Value>| {
+            let p = projection(items, runs.clone());
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()))
+        };
+        let task = "work Tasks 0/1 · Inspect the captures";
+        assert_eq!(derive(vec![user.clone(), tasks.clone()])[1..], ["working", task, "thinking"]);
+        assert_eq!(derive(vec![user.clone(), tasks.clone(), tool.clone()])[1..], ["working", task, "live Running ls"]);
+        assert_eq!(
+            derive(vec![user, tasks, commentary, tool])[1..],
+            ["working", task, "assistant Checking the rendering.", "live Running ls"]
         );
     }
 
