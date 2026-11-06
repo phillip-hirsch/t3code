@@ -1020,7 +1020,7 @@ impl Workspace {
         let composed = !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
         match self.project_environment(&project_id) {
             Some(env) if composed && matches!(self.target, Some(Target::Draft { .. })) => {
-                self.retarget_draft(env, project_id, cx);
+                self.move_draft_to_project(env, project_id, window, cx);
             }
             _ => self.start_draft(project_id, window, cx),
         }

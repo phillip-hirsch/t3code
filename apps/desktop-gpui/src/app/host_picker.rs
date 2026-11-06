@@ -182,10 +182,30 @@ impl Workspace {
             return;
         }
         self.target = Some(Target::Draft { env, project_id });
+        self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
         self.model_override = None;
         self.notify_sidebar(cx);
         cx.notify();
+    }
+
+    /// `selectProject` for a draft with content: it moves to the project and keeps an explicit model.
+    /// A project that already holds an unsent draft keeps it, and that draft opens instead.
+    pub(super) fn move_draft_to_project(
+        &mut self,
+        env: SharedString,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = Target::Draft { env: env.clone(), project_id: project_id.clone() };
+        if self.composer_drafts.contains_key(&destination) || self.target.as_ref() == Some(&destination) {
+            self.start_draft_in(env, project_id, window, cx);
+            return;
+        }
+        let model = self.model_override.take();
+        self.retarget_draft(env, project_id, cx);
+        self.model_override = model;
     }
 
     fn open_scratch_then_retarget(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
