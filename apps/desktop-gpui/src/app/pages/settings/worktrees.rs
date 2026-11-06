@@ -58,7 +58,8 @@ impl Workspace {
                 cx,
                 |this, text, window, cx| this.update_settings(json!({ "worktreesDirectory": text }), window, cx),
             )
-            .sized(px(288.))
+            // The web's `Input` has no width here: a text input's default 20 characters.
+            .sized(px(168.))
         });
         let submodules = view.str("worktreeSubmodules");
         let submodules = if submodules.is_empty() { "recursive" } else { submodules };
