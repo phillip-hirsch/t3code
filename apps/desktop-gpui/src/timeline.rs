@@ -1556,6 +1556,35 @@ fn shown_entries(
     }
 }
 
+/// `settleSupersededReasoning`: a reasoning item still in progress with anything after it has
+/// been superseded, so it reads as finished; only the last entry can still be thinking.
+fn settle_superseded_reasoning(entries: Vec<Rc<TimelineEntry>>) -> Vec<Rc<TimelineEntry>> {
+    let last = entries.len().saturating_sub(1);
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| match entry.work() {
+            Some(work) if index < last && work.is_reasoning() && work.status == Some(Status::InProgress) => {
+                let settled = Entry { status: Some(Status::Completed), ..(**work).clone() };
+                Rc::new(TimelineEntry {
+                    id: entry.id.clone(),
+                    run_id: entry.run_id.clone(),
+                    created_at: entry.created_at.clone(),
+                    end: entry.end.clone(),
+                    failure: entry.failure.clone(),
+                    status: entry.status.clone(),
+                    source_thread_id: entry.source_thread_id.clone(),
+                    inherited: entry.inherited,
+                    node_id: entry.node_id.clone(),
+                    completed_at: entry.completed_at.clone(),
+                    kind: Kind::Work(Rc::new(settled)),
+                })
+            }
+            _ => entry,
+        })
+        .collect()
+}
+
 /// The chat rows for a thread. `expanded` holds the keys of open groups,
 /// folds and entries ([`group_key`], [`fold_key`], [`entry_key`]).
 pub fn rows(
@@ -1585,7 +1614,7 @@ pub fn rows(
     let preview = (zen && is_working).then(|| live_answer_preview(&all)).flatten();
     let answering = is_working && !turn_ended;
     let answering_run = unsettled.as_ref().filter(|_| answering);
-    let entries = shown_entries(all, visibility, answering, answering_run, is_pending);
+    let entries = settle_superseded_reasoning(shown_entries(all, visibility, answering, answering_run, is_pending));
     let terminal = terminal_assistant_messages(&entries);
 
     let mut failed_runs: HashSet<SharedString> = HashSet::new();
@@ -2411,6 +2440,25 @@ mod tests {
         assert_eq!(
             describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
             ["user go", "working", "assistant looking", "thinking"]
+        );
+    }
+
+    #[test]
+    fn reasoning_superseded_by_later_work_is_settled() {
+        let mut items = turn("r1")[..2].to_vec();
+        items.push(item(
+            "r1-t",
+            "reasoning",
+            "r1",
+            "2026-11-04T10:00:02.000Z",
+            json!({"text": "hmm", "status": "running"}),
+        ));
+        items.push(command("r1-c1", "r1", "2026-11-04T10:00:03.000Z"));
+        let p = projection(items, json!([{"id": "r1", "status": "running"}]));
+        // A thought still marked in progress under a finished command no longer holds the live row.
+        assert_eq!(
+            describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default())),
+            ["user go", "working", "assistant looking", "live Running ls"]
         );
     }
 
