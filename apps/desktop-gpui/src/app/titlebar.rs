@@ -172,11 +172,23 @@ impl Workspace {
             .h(TITLEBAR_HEIGHT)
             .child(self.render_sidebar_toggle(window, cx))
             .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
+    }
+
+    /// The drawn window buttons, above Settings, dialogs and toasts as Electron's native ones are;
+    /// only popups and tooltips, which close on the click, draw over them.
+    pub(super) fn render_caption_overlay(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let bar = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(TITLEBAR_HEIGHT)
             .when(cfg!(windows), |el| el.child(render_caption_buttons(window, cx)))
             .when(
                 cfg!(target_os = "linux") && matches!(window.window_decorations(), Decorations::Client { .. }),
                 |el| el.child(render_linux_caption_buttons(window, cx)),
-            )
+            );
+        gpui_kit::deferred(bar).with_priority(gpui_kit::base::POPUP_PRIORITY - 1).into_any_element()
     }
 
     /// `SidebarTrigger` in its `ghost` variant: we draw no stage art behind it.
