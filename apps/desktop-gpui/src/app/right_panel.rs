@@ -5,6 +5,7 @@
 //! device surface is not native, so the launcher leaves it out.
 
 mod diff_base;
+mod diff_load;
 mod diff_tree;
 
 use std::collections::{HashMap, HashSet};
@@ -230,7 +231,15 @@ struct DiffKey {
 enum DiffLoad {
     Idle,
     Loading,
-    Ready { additions: usize, deletions: usize, head: Option<String>, base: Option<String>, truncated: bool },
+    Ready {
+        additions: usize,
+        deletions: usize,
+        head: Option<String>,
+        base: Option<String>,
+        truncated: bool,
+        /// Files whose patches are still loading.
+        pending: usize,
+    },
     Empty(&'static str),
     Failed(SharedString),
 }
@@ -837,7 +846,8 @@ impl Workspace {
             }
             scope => {
                 let Some(cwd) = cwd.clone() else { return };
-                let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace});
+                // Stats only; the patches follow one file at a time, as the web reads them.
+                let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace, "metadataOnly": true});
                 if let Some(base) = &base_ref {
                     input["baseRef"] = base.clone().into();
                 }
@@ -855,13 +865,17 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.filter(|_| source_kind.is_some()).map(|cwd| {
+        let commits_request = cwd.clone().filter(|_| source_kind.is_some()).map(|cwd| {
             let mut input = json!({"cwd": cwd});
-            if let Some(base) = remembered_base {
+            if let Some(base) = remembered_base.clone() {
                 input["baseRef"] = base.into();
             }
             input
         });
+        let commit_sha = match &scope {
+            DiffScope::Commit(sha) => Some(sha.clone()),
+            _ => None,
+        };
         self.right_panel.load = DiffLoad::Loading;
         let diff = self.right_panel.diff.clone();
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -877,7 +891,11 @@ impl Workspace {
                         result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind))
                     })
                     .await;
-            let _ = this.update(cx, |this, cx| {
+            let (deferred, source_base) = match &parsed {
+                Ok(Some(parsed)) => (parsed.deferred.clone(), parsed.base.clone()),
+                _ => (Vec::new(), None),
+            };
+            let shown = this.update(cx, |this, cx| {
                 if let Some(commits) = commits {
                     this.right_panel.commits = commits["commits"]
                         .as_array()
@@ -895,43 +913,101 @@ impl Workspace {
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No patch available for this selection.")
                     }
-                    Ok(Some(parsed)) if parsed.files.is_empty() => {
+                    Ok(Some(parsed)) if parsed.files.is_empty() && parsed.deferred.is_empty() => {
                         this.store_diff_files(Vec::new());
                         diff.update(cx, |state, cx| state.set_files(Vec::new(), cx));
                         DiffLoad::Empty("No net changes in this selection.")
                     }
                     Ok(Some(parsed)) => {
-                        let additions = parsed.files.iter().map(DiffFile::additions).sum();
-                        let deletions = parsed.files.iter().map(DiffFile::deletions).sum();
-                        let paths: Vec<SharedString> = parsed.files.iter().map(|file| file.path().clone()).collect();
-                        let folded = collapsed_files(
-                            this.right_panel.collapsed.get(&selection),
-                            this.client_settings.values.bool("diffFilesCollapsed"),
-                            &paths,
-                        );
-                        this.store_diff_files(parsed.files);
-                        let shown = this.shown_diff_files();
-                        diff.update(cx, |state, cx| {
-                            state.set_files(shown, cx);
-                            for path in &paths {
-                                state.set_file_collapsed(path, folded.contains(path), cx);
-                            }
+                        let (additions, deletions) = parsed.totals.unwrap_or_else(|| {
+                            let sum = |count: fn(&DiffFile) -> usize| parsed.files.iter().map(count).sum::<usize>();
+                            (sum(DiffFile::additions), sum(DiffFile::deletions))
                         });
-                        this.right_panel.shown = Some(selection);
+                        this.show_diff_files(&selection, parsed.files, cx);
                         DiffLoad::Ready {
                             additions,
                             deletions,
                             head: parsed.head,
                             base: parsed.base,
                             truncated: parsed.truncated,
+                            pending: parsed.deferred.len(),
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
                 cx.notify();
             });
+            if shown.is_err() || deferred.is_empty() {
+                return;
+            }
+            // `useReviewFilePatches`: each file's patch on its own, a few at a time, in path order.
+            let (Some(kind), Some(cwd)) = (source_kind, cwd) else { return };
+            let base = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
+            let mut loaded: Vec<DiffFile> = Vec::new();
+            let mut pending = deferred.len();
+            for batch in deferred.chunks(diff_load::PATCH_READS) {
+                let requests = batch.iter().map(|file| {
+                    let input = diff_load::file_patch_request(
+                        &cwd,
+                        base.as_deref(),
+                        commit_sha.as_deref(),
+                        kind,
+                        ignore_whitespace,
+                        file,
+                    );
+                    client.request("review.getDiffPreview", input)
+                });
+                let replies = futures::future::join_all(requests).await;
+                let files = cx
+                    .background_executor()
+                    .spawn(async move {
+                        replies
+                            .into_iter()
+                            .flat_map(|reply| match reply {
+                                Ok(value) => diff_load::file_patch(&value, kind),
+                                Err(error) => {
+                                    log::warn!("diff file patch failed: {error}");
+                                    Vec::new()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                loaded.extend(files);
+                pending -= batch.len();
+                let shown = this.update(cx, |this, cx| {
+                    this.show_diff_files(&selection, loaded.clone(), cx);
+                    if let DiffLoad::Ready { pending: left, .. } = &mut this.right_panel.load {
+                        *left = pending;
+                    }
+                    this.rebuild_tree_rows(cx);
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
         }));
         cx.notify();
+    }
+
+    /// Puts a selection's loaded files in the patch, folded as the user left them.
+    fn show_diff_files(&mut self, selection: &(Target, DiffScope), files: Vec<DiffFile>, cx: &mut Context<Self>) {
+        let paths: Vec<SharedString> = files.iter().map(|file| file.path().clone()).collect();
+        let folded = collapsed_files(
+            self.right_panel.collapsed.get(selection),
+            self.client_settings.values.bool("diffFilesCollapsed"),
+            &paths,
+        );
+        self.store_diff_files(files);
+        let shown = self.shown_diff_files();
+        self.right_panel.diff.update(cx, |state, cx| {
+            state.set_files(shown, cx);
+            for path in &paths {
+                state.set_file_collapsed(path, folded.contains(path), cx);
+            }
+        });
+        self.right_panel.shown = Some(selection.clone());
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -1571,9 +1647,11 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (stats, truncated) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, truncated, .. } => (Some((*additions, *deletions)), *truncated),
-            _ => (None, false),
+        let (stats, truncated, pending) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, pending, .. } => {
+                (Some((*additions, *deletions)), *truncated, *pending)
+            }
+            _ => (None, false, 0),
         };
         // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
         let refs = matches!(scope, DiffScope::Branch).then(|| {
@@ -1763,6 +1841,19 @@ impl Workspace {
                         })
                         .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
                 )
+                // `DiffFileLoadingBoundary` while file patches are still on their way.
+                .when(pending > 0, |el| {
+                    el.child(
+                        div()
+                            .px_3()
+                            .py(px(6.))
+                            .border_t_1()
+                            .border_color(tokens.border.opacity(0.4))
+                            .text_size(px(11.))
+                            .text_color(tokens.muted_foreground)
+                            .child("Loading diff…"),
+                    )
+                })
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
@@ -1987,25 +2078,38 @@ impl Element for DiffTint {
 /// `{sources, ...}` from `review.getDiffPreview` or `{diff}` from `getTurnDiff`, parsed.
 struct ParsedDiff {
     files: Vec<DiffFile>,
+    /// Files whose patches load one by one (`lazySource`); `files` is empty then.
+    deferred: Vec<diff_load::FileStat>,
+    /// `sourceLineStat`: the totals of every file, when the source lists them.
+    totals: Option<(usize, usize)>,
     head: Option<String>,
     base: Option<String>,
     truncated: bool,
 }
 
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
-    let (patch, head, base, truncated) = match source_kind {
-        Some(kind) => {
-            let source = value["sources"].as_array()?.iter().find(|s| s["kind"].as_str() == Some(kind))?;
-            let text = |key: &str| source[key].as_str().map(str::to_owned);
-            (source["diff"].as_str()?, text("headRef"), text("baseRef"), source["truncated"].as_bool() == Some(true))
-        }
-        None => (value["diff"].as_str()?, None, None, false),
+    let Some(kind) = source_kind else {
+        let files = diff_load::parse_patch(value["diff"].as_str()?, false);
+        return Some(ParsedDiff {
+            files,
+            deferred: Vec::new(),
+            totals: None,
+            head: None,
+            base: None,
+            truncated: false,
+        });
     };
-    let files = DiffFile::parse(patch).unwrap_or_else(|error| {
-        log::warn!("unparseable diff: {error}");
-        Vec::new()
-    });
-    Some(ParsedDiff { files, head, base, truncated })
+    let source = value["sources"].as_array()?.iter().find(|s| s["kind"].as_str() == Some(kind))?;
+    let text = |key: &str| source[key].as_str().map(str::to_owned);
+    let truncated = source["truncated"].as_bool() == Some(true);
+    let deferred = diff_load::deferred_files(source);
+    let files =
+        if deferred.is_empty() { diff_load::parse_patch(source["diff"].as_str()?, truncated) } else { Vec::new() };
+    let totals = diff_load::file_stats(source)
+        .map(|stats| stats.iter().fold((0, 0), |(a, d), file| (a + file.additions, d + file.deletions)));
+    // A lazily loaded source shows every file, so the size notice no longer applies.
+    let truncated = truncated && deferred.is_empty();
+    Some(ParsedDiff { files, deferred, totals, head: text("headRef"), base: text("baseRef"), truncated })
 }
 
 /// `HH:MM` from an ISO timestamp, as the turn menu labels completion.
@@ -2241,5 +2345,17 @@ mod tests {
         assert!(parsed.truncated);
         assert!(parse_diff(&value, Some("working-tree")).unwrap().files.is_empty());
         assert!(parse_diff(&value, Some("commit")).is_none());
+    }
+
+    #[test]
+    fn a_patch_cut_at_the_size_limit_keeps_its_files() {
+        // The server stops at its byte cap mid-hunk and appends its marker.
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,10 +1,10 @@\n-old\n+new\n context\n\n\n[truncated]";
+        let value = json!({"sources": [
+            {"kind": "branch-range", "diff": patch, "headRef": "main", "baseRef": "origin/main", "truncated": true},
+        ]});
+        let parsed = parse_diff(&value, Some("branch-range")).unwrap();
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!((parsed.files[0].additions(), parsed.files[0].deletions()), (1, 1));
     }
 }
