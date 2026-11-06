@@ -74,10 +74,16 @@ impl Attempt {
 const QUIT_SAVE_WAIT: Duration = Duration::from_secs(2);
 
 /// The newest queued catalog that no write has tried yet, shared with the quit handler, which
-/// writes it. Writes hold the lock, so they never overlap and an older catalog never lands over
-/// a newer one.
+/// writes it. Writes take `writing`, so they never overlap and an older catalog never lands over
+/// a newer one; the UI thread only takes `slot`, which no one holds across a write.
 #[derive(Clone, Default)]
-struct Unsaved(Arc<Mutex<Slot>>);
+struct Unsaved(Arc<Shared>);
+
+#[derive(Default)]
+struct Shared {
+    slot: Mutex<Slot>,
+    writing: Mutex<()>,
+}
 
 #[derive(Default)]
 struct Slot {
@@ -89,7 +95,7 @@ struct Slot {
 
 impl Unsaved {
     fn lock(&self) -> MutexGuard<'_, Slot> {
-        self.0.lock().expect("a catalog write panicked")
+        self.0.slot.lock().expect("a catalog write panicked")
     }
 
     /// Records a queued catalog; returns its version.
@@ -108,16 +114,19 @@ impl Unsaved {
         catalog: &Catalog,
         save: impl FnOnce(&Catalog) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut slot = self.lock();
-        if slot.newest.as_ref().is_some_and(|(newest, _)| *newest <= version) {
-            slot.newest = None;
-        }
-        if version <= slot.written {
-            return Ok(());
+        let _writing = self.0.writing.lock().expect("a catalog write panicked");
+        {
+            let mut slot = self.lock();
+            if slot.newest.as_ref().is_some_and(|(newest, _)| *newest <= version) {
+                slot.newest = None;
+            }
+            if version <= slot.written {
+                return Ok(());
+            }
         }
         let result = save(catalog);
         if result.is_ok() {
-            slot.written = version;
+            self.lock().written = version;
         }
         result
     }
@@ -678,6 +687,50 @@ mod tests {
         assert!(writes.start().unwrap().run(save(Err("denied".into()))).is_err());
         writes.unsaved.flush(save(Ok(())));
         assert_eq!(*saved.borrow(), ["a", "c", "e", "f"]);
+    }
+
+    #[test]
+    fn queueing_never_waits_behind_a_running_write() {
+        use std::sync::mpsc;
+
+        let unsaved = Unsaved::default();
+        let first = unsaved.queue(&catalog(&[environment("a", true)]));
+        let (entered, save_started) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let writer = {
+            let unsaved = unsaved.clone();
+            let a = catalog(&[environment("a", true)]);
+            std::thread::spawn(move || {
+                unsaved.write(first, &a, |_| {
+                    entered.send(()).expect("the test is waiting");
+                    // Stuck, as on a keyring prompt, until the test lets it finish.
+                    gate.recv().expect("the test releases the write");
+                    Ok(())
+                })
+            })
+        };
+        save_started.recv().expect("the write starts");
+
+        // The UI thread queues another edit while the save is stuck.
+        let (queued, second) = mpsc::channel();
+        let queuer = {
+            let unsaved = unsaved.clone();
+            std::thread::spawn(move || {
+                queued.send(unsaved.queue(&catalog(&[environment("b", true)]))).expect("the test is waiting");
+            })
+        };
+        let second = second.recv_timeout(Duration::from_secs(10)).expect("queueing waited behind the write");
+        release.send(()).expect("the write is waiting");
+        assert_eq!(writer.join().expect("the writer thread"), Ok(()));
+        queuer.join().expect("the queueing thread");
+
+        // The newest catalog is the one left to write.
+        let mut written = Vec::new();
+        unsaved.flush(|catalog| {
+            written.push(labels(catalog).join(","));
+            Ok(())
+        });
+        assert_eq!((second, written), (2, vec!["b".to_owned()]));
     }
 
     #[test]
