@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 mod menu;
 mod pointer;
 
+use gpui_kit::component::input;
 use gpui_kit::component::menu::ContextMenuExt as _;
 
 use super::grid::{Batched, Geometry, TerminalGrid, TerminalTheme, batch};
@@ -549,6 +550,10 @@ impl Render for TerminalSession {
             .track_focus(&self.focus)
             .bg(theme.background)
             .on_key_down(cx.listener(Self::key_down))
+            // Edit › Copy, Paste and Select All; the keys reach `key_down` instead.
+            .on_action(cx.listener(|this, _: &input::Copy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &input::Paste, _, cx| this.paste(cx)))
+            .on_action(cx.listener(|this, _: &input::SelectAll, _, cx| this.select_all(cx)))
             .child(TerminalGrid { session: cx.entity(), theme, focused })
             .children(self.render_selection_menu())
             .context_menu(menu)
