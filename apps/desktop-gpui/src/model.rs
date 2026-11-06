@@ -683,6 +683,8 @@ pub struct Lineage {
 #[serde(rename_all = "camelCase")]
 pub struct PendingRequestSummary {
     pub kind: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

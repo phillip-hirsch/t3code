@@ -314,13 +314,34 @@ impl<'a> Facts<'a> {
         Some(Some(&self.thread.updated_at))
     }
 
-    /// `threadRaisedHandWhileSnoozed` in `threadSettled.ts`.
+    /// A request other than a question, which snoozing can't set aside.
+    fn has_pending_non_question(&self) -> bool {
+        self.thread.pending_runtime_request.as_ref().is_some_and(|r| r.kind != "user_input")
+    }
+
+    /// When the pending question was asked (`pendingQuestionAt`).
+    fn pending_question_at(&self) -> Option<&'a str> {
+        let request = self.thread.pending_runtime_request.as_ref().filter(|r| r.kind == "user_input")?;
+        request.created_at.as_deref()
+    }
+
+    /// `threadRaisedHandWhileSnoozed` in `threadSettled.ts`. Snoozing an existing question means
+    /// "ask me later": only a newer question wakes it, and a missing time keeps it visible.
     fn raised_hand_while_snoozed(&self) -> bool {
-        if self.thread.pending_runtime_request.is_some()
+        if self.has_pending_non_question()
             || self.child_request.is_some()
             || self.thread.pending_guest_message_count > 0
         {
             return true;
+        }
+        if self.has_pending_user_input() {
+            let set_aside = match (ms(self.pending_question_at()), ms(self.thread.snoozed_at.as_deref())) {
+                (Some(asked), Some(snoozed)) => asked <= snoozed,
+                _ => false,
+            };
+            if !set_aside {
+                return true;
+            }
         }
         match self.failure_edge() {
             None => false,
@@ -341,14 +362,25 @@ impl<'a> Facts<'a> {
         let t = self.thread;
         let wake = ms(t.snoozed_until.as_deref())?;
         if self.raised_hand_while_snoozed() {
+            let snoozed_at = ms(t.snoozed_at.as_deref());
+            let question_at = self.pending_question_at();
+            let fresh_question = match (ms(question_at), snoozed_at) {
+                (Some(asked), Some(snoozed)) => asked > snoozed,
+                _ => false,
+            };
             if let Some(Some(failed_at)) = self.failure_edge() {
-                let newer = match ms(t.snoozed_at.as_deref()) {
+                let failed = ms(Some(failed_at));
+                let newer = match snoozed_at {
                     None => true,
-                    Some(snoozed_at) => ms(Some(failed_at)).is_some_and(|f| f > snoozed_at),
+                    Some(snoozed_at) => failed.is_some_and(|f| f > snoozed_at),
                 };
-                if newer {
+                let not_before_question = !fresh_question || failed >= ms(question_at);
+                if newer && not_before_question {
                     return Some(failed_at);
                 }
+            }
+            if fresh_question {
+                return question_at;
             }
             return if self.runtime_status().is_some() { Some(&t.updated_at) } else { t.snoozed_at.as_deref() };
         }
@@ -445,7 +477,8 @@ impl<'a> Facts<'a> {
     /// `canSnooze` in `threadSettled.ts`: nothing waits on the user and no turn is queued.
     pub fn can_snooze(&self, now: i64) -> bool {
         let t = self.thread;
-        if t.pending_runtime_request.is_some() || self.child_request.is_some() || t.pending_guest_message_count > 0 {
+        // A question can wait until the thread wakes; any other request can't.
+        if self.has_pending_non_question() || self.child_request.is_some() || t.pending_guest_message_count > 0 {
             return false;
         }
         !self.has_queued_turn_start(now)
@@ -1156,6 +1189,30 @@ mod tests {
         assert_eq!(PROJECT_COLORS[color_index("japan-trip-december-2026")].0, "blue");
         assert_eq!(PROJECT_COLORS[color_index("examples")].0, "blue");
         assert_eq!(PROJECT_COLORS[color_index(".claude")].0, "purple");
+    }
+
+    #[test]
+    fn a_snoozed_question_waits_until_a_newer_one_is_asked() {
+        let requests = Default::default();
+        let snoozed = |asked: &str| {
+            thread(
+                "q",
+                json!({"snoozedUntil": "2026-11-05T00:00:00.000Z", "snoozedAt": "2026-11-04T10:00:00.000Z",
+                       "pendingRuntimeRequest": {"kind": "user_input", "createdAt": asked}}),
+            )
+        };
+        let old = snoozed("2026-11-04T09:00:00.000Z");
+        let old = Facts::new(&old, &requests);
+        assert!(old.is_snoozed(now()) && old.woke_at(now()).is_none());
+        let new = snoozed("2026-11-04T11:00:00.000Z");
+        let new = Facts::new(&new, &requests);
+        assert!(!new.is_snoozed(now()));
+        assert_eq!(new.woke_at(now()), Some("2026-11-04T11:00:00.000Z"));
+        // A question can be snoozed; an approval can't.
+        let asking = thread("a", json!({"pendingRuntimeRequest": {"kind": "user_input", "createdAt": NOW}}));
+        assert!(Facts::new(&asking, &requests).can_snooze(now()));
+        let approving = thread("b", json!({"pendingRuntimeRequest": {"kind": "command", "createdAt": NOW}}));
+        assert!(!Facts::new(&approving, &requests).can_snooze(now()));
     }
 
     #[test]
