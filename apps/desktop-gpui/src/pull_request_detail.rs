@@ -823,6 +823,52 @@ pub fn visible_body(body: &str) -> Option<String> {
     (!strip_html_comments(trimmed).trim().is_empty()).then(|| trimmed.to_owned())
 }
 
+/// `readableBody`: a body as it reads, for text sent to an agent under a length bound, without
+/// HTML-comment bookkeeping (a bot's, say) using the bound up. Comments in code are source the
+/// remark shows, so they stay; a line that was all comment goes. `None` for a body with no words.
+pub fn readable_body(raw: &str) -> Option<String> {
+    fn html_ranges(node: &markdown::mdast::Node, cuts: &mut Vec<(usize, usize)>) {
+        if let (markdown::mdast::Node::Html(_), Some(position)) = (node, node.position()) {
+            cuts.push((position.start.offset, position.end.offset));
+        }
+        for child in node.children().map(Vec::as_slice).unwrap_or_default() {
+            html_ranges(child, cuts);
+        }
+    }
+    visible_body(raw)?;
+    let body = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut cuts = Vec::new();
+    if let Ok(root) = markdown::to_mdast(&body, &markdown::ParseOptions::default()) {
+        html_ranges(&root, &mut cuts);
+    }
+    let mut readable = String::with_capacity(body.len());
+    let mut from = 0;
+    for (start, end) in cuts {
+        if start < from {
+            continue;
+        }
+        readable.push_str(&body[from..start]);
+        // An HTML block can carry markup around its comment; only the comment itself is hidden.
+        let html = strip_html_comments(&body[start..end]);
+        let after = &body[end..];
+        let line_start = readable.rfind('\n').map_or(0, |at| at + 1);
+        let own_line = readable[line_start..].chars().all(|c| matches!(c, ' ' | '\t' | '>'))
+            && after.trim_start_matches([' ', '\t']).chars().next().is_none_or(|c| c == '\n');
+        if own_line && html.trim().is_empty() {
+            let kept = readable.trim_end_matches([' ', '\t', '>']).len();
+            readable.truncate(kept);
+            let blank = after.len() - after.trim_start_matches([' ', '\t']).len();
+            from = end + if after[blank..].starts_with('\n') { blank + 1 } else { 0 };
+        } else {
+            readable.push_str(&html);
+            from = end;
+        }
+    }
+    readable.push_str(&body[from..]);
+    let readable = readable.trim();
+    (!readable.is_empty()).then(|| readable.to_owned())
+}
+
 pub fn strip_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -1314,7 +1360,7 @@ fn thread_context(thread: &ReviewThread) -> String {
         .comments
         .iter()
         .filter_map(|c| {
-            visible_body(&c.body)
+            readable_body(&c.body)
                 .map(|body| format!("{}: {body}", c.author.as_ref().map_or("ghost", |a| a.login.as_str())))
         })
         .collect();
@@ -1807,6 +1853,19 @@ mod tests {
         assert_eq!(names(attention), ["failure", "action-required"]);
         assert_eq!(names(running), ["pending"]);
         assert_eq!(names(completed), ["success", "skipped"]);
+    }
+
+    #[test]
+    fn readable_bodies_drop_comment_bookkeeping_but_keep_code() {
+        assert_eq!(readable_body("<!-- bot:state -->\nFix this\n<!-- end -->").as_deref(), Some("Fix this"));
+        assert_eq!(readable_body("Keep <!-- note --> this").as_deref(), Some("Keep  this"));
+        assert_eq!(
+            readable_body("```html\n<!-- source -->\n```").as_deref(),
+            Some("```html\n<!-- source -->\n```"),
+            "a comment in code is source"
+        );
+        assert_eq!(readable_body("> quoted\n> <!-- hidden -->\n> more").as_deref(), Some("> quoted\n> more"));
+        assert_eq!(readable_body("<!-- only -->"), None);
     }
 
     #[test]
