@@ -30,6 +30,7 @@ use crate::pull_request_detail::{
     self as logic, Activity, Actor, Check, Comment, Conversation, Detail, Event, EventKind, Primary, Reference,
     ReviewOutcome, TimelineRow,
 };
+use crate::pull_request_reply;
 use crate::pull_requests::{self as list_logic, Entry};
 use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
@@ -37,6 +38,7 @@ use crate::timestamp::parse_ms;
 
 mod avatars;
 mod code;
+mod completions;
 mod guide;
 mod handoff;
 mod header;
@@ -282,10 +284,23 @@ impl Workspace {
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
+        let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
             return;
         }
-        self.read_pr_detail(cx);
+        match self.take_prefetched_pull_request(&key) {
+            // Paints from the detail the row's prefetch read; the rest is read as on a first answer.
+            Some(detail) => {
+                if let Some(panel) = self.pull_requests.panel.as_mut() {
+                    panel.detail = Some(detail);
+                    panel.rebuild_timeline();
+                }
+                self.read_pr_reads_of(&key, false, cx);
+                self.read_pr_extras_of(&key, cx);
+                self.read_pr_avatars(&key, cx);
+            }
+            None => self.read_pr_detail(cx),
+        }
         if guides {
             self.read_pr_guide(cx);
         }
@@ -373,42 +388,49 @@ impl Workspace {
 
     /// Reads the detail and activity of the pull request `key` names, shown or parked; each lands on its own.
     fn read_pr_detail_of(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.read_pr_reads_of(key, true, cx);
+    }
+
+    /// Reads the activity, and the detail with `detail`.
+    fn read_pr_reads_of(&mut self, key: &str, detail: bool, cx: &mut Context<Self>) {
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let reference = panel.reference.to_json();
         let mut detail_input = reference.clone();
         detail_input["allowStale"] = json!(false);
         let (detail_client, detail_key, key) = (client.clone(), key.to_owned(), key.to_owned());
-        let detail_read = cx.spawn(async move |this, cx| {
-            let result = detail_client.request("pullRequests.detail", detail_input).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(panel) = this.pr_panel(&detail_key) else { return };
-                panel.detail_loading = false;
-                let (mut first, mut landed) = (false, false);
-                match result.map(serde_json::from_value::<Detail>) {
-                    Ok(Ok(detail)) => {
-                        first = panel.detail.is_none();
-                        landed = true;
-                        panel.detail = Some(Rc::new(detail));
-                        panel.detail_error = None;
-                        panel.maintainer_choice = None;
+        let detail_read = detail.then(|| {
+            cx.spawn(async move |this, cx| {
+                let result = detail_client.request("pullRequests.detail", detail_input).await;
+                let _ = this.update(cx, |this, cx| {
+                    let Some(panel) = this.pr_panel(&detail_key) else { return };
+                    panel.detail_loading = false;
+                    let (mut first, mut landed) = (false, false);
+                    match result.map(serde_json::from_value::<Detail>) {
+                        Ok(Ok(detail)) => {
+                            first = panel.detail.is_none();
+                            landed = true;
+                            panel.detail = Some(Rc::new(detail));
+                            panel.detail_error = None;
+                            panel.maintainer_choice = None;
+                        }
+                        Ok(Err(error)) => {
+                            panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false));
+                        }
+                        Err(error) => {
+                            panel.detail_error = Some((list_logic::error_message(&error).into(), is_not_found(&error)));
+                        }
                     }
-                    Ok(Err(error)) => {
-                        panel.detail_error = Some((format!("Unreadable pull request: {error}").into(), false));
+                    panel.rebuild_timeline();
+                    if first {
+                        this.read_pr_extras_of(&detail_key, cx);
                     }
-                    Err(error) => {
-                        panel.detail_error = Some((list_logic::error_message(&error).into(), is_not_found(&error)));
+                    if landed {
+                        this.read_pr_avatars(&detail_key, cx);
                     }
-                }
-                panel.rebuild_timeline();
-                if first {
-                    this.read_pr_extras_of(&detail_key, cx);
-                }
-                if landed {
-                    this.read_pr_avatars(&detail_key, cx);
-                }
-                cx.notify();
-            });
+                    cx.notify();
+                });
+            })
         });
         let activity_key = key.clone();
         let activity_read = cx.spawn(async move |this, cx| {
@@ -435,9 +457,11 @@ impl Workspace {
             });
         });
         let Some(panel) = self.pr_panel(&key) else { return };
-        panel.detail_loading = true;
+        if detail {
+            panel.detail_loading = true;
+            panel._detail_read = detail_read;
+        }
         panel.activity_loading = true;
-        panel._detail_read = Some(detail_read);
         panel._activity_read = Some(activity_read);
         cx.notify();
     }
@@ -522,6 +546,7 @@ impl Workspace {
         if let Some(update) = update_method {
             input["updateMethod"] = json!(update);
         }
+        input["replyWithSummary"] = json!(true);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("pullRequests.runAction", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -541,7 +566,7 @@ impl Workspace {
                             logic::readable_failure(&list_logic::error_message(&error), &hint),
                         );
                     }
-                    Ok(_) => {
+                    Ok(reply) => {
                         match action {
                             "revert" => toast_success(window, cx, format!("Revert {term} opened")),
                             "delete-branch" => toast_success(window, cx, "Branch deleted"),
@@ -549,16 +574,40 @@ impl Workspace {
                         }
                         if logic::needs_host_refresh(action) {
                             this.refresh_pr_from_host_of(&key, cx);
+                            this.read_pull_requests(false, cx);
                         } else {
-                            this.read_pr_detail_of(&key, cx);
+                            this.apply_pr_action_reply(&key, &reply, cx);
                         }
-                        this.read_pull_requests(false, cx);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Shows an action's reply in the panel and the list instead of reading them again; without
+    /// one, as from an older server, both are read.
+    fn apply_pr_action_reply(&mut self, key: &str, reply: &Value, cx: &mut Context<Self>) {
+        let Some(reply) = pull_request_reply::Reply::read(reply) else {
+            self.read_pr_detail_of(key, cx);
+            self.read_pull_requests(false, cx);
+            return;
+        };
+        let Some(panel) = self.pr_panel(key) else { return };
+        let reference = panel.reference.clone();
+        let (patched, reread) = match panel.detail.as_deref() {
+            Some(detail) => pull_request_reply::patch_detail(detail, &reply),
+            None => (None, true),
+        };
+        if let Some(patched) = patched {
+            panel.detail = Some(Rc::new(patched));
+            panel.rebuild_timeline();
+        }
+        self.read_pr_reads_of(key, reread, cx);
+        self.read_pr_extras_of(key, cx);
+        self.patch_pull_request_list(&reference, &reply, cx);
         cx.notify();
     }
 
@@ -734,15 +783,24 @@ impl Workspace {
     /// One markdown body, parsed once and kept while the panel shows this pull request.
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
         let panel = self.pull_requests.panel.as_mut()?;
+        let url = panel.detail.as_ref().map(|d| d.url.as_str()).or(panel.seed.as_ref().map(|e| e.url.as_str()));
+        let origin = url.and_then(logic::url_origin);
+        let source = |text: &str| {
+            let stripped = logic::strip_html_comments(text);
+            match origin {
+                Some(origin) => logic::resolve_media_urls(&stripped, origin),
+                None => stripped,
+            }
+        };
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
             if held != text {
-                let source = logic::strip_html_comments(text);
+                let source = source(text);
                 view.update(cx, |view, cx| view.set_text(&source, cx));
                 text.clone_into(held);
             }
             return Some(view.clone());
         }
-        let source = logic::strip_html_comments(text);
+        let source = source(text);
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {

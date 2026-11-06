@@ -70,6 +70,9 @@ pub struct ReviewerCapabilities {
     pub request: bool,
     #[serde(default)]
     pub list_candidates: bool,
+    /// Candidates take a `query` the host matches past the first page.
+    #[serde(default)]
+    pub search_candidates: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -114,6 +117,12 @@ pub struct Capabilities {
     pub delete_branch: Option<bool>,
     #[serde(default)]
     pub labels: Option<bool>,
+    /// The host searches the repository's users, so composers can complete `@login`.
+    #[serde(default)]
+    pub mentions: Option<bool>,
+    /// The sigils (`#`, `!`) whose references composers can complete.
+    #[serde(default)]
+    pub reference_sigils: Vec<String>,
 }
 
 /// Unreported host permissions are granted.
@@ -235,6 +244,11 @@ pub struct Detail {
     pub auto_merge_method: Option<String>,
     #[serde(default)]
     pub workflow_approvals_required: Option<u64>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    /// When the server read it from the host, which orders it against an action's reply.
+    #[serde(default)]
+    pub observed_at: Option<f64>,
 }
 
 /// `PullRequestReaction`.
@@ -838,6 +852,88 @@ pub fn strip_html_comments(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The scheme and host a change request URL lives on.
+pub fn url_origin(url: &str) -> Option<&str> {
+    let start = url.find("://")? + 3;
+    let end = url[start..].find(['/', '?', '#']).map_or(url.len(), |i| start + i);
+    (end > start).then(|| &url[..end])
+}
+
+/// `resolveChangeRequestMediaUrl`: forges link uploads root-relative, as `GitCafe` links
+/// `/api/attachments/<id>`, which in a change request body means the forge's origin.
+fn resolve_media_url(url: &str, origin: &str) -> Option<String> {
+    let rest = url.strip_prefix('/')?;
+    (!rest.starts_with(['/', '\\'])).then(|| format!("{origin}{url}"))
+}
+
+/// `remarkChangeRequestMediaUrls` on the source: image destinations and link reference
+/// definitions resolve against `origin`, outside code fences and code spans.
+pub fn resolve_media_urls(markdown: &str, origin: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut fenced = false;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if fenced || trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            out.push_str(line);
+            continue;
+        }
+        if let Some(resolved) = resolve_definition(line, origin) {
+            out.push_str(&resolved);
+            continue;
+        }
+        for (index, segment) in line.split('`').enumerate() {
+            if index > 0 {
+                out.push('`');
+            }
+            if index % 2 == 1 {
+                out.push_str(segment);
+            } else {
+                resolve_images(segment, origin, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// `[label]: /path`, indented at most three spaces.
+fn resolve_definition(line: &str, origin: &str) -> Option<String> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = line[indent..].strip_prefix('[').filter(|_| indent <= 3)?;
+    let close = rest.find("]:")?;
+    let after = &rest[close + 2..];
+    let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
+    let destination = &after[gap..];
+    let angled = destination.starts_with('<');
+    let url = destination[usize::from(angled)..].split(|c: char| c.is_whitespace() || c == '>').next()?;
+    let resolved = resolve_media_url(url, origin)?;
+    let at = indent + 1 + close + 2 + gap + usize::from(angled);
+    Some(format!("{}{resolved}{}", &line[..at], &line[at + url.len()..]))
+}
+
+/// Rewrites the root-relative destinations of `![alt](dest)` images in `text` into `out`.
+fn resolve_images(text: &str, origin: &str, out: &mut String) {
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        let Some(close) = rest[start + 2..].find("](") else { break };
+        let at = start + 2 + close + 2;
+        let after = &rest[at..];
+        let gap = after.len() - after.trim_start().len();
+        let angled = after[gap..].starts_with('<');
+        let skip = at + gap + usize::from(angled);
+        let url = rest[skip..].split(|c: char| c.is_whitespace() || c == ')' || c == '>').next().unwrap_or_default();
+        out.push_str(&rest[..skip]);
+        match resolve_media_url(url, origin) {
+            Some(resolved) => out.push_str(&resolved),
+            None => out.push_str(url),
+        }
+        rest = &rest[skip + url.len()..];
+    }
+    out.push_str(rest);
 }
 
 /// One conversation: a loose comment, or a review thread and its replies.
@@ -2067,5 +2163,31 @@ mod tests {
         );
         let local = CheckoutRequest { mode: CheckoutMode::Local, ..request };
         assert_eq!(local.input("/repo", "t1")["mode"], "local");
+    }
+
+    #[test]
+    fn root_relative_media_resolves_against_the_forge() {
+        // regression: GitCafe's `/api/attachments/<id>` uploads rendered as missing local files
+        let origin = url_origin("https://git.cafe/pingdotgg/t3code/pulls/31251").unwrap();
+        assert_eq!(origin, "https://git.cafe");
+        for (url, expected) in [
+            ("/api/attachments/attach_1", "https://git.cafe/api/attachments/attach_1"),
+            ("//cdn.example.com/a.png", "//cdn.example.com/a.png"),
+            ("/\\evil.example.com/a.png", "/\\evil.example.com/a.png"),
+            ("https://example.com/a.png", "https://example.com/a.png"),
+            ("docs/a.png", "docs/a.png"),
+        ] {
+            assert_eq!(resolve_media_urls(&format!("![shot]({url})"), origin), format!("![shot]({expected})"), "{url}");
+        }
+        let body = "Before ![a](</api/attachments/x> \"t\") and `![b](/api/y)`\n[ref]: /api/attachments/z\r\n```\n![c](/api/w)\n```\n";
+        assert_eq!(
+            resolve_media_urls(body, origin),
+            "Before ![a](<https://git.cafe/api/attachments/x> \"t\") and `![b](/api/y)`\n[ref]: https://git.cafe/api/attachments/z\r\n```\n![c](/api/w)\n```\n",
+            "definitions and angled images resolve; code is left alone"
+        );
+        assert_eq!(
+            resolve_media_urls("[link](/docs) ![](/a.png)", origin),
+            "[link](/docs) ![](https://git.cafe/a.png)"
+        );
     }
 }

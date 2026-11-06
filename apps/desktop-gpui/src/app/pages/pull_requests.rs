@@ -6,7 +6,7 @@
 mod facets;
 use facets::FacetKind;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
@@ -34,6 +34,11 @@ use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 /// `PullRequestRef` for a listed row.
+/// `INTENT_DELAY_MS`: passing over rows asks the host nothing.
+const INTENT_DELAY: Duration = Duration::from_millis(150);
+/// The detail query's `staleTimeMs`: an older prefetch is read again on open.
+const PREFETCH_FRESH: Duration = Duration::from_mins(1);
+
 fn reference_of(entry: &Entry) -> Reference {
     Reference {
         project_id: entry.project_id.clone(),
@@ -115,6 +120,10 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
     pub(super) _live_interval: Option<Task<()>>,
+    /// The detail read for a row the pointer rested on, so opening it paints from it, and the
+    /// read in flight for the row it rests on now (`usePullRequestIntentPrefetch`).
+    prefetched: Option<(String, Rc<crate::pull_request_detail::Detail>, Instant)>,
+    prefetch: Option<(String, Task<()>)>,
     /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
     pub(super) last_handoff: std::collections::HashMap<String, String>,
     /// The searchable Author or Labels picker, while open.
@@ -165,6 +174,8 @@ impl PullRequestsState {
             panel_width: None,
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
+            prefetched: None,
+            prefetch: None,
             facet_search: None,
         }
     }
@@ -396,6 +407,64 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    /// An action's reply applied to its row; a reply that adds the pull request reads the list.
+    pub(super) fn patch_pull_request_list(
+        &mut self,
+        reference: &crate::pull_request_detail::Reference,
+        reply: &crate::pull_request_reply::Reply,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::pull_request_reply::{ListPatch, Listing, patch_entries};
+        let input = self.pull_request_input(None);
+        let listing =
+            Listing { state: input["state"].as_str().unwrap_or("all"), draft: input["filters"]["draft"].as_str() };
+        let Some(list) = self.pull_requests.list.as_mut() else { return };
+        match patch_entries(&listing, &mut list.entries, reference, reply) {
+            ListPatch::Refresh => self.read_pull_requests(false, cx),
+            ListPatch::Patched => self.rebuild_pull_request_rows(),
+            ListPatch::Unchanged => {}
+        }
+    }
+
+    /// `usePullRequestIntentPrefetch`: the pointer resting on a row reads the detail its panel
+    /// will ask for; leaving the row stops a read that has not landed.
+    fn intend_pull_request(&mut self, entry: &Entry, resting: bool, cx: &mut Context<Self>) {
+        let reference = reference_of(entry);
+        let key = reference.key();
+        if !resting {
+            if self.pull_requests.prefetch.as_ref().is_some_and(|(pending, _)| *pending == key) {
+                self.pull_requests.prefetch = None;
+            }
+            return;
+        }
+        let fresh = |held: &(String, Rc<_>, Instant)| held.0 == key && held.2.elapsed() < PREFETCH_FRESH;
+        if self.pull_requests.prefetched.as_ref().is_some_and(fresh) {
+            return;
+        }
+        let Some(client) = self.project_client(&reference.project_id) else { return };
+        let mut input = reference.to_json();
+        input["allowStale"] = json!(false);
+        let landed = key.clone();
+        let read = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(INTENT_DELAY).await;
+            let result = client.request("pullRequests.detail", input).await;
+            let Ok(Ok(detail)) = result.map(serde_json::from_value::<crate::pull_request_detail::Detail>) else {
+                return;
+            };
+            let _ = this.update(cx, |this, _| {
+                this.pull_requests.prefetch = None;
+                this.pull_requests.prefetched = Some((landed, Rc::new(detail), Instant::now()));
+            });
+        });
+        self.pull_requests.prefetch = Some((key, read));
+    }
+
+    /// The prefetched detail for `key`, while it is fresh.
+    pub(super) fn take_prefetched_pull_request(&mut self, key: &str) -> Option<Rc<crate::pull_request_detail::Detail>> {
+        let held = self.pull_requests.prefetched.take_if(|held| held.0 == key)?;
+        (held.2.elapsed() < PREFETCH_FRESH).then_some(held.1)
     }
 
     /// Asks each pull request's own machine for the diff sizes the listing left at zero.
@@ -1374,8 +1443,12 @@ fn pull_request_row(
         );
 
     let picked = entry.clone();
+    let rested = entry.clone();
     h_flex()
         .id(ElementId::Name(id("row").into()))
+        .on_hover(window.listener_for(view, move |this, resting: &bool, _, cx| {
+            this.intend_pull_request(&rested, *resting, cx);
+        }))
         .when(!first, |el| el.mt(px(2.)))
         .w_full()
         .px(px(12.))

@@ -24,7 +24,7 @@ impl Workspace {
         if keymap::focus_in(&event.context_stack, CAPTURE_CONTEXT) || self.recording_shortcut(cx) {
             return false;
         }
-        if self.composer_menu_key(keystroke, window, cx) {
+        if self.composer_menu_key(keystroke, window, cx) || self.pr_completion_key(keystroke, window, cx) {
             return true;
         }
         let held = self.held_key.as_ref() == Some(keystroke);

@@ -6,12 +6,17 @@
 
 use std::cell::Cell;
 
+use gpui_kit::Focusable as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::popover::Popover;
 
 use super::*;
 use crate::pull_request_detail::Reaction;
 use crate::pull_request_diff::Position;
+use crate::pull_request_reviewers as reviewer_search;
+
+/// `useDebouncedValue(query.trim(), 250)` in `PullRequestReviewerPicker`.
+const REVIEWER_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// `PULL_REQUEST_REACTION_ORDER`, with each reaction's emoji and name.
 const REACTIONS: [(&str, &str, &str); 8] = [
@@ -104,6 +109,12 @@ struct Picker {
     search: Entity<InputState>,
     candidates: Option<Result<Value, String>>,
     pending: Option<String>,
+    /// The reviewer query once typing settles.
+    debounced: String,
+    _debounce: Option<Task<()>>,
+    /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
+    searches: HashMap<String, Result<Value, String>>,
+    searching: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -122,6 +133,9 @@ pub(super) struct WriteState {
     reaction_picker: Option<String>,
     pub(super) draft: Option<LineDraft>,
     picker: Option<Picker>,
+    /// The `@`/`#`/`!` suggestions open under a composer, and an Escape that hid one.
+    pub(super) completion: Option<super::completions::Completing>,
+    pub(super) dismissed: Option<(gpui_kit::EntityId, usize)>,
     title: Option<Entity<InputState>>,
     _watch: Vec<Subscription>,
 }
@@ -177,31 +191,43 @@ pub(super) fn hover_only(child: impl IntoElement) -> AnyElement {
 
 /// Notifies the workspace only when an input turns empty or stops being so, which is all the
 /// buttons beside it read; Ctrl+Enter runs `submit`.
+/// A composer's edits, Mod+Enter, and the caret moves and blur its completions follow.
 fn watch(
     input: &Entity<TextareaState>,
     submit: Option<fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Subscription {
+) -> [Subscription; 3] {
     let empty = Rc::new(Cell::new(true));
-    cx.subscribe_in(input, window, move |this, input, event: &InputEvent, window, cx| match event {
-        InputEvent::Change => {
-            let now = input.read(cx).value().trim().is_empty();
-            if empty.replace(now) != now {
-                cx.notify();
+    let id = input.entity_id();
+    let focus = input.focus_handle(cx);
+    [
+        cx.subscribe_in(input, window, move |this, input, event: &InputEvent, window, cx| match event {
+            InputEvent::Change => {
+                let now = input.read(cx).value().trim().is_empty();
+                if empty.replace(now) != now {
+                    cx.notify();
+                }
+                let focused = input.focus_handle(cx).is_focused(window);
+                this.sync_pr_completion(input, focused, true, cx);
             }
-        }
-        InputEvent::PressEnter { secondary: true, .. } => {
-            if let Some(submit) = submit {
-                submit(this, window, cx);
+            InputEvent::PressEnter { secondary: true, .. } => {
+                if let Some(submit) = submit {
+                    submit(this, window, cx);
+                }
             }
-        }
-        _ => {}
-    })
+            _ => {}
+        }),
+        cx.observe_in(input, window, |this, input, window, cx| {
+            let focused = input.focus_handle(cx).is_focused(window);
+            this.sync_pr_completion(&input, focused, false, cx);
+        }),
+        cx.on_blur(&focus, window, move |this, _, cx| this.close_pr_completion(id, cx)),
+    ]
 }
 
 impl Workspace {
-    fn pr_write(&mut self) -> Option<&mut WriteState> {
+    pub(super) fn pr_write(&mut self) -> Option<&mut WriteState> {
         self.pull_requests.panel.as_mut().map(|p| &mut p.write)
     }
 
@@ -297,7 +323,7 @@ impl Workspace {
             let sub = watch(&input, Some(|this, window, cx| this.post_pr_comment("comment", window, cx)), window, cx);
             if let Some(write) = self.pr_write() {
                 write.comment = Some(input);
-                write._watch.push(sub);
+                write._watch.extend(sub);
             }
         }
         if self.pr_review().is_some_and(|r| r.summary.is_none()) {
@@ -307,7 +333,7 @@ impl Workspace {
                 review.summary = Some(input);
             }
             if let Some(write) = self.pr_write() {
-                write._watch.push(sub);
+                write._watch.extend(sub);
             }
         }
     }
@@ -645,6 +671,7 @@ impl Workspace {
         v_flex()
             .gap(px(8.))
             .child(Textarea::new(&input).disabled(busy))
+            .children(self.render_pr_completions(&input, t, cx))
             .child(
                 h_flex().flex_wrap().justify_end().gap(px(8.)).children(follow).child(
                     xs_outline("pr-comment-send", t)
@@ -662,7 +689,7 @@ impl Workspace {
         detail: &Detail,
         verdicts: &[(&'static str, &'static str)],
         pending: usize,
-        _t: &Tokens,
+        t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
@@ -714,6 +741,7 @@ impl Workspace {
         let can = selected.is_some_and(|(v, _)| can_submit_review(v, &text, pending, required));
         v_flex()
             .child(Textarea::new(&summary))
+            .children(self.render_pr_completions(&summary, t, cx))
             .child(
                 h_flex().mt(px(8.)).justify_end().gap(px(8.)).children(picker).child(
                     Button::new("pr-review-submit")
@@ -777,7 +805,7 @@ impl Workspace {
         let sub = watch(&input, Some(|this, _, cx| this.add_pr_line_comment(cx)), window, cx);
         if let Some(write) = self.pr_write() {
             write.draft = Some(LineDraft { path, old_path, position, start, input });
-            write._watch.push(sub);
+            write._watch.extend(sub);
         }
         cx.notify();
     }
@@ -842,6 +870,7 @@ impl Workspace {
                         .child(format!("{}:{line}", draft.path)),
                 )
                 .child(Textarea::new(&draft.input))
+                .children(self.render_pr_completions(&draft.input, t, cx))
                 .child(
                     h_flex()
                         .justify_end()
@@ -1011,6 +1040,7 @@ impl Workspace {
                         .mt(px(8.))
                         .gap(px(8.))
                         .child(Textarea::new(input))
+                        .children(self.render_pr_completions(input, t, cx))
                         .child(
                             h_flex()
                                 .justify_end()
@@ -1045,7 +1075,7 @@ impl Workspace {
                         let sub = watch(&input, Some(crate::app::Workspace::send_pr_reply), window, cx);
                         if let Some(write) = this.pr_write() {
                             write.reply = Some((id.clone(), input));
-                            write._watch.push(sub);
+                            write._watch.extend(sub);
                         }
                         cx.notify();
                     }))
@@ -1108,7 +1138,7 @@ impl Workspace {
                 let sub = watch(&input, Some(crate::app::Workspace::save_pr_edit), window, cx);
                 if let Some(write) = this.pr_write() {
                     write.editing = Some(Editing { subject: subject.clone(), kind, input, preview: false });
-                    write._watch.push(sub);
+                    write._watch.extend(sub);
                 }
                 cx.notify();
             }));
@@ -1197,7 +1227,10 @@ impl Workspace {
                 })
                 .into_any_element()
         } else {
-            Textarea::new(&input).disabled(saving).into_any_element()
+            v_flex()
+                .child(Textarea::new(&input).disabled(saving))
+                .children(self.render_pr_completions(&input, t, cx))
+                .into_any_element()
         };
         Some(
             v_flex()
@@ -1466,21 +1499,41 @@ impl Workspace {
     // Reviewers and labels (`PullRequestReviewerPicker`, `PullRequestLabelPicker`).
 
     fn open_pr_picker(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
-        let (key, input) = (panel.reference.key(), panel.reference.to_json());
+        if self.pull_request_client().is_none() || self.pull_requests.panel.is_none() {
+            return;
+        }
         let placeholder = if kind == PickerKind::Reviewers { "Search people with access" } else { "Search labels" };
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         search.update(cx, |input, cx| input.focus(window, cx));
-        let sub = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+        let sub = cx.subscribe(&search, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
+                if kind == PickerKind::Reviewers {
+                    this.debounce_pr_reviewer_search(cx);
+                }
                 cx.notify();
             }
         });
         if let Some(write) = self.pr_write() {
-            write.picker = Some(Picker { kind, search, candidates: None, pending: None });
+            write.picker = Some(Picker {
+                kind,
+                search,
+                candidates: None,
+                pending: None,
+                debounced: String::new(),
+                _debounce: None,
+                searches: HashMap::new(),
+                searching: HashSet::new(),
+            });
             write._watch.push(sub);
         }
+        self.read_pr_picker_candidates(kind, cx);
+    }
+
+    /// The first page of candidates; one already shown stays while it is read again.
+    fn read_pr_picker_candidates(&mut self, kind: PickerKind, cx: &mut Context<Self>) {
+        let Some(client) = self.pull_request_client() else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (key, input) = (panel.reference.key(), panel.reference.to_json());
         let method = if kind == PickerKind::Reviewers {
             "pullRequests.reviewerCandidates"
         } else {
@@ -1494,11 +1547,63 @@ impl Workspace {
                     return;
                 };
                 picker.candidates = Some(result.map_err(|error| list_logic::error_message(&error)));
+                this.search_pr_reviewers(cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn debounce_pr_reviewer_search(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.shown_pr_key() else { return };
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REVIEWER_SEARCH_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                picker.debounced = picker.search.read(cx).value().trim().to_owned();
+                this.search_pr_reviewers(cx);
+                cx.notify();
+            });
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()) {
+            picker._debounce = Some(task);
+        }
+    }
+
+    /// Whether the shown pull request's host matches reviewer queries past the first page.
+    fn pr_reviewers_searchable(&self) -> bool {
+        self.pull_requests
+            .panel
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+            .is_some_and(|d| d.capabilities.reviewers.search_candidates)
+    }
+
+    /// Asks the host for the settled query when the loaded page cannot answer it.
+    fn search_pr_reviewers(&mut self, cx: &mut Context<Self>) {
+        let searchable = self.pr_reviewers_searchable();
+        let Some(client) = self.pull_request_client() else { return };
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        let (key, mut input) = (panel.reference.key(), panel.reference.to_json());
+        let Some(picker) = panel.write.picker.as_mut().filter(|p| p.kind == PickerKind::Reviewers) else { return };
+        let loaded = picker.candidates.as_ref().and_then(|c| c.as_ref().ok());
+        let search = reviewer_search::SearchInput { loaded, searchable, query: "", debounced: &picker.debounced };
+        let Some(query) = reviewer_search::host_query(&search) else { return };
+        if picker.searches.contains_key(&query) || !picker.searching.insert(query.clone()) {
+            return;
+        }
+        input["query"] = json!(query);
+        cx.spawn(async move |this, cx| {
+            let result = client.request("pullRequests.reviewerCandidates", input).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                picker.searching.remove(&query);
+                picker.searches.insert(query, result.map_err(|error| list_logic::error_message(&error)));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn pick_pr_candidate(&mut self, kind: PickerKind, candidate: Value, window: &mut Window, cx: &mut Context<Self>) {
@@ -1541,11 +1646,16 @@ impl Workspace {
             if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
                 picker.pending = None;
             }
-            // `open_pr_picker` reads for the shown pull request; a parked one's ticks read again when reopened.
+            // Reads for the shown pull request; a parked one's ticks read again when reopened.
             if ok && this.shown_pr_key().as_deref() == Some(key) {
-                // The list reads again so the ticks follow the host.
-                this.open_pr_picker(kind, window, cx);
+                // The lists read again so the ticks follow the host; a search answer is keyed by
+                // what was typed, so the one on screen is read again too.
+                if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
+                    picker.searches.clear();
+                }
+                this.read_pr_picker_candidates(kind, cx);
             }
+            let _ = window;
         });
     }
 
@@ -1599,43 +1709,62 @@ impl Workspace {
 
     fn render_pr_picker_list(&self, picker: &Picker, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let reviewers = picker.kind == PickerKind::Reviewers;
-        let query = picker.search.read(cx).value().to_lowercase();
+        let typed = picker.search.read(cx).value().to_string();
+        let query = typed.trim().to_lowercase();
         let note =
             |text: String| div().p(px(8.)).text_xs().text_color(t.muted_foreground).child(text).into_any_element();
+        let error_label =
+            if reviewers { "The people with access could not be read." } else { "The labels could not be read." };
         let rows: Vec<AnyElement> = match &picker.candidates {
             None => vec![note("Loading...".into())],
-            Some(Err(_)) => vec![note(
-                if reviewers { "The people with access could not be read." } else { "The labels could not be read." }
-                    .into(),
-            )],
+            Some(Err(error)) => vec![note(format!("{error_label} {error}"))],
             Some(Ok(value)) => {
-                let all = value["candidates"].as_array().cloned().unwrap_or_default();
-                let text = |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_lowercase();
-                let matching: Vec<Value> = all
-                    .iter()
-                    .filter(|c| {
-                        query.is_empty()
-                            || if reviewers {
-                                text(c, "login").contains(&query) || text(c, "name").contains(&query)
-                            } else {
-                                text(c, "name").contains(&query) || text(c, "description").contains(&query)
-                            }
-                    })
-                    .cloned()
-                    .collect();
+                let (matching, pending, error, truncated) = if reviewers {
+                    let input = reviewer_search::SearchInput {
+                        loaded: Some(value),
+                        searchable: self.pr_reviewers_searchable(),
+                        query: &typed,
+                        debounced: &picker.debounced,
+                    };
+                    let search = reviewer_search::host_query(&input)
+                        .and_then(|q| picker.searches.get(&q))
+                        .map(|answer| answer.as_ref().map_err(String::as_str));
+                    let view = reviewer_search::candidate_view(&input, search);
+                    let error = view.candidates.is_empty().then(|| view.search_error.clone()).flatten();
+                    let truncated = view.truncation.map(|why| why.label(view.search_error.as_deref()));
+                    (view.candidates, view.search_pending, error, truncated)
+                } else {
+                    let text = |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_lowercase();
+                    let matching: Vec<Value> = value["candidates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| {
+                            query.is_empty()
+                                || text(c, "name").contains(&query)
+                                || text(c, "description").contains(&query)
+                        })
+                        .cloned()
+                        .collect();
+                    let truncated = (value["truncated"].as_bool() == Some(true)).then(|| {
+                        "This repository has more labels than are listed here. Apply the rest on the host.".to_owned()
+                    });
+                    (matching, false, None, truncated)
+                };
                 let mut rows: Vec<AnyElement> = Vec::new();
-                if all.is_empty() {
-                    rows.push(note(
-                        if reviewers {
-                            "Nobody else has access to this repository."
-                        } else {
-                            "This repository has no labels."
-                        }
-                        .into(),
-                    ));
+                if pending {
+                    rows.push(note("Loading...".into()));
+                } else if let Some(error) = error {
+                    rows.push(note(format!("{error_label} {error}")));
                 } else if matching.is_empty() {
                     rows.push(note(
-                        if reviewers { "Nobody with access matches that." } else { "No label matches that." }.into(),
+                        match (reviewers, query.is_empty()) {
+                            (true, true) => "Nobody else has access to this repository.",
+                            (true, false) => "Nobody with access matches that.",
+                            (false, true) => "This repository has no labels.",
+                            (false, false) => "No label matches that.",
+                        }
+                        .into(),
                     ));
                 }
                 for candidate in matching {
@@ -1692,16 +1821,7 @@ impl Workspace {
                             .into_any_element(),
                     );
                 }
-                if value["truncated"].as_bool() == Some(true) {
-                    rows.push(note(
-                        if reviewers {
-                            "This repository has more people with access than are listed here. Ask for the rest on the host."
-                        } else {
-                            "This repository has more labels than are listed here. Apply the rest on the host."
-                        }
-                        .into(),
-                    ));
-                }
+                rows.extend(truncated.map(note));
                 rows
             }
         };
