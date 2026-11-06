@@ -583,9 +583,19 @@ pub(super) fn render_row(
             created_at,
             revert,
             sent_by_t3code,
+            from_agent,
         } => {
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
+            // `senderShell?.title || "Agent"`.
+            let agent = from_agent.as_ref().map(|from| {
+                let title = from.sender_thread.as_ref().and_then(|sender| {
+                    let workspace = this.upgrade()?;
+                    let title = workspace.read(cx).shell_thread(sender)?.title.trim().to_owned();
+                    (!title.is_empty()).then_some(title)
+                });
+                AgentFold { label: title.unwrap_or_else(|| "Agent".into()).into(), sender: from.sender_thread.clone() }
+            });
             let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
             let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
             user_row(
@@ -599,6 +609,7 @@ pub(super) fn render_row(
                     grouped_with_next: *grouped_with_next,
                     expanded,
                     sent_by_t3code: *sent_by_t3code,
+                    agent,
                 },
                 this,
                 &t,
@@ -1157,6 +1168,13 @@ struct UserRowLook {
     grouped_with_next: bool,
     expanded: bool,
     sent_by_t3code: bool,
+    agent: Option<AgentFold>,
+}
+
+/// An agent's message folds to one line: who sent it, then its first line (`FoldedMessageHeader`).
+struct AgentFold {
+    label: SharedString,
+    sender: Option<SharedString>,
 }
 
 fn user_row(
@@ -1169,7 +1187,10 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code } = look;
+    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code, agent } = look;
+    if let Some(agent) = agent {
+        return agent_row(id, text, body, actions, agent, expanded, this, t);
+    }
     let collapsible = should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
@@ -1238,6 +1259,89 @@ fn user_row(
         .children(toggle_button)
         .child(actions);
     lane(if grouped_with_next { 4. } else { 16. }, column).into_any_element()
+}
+
+/// `UserTimelineRow` with `attribution === "agent"`: a one-line header (`FoldedMessageHeader`)
+/// that opens to the message, capped at `max-h-96`, plus "Open thread" when a thread sent it.
+fn agent_row(
+    id: &SharedString,
+    text: &SharedString,
+    body: AnyElement,
+    actions: gpui_kit::Div,
+    agent: AgentFold,
+    expanded: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let summary = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_owned();
+    let header = h_flex()
+        .id(ElementId::Name(format!("agent-fold:{id}").into()))
+        .w_full()
+        .min_w_0()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(16.))
+        .line_height(px(20.))
+        .cursor_pointer()
+        .child(Icon::new(IconName::MessagesSquare).size(px(16.)).flex_none().text_color(muted))
+        .child(div().flex_none().max_w(relative(0.5)).truncate().text_color(muted).child(agent.label))
+        .child(div().flex_1().min_w_0().truncate().child(summary))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .flex_none()
+                .text_color(muted),
+        )
+        .on_click(toggle(this, timeline::entry_key(id)));
+    let bubble = v_flex()
+        .min_w_0()
+        .max_w(relative(0.8))
+        .rounded(px(16.))
+        .bg(t.message_surface)
+        .text_color(t.foreground)
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .when(expanded, |el| el.w_full())
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                div()
+                    .id(ElementId::Name(format!("agent-fold-body:{id}").into()))
+                    .px(px(12.))
+                    .pb(px(12.))
+                    .max_h(px(384.))
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+        });
+    let open_thread = agent.sender.map(|sender| {
+        let this = this.clone();
+        div()
+            .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(muted)
+            .cursor_pointer()
+            .hover(|s| s.text_color(t.foreground).underline())
+            .child("Open thread")
+            .on_click(move |_, window, cx| {
+                let _ = this.update(cx, |workspace, cx| workspace.select_thread(sender.to_string(), window, cx));
+            })
+    });
+    let actions = h_flex()
+        .w_full()
+        .max_w(relative(0.8))
+        .justify_end()
+        .gap(px(8.))
+        .pr(px(4.))
+        .opacity(0.)
+        .group_hover("timeline-row", |style| style.opacity(1.))
+        .children(open_thread)
+        .child(actions);
+    let column = v_flex().group("timeline-row").items_end().gap(px(4.)).child(bubble).child(actions);
+    lane(16., column).into_any_element()
 }
 
 fn markdown_view(

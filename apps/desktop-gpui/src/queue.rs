@@ -146,6 +146,16 @@ pub fn sent_by_t3code(item: &TurnItem) -> bool {
         && item.str("creationSource") == Some("server")
 }
 
+/// `resolveUserMessagePresentation`'s "agent" attribution: another agent sent it (a subagent's
+/// task, say), so it folds to one line. Guests, automations and T3 Code itself are not agents.
+pub fn sent_by_agent(item: &TurnItem) -> bool {
+    item.raw.get("scheduledTaskId").is_none_or(Value::is_null)
+        && item.raw.pointer("/context/guest").is_none_or(Value::is_null)
+        && item.str("createdBy") == Some("agent")
+        && item.str("creationSource") != Some("server")
+        && !item.str("text").is_some_and(|text| text.starts_with("[Triggered by schedule task: "))
+}
+
 /// `isCompactionCommandMessage`.
 fn is_compaction_command(item: &TurnItem) -> bool {
     let attachments = item.raw.get("attachments").and_then(Value::as_array).map_or(0, Vec::len);

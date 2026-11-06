@@ -145,7 +145,7 @@ fn worktree_pending(worktree_path: Option<&str>, runs: &[Run]) -> bool {
 }
 
 impl Workspace {
-    fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
+    pub(super) fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
