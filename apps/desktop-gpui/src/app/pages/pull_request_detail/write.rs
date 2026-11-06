@@ -478,6 +478,8 @@ impl Workspace {
         let write = &panel.write;
         let open = write.composer_open;
         let review_mode = if can_comment { !verdicts.is_empty() && write.review_mode } else { true };
+        // The suggestion list draws past the popover, so a click on it must not count as outside.
+        let completing = write.completion.is_some();
         let view = cx.entity();
         let badge = (!pending.is_empty()).then(|| {
             div()
@@ -520,6 +522,7 @@ impl Workspace {
             Popover::new("pr-composer-popover")
                 .anchor(gpui_kit::Anchor::BottomRight)
                 .open(open)
+                .overlay_closable(!completing)
                 .on_open_change(move |open, window, cx| {
                     let open = *open;
                     view.update(cx, |this, cx| this.toggle_pr_composer(open, window, cx));
