@@ -16,7 +16,7 @@ use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
@@ -1164,6 +1164,7 @@ impl Workspace {
         let (pull_request, linked) = (self.thread_pull_request_target(), self.thread_links_pull_requests());
         let profiles = self.browser_profiles();
         let terminal = self.terminal_available();
+        let add_menu_open = self.right_panel.add_menu_open;
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
@@ -1201,45 +1202,41 @@ impl Workspace {
                     .flex_none()
                     .size(px(24.))
                     .rounded(px(8.))
+                    // `ghost-muted`: the open menu keeps its trigger's accent fill (`data-pressed`).
+                    .selected(add_menu_open)
                     .dropdown_menu(move |menu: PopupMenu, window, cx| {
                         let menu = menu.min_w(px(200.));
                         // An available Browser lists the profiles to open it in (`MenuSub`).
                         let menu = if browser {
                             let (view, profiles) = (view.clone(), profiles.clone());
                             menu.submenu_with_icon(
-                                Some(Icon::new(IconName::Globe)),
+                                Some(menu_icon(Icon::new(IconName::Globe))),
                                 "Browser",
                                 window,
                                 cx,
                                 move |menu, window, _| profile_items(menu.max_w(px(224.)), &profiles, &view, window),
                             )
                         } else {
-                            menu.item(PopupMenuItem::new("Browser").icon(Icon::new(IconName::Globe)).disabled(true))
+                            menu.item(surface_item(Icon::new(IconName::Globe), "Browser", "B").disabled(true))
                         };
                         let menu = menu
                             .item(
-                                PopupMenuItem::new("Terminal")
-                                    .icon(icon("icons/square-terminal.svg"))
+                                surface_item(icon("icons/square-terminal.svg"), "Terminal", "T")
                                     .disabled(!terminal)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.add_terminal_surface(window, cx);
                                     })),
                             )
+                            .item(surface_item(Icon::new(IconName::Files), "Files", "F").disabled(!files).on_click(
+                                window.listener_for(&view, |this, _, window, cx| {
+                                    this.open_surface(Surface::Files, window, cx);
+                                }),
+                            ))
+                            .item(surface_item(icon("icons/file-diff.svg"), "Diff", "D").disabled(!diff).on_click(
+                                window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
+                            ))
                             .item(
-                                PopupMenuItem::new("Files").icon(Icon::new(IconName::Files)).disabled(!files).on_click(
-                                    window.listener_for(&view, |this, _, window, cx| {
-                                        this.open_surface(Surface::Files, window, cx);
-                                    }),
-                                ),
-                            )
-                            .item(
-                                PopupMenuItem::new("Diff").icon(icon("icons/file-diff.svg")).disabled(!diff).on_click(
-                                    window.listener_for(&view, |this, _, window, cx| this.open_changes(window, cx)),
-                                ),
-                            )
-                            .item(
-                                PopupMenuItem::new("Pull request")
-                                    .icon(Icon::new(IconName::GitPullRequest))
+                                surface_item(Icon::new(IconName::GitPullRequest), "Pull request", "P")
                                     .disabled(pull_request.is_none())
                                     .on_click(window.listener_for(&view, move |this, _, window, cx| {
                                         if let Some(reference) = this.thread_pull_request_target() {
@@ -1248,8 +1245,7 @@ impl Workspace {
                                     })),
                             )
                             .item(
-                                PopupMenuItem::new("Linked pull requests")
-                                    .icon(Icon::new(IconName::Link))
+                                surface_item(Icon::new(IconName::Link), "Linked pull requests", "L")
                                     .disabled(!linked)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.open_surface(Surface::PullRequests, window, cx);
@@ -1257,8 +1253,7 @@ impl Workspace {
                             );
                         match side_chat {
                             Some(available) => menu.item(
-                                PopupMenuItem::new("Side chat")
-                                    .icon(Icon::new(IconName::MessagesSquare))
+                                surface_item(Icon::new(IconName::MessagesSquare), "Side chat", "S")
                                     .disabled(!available)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.add_side_chat_surface(window, cx);
@@ -1956,6 +1951,27 @@ impl Workspace {
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
     }
+}
+
+/// A menu row's 16px icon (`sm:size-4`): the menu lays icons out in a 12px box, so the glyph
+/// is scaled up around its centre.
+fn menu_icon(icon: Icon) -> Icon {
+    icon.transform(gpui_kit::Transformation::scale(gpui_kit::size(4. / 3., 4. / 3.)))
+}
+
+/// A "+" menu row (`SurfaceMenuItem`): icon, label, and its shortcut letter at the right.
+fn surface_item(icon: Icon, label: &'static str, shortcut: &'static str) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        h_flex().w_full().gap_2().child(label).child(
+            div()
+                .ml_auto()
+                .text_xs()
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(theme::tokens(cx).muted_foreground)
+                .child(shortcut),
+        )
+    })
+    .icon(menu_icon(icon))
 }
 
 /// One item per browser profile, each opening a new tab in it.
