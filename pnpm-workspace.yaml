@@ -18,6 +18,8 @@ allowBuilds:
   electron: false
   electron-winstaller: false
   esbuild: true
+  # Ships prebuilds; its host-architecture probe triggers source builds during cross-packaging.
+  koffi: false
   node-pty: true
   # Ships N-API prebuilds; its install script only rebuilds from source.
   objc-js: false
@@ -168,9 +170,6 @@ overrides:
   "expo-sharing>@expo/config-types": 58.0.3
   # @pierre/trees pins @pierre/theming 1.0.0, whose peer range predates @pierre/theme 2.
   "@pierre/trees>@pierre/theming": 1.0.2
-  # tr3x: @opentui/core's bun-ffi-structs peers on TypeScript 5, which would
-  # re-resolve upstream's optional TypeScript peers.
-  "bun-ffi-structs>typescript": "-"
   # Resolve below remark-math so Vite, Metro and Node use the same tokenizer.
   "remark-math>micromark-extension-math": npm:micromark-extension-llm-math@3.1.0
   micromark-extension-gfm-table: 2.1.1
