@@ -529,15 +529,16 @@ impl Workspace {
         let project = self.target_project()?;
         let project_id = project.id.clone();
         let saved = resolve_project_scripts(&self.server_info().settings, project);
-        // `useT3ProjectFileScripts` on the thread's checkout; read on first sight.
-        let importable: Vec<ScriptInput> = match self.git_cwd() {
-            Some(root) => match self.t3_project_files.get(&root) {
+        // `useT3ProjectFileScripts` on the thread's checkout and machine; read on first sight.
+        let checkout = self.active_environment().cloned().zip(self.git_cwd());
+        let importable: Vec<ScriptInput> = match checkout {
+            Some(key) => match self.t3_project_files.get(&key) {
                 Some(file) => importable_scripts(file, &saved).into_iter().map(ScriptInput::from_file_script).collect(),
                 None => {
                     let view = cx.entity();
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
-                            this.t3_project_file(&root, cx);
+                            this.t3_project_file(&key.0, &key.1, cx);
                         });
                     });
                     Vec::new()
