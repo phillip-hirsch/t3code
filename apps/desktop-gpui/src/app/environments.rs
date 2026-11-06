@@ -133,7 +133,12 @@ impl Unsaved {
 
     /// Writes the newest catalog no write has tried yet, after any write still running.
     fn flush(&self, save: impl FnOnce(&Catalog) -> Result<(), String>) {
-        let Some((version, catalog)) = self.lock().newest.take() else { return };
+        let pending = self.lock().newest.take();
+        let Some((version, catalog)) = pending else {
+            // Nothing newer is queued, but a running write may still be saving the last edit.
+            drop(self.0.writing.lock().expect("a catalog write panicked"));
+            return;
+        };
         drop(self.write(version, &catalog, save));
     }
 
@@ -731,6 +736,50 @@ mod tests {
             Ok(())
         });
         assert_eq!((second, written), (2, vec!["b".to_owned()]));
+    }
+
+    #[test]
+    fn quitting_waits_for_a_running_write_even_with_nothing_newer_queued() {
+        use std::sync::mpsc;
+
+        let unsaved = Unsaved::default();
+        let only = unsaved.queue(&catalog(&[environment("a", true)]));
+        let (entered, save_started) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let writer = {
+            let unsaved = unsaved.clone();
+            let a = catalog(&[environment("a", true)]);
+            std::thread::spawn(move || {
+                unsaved.write(only, &a, |_| {
+                    entered.send(()).expect("the test is waiting");
+                    gate.recv().expect("the test releases the write");
+                    Ok(())
+                })
+            })
+        };
+        save_started.recv().expect("the write starts");
+
+        // Quitting flushes while that write is stuck; it must not report done before the write ends.
+        let (flushed, done) = mpsc::channel();
+        let flusher = {
+            let unsaved = unsaved.clone();
+            std::thread::spawn(move || {
+                unsaved.flush(|_| Err("nothing newer should be written".into()));
+                flushed.send(()).expect("the test is waiting");
+            })
+        };
+        // A flush that skips the wait returns at once; one that waits is still blocked after this window.
+        assert!(
+            done.recv_timeout(Duration::from_millis(500)).is_err(),
+            "flush returned while a write was still saving"
+        );
+        // Queueing stays independent of the stuck write.
+        let next = unsaved.queue(&catalog(&[environment("b", true)]));
+        release.send(()).expect("the write is waiting");
+        assert_eq!(writer.join().expect("the writer thread"), Ok(()));
+        done.recv().expect("flush finishes once the write ends");
+        flusher.join().expect("the flushing thread");
+        assert_eq!(next, 2);
     }
 
     #[test]
