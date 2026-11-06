@@ -86,6 +86,8 @@ pub struct Entry {
     pub review_decision: Option<String>,
     #[serde(default)]
     pub checks_state: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<f64>,
     #[serde(skip)]
     pub updated_ms: Option<i64>,
     #[serde(skip)]
