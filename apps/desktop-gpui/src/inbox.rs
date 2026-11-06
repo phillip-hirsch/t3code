@@ -629,9 +629,8 @@ pub struct Sections<'a> {
     pub settled: Vec<Facts<'a>>,
 }
 
-/// `partitionSidebarThreads`. `working_shelf` is false while the environment is disconnected
-/// or the shelf is off; `sort_active_by_send` sorts Active as the Working shelf does, for the
-/// boring sidebar's folders.
+/// `partitionSidebarThreads`. `working_shelf` is false while the shelf is off;
+/// `sort_active_by_send` sorts Active as the Working shelf does, for the boring sidebar's folders.
 pub fn partition<'a>(
     threads: &'a [ThreadShell],
     now: i64,
@@ -1189,8 +1188,8 @@ mod tests {
         active.sort();
         assert_eq!(active, ["asking", "snooze-over", "woke-early"]);
 
-        let offline = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
-        assert!(offline.working.is_empty(), "a disconnected environment has no Working shelf");
+        let shelf_off = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
+        assert!(shelf_off.working.is_empty(), "the Working shelf is off");
     }
 
     #[test]

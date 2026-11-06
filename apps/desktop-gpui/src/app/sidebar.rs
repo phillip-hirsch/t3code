@@ -1149,9 +1149,8 @@ impl Workspace {
         let sb = tokens.sidebar;
         let now = now_ms();
         let query = self.search_query(cx);
-        let connected = matches!(self.connection, Connection::Connected | Connection::Connecting);
-        let working_shelf =
-            connected && self.shell.live() && self.client_settings.values.bool("sidebarWorkingShelfEnabled");
+        // Working threads keep their shelf while the environment is disconnected.
+        let working_shelf = self.client_settings.values.bool("sidebarWorkingShelfEnabled");
         let boring = self.boring_sidebar();
         let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
         let groups = self.project_groups();
