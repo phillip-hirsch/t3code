@@ -397,8 +397,9 @@ impl Workspace {
             .min_w(px(52.))
             .disabled(disabled)
             .selected(open)
+            // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
             .children(icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.foreground))
+                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
             }))
             .child(
                 div()
