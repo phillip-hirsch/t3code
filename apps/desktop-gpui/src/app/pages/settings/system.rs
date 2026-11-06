@@ -34,6 +34,9 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
+/// `TOOL_CALL_VISIBILITY_LABELS`.
+const TOOL_CALL_VISIBILITIES: &[(&str, &str)] =
+    &[("showAll", "Show all"), ("hideSuccessful", "Hide successful"), ("hideAll", "Hide all"), ("zen", "Zen")];
 const GUEST_LINKS: &[Part] = &[
     Part::Text(
         "Share a thread with a guest who watches it live in their browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
@@ -163,6 +166,13 @@ impl Workspace {
                     .description("In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.")
                     .setting("boringSidebarMultilineRows")
                     .switch(),
+            ),
+            row(
+                self,
+                SettingRow::new("tool-call-visibility")
+                    .description("Hide the commands, edits, and searches agents run, so a thread reads like a conversation. Hide successful keeps calls that fail. Zen also hides the agent's in-between messages and shows only final answers. Approvals, questions, and errors always show.")
+                    .setting("toolCallVisibility")
+                    .select(TOOL_CALL_VISIBILITIES, 160.),
             ),
             // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has
             // no T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).

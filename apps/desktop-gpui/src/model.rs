@@ -1476,6 +1476,21 @@ impl ThreadProjection {
         }
     }
 
+    /// `turnEnded`: the provider finished this active run's latest turn, though the run has not settled yet.
+    pub fn turn_ended(&self, run: &Run) -> bool {
+        let activity = matches!(run.status.as_str(), "preparing" | "starting" | "running" | "waiting");
+        let Some(attempt) = run.active_attempt_id.as_ref().filter(|_| activity) else { return false };
+        // `latestProviderTurnForAttempt`: the first turn with the highest ordinal.
+        let latest = self.provider_turns.iter().filter(|turn| turn.run_attempt_id.as_ref() == Some(attempt)).fold(
+            None,
+            |latest: Option<&ProviderTurn>, turn| match latest {
+                Some(latest) if turn.ordinal <= latest.ordinal => Some(latest),
+                _ => Some(turn),
+            },
+        );
+        latest.is_some_and(|turn| !matches!(turn.status.as_str(), "pending" | "running"))
+    }
+
     pub fn is_running(&self) -> bool {
         self.runs.iter().any(|run| is_active_run_status(&run.status))
     }

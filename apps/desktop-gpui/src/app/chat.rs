@@ -1564,7 +1564,7 @@ fn work_line(
 fn work_bottom(work: &WorkRow) -> f32 {
     let header = match &work.kind {
         WorkRowKind::Toggle { expanded, .. } | WorkRowKind::Live { expanded, .. } => *expanded,
-        WorkRowKind::Thinking { group, expanded } => group.is_some() && *expanded,
+        WorkRowKind::Thinking { group, expanded, .. } => group.is_some() && *expanded,
         _ => false,
     };
     if matches!(work.kind, WorkRowKind::Details { .. }) {
@@ -1625,8 +1625,9 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                 )
                 .into_any_element()
         }
-        WorkRowKind::Thinking { group, .. } => {
-            let line = work_line(WorkIcon::Brain, icon_color(t), "Thinking", muted, None);
+        WorkRowKind::Thinking { group, preview, .. } => {
+            let label = preview.clone().unwrap_or_else(|| "Thinking".into());
+            let line = work_line(WorkIcon::Brain, icon_color(t), label, muted, None);
             match group {
                 Some(group) => row
                     .id(ElementId::Name(work.id.clone()))

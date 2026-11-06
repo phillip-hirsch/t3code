@@ -727,10 +727,20 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// This device's Settings › Labs › Tool calls in chat.
+    fn tool_call_visibility(&self) -> timeline::ToolCallVisibility {
+        let value = self.client_settings.values.get("toolCallVisibility");
+        timeline::ToolCallVisibility::from_setting(value.as_str().unwrap_or_default())
+    }
+
     /// Rebuilds the timeline and tells the scroller which rows changed.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         let mut new_rows = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
-            Some(projection) => timeline::rows(projection, &self.expanded, &mut self.entry_cache),
+            Some(projection) => {
+                let visibility = self.tool_call_visibility();
+                let visibility = if self.find.is_some() { visibility.while_finding() } else { visibility };
+                timeline::rows(projection, &self.expanded, visibility, &mut self.entry_cache)
+            }
             None => Vec::new(),
         };
         self.apply_workflow_opening(&mut new_rows, cx);

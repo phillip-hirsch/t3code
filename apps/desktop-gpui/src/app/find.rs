@@ -348,6 +348,10 @@ impl Workspace {
             _refresh: None,
             _subscription: subscription,
         });
+        // Zen hides the in-between messages find can land on.
+        if self.tool_call_visibility() == timeline::ToolCallVisibility::Zen {
+            self.refresh_rows(cx);
+        }
         // Opening find is manual navigation: it releases live follow (`announceOpening`).
         self.scroller.update(cx, |scroller, cx| {
             let top = scroller.logical_scroll_top().item_ix;
@@ -359,6 +363,9 @@ impl Workspace {
         if self.find.is_some() {
             self.clear_find_highlights(cx);
             self.find = None;
+            if self.tool_call_visibility() == timeline::ToolCallVisibility::Zen {
+                self.refresh_rows(cx);
+            }
             self.focus_composer(window, cx);
             cx.notify();
         }

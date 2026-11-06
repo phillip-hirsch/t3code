@@ -364,9 +364,10 @@ impl Workspace {
 
     /// Rebuilds the side chat's rows. Its edit-from-here would rewind the main thread, so it is off.
     pub(super) fn refresh_side_chat_rows(&mut self, cx: &mut Context<Self>) {
+        let visibility = self.tool_call_visibility();
         let Some(view) = self.side_chat.view.as_mut() else { return };
         let mut rows = match view.state.projection.as_ref() {
-            Some(projection) => timeline::rows(projection, &self.expanded, &mut view.cache),
+            Some(projection) => timeline::rows(projection, &self.expanded, visibility, &mut view.cache),
             None => Vec::new(),
         };
         for row in &mut rows {
