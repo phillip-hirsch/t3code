@@ -1185,6 +1185,8 @@ impl Workspace {
                     options.iter().find(|(v, _)| *v == current).map_or(current.clone(), |(_, l)| (*l).to_owned())
                 };
                 let workspace = cx.entity();
+                // `SelectValue` ellipsizes a label wider than the trigger.
+                let label = div().min_w_0().truncate().child(label);
                 select_trigger(id, label, width, &t)
                     .min_w(px(ROW_SELECT_MIN_WIDTH))
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {

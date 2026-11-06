@@ -1,8 +1,7 @@
 //! Settings › Browser (`BrowserSettingsPanel` in `apps/web/src/components/settings/IntegrationsSettings.tsx`).
 //!
-//! Left out until this client has what they configure: "Auto-show floating preview" (agents'
-//! server tabs and devices, which it can't draw), the recordings' key and mouse press overlays
-//! (it doesn't record its own tabs) and importing cookies from other browsers.
+//! Left out until this client has what they configure: the recordings' key and mouse press
+//! overlays (it doesn't record its own tabs) and importing cookies from other browsers.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -72,12 +71,19 @@ impl Workspace {
             .setting("browserLinkTarget")
             .select(LINK_TARGETS, 160.);
         let link_target = self.setting_row(view, link_target, window, cx);
+        let auto_show = SettingRow::new("browser-auto-show-floating-preview")
+            .description(
+                "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.",
+            )
+            .setting("browserAutoShowFloatingPreview")
+            .switch();
+        let auto_show = self.setting_row(view, auto_show, window, cx);
         let search_engine = SettingRow::new("browser-search-engine")
             .description("What the address bar searches when you type something that isn't a URL.")
             .setting("browserSearchEngine")
             .setting("browserCustomSearchUrl")
             .select(SEARCH_ENGINES, 160.);
-        let mut browsing = vec![profiles, link_target, self.setting_row(view, search_engine, window, cx)];
+        let mut browsing = vec![profiles, link_target, auto_show, self.setting_row(view, search_engine, window, cx)];
         if view.str("browserSearchEngine") == "custom" {
             browsing.push(self.custom_search_url_row(view, window, cx));
         }

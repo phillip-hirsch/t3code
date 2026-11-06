@@ -95,6 +95,8 @@ pub(super) struct PreviewState {
     starting: HashMap<String, String>,
     /// The tab each thread's mini player floats (`previewMiniPlayerStore`).
     floating: HashMap<String, String>,
+    /// Agent reveals not yet shown: thread, tab and whether the reveal is forced.
+    reveals: Vec<(String, String, bool)>,
     /// The tabs drawn this frame, by the panel and the mini player, with their page scale.
     panel_view: Option<(String, f32)>,
     mini_view: Option<(String, f32)>,
@@ -136,6 +138,7 @@ impl PreviewState {
             tabs: HashMap::new(),
             starting: HashMap::new(),
             floating: HashMap::new(),
+            reveals: Vec::new(),
             panel_view: None,
             mini_view: None,
             address,
@@ -329,7 +332,12 @@ impl Workspace {
     fn apply_preview_event(&mut self, event: &Value) {
         let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else { return };
         let previews = self.preview.threads.entry(thread_id.to_owned()).or_default();
-        match previews.apply_event(event) {
+        let before = previews.clone();
+        let applied = previews.apply_event(event);
+        let fresh = previews.fresh_reveals(&before);
+        self.preview.reveals.extend(fresh.into_iter().map(|(tab, force)| (thread_id.to_owned(), tab, force)));
+        let previews = self.preview.threads.entry(thread_id.to_owned()).or_default();
+        match applied {
             Ok(Applied::Relist) => {
                 self.preview.stale.insert(thread_id.to_owned());
             }
@@ -362,10 +370,15 @@ impl Workspace {
                 let _ = this.update_in(cx, |this, window, cx| {
                     match result {
                         Ok(list) => {
-                            let previews = this.preview.threads.entry(thread_id).or_default();
+                            let previews = this.preview.threads.entry(thread_id.clone()).or_default();
+                            let before = previews.clone();
                             if let Err(error) = previews.apply_list(&list) {
                                 log::warn!("bad preview list: {error}");
                             }
+                            let fresh = previews.fresh_reveals(&before);
+                            this.preview
+                                .reveals
+                                .extend(fresh.into_iter().map(|(tab, force)| (thread_id.clone(), tab, force)));
                         }
                         Err(error) => log::warn!("preview.list failed: {error}"),
                     }
@@ -374,6 +387,7 @@ impl Workspace {
             })
             .detach();
         }
+        self.show_agent_reveals();
         let threads = &self.preview.threads;
         self.preview.tabs.retain(|tab_id, tab| threads.get(&tab.thread_id).is_none_or(|p| p.get(tab_id).is_some()));
         self.preview.floating.retain(|thread_id, tab| threads.get(thread_id).is_none_or(|p| p.get(tab).is_some()));
@@ -387,6 +401,28 @@ impl Workspace {
         }
         self.sync_address(window, cx);
         cx.notify();
+    }
+
+    /// `revealServerTabs`: a revealed tab floats over the chat while the
+    /// `browserAutoShowFloatingPreview` setting is on; a forced reveal also focuses its panel tab.
+    /// Runs before the panel gains tabs for new sessions, so a new tab floats first.
+    fn show_agent_reveals(&mut self) {
+        let auto_show = self.client_settings.values.bool("browserAutoShowFloatingPreview");
+        for (thread_id, tab_id, force) in std::mem::take(&mut self.preview.reveals) {
+            if !auto_show && !force {
+                continue;
+            }
+            let supported = self
+                .thread_environment(&thread_id)
+                .and_then(|environment| self.session(&environment))
+                .is_some_and(|session| session.server_info.capability("serverBrowser"));
+            if !supported {
+                continue;
+            }
+            if !self.reveal_browser_surface(&thread_id, &tab_id, force) {
+                self.preview.floating.insert(thread_id, tab_id);
+            }
+        }
     }
 
     /// The URL the active tab shows, as its address bar reads when not being edited.
