@@ -115,8 +115,6 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
     pub(super) _live_interval: Option<Task<()>>,
-    /// The prompt each project's composer last received from a handoff (`lastHandoffPromptByDraft`).
-    pub(super) last_handoff: std::collections::HashMap<String, String>,
     /// The searchable Author or Labels picker, while open.
     facet_search: Option<facets::FacetSearch>,
 }
@@ -159,7 +157,6 @@ impl PullRequestsState {
             panel: None,
             last_merge_method: "merge",
             reviews: std::collections::HashMap::new(),
-            last_handoff: std::collections::HashMap::new(),
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
             panel_width: None,

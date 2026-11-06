@@ -20,12 +20,10 @@ impl Workspace {
         }
     }
 
-    /// Puts a handoff's prompt in the composer, replacing the last one it wrote there.
-    fn write_pr_task(&mut self, project_id: &str, prompt: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Adds a handoff's prompt to the composer (`writeHandoffToComposer`).
+    fn write_pr_task(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) {
         let existing = self.composer.read(cx).value().to_string();
-        let last = self.pull_requests.last_handoff.get(project_id).map(String::as_str);
-        let next = logic::handoff_prompt(&existing, last, prompt);
-        self.pull_requests.last_handoff.insert(project_id.to_owned(), prompt.to_owned());
+        let next = logic::append_handoff(&existing, prompt);
         self.set_composer_text(next, window, cx);
     }
 
@@ -42,7 +40,7 @@ impl Workspace {
         }
         let question = !prompt.lines().next().unwrap_or_default().starts_with("PR #");
         self.start_draft(detail.project_id.clone(), window, cx);
-        self.write_pr_task(&detail.project_id, &prompt, window, cx);
+        self.write_pr_task(&prompt, window, cx);
         let description = if question {
             "The question is in the composer. Read it over, then send.".to_owned()
         } else {
@@ -155,7 +153,7 @@ impl Workspace {
                     },
                 };
                 if let Some(task) = &task {
-                    this.write_pr_task(&project_id, task, window, cx);
+                    this.write_pr_task(task, window, cx);
                 }
                 let (title, description) = if !on_head {
                     (
