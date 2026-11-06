@@ -105,9 +105,14 @@ fn main() {
         cx.text_system()
             .add_fonts(theme::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
             .expect("bundled fonts");
-        // Quitting stops the local server, as Electron's backend manager does. GPUI waits only
-        // briefly for this; `main` waits for the rest after `run` returns.
-        cx.on_app_quit(|_| backend::stop_local_servers()).detach();
+        // Quitting stops the local server, as Electron's backend manager does. GPUI gives quit
+        // handlers' futures only 200 ms, and macOS and Windows exit right after them, so the
+        // handler itself waits for the SIGTERM, the grace period and any kill.
+        cx.on_app_quit(|_| {
+            stop_local_servers_before_exit();
+            async {}
+        })
+        .detach();
         #[cfg(unix)]
         desktop::quit_on_signals(cx);
         cx.bind_keys(app::terminal_key_bindings());
@@ -124,7 +129,11 @@ fn main() {
         cx.set_global(desktop::Desktop::load(launches, cx));
         open_main_window(cx);
     });
-    // Linux and Windows return here once the app quits (macOS exits inside `run`).
+}
+
+/// Blocks until every local server has exited: at most [`backend::STOP_TIMEOUT`] for SIGTERM,
+/// then as long again for the kill.
+fn stop_local_servers_before_exit() {
     let stopped = runtime()
         .block_on(async { tokio::time::timeout(backend::STOP_TIMEOUT * 2, backend::stop_local_servers()).await });
     if stopped.is_err() {
