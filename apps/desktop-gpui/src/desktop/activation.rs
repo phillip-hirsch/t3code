@@ -26,7 +26,8 @@ pub enum Instance {
 /// The channel the app owns. On Unix the socket is a file, so a lock held for the app's life
 /// tells a running app's socket from one a crash left behind. Like Electron's single-instance
 /// lock it must last until the process exits (on Windows the pipe is the lock and already does),
-/// so a launch while this app quits waits for it instead of starting a second server.
+/// so a launch while this app quits waits up to [`OWNER_WAIT`] for it. That covers a normal quit;
+/// one stalled on a stuck server or a keyring prompt can outlast it, and the launch then starts.
 #[derive(Debug)]
 pub struct Channel {
     #[cfg(unix)]
