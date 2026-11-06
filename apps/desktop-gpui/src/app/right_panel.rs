@@ -1953,10 +1953,13 @@ impl Workspace {
     }
 }
 
-/// A menu row's 16px icon (`sm:size-4`): the menu lays icons out in a 12px box, so the glyph
-/// is scaled up around its centre.
+/// A menu row's 16px icon (`sm:size-4`, `-mx-0.5`): the menu lays icons out in a 12px box, so
+/// the glyph is scaled up and nudged left to clear the label.
 fn menu_icon(icon: Icon) -> Icon {
-    icon.transform(gpui_kit::Transformation::scale(gpui_kit::size(4. / 3., 4. / 3.)))
+    icon.transform(
+        gpui_kit::Transformation::scale(gpui_kit::size(4. / 3., 4. / 3.))
+            .with_translation(gpui_kit::point(px(-2.), px(0.))),
+    )
 }
 
 /// A "+" menu row (`SurfaceMenuItem`): icon, label, and its shortcut letter at the right.
