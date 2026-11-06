@@ -35,6 +35,7 @@ mod composer;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;
+mod confirm;
 mod context_strip;
 mod desktop;
 mod details;

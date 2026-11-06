@@ -13,7 +13,7 @@ use gpui_kit::component::{Icon, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    Point, PromptLevel, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    Point, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -125,8 +125,7 @@ struct Confirm {
     setting: &'static str,
     message: String,
     detail: Option<&'static str>,
-    ok: &'static str,
-    level: PromptLevel,
+    destructive: bool,
 }
 
 const UNDO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -427,8 +426,7 @@ impl Workspace {
             setting: "confirmThreadUnpin",
             message: format!("Unpin thread \"{title}\"?"),
             detail: Some("This will move the thread out of your pinned section."),
-            ok: "Unpin",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             let entry = this.undo_entry(&thread_id);
@@ -449,8 +447,7 @@ impl Workspace {
             setting: "confirmThreadUnpin",
             message: format!("Unpin {} threads?", ids.len()),
             detail: Some("This will move the threads out of your pinned section."),
-            ok: "Unpin",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             for id in &ids {
@@ -472,8 +469,7 @@ impl Workspace {
             setting: "confirmThreadArchive",
             message: format!("Archive thread \"{title}\"?"),
             detail: None,
-            ok: "Archive",
-            level: PromptLevel::Info,
+            destructive: false,
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
@@ -495,8 +491,7 @@ impl Workspace {
             setting: "confirmThreadDelete",
             message: format!("Delete thread \"{title}\"?"),
             detail: Some("This permanently clears conversation history for this thread."),
-            ok: "Delete",
-            level: PromptLevel::Critical,
+            destructive: true,
         };
         self.confirm_then(question, window, cx, move |this, _, cx| {
             if this.thread_client(&thread_id).is_some() {
@@ -518,9 +513,19 @@ impl Workspace {
             then(self, window, cx);
             return;
         }
-        let answer = window.prompt(question.level, &question.message, question.detail, &[question.ok, "Cancel"], cx);
+        let message = question.detail.map_or_else(
+            || question.message.clone(),
+            |detail| {
+                format!(
+                    "{}
+{detail}",
+                    question.message
+                )
+            },
+        );
+        let answer = super::super::confirm::confirm(&message, question.destructive, window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(0) {
+            if answer.await == Ok(true) {
                 let _ = this.update_in(cx, |this, window, cx| then(this, window, cx));
             }
         })

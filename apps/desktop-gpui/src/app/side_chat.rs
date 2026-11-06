@@ -16,8 +16,8 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, PromptLevel, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    Subscription, Task, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -512,18 +512,16 @@ impl Workspace {
         }
         let confirm = self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(true);
         let answer = confirm.then(|| {
-            window.prompt(
-                PromptLevel::Critical,
-                &format!("Delete side chat \"{title}\"?"),
-                Some("This permanently clears its conversation history."),
-                &["Delete", "Cancel"],
-                cx,
-            )
+            let message = format!(
+                "Delete side chat \"{title}\"?
+This permanently clears its conversation history."
+            );
+            super::confirm::confirm(&message, true, window, cx)
         });
         let client = self.client();
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = answer
-                && answer.await != Ok(0)
+                && answer.await != Ok(true)
             {
                 return;
             }

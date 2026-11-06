@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::{Context, PromptLevel, WeakEntity, Window, px};
+use gpui_kit::{Context, WeakEntity, Window, px};
 use serde_json::json;
 
 use super::actions::UndoAction;
@@ -293,15 +293,14 @@ impl Workspace {
             run(self, cx);
             return;
         }
-        let answer = window.prompt(
-            PromptLevel::Critical,
-            &format!("Delete {count} thread{}?", plural(count)),
-            Some("This permanently clears conversation history for these threads."),
-            &["Delete", "Cancel"],
-            cx,
+        let message = format!(
+            "Delete {count} thread{}?
+This permanently clears conversation history for these threads.",
+            plural(count)
         );
+        let answer = super::super::confirm::confirm(&message, true, window, cx);
         cx.spawn(async move |this, cx| {
-            if answer.await == Ok(0) {
+            if answer.await == Ok(true) {
                 let _ = this.update(cx, |this, cx| run(this, cx));
             }
         })
