@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use futures::channel::oneshot;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::dialog::{DialogEntrance, DialogFooter};
 use gpui_kit::component::{WindowExt as _, v_flex};
 use gpui_kit::{App, FontWeight, ParentElement as _, SharedString, Styled as _, Window, div, px, relative, white};
 
@@ -60,6 +60,7 @@ pub(in crate::app) fn confirm(
         // `AlertDialogPopup`: centred, `max-w-lg`, `dialog-glass` (`rounded-2xl`, a white/8% edge
         // in dark mode); the header and the footer bring their own padding.
         dialog
+            .entrance(DialogEntrance::None)
             .centered()
             .w(px(512.))
             .p_0()
