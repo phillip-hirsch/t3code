@@ -378,6 +378,13 @@ impl super::Workspace {
         }
     }
 
+    /// `isProjectPinShortcut`: the thread pin shortcut, which pins the highlighted row of a
+    /// project list while its search field has focus.
+    pub(super) fn is_pin_shortcut(&self, keystroke: &Keystroke) -> bool {
+        let context = ShortcutContext { editable_focus: true, ..ShortcutContext::default() };
+        resolve(&self.keymap, keystroke, &context) == Some("thread.pin")
+    }
+
     /// `"{label} ({shortcut})"`, or the label alone when the command has no shortcut.
     pub(super) fn with_shortcut(&self, label: &str, command: &str) -> String {
         match self.shortcut_label(command) {
