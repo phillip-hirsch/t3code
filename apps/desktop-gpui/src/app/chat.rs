@@ -451,8 +451,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let project = self.shell.projects.iter().find(|p| p.id == project_id);
         let is_scratch = self.draft_is_scratch();
-        let env = self.target.as_ref().map(Target::environment).cloned().unwrap_or_default();
-        let scratch_env = self.scratch_environment(&env);
+        let scratch_env = self.scratch_environment();
         let viewport = f32::from(window.viewport_size().width);
         // Tailwind's `sm` and `lg` breakpoints, in CSS px.
         let title_size = if viewport >= 640. { rems(1.875) } else { rems(1.5) };

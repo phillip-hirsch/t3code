@@ -191,7 +191,8 @@ impl MarkdownNode {
 
     /// Lay the claimed node's children out first, as ordinary inline Markdown,
     /// so they wrap like the prose around them and only this node is atomic.
-    /// The children keep their own text, marks and source ranges.
+    /// The children keep their own text, marks and source ranges. This node's
+    /// Markdown spells them out, so copying it writes them once.
     pub fn after_children(mut self) -> Self {
         self.after_children = true;
         self

@@ -89,6 +89,12 @@ impl Workspace {
             "commandPalette.toggle" => self.open_palette(palette::View::Root, window, cx),
             "chat.new" if chat && !palette_open => self.new_thread(false, window, cx),
             "chat.newLocal" if chat && !palette_open => self.new_thread(true, window, cx),
+            "chat.newWithoutProject" if chat && !palette_open => {
+                let Some(environment) = self.scratch_environment() else { return false };
+                if !held {
+                    self.start_scratch_thread(environment, None, window, cx);
+                }
+            }
             "preview.toggle" if chat && !palette_open => self.toggle_preview(window, cx),
             "preview.refresh" | "preview.focusUrl" | "preview.zoomIn" | "preview.zoomOut" | "preview.resetZoom"
                 if chat && !palette_open =>

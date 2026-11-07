@@ -98,10 +98,16 @@ that text, then the file chip, and the text wraps like the sentence around it (t
 object, so a sentence-long label could not wrap and overflowed the transcript. The patch adds
 `MarkdownNode::after_children()`: the converter lays the claimed node's children out as ordinary
 inline Markdown (their own text, marks and source ranges) before the object, which keeps the
-node's full source range for copying. Files:
+node's full source range for copying. The object's Markdown already spells out the label, so those
+runs are flagged `covered`, never merge with the text around them under a shared mark, and are
+skipped when the object is serialized (a table's Copy as Markdown, or a selection that takes in
+the object); a selection of the label alone still copies it as text. Files:
 
 - `src/text/markdown_ext.rs`: the `after_children` flag and builder.
-- `src/text/format/markdown.rs`: `parse_paragraph`; one test, `inline_extensions_can_keep_a_nodes_children_as_prose`.
+- `src/text/format/markdown.rs`: `parse_paragraph`, `merge_children_with_mark`, `push_merged`;
+  one test, `inline_extensions_can_keep_a_nodes_children_as_prose`.
+- `src/text/node.rs`: `InlineNode::covered`, `Paragraph::to_markdown`, `selected_markdown`; one
+  test, `selected_object_copies_the_label_it_keeps_as_prose_once`.
 
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as

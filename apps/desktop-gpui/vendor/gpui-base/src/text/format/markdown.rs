@@ -312,6 +312,7 @@ fn push_merged(
     marks: Vec<(Range<usize>, TextMark)>,
     source_segments: Vec<SourceSegment>,
     new_mark: TextMark,
+    covered: bool,
 ) {
     if text.is_empty() {
         return;
@@ -320,6 +321,7 @@ fn push_merged(
     let mut node = InlineNode::new(text)
         .marks(marks)
         .source_segments(source_segments);
+    node.covered = covered;
     let len = node.text.len();
     if let Some(last) = node.marks.last_mut()
         && last.0.start == 0
@@ -350,6 +352,9 @@ fn merge_children_with_mark(
     let mut merged_text = String::new();
     let mut merged_marks = Vec::new();
     let mut merged_source_segments = Vec::new();
+    // A label's runs serialize with their object, so they never merge with
+    // the text around them.
+    let mut merged_covered = false;
 
     for group in inline_groups(children) {
         let mut child_paragraph = Paragraph::default();
@@ -369,6 +374,7 @@ fn merge_children_with_mark(
                     std::mem::take(&mut merged_marks),
                     std::mem::take(&mut merged_source_segments),
                     mark.clone(),
+                    merged_covered,
                 );
                 if let Some((_, existing)) = node.marks.first_mut() {
                     existing.merge(mark.clone());
@@ -377,6 +383,17 @@ fn merge_children_with_mark(
                 }
                 paragraph.push(node);
                 continue;
+            }
+            if node.covered != merged_covered {
+                push_merged(
+                    paragraph,
+                    std::mem::take(&mut merged_text),
+                    std::mem::take(&mut merged_marks),
+                    std::mem::take(&mut merged_source_segments),
+                    mark.clone(),
+                    merged_covered,
+                );
+                merged_covered = node.covered;
             }
             let merged_offset = merged_text.len();
             merged_text.push_str(&node.text);
@@ -407,8 +424,11 @@ fn merge_children_with_mark(
                     std::mem::take(&mut merged_marks),
                     std::mem::take(&mut merged_source_segments),
                     mark.clone(),
+                    merged_covered,
                 );
-                paragraph.push(InlineNode::image(image));
+                let mut image = InlineNode::image(image);
+                image.covered = merged_covered;
+                paragraph.push(image);
             }
         }
     }
@@ -419,6 +439,7 @@ fn merge_children_with_mark(
         merged_marks,
         merged_source_segments,
         mark,
+        merged_covered,
     );
     text
 }
@@ -761,12 +782,16 @@ fn parse_paragraph(
 
     let parse_cx = MarkdownParseContext::new(source, cx.offset);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
+        let label_start = paragraph.children.len();
         let mut text = match node.children() {
             Some(children) if custom.after_children => {
                 parse_inline_children(source, paragraph, children, cx)
             }
             _ => String::new(),
         };
+        for label in &mut paragraph.children[label_start..] {
+            label.covered = true;
+        }
         custom.set_span(span);
         let custom = custom.with_inline_source(parse_cx.node_source(node).unwrap_or_default());
         text.push_str(custom.as_text());
@@ -2431,6 +2456,21 @@ mod tests {
         let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
             panic!()
         };
+        // The object's Markdown spells the label out, so the label is not
+        // written again, also where the label shares an enclosing mark.
+        for (source, markdown) in [
+            (source, "See [the **long** label](a.rs) now"),
+            (
+                "*See [the **long** label](a.rs) now*",
+                "*See [the **long** label](a.rs) now*",
+            ),
+            (
+                "| File |\n| - |\n| See [the **long** label](a.rs) |",
+                "| File |\n| :-- |\n| See [the **long** label](a.rs) |",
+            ),
+        ] {
+            assert_eq!(parse(source, &mut cx).unwrap().to_markdown(), markdown);
+        }
         let texts: Vec<_> = paragraph
             .children
             .iter()
@@ -2450,8 +2490,7 @@ mod tests {
         assert_eq!(bold_runs(paragraph), ["long"]);
         let object = paragraph.children[4].custom.as_ref().unwrap();
         assert_eq!(object.source_range(), Some(4..30));
-        assert_eq!(document.text(), "See the long label a.rs now
-");
+        assert_eq!(document.text(), "See the long label a.rs now\n");
     }
 
     #[test]
