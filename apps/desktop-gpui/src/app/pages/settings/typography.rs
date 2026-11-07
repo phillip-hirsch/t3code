@@ -323,13 +323,18 @@ fn render_preview(
             .child(prompt_preview(t))
             .into_any_element(),
         Preview::Code => {
-            // `render_diff` sizes rows from the rem and the code font; its file header is a 20px
-            // button inside 4px padding over a 1px border.
+            // `render_diff` sizes rows from the rem and the code font; Pierre pads the code 8px
+            // below its last row.
             let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
+            // `--code-background`: `color-mix(in srgb, var(--card) 90%, var(--background))`.
+            let code_background = t.background.blend(t.card.opacity(0.9));
             let preview = Diff::new(diff)
+                .header_visible(false)
+                .border_0()
+                .bg(code_background)
                 .hunk_separator(DiffHunkSeparator::LineInfo)
                 .change_indicator(DiffChangeIndicator::Bars)
-                .h(px(29. + row * DIFF_PREVIEW_ROWS))
+                .h(px(8. + row * DIFF_PREVIEW_ROWS))
                 .text_size(px(fonts.code_size))
                 .into_any_element();
             let preview = match scheme {
@@ -340,10 +345,62 @@ fn render_preview(
                 }
                 .into_any_element(),
             };
-            frame().child(preview).into_any_element()
+            // Pierre's static HTML: no frame, its own header and no fold control.
+            v_flex()
+                .mt(px(4.))
+                .mb(px(8.))
+                .overflow_hidden()
+                .bg(code_background)
+                .child(diff_preview_header(fonts, t, scheme))
+                .child(preview)
+                .into_any_element()
         }
         Preview::Terminal => terminal_preview(fonts, t),
     }
+}
+
+/// Pierre's default file header for the preview patch (`createFileHeaderElement`): the
+/// change icon, the path and `-1 +1`, in the shadow root's own colors. Those are the syntax
+/// theme's `gitDecoration` colors (pierre-dark), Pierre's light defaults otherwise, and the
+/// app's diff colors once blue-orange overrides them.
+fn diff_preview_header(fonts: &Fonts, t: &Tokens, scheme: DiffColorScheme) -> impl IntoElement {
+    let (modified, addition, deletion) =
+        if t.dark { (0x009fff, 0x07c480, 0xff2e3f) } else { (0x009fff, 0x0dbe4e, 0xff2e3f) };
+    let (mut addition, mut deletion): (Hsla, Hsla) = (rgb(addition).into(), rgb(deletion).into());
+    if scheme == DiffColorScheme::BlueOrange {
+        (addition, deletion) = (git::addition_color(t, scheme), git::deletion_color(t, scheme));
+    }
+    // `min-height: calc(1lh + 3 * 8px)` at Pierre's 20px line height, `padding-inline: 16px`.
+    h_flex()
+        .min_h(px(44.))
+        .px(px(16.))
+        .gap(px(8.))
+        .justify_between()
+        .font_family(fonts.sans)
+        .text_size(px(fonts.code_size))
+        .line_height(px(20.))
+        .text_color(t.foreground)
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap(px(8.))
+                .child(
+                    gpui_kit::svg()
+                        .path("icons/app/diffs/symbol-modified.svg")
+                        .size(px(16.))
+                        .flex_none()
+                        .text_color(rgb(modified)),
+                )
+                .child(div().min_w_0().truncate().child("src/formatUser.ts")),
+        )
+        .child(
+            h_flex()
+                .flex_none()
+                .gap(px(fonts.code_size * 0.6))
+                .font_family(fonts.mono)
+                .child(div().text_color(deletion).child("-1"))
+                .child(div().text_color(addition).child("+1")),
+        )
 }
 
 /// `DIFF_PREVIEW_PATCH`: one file, one hunk.
