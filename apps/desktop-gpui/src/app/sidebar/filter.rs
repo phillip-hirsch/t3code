@@ -160,6 +160,7 @@ impl Workspace {
                 return;
             }
         }
+        self.sidebar_open.close_sheet();
         self.open_palette(View::NewThreadIn, window, cx);
     }
 
