@@ -468,7 +468,9 @@ impl Workspace {
                 .track_focus(focus)
                 .when(open, gpui_kit::Styled::underline)
                 .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_draft_picker(window, cx)))
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                    this.toggle_draft_picker(!event.is_keyboard(), window, cx);
+                }))
                 .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                     let key = event.keystroke.key.as_str();
                     if matches!(key, "down" | "up") && !event.keystroke.modifiers.modified() {

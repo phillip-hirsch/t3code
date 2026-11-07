@@ -118,7 +118,7 @@ impl Workspace {
     /// picker's highlight a row.
     pub(super) fn open_draft_picker_from_key(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.draft_picker.open.is_none() {
-            self.toggle_draft_picker(window, cx);
+            self.toggle_draft_picker(false, window, cx);
             return;
         }
         let len = self.draft_picker_rows(cx).len();
@@ -132,12 +132,14 @@ impl Workspace {
         self.draft_picker.open.is_some()
     }
 
-    pub(super) fn toggle_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens or closes the picker; a `pointer` press right after an outside press closed it
+    /// doesn't reopen it, while a key does.
+    pub(super) fn toggle_draft_picker(&mut self, pointer: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.draft_picker.open.is_some() {
             self.close_draft_picker(window, cx);
             return;
         }
-        if self.draft_picker.closed_at.is_some_and(|at| at.elapsed() < Duration::from_millis(300)) {
+        if pointer && self.draft_picker.closed_at.is_some_and(|at| at.elapsed() < Duration::from_millis(300)) {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
