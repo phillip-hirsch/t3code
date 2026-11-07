@@ -2443,6 +2443,18 @@ impl Interactivity {
                             } else {
                                 None
                             };
+                            // A shown tooltip checks the element's current bounds, so it hides
+                            // once a layout change moves the element out from under the pointer.
+                            if let (Some(hitbox), Some(element_state)) =
+                                (hitbox.as_ref(), element_state.as_mut())
+                            {
+                                if self.tooltip_builder.is_some() {
+                                    element_state
+                                        .tooltip_source_bounds
+                                        .get_or_insert_with(Default::default)
+                                        .set(hitbox.bounds);
+                                }
+                            }
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
@@ -3258,6 +3270,10 @@ impl Interactivity {
                     .long_press_tooltip_active
                     .get_or_insert_with(Default::default)
                     .clone();
+                let tooltip_source_bounds = element_state
+                    .tooltip_source_bounds
+                    .get_or_insert_with(Default::default)
+                    .clone();
 
                 let tooltip_is_hoverable = tooltip_builder.hoverable;
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
@@ -3266,11 +3282,12 @@ impl Interactivity {
                 // Use bounds instead of testing hitbox since this is called during prepaint.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
                             && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && tooltip_source_bounds
+                                .get()
+                                .contains(&window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3685,6 +3702,8 @@ pub struct InteractiveElementState {
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+    /// The element's bounds this frame, read by its shown tooltip's hover check.
+    tooltip_source_bounds: Option<Rc<Cell<Bounds<Pixels>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -5228,6 +5247,63 @@ mod tests {
             .unwrap();
 
         assert!(active_tooltip.borrow().is_none());
+    }
+
+    struct MovingTooltipOwner {
+        target_left: Pixels,
+    }
+
+    impl Render for MovingTooltipOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().child(
+                div()
+                    .id("moving-target")
+                    .absolute()
+                    .left(self.target_left)
+                    .top_0()
+                    .size(px(20.))
+                    .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
+            )
+        }
+    }
+
+    #[test]
+    fn tooltip_hides_when_its_element_moves_from_under_a_still_mouse() {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, _| MovingTooltipOwner {
+            target_left: px(0.),
+        });
+        let any_window: AnyWindowHandle = window.into();
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+            })
+            .unwrap();
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+        test_app
+            .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let tooltip_shown = |test_app: &mut TestAppContext| {
+            test_app
+                .update_window(any_window, |_, window, _| window.tooltip_bounds.is_some())
+                .unwrap()
+        };
+        assert!(tooltip_shown(&mut test_app));
+
+        window
+            .update(&mut test_app, |view, _, cx| {
+                view.target_left = px(40.);
+                cx.notify();
+            })
+            .unwrap();
+        test_app
+            .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert!(!tooltip_shown(&mut test_app));
     }
 
     struct MouseDownOutOwner {

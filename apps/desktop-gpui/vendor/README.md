@@ -12,6 +12,23 @@ it once upstream has an equivalent), and update the versions here and in `../Car
 gpui-kit's `gpui-pre-platform` pins). Each patch was committed separately from its unmodified
 copy, so `git log -p -- vendor/<name>` shows it.
 
+## gpui-pre 0.3.11
+
+GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
+
+**A tooltip hides once its element moves away from the pointer.** 0.3.11 checks a shown tooltip
+against the bounds its element had when the tooltip appeared, so a layout change under a still
+pointer (a panel opening, a row reflowing) left the tooltip floating where its button used to be
+until the pointer left that old spot. The patch keeps the element's bounds in its element state,
+updated every frame, and the tooltip's check reads them. Files:
+
+- `src/elements/div.rs`: `InteractiveElementState::tooltip_source_bounds`, set in `prepaint` and
+  read by `check_is_hovered_during_prepaint`; one test,
+  `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`.
+
+The crate's tests need `--features test-support`; run them from a scratch copy outside this
+repository (`cargo test --features test-support --lib`).
+
 ## gpui-pre-windows 0.3.11
 
 GPUI's Windows platform (Zed's `gpui_windows`), which gpui-kit pulls in through `gpui-pre-platform`.
