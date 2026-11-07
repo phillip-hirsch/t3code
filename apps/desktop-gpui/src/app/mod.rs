@@ -218,6 +218,10 @@ pub struct Workspace {
     visit: visits::VisitTracker,
     /// Collapsed, the sidebar column is not rendered at all.
     sidebar_open: sidebar_sheet::SidebarOpen,
+    /// Where focus goes back to when the sheet hides.
+    sheet_focus: sidebar_sheet::SheetFocus<gpui_kit::FocusHandle>,
+    /// The sheet's focus trap: Tab cycles inside it while it shows.
+    sheet_trap: gpui_kit::FocusHandle,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -402,6 +406,8 @@ impl Workspace {
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
             sidebar_open: sidebar_sheet::SidebarOpen::default(),
+            sheet_focus: sidebar_sheet::SheetFocus::default(),
+            sheet_trap: cx.focus_handle(),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
@@ -1046,6 +1052,7 @@ impl Render for Workspace {
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
+        self.sync_sheet_focus(window, cx);
         self.sidebar.fit_brand(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
