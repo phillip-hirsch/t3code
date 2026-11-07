@@ -23,10 +23,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DismissEvent, DragMoveEvent, EmptyView,
-    Entity, FocusHandle, Focusable as _, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, StyledImage as _, Subscription, Task, WeakEntity, Window, anchored, deferred, div, img,
-    prelude::FluentBuilder as _, px, rgb, svg,
+    Entity, FocusHandle, Focusable as _, Font, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun, WeakEntity, Window, anchored,
+    deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
 };
 use serde_json::json;
 
@@ -50,7 +50,10 @@ const FOLDER_GROUP: &str = "sidebar-folder";
 const SUCCESS: u32 = 0x00bc7d;
 
 pub(super) struct SidebarState {
+    /// The width the user chose; [`Workspace::sidebar_width`] keeps it clear of the brand row.
     width: Pixels,
+    /// The brand row's minimum width and what it was measured with (font family, rem size, fullscreen).
+    brand_fit: Option<((SharedString, Pixels, bool), Pixels)>,
     working_expanded: bool,
     snoozed_expanded: bool,
     settled_expanded: bool,
@@ -107,6 +110,34 @@ pub(super) struct SidebarState {
 }
 
 impl SidebarState {
+    /// Measures the brand row's minimum width again when its font, text size or the
+    /// traffic lights' room changed.
+    pub(super) fn fit_brand(&mut self, window: &mut Window) {
+        let font = Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
+        let key = (font.family.clone(), window.rem_size(), window.is_fullscreen());
+        if self.brand_fit.as_ref().is_some_and(|(fitted, _)| *fitted == key) {
+            return;
+        }
+        let size = rems(0.875).to_pixels(window.rem_size());
+        let text_system = window.text_system();
+        let cap_height = text_system.cap_height(text_system.resolve_font(&font), size);
+        let run = TextRun {
+            len: "Code".len(),
+            font,
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let code = text_system.shape_line("Code".into(), size, &[run], None).width;
+        let probe = brand_probe_width(titlebar::collapsed_content_left(window), cap_height, code, size);
+        self.brand_fit = Some((key, min_width(probe)));
+    }
+
+    fn min_width(&self) -> Pixels {
+        self.brand_fit.as_ref().map_or(px(MIN_WIDTH), |(_, min)| *min)
+    }
+
     /// The footer offers to undo a thread action.
     pub(super) fn has_undo(&self) -> bool {
         self.undo.is_some()
@@ -133,6 +164,7 @@ impl SidebarState {
         ];
         Self {
             width: px(DEFAULT_WIDTH),
+            brand_fit: None,
             working_expanded: false,
             snoozed_expanded: false,
             settled_expanded: false,
@@ -409,6 +441,21 @@ fn focus_ring(element: AnyElement, tokens: &Tokens) -> AnyElement {
 
 pub(super) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// `SidebarBrandWidthProbe`: the chrome row's brand mark at `content_left`, room for the two
+/// history arrows, `pr-3` and a 1px border. The wordmark is `h-[1cap] w-auto` on its 94.39 x 56.96
+/// viewBox, and "Code" is `tracking-tight` (-0.025em after each of its 4 letters).
+fn brand_probe_width(content_left: Pixels, cap_height: Pixels, code: Pixels, size: Pixels) -> Pixels {
+    let wordmark = cap_height * (94.3941 / 56.96);
+    let code = code - size * (0.025 * 4.);
+    content_left + wordmark + px(4.) + code + px(4.) + px(56.) + px(12.) + px(1.)
+}
+
+/// `resolveThreadSidebarMinimumWidth`: the brand row never gets cut off. Past macOS's traffic
+/// lights it is wider than the 256px default.
+fn min_width(brand_probe: Pixels) -> Pixels {
+    px(MIN_WIDTH.max(f32::from(brand_probe).ceil()))
 }
 
 fn text_xs<E: gpui_kit::Styled>(el: E) -> E {
@@ -1194,11 +1241,11 @@ impl Workspace {
     /// The sidebar view, reused from the last frame unless it was notified or resized.
     pub(super) fn render_cached_sidebar(&self) -> impl IntoElement {
         AnyView::from(self.sidebar_view.clone())
-            .cached(StyleRefinement::default().flex_none().h_full().w(self.sidebar.width))
+            .cached(StyleRefinement::default().flex_none().h_full().w(self.sidebar_width()))
     }
 
     pub(super) fn sidebar_width(&self) -> Pixels {
-        self.sidebar.width
+        self.sidebar.width.max(self.sidebar.min_width())
     }
 
     /// The return tracker must see every shell change, like the web's. The
@@ -1361,7 +1408,7 @@ impl Workspace {
         v_flex()
             .id("sidebar")
             .relative()
-            .w(self.sidebar.width)
+            .w(self.sidebar_width())
             .h_full()
             .flex_none()
             .bg(sb.background)
@@ -1369,8 +1416,9 @@ impl Workspace {
             .border_r_1()
             .border_color(sb.border)
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SidebarResize>, window, cx| {
-                let max = (window.viewport_size().width - px(MIN_MAIN_WIDTH)).max(px(MIN_WIDTH));
-                this.sidebar.width = (event.event.position.x - event.bounds.left()).clamp(px(MIN_WIDTH), max);
+                let min = this.sidebar.min_width();
+                let max = (window.viewport_size().width - px(MIN_MAIN_WIDTH)).max(min);
+                this.sidebar.width = (event.event.position.x - event.bounds.left()).clamp(min, max);
                 cx.notify();
             }))
             .children(backdrop)
@@ -2597,6 +2645,18 @@ pub(in crate::app) fn project_icon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_brand_row_widens_the_sidebar_past_macos_traffic_lights() {
+        let size = px(14.);
+        // SF Pro at 14px, as CoreText measures it: Electron's macOS sidebar is 257px, its border
+        // in the 257th column.
+        let sf = |content_left| min_width(brand_probe_width(px(content_left), px(9.864), px(34.909), size));
+        assert_eq!(sf(130.), px(257.));
+        // In fullscreen the traffic lights hide, and so do Windows' and Linux's (on the right).
+        assert_eq!(sf(52.), px(MIN_WIDTH));
+        assert_eq!(min_width(brand_probe_width(px(52.), px(10.18), px(36.), size)), px(MIN_WIDTH));
+    }
 
     #[test]
     fn stage_art_follows_the_mode_a_nightly_server_and_the_build() {

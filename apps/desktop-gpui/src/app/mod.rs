@@ -1019,6 +1019,7 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sidebar.fit_brand(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
             self.details_popover = false;
