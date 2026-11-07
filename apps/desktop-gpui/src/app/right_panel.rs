@@ -20,9 +20,9 @@ use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
-    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
-    MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, deferred, div, px,
+    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
+    LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div, px,
 };
 use serde_json::{Value, json};
 
@@ -1163,6 +1163,38 @@ impl Workspace {
         )
     }
 
+    /// `handleAddSurfaceMenuKeyDown`: an available surface's letter closes the "+" menu and opens it.
+    fn add_surface_for_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shortcut) = SurfaceShortcut::for_keystroke(&event.keystroke) else { return };
+        let available = match shortcut {
+            SurfaceShortcut::Browser => self.browser_available(),
+            SurfaceShortcut::Terminal => self.terminal_available(),
+            SurfaceShortcut::Files => self.project_target().is_some(),
+            SurfaceShortcut::Diff => self.diff_available(),
+            SurfaceShortcut::PullRequest => self.thread_pull_request_target().is_some(),
+            SurfaceShortcut::LinkedPullRequests => self.thread_links_pull_requests(),
+            SurfaceShortcut::SideChat => self.side_chats_offered() && self.side_chat_disabled_reason().is_none(),
+        };
+        if !available {
+            return;
+        }
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+        match shortcut {
+            SurfaceShortcut::Browser => self.add_browser_surface(window, cx),
+            SurfaceShortcut::Terminal => self.add_terminal_surface(window, cx),
+            SurfaceShortcut::Files => self.open_surface(Surface::Files, window, cx),
+            SurfaceShortcut::Diff => self.open_changes(window, cx),
+            SurfaceShortcut::PullRequest => {
+                if let Some(reference) = self.thread_pull_request_target() {
+                    self.open_surface(Surface::PullRequest(reference), window, cx);
+                }
+            }
+            SurfaceShortcut::LinkedPullRequests => self.open_surface(Surface::PullRequests, window, cx),
+            SurfaceShortcut::SideChat => self.add_side_chat_surface(window, cx),
+        }
+    }
+
     /// The 40px tab strip, a drag region clear of the panel toggles and caption buttons.
     fn render_tab_bar(
         &self,
@@ -1193,7 +1225,10 @@ impl Workspace {
             .pl(left_inset.unwrap_or(px(8.)))
             .pr(reserve)
             .gap_1();
+        // The open "+" menu has focus; its letters bubble up here (gpui-kit menus bind only arrows,
+        // Enter and Escape).
         super::titlebar::drag_region(tab_bar)
+            .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
                 h_flex()
                     .id("right-panel-tabs")
@@ -2255,10 +2290,55 @@ fn kbd(text: &'static str, tokens: &Tokens) -> impl IntoElement {
         .child(text)
 }
 
+/// A "+" menu surface by its shortcut letter (`SurfaceMenuItem`'s `shortcut`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceShortcut {
+    Browser,
+    Terminal,
+    Files,
+    Diff,
+    PullRequest,
+    LinkedPullRequests,
+    SideChat,
+}
+
+impl SurfaceShortcut {
+    /// `surfaceShortcutActionForKey`: Ctrl, Alt and Cmd chords are commands, not letters.
+    fn for_keystroke(keystroke: &gpui_kit::Keystroke) -> Option<Self> {
+        let modifiers = &keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return None;
+        }
+        Some(match keystroke.key.as_str() {
+            "b" => Self::Browser,
+            "t" => Self::Terminal,
+            "f" => Self::Files,
+            "d" => Self::Diff,
+            "p" => Self::PullRequest,
+            "l" => Self::LinkedPullRequests,
+            "s" => Self::SideChat,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn add_menu_letters_open_surfaces_only_without_command_modifiers() {
+        let shortcut = |key: &'static str| SurfaceShortcut::for_keystroke(&gpui_kit::Keystroke::parse(key).unwrap());
+        assert_eq!(shortcut("f"), Some(SurfaceShortcut::Files));
+        assert_eq!(shortcut("shift-f"), Some(SurfaceShortcut::Files));
+        assert_eq!(shortcut("s"), Some(SurfaceShortcut::SideChat));
+        assert_eq!(shortcut("ctrl-f"), None);
+        assert_eq!(shortcut("alt-t"), None);
+        assert_eq!(shortcut("cmd-d"), None);
+        assert_eq!(shortcut("m"), None);
+        assert_eq!(shortcut("enter"), None);
+    }
 
     #[test]
     fn width_clamps_to_the_viewport_and_the_chat_column() {
