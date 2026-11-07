@@ -226,7 +226,19 @@ pub(super) fn workspace_relative(target: &str, cwd: Option<&str>) -> Option<Stri
     let root = cwd?.trim_end_matches(['/', '\\']).replace('\\', "/");
     let target = target.replace('\\', "/");
     let rest = target.get(root.len()..)?.strip_prefix('/')?;
-    target[..root.len()].eq_ignore_ascii_case(&root).then(|| rest.to_owned())
+    if !target[..root.len()].eq_ignore_ascii_case(&root) {
+        return None;
+    }
+    // `/repo/../x` starts with the root but escapes it; the server rejects it as a workspace path.
+    let mut depth = 0_usize;
+    for segment in rest.split('/') {
+        match segment {
+            ".." => depth = depth.checked_sub(1)?,
+            "" | "." => {}
+            _ => depth += 1,
+        }
+    }
+    Some(rest.to_owned())
 }
 
 impl Workspace {
@@ -714,6 +726,10 @@ mod tests {
         assert_eq!(workspace_relative("/repo/src/a.rs", Some("/repo")).as_deref(), Some("src/a.rs"));
         assert_eq!(workspace_relative("C:\\Repo\\a.rs", Some("c:\\repo")).as_deref(), Some("a.rs"));
         assert_eq!(workspace_relative("/other/a.rs", Some("/repo")), None);
+        // A `..` that climbs above the root leaves the workspace, so the editor opens it.
+        assert_eq!(workspace_relative("/repo/../outside.rs", Some("/repo")), None);
+        assert_eq!(workspace_relative("/repo/src/../../x.rs", Some("/repo")), None);
+        assert_eq!(workspace_relative("/repo/src/../x.rs", Some("/repo")).as_deref(), Some("src/../x.rs"));
         // Lowercasing the Kelvin sign changes its byte length; this sliced inside it.
         assert_eq!(workspace_relative("/repo/\u{212A}/a.rs", Some("/repo/k")), None);
     }
