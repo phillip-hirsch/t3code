@@ -63,6 +63,43 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
     })
 }
 
+/// What the footer controls' natural widths depend on: the picker's text, the mode block's
+/// labels, and the font they are shaped in.
+#[derive(Debug, PartialEq)]
+pub(super) struct FooterText {
+    picker: super::model_picker::TriggerText,
+    chip: Option<&'static str>,
+    toggle: Option<&'static str>,
+    font: gpui_kit::Font,
+    size: gpui_kit::Pixels,
+    scale: f32,
+}
+
+impl FooterText {
+    fn widths(&self, window: &Window) -> ControlsWidths {
+        let measure = |text: &str| {
+            let run = gpui_kit::TextRun {
+                len: text.len(),
+                font: self.font.clone(),
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(text.to_owned().into(), self.size, &[run], None).width)
+        };
+        // The layouts below: `ps-1.5`/8px sides, 1px borders, 16-17px icons, 6px gaps, 4px apart.
+        let chip_widths = self.chip.map(|label| (32. + 6. + measure(label), 32.));
+        let toggle_widths = self.toggle.map(|label| (35. + 6. + measure(label), 35.));
+        let both = if chip_widths.is_some() && toggle_widths.is_some() { 4. } else { 0. };
+        let (block, block_icon_only) = [chip_widths, toggle_widths]
+            .into_iter()
+            .flatten()
+            .fold((both, both), |(natural, icon), (n, i)| (natural + n, icon + i));
+        ControlsWidths { picker: self.picker.natural_width(measure), block, block_icon_only, overflow: 34., gap: 2. }
+    }
+}
+
 /// A failed message first, then whatever was typed after it.
 fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
@@ -735,34 +772,24 @@ impl Workspace {
         if chip.is_none() && !plan_ui {
             return (None, ModeFit::Label);
         }
-        let font = gpui_kit::Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
-        let size = gpui_kit::rems(0.875).to_pixels(window.rem_size());
-        let measure = |text: &str| {
-            let run = gpui_kit::TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color: Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            f32::from(window.text_system().shape_line(text.to_owned().into(), size, &[run], None).width)
+        let text = FooterText {
+            picker: self.model_trigger_text(),
+            chip: chip.map(|(_, label, _)| label),
+            toggle: plan_ui.then_some(if interaction == "plan" { "Plan" } else { "Build" }),
+            font: gpui_kit::Font { weight: FontWeight::MEDIUM, ..window.text_style().font() },
+            size: gpui_kit::rems(0.875).to_pixels(window.rem_size()),
+            scale: window.scale_factor(),
         };
-        let toggle_label = if interaction == "plan" { "Plan" } else { "Build" };
-        // The layouts below: `ps-1.5`/8px sides, 1px borders, 16-17px icons, 6px gaps, 4px apart.
-        let chip_widths = chip.map(|(_, label, _)| (32. + 6. + measure(label), 32.));
-        let toggle_widths = plan_ui.then(|| (35. + 6. + measure(toggle_label), 35.));
-        let both = if chip_widths.is_some() && toggle_widths.is_some() { 4. } else { 0. };
-        let (block, block_icon_only) = [chip_widths, toggle_widths]
-            .into_iter()
-            .flatten()
-            .fold((both, both), |(natural, icon), (n, i)| (natural + n, icon + i));
-        let widths = ControlsWidths {
-            picker: self.model_trigger_natural_width(measure),
-            block,
-            block_icon_only,
-            overflow: 34.,
-            gap: 2.,
+        let widths = {
+            let mut cached = self.composer_ui.footer_widths.borrow_mut();
+            match &*cached {
+                Some((measured, widths)) if *measured == text => *widths,
+                _ => {
+                    let widths = text.widths(window);
+                    *cached = Some((text, widths));
+                    widths
+                }
+            }
         };
         let fit = self
             .composer_ui

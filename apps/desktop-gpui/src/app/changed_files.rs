@@ -145,9 +145,8 @@ pub(super) fn card(
             ),
         );
 
-    let tree = turn_diff_tree::build(&changes.files);
-    let has_directory_nodes = tree.iter().any(|node| matches!(node, Node::Directory { .. }));
-    let rows = turn_diff_tree::rows(&tree, overrides, all_expanded);
+    let has_directory_nodes = changes.tree.iter().any(|node| matches!(node, Node::Directory { .. }));
+    let rows = turn_diff_tree::rows(&changes.tree, overrides, all_expanded);
     let list = v_flex().p(px(8.)).children(rows.into_iter().map(|(node, depth)| {
         tree_row(node, depth, has_directory_nodes, all_expanded, overrides, &run, this, tokens, scheme)
     }));

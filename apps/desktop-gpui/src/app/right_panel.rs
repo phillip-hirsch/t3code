@@ -108,6 +108,9 @@ struct PanelState {
     surfaces: Vec<Surface>,
     active: Option<Surface>,
     scope: DiffScope,
+    /// The file a chat link asked the turn diff to show (`filePath`): it stays visible while
+    /// test files hide, until another selection is picked.
+    turn_file: Option<SharedString>,
     /// Bumped by every panel change the user makes (`userActionRevisionByThreadKey`).
     user_revision: u64,
     /// The turn whose diff was last offered on its own (`proactiveDiffTurnId`).
@@ -330,7 +333,7 @@ pub(super) struct RightPanel {
     tree_selected: Option<String>,
     /// The tree's visible rows, rebuilt when the shown files or the folds change.
     tree_rows: std::rc::Rc<[diff_tree::Row]>,
-    /// The file `open_turn_diff` asked for, scrolled to once its selection loads.
+    /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     _diff_events: Subscription,
 }
@@ -684,11 +687,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(target @ Target::Thread { .. }) = self.target.clone() else { return };
-        let scope = DiffScope::Turn(run.to_string());
+        let selection = (target, DiffScope::Turn(run.to_string()));
         if let Some(panel) = self.panel_state_mut() {
-            panel.scope = scope.clone();
+            panel.scope = selection.1.clone();
+            panel.turn_file = file.clone();
         }
-        self.right_panel.pending_reveal = file.map(|file| ((target, scope), file));
+        // The shown patch may hide the requested file as a test file.
+        if self.right_panel.hide_test_files && self.right_panel.shown.as_ref() == Some(&selection) {
+            self.apply_diff_files(cx);
+        }
+        self.right_panel.pending_reveal = file.map(|file| (selection, file));
         self.open_surface(Surface::Diff, window, cx);
     }
 
@@ -862,13 +870,21 @@ impl Workspace {
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut() {
-            panel.scope = scope;
-            cx.notify();
+        let Some(panel) = self.panel_state_mut() else { return };
+        panel.scope = scope;
+        if panel.turn_file.take().is_some() && self.right_panel.hide_test_files {
+            self.apply_diff_files(cx);
         }
+        cx.notify();
     }
 
-    /// Starts a fetch when the shown selection differs from the loaded one.
+    /// The file a chat link asked `selection`'s turn diff to show.
+    fn requested_diff_file(&self, selection: &(Target, DiffScope)) -> Option<&str> {
+        let panel = self.right_panel.panels.get(&selection.0)?;
+        panel.turn_file.as_deref().filter(|_| panel.scope == selection.1)
+    }
+
+    /// Starts a fetch when the shown selection differs from the loaded one, else reveals a pending file.
     fn sync_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_surface() != Some(&Surface::Diff) {
             return;
@@ -917,6 +933,7 @@ impl Workspace {
             refresh: self.right_panel.refresh,
         };
         if self.right_panel.loaded.as_ref() == Some(&key) {
+            self.reveal_pending_file(cx);
             return;
         }
         self.right_panel.loaded = Some(key);
@@ -1172,11 +1189,27 @@ impl Workspace {
                 state.set_file_collapsed(path, folded.contains(path), cx);
             }
         });
-        if let Some((_, file)) = self.right_panel.pending_reveal.take_if(|(asked, _)| *asked == *selection) {
-            let file = paths.iter().find(|path| path.replace('\\', "/") == file.as_ref()).cloned().unwrap_or(file);
-            self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(&file, cx));
-        }
         self.right_panel.shown = Some(selection.clone());
+        self.reveal_pending_file(cx);
+    }
+
+    /// `revealDiffFile` for the file `open_turn_diff` asked for: done once the shown selection's
+    /// patch holds it, whether that selection just loaded or was already loaded. The file unfolds
+    /// as if the user had unfolded it, then scrolls into view.
+    fn reveal_pending_file(&mut self, cx: &mut Context<Self>) {
+        let Some((selection, file)) = &self.right_panel.pending_reveal else { return };
+        if self.right_panel.shown.as_ref() != Some(selection) {
+            return;
+        }
+        let Some(path) = diff_tree::find_requested(self.right_panel.diff.read(cx).files(), file).cloned() else {
+            return;
+        };
+        self.right_panel.pending_reveal = None;
+        self.right_panel.diff.update(cx, |state, cx| {
+            state.set_file_collapsed(&path, false, cx);
+            state.scroll_to_file(&path, cx);
+        });
+        self.remember_collapsed(cx);
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {

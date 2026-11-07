@@ -35,6 +35,10 @@ pub(super) struct ComposerUi {
     /// The footer controls row's laid-out width, and how its mode block fit there last.
     pub(super) footer_host: Option<f32>,
     pub(super) mode_fit: super::composer_fit::ModeFit,
+    /// The footer controls' natural widths and what they were measured from; renders reuse
+    /// them until that changes.
+    pub(super) footer_widths:
+        std::cell::RefCell<Option<(super::composer::FooterText, super::composer_fit::ControlsWidths)>>,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.
