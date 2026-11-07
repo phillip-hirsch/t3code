@@ -672,6 +672,17 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
             .text_color(Hsla { a: 0.6, ..t.muted_foreground })
             .child(n.map(|n| n.to_string()).unwrap_or_default())
     };
+    // Pierre's change bar at the row's edge: solid for an addition, 1px dashes for a deletion.
+    let bar = |mark: char| {
+        let bar = div().absolute().left_0().top_0().bottom_0().w(px(4.));
+        match mark {
+            '+' => Some(bar.bg(added)),
+            '-' => {
+                Some(bar.flex().flex_col().children((0..10).map(|_| div().flex_1().child(div().h_1_2().bg(t.error)))))
+            }
+            _ => None,
+        }
+    };
     let mut out = v_flex().font_family(FONT_MONO).text_size(px(12.)).line_height(px(20.)).py(px(4.));
     for row in rows {
         let line = if new_side { row.new } else { row.old };
@@ -680,13 +691,15 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
             '-' => Some(tint(t.error)),
             _ => None,
         };
+        // Pierre's unified view: one number per row, the old one only for a deletion.
         out = out.child(
             h_flex()
+                .relative()
                 .min_w_0()
                 .when_some(bg, gpui_kit::Styled::bg)
-                .child(number(row.old))
-                .child(number(row.new))
-                .child(div().w(px(16.)).flex_none().text_color(t.muted_foreground).child(row.mark.to_string()))
+                .children(bar(row.mark))
+                .child(number(row.new.or(row.old)))
+                .child(div().w(px(8.)).flex_none())
                 .child(
                     div()
                         .min_w_0()

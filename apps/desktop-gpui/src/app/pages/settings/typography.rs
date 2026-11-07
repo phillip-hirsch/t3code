@@ -1,7 +1,7 @@
 //! The Appearance page's Typography section (`TypographySettings.tsx`).
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::diff::{Diff, DiffFile, DiffHunkSeparator, DiffState};
+use gpui_kit::component::diff::{Diff, DiffChangeIndicator, DiffFile, DiffHunkSeparator, DiffState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::{Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex};
@@ -321,6 +321,7 @@ fn render_preview(
             let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
             let preview = Diff::new(diff)
                 .hunk_separator(DiffHunkSeparator::LineInfo)
+                .change_indicator(DiffChangeIndicator::Bars)
                 .h(px(29. + row * DIFF_PREVIEW_ROWS))
                 .text_size(px(fonts.code_size))
                 .into_any_element();

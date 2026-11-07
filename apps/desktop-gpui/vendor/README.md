@@ -82,10 +82,28 @@ Files:
 **List spacing like HTML lists.** The chat's markdown CSS gives lists, and the paragraphs of a
 loose list's items, a paragraph gap. 0.9.0 spaces every item by the tight-list gap only, puts no
 gap around a nested list, and draws a marker for a paragraph that follows a nested list inside the
-same item. The patch marks every item of a loose list (`list.spread`) as spread; a loose list's
-items add the paragraph gap to the item gap, a nested list keeps the paragraph gap from what comes
-before it, and a paragraph after a nested list continues the item, indented and without a marker.
+same item. The patch marks every item of a loose list (`list.spread`) as spread. Items of a loose
+list, and an item after one that ends with a nested list or blockquote, sit the paragraph gap below
+the previous item instead of the item gap, as the web's collapsed margins do; a nested list keeps
+the paragraph gap from what comes before it, and a paragraph after a nested list continues the
+item, indented and without a marker.
 Files:
 
 - `src/text/format/markdown.rs`: loose lists in `ast_to_node`.
 - `src/text/node.rs`: `render_list_item` and the list loop that calls it.
+
+## gpui-component 0.9.0
+
+**The diff view draws like the web's.** The web renders diffs with Pierre diffs, whose unified
+view shows one line number per row (the new line, or the old one for a deletion), marks changed
+rows with a 4px bar at the leading edge (dashed for deletions) and separates hunks with an
+"N unmodified lines" bar. 0.9.0's Unified mode always draws both number lanes, its bars sit after
+the numbers, and its line-info separator reads "N lines not in patch" on a flat strip. The patch
+draws one lane per Unified row, moves the bar to the row's edge, and draws the separator as the
+web's rounded bar with Pierre's wording. The app picks `DiffHunkSeparator::LineInfo` and
+`DiffChangeIndicator::Bars`, Pierre's defaults. Expanding unchanged lines needs the full files,
+which the app doesn't load, so the separator has no expand buttons. Files:
+
+- `src/diff/mod.rs`: `code_width`, the lanes and bar in `code_line`, `change_bar`, and the
+  `LineInfo` arm of `render_hunk_separator`.
+- `locales/ui.yml`: `Diff.HiddenLine` and the English `Diff.HiddenLines`.

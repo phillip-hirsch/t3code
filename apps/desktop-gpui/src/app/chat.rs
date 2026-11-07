@@ -273,12 +273,15 @@ fn markdown_with(
     match this.update(cx, |workspace, cx| {
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
         let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
-        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone(), math)
+        let chips = (workspace.git_cwd(), workspace.entry_kinds.clone());
+        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone(), math, chips)
     }) {
-        Ok((state, wrap, images, math)) => markdown_view(&state, kind, key_for_view, wrap, width, this, t)
-            .image_source(images.resolver())
-            .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
-            .into_any_element(),
+        Ok((state, wrap, images, math, chips)) => {
+            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, t)
+                .image_source(images.resolver())
+                .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
+                .into_any_element()
+        }
         Err(_) => div().into_any_element(),
     }
 }
@@ -1375,6 +1378,7 @@ fn markdown_view(
     wrap: bool,
     width: Option<f32>,
     this: &WeakEntity<Workspace>,
+    (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
     t: &Tokens,
 ) -> TextView {
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
@@ -1397,7 +1401,14 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
-        .plugin(super::markdown_ui::FileChips { workspace: this.clone(), dark: t.dark, suffixes: Default::default() })
+        .plugin(super::markdown_ui::FileChips {
+            workspace: this.clone(),
+            dark: t.dark,
+            folder_color: t.sidebar.icon,
+            cwd,
+            kinds,
+            suffixes: Default::default(),
+        })
         .on_link_click(move |url, event, window, cx| {
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);

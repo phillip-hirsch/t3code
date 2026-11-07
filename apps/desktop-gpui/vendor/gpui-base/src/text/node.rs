@@ -3781,7 +3781,7 @@ impl BlockNode {
     fn render_list_item(
         item: &BlockNode,
         ix: usize,
-        loose: bool,
+        wide: bool,
         options: NodeRenderOptions,
         node_cx: &NodeContext,
         window: &mut Window,
@@ -3803,10 +3803,9 @@ impl BlockNode {
                     .w_full()
                     .min_w_0()
                     // Items breathe a little apart, less than paragraphs do; a
-                    // loose list's items also keep their paragraphs' gap.
-                    .when(ix > 0, |this| {
-                        this.pt(body * 0.25 + if loose { gap } else { Pixels::ZERO })
-                    })
+                    // wide item keeps the paragraph gap instead, as the CSS
+                    // margins it stands between collapse to it.
+                    .when(ix > 0, |this| this.pt(if wide { gap } else { body * 0.25 }))
                     .when(*spread, |this| this.child(div()))
                     .children({
                         let mut items: Vec<Div> = Vec::with_capacity(children.len());
@@ -4401,13 +4400,23 @@ impl BlockNode {
                     let loose = children
                         .iter()
                         .any(|item| matches!(item, BlockNode::ListItem { spread: true, .. }));
+                    // Whether the previous item ends with a block that keeps a
+                    // paragraph gap below it, such as a nested list.
+                    let mut after_block = false;
                     for (ix, item) in children.into_iter().enumerate() {
                         let is_item = item.is_list_item();
+                        let wide = loose || after_block;
+                        if let BlockNode::ListItem { children, .. } = item {
+                            after_block = matches!(
+                                children.last(),
+                                Some(BlockNode::List { .. } | BlockNode::Blockquote { .. })
+                            );
+                        }
 
                         items.push(Self::render_list_item(
                             item,
                             item_index,
-                            loose,
+                            wide,
                             NodeRenderOptions {
                                 ix,
                                 ordered: *ordered,

@@ -663,6 +663,8 @@ impl Workspace {
             }
         };
         let fg = tokens.foreground;
+        // Pierre trees' `--trees-git-ignored-color` (`light-dark(#adadb1, #4a4a4e)`); its icon cell fades to half.
+        let ignored = gpui_kit::rgb(if tokens.dark { 0x4a4a4e } else { 0xadadb1 });
         let (click_key, click_row) = (root.clone(), row.clone());
         let menu = self.tree_context_menu(&root.cwd, &row.path, cx);
         h_flex()
@@ -678,7 +680,7 @@ impl Workspace {
             .border_color(if focused { tokens.ring } else { gpui_kit::transparent_black() })
             .cursor_pointer()
             .text_xs()
-            .text_color(if row.ignored { tokens.muted_foreground } else { fg })
+            .text_color(if row.ignored { ignored.into() } else { fg })
             .when(selected, |el| el.bg(fg.opacity(0.12)))
             .when(!selected, |el| el.hover(move |s| s.bg(fg.opacity(0.07))))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -698,7 +700,8 @@ impl Workspace {
                     .size(px(16.))
                     .flex_none()
                     .when(folder, |el| el.text_color(tokens.muted_foreground))
-                    .when(loading, |el| el.opacity(0.6)),
+                    .when(loading, |el| el.opacity(0.6))
+                    .when(row.ignored, |el| el.opacity(0.5)),
             )
             .child(div().min_w_0().truncate().child(row.label.clone()))
             .context_menu(menu)
