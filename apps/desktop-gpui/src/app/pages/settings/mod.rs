@@ -40,9 +40,9 @@ use gpui_kit::component::slider::SliderState;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    AnyElement, AppContext as _, BoxShadow, Context, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::{Map, Value};
 
@@ -126,6 +126,26 @@ pub(super) fn section_label(id: &str) -> Option<&'static str> {
 }
 
 /// The nav entry a page highlights.
+/// The nav's sections in order.
+fn nav_sections() -> Vec<&'static str> {
+    SETTINGS.iter().flat_map(|(_, items)| items.iter().map(|(id, _)| *id)).filter(|id| section_enabled(id)).collect()
+}
+
+/// Where an arrow key moves keyboard focus among the nav's `sections` from `focused`
+/// (`useSettingsSectionNavigation`): Up and Down by one and Home and End to the ends, stopping
+/// at the ends. Every section is a root leaf, so Left and Right go nowhere.
+fn section_nav_step<'a>(key: &str, sections: &[&'a str], focused: &str) -> Option<&'a str> {
+    let index = sections.iter().position(|id| *id == focused)?;
+    let next = match key {
+        "down" => (index + 1).min(sections.len() - 1),
+        "up" => index.saturating_sub(1),
+        "home" => 0,
+        "end" => sections.len() - 1,
+        _ => return None,
+    };
+    Some(sections[next])
+}
+
 fn nav_section(id: &str) -> &str {
     DETAIL_PAGES.iter().find(|(page, ..)| *page == id).map_or(id, |(.., parent)| parent)
 }
@@ -197,6 +217,11 @@ pub(in crate::app) struct SettingsUi {
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
     focus: FocusHandle,
     focus_on_render: bool,
+    /// The nav's section rows, one focus handle each.
+    nav_focus: HashMap<&'static str, FocusHandle>,
+    /// The section the arrow keys last moved to and the page that was open then: the nav's one
+    /// Tab stop while that page stays open (`useSettingsSectionNavigation`).
+    nav_tab_stop: Option<(&'static str, SharedString)>,
     _search_subscription: Subscription,
 }
 
@@ -246,6 +271,8 @@ impl SettingsUi {
             diff_preview: None,
             focus: cx.focus_handle(),
             focus_on_render: false,
+            nav_focus: HashMap::new(),
+            nav_tab_stop: None,
             _search_subscription: subscription,
         }
     }
@@ -496,7 +523,7 @@ impl Workspace {
             return false;
         }
         let search_focused = self.settings_ui.search.read(cx).focus_handle(cx).is_focused(window);
-        let modal_focused = self.settings_ui.focus.is_focused(window);
+        let modal_focused = self.settings_modal_focused(window);
         if window.focused(cx).is_some() && !search_focused && !modal_focused {
             return false;
         }
@@ -512,7 +539,7 @@ impl Workspace {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         let find = keystroke.key == "f" && modifiers.secondary(cx) && !modifiers.alt && !modifiers.shift;
-        let slash = keystroke.key == "/" && !modifiers.modified() && self.settings_ui.focus.is_focused(window);
+        let slash = keystroke.key == "/" && !modifiers.modified() && self.settings_modal_focused(window);
         if find || slash {
             self.settings_ui.compact_search_open = true;
             self.settings_ui.search.update(cx, |search, cx| search.focus(window, cx));
@@ -558,6 +585,35 @@ impl Workspace {
         self.settings_ui.focus_on_render = true;
     }
 
+    /// The section tree's keys (`useSettingsSectionNavigation`); Enter and Space open the row.
+    fn on_settings_nav_key(
+        &mut self,
+        focused: &'static str,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.alt || modifiers.control || modifiers.platform {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        match key {
+            "left" | "right" => {}
+            "enter" | "space" => self.open_nav_section(focused, cx),
+            _ => {
+                let Some(next) = section_nav_step(key, &nav_sections(), focused) else { return };
+                let page = self.settings.clone().unwrap_or_default();
+                self.settings_ui.nav_tab_stop = Some((next, page));
+                if let Some(handle) = self.settings_ui.nav_focus.get(next) {
+                    window.focus(handle, cx);
+                }
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+    }
+
     pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
         // Pressing a section takes focus from the search, which closes the expanded rail.
         if std::mem::take(&mut self.settings_ui.compact_search_open) {
@@ -566,6 +622,22 @@ impl Workspace {
         self.settings_ui.target = None;
         self.settings_ui.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.open_settings(id, cx);
+    }
+
+    /// The modal or one of its nav rows has focus: Escape and `/` are the modal's then.
+    fn settings_modal_focused(&self, window: &Window) -> bool {
+        self.settings_ui.focus.is_focused(window)
+            || self.settings_ui.nav_focus.values().any(|focus| focus.is_focused(window))
+    }
+
+    /// A nav row's press: focus stays on the row, so the arrow keys go on from it, unless the
+    /// press closes the expanded rail's search.
+    fn open_nav_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        let keeps_focus = !self.settings_ui.compact_search_open;
+        self.select_settings_section(id, cx);
+        if keeps_focus {
+            self.settings_ui.focus_on_render = false;
+        }
     }
 
     fn render_settings_nav(&mut self, section: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -708,6 +780,16 @@ impl Workspace {
                         cx.notify();
                     }))
             });
+            let current = nav_section(section);
+            let tab_stop = match &self.settings_ui.nav_tab_stop {
+                Some((id, page)) if page.as_ref() == section => *id,
+                _ => current,
+            };
+            for id in nav_sections() {
+                self.settings_ui.nav_focus.entry(id).or_insert_with(|| cx.focus_handle());
+            }
+            let nav_focus = &self.settings_ui.nav_focus;
+            let keyboard = window.last_input_was_keyboard();
             let groups =
                 v_flex().gap(px(16.)).children(SETTINGS.iter().enumerate().map(|(index, (heading, items))| {
                     v_flex()
@@ -726,9 +808,18 @@ impl Workspace {
                         }))
                         .children(items.iter().filter(|(id, _)| section_enabled(id)).map(|(id, label)| {
                             let id: &'static str = id;
-                            let active = nav_section(section) == id;
+                            let active = current == id;
+                            let focus = nav_focus[id].clone().tab_stop(id == tab_stop);
+                            // `focus-visible:ring-2 focus-visible:ring-inset ring-ring`
+                            let ring = (keyboard && focus.is_focused(window))
+                                .then(|| vec![BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset()]);
                             h_flex()
                                 .id(SharedString::from(format!("settings-nav-{id}")))
+                                .track_focus(&focus)
+                                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                                    this.on_settings_nav_key(id, event, window, cx);
+                                }))
+                                .when_some(ring, gpui_kit::Styled::shadow)
                                 .h(px(32.))
                                 .px(px(10.))
                                 .gap(px(8.))
@@ -739,7 +830,14 @@ impl Workspace {
                                 .text_color(if active { sb.foreground } else { sb.muted_foreground.opacity(0.8) })
                                 .when(active, |el| el.bg(sb.sheet_row_selected))
                                 .hover(|s| s.bg(sb.sheet_row_hover).text_color(sb.foreground))
-                                .on_click(cx.listener(move |this, _, _, cx| this.select_settings_section(id, cx)))
+                                // A pressed button takes focus in a browser, so the arrow keys go on from it.
+                                .on_click({
+                                    let focus = focus.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        window.focus(&focus, cx);
+                                        this.open_nav_section(id, cx);
+                                    })
+                                })
                                 .child(section_icon(id).size(px(16.)).text_color(if active {
                                     sb.foreground
                                 } else {
@@ -991,6 +1089,19 @@ fn kbd(key: &'static str, t: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_keys_walk_the_settings_sections_and_stop_at_the_ends() {
+        let sections = ["general", "appearance", "chat"];
+        assert_eq!(section_nav_step("down", &sections, "general"), Some("appearance"));
+        assert_eq!(section_nav_step("up", &sections, "appearance"), Some("general"));
+        assert_eq!(section_nav_step("down", &sections, "chat"), Some("chat"), "no wrap at the end");
+        assert_eq!(section_nav_step("up", &sections, "general"), Some("general"), "no wrap at the start");
+        assert_eq!(section_nav_step("end", &sections, "general"), Some("chat"));
+        assert_eq!(section_nav_step("home", &sections, "chat"), Some("general"));
+        assert_eq!(section_nav_step("right", &sections, "general"), None, "sections are leaves");
+        assert!(nav_sections().starts_with(&["general", "appearance"]));
+    }
 
     #[test]
     fn the_modal_insets_follow_the_sm_and_lg_breakpoints() {
