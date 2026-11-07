@@ -63,7 +63,8 @@ pub(super) struct PickerState {
     /// The search has focus: its underline takes the ring colour (`focus-within:border-ring`).
     search_focused: bool,
     query: String,
-    highlighted: usize,
+    /// `autoHighlight`: nothing until a filter or the arrows highlight a row.
+    highlighted: Option<usize>,
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
@@ -115,7 +116,7 @@ impl Workspace {
                     match event {
                         InputEvent::Change => {
                             this.picker.query = search.read(cx).value().trim().to_owned();
-                            this.picker.highlighted = 0;
+                            this.picker.highlighted = (!this.picker.query.is_empty()).then_some(0);
                         }
                         InputEvent::Focus => this.picker.search_focused = true,
                         InputEvent::Blur => this.picker.search_focused = false,
@@ -132,7 +133,7 @@ impl Workspace {
             search.focus(window, cx);
         });
         self.picker.query.clear();
-        self.picker.highlighted = 0;
+        self.picker.highlighted = None;
         self.picker.tab = None;
         // Focused above before it renders, which its own focus event can miss.
         self.picker.search_focused = true;
@@ -318,12 +319,17 @@ impl Workspace {
         match keystroke.key.as_str() {
             "escape" => self.close_model_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
-                let step = if keystroke.key == "up" { rows.len() - 1 } else { 1 };
-                self.picker.highlighted = (self.picker.highlighted + step) % rows.len();
+                let last = rows.len() - 1;
+                self.picker.highlighted = Some(match (keystroke.key.as_str(), self.picker.highlighted) {
+                    ("down", None) => 0,
+                    ("down", Some(i)) => (i + 1) % rows.len(),
+                    (_, None | Some(0)) => last,
+                    (_, Some(i)) => i - 1,
+                });
                 cx.notify();
             }
             "enter" => {
-                if let Some(row) = rows.into_iter().nth(self.picker.highlighted) {
+                if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
                     self.pick_row(row.selection, window, cx);
                 }
             }
@@ -355,7 +361,7 @@ impl Workspace {
             )
             .collect();
         self.picker.tab = Some(step_tab(&tabs, &tab, step));
-        self.picker.highlighted = 0;
+        self.picker.highlighted = None;
         if let Some(search) = self.picker.search.clone() {
             search.update(cx, |search, cx| search.set_value("", window, cx));
         }
@@ -638,7 +644,7 @@ impl Workspace {
             .tooltip(|window, cx| Tooltip::new("Favorites").build(window, cx))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.picker.tab = Some(Tab::Favorites);
-                this.picker.highlighted = 0;
+                this.picker.highlighted = None;
                 cx.notify();
             }));
         let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
@@ -667,7 +673,7 @@ impl Workspace {
                 .when(ready, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         this.picker.tab = Some(Tab::Provider(id.clone()));
-                        this.picker.highlighted = 0;
+                        this.picker.highlighted = None;
                         cx.notify();
                     }))
                 })
@@ -699,7 +705,7 @@ impl Workspace {
         let selection = row.selection.clone();
         let star_selection = row.selection.clone();
         let group: SharedString = format!("model-row-{}-{}", row.selection.instance_id, row.selection.model).into();
-        let highlighted = index == self.picker.highlighted;
+        let highlighted = self.picker.highlighted == Some(index);
         // `modelPicker.jump.N`'s live shortcut, read with the picker open.
         let jump_label = (docked && index < 9)
             .then(|| {
@@ -721,8 +727,8 @@ impl Workspace {
             .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
             .hover(|s| s.bg(t.foreground.opacity(0.09)))
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                if this.picker.highlighted != index {
-                    this.picker.highlighted = index;
+                if this.picker.highlighted != Some(index) {
+                    this.picker.highlighted = Some(index);
                     cx.notify();
                 }
             }))
