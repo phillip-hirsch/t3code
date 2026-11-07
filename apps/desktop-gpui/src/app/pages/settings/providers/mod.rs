@@ -36,6 +36,7 @@ use super::system::background;
 use super::widgets::{SettingRow, select_trigger};
 use crate::app::Workspace;
 use crate::settings::contract;
+use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
 /// A driver's label and its settings that may name a secret reference, with their field labels.
@@ -96,16 +97,15 @@ fn card_height(window: &Window) -> f32 {
 impl Workspace {
     pub(super) fn render_providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        if self.settings_info().settings.is_null() {
-            return div()
-                .p_8()
-                .text_sm()
-                .text_color(t.muted_foreground)
-                .child("Connect an environment to set up its providers.")
-                .into_any_element();
+        let view = self.settings_view();
+        if self.settings_client().is_none() {
+            let message = match view.scope.kind {
+                ScopeKind::Environment => format!("Reconnect {} to set up its providers.", view.scope.label),
+                _ => "Connect an environment to set up its providers.".to_owned(),
+            };
+            return div().p_8().text_sm().text_color(t.muted_foreground).child(message).into_any_element();
         }
         let page = window.use_keyed_state("settings-providers", cx, |_, _| ProvidersPage::default());
-        let view = self.settings_view();
         let override_projects =
             instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);

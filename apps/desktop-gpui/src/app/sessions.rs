@@ -147,7 +147,7 @@ impl Workspace {
 
     /// The device state of the environment Settings reads.
     pub(super) fn settings_device_state(&self) -> Option<&DeviceState> {
-        self.sessions[self.settings_index()].device_state.as_ref()
+        self.settings_session()?.device_state.as_ref()
     }
 
     pub(super) fn set_device_state(&mut self, environment_id: &str, state: DeviceState) {
@@ -484,31 +484,41 @@ impl Workspace {
 
     /// The session a settings page reads and its environment-wide controls act on: the
     /// scope's environment (`useSettingsScope().environment`), the primary on device pages.
-    fn settings_index(&self) -> usize {
+    /// `None` when the scope selects no listed environment; it never falls back to the primary.
+    fn settings_session(&self) -> Option<&EnvironmentSession> {
         let device = self.settings.as_deref().is_some_and(super::pages::settings::device_only);
-        if device {
-            return PRIMARY;
-        }
-        self.scoped_settings_environment().and_then(|id| self.session_index(&id)).unwrap_or(PRIMARY)
+        let scoped = if device { None } else { self.scoped_settings_environment() };
+        settings_session_index(&self.sessions, device, scoped.as_deref()).map(|index| &self.sessions[index])
     }
 
+    /// The scope's server config, or an empty one (the contract's defaults, no providers)
+    /// when the scope selects no environment.
     pub(super) fn settings_info(&self) -> &ServerInfo {
-        &self.sessions[self.settings_index()].server_info
+        self.settings_session().map_or(&self.unscoped_server_info, |session| &session.server_info)
     }
 
     pub(super) fn settings_endpoint(&self) -> Option<&Endpoint> {
-        self.sessions[self.settings_index()].endpoint.as_ref()
+        self.settings_session()?.endpoint.as_ref()
     }
 
     pub(super) fn settings_client(&self) -> Option<RpcClient> {
-        self.sessions[self.settings_index()].client.clone()
+        self.settings_session()?.client.clone()
     }
 
     /// The environment Settings reads, for a dialog or request to keep after the scope moves
     /// (with `env_client` and `env_info`).
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
-        self.sessions[self.settings_index()].id.clone()
+        self.settings_session()?.id.clone()
     }
+}
+
+/// Device pages read the primary; every other page reads only `scoped`'s session.
+fn settings_session_index(sessions: &[EnvironmentSession], device_page: bool, scoped: Option<&str>) -> Option<usize> {
+    if device_page {
+        return Some(PRIMARY);
+    }
+    let scoped = scoped?;
+    sessions.iter().position(|session| session.is(scoped))
 }
 
 /// The primary wins when it offers a "No project" home, then `fallback`, then the only
@@ -533,5 +543,14 @@ mod tests {
         assert_eq!(pick(&[&remote, &other], "remote"), Some(remote.clone()));
         assert_eq!(pick(&[&other], "remote"), Some(other.clone()));
         assert_eq!(pick(&[&remote, &other], "elsewhere"), None);
+    }
+
+    #[test]
+    fn scoped_settings_never_fall_back_to_the_primary() {
+        let sessions = [EnvironmentSession::saved("primary".into()), EnvironmentSession::saved("remote".into())];
+        assert_eq!(settings_session_index(&sessions, false, Some("remote")), Some(1));
+        assert_eq!(settings_session_index(&sessions, false, None), None);
+        assert_eq!(settings_session_index(&sessions, false, Some("removed")), None);
+        assert_eq!(settings_session_index(&sessions, true, None), Some(PRIMARY));
     }
 }
