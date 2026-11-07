@@ -46,6 +46,39 @@ pub(in crate::app) struct PickHost {
     pub on_pick: OnPick,
 }
 
+/// The composer trigger's text and marks: what its natural width depends on, besides the font.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TriggerText {
+    name: SharedString,
+    effort: Option<String>,
+    fast: bool,
+    ultracode: bool,
+    logo: bool,
+}
+
+impl TriggerText {
+    /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
+    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
+    pub(super) fn natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
+        let logo = if self.logo { 16. + 6. } else { 0. };
+        let parts: Vec<f32> = self
+            .effort
+            .as_deref()
+            .map(|e| measure(e).min(96.))
+            .into_iter()
+            .chain([self.fast, self.ultracode].into_iter().filter(|on| *on).map(|_| 12.))
+            .collect();
+        let suffix = if parts.is_empty() {
+            0.
+        } else {
+            #[expect(clippy::cast_precision_loss, reason = "at most three suffix parts")]
+            let gaps = (parts.len() - 1) as f32 * 6.;
+            4. + parts.iter().sum::<f32>() + gaps
+        };
+        (18. + logo + measure(&self.name).min(224.) + suffix).max(52.)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Tab {
     Favorites,
@@ -401,28 +434,15 @@ impl Workspace {
         (name, effort, fast, ultracode)
     }
 
-    /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
-    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
-    pub(super) fn model_trigger_natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
+    /// What the composer trigger shows, for measuring it.
+    pub(super) fn model_trigger_text(&self) -> TriggerText {
         let (name, effort, fast, ultracode) = self.trigger_labels();
         let logo = self
             .composer_model()
             .and_then(|s| self.server_info().provider(&s.instance_id))
             .and_then(|p| crate::assets::provider_icon(&p.driver))
-            .map_or(0., |_| 16. + 6.);
-        let parts: Vec<f32> = effort
-            .map(|e| measure(&e).min(96.))
-            .into_iter()
-            .chain([fast, ultracode].into_iter().filter(|on| *on).map(|_| 12.))
-            .collect();
-        let suffix = if parts.is_empty() {
-            0.
-        } else {
-            #[expect(clippy::cast_precision_loss, reason = "at most three suffix parts")]
-            let gaps = (parts.len() - 1) as f32 * 6.;
-            4. + parts.iter().sum::<f32>() + gaps
-        };
-        (18. + logo + measure(&name).min(224.) + suffix).max(52.)
+            .is_some();
+        TriggerText { name, effort, fast, ultracode, logo }
     }
 
     /// The trigger and, while open, the popover.
