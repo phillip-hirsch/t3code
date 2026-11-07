@@ -527,6 +527,31 @@ enum RowControl {
 
 /// Sections whose rows apply to this device only show no scope sentence
 /// (`SETTINGS_DEVICE_ONLY_PATHS`).
+fn scope_groups(groups: &[ProjectGroup]) -> Vec<scope::Group> {
+    groups
+        .iter()
+        .map(|group| scope::Group {
+            key: group.key.clone(),
+            name: group.display_name.clone(),
+            members: group
+                .members
+                .iter()
+                .map(|m| scope::Project {
+                    id: m.project.id.clone(),
+                    environment_id: m.project.environment_id.to_string(),
+                    name: project_name(&m.project).to_string(),
+                    legacy_model_selection: m
+                        .project
+                        .default_model_selection
+                        .as_ref()
+                        .map(crate::model::ModelSelection::to_json),
+                    legacy_thread_env_mode: m.project.default_thread_env_mode.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 pub(in crate::app) fn device_only(section: &str) -> bool {
     matches!(section, "general" | "appearance" | "chat" | "diffs" | "snap-shot" | "connections" | "access" | "about")
 }
@@ -540,28 +565,7 @@ impl Workspace {
 
     pub(in crate::app) fn settings_view(&self) -> SettingsView {
         let groups = self.settings_project_groups();
-        let scope_groups: Vec<scope::Group> = groups
-            .iter()
-            .map(|group| scope::Group {
-                key: group.key.clone(),
-                name: group.display_name.clone(),
-                members: group
-                    .members
-                    .iter()
-                    .map(|m| scope::Project {
-                        id: m.project.id.clone(),
-                        environment_id: m.project.environment_id.to_string(),
-                        name: project_name(&m.project).to_string(),
-                        legacy_model_selection: m
-                            .project
-                            .default_model_selection
-                            .as_ref()
-                            .map(crate::model::ModelSelection::to_json),
-                        legacy_thread_env_mode: m.project.default_thread_env_mode.clone(),
-                    })
-                    .collect(),
-            })
-            .collect();
+        let scope_groups = scope_groups(&groups);
         let environments = self
             .sessions
             .iter()
@@ -581,23 +585,64 @@ impl Workspace {
             targets: Vec::new(),
             groups,
             search: self.settings_ui.scope.clone(),
-            single_environment: matches!(self.settings.as_deref(), Some("providers" | "secrets")),
+            single_environment: self.single_environment_page(),
             environments,
             client: self.client_settings.values.clone(),
         };
         let environments = view.environments();
-        let search = if view.single_environment {
-            scope::single_environment(&self.settings_ui.scope, &scope_groups, &environments)
-        } else {
-            self.settings_ui.scope.clone()
-        };
-        let scope = scope::resolve(&search, &scope_groups, &environments);
+        let (search, scope) = self.resolve_settings_scope(&scope_groups, &environments);
         let targets = scope::targets(&scope, &environments);
         drop(environments);
         view.search = search;
         view.scope = scope;
         view.targets = targets;
         view
+    }
+
+    /// The environment a scoped page reads and acts on (`useSettingsScope().environment`),
+    /// resolved like [`Self::settings_view`] without copying any settings.
+    pub(in crate::app) fn scoped_settings_environment(&self) -> Option<String> {
+        // Only a project pick reads the groups.
+        let groups = match self.settings_ui.scope.project {
+            Some(_) => scope_groups(&self.settings_project_groups()),
+            None => Vec::new(),
+        };
+        let environments: Vec<scope::Environment> = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let id = session.id.as_deref()?;
+                let info = &session.server_info;
+                Some(scope::Environment {
+                    id,
+                    label: info.environment_label.as_deref().unwrap_or(id),
+                    settings: session.is_connected().then_some(&info.settings),
+                })
+            })
+            .collect();
+        let (_, scope) = self.resolve_settings_scope(&groups, &environments);
+        scope::representative(&scope, &environments).map(str::to_owned)
+    }
+
+    /// Whether the open page edits one environment at a time (`singleEnvironment`).
+    fn single_environment_page(&self) -> bool {
+        matches!(self.settings.as_deref(), Some("providers" | "secrets"))
+    }
+
+    /// `useResolvedSettingsScope`: the sentence's search, narrowed to one machine on a
+    /// single-environment page, and the scope it selects.
+    fn resolve_settings_scope(
+        &self,
+        groups: &[scope::Group],
+        environments: &[scope::Environment],
+    ) -> (scope::ScopeSearch, Scope) {
+        let search = if self.single_environment_page() {
+            scope::single_environment(&self.settings_ui.scope, groups, environments)
+        } else {
+            self.settings_ui.scope.clone()
+        };
+        let scope = scope::resolve(&search, groups, environments);
+        (search, scope)
     }
 
     /// Writes a unified patch (`useUpdateScopedSettings`).

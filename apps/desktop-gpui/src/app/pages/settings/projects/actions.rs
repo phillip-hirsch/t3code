@@ -47,8 +47,8 @@ impl Workspace {
                 .is_some_and(|p| resolve_project_scripts(&self.settings_info().settings, p) != scripts)
         });
         let overridden = targets.iter().any(|id| has_project_scripts_override(&self.settings_info().settings, id));
-        let root = project.workspace_root.clone();
-        let file = self.t3_project_file(&root, cx).clone();
+        let (environment, root) = (project.environment_id.clone(), project.workspace_root.clone());
+        let file = self.t3_project_file(&environment, &root, cx).clone();
         let importable: Vec<ScriptInput> =
             importable_scripts(&file, &scripts).into_iter().map(ScriptInput::from_file_script).collect();
         let pid = project_id.to_owned();

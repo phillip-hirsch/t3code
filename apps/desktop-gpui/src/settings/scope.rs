@@ -148,6 +148,24 @@ pub fn single_environment(search: &ScopeSearch, groups: &[Group], environments: 
     selected.map_or_else(|| search.clone(), |e| search.with_machine(Some(e.id.to_owned())))
 }
 
+/// The environment a page reads and its environment-wide controls act on
+/// (`selectScopedSettingsEnvironments().environment`): the primary while it is selected and
+/// connected, else the first connected selected one, else the first selected (so a page on an
+/// offline machine still names that machine and acts nowhere else). `environments` lists the
+/// primary first.
+pub fn representative<'s>(scope: &'s Scope, environments: &[Environment]) -> Option<&'s str> {
+    let selected = |id: &&String| environments.iter().any(|e| e.id == id.as_str() && e.settings.is_some());
+    let primary = environments.first().map(|e| e.id);
+    let connected: Vec<&String> = scope.environment_ids.iter().filter(selected).collect();
+    connected
+        .iter()
+        .find(|id| Some(id.as_str()) == primary)
+        .or(connected.first())
+        .copied()
+        .or(scope.environment_ids.first())
+        .map(String::as_str)
+}
+
 /// The selected environments that are connected, in the given order (`connectedEnvironments`).
 fn connected<'s, 'env>(
     scope: &'s Scope,
@@ -835,6 +853,29 @@ mod tests {
         assert_eq!(single(&search(Some("p1"), None), &[remote], &environments).as_deref(), Some("env-2"));
         assert_eq!(single(&search(Some("gone"), None), &[], &environments), None, "unavailable stays");
         assert_eq!(single(&search(None, None), &[], &[]), None);
+    }
+
+    #[test]
+    fn pages_act_on_the_environment_their_scope_names() {
+        let s = settings(json!({}));
+        let primary = env(&s);
+        let laptop = Environment { id: "env-2", label: "Laptop", settings: Some(&s) };
+        let mut remote = group(&["p1"]);
+        remote.members[0].environment_id = "env-2".into();
+        let groups = [remote];
+        let page = |search: &ScopeSearch, environments: &[Environment]| {
+            let search = single_environment(search, &groups, environments);
+            let scope = resolve(&search, &groups, environments);
+            representative(&scope, environments).map(str::to_owned)
+        };
+        let (all, project) = (search(None, None), search(Some("p1"), None));
+        assert_eq!(page(&project, &[primary, laptop]).as_deref(), Some("env-2"), "the project's only machine");
+        assert_eq!(page(&all, &[primary, laptop]).as_deref(), Some("env-1"));
+        let offline = Environment { settings: None, ..primary };
+        assert_eq!(page(&all, &[offline, laptop]).as_deref(), Some("env-1"), "the named machine, though offline");
+        let all_scope = resolve(&all, &groups, &[offline, laptop]);
+        assert_eq!(representative(&all_scope, &[offline, laptop]), Some("env-2"), "a connected one on other pages");
+        assert_eq!(representative(&resolve(&all, &[], &[]), &[]), None);
     }
 
     #[test]

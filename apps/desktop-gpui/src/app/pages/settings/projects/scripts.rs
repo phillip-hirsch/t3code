@@ -3,7 +3,7 @@
 //! `settings/useProjectScriptSettings.ts`, shared by Settings and the chat's script editor.
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::{Context, Keystroke, Task, Window};
+use gpui_kit::{Context, Keystroke, SharedString, Task, Window};
 use serde::Deserialize as _;
 use serde_json::{Map, Value, json};
 
@@ -669,15 +669,22 @@ impl Workspace {
         .detach();
     }
 
-    /// The checkout's `t3.json`, read once per root (`useT3ProjectFileState`).
-    pub(in crate::app) fn t3_project_file(&mut self, workspace_root: &str, cx: &mut Context<Self>) -> &T3ProjectFile {
+    /// The checkout's `t3.json`, read once per environment and root on that environment
+    /// (`useT3ProjectFileState`).
+    pub(in crate::app) fn t3_project_file(
+        &mut self,
+        environment_id: &SharedString,
+        workspace_root: &str,
+        cx: &mut Context<Self>,
+    ) -> &T3ProjectFile {
         static LOADING: T3ProjectFile = T3ProjectFile::Loading;
-        if !self.t3_project_files.contains_key(workspace_root) {
+        let key = (environment_id.clone(), workspace_root.to_owned());
+        if !self.t3_project_files.contains_key(&key) {
             // Without a client nothing is cached, so the read starts once one connects.
-            let Some(client) = self.settings_client() else { return &LOADING };
-            self.t3_project_files.insert(workspace_root.to_owned(), T3ProjectFile::Loading);
-            let root = workspace_root.to_owned();
-            let input = json!({"cwd": root, "relativePath": "t3.json", "allowMissing": true});
+            let Some(client) = self.env_client(environment_id) else { return &LOADING };
+            self.t3_project_files.insert(key.clone(), T3ProjectFile::Loading);
+            let root = key.clone();
+            let input = json!({"cwd": workspace_root, "relativePath": "t3.json", "allowMissing": true});
             cx.spawn(async move |this, cx| {
                 let result = client.request("projects.readFile", input).await;
                 let file = match result {
@@ -693,7 +700,7 @@ impl Workspace {
             })
             .detach();
         }
-        &self.t3_project_files[workspace_root]
+        &self.t3_project_files[&key]
     }
 }
 

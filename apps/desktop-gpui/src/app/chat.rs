@@ -1397,7 +1397,7 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
-        .plugin(super::markdown_ui::FileChips { workspace: this.clone(), dark: t.dark })
+        .plugin(super::markdown_ui::FileChips { workspace: this.clone(), dark: t.dark, suffixes: Default::default() })
         .on_link_click(move |url, event, window, cx| {
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);

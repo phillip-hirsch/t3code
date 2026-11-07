@@ -264,8 +264,9 @@ pub struct Workspace {
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
     scheduled_tasks_view: Option<gpui_kit::AnyView>,
     preview: preview::PreviewState,
-    /// Each checkout's `t3.json`, keyed by workspace root, read on demand for project actions.
-    t3_project_files: HashMap<String, crate::model::T3ProjectFile>,
+    /// Each checkout's `t3.json`, keyed by environment and workspace root, read on demand for
+    /// project actions.
+    t3_project_files: HashMap<(SharedString, String), crate::model::T3ProjectFile>,
     terminals: terminal::Terminals,
     side_chat: side_chat::SideChats,
     /// Thread notifications: toasts, OS notifications and sounds.
