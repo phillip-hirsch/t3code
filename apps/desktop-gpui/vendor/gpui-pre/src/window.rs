@@ -974,7 +974,7 @@ impl TooltipId {
 
 pub(crate) struct TooltipBounds {
     id: TooltipId,
-    bounds: Bounds<Pixels>,
+    pub(crate) bounds: Bounds<Pixels>,
 }
 
 #[derive(Clone)]
@@ -4083,7 +4083,13 @@ impl Window {
                 size: self.viewport_size(),
             };
 
-            if tooltip_bounds.right() > window_bounds.right() {
+            if let Some(anchor) = tooltip_request.tooltip.anchor {
+                let above = anchor.top() - tooltip_size.height;
+                let y = if above >= Pixels::ZERO { above } else { anchor.bottom() };
+                let max_x = cmp::max(Pixels::ZERO, window_bounds.right() - tooltip_size.width);
+                let x = (anchor.center().x - tooltip_size.width / 2.).clamp(Pixels::ZERO, max_x);
+                tooltip_bounds.origin = point(x, y);
+            } else if tooltip_bounds.right() > window_bounds.right() {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
                 if new_x >= Pixels::ZERO {
                     tooltip_bounds.origin.x = new_x;
@@ -4095,7 +4101,9 @@ impl Window {
                 }
             }
 
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
+            if tooltip_request.tooltip.anchor.is_none()
+                && tooltip_bounds.bottom() > window_bounds.bottom()
+            {
                 let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
                 if new_y >= Pixels::ZERO {
                     tooltip_bounds.origin.y = new_y;
