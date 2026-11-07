@@ -3,7 +3,6 @@
 
 use std::rc::Rc;
 
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::input::{
     Input, InputEvent, InputState, NumberInputEvent, StepAction, Textarea, TextareaState,
 };
@@ -196,7 +195,8 @@ impl FieldInput {
 
     pub(in crate::app) fn element(&self) -> AnyElement {
         match self {
-            Self::Line(input) => Input::new(input).small().into_any_element(),
+            // The web's default `Input`: 32px tall with a 12px inset.
+            Self::Line(input) => Input::new(input).into_any_element(),
             Self::Area(input) => Textarea::new(input).into_any_element(),
         }
     }
@@ -204,6 +204,11 @@ impl FieldInput {
     /// The field at a fixed width, as the web's `w-*` classes set it.
     pub(in crate::app) fn sized(&self, width: gpui_kit::Pixels) -> Div {
         div().w(width).child(self.element())
+    }
+
+    /// A settings row's `Input` (`w-full`): across a stacked row, else `width` wide.
+    pub(in crate::app) fn filling(&self, width: gpui_kit::Pixels) -> Div {
+        div().w_full().min_w(width).child(self.element())
     }
 }
 

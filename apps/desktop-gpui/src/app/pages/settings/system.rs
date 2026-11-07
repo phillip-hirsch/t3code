@@ -172,7 +172,7 @@ impl Workspace {
                 SettingRow::new("tool-call-visibility")
                     .description("Hide the commands, edits, and searches agents run, so a thread reads like a conversation. Hide successful keeps calls that fail. Zen also hides the agent's in-between messages and shows only final answers. Approvals, questions, and errors always show.")
                     .setting("toolCallVisibility")
-                    .select(TOOL_CALL_VISIBILITIES, 160.),
+                    .select_full(TOOL_CALL_VISIBILITIES, 160.),
             ),
             // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has
             // no T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).

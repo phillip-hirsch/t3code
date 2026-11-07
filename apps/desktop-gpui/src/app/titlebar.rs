@@ -50,6 +50,15 @@ fn controls_left(window: &Window) -> Pixels {
     if cfg!(target_os = "macos") && !window.is_fullscreen() { MACOS_CONTROLS_LEFT } else { CONTROLS_LEFT }
 }
 
+/// `useNativeTitlebarHeight`: the caption strip drawn over the window's top (Electron's title bar
+/// overlay, or macOS's traffic lights), or 0 where the window manager draws its own titlebar.
+pub(super) fn native_titlebar_height(window: &Window) -> Pixels {
+    if cfg!(target_os = "linux") && !matches!(window.window_decorations(), Decorations::Client { .. }) {
+        return px(0.);
+    }
+    TITLEBAR_HEIGHT
+}
+
 /// Header content starts here while the sidebar is collapsed, clearing its toggle.
 pub(super) fn collapsed_content_left(window: &Window) -> Pixels {
     controls_left(window) + CONTROL_SIZE + px(11.)
