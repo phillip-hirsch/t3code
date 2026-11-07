@@ -1758,7 +1758,7 @@ pub(in crate::app) enum SelectWidth {
     Small(f32),
     /// `w-full`: across a stacked row, else as wide as its label and at least this.
     Full(f32),
-    /// `w-*`: this wide, growing up to a hugging row's `min-w-40` into room its control is given.
+    /// `w-*`: this wide, growing into room its control is given (a hugging row's `min-w-40`).
     Fixed(f32),
 }
 
@@ -1770,7 +1770,7 @@ impl SelectWidth {
             Self::Small(width) if viewport >= px(640.) => trigger.w(px(width)),
             Self::Small(_) => trigger.w_full(),
             Self::Full(min) => trigger.w_full().min_w(px(min)),
-            Self::Fixed(width) => trigger.w(px(width)).flex_grow(1.).max_w(px(width.max(ROW_SELECT_MIN_WIDTH))),
+            Self::Fixed(width) => trigger.w(px(width)).flex_grow(1.),
         }
     }
 }
