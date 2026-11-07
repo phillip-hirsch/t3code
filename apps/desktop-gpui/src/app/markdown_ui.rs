@@ -711,6 +711,111 @@ impl Workspace {
     }
 }
 
+/// A thread link's ids and its written text, when that is a label and not the link itself.
+struct ThreadChip {
+    link: crate::thread_links::ThreadLink,
+    label: Option<String>,
+}
+
+/// `MarkdownThreadLink`: a thread link draws as the thread's chip, named by its current title
+/// and opening it; a link no thread here answers to draws as an unresolved chip.
+pub(super) struct ThreadChips {
+    pub workspace: WeakEntity<Workspace>,
+}
+
+impl MarkdownPlugin for ThreadChips {
+    fn name(&self) -> &'static str {
+        "t3-thread"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
+        let parsed = crate::thread_links::parse(&link.url)?;
+        let written = link_text(&link.children);
+        // An autolink's text is its own URL, which is no label.
+        let label = (!written.is_empty() && crate::thread_links::parse(&written).is_none()).then_some(written);
+        let text = label.clone().unwrap_or_else(|| "Thread".to_owned());
+        let markdown = cx.node_source(node).unwrap_or_default().to_owned();
+        Some(MarkdownNode::new("t3-thread", ThreadChip { link: parsed, label }).text(text).markdown(markdown))
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some(chip) = node.data::<ThreadChip>() else { return div().into_any_element() };
+        let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
+        let tokens = *crate::theme::tokens(cx);
+        let w = workspace.read(cx);
+        let message_environment = w.active_environment().cloned();
+        let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
+        let id = SharedString::from(format!(
+            "thread-chip:{}:{}",
+            chip.link.environment_id.as_deref().unwrap_or_default(),
+            chip.link.thread_id
+        ));
+        let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
+        let Some(thread) = thread else {
+            let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
+            let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
+            return row
+                .child(Icon::new(IconName::CircleDashed).size(px(14.)).flex_none())
+                .child(div().min_w_0().truncate().child(label))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
+                .into_any_element();
+        };
+        let project =
+            w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
+        let icon = match project {
+            Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
+            None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
+        };
+        let title = thread.title.trim();
+        let title: SharedString = if title.is_empty() {
+            chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
+        } else {
+            title.to_owned().into()
+        };
+        let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
+        let open = self.workspace.clone();
+        row.text_color(rgb(0x009c96))
+            .cursor_pointer()
+            .child(div().flex_none().child(icon))
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))
+            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open thread").build(window, cx))
+            .on_click(move |_, window, cx| {
+                let _ = open.update(cx, |w, cx| w.select_thread_in(environment.clone(), thread_id.clone(), window, cx));
+            })
+            .into_any_element()
+    }
+}
+
+/// The thread a link names: in its own environment (or the message's), as written then
+/// percent-decoded; a v1 link the message's environment lacks takes a unique match elsewhere.
+fn resolve_thread_link<'a>(
+    link: &crate::thread_links::ThreadLink,
+    message_environment: Option<&str>,
+    threads: &'a [crate::model::ThreadShell],
+) -> Option<&'a crate::model::ThreadShell> {
+    let decoded = crate::thread_links::percent_decoded(&link.thread_id);
+    let ids: Vec<&str> = std::iter::once(link.thread_id.as_str()).chain(decoded.as_deref()).collect();
+    let environment = link.environment_id.as_deref().or(message_environment);
+    for id in &ids {
+        if let Some(thread) = threads.iter().find(|t| t.id == *id && Some(t.environment_id.as_ref()) == environment) {
+            return Some(thread);
+        }
+    }
+    if link.environment_id.is_some() {
+        return None;
+    }
+    ids.iter().find_map(|id| {
+        let mut matches = threads.iter().filter(|t| t.id == *id);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    })
+}
+
 /// `$…$` math when Render math is on (`MarkdownMath`), as its Unicode form; copying keeps the TeX.
 pub(super) struct InlineMath;
 

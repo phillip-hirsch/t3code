@@ -46,6 +46,7 @@ mod theme_color;
 mod theme_file;
 mod themes;
 mod thread_details;
+mod thread_links;
 mod thread_now;
 mod thread_pull_requests;
 mod timeline;
