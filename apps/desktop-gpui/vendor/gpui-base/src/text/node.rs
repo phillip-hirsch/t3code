@@ -1015,6 +1015,10 @@ pub struct InlineNode {
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
     /// Rendered UTF-8 byte spans paired with their exact Markdown source spans.
     pub(crate) source_segments: Vec<SourceSegment>,
+    /// Part of the label laid out before an [`MarkdownNode::after_children`]
+    /// object. That object's Markdown spells the label out, so serializing
+    /// skips this run wherever the object is emitted.
+    pub(crate) covered: bool,
 
     pub(super) state: Arc<Mutex<InlineState>>,
 }
@@ -1026,6 +1030,7 @@ impl PartialEq for InlineNode {
             && self.custom == other.custom
             && self.marks == other.marks
             && self.source_segments == other.source_segments
+            && self.covered == other.covered
     }
 }
 
@@ -1482,6 +1487,7 @@ impl InlineNode {
             custom_selection: Arc::default(),
             marks: vec![],
             source_segments: vec![],
+            covered: false,
             state: Arc::new(Mutex::new(InlineState::default())),
         }
     }
@@ -1874,11 +1880,14 @@ impl Paragraph {
 
         for child in self.children.iter() {
             if child.custom.is_some() {
-                let selected = emit_run(&child.state, &run, &mut pending_images, &mut source);
                 let object_selected = child
                     .custom_selection
                     .lock()
                     .is_ok_and(|selected| *selected);
+                if object_selected {
+                    run.retain(|(_, node)| !node.covered);
+                }
+                let selected = emit_run(&child.state, &run, &mut pending_images, &mut source);
                 if object_selected {
                     if run.is_empty() || (selected.emitted && selected.at_end) {
                         source.push_images(&pending_images);
@@ -3521,7 +3530,7 @@ impl Paragraph {
             for node in &self.children {
                 if node.custom.is_some() {
                     source.push_object(node);
-                } else {
+                } else if !node.covered {
                     source.push_text(&node.text, &node.marks, 0..node.text.len());
                     if let Some(image) = &node.image {
                         source.push_str(&image_markdown(image));
@@ -4690,6 +4699,41 @@ mod tests {
         }
         assert_eq!(paragraph.selected_text(), "文 x² Eng");
         assert_eq!(paragraph.selected_source(), "文 **$x^2$** Eng");
+    }
+
+    #[test]
+    fn selected_object_copies_the_label_it_keeps_as_prose_once() {
+        let mut label = InlineNode::new("the label");
+        label.covered = true;
+        let chip = InlineNode::custom(
+            MarkdownNode::new("chip", ())
+                .text(" a.rs")
+                .markdown("[the label](a.rs)"),
+        );
+        let paragraph = Paragraph {
+            children: vec![
+                InlineNode::new("See "),
+                label,
+                chip.clone(),
+                InlineNode::new(" now"),
+            ],
+            ..Default::default()
+        };
+        let select = |run: Option<Range<usize>>, object: bool| {
+            let mut state = chip.state.lock().unwrap();
+            state.text = "See the label".into();
+            state.selection = run.map(Into::into);
+            *chip.custom_selection.lock().unwrap() = object;
+        };
+
+        select(Some(6..13), true);
+        assert_eq!(paragraph.selected_source(), "[the label](a.rs)");
+        select(None, true);
+        assert_eq!(paragraph.selected_source(), "[the label](a.rs)");
+        select(Some(0..13), true);
+        assert_eq!(paragraph.selected_source(), "See [the label](a.rs)");
+        select(Some(4..13), false);
+        assert_eq!(paragraph.selected_source(), "the label");
     }
 
     #[test]
