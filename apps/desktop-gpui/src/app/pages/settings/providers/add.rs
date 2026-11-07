@@ -465,12 +465,13 @@ impl ConfigForm {
                 this.publish_args(window, cx);
             }));
         v_flex()
-            .child(settings_row(
+            .child(stackable_row(
                 SharedString::from(format!("{}-arguments", self.id_prefix)),
                 "Arguments",
                 Some("One literal argument per row, in launch order.".into()),
                 None,
                 Some(add.into_any_element()),
+                self.stacked,
                 t,
             ))
             .when(!self.args.is_empty(), |list| {

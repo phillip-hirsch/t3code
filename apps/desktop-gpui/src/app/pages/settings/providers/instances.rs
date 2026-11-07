@@ -1566,7 +1566,7 @@ impl Workspace {
             .enumerate()
             .map(|(index, env)| self.render_environment_variable(page, row, &dedicated, env, index, t, window, cx))
             .collect::<Vec<_>>();
-        settings_row("Variables", Some("API keys, base URLs, and other per-instance CLI settings."), Some(add_button.into_any_element()), false, t)
+        settings_row("Variables", Some("API keys, base URLs, and other per-instance CLI settings."), Some(add_button.into_any_element()), self.settings_ui.provider_rows_stacked, t)
             .flex_wrap()
             .when(!rows.is_empty(), |el| {
                 el.child(
