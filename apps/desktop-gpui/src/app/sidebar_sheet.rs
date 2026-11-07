@@ -143,34 +143,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The sidebar as a `Sheet` from the left over a dimmed backdrop that closes it on a press.
+    /// The sidebar as a `Sheet` from the left; a press anywhere else closes it.
     /// Electron sizes the sheet to its content: `SIDEBAR_WIDTH_MOBILE` puts `--spacing(3)` in an
     /// inline style, where it is invalid, so the popup's width falls back to `auto`.
     pub(super) fn render_sidebar_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.sidebar_open.sheet() {
             return None;
         }
-        let tokens = crate::theme::tokens(cx);
         let sheet = AnyView::from(self.sidebar_view.clone());
         Some(
             div()
                 .absolute()
                 .inset_0()
                 .child(
-                    // `SheetBackdrop`: `bg-background/60` (the web also blurs it slightly).
-                    div()
-                        .id("sidebar-sheet-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .bg(tokens.background.opacity(0.6))
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.sidebar_open.close_sheet();
-                                cx.notify();
-                            }),
-                        ),
+                    // Base UI draws no `SheetBackdrop` for this sheet (it counts as a nested dialog),
+                    // so the window behind stays undimmed; the full-window `SheetViewport` still
+                    // takes the press that closes it.
+                    div().id("sidebar-sheet-backdrop").absolute().inset_0().occlude().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.sidebar_open.close_sheet();
+                            cx.notify();
+                        }),
+                    ),
                 )
                 .child(
                     div()
