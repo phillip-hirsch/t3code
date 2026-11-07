@@ -33,6 +33,7 @@ use super::codex_callback;
 
 mod antigravity;
 use super::super::scoped_client;
+use super::super::widgets::RowFrame;
 use crate::app::Workspace;
 use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
@@ -281,39 +282,24 @@ fn terminal_input(event: &KeyDownEvent) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared presentation, a stand-in for the settings widgets until they land.
+// Shared presentation.
 
+/// `SettingsRow` without setting bindings.
+#[track_caller]
 pub(super) fn settings_row(
     t: &Tokens,
     title: impl IntoElement,
     description: Option<AnyElement>,
     control: Option<AnyElement>,
 ) -> gpui_kit::Div {
-    div().px_4().py_3().child(
-        h_flex()
-            .w_full()
-            .gap_8()
-            .items_center()
-            .justify_between()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .gap_1()
-                    .child(
-                        div()
-                            .min_h(px(20.))
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(t.foreground)
-                            .child(title),
-                    )
-                    .when_some(description, |el, description| {
-                        el.child(div().text_xs().line_height(px(18.)).text_color(t.muted_foreground).child(description))
-                    }),
-            )
-            .when_some(control, |el, control| el.child(h_flex().flex_none().gap_2().justify_end().child(control))),
-    )
+    let mut row = RowFrame::new(title);
+    if let Some(description) = description {
+        row = row.description(description);
+    }
+    if let Some(control) = control {
+        row = row.control(control);
+    }
+    row.render(t)
 }
 
 fn text(value: impl Into<SharedString>) -> AnyElement {

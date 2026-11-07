@@ -409,6 +409,19 @@ pub fn pickable(groups: &[ProjectGroup]) -> Vec<&ProjectGroup> {
     open().filter(|g| g.pinned).chain(open().filter(|g| !g.pinned)).collect()
 }
 
+/// `buildSidebarProjectPickerEntries`: the pickable groups, with the group holding `preferred`
+/// (the current project) leading the unpinned ones; pinned groups stay first.
+pub fn picker<'g>(groups: &'g [ProjectGroup], preferred: Option<&str>) -> Vec<&'g ProjectGroup> {
+    let mut entries = pickable(groups);
+    let Some(at) = preferred.and_then(|id| entries.iter().position(|g| g.contains(id))) else { return entries };
+    if !entries[at].pinned {
+        let group = entries.remove(at);
+        let pinned = entries.iter().filter(|g| g.pinned).count();
+        entries.insert(pinned, group);
+    }
+    entries
+}
+
 /// `groupSidebarThreadsByProject`: boring sidebar folders in `groups` order, each with its
 /// threads in input order. A group without threads keeps a folder only when `keep_empty`
 /// says so; a thread in no group has no folder and is left out.
@@ -631,14 +644,19 @@ mod tests {
     }
 
     #[test]
-    fn pickable_groups_drop_archived_and_lead_with_pinned() {
+    fn pickable_groups_drop_archived_and_lead_with_pinned_then_the_current_project() {
         let mut pinned = project("p", "/p", Value::Null);
         pinned.pinned_at = Some("2026-11-01T00:00:00.000Z".into());
         let mut archived = project("x", "/x", Value::Null);
         archived.archived_at = Some("2026-11-01T00:00:00.000Z".into());
-        let groups =
-            build_groups(&[project("a", "/a", Value::Null), archived, pinned], &GroupingSettings::default(), &[], true);
+        let projects = [project("a", "/a", Value::Null), archived, pinned, project("b", "/b", Value::Null)];
+        let groups = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let picked: Vec<&str> = pickable(&groups).iter().map(|g| g.key.as_str()).collect();
-        assert_eq!(picked, ["env:/p", "env:/a"]);
+        assert_eq!(picked, ["env:/p", "env:/a", "env:/b"]);
+        // The picker moves the current project to the front of the unpinned ones.
+        let keys = |preferred| picker(&groups, preferred).iter().map(|g| g.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(Some("b")), ["env:/p", "env:/b", "env:/a"]);
+        assert_eq!(keys(Some("p")), ["env:/p", "env:/a", "env:/b"]);
+        assert_eq!(keys(None), ["env:/p", "env:/a", "env:/b"]);
     }
 }

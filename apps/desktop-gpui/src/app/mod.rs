@@ -218,6 +218,10 @@ pub struct Workspace {
     visit: visits::VisitTracker,
     /// Collapsed, the sidebar column is not rendered at all.
     sidebar_open: sidebar_sheet::SidebarOpen,
+    /// Where focus goes back to when the sheet hides.
+    sheet_focus: sidebar_sheet::SheetFocus<gpui_kit::FocusHandle>,
+    /// The sheet's focus trap: Tab cycles inside it while it shows.
+    sheet_trap: gpui_kit::FocusHandle,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -402,6 +406,8 @@ impl Workspace {
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
             sidebar_open: sidebar_sheet::SidebarOpen::default(),
+            sheet_focus: sidebar_sheet::SheetFocus::default(),
+            sheet_trap: cx.focus_handle(),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
@@ -809,10 +815,10 @@ impl Workspace {
     fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let target = Target::Thread { env, id: thread_id.clone() };
         if self.target.as_ref() == Some(&target) {
-            if self.page.take().is_some() {
-                self.record_location();
-                cx.notify();
-            }
+            // `navigateToThread` closes the sheet even when the thread is already open.
+            self.page = None;
+            self.record_location();
+            cx.notify();
             return;
         }
         self.page = None;
@@ -925,13 +931,20 @@ impl Workspace {
     }
 
     /// The model a new draft carries from where it was started: the composer's pick, else the open
-    /// thread's model (`carryModelSelection`).
+    /// thread's model or the draft's project default (`carryModelSelection`).
     fn carried_model(&self) -> Option<ModelSelection> {
         if let Some(selection) = &self.model_override {
             return Some(selection.clone());
         }
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+        match self.target.as_ref()? {
+            Target::Thread { id, .. } => {
+                self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+            }
+            Target::Draft { project_id, .. } => {
+                let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+                crate::new_thread::draft_carried_model(self.server_info(), project, crate::timestamp::now_ms())
+            }
+        }
     }
 
     /// The composer model's provider, borrowing the selection where one is stored.
@@ -1046,6 +1059,7 @@ impl Render for Workspace {
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
+        self.sync_sheet_focus(window, cx);
         self.sidebar.fit_brand(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {

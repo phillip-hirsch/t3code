@@ -2,6 +2,7 @@
 //! window (`ui/sidebar.tsx`: `isMobile`, `openMobile`). The sheet keeps its own open state, so
 //! the docked sidebar's state survives a trip through a narrow window.
 
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::{
     AnyElement, AnyView, Context, InteractiveElement as _, IntoElement as _, MouseButton, ParentElement as _, Pixels,
     Styled as _, Window, div,
@@ -66,7 +67,76 @@ impl SidebarOpen {
     }
 }
 
+/// The web's sheet is a modal dialog: focus moves into it when it shows and returns to where it
+/// was when it hides (Base UI's `initialFocus` and `finalFocus`), so keys never reach the composer
+/// it covers.
+#[derive(Debug)]
+pub(super) struct SheetFocus<F> {
+    /// While the sheet shows: what had focus when it opened.
+    opened_from: Option<Option<F>>,
+}
+
+impl<F> Default for SheetFocus<F> {
+    fn default() -> Self {
+        Self { opened_from: None }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FocusMove<F> {
+    IntoSheet,
+    /// Back to what had focus, or to the window when nothing did.
+    Back(Option<F>),
+}
+
+impl<F> SheetFocus<F> {
+    /// Follows the sheet showing or hiding. A pick that already moved focus out of the sheet,
+    /// such as a thread's composer or the palette, keeps it there.
+    pub(super) fn follow(
+        &mut self,
+        shown: bool,
+        focused: impl FnOnce() -> Option<F>,
+        focus_in_sheet: impl FnOnce() -> bool,
+    ) -> Option<FocusMove<F>> {
+        match (shown, self.opened_from.is_some()) {
+            (true, false) => {
+                self.opened_from = Some(focused());
+                Some(FocusMove::IntoSheet)
+            }
+            (false, true) => {
+                let back = self.opened_from.take().flatten();
+                focus_in_sheet().then_some(FocusMove::Back(back))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Workspace {
+    /// Moves focus into the sheet as it shows and back out as it hides, whichever way it closed:
+    /// the backdrop, Escape, a pick, or a window widened past the breakpoint.
+    pub(super) fn sync_sheet_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A press on the sheet's bare areas focuses the sheet itself, or leaves focus with the
+        // window; the list takes it so the arrows keep working.
+        let on_no_control =
+            window.focused(cx).is_none() || self.focus.is_focused(window) || self.sheet_trap.is_focused(window);
+        let trap = &self.sheet_trap;
+        let shown = self.sidebar_open.sheet();
+        let moved = self.sheet_focus.follow(
+            shown,
+            || window.focused(cx),
+            // The last frame drew the sheet, so its focus path still tells.
+            || on_no_control || trap.contains_focused(window, cx),
+        );
+        match moved {
+            Some(FocusMove::IntoSheet) => self.sidebar.list_focus.focus(window, cx),
+            Some(FocusMove::Back(Some(handle))) => handle.focus(window, cx),
+            Some(FocusMove::Back(None)) => self.focus.focus(window, cx),
+            None if shown && on_no_control => self.sidebar.list_focus.focus(window, cx),
+            None => {}
+        }
+    }
+
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open.toggle();
         self.notify_sidebar(cx);
@@ -112,6 +182,7 @@ impl Workspace {
                         .max_w(window.viewport_size().width)
                         .occlude()
                         .shadow_lg()
+                        .focus_trap("sidebar-sheet-trap", &self.sheet_trap)
                         .child(sheet),
                 )
                 .into_any_element(),
@@ -158,5 +229,30 @@ mod tests {
         assert!(open.sheet());
         open.fit(px(1000.));
         assert!(!open.docked(), "the docked sidebar stays closed");
+    }
+
+    #[test]
+    fn the_sheet_takes_focus_and_hands_it_back() {
+        let mut focus = SheetFocus::default();
+        let in_sheet = || true;
+        assert_eq!(focus.follow(false, || Some("composer"), in_sheet), None);
+        assert_eq!(focus.follow(true, || Some("composer"), in_sheet), Some(FocusMove::IntoSheet));
+        assert_eq!(focus.follow(true, || Some("list"), in_sheet), None, "focus moves in once");
+        assert_eq!(focus.follow(false, || Some("list"), in_sheet), Some(FocusMove::Back(Some("composer"))));
+        assert_eq!(focus.follow(false, || None, in_sheet), None);
+
+        // Opened over nothing focused, it hands focus to the window.
+        focus.follow(true, || None, in_sheet);
+        assert_eq!(focus.follow(false, || None, in_sheet), Some(FocusMove::Back(None)));
+    }
+
+    #[test]
+    fn a_pick_that_moved_focus_out_keeps_it() {
+        let mut focus = SheetFocus::default();
+        focus.follow(true, || Some("composer"), || true);
+        assert_eq!(focus.follow(false, || Some("palette"), || false), None);
+        // The next opening remembers afresh.
+        assert_eq!(focus.follow(true, || Some("palette"), || true), Some(FocusMove::IntoSheet));
+        assert_eq!(focus.follow(false, || None, || true), Some(FocusMove::Back(Some("palette"))));
     }
 }

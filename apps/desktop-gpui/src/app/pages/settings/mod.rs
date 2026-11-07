@@ -17,6 +17,7 @@ mod licenses;
 mod model_select;
 
 mod providers;
+mod row_layout;
 pub(in crate::app) use providers::chatgpt_usage_button;
 pub(in crate::app) use widgets::device_only;
 mod search;

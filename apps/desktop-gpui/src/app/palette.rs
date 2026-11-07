@@ -498,8 +498,8 @@ impl Workspace {
     /// "New thread in...": each project group by its name, with "No project" among them.
     fn new_thread_rows(&self) -> Vec<Row> {
         let groups = self.project_groups();
-        let pickable = crate::project_groups::pickable(&groups);
         let current = self.current_project().map(|p| p.id.clone());
+        let pickable = crate::project_groups::picker(&groups, current.as_deref());
         let entries: Vec<NoProjectEntry> = pickable
             .iter()
             .map(|g| NoProjectEntry {
@@ -777,7 +777,16 @@ impl Workspace {
         let tokens = search::fold_query(query);
         match palette.view {
             View::NewThreadIn => {
-                let rows = self.new_thread_rows();
+                let mut rows = self.new_thread_rows();
+                // `DraftHeroHeadline`'s picker: the projects, then "Add project" unless searching.
+                // "No project" has its own link under the headline.
+                if palette.moves_draft {
+                    rows.retain(|row| !matches!(row.run, Run::ScratchThread(_)));
+                    if tokens.is_empty() {
+                        let icon = RowIcon::Lucide(IconName::FolderPlus);
+                        rows.push(Row::new("draft-add-project", icon, "Add project", Run::Open(View::AddProject)));
+                    }
+                }
                 return vec![Group { label: "Projects", rows: rank_rows(rows, &tokens) }];
             }
             View::Themes => {
@@ -806,7 +815,8 @@ impl Workspace {
                 Group { label: "Recent Threads", rows: recent },
             ];
         }
-        let projects = self.pickable_projects();
+        let current = self.current_project().map(|p| p.id.clone());
+        let projects = self.pickable_projects(current.as_deref());
         let stem: Vec<char> = "new thread in".chars().collect();
         let names_stem = stem.starts_with(&tokens.join(&' ')[..]);
         let suggestions: Vec<Row> = if names_stem {
