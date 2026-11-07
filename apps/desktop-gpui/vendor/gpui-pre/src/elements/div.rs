@@ -3325,7 +3325,7 @@ impl Interactivity {
                         opened_by_focus.set(false);
                     } else if window.last_input_was_keyboard()
                         && !opened_by_focus.get()
-                        && active_tooltip.borrow().is_none()
+                        && focus_may_show(&active_tooltip.borrow())
                     {
                         opened_by_focus.set(true);
                         let (active_tooltip, build_tooltip, check) = (
@@ -3335,7 +3335,8 @@ impl Interactivity {
                         );
                         let anchor = hitbox.bounds;
                         window.defer(cx, move |window, cx| {
-                            if active_tooltip.borrow().is_none() {
+                            if focus_may_show(&active_tooltip.borrow()) {
+                                active_tooltip.borrow_mut().take();
                                 show_tooltip(
                                     &active_tooltip,
                                     &build_tooltip,
@@ -3803,6 +3804,12 @@ pub(crate) enum ActiveTooltip {
     },
     /// The element was pressed: no tooltip until the pointer leaves it.
     Pressed,
+}
+
+/// Whether newly gained keyboard focus may show the tooltip: nothing is showing, or an earlier
+/// press only suppressed it while the pointer stayed.
+fn focus_may_show(state: &Option<ActiveTooltip>) -> bool {
+    matches!(state, None | Some(ActiveTooltip::Pressed))
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -5535,6 +5542,36 @@ mod tests {
 
         focus(&mut test_app, 1);
         assert!(!tooltip_shown(&mut test_app), "losing focus hides it");
+
+        // A click leaves the trigger pressed while the pointer stays on it; keyboard focus
+        // coming back still shows the tooltip.
+        let at = point(px(10.), px(10.));
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.simulate_mouse_move(at, cx);
+                for event in [
+                    MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: at,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Default::default(), click_count: 1 }
+                        .to_platform_input(),
+                ] {
+                    window.dispatch_event(event, cx);
+                }
+            })
+            .unwrap();
+        focus(&mut test_app, 0);
+        assert!(!tooltip_shown(&mut test_app), "the click shows nothing");
+        key_down(&mut test_app, any_window, "tab");
+        focus(&mut test_app, 1);
+        key_down(&mut test_app, any_window, "tab");
+        focus(&mut test_app, 0);
+        assert!(tooltip_shown(&mut test_app), "Tab back to the clicked trigger shows it");
     }
 
     /// A tooltip target and its hover listener in a cached view, under an overlay the parent

@@ -49,7 +49,8 @@ until focus leaves. 0.3.11 shows tooltips only on hover, placed at the pointer. 
 - `src/elements/div.rs`: `InteractiveElementState::tooltip_opened_by_focus`; an element with a
   tooltip and a tracked focus handle that is focused while the last input was the keyboard shows
   its tooltip at once, deferred past the draw so a cached view draws it, and its visibility check
-  also holds while that focus lasts. `show_tooltip` takes the anchor.
+  also holds while that focus lasts; it replaces a press's suppression. `show_tooltip` takes the
+  anchor.
 - `src/app.rs`: `AnyTooltip::anchor`, the trigger's bounds for a focus-shown tooltip.
 - `src/window.rs`: `prepaint_tooltip` centers an anchored tooltip above its trigger (below when
   there is no room) instead of at the pointer; `TooltipBounds::bounds` is crate-visible for tests.
