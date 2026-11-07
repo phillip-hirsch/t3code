@@ -10,7 +10,7 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
     KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative,
+    Subscription, Window, anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative, svg,
 };
 
 use super::Workspace;
@@ -228,6 +228,8 @@ impl Workspace {
         let current = self.current_project().map(|p| p.id.clone());
         let rows = self.draft_picker_rows(cx);
         let pin_shortcut = self.shortcut_label("thread.pin");
+        let show_environments = crate::project_groups::span_environments(&self.project_groups());
+        let primary = self.primary_environment().map(|id| id.to_string());
         let list = rows.iter().enumerate().map(|(i, entry)| {
             let highlighted = open.highlight == Some(i);
             let group = match entry {
@@ -290,6 +292,24 @@ impl Workspace {
                         this.toggle_draft_entry_pin(&key, cx);
                     }))
             });
+            let badge = group.filter(|_| show_environments).and_then(|g| {
+                let (description, environment) = g.environment_badge(primary.as_deref(), |env| {
+                    self.env_info(env).and_then(|info| info.environment_label.clone())
+                })?;
+                let machine = self.env_info(&environment).map_or("server", |info| info.machine_kind());
+                let description = SharedString::from(description);
+                Some(
+                    div()
+                        .id(SharedString::from(format!("draft-picker-env-{}", g.key)))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .child(
+                            svg().path(super::pages::settings::machine_icon(machine)).size(px(14.)).text_color(muted),
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx)),
+                )
+            });
             let pick = entry.clone();
             let row_id: SharedString = match entry {
                 Entry::Project(key) => format!("draft-picker-row-{key}").into(),
@@ -325,6 +345,7 @@ impl Workspace {
                         .child(name),
                 )
                 .children(pin)
+                .children(badge)
         });
         let popup = v_flex()
             .id("draft-project-picker-popup")
