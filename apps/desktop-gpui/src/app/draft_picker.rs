@@ -125,12 +125,13 @@ impl Workspace {
             Entry::AddProject => return self.open_palette(View::AddProject, window, cx),
             Entry::Project(key) => key,
         };
-        let current = self.current_project().map(|p| p.id.clone());
+        let current = self.current_project().map(|p| (p.id.clone(), p.environment_id.clone()));
         let Some(group) = self.draft_picker_groups().into_iter().find(|g| g.key == key) else { return };
-        if current.is_some_and(|id| group.contains(&id)) {
+        if current.as_ref().is_some_and(|(id, _)| group.contains(id)) {
             return;
         }
-        self.select_draft_project(group.representative().id.clone(), window, cx);
+        let target = group.target(current.as_ref().map(|(_, env)| env.as_ref()));
+        self.select_draft_project(target.id.clone(), window, cx);
     }
 
     /// `selectProject`: a draft with content moves to the project; an empty one opens the
