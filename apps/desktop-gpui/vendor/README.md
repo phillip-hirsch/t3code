@@ -101,7 +101,9 @@ inline Markdown (their own text, marks and source ranges) before the object, whi
 node's full source range for copying. The object's Markdown already spells out the label, so those
 runs are flagged `covered`, never merge with the text around them under a shared mark, and are
 skipped when the object is serialized (a table's Copy as Markdown, or a selection that takes in
-the object); a selection of the label alone still copies it as text. Files:
+the object). Objects and images inside the label (an inline-code file chip in a link's text) are
+covered too and skipped with it. A selection of the label alone still copies its text and the
+chips inside it. Files:
 
 - `src/text/markdown_ext.rs`: the `after_children` flag and builder.
 - `src/text/format/markdown.rs`: `parse_paragraph`, `merge_children_with_mark`, `push_merged`;

@@ -2438,14 +2438,17 @@ mod tests {
         let source = "See [the **long** label](a.rs) now";
         let extensions = MarkdownExtensions::default().plugin(
             crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(|node, _| {
-                let Node::Link(link) = node else {
-                    return None;
-                };
-                Some(
-                    MarkdownNode::new("chip", link.url.clone())
-                        .text(" a.rs")
-                        .after_children(),
-                )
+                match node {
+                    Node::Link(link) => Some(
+                        MarkdownNode::new("chip", link.url.clone())
+                            .text(" a.rs")
+                            .after_children(),
+                    ),
+                    Node::InlineCode(code) => {
+                        Some(MarkdownNode::new("code", ()).text(code.value.clone()))
+                    }
+                    _ => None,
+                }
             }),
         );
         let mut cx = NodeContext {
@@ -2467,6 +2470,15 @@ mod tests {
             (
                 "| File |\n| - |\n| See [the **long** label](a.rs) |",
                 "| File |\n| :-- |\n| See [the **long** label](a.rs) |",
+            ),
+            // An object inside the label is part of the label too.
+            (
+                "See [see `src/a.rs`](src/b.rs) and `c.rs`",
+                "See [see `src/a.rs`](src/b.rs) and `c.rs`",
+            ),
+            (
+                "| File |\n| - |\n| [see `src/a.rs`](src/b.rs) |",
+                "| File |\n| :-- |\n| [see `src/a.rs`](src/b.rs) |",
             ),
         ] {
             assert_eq!(parse(source, &mut cx).unwrap().to_markdown(), markdown);
