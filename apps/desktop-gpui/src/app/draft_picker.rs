@@ -26,21 +26,11 @@ pub(super) struct DraftPicker {
     closed_at: Option<Instant>,
     /// The project name that opens it, where Escape and a pick return focus.
     pub(super) trigger: FocusHandle,
-    /// Focus came back from the popup, which shows no focus ring (as in Electron) until it leaves.
-    returned: bool,
-    _trigger_blur: Subscription,
 }
 
 impl DraftPicker {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
-        let trigger = cx.focus_handle().tab_stop(true);
-        let blur = cx.on_blur(&trigger, window, |this, _, _| this.draft_picker.returned = false);
-        Self { open: None, closed_at: None, trigger, returned: false, _trigger_blur: blur }
-    }
-
-    /// Whether the trigger draws its `focus-visible` outline.
-    pub(super) fn trigger_ring(&self, window: &Window) -> bool {
-        !self.returned && self.trigger.is_focused(window) && window.last_input_was_keyboard()
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self { open: None, closed_at: None, trigger: cx.focus_handle().tab_stop(true) }
     }
 }
 
@@ -149,7 +139,6 @@ impl Workspace {
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismiss_draft_picker(cx) {
             window.focus(&self.draft_picker.trigger, cx);
-            self.draft_picker.returned = true;
         }
     }
 
