@@ -777,7 +777,16 @@ impl Workspace {
         let tokens = search::fold_query(query);
         match palette.view {
             View::NewThreadIn => {
-                let rows = self.new_thread_rows();
+                let mut rows = self.new_thread_rows();
+                // `DraftHeroHeadline`'s picker: the projects, then "Add project" unless searching.
+                // "No project" has its own link under the headline.
+                if palette.moves_draft {
+                    rows.retain(|row| !matches!(row.run, Run::ScratchThread(_)));
+                    if tokens.is_empty() {
+                        let icon = RowIcon::Lucide(IconName::FolderPlus);
+                        rows.push(Row::new("draft-add-project", icon, "Add project", Run::Open(View::AddProject)));
+                    }
+                }
                 return vec![Group { label: "Projects", rows: rank_rows(rows, &tokens) }];
             }
             View::Themes => {
