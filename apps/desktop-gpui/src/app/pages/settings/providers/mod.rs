@@ -770,7 +770,7 @@ fn divided(children: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> impl I
 /// `SettingsRow`'s `@min-[32rem]/settings-row` query: a row whose content box (`width` less its
 /// 16px sides) is under 32rem puts its control under the title at full width.
 pub(super) fn rows_stacked(width: Pixels, rem: Pixels) -> bool {
-    width - px(32.) < rem * 32.
+    super::row_layout::stacks(width - px(32.), rem)
 }
 
 /// `SettingsRow`: title and description on the left, the control on the right, or the control

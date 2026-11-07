@@ -33,6 +33,7 @@ use serde_json::{Map, Value};
 
 use super::code::projects::icon::project_icon;
 use super::connections::logic::machine_icon;
+use super::row_layout::RowLayout;
 use crate::app::{Workspace, project_name};
 use crate::project_groups::ProjectGroup;
 use crate::settings::scope::{self, InheritanceState, Plan, Scope, ScopeKind, Target};
@@ -429,57 +430,48 @@ impl RowFrame {
         self
     }
 
+    /// The row remembers its width under its call site and its ancestors' ids, so rows from one
+    /// call site that sit in columns of different widths need parents with their own ids.
+    #[track_caller]
     pub(in crate::app) fn render(self, t: &Tokens) -> gpui_kit::Div {
+        let layout_id = ElementId::CodeLocation(*std::panic::Location::caller());
         let text = if self.dimmed { 0.64 } else { 1. };
         let has_body = self.body.is_some();
+        let label = v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap(px(4.))
+            .child(
+                h_flex()
+                    .min_h(px(20.))
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.foreground.opacity(text))
+                            .child(self.title),
+                    )
+                    .children(self.marker)
+                    .child(div().size(px(20.)).flex().items_center().justify_center().children(self.reset)),
+            )
+            .children(self.description.map(|description| {
+                div()
+                    .max_w(px(672.))
+                    .text_xs()
+                    .line_height(px(18.))
+                    .text_color(t.muted_foreground.opacity(text))
+                    .child(description)
+            }))
+            .children(
+                self.status.map(|status| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(status)),
+            );
         v_flex()
             .px(px(16.))
             .pt(px(12.))
             .pb(px(if has_body { 4. } else { 12. }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap(px(32.))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(4.))
-                            .child(
-                                h_flex()
-                                    .min_h(px(20.))
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .line_height(px(20.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(t.foreground.opacity(text))
-                                            .child(self.title),
-                                    )
-                                    .children(self.marker)
-                                    .child(
-                                        div().size(px(20.)).flex().items_center().justify_center().children(self.reset),
-                                    ),
-                            )
-                            .children(self.description.map(|description| {
-                                div()
-                                    .max_w(px(672.))
-                                    .text_xs()
-                                    .line_height(px(18.))
-                                    .text_color(t.muted_foreground.opacity(text))
-                                    .child(description)
-                            }))
-                            .children(
-                                self.status.map(|status| {
-                                    div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(status)
-                                }),
-                            ),
-                    )
-                    .children(
-                        self.control.map(|control| h_flex().flex_none().justify_end().gap(px(8.)).child(control)),
-                    ),
-            )
+            .child(RowLayout::new(layout_id, label.into_any_element(), self.control))
             .children(self.body)
     }
 }
