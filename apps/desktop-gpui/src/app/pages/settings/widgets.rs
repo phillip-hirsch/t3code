@@ -1641,7 +1641,7 @@ pub(in crate::app) fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoEl
         )
 }
 
-/// The web's `Switch` at desktop size: a 30×18 track and a 14px thumb.
+/// The web's `Switch`: a 30×18 track and a 14px thumb (38×22 and 18px below `sm`).
 pub(in crate::app) fn switch(
     id: &SharedString,
     checked: bool,
@@ -1650,11 +1650,12 @@ pub(in crate::app) fn switch(
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let on = checked && !mixed;
     let thumb: Hsla = if on || !t.dark { t.background } else { t.muted_foreground };
+    let size = switch_thumb_size(false, t);
     div()
         .id(SharedString::from(format!("{id}-switch")))
         .flex_none()
-        .w(px(30.))
-        .h(px(18.))
+        .w(px(size * 2. - 2.))
+        .h(px(size + 2.))
         .p(px(2.))
         .rounded_full()
         .cursor_pointer()
@@ -1670,11 +1671,16 @@ pub(in crate::app) fn switch(
                 el.justify_start()
             }
         })
-        .child(div().size(px(14.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
+        .child(div().size(px(size - 2.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
 }
 
-/// The web's `Switch` as a control with its own handler: a 30×18 track and 14px thumb, or
-/// 26×16 and 12px [`Self::small`] (`size="sm"`). It keeps the kit switch's builder methods.
+/// `--thumb-size`: `--spacing(5) sm:--spacing(4)`, or `--spacing(4) sm:--spacing(3.5)` at `size="sm"`.
+fn switch_thumb_size(small: bool, t: &Tokens) -> f32 {
+    if small { t.breakpoint.pick(16., 14.) } else { t.breakpoint.pick(20., 16.) }
+}
+
+/// The web's `Switch` as a control with its own handler, sized as [`switch`], or one step down
+/// [`Self::small`] (`size="sm"`). It keeps the kit switch's builder methods.
 #[derive(IntoElement)]
 pub(in crate::app) struct Switch {
     id: ElementId,
@@ -1730,8 +1736,8 @@ impl Switch {
 impl gpui_kit::RenderOnce for Switch {
     fn render(self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
         let t = *theme::tokens(cx);
-        // `--thumb-size`: the track is one thumb plus 2px tall and two thumbs less 2px wide.
-        let size = if self.small { 14. } else { 16. };
+        // The track is one thumb plus 2px tall and two thumbs less 2px wide.
+        let size = switch_thumb_size(self.small, &t);
         // `disabled:opacity-64` on the track and thumb alike.
         let fade = if self.disabled { 0.64 } else { 1. };
         let track = if self.checked { t.primary } else { t.input };
@@ -1786,34 +1792,28 @@ impl SelectWidth {
     }
 }
 
-/// The web's `SelectTrigger size="sm"`.
+/// The web's `SelectTrigger size="sm"`: `min-h-8 sm:min-h-7`, `text-base sm:text-sm`.
 pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement, width: f32, t: &Tokens) -> Button {
-    Button::new(SharedString::from(format!("{id}-select")))
+    let trigger = Button::new(SharedString::from(format!("{id}-select")))
         .ghost()
         .when(width > 0., |b| b.w(px(width)))
-        .h(px(28.))
+        .h(px(t.breakpoint.pick(32., 28.)))
         .px(px(9.))
         .rounded(px(8.))
         .border_1()
         .border_color(t.input)
-        .bg(if t.dark { t.input.opacity(0.32) } else { t.background })
-        .text_sm()
-        .font_weight(FontWeight::NORMAL)
-        .text_color(t.foreground)
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                // `gap-1.5`, and the chevron's `-me-1` pulls it 4px into the padding.
-                .gap(px(6.))
-                .child(h_flex().min_w_0().gap(px(8.)).overflow_hidden().child(label))
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(14.))
-                        .mr(px(-4.))
-                        .text_color(t.muted_foreground.opacity(0.7)),
-                ),
-        )
+        .bg(if t.dark { t.input.opacity(0.32) } else { t.background });
+    t.breakpoint.control_text(trigger).font_weight(FontWeight::NORMAL).text_color(t.foreground).child(
+        h_flex()
+            .w_full()
+            .justify_between()
+            // `gap-1.5`, and the chevron's `-me-1` pulls it 4px into the padding.
+            .gap(px(6.))
+            .child(h_flex().min_w_0().gap(px(8.)).overflow_hidden().child(label))
+            .child(
+                Icon::new(IconName::ChevronDown).size(px(14.)).mr(px(-4.)).text_color(t.muted_foreground.opacity(0.7)),
+            ),
+    )
 }
 
 /// How many frames a search jump keeps re-centering its row while the page settles.

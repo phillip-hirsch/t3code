@@ -791,6 +791,11 @@ impl RenderOnce for Input {
             })
             .input_h(self.size)
             .input_text_size(self.size)
+            // t3code: below the web's `sm` breakpoint (640px) a field is 4px taller with 16px text
+            // (`h-9 sm:h-8`, `text-base sm:text-sm`); the caller's own sizes still win.
+            .when(window.viewport_size().width < px(640.), |this| {
+                this.h(self.size.input_height() + px(4.)).text_base()
+            })
             .items_center()
             .when(presentation.is_multi_line(), |this| {
                 this.h_auto()

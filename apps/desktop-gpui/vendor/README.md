@@ -201,3 +201,11 @@ on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always
 menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
+
+**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 4px taller
+with 16px text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
+an input the same at every width. Files:
+
+- `src/input/input.rs`: `Input::render` adds the 4px and `text_base` below 640px, before the
+  caller's style refinement, so a call site's own height or text size still wins.
+- `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
