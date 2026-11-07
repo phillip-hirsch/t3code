@@ -565,9 +565,11 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .pl(px(8.))
-            .pr(px(5.))
-            .py(px(6.))
+            // `ComboboxListVirtualized`'s `px-1 py-1` around the list's `py-1.5 pl-2`; on the right,
+            // `pr-px`, the 6px stable scrollbar gutter and the content's `pr-px`.
+            .pl(px(12.))
+            .pr(px(12.))
+            .py(px(10.))
             .gap(px(2.))
             .when(rows.is_empty(), |el| {
                 let text = if tab == Tab::Favorites && !searching { "No favorites yet" } else { "No models found" };
@@ -601,7 +603,8 @@ impl Workspace {
             h_flex()
                 .relative()
                 .pb(px(6.))
-                .mt(px(-1.))
+                // `-translate-y-px`: drawn 1px up without moving the list.
+                .top(px(-1.))
                 .border_b_1()
                 .border_color(if self.picker.search_focused { t.ring } else { rule })
                 .child(
@@ -613,7 +616,11 @@ impl Workspace {
                         .left_0(),
                 )
                 .children(search.map(|search| {
-                    div().w_full().pl(px(20.)).child(Input::new(&search).appearance(false).small().h(px(26.)).text_sm())
+                    div()
+                        .w_full()
+                        .h(px(26.))
+                        .pl(px(20.))
+                        .child(Input::new(&search).appearance(false).small().h(px(26.)).text_sm())
                 })),
         );
         let column = v_flex()
