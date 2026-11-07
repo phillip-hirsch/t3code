@@ -8,9 +8,9 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, WeakEntity, Window, anchored, deferred, div, px, rgb,
+    AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, Focusable as _, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, anchored, deferred, div, px, rgb,
 };
 
 use gpui_kit::component::WindowExt as _;
@@ -469,7 +469,90 @@ fn file_link(text: &str, url: &str) -> Option<(file_links::FilePosition, Option<
 pub(super) struct FileChips {
     pub workspace: WeakEntity<Workspace>,
     pub dark: bool,
+    /// `text-icon-muted`, the folder icon's color.
+    pub folder_color: Hsla,
+    pub cwd: Option<String>,
+    pub kinds: Arc<EntryKinds>,
     pub suffixes: ParentSuffixes,
+}
+
+/// What `filesystem.getMetadata` said about chip targets (`useFileMetadata`), by absolute path.
+#[derive(Default)]
+pub(super) struct EntryKinds(Mutex<HashMap<String, EntryKind>>);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EntryKind {
+    Wanted,
+    Asking,
+    Known { directory: bool },
+}
+
+impl EntryKinds {
+    /// Whether the server called `target` a directory; an unknown target is queued, and the
+    /// return value says whether it is newly queued.
+    fn directory(&self, target: &str) -> (bool, bool) {
+        let mut kinds = self.0.lock().expect("entry kinds lock poisoned");
+        match kinds.get(target) {
+            Some(EntryKind::Known { directory }) => (*directory, false),
+            Some(_) => (false, false),
+            None => {
+                kinds.insert(target.to_owned(), EntryKind::Wanted);
+                (false, true)
+            }
+        }
+    }
+
+    /// The queued targets, now marked as being asked about.
+    fn take_wanted(&self) -> Vec<String> {
+        let mut kinds = self.0.lock().expect("entry kinds lock poisoned");
+        let wanted: Vec<String> =
+            kinds.iter().filter(|(_, kind)| **kind == EntryKind::Wanted).map(|(path, _)| path.clone()).collect();
+        for path in &wanted {
+            kinds.insert(path.clone(), EntryKind::Asking);
+        }
+        wanted
+    }
+
+    /// Records one batch's answer; entries follow request order and a failed request
+    /// leaves every path a file, as the web's icon does without metadata.
+    fn record(&self, paths: &[String], answer: Option<&serde_json::Value>) {
+        let mut kinds = self.0.lock().expect("entry kinds lock poisoned");
+        for (ix, path) in paths.iter().enumerate() {
+            let directory = answer.is_some_and(|value| value["entries"][ix]["kind"] == "directory");
+            kinds.insert(path.clone(), EntryKind::Known { directory });
+        }
+    }
+}
+
+/// The absolute host path `getFileMetadataQueryAtom` asks about for a chip, if any: never a
+/// network path, which would leak the user's NTLM credentials to its host.
+fn metadata_target(path: &str, cwd: Option<&str>) -> Option<String> {
+    let target = file_links::resolve_target(without_position(path), cwd)?;
+    let network = target.starts_with("\\\\") || target.starts_with("//");
+    (!network && target.len() <= 512).then_some(target)
+}
+
+impl Workspace {
+    /// Asks the server about queued chip targets, 64 at a time (`FILESYSTEM_METADATA_BATCH_LIMIT`).
+    fn ask_entry_kinds(&mut self, cx: &mut Context<Self>) {
+        let kinds = self.entry_kinds.clone();
+        let wanted = kinds.take_wanted();
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(client) = self.client() else {
+            kinds.record(&wanted, None);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for paths in wanted.chunks(64) {
+                let answer = client.request("filesystem.getMetadata", json!({ "paths": paths })).await.ok();
+                kinds.record(paths, answer.as_ref());
+            }
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
 }
 
 /// The parent suffixes of the source last parsed (`buildFileLinkParentSuffixByPath`), so its
@@ -534,9 +617,23 @@ impl MarkdownPlugin for FileChips {
         Some(MarkdownNode::new("t3-file", chip).text(text).markdown(markdown))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(chip) = node.data::<FileChip>() else { return div().into_any_element() };
+        let target = metadata_target(&chip.path, self.cwd.as_deref());
+        let (directory, queued) = target.as_deref().map_or((false, false), |target| self.kinds.directory(target));
+        if queued {
+            let workspace = self.workspace.clone();
+            cx.defer(move |cx| {
+                let _ = workspace.update(cx, Workspace::ask_entry_kinds);
+            });
+        }
         let (asset, icon_color) = crate::file_icons::file_icon(&chip.icon_path, self.dark);
+        // `PierreEntryIcon`: a directory has no Pierre icon, so it takes Lucide's folder.
+        let icon = if directory {
+            Icon::new(IconName::Folder).text_color(self.folder_color)
+        } else {
+            Icon::empty().path(asset).text_color(icon_color)
+        };
         // `documentChipKindForFileName`: documents take their kind's ink, everything else `mention`.
         let ink = match asset.rsplit('/').next().unwrap_or_default() {
             "t3-file-icon-pdf.svg" => rgb(0xd55755),
@@ -558,7 +655,7 @@ impl MarkdownPlugin for FileChips {
             .font_weight(FontWeight::MEDIUM)
             .text_color(ink)
             .cursor_pointer()
-            .child(Icon::empty().path(asset).size(px(14.)).flex_none().text_color(icon_color))
+            .child(icon.size(px(14.)).flex_none())
             .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(move |event, window, cx| {
@@ -787,6 +884,24 @@ mod tests {
         );
         assert_eq!(file_link("src/main.rs", "src/main.rs").map(|(_, text)| text), Some(None), "its own path");
         assert!(file_link("Docs", "https://example.com/docs").is_none());
+    }
+
+    #[test]
+    fn chips_ask_once_about_their_absolute_target() {
+        assert_eq!(metadata_target("bench:12", Some("/home/u")).as_deref(), Some("/home/u/bench"));
+        assert_eq!(metadata_target("bench", None), None);
+        // A network path would send the user's credentials to its host.
+        assert_eq!(metadata_target(r"\\host\share\a", Some(r"\\host\share")), None);
+        let kinds = EntryKinds::default();
+        assert_eq!(kinds.directory("/a"), (false, true));
+        assert_eq!(kinds.directory("/b"), (false, true));
+        assert_eq!(kinds.directory("/a"), (false, false), "queued once");
+        let mut asked = kinds.take_wanted();
+        asked.sort();
+        assert_eq!(asked, ["/a", "/b"]);
+        assert!(kinds.take_wanted().is_empty(), "in flight");
+        kinds.record(&asked, Some(&json!({"entries": [{"kind": "directory"}, null]})));
+        assert_eq!((kinds.directory("/a"), kinds.directory("/b")), ((true, false), (false, false)));
     }
 
     #[test]

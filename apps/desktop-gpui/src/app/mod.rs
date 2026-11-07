@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::{self, Either};
@@ -277,6 +278,7 @@ pub struct Workspace {
     queue: queue::QueueUi,
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
+    entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
@@ -430,6 +432,7 @@ impl Workspace {
             queue: Default::default(),
             now: Default::default(),
             markdown_images: Default::default(),
+            entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,
@@ -865,6 +868,7 @@ impl Workspace {
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
         self.markdown_images = markdown_images::ImageCache::default();
+        self.entry_kinds = Arc::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
