@@ -160,12 +160,14 @@ impl Workspace {
 
     /// Closes the picker and returns focus to its trigger, as a combobox does.
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dismiss_draft_picker(cx) {
+        if self.draft_picker.open.take().is_some() {
             window.focus(&self.draft_picker.trigger, cx);
+            cx.notify();
         }
     }
 
-    /// Closes the picker without moving focus; whether it was open.
+    /// Closes the picker after focus or a press went elsewhere, leaving focus there; whether it
+    /// was open.
     fn dismiss_draft_picker(&mut self, cx: &mut Context<Self>) -> bool {
         if self.draft_picker.open.take().is_none() {
             return false;
