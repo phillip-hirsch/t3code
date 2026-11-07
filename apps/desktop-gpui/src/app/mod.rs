@@ -74,6 +74,7 @@ mod send;
 mod sessions;
 mod side_chat;
 mod sidebar;
+mod sidebar_sheet;
 mod snap_shot;
 mod subagents;
 mod terminal;
@@ -170,6 +171,9 @@ pub struct Workspace {
     rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
+    /// The model the user last picked in the composer (`stickyModelSelectionByProvider`), which
+    /// new drafts start on. Kept for the session.
+    sticky_model: Option<ModelSelection>,
     /// Runtime mode a new thread launches with; open threads keep theirs on the server.
     runtime_mode_override: Option<String>,
     /// Tracked so typing only re-renders when the send button's state flips.
@@ -213,7 +217,7 @@ pub struct Workspace {
     sidebar_view: Entity<sidebar::SidebarView>,
     visit: visits::VisitTracker,
     /// Collapsed, the sidebar column is not rendered at all.
-    sidebar_open: bool,
+    sidebar_open: sidebar_sheet::SidebarOpen,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -369,6 +373,7 @@ impl Workspace {
             sending: false,
             rewinding: HashSet::new(),
             model_override: None,
+            sticky_model: None,
             runtime_mode_override: None,
             composer_empty: true,
             composer_height: 0.,
@@ -396,7 +401,7 @@ impl Workspace {
                 let workspace = cx.weak_entity();
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
-            sidebar_open: true,
+            sidebar_open: sidebar_sheet::SidebarOpen::default(),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
@@ -851,11 +856,16 @@ impl Workspace {
         self.stash_composer(cx);
         let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
+        let carried = self.carried_model();
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
-        self.model_override = None;
+        if opened {
+            let project = self.target_project();
+            self.model_override =
+                crate::new_thread::new_draft_model(self.server_info(), project, carried, self.sticky_model.as_ref());
+        }
         self.runtime_mode_override = None;
         self.restore_composer(window, cx);
         if opened {
@@ -912,6 +922,16 @@ impl Workspace {
             }
             None => None,
         }
+    }
+
+    /// The model a new draft carries from where it was started: the composer's pick, else the open
+    /// thread's model (`carryModelSelection`).
+    fn carried_model(&self) -> Option<ModelSelection> {
+        if let Some(selection) = &self.model_override {
+            return Some(selection.clone());
+        }
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
     }
 
     /// The composer model's provider, borrowing the selection where one is stored.
@@ -1023,6 +1043,9 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sidebar_open.fit(window.viewport_size().width) {
+            self.notify_sidebar(cx);
+        }
         self.sidebar.fit_brand(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
@@ -1056,10 +1079,7 @@ impl Render for Workspace {
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
             .on_action(
                 cx.listener(|this, _: &TogglePalette, window, cx| this.open_palette(palette::View::Root, window, cx)),
@@ -1092,6 +1112,12 @@ impl Render for Workspace {
             }))
             // Escape that nothing else took closes find (`useChatShortcuts` `dismissFind`).
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.sidebar_open.sheet() {
+                    this.sidebar_open.close_sheet();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.find.is_some() && this.palette.is_none() {
                     this.close_thread_find(window, cx);
                     cx.stop_propagation();
@@ -1108,7 +1134,7 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open, |el| el.child(self.render_cached_sidebar()))
+                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar()))
                     .child(
                         v_flex()
                             .flex_1()
@@ -1172,6 +1198,8 @@ impl Render for Workspace {
                             .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
                     ),
             )
+            // The panel toggles stay above the sheet, as the web's `z-50` titlebar controls do.
+            .children(self.render_sidebar_sheet(window, cx))
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))

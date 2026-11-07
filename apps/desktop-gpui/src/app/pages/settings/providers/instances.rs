@@ -1118,19 +1118,20 @@ impl Workspace {
 
         let status = self.render_editor_status(page, row, &facts, live.as_ref(), &t, cx);
         let display_name = self.render_display_name_control(page, row, &instance, window, cx);
+        let stacked = self.settings_ui.provider_rows_stacked;
         sections.push(
             section(
                 facts.name.clone(),
                 Some(self.provider_instance_icon(row, &facts.name, &t)),
                 Some(header_action.into_any_element()),
                 [
-                    settings_row("Status", None, None, &t)
+                    settings_row("Status", None, None, false, &t)
                         .child(status)
                         .flex_col()
                         .items_start()
                         .gap_1()
                         .into_any_element(),
-                    settings_row("Display name", None, Some(display_name), &t).into_any_element(),
+                    settings_row("Display name", None, Some(display_name), stacked, &t).into_any_element(),
                 ],
                 false,
                 &t,
@@ -1177,6 +1178,7 @@ impl Workspace {
                             row.driver
                         )),
                         None,
+                        false,
                         &t,
                     )
                     .into_any_element()],
@@ -1393,7 +1395,14 @@ impl Workspace {
                 this.persist_provider_instance(&instance_id, next, window, cx);
             },
         );
-        h_flex().gap_2().justify_end().child(picker).child(text_input(&input, Some(224.))).into_any_element()
+        let input = text_input(&input, (!self.settings_ui.provider_rows_stacked).then_some(224.));
+        h_flex()
+            .gap_2()
+            .justify_end()
+            .when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::w_full)
+            .child(picker)
+            .child(input.when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::flex_1))
+            .into_any_element()
     }
 
     /// One `environmentFields` row, e.g. Cursor's API key, kept as a sensitive variable.
@@ -1440,8 +1449,12 @@ impl Workspace {
             },
         );
         let clear_row = row.clone();
-        let control =
-            h_flex().w(px(224.)).gap_2().child(text_input(&input, None).flex_1()).when(variable.is_some(), |el| {
+        let stacked = self.settings_ui.provider_rows_stacked;
+        let control = h_flex()
+            .map(|el| if stacked { el.w_full() } else { el.w(px(224.)) })
+            .gap_2()
+            .child(text_input(&input, None).flex_1())
+            .when(variable.is_some(), |el| {
                 el.child(
                     ghost_icon_button(
                         SharedString::from(format!("env-field-clear-{}", field.name)),
@@ -1457,7 +1470,7 @@ impl Workspace {
                     })),
                 )
             });
-        settings_row(field.label, field.description, Some(control.into_any_element()), t).into_any_element()
+        settings_row(field.label, field.description, Some(control.into_any_element()), stacked, t).into_any_element()
     }
 
     /// The saved instance behind a list row, looked up again when a deferred edit commits.
@@ -1553,7 +1566,7 @@ impl Workspace {
             .enumerate()
             .map(|(index, env)| self.render_environment_variable(page, row, &dedicated, env, index, t, window, cx))
             .collect::<Vec<_>>();
-        settings_row("Variables", Some("API keys, base URLs, and other per-instance CLI settings."), Some(add_button.into_any_element()), t)
+        settings_row("Variables", Some("API keys, base URLs, and other per-instance CLI settings."), Some(add_button.into_any_element()), false, t)
             .flex_wrap()
             .when(!rows.is_empty(), |el| {
                 el.child(

@@ -278,6 +278,21 @@ pub struct UsageFallback {
     pub resets_at: Option<String>,
 }
 
+/// The model a new draft starts on (`useHandleNewThread`): the project's configured default wins
+/// (`None` here, so the draft shows it); otherwise the model of the thread or draft it was started
+/// from, then the model the user last picked (`applyStickyState`).
+pub fn new_draft_model(
+    info: &ServerInfo,
+    project: Option<&ProjectShell>,
+    carried: Option<ModelSelection>,
+    sticky: Option<&ModelSelection>,
+) -> Option<ModelSelection> {
+    if ModelSelection::deserialize(info.project_setting(project, "defaultModelSelection")).is_ok() {
+        return None;
+    }
+    carried.or_else(|| sticky.cloned())
+}
+
 /// `resolveNewThreadModelSelection` for a draft without an explicit pick.
 pub fn usage_fallback(
     info: &ServerInfo,
@@ -449,6 +464,20 @@ mod tests {
         let antigravity = provider("antigravity", &["3p-weekly"]);
         assert!(exhausted_window(&antigravity, now, "claude-sonnet").is_some());
         assert!(exhausted_window(&antigravity, now, "gemini-pro").is_none());
+    }
+
+    #[test]
+    fn a_new_draft_takes_the_configured_default_then_the_carried_model_then_the_last_pick() {
+        let selection =
+            |model: &str| ModelSelection { instance_id: "claude".into(), model: model.into(), options: None };
+        let (carried, sticky) = (selection("carried"), selection("sticky"));
+        let bare = info(json!({}));
+        let p = project("H:/code/p", None);
+        assert_eq!(new_draft_model(&bare, Some(&p), Some(carried.clone()), Some(&sticky)), Some(carried.clone()));
+        assert_eq!(new_draft_model(&bare, Some(&p), None, Some(&sticky)), Some(sticky.clone()));
+        assert_eq!(new_draft_model(&bare, Some(&p), None, None), None);
+        let configured = info(json!({"defaultModelSelection": {"instanceId": "codex", "model": "gpt"}}));
+        assert_eq!(new_draft_model(&configured, Some(&p), Some(carried), Some(&sticky)), None);
     }
 
     #[test]

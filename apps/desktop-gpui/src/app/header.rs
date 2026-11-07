@@ -24,7 +24,7 @@ impl Workspace {
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
-            .pl(if self.sidebar_open { px(20.) } else { titlebar::collapsed_content_left(window) })
+            .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
             .pr(if panel_open { px(20.) } else { controls_inset })
             .bg(tokens.background);
         let header = titlebar::drag_region(header);

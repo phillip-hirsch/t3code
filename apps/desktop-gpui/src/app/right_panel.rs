@@ -42,6 +42,12 @@ const MAX_WIDTH_FRACTION: f32 = 0.7;
 /// The chat column keeps at least this much beside the panel.
 const SIBLING_MIN_WIDTH: f32 = 360.;
 
+/// The row the panel and the chat column share: the window less the docked sidebar and the
+/// right resize inset `#root` keeps free (`getPreviewPanelMaxWidth`'s `containerWidth`).
+fn panel_row(viewport: f32, sidebar: f32) -> f32 {
+    viewport - sidebar - f32::from(RIGHT_RESIZE_INSET)
+}
+
 /// `getPreviewPanelMaxWidth` + the clamp in `useResizableWidth`.
 fn clamp_width(width: f32, viewport: f32, row: f32) -> f32 {
     let max = (viewport * MAX_WIDTH_FRACTION).floor().min((row - SIBLING_MIN_WIDTH).floor()).max(MIN_WIDTH);
@@ -420,11 +426,11 @@ impl Workspace {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
-        let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         if self.right_panel_maximized() {
-            return Some(viewport - sidebar - f32::from(RIGHT_RESIZE_INSET));
+            return Some(panel_row(viewport, sidebar));
         }
-        Some(clamp_width(self.right_panel.width, viewport, viewport - sidebar))
+        Some(clamp_width(self.right_panel.width, viewport, panel_row(viewport, sidebar)))
     }
 
     /// `rightPanelMaximized`: only an open panel counts as maximized.
@@ -1304,13 +1310,14 @@ impl Workspace {
                     let viewport = f32::from(window.viewport_size().width);
                     let right = f32::from(event.bounds.right());
                     this.right_panel.width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
-                    let sidebar = if this.sidebar_open { f32::from(this.sidebar_width()) } else { 0. };
-                    this.right_panel.width = clamp_width(this.right_panel.width, viewport, viewport - sidebar);
+                    let sidebar = if this.sidebar_open.docked() { f32::from(this.sidebar_width()) } else { 0. };
+                    this.right_panel.width =
+                        clamp_width(this.right_panel.width, viewport, panel_row(viewport, sidebar));
                     cx.notify();
                 }))
                 .child({
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
-                    let inset = (panel.maximized && !self.sidebar_open)
+                    let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
                     self.render_tab_bar(&panel, inset, &tokens, cx)
                 })
@@ -2571,6 +2578,9 @@ mod tests {
         assert_eq!(clamp_width(100., 1600., 1300.), MIN_WIDTH);
         // Too narrow for both: the panel keeps its minimum.
         assert_eq!(clamp_width(540., 600., 500.), MIN_WIDTH);
+        // The web's 1138px window beside a 256px sidebar leaves 516 once the resize inset is out.
+        let expected = if cfg!(windows) { 516. } else { 522. };
+        assert_eq!(clamp_width(540., 1138., panel_row(1138., 256.)), expected);
     }
 
     #[test]

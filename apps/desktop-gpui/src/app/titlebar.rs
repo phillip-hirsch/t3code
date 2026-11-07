@@ -14,9 +14,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use std::cell::Cell;
 
 use gpui_kit::{
-    AnyElement, App, Context, CursorStyle, Decorations, Div, FontFallbacks, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Tiling, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
+    AnyElement, App, Bounds, Context, CursorStyle, Decorations, Div, Element, ElementId, FontFallbacks,
+    GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
+    ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    TextRenderingMode, Tiling, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
 };
 
 use super::{ToggleRightPanel, ToggleSidebar, Workspace};
@@ -171,7 +172,7 @@ impl Workspace {
             .left_0()
             .right_0()
             .h(TITLEBAR_HEIGHT)
-            .child(self.render_sidebar_toggle(window, cx))
+            .when(!self.sidebar_open.sheet(), |el| el.child(self.render_sidebar_toggle(window, cx)))
             .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
     }
 
@@ -193,10 +194,10 @@ impl Workspace {
     }
 
     /// `SidebarTrigger` in its `ghost` variant: we draw no stage art behind it.
-    fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
         let (color, hover_bg, hover_color) = (tokens.muted_foreground, tokens.accent, tokens.foreground);
-        let path = if self.sidebar_open { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
+        let path = if self.sidebar_open.shown() { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
         div().absolute().left(controls_left(window)).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
             control("toggle-sidebar")
                 .group("toggle-sidebar")
@@ -331,7 +332,7 @@ fn render_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
             .text_color(glyph)
             .hover(|style| style.bg(hover).text_color(hover_glyph))
             .active(|style| style.bg(pressed).text_color(hover_glyph))
-            .child(glyph_char)
+            .child(Grayscale(div().child(glyph_char).into_any_element()))
     };
     let maximize = if window.is_maximized() { ("restore", "\u{E923}") } else { ("maximize", "\u{E922}") };
     div()
@@ -343,6 +344,70 @@ fn render_caption_buttons(window: &Window, cx: &App) -> impl IntoElement {
         .child(button("minimize", "\u{E921}", WindowControlArea::Min, hover, pressed, glyph))
         .child(button(maximize.0, maximize.1, WindowControlArea::Max, hover, pressed, glyph))
         .child(button("close", "\u{E8BB}", WindowControlArea::Close, close_hover, close_pressed, white(1.)))
+}
+
+/// Paints its child's text with grayscale antialiasing, as Windows draws its caption glyphs;
+/// `ClearType`'s color fringes show on their hairline strokes. The mode is app-wide, so it is
+/// set only around this paint.
+struct Grayscale(AnyElement);
+
+impl IntoElement for Grayscale {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Grayscale {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.0.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut (),
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let previous = cx.text_rendering_mode();
+        cx.set_text_rendering_mode(TextRenderingMode::Grayscale);
+        self.0.paint(window, cx);
+        cx.set_text_rendering_mode(previous);
+    }
 }
 
 /// Minimize, maximize/restore and close as Electron's titlebar overlay draws them on Linux, with

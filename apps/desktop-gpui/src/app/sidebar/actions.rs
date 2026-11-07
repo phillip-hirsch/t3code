@@ -808,6 +808,12 @@ pub(in crate::app) struct ThreadMenu {
     turn_into_project: bool,
 }
 
+/// Electron shows a thread's menu natively: on Windows, Segoe UI at 9pt in 28px rows (26px plus
+/// the menu's 2px row gap). macOS keeps the reviewed look.
+fn native_rows(menu: PopupMenu) -> PopupMenu {
+    if cfg!(windows) { menu.item_text(Some("Segoe UI".into()), px(12.), px(26.)) } else { menu }
+}
+
 impl ThreadMenu {
     pub(in crate::app) fn build(
         self,
@@ -817,6 +823,7 @@ impl ThreadMenu {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         // Electron shows this as a native menu: plain rows, a trash icon on Delete only (macOS).
+        menu = native_rows(menu);
         let item = |label: &str| PopupMenuItem::new(label.to_owned());
         let origin = self.origin;
         let advance = origin == MenuOrigin::Sidebar;
@@ -857,7 +864,9 @@ impl ThreadMenu {
                 (_, true) => menu.item(act!(item("Wake thread"), |this, _w, cx, id| this.wake_thread(&id, cx))),
                 (Some(snooze), false) => {
                     let (snooze, view) = (snooze.clone(), view.clone());
-                    menu.submenu("Snooze", window, cx, move |menu, _, _| snooze.add_to(&view, menu.min_w(px(160.))))
+                    menu.submenu("Snooze", window, cx, move |menu, _, _| {
+                        snooze.add_to(&view, native_rows(menu).min_w(px(160.)))
+                    })
                 }
                 (None, false) => menu.item(item("Snooze").disabled(true)),
             };
@@ -887,7 +896,8 @@ impl ThreadMenu {
         }
         if let Some(enabled) = self.auto_settle {
             let (view, id) = (view.clone(), self.thread_id.clone());
-            menu = menu.submenu("Auto-settle behavior", window, cx, move |mut menu, _, _| {
+            menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, _| {
+                let mut menu = native_rows(menu);
                 for (label, on) in [("Enabled", true), ("Disabled", false)] {
                     let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
@@ -902,7 +912,8 @@ impl ThreadMenu {
         menu = menu.separator();
         let (path, branch, link, id) =
             (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread_id.clone());
-        menu = menu.submenu("Copy", window, cx, move |mut menu, _, _| {
+        menu = menu.submenu("Copy", window, cx, move |menu, _, _| {
+            let mut menu = native_rows(menu);
             let copy = |text: String| {
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));

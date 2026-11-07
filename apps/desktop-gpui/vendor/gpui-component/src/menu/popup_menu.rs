@@ -300,6 +300,9 @@ pub struct PopupMenu {
     max_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
     size: Size,
+    /// The items' font and text size and the rows' height, in place of the theme's `text_sm`
+    /// rows, e.g. to match a platform's native menus.
+    item_text: Option<(Option<SharedString>, Pixels, Pixels)>,
     check_side: Side,
     /// Indexes of the items added as options that can be checked, so an
     /// unchecked one reports its state rather than reading as a command.
@@ -354,6 +357,7 @@ impl PopupMenu {
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
             size: Size::default(),
+            item_text: None,
             submenu_anchor: (Anchor::TopLeft, Pixels::ZERO),
             priority: gpui_base::POPUP_PRIORITY,
             _subscriptions: vec![],
@@ -435,6 +439,12 @@ impl PopupMenu {
     /// Set min width of the popup menu, default is 120px
     pub fn min_w(mut self, width: impl Into<Pixels>) -> Self {
         self.min_width = Some(width.into());
+        self
+    }
+
+    /// Set the items' font family (the theme's when `None`), text size and row height.
+    pub fn item_text(mut self, family: Option<SharedString>, size: Pixels, height: Pixels) -> Self {
+        self.item_text = Some((family, size, height));
         self
     }
 
@@ -1282,10 +1292,14 @@ impl PopupMenu {
             Size::Small => (px(20.), options.radius.half()),
             _ => (px(26.), options.radius),
         };
+        let item_height = self.item_text.as_ref().map_or(item_height, |(_, _, height)| *height);
 
         let this = MenuItemElement::new(ix)
             .relative()
-            .text_sm()
+            .map(|this| match &self.item_text {
+                Some((_, size, _)) => this.text_size(*size),
+                None => this.text_sm(),
+            })
             .py_0()
             .px(INNER_PADDING)
             .rounded(radius)
@@ -1557,6 +1571,10 @@ impl Render for PopupMenu {
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .popover_style(cx)
             .text_color(cx.theme().popover_foreground)
+            .when_some(
+                self.item_text.as_ref().and_then(|(family, ..)| family.clone()),
+                |this, family| this.font_family(family),
+            )
             .relative()
             .occlude()
             .child(

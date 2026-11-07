@@ -3833,10 +3833,12 @@ impl BlockNode {
                 div()
                     .w_full()
                     .min_w_0()
-                    // Items breathe a little apart, less than paragraphs do; a
-                    // wide item keeps the paragraph gap instead, as the CSS
-                    // margins it stands between collapse to it.
-                    .when(ix > 0, |this| this.pt(if wide { gap } else { body * 0.25 }))
+                    // Items breathe a little apart (`li + li` is 0.25rem), less than
+                    // paragraphs do; a wide item keeps the paragraph gap instead, as
+                    // the CSS margins it stands between collapse to it.
+                    .when(ix > 0, |this| {
+                        this.pt(if wide { gap } else { rems(0.25).to_pixels(window.rem_size()) })
+                    })
                     .when(*spread, |this| this.child(div()))
                     .children({
                         let mut items: Vec<Div> = Vec::with_capacity(children.len());

@@ -12,6 +12,23 @@ it once upstream has an equivalent), and update the versions here and in `../Car
 gpui-kit's `gpui-pre-platform` pins). Each patch was committed separately from its unmodified
 copy, so `git log -p -- vendor/<name>` shows it.
 
+## gpui-pre 0.3.11
+
+GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
+
+**A tooltip hides once its element moves away from the pointer.** 0.3.11 checks a shown tooltip
+against the bounds its element had when the tooltip appeared, so a layout change under a still
+pointer (a panel opening, a row reflowing) left the tooltip floating where its button used to be
+until the pointer left that old spot. The patch keeps the element's bounds in its element state,
+updated every frame, and the tooltip's check reads them. Files:
+
+- `src/elements/div.rs`: `InteractiveElementState::tooltip_source_bounds`, set in `prepaint` and
+  read by `check_is_hovered_during_prepaint`; one test,
+  `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`.
+
+The crate's tests need `--features test-support`; run them from a scratch copy outside this
+repository (`cargo test --features test-support --lib`).
+
 ## gpui-pre-windows 0.3.11
 
 GPUI's Windows platform (Zed's `gpui_windows`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -82,7 +99,8 @@ Files:
 **List spacing like HTML lists.** The chat's markdown CSS gives lists, and the paragraphs of a
 loose list's items, a paragraph gap. 0.9.0 spaces every item by the tight-list gap only, puts no
 gap around a nested list, and draws a marker for a paragraph that follows a nested list inside the
-same item. The patch marks every item of a loose list (`list.spread`) as spread. Items of a loose
+same item. Its item gap is a quarter of the body size; the web's `li + li` margin is 0.25rem, and
+the patch uses that. The patch marks every item of a loose list (`list.spread`) as spread. Items of a loose
 list, and an item after one that ends with a nested list or blockquote, sit the paragraph gap below
 the previous item instead of the item gap, as the web's collapsed margins do; a nested list keeps
 the paragraph gap from what comes before it, and a paragraph after a nested list continues the
@@ -142,3 +160,10 @@ in place so the viewport stays, and selections stay while they lie in such files
 - `src/diff/state.rs`: `update_files`.
 - `src/diff/document.rs`: `DiffFile::is_same`.
 - `src/diff/tests.rs`: one test, `updating_files_keeps_the_state_of_files_that_stay`.
+
+**Menus can take a platform's text metrics.** Electron shows thread menus as native menus, which
+on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always the theme's
+`text_sm` at 26px. The patch adds `PopupMenu::item_text(family, size, height)`; without it the
+menu is unchanged. Files:
+
+- `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.

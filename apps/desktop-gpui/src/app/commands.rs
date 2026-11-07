@@ -30,7 +30,7 @@ impl Workspace {
         let held = self.held_key.as_ref() == Some(keystroke);
         let mut context = self.shortcut_context(&event.context_stack, window, cx);
         // The sidebar's undo notice claims Mod+Z from text fields while it shows.
-        if context.editable_focus && self.sidebar_open && self.sidebar.has_undo() {
+        if context.editable_focus && self.sidebar_open.shown() && self.sidebar.has_undo() {
             context.editable_focus = false;
         }
         let keymap = self.keymap.clone();
@@ -75,10 +75,7 @@ impl Workspace {
             return handled;
         }
         match command {
-            "sidebar.toggle" => {
-                self.sidebar_open = !self.sidebar_open;
-                cx.notify();
-            }
+            "sidebar.toggle" => self.toggle_sidebar(cx),
             "threadPanel.toggle" if chat => self.toggle_details(window, cx),
             "navigation.back" => self.go_back(window, cx),
             "navigation.forward" => self.go_forward(window, cx),
@@ -340,7 +337,7 @@ impl Workspace {
         }
         let chat = self.page.is_none() && self.target.is_some();
         let shown: Vec<Area> = [
-            (Area::Sidebar, self.sidebar_open),
+            (Area::Sidebar, self.sidebar_open.shown()),
             (Area::Conversation, chat && matches!(self.target, Some(Target::Thread { .. }))),
             (Area::Composer, chat),
             (Area::Panel, matches!(self.active_surface(), Some(super::right_panel::Surface::Browser(_)))),

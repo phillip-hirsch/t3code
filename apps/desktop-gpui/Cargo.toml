@@ -152,6 +152,8 @@ zbus = "5"
 gpui-base = { path = "vendor/gpui-base" }
 # gpui-component 0.9.0: the diff view draws like the web's Pierre diffs.
 gpui-component = { path = "vendor/gpui-component" }
+# gpui-pre 0.3.11: a shown tooltip follows its element's bounds.
+gpui-pre = { path = "vendor/gpui-pre" }
 # gpui-pre-windows 0.3.11: a setter that turns off DirectComposition.
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.

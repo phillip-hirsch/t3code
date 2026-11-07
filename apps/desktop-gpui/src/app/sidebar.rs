@@ -1251,7 +1251,7 @@ impl Workspace {
     /// The return tracker must see every shell change, like the web's. The
     /// render pass feeds it while the sidebar shows; this covers it hidden.
     pub(super) fn observe_inbox_while_hidden(&mut self) {
-        if self.sidebar_open {
+        if self.sidebar_open.shown() {
             return;
         }
         let requests = inbox::child_requests(&self.shell.threads);
@@ -1405,11 +1405,12 @@ impl Workspace {
                 .child(div().absolute().left_0().right_0().top(px(74.)).bottom_0().bg(sb.background))
         });
 
+        let sheet = self.sidebar_open.sheet();
         v_flex()
             .id("sidebar")
             .relative()
-            .w(self.sidebar_width())
             .h_full()
+            .when(!sheet, |el| el.w(self.sidebar_width()))
             .flex_none()
             .bg(sb.background)
             .text_color(sb.foreground)
@@ -1441,11 +1442,12 @@ impl Workspace {
                     .map(|pill| div().flex_none().px(px(8.)).pt(px(4.)).pb(px(4.)).child(pill)),
             )
             .child(self.render_sidebar_footer(&tokens, cx))
-            .child(deferred(rail).with_priority(1))
+            // The sheet doesn't resize (`resolveSidebarResizable`).
+            .when(!sheet, |el| el.child(deferred(rail).with_priority(1)))
             .children(self.render_open_menu())
     }
 
-    fn render_chrome_row(&self, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_chrome_row(&self, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
         // On the stage art the brand turns white and the arrows take `media-navigation`.
         let on_art = self.stage_art().is_some();
@@ -1472,6 +1474,10 @@ impl Workspace {
         };
         let (back, forward) = (self.history.can_go_back(), self.history.can_go_forward());
         let chrome = h_flex().id("sidebar-chrome").h(TITLEBAR_HEIGHT).flex_none().pr(px(12.));
+        // In the sheet the header carries the toggle and hides the brand and arrows (`md:hidden`).
+        if self.sidebar_open.sheet() {
+            return titlebar::drag_region(chrome).child(self.render_sidebar_toggle(window, cx)).into_any_element();
+        }
         titlebar::drag_region(chrome)
             .child(
                 h_flex()
@@ -1503,6 +1509,7 @@ impl Workspace {
                     .text_color(sb.foreground)
                     .child(label)
             }))
+            .into_any_element()
     }
 
     fn render_search_row(
