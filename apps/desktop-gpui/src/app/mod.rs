@@ -443,7 +443,7 @@ impl Workspace {
             keybindings_panel: None,
             theme_editor: None,
             palette: None,
-            draft_picker: draft_picker::DraftPicker::new(cx),
+            draft_picker: draft_picker::DraftPicker::new(window, cx),
             find: None,
             files: files::FilesState::default(),
             focus: cx.focus_handle(),

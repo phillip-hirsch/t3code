@@ -461,7 +461,7 @@ impl Workspace {
         let open = self.draft_picker_open();
         let focus = &self.draft_picker.trigger;
         // `focus-visible:outline-2 outline-ring`, drawn outside the text as an outline is.
-        let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+        let ring = self.draft_picker.trigger_ring(window);
         let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
             // `InlineButton tone="picker"`: underlined while its popup is open.
             let trigger = inline_button("draft-project-picker", label, t.foreground, t.foreground)
