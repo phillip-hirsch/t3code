@@ -18,7 +18,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::composer::runtime_modes;
+use super::composer::{control_button, runtime_modes};
 use super::{Target, Workspace};
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
 use crate::theme::Tokens;
@@ -69,6 +69,16 @@ const MODE_DESCRIPTIONS: [&str; 4] = [
     "Supported providers approve routine actions; others still ask.",
     "Allow commands and edits without prompts.",
 ];
+
+/// Where the permissions trigger sits: the draft's strip, the footer chip (with or without its
+/// label), the footer's overflow menu, or the model picker's footer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PermissionsForm {
+    Strip,
+    Chip { label: bool },
+    Overflow,
+    Picker,
+}
 
 /// The draft's workspace: what the controls picked and what they read.
 #[derive(Default)]
@@ -206,8 +216,9 @@ impl Workspace {
         Some(new_thread::launch_strategy(mode, &state.choice, refs, self.draft_start_from_origin()))
     }
 
+    /// `isGitRepo` as `ChatView` reads it: the checkout's live status, not its refs reply.
     pub(super) fn is_git_repo(&self) -> bool {
-        self.draft_workspace.refs.as_ref().and_then(|r| r.get("isRepo")).and_then(Value::as_bool).unwrap_or(true)
+        self.vcs.is_repo()
     }
 
     fn ref_list(&self) -> &[Value] {
@@ -483,7 +494,7 @@ impl Workspace {
                     "strip-permissions",
                     icon,
                     label,
-                    false,
+                    PermissionsForm::Strip,
                     t,
                     cx,
                 )))
@@ -492,7 +503,7 @@ impl Workspace {
     }
 
     fn render_thread_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let git = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
+        let git = self.is_git_repo();
         let persist = self.client_settings.values.bool("persistComposerContextStrip");
         let environment = self.render_host_picker(t, cx);
         if !persist || !(git || environment.is_some()) {
@@ -820,30 +831,55 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The permissions trigger and its popover (`ComposerPermissionsSection`):
-    /// a 24px strip control, or the 28px footer form inside the model picker.
+    /// The permissions trigger and its popover (`ComposerPermissionsSection`), in `form`.
     pub(super) fn render_permissions_control(
         &self,
         id: &'static str,
         icon: Lucide,
         label: &'static str,
-        footer: bool,
+        form: PermissionsForm,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.draft_workspace.permissions_open == Some(id);
-        let trigger = strip_button(id, t)
-            .when(footer, |b| b.h(px(28.)).px(px(8.)).rounded(px(6.)))
-            .selected(open)
-            .child(Icon::new(icon).with_size(px(if footer { 14. } else { 12. })))
-            .child(div().max_w(px(240.)).truncate().child(label))
-            .when(footer, |b| b.child(Icon::new(Lucide::ChevronUp).with_size(px(12.))))
-            .when(!footer, |b| {
-                b.tooltip(match self.shortcut_label("composer.mode") {
-                    Some(keys) => format!("Permissions · {keys}"),
-                    None => "Permissions".to_owned(),
-                })
-            });
+        let trigger = match form {
+            PermissionsForm::Strip | PermissionsForm::Picker => {
+                let picker = form == PermissionsForm::Picker;
+                strip_button(id, t)
+                    .when(picker, |b| b.h(px(28.)).px(px(8.)).rounded(px(6.)))
+                    .selected(open)
+                    .child(Icon::new(icon).with_size(px(if picker { 14. } else { 12. })))
+                    .child(div().max_w(px(240.)).truncate().child(label))
+                    .when(picker, |b| b.child(Icon::new(Lucide::ChevronUp).with_size(px(12.))))
+                    .when(!picker, |b| {
+                        b.tooltip(match self.shortcut_label("composer.mode") {
+                            Some(keys) => format!("Permissions · {keys}"),
+                            None => "Permissions".to_owned(),
+                        })
+                    })
+            }
+            // `ComposerFooterModeControls`' chip (`ps-1.5`); it shows only off the default, so its
+            // icon takes the label colour (`emphasized`).
+            PermissionsForm::Chip { label: labelled } => {
+                let description =
+                    runtime_modes().iter().position(|(_, l, _)| *l == label).map_or("", |i| MODE_DESCRIPTIONS[i]);
+                control_button(id, t)
+                    .pl(px(6.))
+                    .selected(open)
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(Icon::new(icon).with_size(px(16.)))
+                            .when(labelled, |row| row.child(label)),
+                    )
+                    .tooltip(format!("Permissions: {label}. {description}"))
+            }
+            // `CompactComposerControlsMenu`'s "More composer controls" trigger.
+            PermissionsForm::Overflow => control_button(id, t)
+                .selected(open)
+                .child(Icon::new(Lucide::Ellipsis).with_size(px(16.)).text_color(t.muted_foreground))
+                .tooltip("More composer controls"),
+        };
         let view = cx.entity();
         let mut popover = Popover::new(SharedString::from(format!("{id}-popover")))
             .anchor(gpui_kit::Anchor::BottomRight)

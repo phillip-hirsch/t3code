@@ -2,6 +2,8 @@
 //! details card offers: Initialize Git, the quick action, Commit/Push/PR, Pull.
 //! The decision logic mirrors `apps/web/src/components/GitActionsControl.logic.ts`.
 
+use std::collections::HashMap;
+
 use gpui_kit::{Context, Hsla, SharedString, Task, Window, rgb};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -325,6 +327,47 @@ pub fn group_thousands(value: u64) -> String {
     grouped
 }
 
+/// `formatCompactDiffCount`: 999, 1.2k, 12k, 1.5m, 2b.
+pub fn compact_diff_count(value: u64) -> String {
+    let short = |scaled: f64, unit: &str| {
+        if scaled < 10. {
+            // `toFixed(1)` rounds an exact half up; `{:.1}` would round it to even.
+            let tenths = format!("{:.1}", (scaled * 10.).round() / 10.);
+            format!("{}{unit}", tenths.strip_suffix(".0").unwrap_or(&tenths))
+        } else {
+            format!("{}{unit}", scaled.round())
+        }
+    };
+    #[expect(clippy::cast_precision_loss, reason = "a display count")]
+    let value_f = value as f64;
+    match value {
+        0..1_000 => value.to_string(),
+        1_000..999_500 => short(value_f / 1e3, "k"),
+        999_500..999_500_000 => short(value_f / 1e6, "m"),
+        _ => short(value_f / 1e9, "b"),
+    }
+}
+
+/// `DiffStatLabel` (`layout="aligned"`): `+n` and `-n` in mono at `size`px, in right-aligned
+/// 4ch columns (a mono `ch` is 0.6em).
+pub fn diff_stat_label(
+    additions: u64,
+    deletions: u64,
+    size: f32,
+    tokens: &Tokens,
+    scheme: DiffColorScheme,
+) -> gpui_kit::Div {
+    use gpui_kit::{ParentElement as _, Styled as _, div, px};
+    let column = |text: String, color: Hsla| div().w(px(size * 2.4)).flex().justify_end().text_color(color).child(text);
+    gpui_kit::component::h_flex()
+        .flex_none()
+        .gap(px(8.))
+        .font_family(tokens.fonts.mono)
+        .text_size(px(size))
+        .child(column(format!("+{}", compact_diff_count(additions)), addition_color(tokens, scheme)))
+        .child(column(format!("-{}", compact_diff_count(deletions)), deletion_color(tokens, scheme)))
+}
+
 /// The open target's status subscription; it follows the git cwd and its environment.
 #[derive(Default)]
 pub(super) struct VcsWatch {
@@ -335,12 +378,25 @@ pub(super) struct VcsWatch {
     /// The label of the git action in flight, as its progress reports it.
     pub running: Option<SharedString>,
     task: Option<Task<()>>,
+    /// `rememberCheckoutIsRepo`: what each checkout reported this session, read while its status loads.
+    known_repo: HashMap<(Option<SharedString>, String), bool>,
 }
 
 impl VcsWatch {
     /// Whether a reply for `cwd` on `env` is about the checkout watched now.
     fn watches(&self, env: Option<&str>, cwd: &str) -> bool {
         self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
+    }
+
+    /// `liveIsGitRepo ?? recallCheckoutIsRepo(...) ?? true`.
+    pub(super) fn is_repo(&self) -> bool {
+        self.status.as_ref().map_or_else(
+            || {
+                let recalled = self.cwd.as_ref().and_then(|cwd| self.known_repo.get(&(self.env.clone(), cwd.clone())));
+                recalled.copied().unwrap_or(true)
+            },
+            |status| status.local.is_repo,
+        )
     }
 }
 
@@ -386,6 +442,9 @@ impl Workspace {
                         match event {
                             StreamEvent::Item(value) if this.vcs.watches(env.as_deref(), &cwd) => {
                                 this.vcs.status = VcsStatus::apply(this.vcs.status.take(), &value);
+                                if let Some(status) = &this.vcs.status {
+                                    this.vcs.known_repo.insert((env.clone(), cwd.clone()), status.local.is_repo);
+                                }
                             }
                             StreamEvent::Item(_) => {}
                             StreamEvent::End(result) => {
@@ -528,6 +587,26 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_counts_compact_like_the_web() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1k"),
+            (1_250, "1.3k"),
+            (9_940, "9.9k"),
+            (12_345, "12k"),
+            (999_499, "999k"),
+            (999_500, "1m"),
+            (1_500_000, "1.5m"),
+            (999_500_000, "1b"),
+            (23_000_000_000, "23b"),
+        ];
+        for (value, shown) in cases {
+            assert_eq!(compact_diff_count(value), shown, "{value}");
+        }
+    }
 
     fn status(local: Value, remote: Value) -> VcsStatus {
         VcsStatus::apply(None, &json!({"_tag": "snapshot", "local": local, "remote": remote})).unwrap()

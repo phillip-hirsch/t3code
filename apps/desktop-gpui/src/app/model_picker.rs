@@ -63,7 +63,8 @@ pub(super) struct PickerState {
     /// The search has focus: its underline takes the ring colour (`focus-within:border-ring`).
     search_focused: bool,
     query: String,
-    highlighted: usize,
+    /// `autoHighlight`: nothing until a filter or the arrows highlight a row.
+    highlighted: Option<usize>,
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
@@ -115,7 +116,7 @@ impl Workspace {
                     match event {
                         InputEvent::Change => {
                             this.picker.query = search.read(cx).value().trim().to_owned();
-                            this.picker.highlighted = 0;
+                            this.picker.highlighted = (!this.picker.query.is_empty()).then_some(0);
                         }
                         InputEvent::Focus => this.picker.search_focused = true,
                         InputEvent::Blur => this.picker.search_focused = false,
@@ -132,7 +133,7 @@ impl Workspace {
             search.focus(window, cx);
         });
         self.picker.query.clear();
-        self.picker.highlighted = 0;
+        self.picker.highlighted = None;
         self.picker.tab = None;
         // Focused above before it renders, which its own focus event can miss.
         self.picker.search_focused = true;
@@ -318,12 +319,17 @@ impl Workspace {
         match keystroke.key.as_str() {
             "escape" => self.close_model_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
-                let step = if keystroke.key == "up" { rows.len() - 1 } else { 1 };
-                self.picker.highlighted = (self.picker.highlighted + step) % rows.len();
+                let last = rows.len() - 1;
+                self.picker.highlighted = Some(match (keystroke.key.as_str(), self.picker.highlighted) {
+                    ("down", None) => 0,
+                    ("down", Some(i)) => (i + 1) % rows.len(),
+                    (_, None | Some(0)) => last,
+                    (_, Some(i)) => i - 1,
+                });
                 cx.notify();
             }
             "enter" => {
-                if let Some(row) = rows.into_iter().nth(self.picker.highlighted) {
+                if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
                     self.pick_row(row.selection, window, cx);
                 }
             }
@@ -355,7 +361,7 @@ impl Workspace {
             )
             .collect();
         self.picker.tab = Some(step_tab(&tabs, &tab, step));
-        self.picker.highlighted = 0;
+        self.picker.highlighted = None;
         if let Some(search) = self.picker.search.clone() {
             search.update(cx, |search, cx| search.set_value("", window, cx));
         }
@@ -376,8 +382,8 @@ impl Workspace {
         true
     }
 
-    /// The trigger and, while open, the popover.
-    pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The composer trigger's model name, effort, and whether the fast and ultracode marks show.
+    fn trigger_labels(&self) -> (SharedString, Option<String>, bool, bool) {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
@@ -392,36 +398,82 @@ impl Workspace {
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
         let fast = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "fastMode", s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
+        (name, effort, fast, ultracode)
+    }
+
+    /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
+    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
+    pub(super) fn model_trigger_natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
+        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let logo = self
+            .composer_model()
+            .and_then(|s| self.server_info().provider(&s.instance_id))
+            .and_then(|p| crate::assets::provider_icon(&p.driver))
+            .map_or(0., |_| 16. + 6.);
+        let parts: Vec<f32> = effort
+            .map(|e| measure(&e).min(96.))
+            .into_iter()
+            .chain([fast, ultracode].into_iter().filter(|on| *on).map(|_| 12.))
+            .collect();
+        let suffix = if parts.is_empty() {
+            0.
+        } else {
+            #[expect(clippy::cast_precision_loss, reason = "at most three suffix parts")]
+            let gaps = (parts.len() - 1) as f32 * 6.;
+            4. + parts.iter().sum::<f32>() + gaps
+        };
+        (18. + logo + measure(&name).min(224.) + suffix).max(52.)
+    }
+
+    /// The trigger and, while open, the popover.
+    pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.composer_model();
+        let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
+        let model = current.as_ref().and_then(|s| self.server_info().model(s));
+        let descriptors =
+            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let (name, effort, fast, ultracode) = self.trigger_labels();
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
         let trigger = control_button("model-picker", t)
             .min_w(px(52.))
+            // `min-w-0 shrink`: a narrow composer truncates the name instead of overflowing.
+            .flex_shrink(1.)
             .disabled(disabled)
             .selected(open)
-            // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
-            .children(icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
-            }))
             .child(
-                div()
-                    .max_w(px(224.))
-                    .truncate()
-                    .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
-                    .child(name.clone()),
-            )
-            .when(effort.is_some() || fast || ultracode, |el| {
-                el.child(
-                    h_flex()
-                        .ml(px(-2.))
-                        .gap(px(6.))
-                        .text_color(suffix_color)
-                        .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
-                        .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
-                        .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
-                )
-            });
+                // The trigger's `gap-1.5` row; the suffix sits a word space after the name (`-ms-0.5`).
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(6.))
+                    // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
+                    .children(icon.map(|(path, tint)| {
+                        svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .max_w(px(224.))
+                            .truncate()
+                            .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
+                            .child(name.clone()),
+                    )
+                    .when(effort.is_some() || fast || ultracode, |el| {
+                        el.child(
+                            h_flex()
+                                .flex_none()
+                                .ml(px(-2.))
+                                .gap(px(6.))
+                                .text_color(suffix_color)
+                                .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
+                                .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
+                                .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
+                        )
+                    }),
+            );
         let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
@@ -592,7 +644,7 @@ impl Workspace {
             .tooltip(|window, cx| Tooltip::new("Favorites").build(window, cx))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.picker.tab = Some(Tab::Favorites);
-                this.picker.highlighted = 0;
+                this.picker.highlighted = None;
                 cx.notify();
             }));
         let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
@@ -621,7 +673,7 @@ impl Workspace {
                 .when(ready, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         this.picker.tab = Some(Tab::Provider(id.clone()));
-                        this.picker.highlighted = 0;
+                        this.picker.highlighted = None;
                         cx.notify();
                     }))
                 })
@@ -653,7 +705,7 @@ impl Workspace {
         let selection = row.selection.clone();
         let star_selection = row.selection.clone();
         let group: SharedString = format!("model-row-{}-{}", row.selection.instance_id, row.selection.model).into();
-        let highlighted = index == self.picker.highlighted;
+        let highlighted = self.picker.highlighted == Some(index);
         // `modelPicker.jump.N`'s live shortcut, read with the picker open.
         let jump_label = (docked && index < 9)
             .then(|| {
@@ -675,8 +727,8 @@ impl Workspace {
             .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
             .hover(|s| s.bg(t.foreground.opacity(0.09)))
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                if this.picker.highlighted != index {
-                    this.picker.highlighted = index;
+                if this.picker.highlighted != Some(index) {
+                    this.picker.highlighted = Some(index);
                     cx.notify();
                 }
             }))
@@ -1018,7 +1070,14 @@ impl Workspace {
             .children(speed)
             .children(ultracode)
             .child(div().flex_1())
-            .child(self.render_permissions_control("picker-permissions", icon, label, true, t, cx))
+            .child(self.render_permissions_control(
+                "picker-permissions",
+                icon,
+                label,
+                super::context_strip::PermissionsForm::Picker,
+                t,
+                cx,
+            ))
             .into_any_element()
     }
 }

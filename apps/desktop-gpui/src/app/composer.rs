@@ -22,6 +22,8 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::attachments::Attachment;
+use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
+use super::context_strip::PermissionsForm;
 use super::send::Intent;
 use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
@@ -678,6 +680,8 @@ impl Workspace {
             .when(!subagent, |surface| {
                 surface
                     .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
+                        // The placeholder wraps over the editor's two reserved lines without
+                        // growing it, as Tiptap's zero-height `::before` does.
                         div().relative().child(editor).when(self.composer_empty, |el| {
                             el.child(
                                 div()
@@ -689,7 +693,6 @@ impl Workspace {
                                     .text_size(px(t.fonts.prompt_size))
                                     .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                     .text_color(t.muted_foreground)
-                                    .truncate()
                                     .child(placeholder),
                             )
                         }),
@@ -697,7 +700,7 @@ impl Workspace {
                     .children(self.composer_ui.length_error.clone().map(|error| {
                         div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
                     }))
-                    .child(self.render_footer(&t, cx))
+                    .child(self.render_footer(window, &t, cx))
             });
         // The draft hero centers the bare stack; under a thread the overlay keeps `sm:pt-2`.
         let top = if matches!(self.target, Some(Target::Draft { .. })) { 0. } else { 8. };
@@ -720,11 +723,74 @@ impl Workspace {
         )
     }
 
-    fn render_footer(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `resolveComposerControlsOwnership` plus the width check: the permissions chip (off the
+    /// default only) and the Build/Plan toggle, labelled, icons only, or in the overflow menu.
+    fn render_mode_block(&self, window: &Window, t: &Tokens, cx: &mut Context<Self>) -> (Option<AnyElement>, ModeFit) {
         let mode = self.runtime_mode();
         // Drafts name their permissions in the row under the composer instead.
         let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
         let (plan_ui, interaction) = self.interaction_mode();
+        let chip = (!strip_owns_mode && mode != self.default_runtime_mode())
+            .then(|| runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]));
+        if chip.is_none() && !plan_ui {
+            return (None, ModeFit::Label);
+        }
+        let font = gpui_kit::Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
+        let size = gpui_kit::rems(0.875).to_pixels(window.rem_size());
+        let measure = |text: &str| {
+            let run = gpui_kit::TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(text.to_owned().into(), size, &[run], None).width)
+        };
+        let toggle_label = if interaction == "plan" { "Plan" } else { "Build" };
+        // The layouts below: `ps-1.5`/8px sides, 1px borders, 16-17px icons, 6px gaps, 4px apart.
+        let chip_widths = chip.map(|(_, label, _)| (32. + 6. + measure(label), 32.));
+        let toggle_widths = plan_ui.then(|| (35. + 6. + measure(toggle_label), 35.));
+        let both = if chip_widths.is_some() && toggle_widths.is_some() { 4. } else { 0. };
+        let (block, block_icon_only) = [chip_widths, toggle_widths]
+            .into_iter()
+            .flatten()
+            .fold((both, both), |(natural, icon), (n, i)| (natural + n, icon + i));
+        let widths = ControlsWidths {
+            picker: self.model_trigger_natural_width(measure),
+            block,
+            block_icon_only,
+            overflow: 34.,
+            gap: 2.,
+        };
+        let fit = self
+            .composer_ui
+            .footer_host
+            .map_or(ModeFit::Label, |host| resolve_mode_fit(widths, host, self.composer_ui.mode_fit));
+        let element = match fit {
+            ModeFit::Hidden if plan_ui => self.render_mode_overflow_menu(interaction, t, cx),
+            // Without the Plan toggle the overflow menu holds Permissions alone.
+            ModeFit::Hidden => {
+                let (_, label, icon) = chip.unwrap_or(runtime_modes()[3]);
+                self.render_permissions_control("footer-permissions", icon, label, PermissionsForm::Overflow, t, cx)
+            }
+            ModeFit::Label | ModeFit::Icon => h_flex()
+                .flex_none()
+                .gap(px(4.))
+                .children(chip.map(|(_, label, icon)| {
+                    let form = PermissionsForm::Chip { label: fit == ModeFit::Label };
+                    self.render_permissions_control("footer-permissions", icon, label, form, t, cx)
+                }))
+                .when(plan_ui, |el| el.child(self.render_interaction_toggle(interaction, fit == ModeFit::Label, t, cx)))
+                .into_any_element(),
+        };
+        (Some(element), fit)
+    }
+
+    fn render_footer(&self, window: &Window, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let (mode_block, fit) = self.render_mode_block(window, t, cx);
+        let view = cx.weak_entity();
         h_flex()
             .items_center()
             .px(px(8.))
@@ -760,6 +826,21 @@ impl Workspace {
                     .min_w_0()
                     .justify_end()
                     .gap(px(8.))
+                    // The controls row's width decides what fits next frame, like the web's observer.
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        let Some(host) = bounds.first().map(|b| f32::from(b.size.width)) else { return };
+                        let view = view.clone();
+                        cx.defer(move |cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                let ui = &mut this.composer_ui;
+                                if ui.footer_host.is_none_or(|old| (old - host).abs() >= 0.5) || ui.mode_fit != fit {
+                                    ui.footer_host = Some(host);
+                                    ui.mode_fit = fit;
+                                    cx.notify();
+                                }
+                            });
+                        });
+                    })
                     .child(
                         h_flex()
                             .flex_1()
@@ -767,21 +848,7 @@ impl Workspace {
                             .justify_end()
                             .gap(px(2.))
                             .child(self.render_model_picker(t, cx))
-                            .when(!strip_owns_mode && mode != self.default_runtime_mode(), |el| {
-                                let (_, label, icon) = runtime_modes()
-                                    .into_iter()
-                                    .find(|(id, ..)| *id == mode)
-                                    .unwrap_or(runtime_modes()[3]);
-                                el.child(self.render_permissions_control(
-                                    "footer-permissions",
-                                    icon,
-                                    label,
-                                    false,
-                                    t,
-                                    cx,
-                                ))
-                            })
-                            .when(plan_ui, |el| el.child(self.render_interaction_toggle(interaction, t, cx))),
+                            .children(mode_block),
                     )
                     .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
@@ -1547,14 +1614,17 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-/// `ComposerControl size="sm"`: 28px tall, 8px padding, 6px gap, text-sm medium.
+/// `ComposerControl size="sm"`: 28px tall, 8px padding inside a transparent 1px border,
+/// text-sm medium. The kit spaces children 4px apart, so a control wanting the web's `gap-1.5`
+/// wraps them in its own 6px row.
 pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .small()
         .h(px(28.))
         .px(px(8.))
-        .gap(px(6.))
+        .border_1()
+        .border_color(gpui_kit::transparent_black())
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.foreground.opacity(0.8))

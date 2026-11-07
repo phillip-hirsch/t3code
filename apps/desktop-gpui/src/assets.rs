@@ -38,6 +38,12 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/source-control/github.svg", include_bytes!("../assets/icons/source-control/github.svg")),
     ("icons/app/source-control/gitlab.svg", include_bytes!("../assets/icons/source-control/gitlab.svg")),
     ("icons/app/source-control/jj.svg", include_bytes!("../assets/icons/source-control/jj.svg")),
+    // @pierre/diffs' change icons (Apache-2.0), as the web's diff headers draw them.
+    ("icons/app/diffs/file-code.svg", include_bytes!("../assets/icons/diffs/file-code.svg")),
+    ("icons/app/diffs/symbol-added.svg", include_bytes!("../assets/icons/diffs/symbol-added.svg")),
+    ("icons/app/diffs/symbol-deleted.svg", include_bytes!("../assets/icons/diffs/symbol-deleted.svg")),
+    ("icons/app/diffs/symbol-modified.svg", include_bytes!("../assets/icons/diffs/symbol-modified.svg")),
+    ("icons/app/diffs/symbol-moved.svg", include_bytes!("../assets/icons/diffs/symbol-moved.svg")),
     ("icons/app/pr-branch-mark.svg", include_bytes!("../assets/icons/pr-branch-mark.svg")),
     ("icons/app/vscode.svg", include_bytes!("../assets/icons/vscode.svg")),
     ("icons/app/file-explorer.svg", include_bytes!("../assets/icons/file-explorer.svg")),

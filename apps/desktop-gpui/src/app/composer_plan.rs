@@ -32,6 +32,9 @@ pub(super) struct ComposerUi {
     implementing: bool,
     /// Why the last send was refused for length; it follows edits until it clears.
     pub(super) length_error: Option<String>,
+    /// The footer controls row's laid-out width, and how its mode block fit there last.
+    pub(super) footer_host: Option<f32>,
+    pub(super) mode_fit: super::composer_fit::ModeFit,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.
@@ -238,6 +241,7 @@ impl Workspace {
     pub(super) fn render_interaction_toggle(
         &self,
         mode: &'static str,
+        labelled: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -249,13 +253,44 @@ impl Workspace {
         };
         control_button("interaction-mode", t)
             .child(
-                Icon::new(if plan { Lucide::PencilRuler } else { Lucide::Bot })
-                    .with_size(px(if plan { 16. } else { 17. }))
-                    .when(!plan, |icon| icon.text_color(t.muted_foreground)),
+                h_flex()
+                    .gap(px(6.))
+                    .child(
+                        Icon::new(if plan { Lucide::PencilRuler } else { Lucide::Bot })
+                            .with_size(px(if plan { 16. } else { 17. }))
+                            .when(!plan, |icon| icon.text_color(t.muted_foreground)),
+                    )
+                    .when(labelled, |row| row.child(if plan { "Plan" } else { "Build" })),
             )
-            .child(if plan { "Plan" } else { "Build" })
             .tooltip(tooltip)
             .on_click(cx.listener(|this, _, window, cx| this.toggle_interaction_mode(window, cx)))
+            .into_any_element()
+    }
+
+    /// `CompactComposerControlsMenu` holding the Build/Plan toggle once it no longer fits.
+    pub(super) fn render_mode_overflow_menu(
+        &self,
+        mode: &'static str,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity();
+        control_button("composer-overflow", t)
+            .child(Icon::new(Lucide::Ellipsis).with_size(px(16.)).text_color(t.muted_foreground))
+            .tooltip("More composer controls")
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, move |menu, window, _| {
+                let item = |label: &'static str, value: &'static str| {
+                    PopupMenuItem::new(label).checked(mode == value).on_click(window.listener_for(
+                        &view,
+                        move |this, _, window, cx| {
+                            if mode != value {
+                                this.toggle_interaction_mode(window, cx);
+                            }
+                        },
+                    ))
+                };
+                menu.label("Mode").item(item("Chat", "default")).item(item("Plan", "plan"))
+            })
             .into_any_element()
     }
 

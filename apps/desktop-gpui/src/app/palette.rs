@@ -283,7 +283,12 @@ impl Workspace {
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
-        if view != View::Root {
+        if view == View::Root {
+            // `autoHighlight="always"`: the root opens on its first row.
+            if let Some(palette) = &mut self.palette {
+                palette.highlight = Some(0);
+            }
+        } else {
             self.push_palette_view(view, window, cx);
         }
         cx.notify();
@@ -319,7 +324,7 @@ impl Workspace {
         let Some(palette) = &mut self.palette else { return };
         palette.stack.push((palette.view, query));
         palette.view = view;
-        palette.highlight = (view != View::Browse).then_some(0);
+        palette.highlight = None;
         let start = match view {
             View::Browse => {
                 let base = self
@@ -340,7 +345,7 @@ impl Workspace {
         let Some(palette) = &mut self.palette else { return };
         let Some((view, query)) = palette.stack.pop() else { return };
         palette.view = view;
-        palette.highlight = Some(0);
+        palette.highlight = None;
         self.set_palette_query(&query, window, cx);
     }
 
@@ -1286,8 +1291,8 @@ impl Workspace {
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
         let in_submenu = !palette.stack.is_empty();
-        // `autoHighlight="always"`: the first row paints highlighted until the arrows move, except while browsing.
-        let highlight = palette.highlight.or((!browsing).then_some(0));
+        // Only `highlightedItemValue` paints; Enter still runs the first row when it is `None`.
+        let highlight = palette.highlight;
         let groups = self.palette_groups(&query);
         let input = palette.input.clone();
         let fg = tokens.foreground;
@@ -1511,18 +1516,20 @@ impl Workspace {
                 .into_any_element(),
         });
         let run = row.run.clone();
+        // `CommandItem`: centred, with the icon held to the title line (`CommandPaletteTitleIcon`)
+        // and the pin, time, shortcut and chevron beside the text, in that order.
         h_flex()
             .id(row.key.clone())
-            .items_start()
+            .items_center()
             .gap(px(8.))
             .px(px(8.))
             .py(px(6.))
             .rounded(px(4.))
             .cursor_pointer()
             .when(highlighted, |el| el.bg(tokens.foreground.opacity(0.04)))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered
-                    && let Some(palette) = &mut this.palette
+            // The pointer highlights a row by moving, not by a row appearing under it.
+            .on_mouse_move(cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                if let Some(palette) = &mut this.palette
                     && palette.highlight != Some(index)
                 {
                     palette.highlight = Some(index);
@@ -1532,61 +1539,35 @@ impl Workspace {
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, window, cx| this.run_palette_row(run.clone(), window, cx)),
             )
-            .child(div().flex_none().h(px(20.)).pt(px(2.)).child(icon))
+            .child(div().flex_none().self_start().h(px(20.)).pt(px(2.)).child(icon))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .child(
-                        h_flex()
-                            .h(px(20.))
-                            .gap(px(8.))
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_sm()
-                                    .line_height(px(20.))
-                                    .text_color(tokens.foreground)
-                                    .child(
-                                        div()
-                                            .when(row.strong.is_none(), |el| el.flex_1().min_w_0().truncate())
-                                            .child(row.title.clone()),
-                                    )
-                                    .children(row.strong.clone().map(|strong| {
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .ml(px(4.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(strong)
-                                    })),
-                            )
-                            .children(row.time.clone().map(|time| {
-                                div()
-                                    .flex_none()
-                                    .min_w(px(48.))
-                                    .text_right()
-                                    .text_xs()
-                                    .text_color(muted.opacity(0.7))
-                                    .child(time)
-                            }))
-                            .children(row.shortcut.clone().map(|shortcut| {
-                                div()
-                                    .flex_none()
-                                    .ml_auto()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(tokens.sidebar.secondary_label)
-                                    .child(shortcut)
-                            }))
-                            .when(row.chevron, |el| {
-                                el.child(div().ml_auto().mr(px(-2.)).child(
-                                    Icon::new(IconName::ChevronRight).size(px(16.)).text_color(muted.opacity(0.7)),
-                                ))
-                            }),
+                        h_flex().h(px(20.)).gap(px(8.)).child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_sm()
+                                .line_height(px(20.))
+                                .text_color(tokens.foreground)
+                                .child(
+                                    div()
+                                        .when(row.strong.is_none(), |el| el.flex_1().min_w_0().truncate())
+                                        .child(row.title.clone()),
+                                )
+                                .children(row.strong.clone().map(|strong| {
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .ml(px(4.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(strong)
+                                })),
+                        ),
                     )
                     .children(
                         description
@@ -1601,7 +1582,6 @@ impl Workspace {
                     .id(group.clone())
                     .group(group.clone())
                     .flex_none()
-                    .self_center()
                     .size(px(24.))
                     .flex()
                     .items_center()
@@ -1630,6 +1610,25 @@ impl Workspace {
                         this.set_projects_pinned(&ids, !pinned, cx);
                     }))
             }))
+            .children(row.time.clone().map(|time| {
+                div().flex_none().min_w(px(48.)).text_right().text_xs().text_color(muted.opacity(0.7)).child(time)
+            }))
+            .children(row.shortcut.clone().map(|shortcut| {
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.sidebar.secondary_label)
+                    .child(shortcut)
+            }))
+            .when(row.chevron, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .mr(px(-2.))
+                        .child(Icon::new(IconName::ChevronRight).size(px(16.)).text_color(muted.opacity(0.7))),
+                )
+            })
             .into_any_element()
     }
 }

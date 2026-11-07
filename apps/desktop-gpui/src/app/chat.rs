@@ -648,7 +648,7 @@ pub(super) fn render_row(
                     .group_hover("timeline-meta", |style| style.opacity(1.));
             lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
         }
-        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, .. } => {
+        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, changes, .. } => {
             let body = div()
                 .px(px(4.))
                 .py(px(2.))
@@ -670,8 +670,16 @@ pub(super) fn render_row(
                     .opacity(0.)
                     .group_hover("timeline-row", |style| style.opacity(1.))
             });
-            lane(if *terminal { 16. } else { 8. }, v_flex().group("timeline-row").child(body).children(meta))
-                .into_any_element()
+            let changes = changes.as_ref().map(|c| super::changed_files::card(c, this, lane_width - 8., &t, cx));
+            lane(
+                if *terminal { 16. } else { 8. },
+                v_flex()
+                    .group("timeline-row")
+                    .child(body)
+                    .children(changes.map(|card| div().px(px(4.)).child(card)))
+                    .children(meta),
+            )
+            .into_any_element()
         }
         Row::Plan { id, plan } => plan_card(id, plan, this, lane_width, cx, &t),
         Row::Work(work) => work_row(work, this, &t, cx),
@@ -1400,6 +1408,7 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
         .plugin(super::markdown_ui::FileChips {
             workspace: this.clone(),
             dark: t.dark,

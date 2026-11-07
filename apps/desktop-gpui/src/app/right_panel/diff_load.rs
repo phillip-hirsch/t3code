@@ -1,7 +1,7 @@
 //! The git diff's two-step read (`useReviewFilePatches`): the preview carries every file's stats,
 //! and a large or `metadataOnly` comparison sends its patches one file per request.
 
-use std::cmp::Ordering;
+use crate::turn_diff_tree::natural_cmp;
 
 use gpui_kit::component::diff::{DiffFile, DiffParseOptions};
 use serde_json::{Value, json};
@@ -128,41 +128,6 @@ fn placeholder(file: &FileStat) -> Vec<DiffFile> {
         ),
         false,
     )
-}
-
-/// `Intl.Collator(undefined, {numeric: true, sensitivity: "base"})`, for paths: case-insensitive,
-/// with digit runs compared by value.
-fn natural_cmp(a: &str, b: &str) -> Ordering {
-    fn digits(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
-        let mut run = String::new();
-        while let Some(c) = chars.next_if(char::is_ascii_digit) {
-            run.push(c);
-        }
-        run.trim_start_matches('0').to_owned()
-    }
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
-    loop {
-        match (a.peek().copied(), b.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let (x, y) = (digits(&mut a), digits(&mut b));
-                let order = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            (Some(x), Some(y)) => {
-                let order = x.to_lowercase().cmp(y.to_lowercase());
-                if order != Ordering::Equal {
-                    return order;
-                }
-                a.next();
-                b.next();
-            }
-        }
-    }
 }
 
 #[cfg(test)]

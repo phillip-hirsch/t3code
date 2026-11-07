@@ -30,9 +30,11 @@ mod alerts;
 mod attachment_preview;
 mod attachments;
 mod banners;
+mod changed_files;
 mod chat;
 mod commands;
 mod composer;
+mod composer_fit;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;
@@ -190,6 +192,7 @@ pub struct Workspace {
     draft_workspace: context_strip::DraftWorkspaceState,
     /// Plan mode per target and the dismissed fallback notice.
     composer_ui: composer_plan::ComposerUi,
+    changed_files: changed_files::ChangedFilesUi,
     attachments: Vec<attachments::Attachment>,
     /// Prompts set aside with `composer.stash`.
     prompt_stash: prompt_stash::PromptStash,
@@ -377,6 +380,7 @@ impl Workspace {
             picker: Default::default(),
             draft_workspace: Default::default(),
             composer_ui: Default::default(),
+            changed_files: Default::default(),
             attachments: Vec::new(),
             prompt_stash: Default::default(),
             prompt_history: None,
