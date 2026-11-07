@@ -293,6 +293,7 @@ impl Workspace {
         }));
         let popup = v_flex()
             .id("draft-project-picker-popup")
+            .key_context(super::keymap::COMBOBOX_CONTEXT)
             .occlude()
             .w(px(POPUP_WIDTH))
             .max_h(px(368.))
