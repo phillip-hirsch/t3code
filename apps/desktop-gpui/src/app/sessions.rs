@@ -444,15 +444,10 @@ impl Workspace {
             .collect()
     }
 
-    /// `scratchEnvironmentId`: where "start without a project" opens its draft.
-    pub(super) fn scratch_environment(&self, fallback: &str) -> Option<SharedString> {
-        let offering: Vec<&SharedString> = self
-            .sessions
-            .iter()
-            .filter(|session| session.is_connected() && session.server_info.scratch_workspace_root.is_some())
-            .filter_map(|session| session.id.as_ref())
-            .collect();
-        pick_scratch_environment(&offering, self.primary_environment().map(SharedString::as_ref), fallback)
+    /// `scratchEnvironmentId(currentProjectEnvironmentId)`: where "start without a project"
+    /// opens its draft from the open thread or draft; `None` hides the way in.
+    pub(super) fn scratch_environment(&self) -> Option<SharedString> {
+        scratch_environment_of(&self.sessions, self.target.as_ref().map(|target| target.environment().as_ref()))
     }
 
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.
@@ -521,11 +516,24 @@ fn settings_session_index(sessions: &[EnvironmentSession], device_page: bool, sc
     sessions.iter().position(|session| session.is(scoped))
 }
 
+fn scratch_environment_of(sessions: &[EnvironmentSession], current: Option<&str>) -> Option<SharedString> {
+    let offering: Vec<&SharedString> = sessions
+        .iter()
+        .filter(|session| session.is_connected() && session.server_info.scratch_workspace_root.is_some())
+        .filter_map(|session| session.id.as_ref())
+        .collect();
+    pick_scratch_environment(&offering, sessions[PRIMARY].id.as_deref(), current)
+}
+
 /// The primary wins when it offers a "No project" home, then `fallback`, then the only
 /// environment that offers one.
-fn pick_scratch_environment(offering: &[&SharedString], primary: Option<&str>, fallback: &str) -> Option<SharedString> {
+fn pick_scratch_environment(
+    offering: &[&SharedString],
+    primary: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<SharedString> {
     let offers = |id: &str| offering.iter().find(|offered| offered.as_ref() == id).map(|id| (*id).clone());
-    primary.and_then(offers).or_else(|| offers(fallback)).or_else(|| match offering {
+    primary.and_then(offers).or_else(|| fallback.and_then(offers)).or_else(|| match offering {
         [only] => Some((*only).clone()),
         _ => None,
     })
@@ -538,11 +546,26 @@ mod tests {
     #[test]
     fn scratch_drafts_prefer_the_primary_then_the_draft_then_a_sole_offer() {
         let (primary, remote, other) = (SharedString::from("primary"), SharedString::from("remote"), "other".into());
-        let pick = |offering: &[&SharedString], fallback| pick_scratch_environment(offering, Some("primary"), fallback);
+        let pick =
+            |offering: &[&SharedString], fallback| pick_scratch_environment(offering, Some("primary"), Some(fallback));
         assert_eq!(pick(&[&remote, &primary], "remote"), Some(primary.clone()));
         assert_eq!(pick(&[&remote, &other], "remote"), Some(remote.clone()));
         assert_eq!(pick(&[&other], "remote"), Some(other.clone()));
         assert_eq!(pick(&[&remote, &other], "elsewhere"), None);
+
+        // From a thread on a remote, even one that went offline, the primary takes the draft.
+        let session = |id: &SharedString, connected: bool| {
+            let mut session = EnvironmentSession::saved(id.clone());
+            session.client = connected.then(RpcClient::unopened);
+            session.server_info.scratch_workspace_root = Some("scratch".into());
+            session
+        };
+        let sessions = [session(&primary, true), session(&remote, true)];
+        assert_eq!(scratch_environment_of(&sessions, Some("remote")), Some(primary.clone()));
+        let sessions = [session(&primary, true), session(&remote, false)];
+        assert_eq!(scratch_environment_of(&sessions, Some("remote")), Some(primary));
+        let sessions = [session(&"primary".into(), false), session(&remote, true)];
+        assert_eq!(scratch_environment_of(&sessions, Some("remote")), Some(remote));
     }
 
     #[test]

@@ -133,6 +133,14 @@ impl RpcClient {
         Ok(Self { commands, next_id: Arc::new(AtomicU64::new(0)), closed })
     }
 
+    /// A client whose socket never opened, for state that only asks whether one is held.
+    #[cfg(test)]
+    pub fn unopened() -> Self {
+        let (commands, _) = mpsc::unbounded_channel();
+        let (_, closed) = async_channel::bounded(1);
+        Self { commands, next_id: Arc::default(), closed }
+    }
+
     /// Resolves with the reason once the socket closes.
     pub async fn closed(&self) -> String {
         self.closed.recv().await.unwrap_or_else(|_| "closed".into())

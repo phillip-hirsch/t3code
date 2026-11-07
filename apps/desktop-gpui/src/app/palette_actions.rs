@@ -4,7 +4,7 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{ClipboardItem, Context, Window};
+use gpui_kit::{ClipboardItem, Context, SharedString, Window};
 use serde_json::json;
 
 use super::{Target, Workspace, new_id};
@@ -53,9 +53,15 @@ fn toast_error(title: &str, message: impl Into<gpui_kit::SharedString>, window: 
 }
 
 impl Workspace {
-    /// `startScratchThread`: `projects.ensureScratch`, then a draft there, holding `prompt` if given.
-    pub(super) fn start_scratch_thread(&mut self, prompt: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(environment) = self.active_environment().cloned() else { return };
+    /// `startScratchThread`: `projects.ensureScratch` on `environment`, then a draft there,
+    /// holding `prompt` if given.
+    pub(super) fn start_scratch_thread(
+        &mut self,
+        environment: SharedString,
+        prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.env_client(&environment) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.ensureScratch", json!({})).await;
@@ -92,7 +98,7 @@ impl Workspace {
             );
             return;
         }
-        let Some(client) = self.client() else { return };
+        let (Some(environment), Some(client)) = (self.active_environment().cloned(), self.client()) else { return };
         let os = match std::env::consts::OS {
             "windows" => "Windows",
             "macos" => "macOS",
@@ -109,7 +115,7 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(value) => {
                     let prompt = value["prompt"].as_str().map(str::to_owned);
-                    this.start_scratch_thread(prompt, window, cx);
+                    this.start_scratch_thread(environment, prompt, window, cx);
                 }
                 Err(error) => toast_error("Could not start triage", fail(&error.to_string()), window, cx),
             });

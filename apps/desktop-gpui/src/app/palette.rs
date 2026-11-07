@@ -84,8 +84,8 @@ enum Run {
         query: String,
         message_id: Option<String>,
     },
-    /// "New thread without a project" (`chat.newWithoutProject`).
-    ScratchThread,
+    /// "New thread without a project" (`chat.newWithoutProject`), on this environment.
+    ScratchThread(SharedString),
     Triage,
     /// The composer's prompt as a link; `true` adds the repository and model.
     CopyPromptLink(bool),
@@ -521,12 +521,12 @@ impl Workspace {
                 row
             })
             .collect();
-        if self.server_info().scratch_workspace_root.is_some() && self.client().is_some() {
+        if let Some(environment) = self.scratch_environment() {
             let mut row = Row::new(
                 "new-thread-no-project",
                 RowIcon::Lucide(IconName::MessageSquareDashed),
                 "No project",
-                Run::ScratchThread,
+                Run::ScratchThread(environment),
             );
             row.terms = &["no project", "without project", "none"];
             row.shortcut = self.shortcut("chat.newWithoutProject");
@@ -563,12 +563,12 @@ impl Workspace {
             row.terms = &["new thread", "project", "pick", "choose", "select"];
             rows.push(row);
         }
-        if self.server_info().scratch_workspace_root.is_some() && self.client().is_some() {
+        if let Some(environment) = self.scratch_environment() {
             let mut row = lucide(
                 "new-thread-without-project",
                 IconName::MessageSquareDashed,
                 "New thread without a project",
-                Run::ScratchThread,
+                Run::ScratchThread(environment),
             );
             row.terms = &["new thread", "no project", "without project", "none", "chat"];
             row.shortcut = self.shortcut("chat.newWithoutProject");
@@ -1087,7 +1087,7 @@ impl Workspace {
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Page(page) => self.open_page(page, cx),
             Run::Find => self.open_thread_find_or_explain(window, cx),
-            Run::ScratchThread => self.start_scratch_thread(None, window, cx),
+            Run::ScratchThread(environment) => self.start_scratch_thread(environment, None, window, cx),
             Run::Triage => self.start_triage(window, cx),
             Run::CopyPromptLink(with_context) => self.copy_prompt_link(with_context, window, cx),
             Run::CopyThread => self.copy_thread_reference(window, cx),
