@@ -332,7 +332,7 @@ fn next_area(shown: &[Area], current: Option<Area>, forward: bool) -> Option<Are
 impl Workspace {
     /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
     fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.palette.is_some() {
+        if self.settings.is_some() || self.palette.is_some() || self.sidebar_open.sheet() {
             return;
         }
         let chat = self.page.is_none() && self.target.is_some();
