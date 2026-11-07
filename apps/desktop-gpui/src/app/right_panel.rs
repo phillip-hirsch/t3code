@@ -6,6 +6,7 @@
 
 mod diff_base;
 mod diff_load;
+mod diff_open;
 mod diff_tree;
 
 use std::collections::{HashMap, HashSet};
@@ -1933,7 +1934,11 @@ impl Workspace {
                         .items_start()
                         .child({
                             // `--diffs-font-size`, the Code font size.
+                            let (state, view, header_tokens) = (self.right_panel.diff.clone(), cx.entity(), *tokens);
                             let diff = Diff::new(&self.right_panel.diff)
+                                .render_header(move |file, _, cx| {
+                                    diff_open::header(file, state.clone(), view.clone(), &header_tokens, cx)
+                                })
                                 .soft_wrap(wrap)
                                 .flex_1()
                                 .min_h_0()

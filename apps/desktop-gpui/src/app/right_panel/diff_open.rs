@@ -1,0 +1,176 @@
+//! Opening a diff's file from its header (`openDiffFilePrimaryAction`): the path opens in the
+//! panel's Files surface; the rest of the header folds the file, as the chevron does.
+
+use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
+use gpui_kit::component::h_flex;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div,
+};
+
+use super::super::Workspace;
+use super::super::markdown_ui::workspace_relative;
+use crate::theme::Tokens;
+
+fn is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("\\\\") || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// `normalizedRelativePathSegments`: `None` for absolute paths and paths that climb out.
+fn relative_segments(path: &str) -> Option<Vec<&str>> {
+    if path.starts_with('/') || is_windows_absolute(path) {
+        return None;
+    }
+    let segments: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect();
+    (!segments.is_empty() && !segments.contains(&"..")).then_some(segments)
+}
+
+/// `normalizeProjectPathForComparison`.
+fn comparable_root(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if is_windows_absolute(trimmed) { trimmed.replace('/', "\\").to_lowercase() } else { trimmed.to_owned() }
+}
+
+/// `repositoryRelativeWorkspaceSegments`: where the workspace sits inside the repository.
+fn workspace_segments(workspace_root: Option<&str>, repository_root: Option<&str>) -> Option<Vec<String>> {
+    let (workspace, repository) = (comparable_root(workspace_root?), comparable_root(repository_root?));
+    if workspace == repository {
+        return Some(Vec::new());
+    }
+    let separator = if repository.contains('\\') { '\\' } else { '/' };
+    let rest = workspace.strip_prefix(&format!("{repository}{separator}"))?;
+    Some(rest.split(['/', '\\']).filter(|s| !s.is_empty()).map(str::to_owned).collect())
+}
+
+/// `resolveDiffPathForWorkspace`: a diff file's path relative to the workspace, or `None`
+/// when it lies outside it. Diffs name files from the repository root, or by absolute path.
+pub(super) fn workspace_path(
+    file_path: &str,
+    workspace_root: Option<&str>,
+    repository_root: Option<&str>,
+) -> Option<String> {
+    if file_path.starts_with('/') || is_windows_absolute(file_path) {
+        return Some(relative_segments(&workspace_relative(file_path, workspace_root)?)?.join("/"));
+    }
+    let file = relative_segments(file_path)?;
+    let Some(workspace) = workspace_segments(workspace_root, repository_root).filter(|s| !s.is_empty()) else {
+        return Some(file.join("/"));
+    };
+    let case_insensitive = repository_root.is_some_and(is_windows_absolute);
+    let inside = workspace.iter().enumerate().all(|(index, segment)| {
+        file.get(index).is_some_and(|candidate| {
+            if case_insensitive { candidate.to_lowercase() == *segment } else { candidate == segment }
+        })
+    });
+    let rest = file.get(workspace.len()..).filter(|rest| inside && !rest.is_empty())?;
+    Some(rest.join("/"))
+}
+
+impl Workspace {
+    /// `openDiffFile`: the open checkout's file, in the panel.
+    pub(super) fn open_diff_file(&mut self, file_path: &str, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let worktree = match &self.target {
+            Some(super::super::Target::Thread { id, .. }) => {
+                self.shell.threads.iter().find(|thread| &thread.id == id).and_then(|t| t.worktree_path.clone())
+            }
+            _ => None,
+        };
+        let project = self.target_project();
+        let workspace_root = worktree.clone().or_else(|| project.map(|p| p.workspace_root.clone()));
+        let repository_root = worktree
+            .is_none()
+            .then(|| project.and_then(|p| p.repository_identity.as_ref()?.root_path.clone()))
+            .flatten();
+        if let Some(path) = workspace_path(file_path, workspace_root.as_deref(), repository_root.as_deref()) {
+            self.open_file(&path, None, window, cx);
+        }
+    }
+}
+
+/// The default diff header (path, `+n −n`, status) with the path opening the file and the
+/// rest of the row folding it.
+pub(super) fn header(
+    file: &DiffFile,
+    state: Entity<DiffState>,
+    view: Entity<Workspace>,
+    tokens: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    let name: SharedString = match (file.original_path(), file.modified_path()) {
+        (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
+        _ => file.path().clone(),
+    };
+    let status = match file.status() {
+        DiffFileStatus::Added => Some("Added file"),
+        DiffFileStatus::Deleted => Some("Deleted file"),
+        DiffFileStatus::Renamed => Some("Renamed"),
+        DiffFileStatus::Copied => Some("Copied"),
+        DiffFileStatus::Conflicted => Some("Conflicts"),
+        _ => None,
+    };
+    let statistics = !matches!(file.status(), DiffFileStatus::Unchanged | DiffFileStatus::Conflicted);
+    let path = file.path().clone();
+    let collapsed = state.read(cx).is_file_collapsed(&path);
+    let (open_path, fold_path, fold_view) = (path.clone(), path, view.clone());
+    // `[data-title]:hover`: the code foreground mixed 16% toward primary.
+    let hover = tokens.foreground.blend(tokens.primary.opacity(0.16));
+    let muted = tokens.muted_foreground;
+    h_flex()
+        .id("diff-file-header-content")
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .on_click(move |_, _, cx| {
+            state.update(cx, |state, cx| state.set_file_collapsed(&fold_path, !collapsed, cx));
+            fold_view.update(cx, Workspace::remember_collapsed);
+        })
+        .child(
+            div()
+                .id("diff-file-title")
+                .min_w_0()
+                .truncate()
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(move |style| style.text_color(hover))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    view.update(cx, |this, cx| this.open_diff_file(&open_path, window, cx));
+                })
+                .child(name),
+        )
+        .child(div().flex_1())
+        .when(statistics, |el| {
+            el.child(div().text_xs().text_color(muted).child(format!("+{} −{}", file.additions(), file.deletions())))
+        })
+        .when_some(status, |el, status| el.child(div().text_xs().text_color(muted).child(status)))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_path;
+
+    #[test]
+    fn diff_paths_resolve_from_the_repository_into_the_workspace() {
+        // The workspace is the repository: repository paths open as they are.
+        assert_eq!(workspace_path("src/a.rs", Some("/repo"), Some("/repo")).as_deref(), Some("src/a.rs"));
+        assert_eq!(workspace_path("./src//a.rs", Some("/repo"), None).as_deref(), Some("src/a.rs"));
+        // A workspace inside the repository drops its own prefix and refuses files outside it.
+        assert_eq!(
+            workspace_path("apps/web/main.ts", Some("/repo/apps/web"), Some("/repo")).as_deref(),
+            Some("main.ts")
+        );
+        assert_eq!(workspace_path("apps/server/main.ts", Some("/repo/apps/web"), Some("/repo")), None);
+        assert_eq!(workspace_path("apps/web", Some("/repo/apps/web"), Some("/repo")), None);
+        assert_eq!(
+            workspace_path("Apps/Web/main.ts", Some("C:\\Repo\\apps\\web"), Some("C:\\Repo")).as_deref(),
+            Some("main.ts")
+        );
+        // Absolute paths (Claude's tool diffs) open only under the workspace.
+        assert_eq!(workspace_path("/repo/src/a.rs", Some("/repo"), None).as_deref(), Some("src/a.rs"));
+        assert_eq!(workspace_path("/other/a.rs", Some("/repo"), None), None);
+        assert_eq!(workspace_path("../a.rs", Some("/repo"), None), None);
+    }
+}
