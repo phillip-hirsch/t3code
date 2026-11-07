@@ -13,6 +13,14 @@ use super::Workspace;
 /// `SIDEBAR_MOBILE_QUERY` is `(max-width: 767px)`.
 const SHEET_BELOW: f32 = 768.;
 
+/// Where the sidebar's rows are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowsSurface {
+    Hidden,
+    Docked,
+    Sheet,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SidebarOpen {
     /// `open`: the docked sidebar, from a wide window.
@@ -50,6 +58,15 @@ impl SidebarOpen {
         self.sheet && self.narrow
     }
 
+    /// Where the rows are drawn; rows on another surface are new rows, as the web remounts them.
+    pub(super) fn surface(self) -> RowsSurface {
+        match (self.docked(), self.sheet()) {
+            (true, _) => RowsSurface::Docked,
+            (false, true) => RowsSurface::Sheet,
+            (false, false) => RowsSurface::Hidden,
+        }
+    }
+
     /// `toggleSidebar`: the sheet in a narrow window, the docked sidebar otherwise.
     pub(super) fn toggle(&mut self) {
         if self.narrow {
@@ -64,6 +81,14 @@ impl SidebarOpen {
         if self.narrow {
             self.sheet = false;
         }
+    }
+}
+
+impl RowsSurface {
+    /// Moves to `now`; true when the rows left their surface. Rows that stop drawing never see
+    /// the pointer leave, so whatever they tracked of it (the hovered row, its hover card) is stale.
+    pub(super) fn follow(&mut self, now: Self) -> bool {
+        std::mem::replace(self, now) != now
     }
 }
 
@@ -224,6 +249,21 @@ mod tests {
         assert!(open.sheet());
         open.fit(px(1000.));
         assert!(!open.docked(), "the docked sidebar stays closed");
+    }
+
+    #[test]
+    fn rows_hidden_by_a_resize_and_shown_in_the_sheet_are_new_rows() {
+        let mut open = at(1000.);
+        let mut rows = open.surface();
+        assert_eq!(rows, RowsSurface::Docked);
+        assert!(!rows.follow(open.surface()), "a frame with no change keeps the rows");
+        open.fit(px(700.));
+        assert!(rows.follow(open.surface()), "narrowing hides the docked rows");
+        open.toggle();
+        assert!(rows.follow(open.surface()), "the sheet draws its own rows");
+        assert_eq!(rows, RowsSurface::Sheet);
+        open.close_sheet();
+        assert!(rows.follow(open.surface()));
     }
 
     #[test]
