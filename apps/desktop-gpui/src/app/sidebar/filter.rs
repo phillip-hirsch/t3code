@@ -166,9 +166,13 @@ impl Workspace {
 
     pub(super) fn render_header_buttons(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let sb = tokens.sidebar;
-        let header_button = |id: &'static str| {
+        let ring = tokens.ring;
+        let [_, add_focus, new_focus] = &self.sidebar.header_focus;
+        let header_button = |id: &'static str, focus: &gpui_kit::FocusHandle| {
             div()
                 .id(id)
+                .track_focus(focus)
+                .focus_visible(move |s| s.border_2().border_color(ring))
                 .relative()
                 .size(px(28.))
                 .flex_none()
@@ -191,14 +195,14 @@ impl Workspace {
             .flex_none()
             .when(has_projects, |el| {
                 el.child(self.render_filter(tokens, cx)).child(
-                    header_button("sidebar-add-project")
+                    header_button("sidebar-add-project", add_focus)
                         .tooltip(tooltip("Add project"))
                         .on_click(cx.listener(|this, _, window, cx| this.open_palette(View::AddProject, window, cx)))
                         .child(icon(IconName::FolderPlus, 16., sb.icon)),
                 )
             })
             .child(
-                header_button("sidebar-new-thread")
+                header_button("sidebar-new-thread", new_focus)
                     .when(!has_projects, |el| el.opacity(0.64).cursor_default())
                     .tooltip(move |window, cx| {
                         let (label, hint) = (new_thread_label.clone(), in_project_hint.clone());
@@ -247,8 +251,11 @@ impl Workspace {
                 .into_any_element(),
         };
         let open = self.sidebar.filter.is_some();
+        let ring = tokens.ring;
         div()
             .id("sidebar-filter")
+            .track_focus(&self.sidebar.header_focus[0])
+            .focus_visible(move |s| s.border_2().border_color(ring))
             .relative()
             .size(px(28.))
             .flex_none()

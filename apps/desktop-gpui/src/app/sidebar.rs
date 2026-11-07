@@ -98,6 +98,10 @@ pub(super) struct SidebarState {
     messages: super::palette::MessageSearch,
     /// Keyboard navigation of the rows (`sidebarTree.ts`).
     pub(super) list_focus: FocusHandle,
+    /// The header's filter, Add project and New thread buttons, tab stops after the search box.
+    header_focus: [FocusHandle; 3],
+    /// The sheet's "Toggle main sidebar" button, its first tab stop.
+    pub(super) sheet_toggle: FocusHandle,
     /// The keyboard row (`thread:<id>`, `shelf:<name>`, `settled:more`), and the rows in order.
     cursor: Option<SharedString>,
     nav_rows: Vec<SharedString>,
@@ -151,17 +155,19 @@ impl SidebarState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let list_focus = cx.focus_handle().tab_stop(true);
-        // The sidebar is a cached view: focus moving in or out of the search box or
-        // the list changes what it draws, so it re-renders on those too.
-        let subscriptions = vec![
-            cx.subscribe(&search, |this, _, event: &InputEvent, cx| match event {
-                InputEvent::Change => this.on_search_changed(cx),
-                InputEvent::Focus | InputEvent::Blur => this.notify_sidebar(cx),
-                InputEvent::PressEnter { .. } => {}
-            }),
-            cx.on_focus(&list_focus, window, |this, _, cx| this.notify_sidebar(cx)),
-            cx.on_blur(&list_focus, window, |this, _, cx| this.notify_sidebar(cx)),
-        ];
+        let header_focus: [FocusHandle; 3] = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
+        let sheet_toggle = cx.focus_handle().tab_stop(true);
+        // The sidebar is a cached view: focus moving in or out of the search box, the
+        // header buttons or the list changes what it draws, so it re-renders on those too.
+        let mut subscriptions = vec![cx.subscribe(&search, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.on_search_changed(cx),
+            InputEvent::Focus | InputEvent::Blur => this.notify_sidebar(cx),
+            InputEvent::PressEnter { .. } => {}
+        })];
+        for focus in header_focus.iter().chain([&list_focus, &sheet_toggle]) {
+            subscriptions.push(cx.on_focus(focus, window, |this, _, cx| this.notify_sidebar(cx)));
+            subscriptions.push(cx.on_blur(focus, window, |this, _, cx| this.notify_sidebar(cx)));
+        }
         Self {
             width: px(DEFAULT_WIDTH),
             brand_fit: None,
@@ -193,6 +199,8 @@ impl SidebarState {
             search_highlight: None,
             messages: Default::default(),
             list_focus,
+            header_focus,
+            sheet_toggle,
             cursor: None,
             nav_rows: Vec::new(),
             search,

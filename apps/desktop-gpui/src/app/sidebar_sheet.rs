@@ -67,9 +67,9 @@ impl SidebarOpen {
     }
 }
 
-/// The web's sheet is a modal dialog: focus moves into it when it shows and returns to where it
-/// was when it hides (Base UI's `initialFocus` and `finalFocus`), so keys never reach the composer
-/// it covers.
+/// The web's sheet is a modal dialog: focus moves into it when it shows, to its first tab stop (the
+/// "Toggle main sidebar" button), and returns to where it was when it hides (Base UI's
+/// `initialFocus` and `finalFocus`), so keys never reach the composer it covers.
 #[derive(Debug)]
 pub(super) struct SheetFocus<F> {
     /// While the sheet shows: what had focus when it opened.
@@ -129,7 +129,7 @@ impl Workspace {
             || on_no_control || trap.contains_focused(window, cx),
         );
         match moved {
-            Some(FocusMove::IntoSheet) => self.sidebar.list_focus.focus(window, cx),
+            Some(FocusMove::IntoSheet) => self.sidebar.sheet_toggle.focus(window, cx),
             Some(FocusMove::Back(Some(handle))) => handle.focus(window, cx),
             Some(FocusMove::Back(None)) => self.focus.focus(window, cx),
             None if shown && on_no_control => self.sidebar.list_focus.focus(window, cx),

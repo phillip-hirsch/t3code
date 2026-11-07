@@ -196,12 +196,18 @@ impl Workspace {
     /// `SidebarTrigger` in its `ghost` variant: we draw no stage art behind it.
     pub(super) fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
-        let (color, hover_bg, hover_color) = (tokens.muted_foreground, tokens.accent, tokens.foreground);
+        let (color, hover_bg, hover_color, ring) =
+            (tokens.muted_foreground, tokens.accent, tokens.foreground, tokens.ring);
         let path = if self.sidebar_open.shown() { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
         div().absolute().left(controls_left(window)).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
             control("toggle-sidebar")
                 .group("toggle-sidebar")
                 .hover(|style| style.bg(hover_bg))
+                // In the sheet it is the first tab stop, with `Button`'s inset focus-visible ring.
+                .when(self.sidebar_open.sheet(), |el| {
+                    el.track_focus(&self.sidebar.sheet_toggle)
+                        .focus_visible(|style| style.border_2().border_color(ring))
+                })
                 .child(
                     svg()
                         .path(path)
