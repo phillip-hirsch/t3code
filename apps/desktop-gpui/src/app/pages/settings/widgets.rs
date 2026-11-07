@@ -1804,9 +1804,15 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
             h_flex()
                 .w_full()
                 .justify_between()
-                .gap(px(8.))
+                // `gap-1.5`, and the chevron's `-me-1` pulls it 4px into the padding.
+                .gap(px(6.))
                 .child(h_flex().min_w_0().gap(px(8.)).overflow_hidden().child(label))
-                .child(Icon::new(IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground.opacity(0.7))),
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(14.))
+                        .mr(px(-4.))
+                        .text_color(t.muted_foreground.opacity(0.7)),
+                ),
         )
 }
 
