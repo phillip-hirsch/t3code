@@ -173,6 +173,8 @@ enum Control {
         placeholder: &'static str,
     },
     Element(AnyElement),
+    /// An element that keeps its content's width under the title and is at least this wide beside it.
+    Hugging(AnyElement, f32),
 }
 
 impl SettingRow {
@@ -270,6 +272,13 @@ impl SettingRow {
     /// A control the section builds itself.
     pub(in crate::app) fn control(mut self, control: impl IntoElement) -> Self {
         self.control = Control::Element(control.into_any_element());
+        self
+    }
+
+    /// [`Self::control`] as wide as its content under the title, and at least `min` wide beside it
+    /// (`SettingsRow`'s `min-w-40` on the selects in it).
+    pub(in crate::app) fn hugging_control(mut self, control: impl IntoElement, min: f32) -> Self {
+        self.control = Control::Hugging(control.into_any_element(), min);
         self
     }
 
@@ -1239,6 +1248,7 @@ impl Workspace {
                 return Some(RowControl::Body(super::fields::textarea_body(&field)));
             }
             (Control::Element(element), _) => element,
+            (Control::Hugging(element, min), _) => return Some(RowControl::Hugging(element, px(min))),
             (Control::Switch, Some(key)) => {
                 let checked = view.bool(key);
                 switch(id, checked, mixed, &t)
@@ -1748,6 +1758,8 @@ pub(in crate::app) enum SelectWidth {
     Small(f32),
     /// `w-full`: across a stacked row, else as wide as its label and at least this.
     Full(f32),
+    /// `w-*`: this wide, growing into room its control is given (a hugging row's `min-w-40`).
+    Fixed(f32),
 }
 
 impl SelectWidth {
@@ -1758,6 +1770,7 @@ impl SelectWidth {
             Self::Small(width) if viewport >= px(640.) => trigger.w(px(width)),
             Self::Small(_) => trigger.w_full(),
             Self::Full(min) => trigger.w_full().min_w(px(min)),
+            Self::Fixed(width) => trigger.w(px(width)).flex_grow(1.),
         }
     }
 }

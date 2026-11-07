@@ -21,6 +21,11 @@ use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
+/// `FontFamilyPicker`'s `sm:w-44`.
+const FAMILY_PICKER_WIDTH: f32 = 176.;
+/// The size select's `w-22`; beside the title the row's `min-w-40` widens it.
+const SIZE_SELECT_WIDTH: f32 = 88.;
+
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
     state: Entity<SelectState<SearchableVec<FontItem>>>,
@@ -211,7 +216,7 @@ impl Workspace {
             format!("{}-size", row.id),
             sizes,
             format!("{size} px"),
-            SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+            SelectWidth::Fixed(SIZE_SELECT_WIDTH),
             window,
             cx,
             move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
@@ -221,7 +226,7 @@ impl Workspace {
             .child(
                 Select::new(&picker)
                     .small()
-                    .w(px(176.))
+                    .w(px(FAMILY_PICKER_WIDTH))
                     .menu_width(px(288.))
                     .placeholder(row.default_family.clone())
                     .search_placeholder("Search fonts…"),
@@ -242,7 +247,7 @@ impl Workspace {
             .description(row.description)
             .setting(row.family_key)
             .setting(row.size_key)
-            .control(control)
+            .hugging_control(control, FAMILY_PICKER_WIDTH + 8. + ROW_SELECT_MIN_WIDTH)
             .reset(reset);
         let setting = if row.previews.is_empty() { setting } else { setting.body(previews) };
         self.setting_row(view, setting, window, cx)
