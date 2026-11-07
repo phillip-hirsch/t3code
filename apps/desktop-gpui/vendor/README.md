@@ -32,6 +32,13 @@ sidebar) under a newly opened overlay kept its hover card. The patch:
 - Tests in `div.rs`: `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`,
   `an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views`.
 
+**An element that appears under a still pointer unhovers when the pointer leaves.** 0.3.11 paints
+a `hover` style from the hitbox, but its mouse-move listener compares against a flag only mouse
+moves set, so an element drawn hovered without a move (a settings nav row back under the pointer
+after a search result closes) kept its hover until the pointer crossed it again. The patch, in
+`src/elements/div.rs`: painting records the hover state it drew. Test:
+`an_element_that_appears_under_a_still_mouse_unhovers_when_the_mouse_leaves`.
+
 **A press hides the pressed element's tooltip until the pointer leaves.** 0.3.11 clears a shown
 tooltip on mouse down but not one still waiting out its show delay, so a quick click opened a menu
 and the tooltip appeared over it; and the next mouse move over the element scheduled it again.

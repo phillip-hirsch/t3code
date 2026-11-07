@@ -3600,7 +3600,15 @@ impl Interactivity {
 
             if let Some(hover_style) = self.hover_style.as_ref() {
                 let is_hovered = if let Some(hitbox) = hitbox {
-                    !window.last_input_was_touch() && hitbox.is_hovered(window)
+                    let hovered = !window.last_input_was_touch() && hitbox.is_hovered(window);
+                    // t3code: record what paints, so the mouse move that leaves an element that
+                    // appeared under a still pointer sees the change and repaints it.
+                    if let Some(hover_state) =
+                        element_state.as_ref().and_then(|state| state.hover_state.as_ref())
+                    {
+                        hover_state.borrow_mut().element = hovered;
+                    }
+                    hovered
                 } else if let Some(element_state) = element_state.as_ref() {
                     !window.last_input_was_touch()
                         && element_state
@@ -5638,6 +5646,66 @@ mod tests {
                     .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
             )
         }
+    }
+
+    struct AppearingHoverTarget {
+        shown: bool,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for AppearingHoverTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().when(self.shown, |el| {
+                el.child(
+                    div()
+                        .id("appearing-target")
+                        .size(px(20.))
+                        .hover(|style| style.bg(crate::red())),
+                )
+            })
+        }
+    }
+
+    #[test]
+    fn an_element_that_appears_under_a_still_mouse_unhovers_when_the_mouse_leaves() {
+        let mut test_app = TestAppContext::single();
+        let renders = Rc::new(Cell::new(0));
+        let window = test_app.add_window({
+            let renders = renders.clone();
+            move |_, _| AppearingHoverTarget { shown: false, renders }
+        });
+        let any_window: AnyWindowHandle = window.into();
+        let draw = |test_app: &mut TestAppContext| {
+            test_app
+                .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            test_app.run_until_parked();
+        };
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+            })
+            .unwrap();
+        draw(&mut test_app);
+        window
+            .update(&mut test_app, |view, _, cx| {
+                view.shown = true;
+                cx.notify();
+            })
+            .unwrap();
+        // It paints hovered: the still pointer is over it.
+        draw(&mut test_app);
+        let before = renders.get();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.simulate_mouse_move(point(px(100.), px(100.)), cx);
+            })
+            .unwrap();
+        test_app.run_until_parked();
+        assert!(renders.get() > before, "leaving it redraws it without its hover style");
     }
 
     struct OverlayOwner {
