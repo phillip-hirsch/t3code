@@ -328,6 +328,8 @@ pub(super) struct RightPanel {
     tree_selected: Option<String>,
     /// The tree's visible rows, rebuilt when the shown files or the folds change.
     tree_rows: std::rc::Rc<[diff_tree::Row]>,
+    /// The file `open_turn_diff` asked for, scrolled to once its selection loads.
+    pending_reveal: Option<((Target, DiffScope), SharedString)>,
     _diff_events: Subscription,
 }
 
@@ -371,6 +373,7 @@ impl RightPanel {
             tree_folded: HashSet::new(),
             tree_selected: None,
             tree_rows: std::rc::Rc::new([]),
+            pending_reveal: None,
             _diff_events: diff_events,
         }
     }
@@ -666,6 +669,23 @@ impl Workspace {
         if let Some(panel) = self.panel_state_mut() {
             panel.scope = DiffScope::Branch;
         }
+        self.open_surface(Surface::Diff, window, cx);
+    }
+
+    /// `onOpenTurnDiff` (`selectTurn` then the Diff tab): the run's turn diff, at `file` if given.
+    pub(super) fn open_turn_diff(
+        &mut self,
+        run: SharedString,
+        file: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target @ Target::Thread { .. }) = self.target.clone() else { return };
+        let scope = DiffScope::Turn(run.to_string());
+        if let Some(panel) = self.panel_state_mut() {
+            panel.scope = scope.clone();
+        }
+        self.right_panel.pending_reveal = file.map(|file| ((target, scope), file));
         self.open_surface(Surface::Diff, window, cx);
     }
 
@@ -1149,6 +1169,10 @@ impl Workspace {
                 state.set_file_collapsed(path, folded.contains(path), cx);
             }
         });
+        if let Some((_, file)) = self.right_panel.pending_reveal.take_if(|(asked, _)| *asked == *selection) {
+            let file = paths.iter().find(|path| path.replace('\\', "/") == file.as_ref()).cloned().unwrap_or(file);
+            self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(&file, cx));
+        }
         self.right_panel.shown = Some(selection.clone());
     }
 

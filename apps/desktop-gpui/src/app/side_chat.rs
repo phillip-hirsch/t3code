@@ -387,8 +387,11 @@ impl Workspace {
             None => Vec::new(),
         };
         for row in &mut rows {
-            if let Row::User { revert, .. } = row {
-                *revert = None;
+            match row {
+                Row::User { revert, .. } => *revert = None,
+                // Side chat runs keep no checkpoints to diff (`onOpenTurnDiff` is the main view's).
+                Row::Assistant { changes, .. } => *changes = None,
+                _ => {}
             }
         }
         let was_empty = view.rows.is_empty();

@@ -46,6 +46,8 @@ pub enum Row {
         /// The thread and run "Fork from this response" forks at.
         fork: Option<(SharedString, SharedString)>,
         run_id: Option<SharedString>,
+        /// The run's changed files, under its last reply (`assistantTurnDiffSummary`).
+        changes: Option<Rc<ChangedFiles>>,
     },
     /// A finished reply's actions, moved under the tool groups that ran after it.
     AssistantMeta {
@@ -1985,6 +1987,7 @@ pub fn rows(
                     .filter(|_| entry.status == "completed")
                     .map(|run| (entry.source_thread_id.clone(), run)),
                 run_id: entry.run_id.clone(),
+                changes: None,
             }),
         }
         index += 1;
@@ -2034,7 +2037,59 @@ pub fn rows(
             _ => {}
         }
     }
+    attach_changed_files(projection, &mut rows);
     rows
+}
+
+/// A run's checkpointed changes: `files` may be a prefix of them; `totals` covers them all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFiles {
+    pub run_id: SharedString,
+    pub files: Vec<crate::turn_diff_tree::FileChange>,
+    /// Files, additions and deletions (`checkpointFileTotals`).
+    pub totals: (u64, u64, u64),
+}
+
+/// `deriveThreadCheckpointSummaries`: each checkpoint with files goes to its run's last
+/// assistant message.
+fn attach_changed_files(projection: &ThreadProjection, rows: &mut [Row]) {
+    let mut last_reply: HashMap<&str, &str> = HashMap::new();
+    for item in projection.turn_items.iter().filter(|item| item.item_type == "assistant_message") {
+        if let Some(run) = item.run_id.as_deref() {
+            last_reply.insert(run, &item.id);
+        }
+    }
+    let mut by_reply: HashMap<&str, Rc<ChangedFiles>> = HashMap::new();
+    for checkpoint in &projection.checkpoints {
+        let (Some(run), Some(_)) = (checkpoint.run_id.as_deref(), checkpoint.app_run_ordinal) else { continue };
+        let Some(reply) = last_reply.get(run).filter(|_| !checkpoint.files.is_empty()) else { continue };
+        let totals = checkpoint.file_totals();
+        let files = checkpoint
+            .files
+            .iter()
+            .map(|file| crate::turn_diff_tree::FileChange {
+                path: file.path.clone(),
+                additions: file.additions,
+                deletions: file.deletions,
+            })
+            .collect();
+        by_reply.insert(
+            reply,
+            Rc::new(ChangedFiles {
+                run_id: run.into(),
+                files,
+                totals: (totals.count, totals.additions, totals.deletions),
+            }),
+        );
+    }
+    if by_reply.is_empty() {
+        return;
+    }
+    for row in rows {
+        if let Row::Assistant { id, changes, .. } = row {
+            *changes = by_reply.get(id.as_ref()).cloned();
+        }
+    }
 }
 
 /// `attachTrailingToolGroupsToAssistant`: when tool groups of the same run follow a finished

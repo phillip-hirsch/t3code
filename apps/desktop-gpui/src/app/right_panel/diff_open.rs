@@ -71,8 +71,8 @@ pub(super) fn workspace_path(
 }
 
 impl Workspace {
-    /// `openDiffFile`: the open checkout's file, in the panel.
-    pub(super) fn open_diff_file(&mut self, file_path: &str, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+    /// A diff's file in the open checkout: its workspace root and the path inside it.
+    fn diff_file_in_workspace(&self, file_path: &str) -> Option<(String, String)> {
         let worktree = match &self.target {
             Some(super::super::Target::Thread { id, .. }) => {
                 self.shell.threads.iter().find(|thread| &thread.id == id).and_then(|t| t.worktree_path.clone())
@@ -80,14 +80,37 @@ impl Workspace {
             _ => None,
         };
         let project = self.target_project();
-        let workspace_root = worktree.clone().or_else(|| project.map(|p| p.workspace_root.clone()));
+        let workspace_root = worktree.clone().or_else(|| project.map(|p| p.workspace_root.clone()))?;
         let repository_root = worktree
             .is_none()
             .then(|| project.and_then(|p| p.repository_identity.as_ref()?.root_path.clone()))
             .flatten();
-        if let Some(path) = workspace_path(file_path, workspace_root.as_deref(), repository_root.as_deref()) {
+        let path = workspace_path(file_path, Some(&workspace_root), repository_root.as_deref())?;
+        Some((workspace_root, path))
+    }
+
+    /// `openDiffFile`: the open checkout's file, in the panel.
+    pub(super) fn open_diff_file(&mut self, file_path: &str, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        if let Some((_, path)) = self.diff_file_in_workspace(file_path) {
             self.open_file(&path, None, window, cx);
         }
+    }
+
+    /// `useFileContextMenuHandler` for a changed file: the file menu on its full path.
+    pub(in crate::app) fn open_changed_file_menu(
+        &mut self,
+        file_path: &str,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let Some((root, path)) = self.diff_file_in_workspace(file_path) else { return };
+        let full = if is_windows_absolute(&root) {
+            format!("{}\\{}", root.trim_end_matches(['/', '\\']), path.replace('/', "\\"))
+        } else {
+            format!("{}/{path}", root.trim_end_matches('/'))
+        };
+        self.open_file_menu(full, position, window, cx);
     }
 }
 

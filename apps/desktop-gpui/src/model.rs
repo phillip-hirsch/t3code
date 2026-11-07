@@ -1263,6 +1263,8 @@ impl Checkpoint {
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointFile {
     #[serde(default)]
+    pub path: String,
+    #[serde(default)]
     pub additions: u64,
     #[serde(default)]
     pub deletions: u64,

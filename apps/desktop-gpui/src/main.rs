@@ -50,6 +50,7 @@ mod thread_now;
 mod thread_pull_requests;
 mod timeline;
 mod timestamp;
+mod turn_diff_tree;
 mod usage;
 mod vscode_theme;
 mod work_log;
