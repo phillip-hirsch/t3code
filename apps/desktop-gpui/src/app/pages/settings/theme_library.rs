@@ -33,6 +33,19 @@ pub(in crate::app) struct LibraryUi {
     variant: HashMap<String, usize>,
     fan: Option<(String, bool)>,
     removal: Option<Removal>,
+    /// How many card columns fit the grid's last measured width.
+    columns: Option<u16>,
+}
+
+/// The card gap (`gap-2`).
+const CARD_GAP: f32 = 8.;
+
+/// `repeat(auto-fit, minmax(min(100%, 16rem), 1fr))`: as many columns as fit at the minimum width.
+fn auto_fit_columns(width: f32, min_width: f32) -> u16 {
+    let fit = ((width + CARD_GAP) / (min_width + CARD_GAP)).floor();
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a small, clamped column count")]
+    let columns = fit.clamp(1., 64.) as u16;
+    columns
 }
 
 struct Removal {
@@ -196,13 +209,33 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| this.open_theme_import(window, cx))),
                     ),
             );
+        let columns = self.settings_ui.theme_library.columns;
+        let view = cx.weak_entity();
+        let grid = div()
+            .w_full()
+            // The grid's width decides how many columns fit next frame.
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(width) = bounds.first().map(|bounds| f32::from(bounds.size.width)) else { return };
+                let fit = auto_fit_columns(width, f32::from(gpui_kit::rems(16.).to_pixels(window.rem_size())));
+                if columns == Some(fit) {
+                    return;
+                }
+                let view = view.clone();
+                cx.defer(move |cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.settings_ui.theme_library.columns = Some(fit);
+                        cx.notify();
+                    });
+                });
+            })
+            .child(div().grid().grid_cols(columns.unwrap_or(2)).gap(px(CARD_GAP)).children(rendered));
         v_flex()
             .id("theme")
             .gap(px(12.))
             .child(subheading(title("color-scheme", "Color scheme")))
             .child(tiles)
             .child(header)
-            .child(div().grid().grid_cols(3).gap(px(8.)).children(rendered))
+            .child(grid)
             .into_any_element()
     }
 
@@ -908,4 +941,17 @@ fn wireframe_pane(c: &Preview) -> Div {
                 .child(menu_row(1, c.message_action))
                 .child(menu_row(2, gpui_kit::rgb(0xfbbf24).into())),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_fit_columns;
+
+    #[test]
+    fn theme_cards_fit_as_many_16rem_columns_as_the_width_holds() {
+        assert_eq!(auto_fit_columns(668., 256.), 2);
+        assert_eq!(auto_fit_columns(784., 256.), 3);
+        assert_eq!(auto_fit_columns(783., 256.), 2);
+        assert_eq!(auto_fit_columns(200., 256.), 1);
+    }
 }
