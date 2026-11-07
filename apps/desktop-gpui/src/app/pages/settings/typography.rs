@@ -66,23 +66,13 @@ impl SelectItem for FontItem {
         // `ComboboxItem`: `min-h-8 sm:min-h-7` with `py-1`; the list row adds 2px a side, and a
         // fixed line keeps every family's row that tall whatever its metrics.
         bp.control_text(h_flex())
-            .flex_1()
             .w_full()
             .min_w_0()
             .h(px(bp.pick(28., 24.)))
             .line_height(px(bp.pick(24., 20.)))
             .justify_between()
             .gap(px(8.))
-            // Ellipsized but clipped only across: faces with tall metrics overhang the line.
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .font_family(self.label.clone())
-                    .child(self.label.clone()),
-            )
+            .child(div().min_w_0().truncate().font_family(self.label.clone()).child(self.label.clone()))
             .when(self.family.is_empty(), |el| {
                 el.child(div().flex_none().text_size(px(10.)).text_color(muted).child("default"))
             })
