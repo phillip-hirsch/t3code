@@ -479,10 +479,11 @@ pub fn tokens(cx: &App) -> &Tokens {
     cx.global::<Tokens>()
 }
 
-/// `dialog-backdrop` (`index.css`): the background at 60% (64% dark) over a 4px blur that leaves
-/// nothing behind readable. GPUI cannot blur what lies beneath, so a denser veil hides it instead.
+/// `dialog-backdrop` (`index.css`): the background at 60% (64% dark) over a 4px blur. Without the
+/// blur no single alpha matches both what Electron lets through on average (36%, as 64% gives) and
+/// on text (~9%, as ~91% gives); 82% splits the miss evenly, about 2x each way.
 pub fn dialog_backdrop(t: &Tokens) -> Hsla {
-    t.background.opacity(0.86)
+    t.background.opacity(0.82)
 }
 
 /// The theme library pick: the appearance mode, the theme and the light/dark mix.
