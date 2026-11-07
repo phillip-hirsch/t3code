@@ -160,3 +160,10 @@ in place so the viewport stays, and selections stay while they lie in such files
 - `src/diff/state.rs`: `update_files`.
 - `src/diff/document.rs`: `DiffFile::is_same`.
 - `src/diff/tests.rs`: one test, `updating_files_keeps_the_state_of_files_that_stay`.
+
+**Menus can take a platform's text metrics.** Electron shows thread menus as native menus, which
+on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always the theme's
+`text_sm` at 26px. The patch adds `PopupMenu::item_text(family, size, height)`; without it the
+menu is unchanged. Files:
+
+- `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
