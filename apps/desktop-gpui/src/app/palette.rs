@@ -1527,9 +1527,9 @@ impl Workspace {
             .rounded(px(4.))
             .cursor_pointer()
             .when(highlighted, |el| el.bg(tokens.foreground.opacity(0.04)))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered
-                    && let Some(palette) = &mut this.palette
+            // The pointer highlights a row by moving, not by a row appearing under it.
+            .on_mouse_move(cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                if let Some(palette) = &mut this.palette
                     && palette.highlight != Some(index)
                 {
                     palette.highlight = Some(index);
