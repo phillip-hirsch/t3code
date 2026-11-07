@@ -736,9 +736,14 @@ fn is_resource_card(item_type: &str) -> bool {
 }
 
 /// Entries from the previous refresh, reused while their item's revision is
-/// unchanged, so a streamed delta rebuilds only its own item.
+/// unchanged, so a streamed delta rebuilds only its own item. Checkpoints' changed files
+/// (by checkpoint id) are kept the same way.
 #[derive(Default)]
-pub struct EntryCache(HashMap<String, (u64, Rc<TimelineEntry>)>, HashMap<SharedString, Vec<SharedString>>);
+pub struct EntryCache(
+    HashMap<String, (u64, Rc<TimelineEntry>)>,
+    HashMap<SharedString, Vec<SharedString>>,
+    HashMap<String, Rc<ChangedFiles>>,
+);
 
 impl EntryCache {
     /// The closed folds ([`fold_key`], [`attempt_key`]) hiding item `item_id` in the last rows built.
@@ -2037,7 +2042,7 @@ pub fn rows(
             _ => {}
         }
     }
-    attach_changed_files(projection, &mut rows);
+    attach_changed_files(projection, &mut rows, &mut cache.2);
     rows
 }
 
@@ -2048,11 +2053,29 @@ pub struct ChangedFiles {
     pub files: Vec<crate::turn_diff_tree::FileChange>,
     /// Files, additions and deletions (`checkpointFileTotals`).
     pub totals: (u64, u64, u64),
+    /// `files` as the card's folder tree, built once with them.
+    pub tree: Vec<crate::turn_diff_tree::Node>,
+}
+
+impl ChangedFiles {
+    /// Whether these are `checkpoint`'s changes for `run`.
+    fn is_of(&self, run: &str, checkpoint: &model::Checkpoint, totals: (u64, u64, u64)) -> bool {
+        self.run_id == run
+            && self.totals == totals
+            && self.files.len() == checkpoint.files.len()
+            && self.files.iter().zip(&checkpoint.files).all(|(change, file)| {
+                change.path == file.path && change.additions == file.additions && change.deletions == file.deletions
+            })
+    }
 }
 
 /// `deriveThreadCheckpointSummaries`: each checkpoint with files goes to its run's last
-/// assistant message.
-fn attach_changed_files(projection: &ThreadProjection, rows: &mut [Row]) {
+/// assistant message. A checkpoint's changes from the last refresh are kept while they match.
+fn attach_changed_files(
+    projection: &ThreadProjection,
+    rows: &mut [Row],
+    cache: &mut HashMap<String, Rc<ChangedFiles>>,
+) {
     let mut last_reply: HashMap<&str, &str> = HashMap::new();
     for item in projection.turn_items.iter().filter(|item| item.item_type == "assistant_message") {
         if let Some(run) = item.run_id.as_deref() {
@@ -2060,28 +2083,32 @@ fn attach_changed_files(projection: &ThreadProjection, rows: &mut [Row]) {
         }
     }
     let mut by_reply: HashMap<&str, Rc<ChangedFiles>> = HashMap::new();
+    let mut next = HashMap::with_capacity(cache.len());
     for checkpoint in &projection.checkpoints {
         let (Some(run), Some(_)) = (checkpoint.run_id.as_deref(), checkpoint.app_run_ordinal) else { continue };
         let Some(reply) = last_reply.get(run).filter(|_| !checkpoint.files.is_empty()) else { continue };
         let totals = checkpoint.file_totals();
-        let files = checkpoint
-            .files
-            .iter()
-            .map(|file| crate::turn_diff_tree::FileChange {
-                path: file.path.clone(),
-                additions: file.additions,
-                deletions: file.deletions,
-            })
-            .collect();
-        by_reply.insert(
-            reply,
-            Rc::new(ChangedFiles {
-                run_id: run.into(),
-                files,
-                totals: (totals.count, totals.additions, totals.deletions),
-            }),
-        );
+        let totals = (totals.count, totals.additions, totals.deletions);
+        let (id, changes) = match cache.remove_entry(&checkpoint.id) {
+            Some((id, cached)) if cached.is_of(run, checkpoint, totals) => (id, cached),
+            _ => {
+                let files: Vec<_> = checkpoint
+                    .files
+                    .iter()
+                    .map(|file| crate::turn_diff_tree::FileChange {
+                        path: file.path.clone(),
+                        additions: file.additions,
+                        deletions: file.deletions,
+                    })
+                    .collect();
+                let tree = crate::turn_diff_tree::build(&files);
+                (checkpoint.id.clone(), Rc::new(ChangedFiles { run_id: run.into(), files, totals, tree }))
+            }
+        };
+        by_reply.insert(reply, changes.clone());
+        next.insert(id, changes);
     }
+    *cache = next;
     if by_reply.is_empty() {
         return;
     }
@@ -2714,6 +2741,36 @@ mod tests {
         let continues: Vec<bool> =
             rows.iter().filter_map(|row| if let Row::Work(work) = row { Some(work.continues) } else { None }).collect();
         assert_eq!(continues, [true, false]);
+    }
+
+    #[test]
+    fn a_checkpoints_changed_files_are_kept_until_they_change() {
+        let items = turn("r1");
+        let mut value = projection_value(items.clone(), json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
+        value["turnItems"] = json!(items);
+        let checkpoint = |path: &str| {
+            json!([{"id": "c1", "scopeId": "s", "runId": "r1", "appRunOrdinal": 1, "status": "ready",
+                "files": [{"path": path, "additions": 1, "deletions": 0}]}])
+        };
+        let mut cache = EntryCache::default();
+        let mut changes = |value: &Value| {
+            let projection: ThreadProjection = serde_json::from_value(value.clone()).unwrap();
+            rows(&projection, &HashSet::new(), &RowOptions::default(), &mut cache)
+                .into_iter()
+                .find_map(|row| match row {
+                    Row::Assistant { changes, .. } => changes,
+                    _ => None,
+                })
+                .expect("the run's last reply holds its changes")
+        };
+        value["checkpoints"] = checkpoint("src/a.rs");
+        let first = changes(&value);
+        assert_eq!(first.tree.iter().map(crate::turn_diff_tree::Node::path).collect::<Vec<_>>(), ["src"]);
+        assert!(Rc::ptr_eq(&first, &changes(&value)), "an unchanged checkpoint keeps its tree");
+        value["checkpoints"] = checkpoint("src/b.rs");
+        let changed = changes(&value);
+        assert!(!Rc::ptr_eq(&first, &changed));
+        assert_eq!(changed.files[0].path, "src/b.rs");
     }
 
     #[test]
