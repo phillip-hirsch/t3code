@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, settings_section, switch};
+use super::widgets::{SelectWidth, SettingRow, settings_section, switch};
 use crate::app::Workspace;
 use crate::app::git::{self, DiffColorScheme};
 use crate::app::pages::settings::widgets::SettingsView;
@@ -23,8 +23,8 @@ use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
 /// `FontFamilyPicker`'s `sm:w-44`.
 const FAMILY_PICKER_WIDTH: f32 = 176.;
-/// The size select's `w-22`, held to the trigger's own `min-w-36`; beside the title the row's
-/// `min-w-40` widens it.
+/// The size select's `w-22`, held to the trigger's own `min-w-36`. Beside the title the web's
+/// row widens it to `min-w-40`, which a select in GPUI's popover wrapper can't follow.
 const SIZE_SELECT_WIDTH: f32 = 144.;
 
 /// A font row's family picker, rebuilt when its default family changes.
@@ -248,7 +248,7 @@ impl Workspace {
             .description(row.description)
             .setting(row.family_key)
             .setting(row.size_key)
-            .hugging_control(control, FAMILY_PICKER_WIDTH + 8. + ROW_SELECT_MIN_WIDTH)
+            .control(control)
             .reset(reset);
         let setting = if row.previews.is_empty() { setting } else { setting.body(previews) };
         self.setting_row(view, setting, window, cx)
