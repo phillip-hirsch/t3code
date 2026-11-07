@@ -101,14 +101,19 @@ impl Workspace {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
-        let subscription = cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
+        let subscription = cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
                 // `autoHighlight`: typing highlights the first match.
                 if let Some(open) = &mut this.draft_picker.open {
                     open.highlight(0);
                 }
                 cx.notify();
             }
+            // Focus left the combobox (Tab, a click elsewhere): it closes and the focus stays there.
+            InputEvent::Blur => {
+                this.dismiss_draft_picker(cx);
+            }
+            _ => {}
         });
         query.update(cx, |query, cx| query.focus(window, cx));
         let groups = self.draft_picker_groups();
@@ -123,11 +128,19 @@ impl Workspace {
     }
 
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft_picker.open.take().is_some() {
-            self.draft_picker.closed_at = Some(Instant::now());
+        if self.dismiss_draft_picker(cx) {
             self.focus_composer(window, cx);
-            cx.notify();
         }
+    }
+
+    /// Closes the picker without moving focus; whether it was open.
+    fn dismiss_draft_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.draft_picker.open.take().is_none() {
+            return false;
+        }
+        self.draft_picker.closed_at = Some(Instant::now());
+        cx.notify();
+        true
     }
 
     fn pick_draft_entry(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
