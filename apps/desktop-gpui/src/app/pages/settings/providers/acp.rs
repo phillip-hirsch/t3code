@@ -10,7 +10,6 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -697,8 +696,8 @@ impl AcpSessions {
             session.title.as_deref().unwrap_or(&session.session_id)
         );
         let view = cx.entity();
-        confirm_destructive(window, cx, message, "Delete", move |window, cx| {
-            view.update(cx, |this, cx| this.delete_session(session.clone(), window, cx));
+        confirm_destructive(window, cx, &message, move |window, cx| {
+            view.update(cx, |this, cx| this.delete_session(session, window, cx));
         });
     }
 
@@ -790,8 +789,8 @@ impl AcpSessions {
         }
         let view = cx.entity();
         let message = format!("Disable ACP provider \"{provider_id}\"?");
-        confirm_destructive(window, cx, message, "Disable", move |window, cx| {
-            view.update(cx, |this, cx| this.disable_provider(provider_id.clone(), window, cx));
+        confirm_destructive(window, cx, &message, move |window, cx| {
+            view.update(cx, |this, cx| this.disable_provider(provider_id, window, cx));
         });
     }
 
@@ -864,21 +863,17 @@ fn report_failure(window: &mut Window, cx: &mut App, title: &str, error: &RpcErr
 fn confirm_destructive(
     window: &mut Window,
     cx: &mut App,
-    message: String,
-    action: &'static str,
-    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    message: &str,
+    on_confirm: impl FnOnce(&mut Window, &mut App) + 'static,
 ) {
-    let on_confirm = std::rc::Rc::new(on_confirm);
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let alert = alert.entrance(DialogEntrance::None);
-        let on_confirm = on_confirm.clone();
-        alert.title(message.clone()).show_cancel(true).ok_text(action).ok_variant(ButtonVariant::Danger).on_ok(
-            move |_, window, cx| {
-                on_confirm(window, cx);
-                true
-            },
-        )
-    });
+    let answer = crate::app::confirm::confirm(message, true, window, cx);
+    window
+        .spawn(cx, async move |cx| {
+            if answer.await == Ok(true) {
+                let _ = cx.update(on_confirm);
+            }
+        })
+        .detach();
 }
 
 impl AcpSessions {

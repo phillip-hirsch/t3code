@@ -5,10 +5,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use futures::channel::oneshot;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogDescription, DialogFooter};
-use gpui_kit::{App, ParentElement as _, SharedString, Window, px};
+use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::{WindowExt as _, v_flex};
+use gpui_kit::{App, FontWeight, ParentElement as _, SharedString, Styled as _, Window, div, px, relative, white};
+
+use crate::theme;
 
 /// `resolveConfirmDialogCopy`: the line that asks the question is the title, the rest its
 /// description.
@@ -30,36 +32,78 @@ fn copy(message: &str) -> (String, Option<String>) {
 
 /// Asks `message` in an alert dialog with Cancel and Confirm (red when `destructive`);
 /// resolves to whether the user confirmed.
-pub(super) fn confirm(message: &str, destructive: bool, window: &mut Window, cx: &mut App) -> oneshot::Receiver<bool> {
+pub(in crate::app) fn confirm(
+    message: &str,
+    destructive: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> oneshot::Receiver<bool> {
     let (title, description) = copy(message);
     let (title, description) = (SharedString::from(title), description.map(SharedString::from));
     let (sender, receiver) = oneshot::channel();
     let sender = Rc::new(RefCell::new(Some(sender)));
-    let answer = move |confirmed: bool| {
-        let sender = sender.clone();
-        move |_: &gpui_kit::ClickEvent, _: &mut Window, _: &mut App| {
-            if let Some(sender) = sender.borrow_mut().take() {
-                let _ = sender.send(confirmed);
-            }
-            true
+    // Closing any other way drops the sender, which reads as Cancel.
+    let send = move |confirmed: bool| {
+        if let Some(sender) = sender.borrow_mut().take() {
+            let _ = sender.send(confirmed);
         }
     };
-    let (on_ok, on_cancel) = (answer(true), answer(false));
-    window.open_dialog(cx, move |dialog, _, _| {
-        let action = Button::new("confirm-dialog-ok").label("Confirm");
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let t = theme::tokens(cx);
+        let ok = send.clone();
+        let action = Button::new("confirm-dialog-ok").label("Confirm").on_click(move |_, window, cx| {
+            ok(true);
+            window.close_dialog(cx);
+        });
         let action = if destructive { action.danger() } else { action.primary() };
+        let enter = send.clone();
+        // `AlertDialogPopup`: centred, `max-w-lg`, `dialog-glass` (`rounded-2xl`, a white/8% edge
+        // in dark mode); the header and the footer bring their own padding.
         dialog
-            .title(title.clone())
+            .centered()
             .w(px(512.))
+            .p_0()
+            .gap_0()
+            .rounded(px(16.))
+            .border_color(if t.dark { white().opacity(0.08) } else { t.foreground.opacity(0.1) })
             .close_button(false)
-            .children(description.clone().map(|text| DialogDescription::new().child(text)))
-            .footer(
-                DialogFooter::new()
-                    .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
-                    .child(DialogAction::new().child(action)),
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .p(px(24.))
+                    .child(
+                        div()
+                            .text_xl()
+                            .line_height(relative(1.375))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.foreground)
+                            .child(title.clone()),
+                    )
+                    .children(
+                        description.clone().map(|text| div().text_sm().text_color(t.muted_foreground).child(text)),
+                    ),
             )
-            .on_ok(on_ok.clone())
-            .on_cancel(on_cancel.clone())
+            .footer(
+                // `AlertDialogFooter`: right-aligned buttons on a `bg-muted/72` strip under a border.
+                DialogFooter::new()
+                    .px(px(24.))
+                    .py(px(16.))
+                    .border_t_1()
+                    .border_color(t.border)
+                    .bg(t.muted.opacity(0.72))
+                    .rounded_b(px(15.))
+                    .child(
+                        Button::new("confirm-dialog-cancel")
+                            .label("Cancel")
+                            .outline()
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(action),
+            )
+            .on_ok(move |_, _, _| {
+                enter(true);
+                true
+            })
     });
     receiver
 }

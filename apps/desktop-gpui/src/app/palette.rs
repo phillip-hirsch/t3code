@@ -1440,6 +1440,8 @@ impl Workspace {
                         .id("palette")
                         .w_full()
                         .max_w(px(576.))
+                        // `max-h-105` on the popup, inside the viewport's 10vh top and bottom insets.
+                        .max_h(px(420.).min(height * 0.8))
                         .overflow_hidden()
                         .rounded(px(16.))
                         .border_1()

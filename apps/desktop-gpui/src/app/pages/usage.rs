@@ -1464,9 +1464,10 @@ fn driver_label(driver: &str) -> String {
 
 /// A breadcrumb menu trigger that reads as text (`InlineButton`).
 fn inline_menu_button(id: &'static str, t: &Tokens) -> Button {
+    // `small`: the button sizes its label's text itself, and `xsmall` would make it 12px.
     Button::new(id)
         .ghost()
-        .xsmall()
+        .small()
         .h(px(28.))
         .px(px(0.))
         .gap(px(4.))

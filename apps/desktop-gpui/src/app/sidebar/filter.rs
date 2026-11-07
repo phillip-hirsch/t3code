@@ -334,6 +334,7 @@ impl Workspace {
                     let name = &g.display_name;
                     let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
                     let gear_title: SharedString = format!("Project settings for {name}").into();
+                    let pin_group: SharedString = format!("filter-pin-{}", g.key).into();
                     div()
                         .ml_auto()
                         .flex()
@@ -353,7 +354,7 @@ impl Workspace {
                                 .child(gpui_kit::component::Icon::new(IconName::Settings).size(px(14.))),
                         )
                         .child(
-                            small_button(format!("filter-pin-{}", g.key).into())
+                            small_button(pin_group.clone())
                                 .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
                                 .tooltip(move |window, cx| {
                                     gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
@@ -362,14 +363,26 @@ impl Workspace {
                                     cx.stop_propagation();
                                     this.set_projects_pinned(&members, !pinned, cx);
                                 }))
+                                // `ProjectPinButton`: a pinned project shows its pin, which turns
+                                // into PinOff while the button is hovered.
+                                .group(pin_group.clone())
+                                .relative()
                                 .child(
-                                    gpui_kit::component::Icon::new(if pinned {
-                                        IconName::PinOff
-                                    } else {
-                                        IconName::Pin
-                                    })
-                                    .size(px(14.)),
-                                ),
+                                    div()
+                                        .when(pinned, |el| {
+                                            el.group_hover(pin_group.clone(), gpui_kit::Styled::invisible)
+                                        })
+                                        .child(gpui_kit::component::Icon::new(IconName::Pin).size(px(14.))),
+                                )
+                                .when(pinned, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .invisible()
+                                            .group_hover(pin_group, gpui_kit::Styled::visible)
+                                            .child(gpui_kit::component::Icon::new(IconName::PinOff).size(px(14.))),
+                                    )
+                                }),
                         )
                 }
             };
