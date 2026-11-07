@@ -97,6 +97,18 @@ fn disabled_reason(origin: Origin, capability: Option<bool>, worktree_pending: b
     }
 }
 
+/// A started thread as a side chat source. A thread an agent on another machine started
+/// (`delegatedFrom`) is that remote thread's subagent (`isSubagentThread`).
+fn shell_origin(shell: &ThreadShell) -> Origin {
+    if shell.lineage.side_chat == Some(true) {
+        Origin::SideChat
+    } else if shell.lineage.relationship_to_parent.as_deref() == Some("subagent") || shell.delegated_from.is_some() {
+        Origin::Subagent
+    } else {
+        Origin::Thread
+    }
+}
+
 /// `parseSideChatCommand`: `/side` or `/btw`, then the prompt.
 pub(super) fn parse_command(text: &str) -> Option<&str> {
     let text = text.trim();
@@ -153,11 +165,7 @@ impl Workspace {
     fn side_chat_origin(&self) -> Option<Origin> {
         Some(match self.target.as_ref()? {
             Target::Draft { .. } => Origin::Draft,
-            Target::Thread { id, .. } => match self.shell_thread(id) {
-                Some(shell) if shell.lineage.side_chat == Some(true) => Origin::SideChat,
-                Some(shell) if shell.lineage.relationship_to_parent.as_deref() == Some("subagent") => Origin::Subagent,
-                _ => Origin::Thread,
-            },
+            Target::Thread { id, .. } => self.shell_thread(id).map_or(Origin::Thread, shell_origin),
         })
     }
 
@@ -778,6 +786,23 @@ fn delete_command(thread_id: &str, only_if_unused: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_and_subagent_threads_offer_no_side_chats() {
+        let shell = |extra: serde_json::Value| -> ThreadShell {
+            let mut thread = json!({
+                "id": "t", "projectId": "p", "title": "t", "status": "idle", "lineage": {},
+                "updatedAt": "2026-11-01T00:00:00.000Z", "createdAt": "2026-11-01T00:00:00.000Z",
+            });
+            thread.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(thread).unwrap()
+        };
+        assert_eq!(shell_origin(&shell(json!({}))), Origin::Thread);
+        assert_eq!(shell_origin(&shell(json!({"lineage": {"sideChat": true}}))), Origin::SideChat);
+        assert_eq!(shell_origin(&shell(json!({"lineage": {"relationshipToParent": "subagent"}}))), Origin::Subagent);
+        let delegated = json!({"delegatedFrom": {"environmentId": "mac", "threadId": "parent", "title": "Parent"}});
+        assert_eq!(shell_origin(&shell(delegated)), Origin::Subagent);
+    }
 
     #[test]
     fn side_command_takes_the_rest_as_its_prompt() {
