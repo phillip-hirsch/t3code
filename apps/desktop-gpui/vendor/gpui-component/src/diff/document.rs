@@ -413,6 +413,11 @@ impl DiffFile {
         super::parser::parse(patch, options)
     }
 
+    /// Whether `other` is this file (a clone of it), not just an equal parse.
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) && self.language == other.language
+    }
+
     /// Assembles a parsed file, pairing counterpart lines and deriving its
     /// display path, change counts and line-number width.
     pub(crate) fn new(

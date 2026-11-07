@@ -8,9 +8,10 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, anchored, deferred, div, px, rgb,
+    AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, Focusable as _, FontStyle, FontWeight,
+    HighlightStyle, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, SharedString,
+    StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, StyledText, Subscription, WeakEntity, Window,
+    anchored, deferred, div, px, rgb,
 };
 
 use gpui_kit::component::WindowExt as _;
@@ -18,6 +19,7 @@ use gpui_kit::component::notification::Notification;
 use serde_json::json;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use super::Workspace;
@@ -452,7 +454,84 @@ struct FileChip {
     icon_path: String,
     label: String,
     /// A descriptive link's own text, shown before the chip.
-    description: Option<String>,
+    description: Option<LinkText>,
+}
+
+/// A link's text with the inline formatting the web keeps when it renders the link's children.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LinkText {
+    text: String,
+    /// Disjoint byte ranges of `text`, in order.
+    styles: Vec<(Range<usize>, LinkStyle)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LinkStyle {
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    code: bool,
+}
+
+impl LinkText {
+    /// The text of `nodes` and everything inside them (`nodeToPlainText`), with their emphasis.
+    fn of(nodes: &[gpui_kit::component::text::markdown_ast::Node]) -> Self {
+        let mut text = Self::default();
+        text.push_nodes(nodes, LinkStyle::default());
+        text
+    }
+
+    fn push_nodes(&mut self, nodes: &[gpui_kit::component::text::markdown_ast::Node], style: LinkStyle) {
+        use gpui_kit::component::text::markdown_ast::Node;
+        for node in nodes {
+            match node {
+                Node::Strong(strong) => self.push_nodes(&strong.children, LinkStyle { bold: true, ..style }),
+                Node::Emphasis(emphasis) => self.push_nodes(&emphasis.children, LinkStyle { italic: true, ..style }),
+                Node::Delete(delete) => self.push_nodes(&delete.children, LinkStyle { strikethrough: true, ..style }),
+                Node::InlineCode(code) => self.push(&code.value, LinkStyle { code: true, ..style }),
+                Node::Break(_) => self.push(" ", style),
+                other => self.push(&other.to_string(), style),
+            }
+        }
+    }
+
+    fn push(&mut self, text: &str, style: LinkStyle) {
+        let start = self.text.len();
+        self.text.push_str(text);
+        if style != LinkStyle::default() && !text.is_empty() {
+            self.styles.push((start..self.text.len(), style));
+        }
+    }
+
+    /// Without leading and trailing whitespace, its styles kept on the same characters.
+    fn trimmed(&self) -> Self {
+        let start = self.text.len() - self.text.trim_start().len();
+        let end = self.text.trim_end().len().max(start);
+        let styles = self
+            .styles
+            .iter()
+            .filter_map(|(range, style)| {
+                let range = range.start.clamp(start, end) - start..range.end.clamp(start, end) - start;
+                (!range.is_empty()).then_some((range, *style))
+            })
+            .collect();
+        Self { text: self.text[start..end].to_owned(), styles }
+    }
+
+    /// The text as GPUI draws it; inline code takes the chat's code background.
+    fn styled(&self, code_background: Hsla) -> StyledText {
+        let highlights = self.styles.iter().map(|(range, style)| {
+            let highlight = HighlightStyle {
+                font_weight: style.bold.then_some(FontWeight::BOLD),
+                font_style: style.italic.then_some(FontStyle::Italic),
+                strikethrough: style.strikethrough.then(StrikethroughStyle::default),
+                background_color: style.code.then_some(code_background),
+                ..HighlightStyle::default()
+            };
+            (range.clone(), highlight)
+        });
+        StyledText::new(self.text.clone()).with_highlights(highlights.collect::<Vec<_>>())
+    }
 }
 
 /// A Markdown link to a file: its destination, and its text unless that text is the path.
@@ -474,6 +553,8 @@ pub(super) struct FileChips {
     pub cwd: Option<String>,
     pub kinds: Arc<EntryKinds>,
     pub suffixes: ParentSuffixes,
+    /// The chat's inline code background, for code in a link's text.
+    pub code_background: Hsla,
 }
 
 /// What `filesystem.getMetadata` said about chip targets (`useFileMetadata`), by absolute path.
@@ -596,23 +677,16 @@ impl MarkdownPlugin for FileChips {
                 (candidate, file, None)
             }
             Node::Link(link) if !link.url.starts_with(SKILL_SCHEME) && !link.url.starts_with("t3-thread:") => {
-                let text: String = link
-                    .children
-                    .iter()
-                    .map(|child| match child {
-                        Node::Text(text) => text.value.as_str(),
-                        Node::InlineCode(code) => code.value.as_str(),
-                        _ => "",
-                    })
-                    .collect();
-                let (file, description) = file_link(&text, &link.url)?;
-                (file_links::with_position(&file), file, description)
+                let text = LinkText::of(&link.children);
+                let (file, description) = file_link(&text.text, &link.url)?;
+                (file_links::with_position(&file), file, description.map(|_| text.trimmed()))
             }
             _ => return None,
         };
         let label = file_links::chip_label(&file, &self.suffixes.of(cx.source()));
         let markdown = cx.node_source(node).unwrap_or_default().to_owned();
-        let text = description.as_ref().map_or_else(|| label.clone(), |description| format!("{description} {label}"));
+        let text =
+            description.as_ref().map_or_else(|| label.clone(), |description| format!("{} {label}", description.text));
         let chip = FileChip { path, line: file.line, icon_path: file.path, label, description };
         Some(MarkdownNode::new("t3-file", chip).text(text).markdown(markdown))
     }
@@ -677,7 +751,7 @@ impl MarkdownPlugin for FileChips {
             Some(description) => h_flex()
                 .max_w_full()
                 .gap(px(4.))
-                .child(div().flex_none().child(description.clone()))
+                .child(div().flex_none().child(description.styled(self.code_background)))
                 .child(element.min_w_0())
                 .into_any_element(),
             None => element.into_any_element(),
@@ -884,6 +958,35 @@ mod tests {
         );
         assert_eq!(file_link("src/main.rs", "src/main.rs").map(|(_, text)| text), Some(None), "its own path");
         assert!(file_link("Docs", "https://example.com/docs").is_none());
+    }
+
+    #[test]
+    fn file_link_text_keeps_nested_markdown() {
+        use gpui_kit::component::text::markdown_ast::Node;
+        let source = "[**Read implementation**](src/main.rs) and [ mixed *emphasis* and `code` ](a.rs)";
+        let root = markdown::to_mdast(source, &markdown::ParseOptions::gfm()).expect("markdown parses");
+        let paragraph = &root.children().expect("a root")[0];
+        let links: Vec<LinkText> = paragraph
+            .children()
+            .expect("a paragraph")
+            .iter()
+            .filter_map(|node| match node {
+                Node::Link(link) => Some(LinkText::of(&link.children).trimmed()),
+                _ => None,
+            })
+            .collect();
+        let style = |bold, italic, code| LinkStyle { bold, italic, code, strikethrough: false };
+        assert_eq!(
+            links[0],
+            LinkText { text: "Read implementation".into(), styles: vec![(0..19, style(true, false, false))] }
+        );
+        assert_eq!(
+            links[1],
+            LinkText {
+                text: "mixed emphasis and code".into(),
+                styles: vec![(6..14, style(false, true, false)), (19..23, style(false, false, true))],
+            }
+        );
     }
 
     #[test]

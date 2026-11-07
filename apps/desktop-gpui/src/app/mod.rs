@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::backend;
 use crate::environments::{BackendStatus, PrimaryBackend};
-use crate::model::{ModelSelection, ProjectShell, ShellState, ThreadState};
+use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
 use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
@@ -141,6 +141,8 @@ pub struct Workspace {
     connection: Connection,
     /// One per connected environment, the primary first.
     sessions: Vec<sessions::EnvironmentSession>,
+    /// What Settings reads while its scope selects no environment; see `settings_info`.
+    unscoped_server_info: ServerInfo,
     /// Every environment's projects and threads.
     shell: ShellState,
     target: Option<Target>,
@@ -346,6 +348,7 @@ impl Workspace {
         let mut workspace = Self {
             connection: Connection::Starting,
             sessions: vec![sessions::EnvironmentSession::default()],
+            unscoped_server_info: ServerInfo::default(),
             shell: ShellState::default(),
             target: None,
             thread: None,
