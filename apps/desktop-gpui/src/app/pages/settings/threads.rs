@@ -20,7 +20,7 @@ use serde_json::json;
 
 use super::super::fields::resolve_pasted_path;
 use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
-use super::super::widgets::{SettingRow, SettingsView, settings_section, switch};
+use super::super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
 use crate::theme::tokens;
@@ -264,7 +264,8 @@ impl Workspace {
             &if mixed_mode { serde_json::Value::Null } else { json!(mode) },
             ["local", "worktree"].map(|mode| (json!(mode), env_mode_label(mode).into())).to_vec(),
             if mixed_mode { "Mixed" } else { env_mode_label(mode) },
-            0.,
+            SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+            window,
             cx,
         );
         rows.push(

@@ -6,7 +6,7 @@ use gpui_kit::component::h_flex;
 use gpui_kit::{AnyElement, Context, Div, Hsla, ParentElement as _, Styled as _, Window, div, px};
 use serde_json::{Value, json};
 
-use super::widgets::{SettingRow, settings_section};
+use super::widgets::{SelectWidth, SettingRow, settings_section};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
@@ -29,7 +29,8 @@ impl Workspace {
             &collapsed,
             vec![(json!(false), "Expanded".into()), (json!(true), "Collapsed".into())],
             file_state_label,
-            160.,
+            SelectWidth::Small(160.),
+            window,
             cx,
         );
         let scheme = view.value("diffColorScheme").clone();
@@ -44,7 +45,8 @@ impl Workspace {
             &scheme,
             vec![(json!("red-green"), "Red & green (default)".into()), (json!("blue-orange"), "Blue & orange".into())],
             scheme_label,
-            0.,
+            SelectWidth::Small(160.),
+            window,
             cx,
         );
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);

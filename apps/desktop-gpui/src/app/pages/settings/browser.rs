@@ -18,7 +18,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
-use crate::app::pages::settings::widgets::{SettingRow, SettingsView, select_trigger, settings_section};
+use crate::app::pages::settings::widgets::{SelectWidth, SettingRow, SettingsView, select_trigger, settings_section};
 use crate::preview::{self, PRESETS, Profile, ProfileKind, Viewport};
 use crate::theme::{self, Tokens};
 
@@ -111,7 +111,8 @@ impl Workspace {
             &rate,
             options,
             rate_label,
-            160.,
+            SelectWidth::Small(160.),
+            window,
             cx,
         );
         let frame_rate = SettingRow::new("browser-recording-frame-rate")

@@ -29,7 +29,9 @@ use serde_json::{Map, Value, json};
 
 use super::super::fields::textarea_body;
 use super::super::model_select::{generates_text, muted, resolve_text_generation};
-use super::super::widgets::{SettingRow, SettingsView, section_with_action, settings_section, switch};
+use super::super::widgets::{
+    ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
+};
 use crate::app::Workspace;
 use crate::model::ModelSelection;
 use crate::rpc::RpcClient;
@@ -415,7 +417,8 @@ impl Workspace {
                 .map(|(id, label)| (if *id == "last" { Value::Null } else { json!(id) }, (*label).into()))
                 .collect(),
             MERGE_METHODS.iter().find(|(id, _)| *id == method).map_or("", |(_, label)| label),
-            0.,
+            SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+            window,
             cx,
         );
         let discovery = self.discovery_sections(&state, client.is_some(), window, cx);

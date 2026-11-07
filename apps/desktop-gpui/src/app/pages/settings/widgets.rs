@@ -1309,12 +1309,13 @@ impl Workspace {
         current: &Value,
         options: Vec<(Value, SharedString)>,
         trigger: impl IntoElement,
-        width: f32,
+        width: SelectWidth,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let current = current.clone();
         let options = options.into_iter().map(|(value, label)| (value.clone(), label, value == current)).collect();
-        self.row_menu_select(id, options, trigger, width, cx, move |this, value, window, cx| {
+        self.row_menu_select(id, options, trigger, width, window, cx, move |this, value, window, cx| {
             this.update_settings(serde_json::json!({ key: value }), window, cx);
         })
     }
@@ -1333,19 +1334,19 @@ impl Workspace {
         Self::with_select_menu(trigger, options, cx, on_pick)
     }
 
-    /// [`Self::menu_select`] in a row's control as the web's plain `SelectTrigger` (`w-full`): across a
-    /// stacked row, else as wide as its label and at least `width` and [`ROW_SELECT_MIN_WIDTH`].
+    /// [`Self::menu_select`] in a row's control, sized as `width` says.
     pub(in crate::app) fn row_menu_select<T: Clone + 'static>(
         &self,
         id: impl Into<SharedString>,
         options: Vec<(T, SharedString, bool)>,
         trigger: impl IntoElement,
-        width: f32,
+        width: SelectWidth,
+        window: &Window,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let trigger = SelectWidth::Full(width.max(ROW_SELECT_MIN_WIDTH))
-            .apply(select_trigger(&id.into(), trigger, 0., theme::tokens(cx)), gpui_kit::Pixels::ZERO);
+        let trigger =
+            width.apply(select_trigger(&id.into(), trigger, 0., theme::tokens(cx)), window.viewport_size().width);
         Self::with_select_menu(trigger, options, cx, on_pick)
     }
 
