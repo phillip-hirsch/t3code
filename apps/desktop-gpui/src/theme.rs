@@ -120,6 +120,10 @@ pub struct SidebarTokens {
     pub border: Hsla,
     pub row_hover: Hsla,
     pub row_active: Hsla,
+    /// The page's `--sidebar-row-hover` and `--sidebar-row-selected`, which rows on [`Self::sheet`]
+    /// (the settings nav) use.
+    pub sheet_row_hover: Hsla,
+    pub sheet_row_selected: Hsla,
     pub icon: Hsla,
 }
 
@@ -177,6 +181,9 @@ impl Tokens {
                 border: white(0.08),
                 row_hover: with_alpha(sidebar_foreground, 0.08),
                 row_active: with_alpha(sidebar_foreground, 0.11),
+                // `--accent` and `--muted`.
+                sheet_row_hover: white(0.04),
+                sheet_row_selected: white(0.03),
                 icon: hex(0x8b8b8b),
             },
             glass: 0.8,
@@ -223,6 +230,8 @@ impl Tokens {
                 border: hex(0xe4e4e7),
                 row_hover: hex(0xfcfcfc),
                 row_active: hex(0xffffff),
+                sheet_row_hover: hex(0xfcfcfc),
+                sheet_row_selected: hex(0xffffff),
                 icon: hex(0x86858e),
             },
             glass: 0.8,
@@ -417,6 +426,8 @@ impl Tokens {
             border: c.sidebar_border,
             row_hover: c.sidebar_row_hover,
             row_active: c.sidebar_row_active,
+            sheet_row_hover: c.sidebar_row_hover,
+            sheet_row_selected: c.sidebar_row_active,
             icon: c.icon_muted,
         };
         self

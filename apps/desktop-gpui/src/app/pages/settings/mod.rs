@@ -569,52 +569,59 @@ impl Workspace {
         let sb = t.sidebar;
         let query = self.settings_ui.search.read(cx).value();
         let searching = !query.trim().is_empty();
-        let search_focused = self.settings_ui.search.read(cx).focus_handle(cx).is_focused(window);
         let compact = settings_nav_is_rail(window.viewport_size().width);
         // `compactSearchOpen` only changes the layout below `md`.
         let expanded = !compact || self.settings_ui.compact_search_open;
-        let search_row =
-            expanded.then(|| {
-                h_flex()
-                    .id("settings-search")
-                    .h(px(32.))
-                    .px(px(8.))
-                    .gap(px(8.))
-                    .rounded(px(6.))
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(sb.muted_foreground)
-                    .hover(|s| s.bg(sb.row_hover))
-                    .when(search_focused, |el| el.bg(sb.row_hover))
-                    .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.muted_foreground.opacity(0.8)))
-                    .child(div().flex_1().min_w_0().child(
-                        Input::new(&self.settings_ui.search).appearance(false).px_0().py_0().h(px(20.)).text_sm(),
-                    ))
-                    .map(|el| {
-                        if searching {
-                            el.child(
-                                div()
-                                    .id("settings-search-clear")
-                                    .size(px(20.))
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .hover(|s| s.bg(t.accent))
-                                    .child(Icon::new(IconName::X).size(px(12.)).text_color(t.muted_foreground))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.settings_ui.search.update(cx, |search, cx| {
-                                            search.set_value("", window, cx);
-                                            search.focus(window, cx);
-                                        });
-                                    })),
-                            )
-                        } else {
-                            el.child(kbd("/", &t))
-                        }
-                    })
-            });
+        let search_row = expanded.then(|| {
+            h_flex()
+                .id("settings-search")
+                .h(px(32.))
+                .px(px(8.))
+                .gap(px(8.))
+                .rounded(px(6.))
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(sb.muted_foreground)
+                .hover(|s| s.bg(sb.sheet_row_hover))
+                .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.muted_foreground.opacity(0.8)))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        // `SidebarInput`: medium `text-sidebar-foreground`.
+                        Input::new(&self.settings_ui.search)
+                            .appearance(false)
+                            .px_0()
+                            .py_0()
+                            .h(px(20.))
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(sb.foreground),
+                    ),
+                )
+                .map(|el| {
+                    if searching {
+                        el.child(
+                            div()
+                                .id("settings-search-clear")
+                                .size(px(20.))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.))
+                                .hover(|s| s.bg(t.accent))
+                                .child(Icon::new(IconName::X).size(px(12.)).text_color(t.muted_foreground))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.settings_ui.search.update(cx, |search, cx| {
+                                        search.set_value("", window, cx);
+                                        search.focus(window, cx);
+                                    });
+                                })),
+                        )
+                    } else {
+                        el.child(kbd("/", &t))
+                    }
+                })
+        });
         let body = if searching {
             let results = self.settings_results(cx);
             let active = self.settings_ui.active_result.min(results.len().saturating_sub(1));
@@ -642,8 +649,8 @@ impl Workspace {
                             .gap(px(8.))
                             .rounded(px(8.))
                             .cursor_pointer()
-                            .when(is_active, |el| el.bg(sb.row_active))
-                            .hover(|s| s.bg(sb.row_hover))
+                            .when(is_active, |el| el.bg(sb.sheet_row_selected))
+                            .hover(|s| s.bg(sb.sheet_row_hover))
                             .on_mouse_move(cx.listener(move |this, _, _, cx| {
                                 if this.settings_ui.active_result != index {
                                     this.settings_ui.active_result = index;
@@ -689,7 +696,7 @@ impl Workspace {
                     .items_center()
                     .rounded(px(8.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(sb.row_hover))
+                    .hover(|s| s.bg(sb.sheet_row_hover))
                     .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.icon))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.settings_ui.compact_search_open = true;
@@ -726,8 +733,8 @@ impl Workspace {
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(if active { sb.foreground } else { sb.muted_foreground.opacity(0.8) })
-                                .when(active, |el| el.bg(sb.row_active))
-                                .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
+                                .when(active, |el| el.bg(sb.sheet_row_selected))
+                                .hover(|s| s.bg(sb.sheet_row_hover).text_color(sb.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select_settings_section(id, cx)))
                                 .child(section_icon(id).size(px(16.)).text_color(if active {
                                     sb.foreground
