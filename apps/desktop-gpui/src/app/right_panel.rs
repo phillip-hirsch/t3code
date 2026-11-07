@@ -1178,7 +1178,8 @@ impl Workspace {
     }
 
     /// `revealDiffFile` for the file `open_turn_diff` asked for: done once the shown selection's
-    /// patch holds it, whether that selection just loaded or was already loaded.
+    /// patch holds it, whether that selection just loaded or was already loaded. The file unfolds
+    /// as if the user had unfolded it, then scrolls into view.
     fn reveal_pending_file(&mut self, cx: &mut Context<Self>) {
         let Some((selection, file)) = &self.right_panel.pending_reveal else { return };
         if self.right_panel.shown.as_ref() != Some(selection) {
@@ -1188,7 +1189,11 @@ impl Workspace {
             return;
         };
         self.right_panel.pending_reveal = None;
-        self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
+        self.right_panel.diff.update(cx, |state, cx| {
+            state.set_file_collapsed(&path, false, cx);
+            state.scroll_to_file(&path, cx);
+        });
+        self.remember_collapsed(cx);
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
