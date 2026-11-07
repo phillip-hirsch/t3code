@@ -470,11 +470,10 @@ impl Workspace {
                 .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_draft_picker(window, cx)))
                 .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        && !event.keystroke.modifiers.modified()
-                    {
+                    let key = event.keystroke.key.as_str();
+                    if matches!(key, "down" | "up") && !event.keystroke.modifiers.modified() {
                         cx.stop_propagation();
-                        this.toggle_draft_picker(window, cx);
+                        this.open_draft_picker_from_key(key == "down", window, cx);
                     }
                 }));
             div()

@@ -49,6 +49,17 @@ impl Open {
         self.highlight = Some(index);
         self.scroll.scroll_to_item(index);
     }
+
+    /// Moves the highlight one of `len` rows down or up, wrapping at the ends.
+    fn step(&mut self, len: usize, down: bool) {
+        let Some(last) = len.checked_sub(1) else { return };
+        self.highlight(match (down, self.highlight) {
+            (true, Some(i)) if i < last => i + 1,
+            (true, _) => 0,
+            (false, Some(i)) if i > 0 => i - 1,
+            (false, _) => last,
+        });
+    }
 }
 
 /// A picker row.
@@ -93,6 +104,18 @@ impl Workspace {
         let groups: Vec<(String, String)> =
             self.draft_picker_groups().into_iter().map(|g| (g.key, g.display_name)).collect();
         rows(&groups, &open.order, &open.query.read(cx).value())
+    }
+
+    /// `ComboboxTrigger`'s arrow keys: open the picker and move its highlight a row.
+    pub(super) fn open_draft_picker_from_key(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft_picker.open.is_none() {
+            self.toggle_draft_picker(window, cx);
+        }
+        let len = self.draft_picker_rows(cx).len();
+        if let Some(open) = &mut self.draft_picker.open {
+            open.step(len, down);
+            cx.notify();
+        }
     }
 
     pub(super) fn draft_picker_open(&self) -> bool {
@@ -199,14 +222,8 @@ impl Workspace {
         }
         match event.keystroke.key.as_str() {
             "escape" => self.close_draft_picker(window, cx),
-            "down" | "up" if !rows.is_empty() => {
-                let last = rows.len() - 1;
-                open.highlight(match (event.keystroke.key.as_str(), highlight) {
-                    ("down", Some(i)) if i < last => i + 1,
-                    ("down", _) => 0,
-                    (_, Some(i)) if i > 0 => i - 1,
-                    _ => last,
-                });
+            key @ ("down" | "up") => {
+                open.step(rows.len(), key == "down");
                 cx.notify();
             }
             "enter" => {
