@@ -1877,16 +1877,38 @@ impl Paragraph {
         let mut run: Vec<(usize, &InlineNode)> = Vec::new();
         let mut offset = 0;
         let mut enters_image = true;
-
-        for child in self.children.iter() {
-            if child.custom.is_some() {
-                let object_selected = child
-                    .custom_selection
-                    .lock()
-                    .is_ok_and(|selected| *selected);
-                if object_selected {
-                    run.retain(|(_, node)| !node.covered);
+        let object_selected =
+            |node: &InlineNode| node.custom_selection.lock().is_ok_and(|selected| *selected);
+        // Covered runs (text, objects and images) sit right before the object
+        // whose label they are; its Markdown spells them out when it's copied.
+        let mut owner_selected = false;
+        let mut spelled_out: Vec<bool> = self
+            .children
+            .iter()
+            .rev()
+            .map(|child| {
+                if !child.covered {
+                    owner_selected = child.custom.is_some() && object_selected(child);
                 }
+                child.covered && owner_selected
+            })
+            .collect();
+        spelled_out.reverse();
+
+        for (child, spelled_out) in self.children.iter().zip(spelled_out) {
+            if spelled_out {
+                if child.custom.is_none() && child.image.is_none() {
+                    offset += child.text.len();
+                    continue;
+                }
+                // It still ends the rendered run before it.
+                emit_run(&child.state, &run, &mut pending_images, &mut source);
+                run.clear();
+                offset = 0;
+                continue;
+            }
+            if child.custom.is_some() {
+                let object_selected = object_selected(child);
                 let selected = emit_run(&child.state, &run, &mut pending_images, &mut source);
                 if object_selected {
                     if run.is_empty() || (selected.emitted && selected.at_end) {
@@ -3527,10 +3549,10 @@ impl Paragraph {
     fn to_markdown(&self) -> String {
         if self.children.iter().any(|node| node.custom.is_some()) {
             let mut source = MarkdownSource::default();
-            for node in &self.children {
+            for node in self.children.iter().filter(|node| !node.covered) {
                 if node.custom.is_some() {
                     source.push_object(node);
-                } else if !node.covered {
+                } else {
                     source.push_text(&node.text, &node.marks, 0..node.text.len());
                     if let Some(image) = &node.image {
                         source.push_str(&image_markdown(image));
@@ -4734,6 +4756,75 @@ mod tests {
         assert_eq!(paragraph.selected_source(), "See [the label](a.rs)");
         select(Some(4..13), false);
         assert_eq!(paragraph.selected_source(), "the label");
+
+        // An object inside the label belongs to it like the label's text.
+        let mut label = InlineNode::new("see ");
+        label.covered = true;
+        let mut inner = InlineNode::custom(
+            MarkdownNode::new("code", ())
+                .text("src/a.rs")
+                .markdown("`src/a.rs`"),
+        );
+        inner.covered = true;
+        let outer = InlineNode::custom(
+            MarkdownNode::new("chip", ())
+                .text(" b.rs")
+                .markdown("[see `src/a.rs`](src/b.rs)"),
+        );
+        let paragraph = Paragraph {
+            children: vec![
+                InlineNode::new("See "),
+                label,
+                inner.clone(),
+                outer.clone(),
+                InlineNode::new(" now"),
+            ],
+            ..Default::default()
+        };
+        let select = |run: Option<Range<usize>>, inner_object: bool, outer_object: bool| {
+            let mut state = inner.state.lock().unwrap();
+            state.text = "See see ".into();
+            state.selection = run.map(Into::into);
+            *inner.custom_selection.lock().unwrap() = inner_object;
+            *outer.custom_selection.lock().unwrap() = outer_object;
+        };
+
+        select(Some(4..8), true, true);
+        assert_eq!(paragraph.selected_source(), "[see `src/a.rs`](src/b.rs)");
+        select(Some(0..8), true, true);
+        assert_eq!(paragraph.selected_source(), "See [see `src/a.rs`](src/b.rs)");
+        select(None, false, true);
+        assert_eq!(paragraph.selected_source(), "[see `src/a.rs`](src/b.rs)");
+        select(Some(4..8), true, false);
+        assert_eq!(paragraph.selected_source(), "see `src/a.rs`");
+
+        let mut image = InlineNode::image(ImageNode {
+            url: "y.png".into(),
+            alt: Some("j".into()),
+            ..Default::default()
+        });
+        image.covered = true;
+        {
+            let mut state = image.state.lock().unwrap();
+            state.text = "See see ".into();
+            state.selection = Some((0..8).into());
+        }
+        *outer.custom_selection.lock().unwrap() = true;
+        let mut label = InlineNode::new("see ");
+        label.covered = true;
+        let paragraph = Paragraph {
+            children: vec![
+                InlineNode::new("See "),
+                label,
+                image,
+                outer.clone(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            paragraph.selected_source(),
+            "See [see `src/a.rs`](src/b.rs)"
+        );
     }
 
     #[test]
