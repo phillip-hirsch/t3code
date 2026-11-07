@@ -91,6 +91,14 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
+/// t3code: an anchored tooltip's gap from its trigger, Base UI's default `sideOffset`.
+const TOOLTIP_SIDE_OFFSET: Pixels = px(4.);
+/// t3code: the gap an anchored tooltip keeps from the window's edges, Base UI's `collisionPadding`.
+const TOOLTIP_COLLISION_PADDING: Pixels = px(5.);
+/// t3code: a pointer-placed tooltip's gap from the pointer (1px plus the 12px margin
+/// gpui-component's tooltip had).
+const POINTER_TOOLTIP_OFFSET: Pixels = px(13.);
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -4077,20 +4085,28 @@ impl Window {
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
 
             let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+                Bounds::new(mouse_position + point(POINTER_TOOLTIP_OFFSET, POINTER_TOOLTIP_OFFSET), tooltip_size);
             let window_bounds = Bounds {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
 
             if let Some(anchor) = tooltip_request.tooltip.anchor {
-                let above = anchor.top() - tooltip_size.height;
-                let y = if above >= Pixels::ZERO { above } else { anchor.bottom() };
-                let max_x = cmp::max(Pixels::ZERO, window_bounds.right() - tooltip_size.width);
-                let x = (anchor.center().x - tooltip_size.width / 2.).clamp(Pixels::ZERO, max_x);
+                let above = anchor.top() - TOOLTIP_SIDE_OFFSET - tooltip_size.height;
+                let y = if above >= TOOLTIP_COLLISION_PADDING {
+                    above
+                } else {
+                    anchor.bottom() + TOOLTIP_SIDE_OFFSET
+                };
+                let min_x = TOOLTIP_COLLISION_PADDING;
+                let max_x = cmp::max(
+                    min_x,
+                    window_bounds.right() - TOOLTIP_COLLISION_PADDING - tooltip_size.width,
+                );
+                let x = (anchor.center().x - tooltip_size.width / 2.).clamp(min_x, max_x);
                 tooltip_bounds.origin = point(x, y);
             } else if tooltip_bounds.right() > window_bounds.right() {
-                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
+                let new_x = mouse_position.x - tooltip_bounds.size.width - POINTER_TOOLTIP_OFFSET;
                 if new_x >= Pixels::ZERO {
                     tooltip_bounds.origin.x = new_x;
                 } else {
@@ -4104,7 +4120,7 @@ impl Window {
             if tooltip_request.tooltip.anchor.is_none()
                 && tooltip_bounds.bottom() > window_bounds.bottom()
             {
-                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
+                let new_y = mouse_position.y - tooltip_bounds.size.height - POINTER_TOOLTIP_OFFSET;
                 if new_y >= Pixels::ZERO {
                     tooltip_bounds.origin.y = new_y;
                 } else {

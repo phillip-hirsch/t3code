@@ -57,6 +57,18 @@ until focus leaves. 0.3.11 shows tooltips only on hover, placed at the pointer. 
   there is no room) instead of at the pointer; `TooltipBounds::bounds` is crate-visible for tests.
 - Test: `a_trigger_focused_from_the_keyboard_shows_its_tooltip_until_it_loses_focus`.
 
+**Tooltips sit 4px off their trigger.** Base UI positions a tooltip from its trigger, not the
+pointer: `sideOffset` 4px above it (below when there is no room) and 5px in from the window's
+edges (`collisionPadding`). The patch:
+
+- `src/elements/div.rs`: a hovered element's tooltip shows anchored to the element's bounds too
+  (`register_tooltip_mouse_handlers` and `handle_tooltip_mouse_move` take the anchor); text-range
+  tooltips (`text.rs`) stay at the pointer.
+- `src/window.rs`: `prepaint_tooltip` keeps the 4px and 5px; a pointer-placed tooltip keeps 13px
+  from the pointer, the 1px plus the 12px margin gpui-component's tooltip used to carry.
+- Tests: the focus test above and `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`
+  check the placement.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -209,3 +221,7 @@ an input the same at every width. Files:
 - `src/input/input.rs`: `Input::render` adds the 4px and `text_base` below 640px, before the
   caller's style refinement, so a call site's own height or text size still wins.
 - `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
+
+**The tooltip has no margin.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap from
+the pointer. gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
+trigger"), so `src/tooltip.rs` drops the `m_3`.

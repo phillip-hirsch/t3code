@@ -111,11 +111,10 @@ impl Render for Tooltip {
         };
 
         div().child(
-            // Wrap in a child, to ensure the left margin is applied to the tooltip
+            // t3code: no margin; the window places a tooltip its offset from the trigger or pointer.
             BaseTooltip::new("tooltip-popup")
                 .h_flex()
                 .font_family(cx.theme().font_family.clone())
-                .m_3()
                 .bg(cx.theme().tokens.popover)
                 .text_color(cx.theme().popover_foreground)
                 .bg(cx.theme().tokens.popover)

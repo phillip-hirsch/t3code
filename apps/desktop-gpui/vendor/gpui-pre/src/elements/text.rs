@@ -1293,6 +1293,7 @@ impl Element for InteractiveText {
                         interactive_state.long_press_tooltip_active.clone(),
                         Rc::default(),
                         None,
+                        None,
                         window,
                     );
                 }

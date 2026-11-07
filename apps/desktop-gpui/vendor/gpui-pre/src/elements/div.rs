@@ -3368,6 +3368,7 @@ impl Interactivity {
                     long_press_tooltip_active,
                     opened_by_focus,
                     self.tooltip_show_delay,
+                    Some(hitbox.bounds),
                     window,
                 );
             }
@@ -3872,6 +3873,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     long_press_tooltip_active: Rc<Cell<bool>>,
     opened_by_focus: Rc<Cell<bool>>,
     show_delay: Option<Duration>,
+    anchor: Option<Bounds<Pixels>>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
@@ -3893,6 +3895,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 current_view,
                 phase,
                 show_delay,
+                anchor,
                 window,
                 cx,
             )
@@ -3993,6 +3996,7 @@ fn handle_tooltip_mouse_move(
     current_view: EntityId,
     phase: DispatchPhase,
     show_delay: Duration,
+    anchor: Option<Bounds<Pixels>>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -4075,7 +4079,7 @@ fn handle_tooltip_mouse_move(
                             &build_tooltip,
                             &check_is_hovered_during_prepaint,
                             None,
-                            None,
+                            anchor,
                             window,
                             cx,
                         );
@@ -5398,6 +5402,10 @@ mod tests {
                 .unwrap()
         };
         assert!(tooltip_shown(&mut test_app));
+        let origin = test_app
+            .update_window(any_window, |_, window, _| window.tooltip_bounds.as_ref().map(|t| t.bounds.origin))
+            .unwrap();
+        assert_eq!(origin, Some(point(px(5.), px(24.))), "placed off its trigger like focus, not at the pointer");
 
         window
             .update(&mut test_app, |view, _, cx| {
@@ -5559,7 +5567,11 @@ mod tests {
         let origin = test_app
             .update_window(any_window, |_, window, _| window.tooltip_bounds.as_ref().map(|t| t.bounds.origin))
             .unwrap();
-        assert_eq!(origin, Some(point(px(0.), px(20.))), "under the trigger, with no room above it");
+        assert_eq!(
+            origin,
+            Some(point(px(5.), px(24.))),
+            "4px under the trigger with no room above it, 5px in from the window's edge"
+        );
 
         focus(&mut test_app, 1);
         assert!(!tooltip_shown(&mut test_app), "losing focus hides it");
