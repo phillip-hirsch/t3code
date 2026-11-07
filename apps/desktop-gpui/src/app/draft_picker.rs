@@ -8,9 +8,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative,
 };
 
 use super::Workspace;
@@ -20,11 +20,18 @@ use crate::theme::Tokens;
 /// `ComboboxPopup className="w-72"`.
 const POPUP_WIDTH: f32 = 288.;
 
-#[derive(Default)]
 pub(super) struct DraftPicker {
     open: Option<Open>,
     /// When an outside press last closed it, so that press on the trigger doesn't reopen it.
     closed_at: Option<Instant>,
+    /// The project name that opens it, where Escape and a pick return focus.
+    pub(super) trigger: FocusHandle,
+}
+
+impl DraftPicker {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self { open: None, closed_at: None, trigger: cx.focus_handle().tab_stop(true) }
+    }
 }
 
 struct Open {
@@ -128,9 +135,10 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes the picker and returns focus to its trigger, as a combobox does.
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismiss_draft_picker(cx) {
-            self.focus_composer(window, cx);
+            window.focus(&self.draft_picker.trigger, cx);
         }
     }
 
@@ -337,7 +345,9 @@ impl Workspace {
             .font_weight(FontWeight::NORMAL)
             .text_color(fg)
             .on_click(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_draft_picker(window, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_draft_picker(cx);
+            }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.draft_picker_key(event, window, cx);
             }))

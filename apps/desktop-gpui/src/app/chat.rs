@@ -459,13 +459,42 @@ impl Workspace {
         // `[@media(max-height:28rem)]`: very short windows keep only the project name.
         let terse = f32::from(window.viewport_size().height) <= 448.;
         let open = self.draft_picker_open();
+        let focus = &self.draft_picker.trigger;
+        // `focus-visible:outline-2 outline-ring`, drawn outside the text as an outline is.
+        let ring = focus.is_focused(window) && window.last_input_was_keyboard();
         let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
             // `InlineButton tone="picker"`: underlined while its popup is open.
             let trigger = inline_button("draft-project-picker", label, t.foreground, t.foreground)
+                .track_focus(focus)
                 .when(open, gpui_kit::Styled::underline)
                 .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_draft_picker(window, cx)));
-            div().relative().min_w_0().max_w_full().child(trigger).children(self.render_draft_picker(&t, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_draft_picker(window, cx)))
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        && !event.keystroke.modifiers.modified()
+                    {
+                        cx.stop_propagation();
+                        this.toggle_draft_picker(window, cx);
+                    }
+                }));
+            div()
+                .relative()
+                .min_w_0()
+                .max_w_full()
+                .child(trigger)
+                .when(ring, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(-2.))
+                            .bottom(px(-2.))
+                            .left(px(-2.))
+                            .right(px(-2.))
+                            .border_2()
+                            .border_color(t.ring),
+                    )
+                })
+                .children(self.render_draft_picker(&t, cx))
         };
         let title = |el: gpui_kit::Div| {
             el.w_full().text_size(title_size).line_height(rems(2.25)).text_color(t.foreground).justify_center()
