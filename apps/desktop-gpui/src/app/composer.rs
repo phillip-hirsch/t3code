@@ -889,7 +889,7 @@ impl Workspace {
             .and_then(|t| t.state.projection.as_ref())
             .is_some_and(super::super::model::ThreadProjection::is_running);
         let stop = || {
-            round_button("stop", t.error.opacity(0.9), t.error)
+            round_button("stop", t.error.opacity(0.9), t.error, t)
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
@@ -969,7 +969,7 @@ impl Workspace {
             } else {
                 Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
             };
-            return round_button("resume", t.primary, t.primary)
+            return round_button("resume", t.primary, t.primary, t)
                 .child(content)
                 .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
                 .when(enabled, |el| {
@@ -1032,7 +1032,7 @@ impl Workspace {
             }
             _ => None,
         };
-        round_button("send", fill, t.primary)
+        round_button("send", fill, t.primary, t)
             .when_some(stage, |el, art| {
                 el.relative()
                     .when(!can_send, |el| el.opacity(0.64))
@@ -1642,26 +1642,19 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
 }
 
 /// `ComposerControl size="sm"`: 28px tall, 8px padding inside a transparent 1px border,
-/// text-sm medium. The kit spaces children 4px apart, so a control wanting the web's `gap-1.5`
-/// wraps them in its own 6px row.
+/// `text-base sm:text-sm` medium. The kit spaces children 4px apart, so a control wanting the
+/// web's `gap-1.5` wraps them in its own 6px row.
 pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
-    Button::new(id)
-        .ghost()
-        .small()
-        .h(px(28.))
-        .px(px(8.))
-        .border_1()
-        .border_color(gpui_kit::transparent_black())
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(t.foreground.opacity(0.8))
+    let button =
+        Button::new(id).ghost().small().h(px(28.)).px(px(8.)).border_1().border_color(gpui_kit::transparent_black());
+    t.breakpoint.control_text(button).font_weight(FontWeight::MEDIUM).text_color(t.foreground.opacity(0.8))
 }
 
-/// The 32px send/stop circle with its tinted shadow and inset highlight.
-fn round_button(id: &'static str, fill: Hsla, shadow: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+/// The send/stop circle (`h-9 w-9 sm:h-8 sm:w-8`) with its tinted shadow and inset highlight.
+fn round_button(id: &'static str, fill: Hsla, shadow: Hsla, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(id)
-        .size(px(32.))
+        .size(px(t.breakpoint.pick(36., 32.)))
         .flex_none()
         .flex()
         .items_center()

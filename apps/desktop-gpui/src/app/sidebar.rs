@@ -356,7 +356,7 @@ fn stage_backdrop(art: StageArt, dark: bool, height: f32) -> AnyElement {
 
 /// The send button's round art.
 pub(super) fn stage_button_art(art: StageArt, dark: bool) -> AnyElement {
-    img(stage_image(art, dark, true)).absolute().top_0().left_0().size(px(32.)).rounded_full().into_any_element()
+    img(stage_image(art, dark, true)).absolute().top_0().left_0().size_full().rounded_full().into_any_element()
 }
 
 /// The sidebar as its own view, so GPUI can reuse its frame while the rest of

@@ -222,6 +222,10 @@ an input the same at every width. Files:
   caller's style refinement, so a call site's own height or text size still wins.
 - `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
 
+**A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
+its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
+`Size`'s text size only when the caller set none.
+
 **The tooltip has no margin.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap from
 the pointer. gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`.

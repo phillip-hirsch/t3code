@@ -978,18 +978,16 @@ fn is_within(root: &str, path: &str) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
 }
 
-/// `ComposerControl size="xs"`: 24px, 7px padding, 6px gap, text-xs, muted until hovered.
+/// `ComposerControl size="xs"`: `h-7 text-sm sm:h-6 sm:text-xs`, 7px padding, 6px gap, muted
+/// until hovered.
 pub(super) fn strip_button(id: &'static str, t: &Tokens) -> Button {
-    Button::new(id)
-        .ghost()
-        .xsmall()
-        .h(px(24.))
-        .px(px(7.))
-        .gap(px(6.))
-        .rounded(px(8.))
-        .text_xs()
-        .font_weight(FontWeight::NORMAL)
-        .text_color(t.muted_foreground)
+    let button =
+        Button::new(id).ghost().xsmall().h(px(t.breakpoint.pick(28., 24.))).px(px(7.)).gap(px(6.)).rounded(px(8.));
+    let button = match t.breakpoint {
+        crate::theme::Breakpoint::Base => button.text_sm(),
+        crate::theme::Breakpoint::Sm => button.text_xs(),
+    };
+    button.font_weight(FontWeight::NORMAL).text_color(t.muted_foreground)
 }
 
 fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
