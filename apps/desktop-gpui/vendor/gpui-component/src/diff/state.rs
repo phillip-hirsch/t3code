@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    mem,
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -631,6 +632,96 @@ impl DiffState {
         self.geometry.borrow_mut().clear();
         self.rebuild(true);
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
+        self.ensure_presentation(cx);
+        cx.notify();
+    }
+
+    /// Replaces the files like [`Self::set_files`], but keeps what belongs to
+    /// files that stay: a file that is a clone of one already shown keeps its
+    /// context expansion, conflict choices and prepared emphasis, and the
+    /// viewport, horizontal scroll and selections survive while they lie in
+    /// such files. Use it when files arrive one by one beside shown ones.
+    pub fn update_files(
+        &mut self,
+        files: impl IntoIterator<Item = DiffFile>,
+        cx: &mut Context<Self>,
+    ) {
+        let files = files.into_iter().collect::<Vec<_>>();
+        // Each new file's index among the shown files, when it is the same file.
+        let previous = files
+            .iter()
+            .map(|file| {
+                self.file_ix(file.path())
+                    .filter(|&old| self.files[old].is_same(file))
+            })
+            .collect::<Vec<_>>();
+        let unmoved = |ix: usize| previous.get(ix) == Some(&Some(ix));
+        let entity = Some(self.selection.entity_id());
+        let text_kept = self.selection.snapshot(cx).is_none_or(|snapshot| {
+            [snapshot.anchor(), snapshot.cursor()]
+                .into_iter()
+                .all(|point| {
+                    point.entity_id() != entity
+                        || point
+                            .content_key()
+                            .is_some_and(|key| unmoved(decode_key(key.value()).0))
+                })
+        });
+        if let Some(window) = self.window
+            && !text_kept
+        {
+            TextSelection::clear_for_window(window, cx);
+        }
+        let kept_path = |path: &SharedString| {
+            files
+                .iter()
+                .zip(&previous)
+                .any(|(file, previous)| previous.is_some() && file.path() == path)
+        };
+        let lines_kept = self
+            .selected_lines
+            .as_ref()
+            .is_none_or(|range| kept_path(range.path()))
+            && [&self.selection_anchor, &self.selection_cursor]
+                .into_iter()
+                .flatten()
+                .all(|position| kept_path(position.path()));
+        if !lines_kept {
+            self.selection.set_local_selection(false, cx);
+            self.selection.set_fallback_copy_text("", cx);
+            self.selected_lines = None;
+            self.selection_anchor = None;
+            self.selection_cursor = None;
+            self.selecting = false;
+        }
+        self.resolutions.retain(|(path, _), _| kept_path(path));
+        self.expanded = previous
+            .iter()
+            .map(|old| old.map_or_else(Vec::new, |old| mem::take(&mut self.expanded[old])))
+            .collect();
+        let presentations = previous
+            .iter()
+            .map(|old| old.and_then(|old| self.presentations[old].take()))
+            .collect();
+        self.files = files;
+        self.file_ixs = file_ixs(&self.files);
+        self.collapsed
+            .retain(|path| self.file_ixs.contains_key(path));
+        self.reset_presentation();
+        self.presentations = presentations;
+        self.annotations.clear();
+        self.geometry.borrow_mut().clear();
+        self.rebuild(false);
+        // Rows of a replaced file can equal the old file's and keep its heights.
+        for (ix, _) in previous.iter().enumerate().filter(|(_, old)| old.is_none()) {
+            let start = self.header_rows[ix];
+            let end = self
+                .header_rows
+                .get(ix + 1)
+                .copied()
+                .unwrap_or(self.rows.len());
+            self.list.remeasure_items(start..end);
+        }
         self.ensure_presentation(cx);
         cx.notify();
     }

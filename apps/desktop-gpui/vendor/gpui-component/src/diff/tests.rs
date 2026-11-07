@@ -628,3 +628,56 @@ fn setting_or_clearing_a_syntax_highlighter_prepares_the_files_again(cx: &mut Te
             .any(|style| style.font_style == Some(FontStyle::Italic))
     );
 }
+
+#[gpui::test]
+fn updating_files_keeps_the_state_of_files_that_stay(cx: &mut TestAppContext) {
+    let kept = context_document();
+    let changed = |text: &str| fixture::modified("other.txt", "a\n", text);
+    let state = cx.new(|cx| DiffState::new([kept.clone(), changed("b\n")], cx));
+    state.update(cx, |state, cx| {
+        state.set_context_lines(Some(1), cx);
+        state.expand_fold(0, 0..13, super::state::FoldExpansion::All, cx);
+        state.set_selected_lines(
+            Some(DiffLineRange::new("review.txt", DiffSide::Modified, 14, 16)),
+            cx,
+        );
+        state
+            .horizontal_scroll()
+            .set_offset(gpui::point(px(-40.), px(0.)));
+        state.ensure_presentation(cx);
+    });
+    cx.run_until_parked();
+    let prepared = state.read_with(cx, |state, _| state.presentations()[0].clone());
+    assert!(prepared.is_some());
+
+    let added = fixture::modified("z.txt", "x\n", "y\n");
+    state.update(cx, |state, cx| {
+        let rows = state.rows().len();
+        state.update_files([kept.clone(), changed("c\n"), added], cx);
+        let presentation = state.presentations()[0].as_ref().expect("still prepared");
+        assert!(std::sync::Arc::ptr_eq(
+            presentation,
+            prepared.as_ref().unwrap()
+        ));
+        assert!(
+            state.presentations()[1].is_none(),
+            "a changed file is prepared again"
+        );
+        // The expanded fold and the selection survive; only the new file's rows are added.
+        assert_eq!(state.rows().len(), rows + 3);
+        assert_eq!(
+            state.selected_lines(),
+            Some(DiffLineRange::new("review.txt", DiffSide::Modified, 14, 16))
+        );
+        assert_eq!(state.horizontal_scroll().offset().x, px(-40.));
+
+        // A selection in a file that changes goes, as `set_files` drops it.
+        state.set_selected_lines(
+            Some(DiffLineRange::new("other.txt", DiffSide::Modified, 1, 1)),
+            cx,
+        );
+        assert!(state.selected_lines().is_some());
+        state.update_files([kept.clone(), changed("d\n")], cx);
+        assert_eq!(state.selected_lines(), None);
+    });
+}

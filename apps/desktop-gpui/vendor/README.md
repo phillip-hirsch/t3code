@@ -107,3 +107,15 @@ which the app doesn't load, so the separator has no expand buttons. Files:
 - `src/diff/mod.rs`: `code_width`, the lanes and bar in `code_line`, `change_bar`, and the
   `LineInfo` arm of `render_hunk_separator`.
 - `locales/ui.yml`: `Diff.HiddenLine` and the English `Diff.HiddenLines`.
+
+**Lazily read files join a diff without resetting it.** The app reads a large diff one file at a
+time and shows each batch as it settles. 0.9.0's only way to change the files is `set_files`,
+which clears text and line selection, expanded context and horizontal scroll and prepares syntax
+emphasis for every file again, so each batch reset the whole view. The patch adds
+`DiffState::update_files`: a file that is a clone of one already shown (`DiffFile::is_same`, the
+same parsed document) keeps its expansion, conflict choices and prepared emphasis, the rows splice
+in place so the viewport stays, and selections stay while they lie in such files. Files:
+
+- `src/diff/state.rs`: `update_files`.
+- `src/diff/document.rs`: `DiffFile::is_same`.
+- `src/diff/tests.rs`: one test, `updating_files_keeps_the_state_of_files_that_stay`.

@@ -256,6 +256,16 @@ struct Commit {
     subject: String,
 }
 
+/// How [`Workspace::show_diff_files`] puts files in the patch.
+#[derive(Clone, Copy)]
+enum Install {
+    /// A new read: every file starts fresh.
+    Replace,
+    /// More of the shown selection's files settled: the files already shown keep their
+    /// selection, expanded context, scroll and prepared highlighting.
+    Update,
+}
+
 /// A selection's files whose patches load one by one (`useReviewFilePatches`): each metadata
 /// row's files once settled, in path order, and what reads one again. Dropping it cancels its
 /// retries.
@@ -992,7 +1002,7 @@ impl Workspace {
                             let sum = |count: fn(&DiffFile) -> usize| parsed.files.iter().map(count).sum::<usize>();
                             (sum(DiffFile::additions), sum(DiffFile::deletions))
                         });
-                        this.show_diff_files(&selection, parsed.files, cx);
+                        this.show_diff_files(&selection, parsed.files, Install::Replace, cx);
                         DiffLoad::Ready {
                             additions,
                             deletions,
@@ -1079,7 +1089,7 @@ impl Workspace {
         let pending = patches.rows.iter().filter(|row| row.is_none()).count();
         let selection = patches.selection.clone();
         self.right_panel.patch_states = std::rc::Rc::new(states);
-        self.show_diff_files(&selection, files, cx);
+        self.show_diff_files(&selection, files, Install::Update, cx);
         // A row that did not load has no lines to show, so it stays folded.
         let states = self.right_panel.patch_states.clone();
         self.right_panel.diff.update(cx, |state, cx| {
@@ -1115,7 +1125,13 @@ impl Workspace {
     }
 
     /// Puts a selection's loaded files in the patch, folded as the user left them.
-    fn show_diff_files(&mut self, selection: &(Target, DiffScope), files: Vec<DiffFile>, cx: &mut Context<Self>) {
+    fn show_diff_files(
+        &mut self,
+        selection: &(Target, DiffScope),
+        files: Vec<DiffFile>,
+        install: Install,
+        cx: &mut Context<Self>,
+    ) {
         let paths: Vec<SharedString> = files.iter().map(|file| file.path().clone()).collect();
         let folded = collapsed_files(
             self.right_panel.collapsed.get(selection),
@@ -1125,7 +1141,10 @@ impl Workspace {
         self.store_diff_files(files);
         let shown = self.shown_diff_files();
         self.right_panel.diff.update(cx, |state, cx| {
-            state.set_files(shown, cx);
+            match install {
+                Install::Replace => state.set_files(shown, cx),
+                Install::Update => state.update_files(shown, cx),
+            }
             for path in &paths {
                 state.set_file_collapsed(path, folded.contains(path), cx);
             }
