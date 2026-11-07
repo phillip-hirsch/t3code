@@ -1071,7 +1071,7 @@ impl Render for Workspace {
             self.notify_sidebar(cx);
         }
         self.sync_sheet_focus(window, cx);
-        self.sidebar.fit_brand(window);
+        self.sidebar.fit_window(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
             self.details_popover = false;

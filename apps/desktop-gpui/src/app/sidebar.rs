@@ -54,6 +54,8 @@ pub(super) struct SidebarState {
     width: Pixels,
     /// The brand row's minimum width and what it was measured with (font family, rem size, fullscreen).
     brand_fit: Option<((SharedString, Pixels, bool), Pixels)>,
+    /// The window's width as last drawn, which caps the sidebar's.
+    viewport: Pixels,
     working_expanded: bool,
     snoozed_expanded: bool,
     settled_expanded: bool,
@@ -114,9 +116,10 @@ pub(super) struct SidebarState {
 }
 
 impl SidebarState {
-    /// Measures the brand row's minimum width again when its font, text size or the
-    /// traffic lights' room changed.
-    pub(super) fn fit_brand(&mut self, window: &mut Window) {
+    /// Records the window's width, and measures the brand row's minimum width again when its
+    /// font, text size or the traffic lights' room changed.
+    pub(super) fn fit_window(&mut self, window: &mut Window) {
+        self.viewport = window.viewport_size().width;
         let font = Font { weight: FontWeight::MEDIUM, ..window.text_style().font() };
         let key = (font.family.clone(), window.rem_size(), window.is_fullscreen());
         if self.brand_fit.as_ref().is_some_and(|(fitted, _)| *fitted == key) {
@@ -171,6 +174,7 @@ impl SidebarState {
         Self {
             width: px(DEFAULT_WIDTH),
             brand_fit: None,
+            viewport: window.viewport_size().width,
             working_expanded: false,
             snoozed_expanded: false,
             settled_expanded: false,
@@ -464,6 +468,13 @@ fn brand_probe_width(content_left: Pixels, cap_height: Pixels, code: Pixels, siz
 /// lights it is wider than the 256px default.
 fn min_width(brand_probe: Pixels) -> Pixels {
     px(MIN_WIDTH.max(f32::from(brand_probe).ceil()))
+}
+
+/// `clampThreadSidebarWidth`: the chosen width, at least `min` and leaving the main column its
+/// [`MIN_MAIN_WIDTH`] in a `viewport`-wide window.
+fn clamp_width(width: Pixels, min: Pixels, viewport: Pixels) -> Pixels {
+    let max = (viewport.floor() - px(MIN_MAIN_WIDTH)).max(min);
+    width.max(min).min(max)
 }
 
 fn text_xs<E: gpui_kit::Styled>(el: E) -> E {
@@ -1254,7 +1265,7 @@ impl Workspace {
     }
 
     pub(super) fn sidebar_width(&self) -> Pixels {
-        self.sidebar.width.max(self.sidebar.min_width())
+        clamp_width(self.sidebar.width, self.sidebar.min_width(), self.sidebar.viewport)
     }
 
     /// The return tracker must see every shell change, like the web's. The
@@ -1421,9 +1432,8 @@ impl Workspace {
             .border_r_1()
             .border_color(sb.border)
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SidebarResize>, window, cx| {
-                let min = this.sidebar.min_width();
-                let max = (window.viewport_size().width - px(MIN_MAIN_WIDTH)).max(min);
-                this.sidebar.width = (event.event.position.x - event.bounds.left()).clamp(min, max);
+                let chosen = event.event.position.x - event.bounds.left();
+                this.sidebar.width = clamp_width(chosen, this.sidebar.min_width(), window.viewport_size().width);
                 cx.notify();
             }))
             .children(backdrop)
@@ -2667,6 +2677,17 @@ mod tests {
         // In fullscreen the traffic lights hide, and so do Windows' and Linux's (on the right).
         assert_eq!(sf(52.), px(MIN_WIDTH));
         assert_eq!(min_width(brand_probe_width(px(52.), px(10.18), px(36.), size)), px(MIN_WIDTH));
+    }
+
+    #[test]
+    fn the_sidebar_leaves_the_main_column_its_640px() {
+        let min = px(MIN_WIDTH);
+        let width = |chosen: f32, viewport: f32| clamp_width(px(chosen), min, px(viewport));
+        assert_eq!(width(DEFAULT_WIDTH, 800.), min, "an 800px window keeps only the minimum");
+        assert_eq!(width(DEFAULT_WIDTH, 870.5), px(230.));
+        assert_eq!(width(DEFAULT_WIDTH, 1280.), px(DEFAULT_WIDTH));
+        assert_eq!(width(500., 1000.), px(360.));
+        assert_eq!(width(100., 1280.), min);
     }
 
     #[test]
