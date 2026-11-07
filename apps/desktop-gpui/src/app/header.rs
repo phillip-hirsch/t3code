@@ -5,8 +5,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::{
-    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px, rgb,
+    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
 };
 
 use super::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
@@ -83,7 +83,7 @@ impl Workspace {
             breadcrumb = breadcrumb
                 .child(
                     crumb("crumb-project")
-                        .child(project_monogram(&project.title, tokens.dark))
+                        .child(super::sidebar::project_icon(project, &tokens, false, 14., self.favicon(project)))
                         .child(div().max_w(px(160.)).truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                         .on_click(
@@ -186,26 +186,4 @@ impl Workspace {
             )
             .into_any_element()
     }
-}
-
-/// `ProjectMonogram` at the breadcrumb's 14px: two letters on a 14% tint of the project's color.
-fn project_monogram(project_title: &str, dark: bool) -> AnyElement {
-    let (_, light, dark_hex) = crate::inbox::PROJECT_COLORS[crate::inbox::color_index(project_title)];
-    let color: Hsla = rgb(if dark { dark_hex } else { light }).into();
-    let text = crate::inbox::monogram(project_title);
-    div()
-        .size(px(14.))
-        .flex_none()
-        .rounded(px(3.5))
-        .bg(color.opacity(0.14))
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(theme::FONT_MONO)
-        .font_weight(FontWeight::BOLD)
-        .text_size(px(8.))
-        .line_height(px(14.))
-        .text_color(color)
-        .child(text)
-        .into_any_element()
 }
