@@ -27,7 +27,7 @@ use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
+    ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Map, Value};
 
@@ -394,6 +394,8 @@ pub(in crate::app) struct RowFrame {
     description: Option<AnyElement>,
     status: Option<AnyElement>,
     control: Option<AnyElement>,
+    /// The control hugs its content under the title and is at least this wide beside it.
+    hug: Option<Pixels>,
     body: Option<AnyElement>,
     dimmed: bool,
 }
@@ -407,6 +409,7 @@ impl RowFrame {
             description: None,
             status: None,
             control: None,
+            hug: None,
             body: None,
             dimmed: false,
         }
@@ -479,7 +482,7 @@ impl RowFrame {
             .px(px(16.))
             .pt(px(12.))
             .pb(px(if has_body { 4. } else { 12. }))
-            .child(RowLayout::new(layout_id, label.into_any_element(), self.control))
+            .child(RowLayout::new(layout_id, label.into_any_element(), self.control).hugging(self.hug))
             .children(self.body)
     }
 }
@@ -522,6 +525,8 @@ pub(in crate::app) fn subheading(text: impl Into<SharedString>) -> impl IntoElem
 /// Where a row's control goes: beside its text, or under it like a textarea.
 enum RowControl {
     Side(AnyElement),
+    /// A side control that hugs its content, at least this wide beside the title.
+    Hugging(AnyElement, Pixels),
     Body(AnyElement),
 }
 
@@ -931,10 +936,11 @@ impl Workspace {
             None
         };
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
-        let (control, body) = match control {
-            Some(RowControl::Body(field)) => (None, Some(field)),
-            Some(RowControl::Side(control)) => (Some(control), body),
-            None => (None, body),
+        let (control, hug, body) = match control {
+            Some(RowControl::Body(field)) => (None, None, Some(field)),
+            Some(RowControl::Side(control)) => (Some(control), None, body),
+            Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body),
+            None => (None, None, body),
         };
         let inert = if unavailable { Some("") } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
@@ -961,6 +967,7 @@ impl Workspace {
         frame.reset = reset.filter(|_| !unavailable);
         frame.description = description;
         frame.body = body;
+        frame.hug = hug;
         frame.control = control.map(|control| match inert {
             Some(message) => div()
                 .id(SharedString::from(format!("{id}-inert")))
@@ -1250,9 +1257,13 @@ impl Workspace {
                 let workspace = cx.entity();
                 // `SelectValue` ellipsizes a label wider than the trigger.
                 let label = div().min_w_0().truncate().child(label);
-                width
-                    .apply(select_trigger(id, label, 0., &t), window.viewport_size().width)
-                    .min_w(px(ROW_SELECT_MIN_WIDTH))
+                let trigger = width.apply(select_trigger(id, label, 0., &t), window.viewport_size().width);
+                // `w-auto`: `SettingsRow`'s `min-w-40` holds only beside the title (see `RowControl::Hugging`).
+                let trigger = match width {
+                    SelectWidth::Label => trigger,
+                    _ => trigger.min_w(px(ROW_SELECT_MIN_WIDTH)),
+                };
+                let element = trigger
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                         for (value, label) in options {
                             let picked = (*value).to_owned();
@@ -1264,7 +1275,11 @@ impl Workspace {
                         }
                         menu
                     })
-                    .into_any_element()
+                    .into_any_element();
+                if matches!(width, SelectWidth::Label) {
+                    return Some(RowControl::Hugging(element, px(ROW_SELECT_MIN_WIDTH)));
+                }
+                element
             }
             (Control::Slider { min, max, step, unit }, Some(key)) => {
                 #[expect(clippy::cast_possible_truncation, reason = "a slider position; f32 is plenty")]
