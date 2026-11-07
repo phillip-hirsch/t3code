@@ -108,6 +108,9 @@ struct PanelState {
     surfaces: Vec<Surface>,
     active: Option<Surface>,
     scope: DiffScope,
+    /// The file a chat link asked the turn diff to show (`filePath`): it stays visible while
+    /// test files hide, until another selection is picked.
+    turn_file: Option<SharedString>,
     /// Bumped by every panel change the user makes (`userActionRevisionByThreadKey`).
     user_revision: u64,
     /// The turn whose diff was last offered on its own (`proactiveDiffTurnId`).
@@ -684,11 +687,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(target @ Target::Thread { .. }) = self.target.clone() else { return };
-        let scope = DiffScope::Turn(run.to_string());
+        let selection = (target, DiffScope::Turn(run.to_string()));
         if let Some(panel) = self.panel_state_mut() {
-            panel.scope = scope.clone();
+            panel.scope = selection.1.clone();
+            panel.turn_file = file.clone();
         }
-        self.right_panel.pending_reveal = file.map(|file| ((target, scope), file));
+        // The shown patch may hide the requested file as a test file.
+        if self.right_panel.hide_test_files && self.right_panel.shown.as_ref() == Some(&selection) {
+            self.apply_diff_files(cx);
+        }
+        self.right_panel.pending_reveal = file.map(|file| (selection, file));
         self.open_surface(Surface::Diff, window, cx);
     }
 
@@ -862,10 +870,18 @@ impl Workspace {
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
-        if let Some(panel) = self.panel_state_mut() {
-            panel.scope = scope;
-            cx.notify();
+        let Some(panel) = self.panel_state_mut() else { return };
+        panel.scope = scope;
+        if panel.turn_file.take().is_some() && self.right_panel.hide_test_files {
+            self.apply_diff_files(cx);
         }
+        cx.notify();
+    }
+
+    /// The file a chat link asked `selection`'s turn diff to show.
+    fn requested_diff_file(&self, selection: &(Target, DiffScope)) -> Option<&str> {
+        let panel = self.right_panel.panels.get(&selection.0)?;
+        panel.turn_file.as_deref().filter(|_| panel.scope == selection.1)
     }
 
     /// Starts a fetch when the shown selection differs from the loaded one, else reveals a pending file.

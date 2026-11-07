@@ -112,23 +112,34 @@ pub(super) fn rows(files: &[(&str, Status)], folded: &HashSet<String>) -> Vec<Ro
     out
 }
 
-/// The patch's path for `requested`, a `/`-separated path from the chat, if the patch shows it.
+/// Whether the patch path `path` is `requested`, a `/`-separated path from the chat.
+fn is_requested(path: &str, requested: &str) -> bool {
+    path.len() == requested.len()
+        && path.bytes().zip(requested.bytes()).all(|(a, b)| a == b || (a == b'\\' && b == b'/'))
+}
+
+/// The patch's path for `requested`, if the patch shows it.
 pub(super) fn find_requested<'a>(files: &'a [DiffFile], requested: &str) -> Option<&'a SharedString> {
-    let same = |path: &str| {
-        path.len() == requested.len()
-            && path.bytes().zip(requested.bytes()).all(|(a, b)| a == b || (a == b'\\' && b == b'/'))
-    };
-    files.iter().map(DiffFile::path).find(|path| same(path))
+    files.iter().map(DiffFile::path).find(|path| is_requested(path, requested))
+}
+
+/// `isFileShown`: while test files hide, a test file shows only as the file the chat asked for.
+fn shows_file(path: &str, hide_tests: bool, requested: Option<&str>) -> bool {
+    !hide_tests
+        || !crate::pull_request_diff::is_test_file(path)
+        || requested.is_some_and(|requested| is_requested(path, requested))
 }
 
 impl Workspace {
-    /// The loaded files the patch shows: test files leave while "Hide test files" is on.
+    /// The loaded files the patch shows: test files leave while "Hide test files" is on, except
+    /// the one the chat asked the shown selection for.
     pub(super) fn shown_diff_files(&self) -> Vec<DiffFile> {
         let hide = self.right_panel.hide_test_files;
+        let requested = self.right_panel.shown.as_ref().and_then(|selection| self.requested_diff_file(selection));
         self.right_panel
             .all_diff_files
             .iter()
-            .filter(|file| !hide || !crate::pull_request_diff::is_test_file(file.path()))
+            .filter(|file| shows_file(file.path(), hide, requested))
             .cloned()
             .collect()
     }
@@ -283,5 +294,14 @@ mod tests {
         let files = DiffFile::parse(patch).expect("a one-file patch parses");
         assert_eq!(find_requested(&files, "src/app/a.rs").map(SharedString::as_ref), Some("src\\app\\a.rs"));
         assert_eq!(find_requested(&files, "src/app/a.test.rs"), None);
+    }
+
+    #[test]
+    fn hidden_test_files_still_show_the_requested_one() {
+        assert!(shows_file("src/a.test.ts", false, None));
+        assert!(!shows_file("src/a.test.ts", true, None));
+        assert!(!shows_file("src/a.test.ts", true, Some("src/b.test.ts")));
+        assert!(shows_file("src\\a.test.ts", true, Some("src/a.test.ts")));
+        assert!(shows_file("src/a.ts", true, Some("src/b.test.ts")));
     }
 }
