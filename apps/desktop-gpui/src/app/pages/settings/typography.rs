@@ -223,6 +223,7 @@ impl Workspace {
             move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
         );
         let control = h_flex()
+            .flex_wrap()
             .gap(px(8.))
             .child(
                 Select::new(&picker)
