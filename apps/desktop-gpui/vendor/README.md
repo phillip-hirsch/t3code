@@ -226,6 +226,7 @@ an input the same at every width. Files:
 its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
 `Size`'s text size only when the caller set none.
 
-**The tooltip has no margin.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap from
-the pointer. gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
-trigger"), so `src/tooltip.rs` drops the `m_3`.
+**The tooltip looks like the web's.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap
+from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
+trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
+`rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
