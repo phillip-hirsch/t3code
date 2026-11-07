@@ -74,6 +74,7 @@ mod send;
 mod sessions;
 mod side_chat;
 mod sidebar;
+mod sidebar_sheet;
 mod snap_shot;
 mod subagents;
 mod terminal;
@@ -213,7 +214,7 @@ pub struct Workspace {
     sidebar_view: Entity<sidebar::SidebarView>,
     visit: visits::VisitTracker,
     /// Collapsed, the sidebar column is not rendered at all.
-    sidebar_open: bool,
+    sidebar_open: sidebar_sheet::SidebarOpen,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -396,7 +397,7 @@ impl Workspace {
                 let workspace = cx.weak_entity();
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
-            sidebar_open: true,
+            sidebar_open: sidebar_sheet::SidebarOpen::default(),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
@@ -1023,6 +1024,9 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sidebar_open.fit(window.viewport_size().width) {
+            self.notify_sidebar(cx);
+        }
         self.sidebar.fit_brand(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
@@ -1056,10 +1060,7 @@ impl Render for Workspace {
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleThreadDetails, window, cx| this.toggle_details(window, cx)))
             .on_action(
                 cx.listener(|this, _: &TogglePalette, window, cx| this.open_palette(palette::View::Root, window, cx)),
@@ -1092,6 +1093,12 @@ impl Render for Workspace {
             }))
             // Escape that nothing else took closes find (`useChatShortcuts` `dismissFind`).
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.sidebar_open.sheet() {
+                    this.sidebar_open.close_sheet();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.find.is_some() && this.palette.is_none() {
                     this.close_thread_find(window, cx);
                     cx.stop_propagation();
@@ -1108,7 +1115,7 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open, |el| el.child(self.render_cached_sidebar()))
+                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar()))
                     .child(
                         v_flex()
                             .flex_1()
@@ -1172,6 +1179,8 @@ impl Render for Workspace {
                             .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
                     ),
             )
+            // The panel toggles stay above the sheet, as the web's `z-50` titlebar controls do.
+            .children(self.render_sidebar_sheet(window, cx))
             .child(self.render_titlebar_overlay(window, cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))

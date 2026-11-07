@@ -200,7 +200,7 @@ impl Workspace {
     /// The panel's width in this window.
     pub(super) fn pr_panel_width(&self, window: &Window) -> f32 {
         let viewport = f32::from(window.viewport_size().width);
-        let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         clamp_panel_width(self.pull_requests.panel_width.unwrap_or(viewport / 2.), viewport - sidebar)
     }
 
@@ -208,7 +208,7 @@ impl Workspace {
     pub(in crate::app) fn render_pr_panel_column(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let viewport = f32::from(window.viewport_size().width);
-        let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         let available = viewport - sidebar;
         let width = clamp_panel_width(self.pull_requests.panel_width.unwrap_or(viewport / 2.), available);
         let handle = div()

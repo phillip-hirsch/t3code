@@ -171,7 +171,7 @@ impl Workspace {
             .left_0()
             .right_0()
             .h(TITLEBAR_HEIGHT)
-            .child(self.render_sidebar_toggle(window, cx))
+            .when(!self.sidebar_open.sheet(), |el| el.child(self.render_sidebar_toggle(window, cx)))
             .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
     }
 
@@ -193,10 +193,10 @@ impl Workspace {
     }
 
     /// `SidebarTrigger` in its `ghost` variant: we draw no stage art behind it.
-    fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar_toggle(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = theme::tokens(cx);
         let (color, hover_bg, hover_color) = (tokens.muted_foreground, tokens.accent, tokens.foreground);
-        let path = if self.sidebar_open { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
+        let path = if self.sidebar_open.shown() { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
         div().absolute().left(controls_left(window)).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
             control("toggle-sidebar")
                 .group("toggle-sidebar")

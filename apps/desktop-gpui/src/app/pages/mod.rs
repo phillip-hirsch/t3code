@@ -105,6 +105,7 @@ impl Workspace {
 
     /// Records where the window is now; navigation calls this after it lands.
     pub(super) fn record_location(&mut self) {
+        self.sidebar_open.close_sheet();
         let location = self.location();
         self.history.push(location);
     }

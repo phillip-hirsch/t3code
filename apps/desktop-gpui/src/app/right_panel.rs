@@ -420,7 +420,7 @@ impl Workspace {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
-        let sidebar = if self.sidebar_open { f32::from(self.sidebar_width()) } else { 0. };
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         if self.right_panel_maximized() {
             return Some(viewport - sidebar - f32::from(RIGHT_RESIZE_INSET));
         }
@@ -1304,13 +1304,13 @@ impl Workspace {
                     let viewport = f32::from(window.viewport_size().width);
                     let right = f32::from(event.bounds.right());
                     this.right_panel.width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
-                    let sidebar = if this.sidebar_open { f32::from(this.sidebar_width()) } else { 0. };
+                    let sidebar = if this.sidebar_open.docked() { f32::from(this.sidebar_width()) } else { 0. };
                     this.right_panel.width = clamp_width(this.right_panel.width, viewport, viewport - sidebar);
                     cx.notify();
                 }))
                 .child({
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
-                    let inset = (panel.maximized && !self.sidebar_open)
+                    let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
                     self.render_tab_bar(&panel, inset, &tokens, cx)
                 })
