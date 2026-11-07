@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use super::git::{self, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
-use crate::model::{ThreadShell, TokenUsage, UsageLimits};
+use crate::model::{DelegatedFrom, ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
@@ -1042,7 +1042,8 @@ impl Workspace {
             .open_projection()
             .and_then(|projection| projection.provider_session())
             .is_some_and(|session| !matches!(session.status.as_str(), "stopped" | "error"));
-        if parent.is_none() && active.is_empty() && previous.is_empty() && !can_detach {
+        let delegated = thread.delegated_from.as_ref();
+        if parent.is_none() && active.is_empty() && previous.is_empty() && !can_detach && delegated.is_none() {
             return None;
         }
         let relationship_row = |thread: &ThreadShell, path: &'static str, cx: &mut Context<Self>| {
@@ -1069,11 +1070,15 @@ impl Workspace {
             running => format!("Lineage · {running} running").into(),
         };
         let mut rows = 0usize;
-        let show_heading = parent.is_some() || !active.is_empty() || can_detach;
+        let show_heading = parent.is_some() || !active.is_empty() || can_detach || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
             let actions = can_detach.then(|| self.lineage_menu(tokens, colors, cx));
             el.child(section_heading(heading, tokens).children(actions))
         });
+        if let Some(from) = delegated {
+            section = section.child(self.delegated_from_row(from, thread, tokens, colors, cx));
+            rows += 1;
+        }
         if let Some(parent) = parent {
             section = section.child(relationship_row(parent, "icons/corner-left-up.svg", cx));
             rows += 1;
@@ -1127,6 +1132,68 @@ impl Workspace {
             element: section.into_any_element(),
             min_density: Density::Full,
         })
+    }
+
+    /// `DelegatedFromRow`: the thread on a linked environment whose agent delegated this one.
+    /// It opens only when this client is connected to that environment.
+    fn delegated_from_row(
+        &self,
+        from: &DelegatedFrom,
+        thread: &ThreadShell,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let parent = self
+            .shell
+            .threads
+            .iter()
+            .find(|parent| parent.id == from.thread_id && *parent.environment_id == *from.environment_id);
+        let title = parent.map_or(&from.title, |parent| &parent.title).clone();
+        let reachable = self.session(&from.environment_id).is_some();
+        let label = self
+            .env_info(&from.environment_id)
+            .and_then(|info| info.environment_label.clone())
+            .or_else(|| thread.link_origin.as_ref().map(|origin| origin.label.clone()));
+        let hint: SharedString = if reachable {
+            "Open parent agent".into()
+        } else {
+            format!(
+                "Delegated from {}. Connect to it to open the parent thread.",
+                label.as_deref().unwrap_or("a linked environment")
+            )
+            .into()
+        };
+        let (environment, thread_id) = (SharedString::from(from.environment_id.clone()), from.thread_id.clone());
+        row(colors)
+            .id("details-lineage-delegated-from")
+            .when(reachable, |el| {
+                el.cursor_pointer().hover(|style| style.bg(colors.hover)).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
+                    },
+                ))
+            })
+            .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+            .child(icon("icons/corner-left-up.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .line_height(px(16.))
+                    .text_color(tokens.foreground.opacity(0.85))
+                    .child(title),
+            )
+            .children(label.map(|label| {
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .text_color(tokens.muted_foreground)
+                    .child(format!("on {label}"))
+            }))
     }
 
     /// The Lineage heading's "…" menu: Disconnect agent session (`provider-session.detach`).
