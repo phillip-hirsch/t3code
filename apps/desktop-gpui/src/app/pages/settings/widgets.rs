@@ -1441,9 +1441,11 @@ impl Workspace {
         let pending = self.settings_ui.scroll_pending.clone();
         let scroll = self.settings_ui.scroll.clone();
         gpui_kit::canvas(
-            move |bounds, _, _| {
-                if !pending.replace(false) {
-                    return;
+            move |bounds, window, _| {
+                let Some(left) = pending.get().checked_sub(1) else { return };
+                pending.set(left);
+                if left > 0 {
+                    window.request_animation_frame();
                 }
                 let viewport = scroll.bounds();
                 let offset = scroll.offset();
@@ -1788,6 +1790,9 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
                 .child(Icon::new(IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground.opacity(0.7))),
         )
 }
+
+/// How many frames a search jump keeps re-centering its row while the page settles.
+pub(super) const JUMP_SETTLE_FRAMES: u8 = 3;
 
 /// A project group as the scope sentence's menu lists it.
 /// `ScopeMenu` turns into a searchable combobox past this many projects.
