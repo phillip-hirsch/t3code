@@ -376,8 +376,8 @@ impl Workspace {
         true
     }
 
-    /// The trigger and, while open, the popover.
-    pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The composer trigger's model name, effort, and whether the fast and ultracode marks show.
+    fn trigger_labels(&self) -> (SharedString, Option<String>, bool, bool) {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
@@ -392,36 +392,82 @@ impl Workspace {
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
         let fast = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "fastMode", s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
+        (name, effort, fast, ultracode)
+    }
+
+    /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
+    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
+    pub(super) fn model_trigger_natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
+        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let logo = self
+            .composer_model()
+            .and_then(|s| self.server_info().provider(&s.instance_id))
+            .and_then(|p| crate::assets::provider_icon(&p.driver))
+            .map_or(0., |_| 16. + 6.);
+        let parts: Vec<f32> = effort
+            .map(|e| measure(&e).min(96.))
+            .into_iter()
+            .chain([fast, ultracode].into_iter().filter(|on| *on).map(|_| 12.))
+            .collect();
+        let suffix = if parts.is_empty() {
+            0.
+        } else {
+            #[expect(clippy::cast_precision_loss, reason = "at most three suffix parts")]
+            let gaps = (parts.len() - 1) as f32 * 6.;
+            4. + parts.iter().sum::<f32>() + gaps
+        };
+        (18. + logo + measure(&name).min(224.) + suffix).max(52.)
+    }
+
+    /// The trigger and, while open, the popover.
+    pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.composer_model();
+        let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
+        let model = current.as_ref().and_then(|s| self.server_info().model(s));
+        let descriptors =
+            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let (name, effort, fast, ultracode) = self.trigger_labels();
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
         let trigger = control_button("model-picker", t)
             .min_w(px(52.))
+            // `min-w-0 shrink`: a narrow composer truncates the name instead of overflowing.
+            .flex_shrink(1.)
             .disabled(disabled)
             .selected(open)
-            // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
-            .children(icon.map(|(path, tint)| {
-                svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
-            }))
             .child(
-                div()
-                    .max_w(px(224.))
-                    .truncate()
-                    .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
-                    .child(name.clone()),
-            )
-            .when(effort.is_some() || fast || ultracode, |el| {
-                el.child(
-                    h_flex()
-                        .ml(px(-2.))
-                        .gap(px(6.))
-                        .text_color(suffix_color)
-                        .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
-                        .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
-                        .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
-                )
-            });
+                // The trigger's `gap-1.5` row; the suffix sits a word space after the name (`-ms-0.5`).
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(6.))
+                    // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
+                    .children(icon.map(|(path, tint)| {
+                        svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .max_w(px(224.))
+                            .truncate()
+                            .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
+                            .child(name.clone()),
+                    )
+                    .when(effort.is_some() || fast || ultracode, |el| {
+                        el.child(
+                            h_flex()
+                                .flex_none()
+                                .ml(px(-2.))
+                                .gap(px(6.))
+                                .text_color(suffix_color)
+                                .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
+                                .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
+                                .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
+                        )
+                    }),
+            );
         let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
@@ -1018,7 +1064,14 @@ impl Workspace {
             .children(speed)
             .children(ultracode)
             .child(div().flex_1())
-            .child(self.render_permissions_control("picker-permissions", icon, label, true, t, cx))
+            .child(self.render_permissions_control(
+                "picker-permissions",
+                icon,
+                label,
+                super::context_strip::PermissionsForm::Picker,
+                t,
+                cx,
+            ))
             .into_any_element()
     }
 }

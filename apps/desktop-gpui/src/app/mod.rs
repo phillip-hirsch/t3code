@@ -33,6 +33,7 @@ mod banners;
 mod chat;
 mod commands;
 mod composer;
+mod composer_fit;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;

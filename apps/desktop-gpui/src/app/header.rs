@@ -127,7 +127,6 @@ impl Workspace {
             div()
                 .id("thread-link-origin")
                 .flex_none()
-                .ml(px(6.))
                 .h(px(16.))
                 .px(px(3.))
                 .flex()
@@ -142,7 +141,10 @@ impl Workspace {
                 .child(format!("From {label}"))
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         });
-        header.child(breadcrumb.child(title).children(origin)).children(self.render_title_menu())
+        // `WorkspaceBreadcrumbItem current` (`min-w-10 flex-1`) in the clipped breadcrumb: the title
+        // gives way first, then the chip is cut at the edge.
+        let current = h_flex().min_w(px(40.)).flex_1().overflow_hidden().child(title).children(origin);
+        header.child(breadcrumb.child(current)).children(self.render_title_menu())
     }
 
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
@@ -152,7 +154,7 @@ impl Workspace {
             .id("thread-title")
             .group("thread-title")
             .relative()
-            .min_w(px(40.))
+            .min_w_0()
             .flex_shrink(1.)
             .gap_1()
             .occlude()
