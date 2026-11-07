@@ -23,8 +23,9 @@ use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
 /// `FontFamilyPicker`'s `sm:w-44`.
 const FAMILY_PICKER_WIDTH: f32 = 176.;
-/// The size select's `w-22`; beside the title the row's `min-w-40` widens it.
-const SIZE_SELECT_WIDTH: f32 = 88.;
+/// The size select's `w-22`, held to the trigger's own `min-w-36`; beside the title the row's
+/// `min-w-40` widens it.
+const SIZE_SELECT_WIDTH: f32 = 144.;
 
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
