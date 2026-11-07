@@ -13,7 +13,9 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
-use super::super::widgets::{SettingRow, SettingsView, note, settings_section, switch};
+use super::super::widgets::{
+    ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, note, settings_section, switch,
+};
 use crate::app::Workspace;
 use crate::settings::scope::{self, Source};
 use crate::theme::tokens;
@@ -70,7 +72,8 @@ impl Workspace {
             &json!(submodules),
             SUBMODULES.iter().map(|(id, label)| (json!(id), (*label).into())).collect(),
             SUBMODULES.iter().find(|(id, _)| *id == submodules).map_or("", |(_, label)| label),
-            176.,
+            SelectWidth::Full(176.),
+            window,
             cx,
         );
         let mode = view.str("branchNamingMode").to_owned();
@@ -170,7 +173,8 @@ impl Workspace {
                 "worktree-cleanup-mode",
                 options,
                 label,
-                0.,
+                SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+                window,
                 cx,
                 |this, mode: &str, window, cx| match mode {
                     "inherit" => this.clear_setting_overrides(&["worktreeCleanup"], window, cx),

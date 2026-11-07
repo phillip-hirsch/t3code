@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::widgets::{SettingRow, settings_section, switch};
+use super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, settings_section, switch};
 use crate::app::Workspace;
 use crate::app::git::{self, DiffColorScheme};
 use crate::app::pages::settings::widgets::SettingsView;
@@ -211,7 +211,8 @@ impl Workspace {
             format!("{}-size", row.id),
             sizes,
             format!("{size} px"),
-            88.,
+            SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+            window,
             cx,
             move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
         );

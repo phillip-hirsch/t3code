@@ -3755,6 +3755,8 @@ pub(crate) enum ActiveTooltip {
         tooltip: AnyTooltip,
         _task: Task<()>,
     },
+    /// The element was pressed: no tooltip until the pointer leaves it.
+    Pressed,
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -3763,7 +3765,7 @@ pub(crate) fn clear_active_tooltip(
 ) {
     match active_tooltip.borrow_mut().take() {
         None => {}
-        Some(ActiveTooltip::WaitingForShow { .. }) => {}
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => {}
         Some(ActiveTooltip::Visible { .. }) => window.refresh(),
         Some(ActiveTooltip::WaitingForHide { .. }) => window.refresh(),
     }
@@ -3775,7 +3777,7 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
 ) {
     let should_clear = match active_tooltip.borrow().as_ref() {
         None => false,
-        Some(ActiveTooltip::WaitingForShow { .. }) => false,
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => false,
         Some(ActiveTooltip::Visible { is_hoverable, .. }) => !is_hoverable,
         Some(ActiveTooltip::WaitingForHide { .. }) => false,
     };
@@ -3791,7 +3793,7 @@ pub(crate) fn set_tooltip_on_window(
 ) -> Option<TooltipId> {
     let tooltip = match active_tooltip.borrow().as_ref() {
         None => return None,
-        Some(ActiveTooltip::WaitingForShow { .. }) => return None,
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => return None,
         Some(ActiveTooltip::Visible { tooltip, .. }) => tooltip.clone(),
         Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => tooltip.clone(),
     };
@@ -3816,9 +3818,10 @@ pub(crate) fn register_tooltip_mouse_handlers(
         let build_tooltip = build_tooltip.clone();
         let check_is_hovered = check_is_hovered.clone();
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
-        move |_: &MouseMoveEvent, phase, window, cx| {
+        move |event: &MouseMoveEvent, phase, window, cx| {
             handle_tooltip_mouse_move(
                 &active_tooltip,
+                event.pressed_button,
                 &build_tooltip,
                 &check_is_hovered,
                 &check_is_hovered_during_prepaint,
@@ -3834,10 +3837,24 @@ pub(crate) fn register_tooltip_mouse_handlers(
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
-        move |_: &MouseDownEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
-                clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
+        let check_is_hovered = check_is_hovered.clone();
+        move |_: &MouseDownEvent, phase, window: &mut Window, _cx| {
+            if tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
+                return;
             }
+            // A press on the element hides its tooltip, shown or pending, like a browser's.
+            if phase.capture() && check_is_hovered(window) {
+                let previous = active_tooltip.borrow_mut().replace(ActiveTooltip::Pressed);
+                let was_shown = matches!(
+                    previous,
+                    Some(ActiveTooltip::Visible { .. } | ActiveTooltip::WaitingForHide { .. })
+                );
+                if was_shown {
+                    window.refresh();
+                }
+                return;
+            }
+            clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
         }
     });
 
@@ -3902,6 +3919,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
 /// gets occluded after display, it will stick around until the mouse exits the hover bounds.
 fn handle_tooltip_mouse_move(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    pressed_button: Option<MouseButton>,
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
@@ -3922,6 +3940,14 @@ fn handle_tooltip_mouse_move(
     }
 
     let action = match active_tooltip.borrow().as_ref() {
+        // Hover reads false while a button is held on the element, so wait for the release.
+        Some(ActiveTooltip::Pressed) => {
+            if pressed_button.is_none() && !check_is_hovered(window) {
+                Action::CancelShow
+            } else {
+                Action::None
+            }
+        }
         None => {
             let is_hovered = check_is_hovered(window);
             if is_hovered && phase.bubble() {
@@ -4085,7 +4111,7 @@ fn handle_tooltip_check_visible_and_update(
                 Action::None
             }
         }
-        None | Some(ActiveTooltip::WaitingForShow { .. }) => Action::None,
+        None | Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => Action::None,
     };
 
     match action {
@@ -4532,7 +4558,8 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
-        MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
+        MouseMoveEvent, PlatformInput, TestAppContext, TouchEvent, TouchId, canvas,
+        util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -5313,6 +5340,91 @@ mod tests {
             .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         assert!(!tooltip_shown(&mut test_app));
+    }
+
+    struct PressTarget;
+
+    impl Render for PressTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("press-target")
+                    .size(px(20.))
+                    .on_click(|_, _, _| {})
+                    .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
+            )
+        }
+    }
+
+    #[test]
+    fn pressing_a_tooltip_trigger_hides_its_tooltip_until_the_pointer_leaves() {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, _| PressTarget);
+        let any_window: AnyWindowHandle = window.into();
+        let settle = |test_app: &mut TestAppContext, event: Option<PlatformInput>| {
+            test_app
+                .update_window(any_window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    if let Some(event) = event {
+                        window.dispatch_event(event, cx);
+                    }
+                })
+                .unwrap();
+            test_app
+                .dispatcher
+                .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+            test_app.run_until_parked();
+            test_app
+                .update_window(any_window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.tooltip_bounds.is_some()
+                })
+                .unwrap()
+        };
+        let move_to = |x: f32| {
+            Some(
+                MouseMoveEvent {
+                    position: point(px(x), px(10.)),
+                    modifiers: Default::default(),
+                    pressed_button: None,
+                }
+                .to_platform_input(),
+            )
+        };
+        let at = point(px(10.), px(10.));
+
+        // The pointer arrives and the press lands before the tooltip's delay ends.
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(at, cx);
+                window.dispatch_event(
+                    MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: at,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: at,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(!settle(&mut test_app, None), "a press cancels a pending tooltip");
+        assert!(!settle(&mut test_app, move_to(12.)), "moving over the pressed trigger keeps it hidden");
+        assert!(!settle(&mut test_app, move_to(50.)));
+        assert!(settle(&mut test_app, move_to(10.)), "it shows again once the pointer comes back");
     }
 
     /// A tooltip target and its hover listener in a cached view, under an overlay the parent

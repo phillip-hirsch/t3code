@@ -9,8 +9,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, anchored,
-    deferred, div, point, prelude::FluentBuilder as _, px, relative,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative,
 };
 
 use super::Workspace;
@@ -32,7 +32,16 @@ struct Open {
     highlight: Option<usize>,
     /// `useOrderWhileOpen`: the group keys as the picker opened, so a pin doesn't move rows.
     order: Vec<String>,
+    scroll: ScrollHandle,
     _subscription: Subscription,
+}
+
+impl Open {
+    /// Highlights row `index` and scrolls the list to reveal it.
+    fn highlight(&mut self, index: usize) {
+        self.highlight = Some(index);
+        self.scroll.scroll_to_item(index);
+    }
 }
 
 /// A picker row.
@@ -92,31 +101,47 @@ impl Workspace {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
-        let subscription = cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
+        let subscription = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, window, cx| match event {
+            InputEvent::Change => {
                 // `autoHighlight`: typing highlights the first match.
                 if let Some(open) = &mut this.draft_picker.open {
-                    open.highlight = Some(0);
+                    open.highlight(0);
                 }
                 cx.notify();
             }
+            // Focus left the combobox (Tab, a click elsewhere): it closes and the focus stays there.
+            // Switching to another window leaves it open, as in the browser.
+            InputEvent::Blur if window.is_window_active() => {
+                this.dismiss_draft_picker(cx);
+            }
+            _ => {}
         });
         query.update(cx, |query, cx| query.focus(window, cx));
         let groups = self.draft_picker_groups();
         let current = self.current_project().map(|p| p.id.clone());
         // The selected project starts highlighted, as Base UI opens a combobox on its value.
-        let highlight = current.and_then(|id| groups.iter().position(|g| g.contains(&id))).or(Some(0));
+        let highlight = current.and_then(|id| groups.iter().position(|g| g.contains(&id))).unwrap_or(0);
         let order = groups.into_iter().map(|g| g.key).collect();
-        self.draft_picker.open = Some(Open { query, highlight, order, _subscription: subscription });
+        let mut open = Open { query, highlight: None, order, scroll: ScrollHandle::new(), _subscription: subscription };
+        open.highlight(highlight);
+        self.draft_picker.open = Some(open);
         cx.notify();
     }
 
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft_picker.open.take().is_some() {
-            self.draft_picker.closed_at = Some(Instant::now());
+        if self.dismiss_draft_picker(cx) {
             self.focus_composer(window, cx);
-            cx.notify();
         }
+    }
+
+    /// Closes the picker without moving focus; whether it was open.
+    fn dismiss_draft_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.draft_picker.open.take().is_none() {
+            return false;
+        }
+        self.draft_picker.closed_at = Some(Instant::now());
+        cx.notify();
+        true
     }
 
     fn pick_draft_entry(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
@@ -125,12 +150,13 @@ impl Workspace {
             Entry::AddProject => return self.open_palette(View::AddProject, window, cx),
             Entry::Project(key) => key,
         };
-        let current = self.current_project().map(|p| p.id.clone());
+        let current = self.current_project().map(|p| (p.id.clone(), p.environment_id.clone()));
         let Some(group) = self.draft_picker_groups().into_iter().find(|g| g.key == key) else { return };
-        if current.is_some_and(|id| group.contains(&id)) {
+        if current.as_ref().is_some_and(|(id, _)| group.contains(id)) {
             return;
         }
-        self.select_draft_project(group.representative().id.clone(), window, cx);
+        let target = group.target(current.as_ref().map(|(_, env)| env.as_ref()));
+        self.select_draft_project(target.id.clone(), window, cx);
     }
 
     /// `selectProject`: a draft with content moves to the project; an empty one opens the
@@ -167,7 +193,7 @@ impl Workspace {
             "escape" => self.close_draft_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
                 let last = rows.len() - 1;
-                open.highlight = Some(match (event.keystroke.key.as_str(), highlight) {
+                open.highlight(match (event.keystroke.key.as_str(), highlight) {
                     ("down", Some(i)) if i < last => i + 1,
                     ("down", _) => 0,
                     (_, Some(i)) if i > 0 => i - 1,
@@ -194,7 +220,7 @@ impl Workspace {
         let current = self.current_project().map(|p| p.id.clone());
         let rows = self.draft_picker_rows(cx);
         let pin_shortcut = self.shortcut_label("thread.pin");
-        let list = v_flex().p(px(4.)).children(rows.iter().enumerate().map(|(i, entry)| {
+        let list = rows.iter().enumerate().map(|(i, entry)| {
             let highlighted = open.highlight == Some(i);
             let group = match entry {
                 Entry::Project(key) => groups.iter().find(|g| &g.key == key),
@@ -263,6 +289,7 @@ impl Workspace {
             };
             h_flex()
                 .id(row_id.clone())
+                .flex_none()
                 .min_h(px(28.))
                 .px(px(8.))
                 .py(px(4.))
@@ -290,9 +317,10 @@ impl Workspace {
                         .child(name),
                 )
                 .children(pin)
-        }));
+        });
         let popup = v_flex()
             .id("draft-project-picker-popup")
+            .key_context(super::keymap::COMBOBOX_CONTEXT)
             .occlude()
             .w(px(POPUP_WIDTH))
             .max_h(px(368.))
@@ -339,13 +367,16 @@ impl Workspace {
                         ),
                 ),
             )
+            // The rows are the list's direct children, so the scroll handle can reveal one by index.
             .child(
-                div()
+                v_flex()
                     .id("draft-project-picker-list")
+                    .track_scroll(&open.scroll)
                     .flex_1()
                     .min_h_0()
+                    .p(px(4.))
                     .overflow_y_scroll()
-                    .child(list)
+                    .children(list)
                     .when(rows.is_empty(), |el| {
                         el.child(div().p(px(8.)).text_center().text_color(muted).child("No matching projects."))
                     }),

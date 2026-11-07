@@ -32,6 +32,16 @@ sidebar) under a newly opened overlay kept its hover card. The patch:
 - Tests in `div.rs`: `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`,
   `an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views`.
 
+**A press hides the pressed element's tooltip until the pointer leaves.** 0.3.11 clears a shown
+tooltip on mouse down but not one still waiting out its show delay, so a quick click opened a menu
+and the tooltip appeared over it; and the next mouse move over the element scheduled it again.
+Browsers (and Base UI's tooltips) close a tooltip when its trigger is pressed and keep it closed
+while the pointer stays. The patch, in `src/elements/div.rs`:
+
+- `ActiveTooltip::Pressed`: set by a mouse down on the element (capture phase), which drops a
+  pending or shown tooltip; a mouse move with no button held and the pointer off the element ends it.
+- Test: `pressing_a_tooltip_trigger_hides_its_tooltip_until_the_pointer_leaves`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and

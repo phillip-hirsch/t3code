@@ -268,6 +268,14 @@ impl ProjectGroup {
     pub fn contains(&self, project_id: &str) -> bool {
         self.project_ids.iter().any(|id| id == project_id)
     }
+
+    /// `buildSidebarProjectPickerEntries`' `targetProject`: the checkout on the current
+    /// project's environment, else the representative.
+    pub fn target(&self, environment_id: Option<&str>) -> &ProjectShell {
+        environment_id
+            .and_then(|env| self.members.iter().find(|m| m.project.environment_id == env))
+            .map_or_else(|| self.representative(), |m| &m.project)
+    }
 }
 
 /// An environment's "No project" workspace (`scratchWorkspaceRoot`).
@@ -479,6 +487,10 @@ mod tests {
         let members: Vec<(&str, bool)> =
             groups[0].members.iter().map(|m| (m.physical_key.as_str(), m.is_scratch)).collect();
         assert_eq!(members, [("env:/src/app", true), ("remote:/src/app", false)], "scratch roots are per environment");
+        // Picking the group from a remote draft stays on the remote checkout.
+        assert_eq!(groups[0].target(Some("remote")).id, "b");
+        assert_eq!(groups[0].target(Some("elsewhere")).id, "a");
+        assert_eq!(groups[0].target(None).id, "a");
     }
 
     fn repo(key: &str, root: &str) -> Value {

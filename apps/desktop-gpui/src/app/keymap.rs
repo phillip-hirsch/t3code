@@ -23,6 +23,8 @@ pub(super) const CAPTURE_CONTEXT: &str = "KeybindingCapture";
 pub(super) const PREVIEW_CONTEXT: &str = "PreviewPanel";
 const TERMINAL_CONTEXT: &str = "Terminal";
 const INPUT_CONTEXT: &str = "Input";
+/// An open combobox: the palette or a project picker (`[role="combobox"][aria-expanded="true"]`).
+pub(super) const COMBOBOX_CONTEXT: &str = "Combobox";
 pub(super) const MAC: bool = cfg!(target_os = "macos");
 
 /// `ShortcutMatchContext`, read when a key arrives.
@@ -40,6 +42,8 @@ pub(super) struct ShortcutContext {
     pub turn_running: bool,
     pub usage_page_open: bool,
     pub composer_requires_modifier: bool,
+    /// Not a `when` key: focus sits in an open combobox.
+    pub combobox_focus: bool,
 }
 
 impl ShortcutContext {
@@ -162,6 +166,8 @@ fn resolve_on<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutCo
         .filter(|rule| context.admits(rule))
         .find(|rule| matches(keystroke, &shortcut_for_context(rule, context), mac))
         .map(|rule| rule.command.as_str())
+        // `useThreadLifecycle`: an open project list pins its highlighted project with this key instead.
+        .filter(|command| !(context.combobox_focus && *command == "thread.pin"))
 }
 
 /// `effectiveShortcutsForCommand(…)[0]`: the command's newest shortcut no later rule claims.
@@ -347,6 +353,7 @@ impl super::Workspace {
             usage_page_open: self.page == Some(super::pages::Page::Usage),
             composer_requires_modifier: composer_focus
                 && super::send::requires_modifier(shortcut, &self.composer.read(cx).value()),
+            combobox_focus: focus_in(stack, COMBOBOX_CONTEXT),
         }
     }
 
@@ -430,6 +437,13 @@ mod tests {
         let rules = defaults();
         let rest = ShortcutContext::default();
         assert_eq!(resolve_on(rules, &key("ctrl-t"), &rest, false), None);
+        let editing = ShortcutContext { editable_focus: true, ..rest };
+        assert_eq!(resolve_on(rules, &key("ctrl-shift-p"), &editing, false), Some("thread.pin"));
+        assert_eq!(
+            resolve_on(rules, &key("ctrl-shift-p"), &ShortcutContext { combobox_focus: true, ..editing }, false),
+            None,
+            "an open project list takes the pin shortcut"
+        );
         assert_eq!(
             resolve_on(rules, &key("ctrl-t"), &ShortcutContext { right_panel_open: true, ..rest }, false),
             Some("rightPanel.new")

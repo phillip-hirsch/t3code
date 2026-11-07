@@ -1429,6 +1429,7 @@ impl Workspace {
                 .child(
                     v_flex()
                         .id("palette")
+                        .key_context(super::keymap::COMBOBOX_CONTEXT)
                         .w_full()
                         .max_w(px(576.))
                         // `max-h-105` on the popup, inside the viewport's 10vh top and bottom insets.

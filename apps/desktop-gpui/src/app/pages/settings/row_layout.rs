@@ -21,12 +21,20 @@ pub(super) struct RowLayout {
     id: ElementId,
     label: Option<AnyElement>,
     control: Option<AnyElement>,
+    /// A `w-auto` control: as wide as its content under the title, and at least this wide (its
+    /// content grows to fill) beside it.
+    hug: Option<Pixels>,
 }
 
 impl RowLayout {
     /// `id` keys the width remembered across frames; rows sharing one share a width.
     pub(super) fn new(id: ElementId, label: AnyElement, control: Option<AnyElement>) -> Self {
-        Self { id, label: Some(label), control }
+        Self { id, label: Some(label), control, hug: None }
+    }
+
+    pub(super) fn hugging(mut self, min: Option<Pixels>) -> Self {
+        self.hug = min;
+        self
     }
 }
 
@@ -70,15 +78,23 @@ impl Element for RowLayout {
                 .w_full()
                 .gap(px(12.))
                 .child(label)
-                // A block box, so a `w-full` control spans the row.
-                .children(control.map(|control| div().w_full().min_w_0().child(control)))
+                .children(control.map(|control| match self.hug {
+                    // A flex item, so it keeps its content's width.
+                    Some(_) => h_flex().w_full().min_w_0().child(control).into_any_element(),
+                    // A block box, so a `w-full` control spans the row.
+                    None => div().w_full().min_w_0().child(control).into_any_element(),
+                }))
                 .into_any_element()
         } else {
             h_flex()
                 .w_full()
                 .gap(px(32.))
                 .child(label)
-                .children(control.map(|control| h_flex().flex_none().justify_end().gap(px(8.)).child(control)))
+                .children(control.map(|control| match self.hug {
+                    // A block box at least `min` wide, which the control stretches to fill.
+                    Some(min) => div().flex_none().min_w(min).child(control).into_any_element(),
+                    None => h_flex().flex_none().justify_end().gap(px(8.)).child(control).into_any_element(),
+                }))
                 .into_any_element()
         };
         (row.request_layout(window, cx), (row, stacked))
