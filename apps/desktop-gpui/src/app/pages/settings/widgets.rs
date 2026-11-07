@@ -145,6 +145,8 @@ pub(in crate::app) struct SettingRow {
     body: Option<AnyElement>,
     keys: Vec<&'static str>,
     control: Control,
+    /// The control as it draws beside the title, when that differs (see [`Self::control_beside`]).
+    control_beside: Option<AnyElement>,
     /// A reset the row works out itself, replacing the bound keys' default.
     reset: Option<Option<Value>>,
     unavailable: bool,
@@ -193,6 +195,7 @@ impl SettingRow {
             body: None,
             keys: Vec::new(),
             control: Control::None,
+            control_beside: None,
             unavailable: false,
             reset: None,
         }
@@ -270,6 +273,13 @@ impl SettingRow {
     /// A control the section builds itself.
     pub(in crate::app) fn control(mut self, control: impl IntoElement) -> Self {
         self.control = Control::Element(control.into_any_element());
+        self
+    }
+
+    /// The control as drawn beside the title, where `SettingsRow` gives every select trigger
+    /// in it `min-w-40`; `control` stays the stacked one.
+    pub(in crate::app) fn control_beside(mut self, control: impl IntoElement) -> Self {
+        self.control_beside = Some(control.into_any_element());
         self
     }
 
@@ -394,6 +404,8 @@ pub(in crate::app) struct RowFrame {
     description: Option<AnyElement>,
     status: Option<AnyElement>,
     control: Option<AnyElement>,
+    /// `control` as drawn beside the title, when that differs.
+    control_beside: Option<AnyElement>,
     /// The control hugs its content under the title and is at least this wide beside it.
     hug: Option<Pixels>,
     body: Option<AnyElement>,
@@ -409,6 +421,7 @@ impl RowFrame {
             description: None,
             status: None,
             control: None,
+            control_beside: None,
             hug: None,
             body: None,
             dimmed: false,
@@ -482,7 +495,11 @@ impl RowFrame {
             .px(px(16.))
             .pt(px(12.))
             .pb(px(if has_body { 4. } else { 12. }))
-            .child(RowLayout::new(layout_id, label.into_any_element(), self.control).hugging(self.hug))
+            .child(
+                RowLayout::new(layout_id, label.into_any_element(), self.control)
+                    .beside(self.control_beside)
+                    .hugging(self.hug),
+            )
             .children(self.body)
     }
 }
@@ -918,7 +935,7 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
-        let SettingRow { id, title, description, status, tip, body, control, unavailable, .. } = row;
+        let SettingRow { id, title, description, status, tip, body, control, control_beside, unavailable, .. } = row;
         let (state, summary) = match view.environment() {
             Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
             None => (InheritanceState::Default, "Built-in default".to_owned()),
@@ -968,7 +985,7 @@ impl Workspace {
         frame.description = description;
         frame.body = body;
         frame.hug = hug;
-        frame.control = control.map(|control| match inert {
+        let inert_control = |control: AnyElement| match inert {
             Some(message) => div()
                 .id(SharedString::from(format!("{id}-inert")))
                 .flex_none()
@@ -978,7 +995,9 @@ impl Workspace {
                 .child(control)
                 .into_any_element(),
             None => control,
-        });
+        };
+        frame.control = control.map(inert_control);
+        frame.control_beside = control_beside.map(inert_control);
         frame
             .render(&t)
             .id(group.clone())

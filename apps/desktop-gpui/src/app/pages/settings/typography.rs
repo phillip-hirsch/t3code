@@ -21,11 +21,12 @@ use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
-/// `FontFamilyPicker`'s `sm:w-44`.
+/// `FontFamilyPicker`'s `sm:w-44`; below `sm` it is `min-w-36 flex-1`.
 const FAMILY_PICKER_WIDTH: f32 = 176.;
-/// The size select's `w-22`, held to the trigger's own `min-w-36`. Beside the title the web's
-/// row widens it to `min-w-40`, which a select in GPUI's popover wrapper can't follow.
+/// The size select's `w-22`, held to the trigger's own `min-w-36`.
 const SIZE_SELECT_WIDTH: f32 = 144.;
+/// Beside the title, `SettingsRow` widens every select trigger to `min-w-40`.
+const SIZE_SELECT_BESIDE_WIDTH: f32 = 160.;
 
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
@@ -211,28 +212,36 @@ impl Workspace {
         let size = view.value(row.size_key).as_i64().unwrap_or(size_default);
         let picker = self.font_picker(&row, &family, window, cx);
         let size_key = row.size_key;
-        let sizes =
+        let sizes: Vec<_> =
             (row.sizes.0..=row.sizes.1).map(|px| (px, SharedString::from(format!("{px} px")), px == size)).collect();
-        let size_select = self.row_menu_select(
-            format!("{}-size", row.id),
-            sizes,
-            format!("{size} px"),
-            SelectWidth::Fixed(SIZE_SELECT_WIDTH),
-            window,
-            cx,
-            move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
-        );
-        let control = h_flex()
-            .gap(px(8.))
-            .child(
-                Select::new(&picker)
-                    .small()
-                    .w(px(FAMILY_PICKER_WIDTH))
-                    .menu_width(px(288.))
-                    .placeholder(row.default_family.clone())
-                    .search_placeholder("Search fonts…"),
+        let mut size_select = |width| {
+            self.row_menu_select(
+                format!("{}-size", row.id),
+                sizes.clone(),
+                format!("{size} px"),
+                SelectWidth::Fixed(width),
+                window,
+                cx,
+                move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
             )
-            .child(size_select);
+        };
+        let (stacked_size, beside_size) = (size_select(SIZE_SELECT_WIDTH), size_select(SIZE_SELECT_BESIDE_WIDTH));
+        let below_sm = window.viewport_size().width < px(640.);
+        // `min-w-36 flex-1 sm:w-44 sm:flex-none` on the picker's wrapper.
+        let family_picker = |stacked: bool| {
+            let select = Select::new(&picker)
+                .small()
+                .w_full()
+                .menu_width(px(288.))
+                .placeholder(row.default_family.clone())
+                .search_placeholder("Search fonts…");
+            div()
+                .map(|el| if stacked && below_sm { el.flex_1().min_w(px(144.)) } else { el.w(px(FAMILY_PICKER_WIDTH)) })
+                .child(select)
+        };
+        // `flex w-full flex-wrap sm:w-auto @min-[32rem]/settings-row:flex-nowrap`
+        let control = h_flex().w_full().flex_wrap().gap(px(8.)).child(family_picker(true)).child(stacked_size);
+        let control_beside = h_flex().gap(px(8.)).child(family_picker(false)).child(beside_size);
         let reset = (!family.is_empty() || size != size_default)
             .then(|| json!({ row.family_key: "", row.size_key: size_default }));
         let fonts = t.fonts;
@@ -249,6 +258,7 @@ impl Workspace {
             .setting(row.family_key)
             .setting(row.size_key)
             .control(control)
+            .control_beside(control_beside)
             .reset(reset);
         let setting = if row.previews.is_empty() { setting } else { setting.body(previews) };
         self.setting_row(view, setting, window, cx)
