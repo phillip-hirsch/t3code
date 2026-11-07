@@ -493,7 +493,7 @@ impl Workspace {
                             .border_color(t.ring),
                     )
                 })
-                .children(self.render_draft_picker(&t, cx))
+                .children(self.render_draft_picker(&t, window, cx))
         };
         let title = |el: gpui_kit::Div| {
             el.w_full().text_size(title_size).line_height(rems(2.25)).text_color(t.foreground).justify_center()

@@ -239,8 +239,17 @@ impl Workspace {
     }
 
     /// The open popup, centered under the trigger it is a child of (`ComboboxPopup align="center"`).
-    pub(super) fn render_draft_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_draft_picker(
+        &self,
+        t: &Tokens,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let open = self.draft_picker.open.as_ref()?;
+        // Below `sm`, `ComboboxItem` is `min-h-8` and `ProjectPinButton`'s `icon-xs` is `size-7`.
+        let below_sm = window.viewport_size().width < px(640.);
+        let (row_min_height, pin_size) = if below_sm { (32., 28.) } else { (28., 24.) };
+        let search_focused = gpui_kit::Focusable::focus_handle(open.query.read(cx), cx).is_focused(window);
         let fg = t.foreground;
         let muted = t.muted_foreground;
         let groups = self.draft_picker_groups();
@@ -280,7 +289,7 @@ impl Workspace {
                     .group(pin_group.clone())
                     .relative()
                     .ml_auto()
-                    .size(px(24.))
+                    .size(px(pin_size))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -337,7 +346,7 @@ impl Workspace {
             h_flex()
                 .id(row_id.clone())
                 .flex_none()
-                .min_h(px(28.))
+                .min_h(px(row_min_height))
                 .px(px(8.))
                 .py(px(4.))
                 .gap(px(8.))
@@ -391,14 +400,15 @@ impl Workspace {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.draft_picker_key(event, window, cx);
             }))
-            // `ComboboxSearchInput`: a search glyph and an underline in the ring color while focused.
+            // `ComboboxSearchInput`: a search glyph and an underline, `border-border/70` and
+            // `focus-within:border-ring`.
             .child(
                 div().px(px(12.)).pt(px(10.)).child(
                     h_flex()
                         .relative()
                         .pb(px(6.))
                         .border_b_1()
-                        .border_color(t.ring)
+                        .border_color(if search_focused { t.ring } else { t.border.opacity(0.7) })
                         .child(
                             div()
                                 .absolute()
