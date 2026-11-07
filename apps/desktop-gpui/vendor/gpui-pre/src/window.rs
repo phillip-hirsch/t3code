@@ -3964,8 +3964,6 @@ impl Window {
         let mut prompt_element = None;
         let mut active_drag_element = None;
         let mut tooltip_element = None;
-        // Shown tooltips check their element against this frame's hitboxes as they prepaint.
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
         if let Some(prompt) = self.prompt.take() {
             let mut element = prompt.view.any_view().into_any_element();
             let prompt_layout_id = element.request_layout(self, cx);
@@ -3983,6 +3981,10 @@ impl Window {
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
+            // Shown tooltips check their element against this frame's hitboxes as they prepaint.
+            if self.next_frame.tooltip_requests.iter().any(Option::is_some) {
+                self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+            }
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
