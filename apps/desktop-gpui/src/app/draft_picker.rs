@@ -37,6 +37,8 @@ impl DraftPicker {
 struct Open {
     query: Entity<InputState>,
     highlight: Option<usize>,
+    /// The selected project's row, highlighted again when the query is cleared.
+    selected: usize,
     /// `useOrderWhileOpen`: the group keys as the picker opened, so a pin doesn't move rows.
     order: Vec<String>,
     scroll: ScrollHandle,
@@ -68,6 +70,12 @@ enum Entry {
     /// A project group, by key.
     Project(String),
     AddProject,
+}
+
+/// The row a query change highlights (`autoHighlight`): the first match, or the selected
+/// project once the query is empty again.
+fn query_highlight(query: &str, selected: usize) -> usize {
+    if query.trim().is_empty() { selected } else { 0 }
 }
 
 /// The rows for `groups` (`(key, name)` in picker order): the projects in the order they had
@@ -106,10 +114,12 @@ impl Workspace {
         rows(&groups, &open.order, &open.query.read(cx).value())
     }
 
-    /// `ComboboxTrigger`'s arrow keys: open the picker and move its highlight a row.
+    /// `ComboboxTrigger`'s arrow keys: open the picker on the selected project, or move an open
+    /// picker's highlight a row.
     pub(super) fn open_draft_picker_from_key(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.draft_picker.open.is_none() {
             self.toggle_draft_picker(window, cx);
+            return;
         }
         let len = self.draft_picker_rows(cx).len();
         if let Some(open) = &mut self.draft_picker.open {
@@ -131,11 +141,11 @@ impl Workspace {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
-        let subscription = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&query, window, |this, query, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
-                // `autoHighlight`: typing highlights the first match.
+                let value = query.read(cx).value();
                 if let Some(open) = &mut this.draft_picker.open {
-                    open.highlight(0);
+                    open.highlight(query_highlight(&value, open.selected));
                 }
                 cx.notify();
             }
@@ -152,7 +162,14 @@ impl Workspace {
         // The selected project starts highlighted, as Base UI opens a combobox on its value.
         let highlight = current.and_then(|id| groups.iter().position(|g| g.contains(&id))).unwrap_or(0);
         let order = groups.into_iter().map(|g| g.key).collect();
-        let mut open = Open { query, highlight: None, order, scroll: ScrollHandle::new(), _subscription: subscription };
+        let mut open = Open {
+            query,
+            highlight: None,
+            selected: highlight,
+            order,
+            scroll: ScrollHandle::new(),
+            _subscription: subscription,
+        };
         open.highlight(highlight);
         self.draft_picker.open = Some(open);
         cx.notify();
@@ -482,5 +499,8 @@ mod tests {
         let all = groups(&["t3code", "Phillip", "examples"]);
         assert_eq!(keys(&rows(&all, &[], " T3 ")), ["key-t3code"]);
         assert_eq!(keys(&rows(&all, &[], "zzz")), Vec::<&str>::new());
+        // Typing highlights the first match; clearing the query goes back to the selected project.
+        assert_eq!(query_highlight("t3", 2), 0);
+        assert_eq!(query_highlight(" ", 2), 2);
     }
 }
