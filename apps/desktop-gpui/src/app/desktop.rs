@@ -323,6 +323,7 @@ impl Workspace {
             let resolved = links::resolve_model(&self.server_info().providers, provider, model.as_deref());
             if let Some((selection, _)) = &resolved {
                 self.model_override = Some(selection.clone());
+                self.model_explicit = true;
             }
             match resolved {
                 None => notes.push(format!(

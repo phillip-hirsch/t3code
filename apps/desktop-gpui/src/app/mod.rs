@@ -171,6 +171,9 @@ pub struct Workspace {
     rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
+    /// `model_override` is the user's pick, not the model a new draft inherited
+    /// (`modelSelectionExplicit`).
+    model_explicit: bool,
     /// The model the user last picked in the composer (`stickyModelSelectionByProvider`), which
     /// new drafts start on. Kept for the session.
     sticky_model: Option<ModelSelection>,
@@ -377,6 +380,7 @@ impl Workspace {
             sending: false,
             rewinding: HashSet::new(),
             model_override: None,
+            model_explicit: false,
             sticky_model: None,
             runtime_mode_override: None,
             composer_empty: true,
@@ -760,6 +764,7 @@ impl Workspace {
         self.set_composer_text("", window, cx);
         self.thread = None;
         self.model_override = None;
+        self.model_explicit = false;
         self.question = None;
         self.reset_timeline(cx);
         self.notify_sidebar(cx);
@@ -837,6 +842,7 @@ impl Workspace {
             _subscription: None,
         });
         self.model_override = None;
+        self.model_explicit = false;
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
@@ -871,6 +877,7 @@ impl Workspace {
             let project = self.target_project();
             self.model_override =
                 crate::new_thread::new_draft_model(self.server_info(), project, carried, self.sticky_model.as_ref());
+            self.model_explicit = false;
         }
         self.runtime_mode_override = None;
         self.restore_composer(window, cx);

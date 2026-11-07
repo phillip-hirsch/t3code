@@ -229,6 +229,7 @@ impl Workspace {
         let key = (selection.instance_id.clone(), selection.model.clone());
         let options = self.picker.remembered.get(&key).cloned();
         self.model_override = Some(ModelSelection { options, ..selection });
+        self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
         self.refresh_menu_items(cx);
         cx.notify();
@@ -241,6 +242,7 @@ impl Workspace {
         self.picker.remembered.insert(key, next.options.clone().unwrap_or_default());
         self.sticky_model = Some(next.clone());
         self.model_override = Some(next);
+        self.model_explicit = true;
         cx.notify();
     }
 

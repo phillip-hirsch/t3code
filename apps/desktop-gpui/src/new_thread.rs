@@ -293,6 +293,21 @@ pub fn new_draft_model(
     carried.or_else(|| sticky.cloned())
 }
 
+/// The model a draft with content keeps when it moves to `project` (`selectProject`): an explicit
+/// pick stays; an inherited one resolves again there, like a new draft with nothing to carry.
+pub fn moved_draft_model(
+    info: &ServerInfo,
+    project: Option<&ProjectShell>,
+    current: Option<ModelSelection>,
+    explicit: bool,
+    sticky: Option<&ModelSelection>,
+) -> Option<ModelSelection> {
+    if explicit && current.is_some() {
+        return current;
+    }
+    new_draft_model(info, project, None, sticky)
+}
+
 /// The model a draft without a pick hands to a draft started from it: the web stores its
 /// project's default, or the usage fallback that replaced it, on the draft
 /// (`projectDefaultModelSelection`). A draft on an automatic provider default stores none.
@@ -488,7 +503,11 @@ mod tests {
         assert_eq!(new_draft_model(&bare, Some(&p), None, Some(&sticky)), Some(sticky.clone()));
         assert_eq!(new_draft_model(&bare, Some(&p), None, None), None);
         let configured = info(json!({"defaultModelSelection": {"instanceId": "codex", "model": "gpt"}}));
-        assert_eq!(new_draft_model(&configured, Some(&p), Some(carried), Some(&sticky)), None);
+        assert_eq!(new_draft_model(&configured, Some(&p), Some(carried.clone()), Some(&sticky)), None);
+        // Moving a draft with content: only an explicit pick survives the destination's default.
+        assert_eq!(moved_draft_model(&configured, Some(&p), Some(carried.clone()), false, Some(&sticky)), None);
+        assert_eq!(moved_draft_model(&bare, Some(&p), Some(carried.clone()), false, Some(&sticky)), Some(sticky));
+        assert_eq!(moved_draft_model(&configured, Some(&p), Some(carried.clone()), true, None), Some(carried));
     }
 
     #[test]

@@ -185,11 +185,13 @@ impl Workspace {
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
         self.model_override = None;
+        self.model_explicit = false;
         self.notify_sidebar(cx);
         cx.notify();
     }
 
-    /// `selectProject` for a draft with content: it moves to the project and keeps an explicit model.
+    /// `selectProject` for a draft with content: it moves to the project and keeps an explicit model;
+    /// an inherited one resolves again for the destination.
     /// A project that already holds an unsent draft keeps it, and that draft opens instead.
     pub(super) fn move_draft_to_project(
         &mut self,
@@ -203,9 +205,16 @@ impl Workspace {
             self.start_draft_in(env, project_id, window, cx);
             return;
         }
-        let model = self.model_override.take();
+        let (model, explicit) = (self.model_override.take(), self.model_explicit);
         self.retarget_draft(env, project_id, cx);
-        self.model_override = model;
+        self.model_override = crate::new_thread::moved_draft_model(
+            self.server_info(),
+            self.target_project(),
+            model,
+            explicit,
+            self.sticky_model.as_ref(),
+        );
+        self.model_explicit = explicit && self.model_override.is_some();
     }
 
     fn open_scratch_then_retarget(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
