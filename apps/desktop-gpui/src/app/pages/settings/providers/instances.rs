@@ -135,6 +135,18 @@ pub(super) fn instance_rows(settings: &Value, providers: &[Value]) -> Vec<Instan
     rows
 }
 
+fn saved_row(settings: &Value, providers: &[Value], instance_id: &str) -> Option<InstanceRow> {
+    instance_rows(settings, providers).into_iter().find(|row| row.id == instance_id)
+}
+
+/// The config a label edit saves: the instance as saved now, never as the field first saw it, with
+/// `displayName` set, or removed when blank. `None` once the instance is gone.
+fn with_display_name(settings: &Value, providers: &[Value], instance_id: &str, label: &str) -> Option<Value> {
+    let instance = saved_row(settings, providers, instance_id)?.instance();
+    let label = label.trim();
+    Some(with_key(&instance, "displayName", (!label.is_empty()).then(|| json!(label))))
+}
+
 pub(super) fn live_provider<'a>(providers: &'a [Value], instance_id: &str) -> Option<&'a Value> {
     providers.iter().find(|p| p["instanceId"] == instance_id)
 }
@@ -1364,7 +1376,7 @@ impl Workspace {
             window,
             cx,
         );
-        let name_row = row.clone();
+        let instance_id = row.id.clone();
         let input = self.draft_input(
             page,
             format!("display-name:{}", row.id),
@@ -1374,9 +1386,11 @@ impl Workspace {
             window,
             cx,
             move |this, value, window, cx| {
-                let trimmed = value.trim();
-                let next = with_key(&name_row.instance(), "displayName", (!trimmed.is_empty()).then(|| json!(trimmed)));
-                this.persist_provider_instance(&name_row.id, next, window, cx);
+                let info = this.settings_info();
+                let Some(next) = with_display_name(&info.settings, &info.providers_json, &instance_id, &value) else {
+                    return;
+                };
+                this.persist_provider_instance(&instance_id, next, window, cx);
             },
         );
         h_flex().gap_2().justify_end().child(picker).child(text_input(&input, Some(224.))).into_any_element()
@@ -1401,7 +1415,7 @@ impl Workspace {
         } else {
             field.placeholder.unwrap_or("Not set")
         };
-        let commit_row = row.clone();
+        let instance_id = row.id.clone();
         let input = self.draft_input(
             page,
             format!("env-field:{}:{}", row.id, field.name),
@@ -1411,7 +1425,8 @@ impl Workspace {
             window,
             cx,
             move |this, value, window, cx| {
-                let instance = commit_row.instance();
+                let Some(row) = this.instance_row(&instance_id) else { return };
+                let instance = row.instance();
                 let configured =
                     environment(&instance).iter().any(|v| v["name"] == field.name && v["valueRedacted"] == true);
                 if configured && value.is_empty() {
@@ -1421,7 +1436,7 @@ impl Workspace {
                     &instance,
                     environment_with_field_value(&environment(&instance), field.name, &value),
                 );
-                this.persist_provider_instance(&commit_row.id, next, window, cx);
+                this.persist_provider_instance(&instance_id, next, window, cx);
             },
         );
         let clear_row = row.clone();
@@ -1447,9 +1462,7 @@ impl Workspace {
 
     /// The saved instance behind a list row, looked up again when a deferred edit commits.
     pub(super) fn instance_row(&self, instance_id: &str) -> Option<InstanceRow> {
-        instance_rows(&self.settings_info().settings, &self.settings_info().providers_json)
-            .into_iter()
-            .find(|row| row.id == instance_id)
+        saved_row(&self.settings_info().settings, &self.settings_info().providers_json, instance_id)
     }
 
     /// A managed Codex instance's Runtime section: folded, its header outside the card
@@ -1913,6 +1926,20 @@ mod tests {
         assert_eq!(one_click_update_candidates(&same), [("codex".to_owned(), "codex".to_owned())]);
         let split = [candidate("codex", "a"), candidate("codex_2", "b")];
         assert!(one_click_update_candidates(&split).is_empty());
+    }
+
+    #[test]
+    fn label_edits_keep_the_saved_config() {
+        let settings = json!({"providerInstances": {
+            "codex": {"driver": "codex", "enabled": false, "config": {"binaryPath": "/opt/b/codex"}},
+        }});
+        let labeled = with_display_name(&settings, &[], "codex", " Work ").expect("codex is saved");
+        assert_eq!(labeled["displayName"], "Work");
+        assert_eq!(labeled["enabled"], false);
+        assert_eq!(labeled["config"], json!({"binaryPath": "/opt/b/codex"}));
+        let labeled = json!({"providerInstances": {"codex": {"driver": "codex", "displayName": "Work"}}});
+        assert_eq!(with_display_name(&labeled, &[], "codex", "  "), Some(json!({"driver": "codex"})));
+        assert_eq!(with_display_name(&settings, &[], "codex_gone", "Work"), None);
     }
 
     #[test]

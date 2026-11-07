@@ -103,9 +103,11 @@ impl Workspace {
                 ScopeKind::Environment => format!("Reconnect {} to set up its providers.", view.scope.label),
                 _ => "Connect an environment to set up its providers.".to_owned(),
             };
-            return div().p_8().text_sm().text_color(t.muted_foreground).child(message).into_any_element();
+            let note = div().px_4().text_sm().text_color(t.muted_foreground).child(message);
+            return self.settings_page("providers", &view, [note.into_any_element()], cx);
         }
-        let page = window.use_keyed_state("settings-providers", cx, |_, _| ProvidersPage::default());
+        let page =
+            window.use_keyed_state(self.settings_state_key("settings-providers"), cx, |_, _| ProvidersPage::default());
         let override_projects =
             instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);
