@@ -447,11 +447,22 @@ struct FileChip {
     path: String,
     line: Option<u32>,
     icon_path: String,
+    label: String,
+    /// A descriptive link's own text, shown before the chip.
+    description: Option<String>,
 }
 
-/// `MarkdownFileLink`: inline code that names a file, and a link whose text is its own path,
-/// draw as a chip with the file's icon. A click previews it in the panel (an editor with the
-/// platform modifier, or outside the workspace); a right click opens the file menu.
+/// A Markdown link to a file: its destination, and its text unless that text is the path.
+fn file_link(text: &str, url: &str) -> Option<(file_links::FilePosition, Option<String>)> {
+    let file = file_links::parse_file_link(url)?;
+    let description = (!file_links::is_file_link_label(text, url)).then(|| text.trim().to_owned());
+    Some((file, description.filter(|text| !text.is_empty())))
+}
+
+/// `MarkdownFileLink`: inline code that names a file, and a link to a file, draw as a chip with
+/// the file's icon; a link with descriptive text keeps it before the chip. A click previews the
+/// file in the panel (an editor with the platform modifier, or outside the workspace); a right
+/// click opens the file menu.
 pub(super) struct FileChips {
     pub workspace: WeakEntity<Workspace>,
     pub dark: bool,
@@ -468,14 +479,13 @@ impl MarkdownPlugin for FileChips {
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         use gpui_kit::component::text::markdown_ast::Node;
-        let (path, file) = match node {
+        let (path, file, description) = match node {
             Node::InlineCode(code) => {
                 let candidate = file_links::inline_code_candidate(&code.value)?;
                 let file = file_links::split_position(&candidate, "");
-                (candidate, file)
+                (candidate, file, None)
             }
             Node::Link(link) if !link.url.starts_with(SKILL_SCHEME) && !link.url.starts_with("t3-thread:") => {
-                let file = file_links::parse_file_link(&link.url)?;
                 let text: String = link
                     .children
                     .iter()
@@ -485,18 +495,17 @@ impl MarkdownPlugin for FileChips {
                         _ => "",
                     })
                     .collect();
-                if !file_links::is_file_link_label(&text, &link.url) {
-                    return None;
-                }
-                (file_links::with_position(&file), file)
+                let (file, description) = file_link(&text, &link.url)?;
+                (file_links::with_position(&file), file, description)
             }
             _ => return None,
         };
         let paths = file_links::document_paths(cx.source());
         let label = file_links::chip_label(&file, &file_links::parent_suffixes(paths.iter().map(String::as_str)));
         let markdown = cx.node_source(node).unwrap_or_default().to_owned();
-        let chip = FileChip { path, line: file.line, icon_path: file.path };
-        Some(MarkdownNode::new("t3-file", chip).text(label).markdown(markdown))
+        let text = description.as_ref().map_or_else(|| label.clone(), |description| format!("{description} {label}"));
+        let chip = FileChip { path, line: file.line, icon_path: file.path, label, description };
+        Some(MarkdownNode::new("t3-file", chip).text(text).markdown(markdown))
     }
 
     fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
@@ -515,7 +524,7 @@ impl MarkdownPlugin for FileChips {
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
         let menu_path = path.clone();
         let tooltip: SharedString = path.clone().into();
-        h_flex()
+        let element = h_flex()
             .id(SharedString::from(format!("file-chip:{path}")))
             .max_w_full()
             .gap(px(3.))
@@ -524,7 +533,7 @@ impl MarkdownPlugin for FileChips {
             .text_color(ink)
             .cursor_pointer()
             .child(Icon::empty().path(asset).size(px(14.)).flex_none().text_color(icon_color))
-            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(move |event, window, cx| {
                 let editor = event.modifiers().secondary(cx);
@@ -539,8 +548,17 @@ impl MarkdownPlugin for FileChips {
                         w.open_file_menu(target, position, window, cx);
                     }
                 });
-            })
-            .into_any_element()
+            });
+        match &chip.description {
+            // The link's text stays plain prose; the chip opens the file.
+            Some(description) => h_flex()
+                .max_w_full()
+                .gap(px(4.))
+                .child(div().flex_none().child(description.clone()))
+                .child(element.min_w_0())
+                .into_any_element(),
+            None => element.into_any_element(),
+        }
     }
 }
 
@@ -732,6 +750,17 @@ mod tests {
         assert_eq!(workspace_relative("/repo/src/../x.rs", Some("/repo")).as_deref(), Some("src/../x.rs"));
         // Lowercasing the Kelvin sign changes its byte length; this sliced inside it.
         assert_eq!(workspace_relative("/repo/\u{212A}/a.rs", Some("/repo/k")), None);
+    }
+
+    #[test]
+    fn descriptive_file_links_keep_their_text_beside_the_chip() {
+        let (file, description) = file_link("Open implementation", "src/main.rs:12").expect("a file link");
+        assert_eq!(
+            (file.path.as_str(), file.line, description.as_deref()),
+            ("src/main.rs", Some(12), Some("Open implementation"))
+        );
+        assert_eq!(file_link("src/main.rs", "src/main.rs").map(|(_, text)| text), Some(None), "its own path");
+        assert!(file_link("Docs", "https://example.com/docs").is_none());
     }
 
     #[test]
