@@ -162,6 +162,10 @@ fn section_icon(id: &str) -> Icon {
 pub(in crate::app) struct SettingsUi {
     /// The scope the sentence picked, kept across sections (`retainSettingsScope`).
     pub(in crate::app) scope: ScopeSearch,
+    /// The providers card is under 48rem, so its list sits above the editor (`@container/providers`).
+    pub(in crate::app) providers_narrow: bool,
+    /// The provider editor is too narrow for its rows' controls to sit beside their titles.
+    pub(in crate::app) provider_rows_stacked: bool,
     search: Entity<InputState>,
     active_result: usize,
     /// The row a search result jumped to; highlighted until the next navigation.
@@ -220,6 +224,8 @@ impl SettingsUi {
             project_picker: None,
             last_grouping_mode: "repository",
             theme_library: Default::default(),
+            providers_narrow: false,
+            provider_rows_stacked: false,
             diff_preview: None,
             focus: cx.focus_handle(),
             focus_on_render: false,

@@ -27,8 +27,8 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, px,
+    IntoElement, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -150,11 +150,33 @@ impl Workspace {
                 move |this, _, window, cx| this.open_add_provider_dialog(page.clone(), window, cx)
             }));
 
+        let layout = (self.settings_ui.providers_narrow, self.settings_ui.provider_rows_stacked);
+        let narrow = layout.0;
+        let workspace = cx.weak_entity();
         let card = div()
             .flex()
-            .h(px(card_height(window)))
+            .when(narrow, gpui_kit::Styled::flex_col)
+            .when(!narrow, |el| el.h(px(card_height(window))))
             .w_full()
             .overflow_hidden()
+            // The card's and the editor's widths decide next frame how they lay out.
+            .on_children_prepainted(move |bounds, window, cx| {
+                let (Some(list), Some(editor)) = (bounds.first(), bounds.get(1)) else { return };
+                let rem = window.rem_size();
+                // The card's 1px border on each side, around its children.
+                let card = editor.right() - list.left() + px(2.);
+                let next = (card < rem * 48., rows_stacked(editor.size.width, rem));
+                if next == layout {
+                    return;
+                }
+                let workspace = workspace.clone();
+                cx.defer(move |cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        (this.settings_ui.providers_narrow, this.settings_ui.provider_rows_stacked) = next;
+                        cx.notify();
+                    });
+                });
+            })
             .rounded_xl()
             .border_1()
             .border_color(t.border.opacity(0.6))
@@ -162,25 +184,31 @@ impl Workspace {
             .child(
                 div()
                     .id("providers-list")
-                    .w(px(272.))
-                    .flex_none()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .border_r_1()
+                    .map(|el| {
+                        if narrow {
+                            el.w_full().border_b_1()
+                        } else {
+                            el.w(px(272.)).flex_none().h_full().overflow_y_scroll().border_r_1()
+                        }
+                    })
                     .border_color(t.border.opacity(0.6))
                     .bg(t.muted.opacity(0.1))
                     .child(divided(list.into_iter().chain([add_row.into_any_element()]), &t)),
             )
             .child(
-                div().id("providers-detail").flex_1().min_w_0().h_full().overflow_y_scroll().child(match editor {
-                    Some(editor) => v_flex().w_full().gap_6().py_4().children(editor).into_any_element(),
-                    None => div()
-                        .p_6()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child("No providers configured.")
-                        .into_any_element(),
-                }),
+                div()
+                    .id("providers-detail")
+                    .min_w_0()
+                    .when(!narrow, |el| el.flex_1().h_full().overflow_y_scroll())
+                    .child(match editor {
+                        Some(editor) => v_flex().w_full().gap_6().py_4().children(editor).into_any_element(),
+                        None => div()
+                            .p_6()
+                            .text_sm()
+                            .text_color(t.muted_foreground)
+                            .child("No providers configured.")
+                            .into_any_element(),
+                    }),
             );
 
         let providers = v_flex()
@@ -739,35 +767,45 @@ fn divided(children: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> impl I
     }))
 }
 
-/// `SettingsRow`: title and description on the left, the control on the right.
+/// `SettingsRow`'s `@min-[32rem]/settings-row` query: a row whose content box (`width` less its
+/// 16px sides) is under 32rem puts its control under the title at full width.
+pub(super) fn rows_stacked(width: Pixels, rem: Pixels) -> bool {
+    width - px(32.) < rem * 32.
+}
+
+/// `SettingsRow`: title and description on the left, the control on the right, or the control
+/// under them when `stacked`.
 fn settings_row(
     title: impl Into<SharedString>,
     description: Option<&str>,
     control: Option<AnyElement>,
+    stacked: bool,
     t: &Tokens,
 ) -> gpui_kit::Div {
+    let label = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div().min_h(px(20.)).text_sm().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(title.into()),
+        )
+        .when_some(description, |el, description| {
+            el.child(div().text_xs().text_color(t.muted_foreground).child(description.to_owned()))
+        });
+    if stacked {
+        return v_flex()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .child(label)
+            .when_some(control, |el, control| el.child(h_flex().w_full().gap_2().child(control)));
+    }
     h_flex()
         .px_4()
         .py_3()
         .gap_8()
         .justify_between()
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .min_h(px(20.))
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(t.foreground)
-                        .child(title.into()),
-                )
-                .when_some(description, |el, description| {
-                    el.child(div().text_xs().text_color(t.muted_foreground).child(description.to_owned()))
-                }),
-        )
+        .child(label)
         .when_some(control, |el, control| el.child(h_flex().flex_none().gap_2().justify_end().child(control)))
 }
 

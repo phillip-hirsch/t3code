@@ -181,22 +181,39 @@ pub(super) fn settings_row(
     control: Option<AnyElement>,
     t: &Tokens,
 ) -> gpui_kit::Stateful<Div> {
-    div().id(id).px(px(16.)).py(px(12.)).child(
+    stackable_row(id, title, description, status, control, false, t)
+}
+
+/// [`settings_row`], with the control under the title at full width when `stacked`
+/// (`super::rows_stacked`).
+fn stackable_row(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    description: Option<SharedString>,
+    status: Option<AnyElement>,
+    control: Option<AnyElement>,
+    stacked: bool,
+    t: &Tokens,
+) -> gpui_kit::Stateful<Div> {
+    let label = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap(px(4.))
+        .child(div().min_h(px(20.)).text_sm().font_weight(FontWeight::MEDIUM).child(title.into()))
+        .children(
+            description
+                .map(|d| div().max_w(px(672.)).text_xs().line_height(px(18.)).text_color(t.muted_foreground).child(d)),
+        )
+        .children(status.map(|s| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(s)));
+    let row = if stacked {
+        v_flex().gap(px(12.)).child(label).children(control.map(|c| h_flex().w_full().gap(px(8.)).child(c)))
+    } else {
         h_flex()
             .gap(px(32.))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .child(div().min_h(px(20.)).text_sm().font_weight(FontWeight::MEDIUM).child(title.into()))
-                    .children(description.map(|d| {
-                        div().max_w(px(672.)).text_xs().line_height(px(18.)).text_color(t.muted_foreground).child(d)
-                    }))
-                    .children(status.map(|s| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(s))),
-            )
-            .children(control.map(|c| h_flex().flex_none().gap(px(8.)).justify_end().child(c))),
-    )
+            .child(label)
+            .children(control.map(|c| h_flex().flex_none().gap(px(8.)).justify_end().child(c)))
+    };
+    div().id(id).px(px(16.)).py(px(12.)).child(row)
 }
 
 fn notify_error(window: &mut Window, cx: &mut App, title: &str, message: String) {
@@ -224,6 +241,8 @@ pub(super) struct ConfigForm {
     locks: Option<(HashSet<String>, SharedString)>,
     /// Hairlines between rows, as in a grouped settings card; the wizard's plain group spaces them.
     divided: bool,
+    /// Controls sit under their titles (`super::rows_stacked`).
+    stacked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -249,6 +268,7 @@ impl ConfigForm {
             next_arg: 0,
             locks,
             divided,
+            stacked: false,
             _subscriptions: Vec::new(),
         };
         for field in driver.fields.iter().filter(|f| !matches!(f.control, Control::Select(_))) {
@@ -382,7 +402,7 @@ impl ConfigForm {
                 Button::new(id("-select"))
                     .outline()
                     .small()
-                    .w(px(224.))
+                    .map(|el| if self.stacked { el.w_full() } else { el.w(px(224.)) })
                     .disabled(locked.is_some())
                     .child(
                         h_flex()
@@ -407,7 +427,7 @@ impl ConfigForm {
                 let input = self.inputs[field.key].clone();
                 let configured = field.secret && has_secret(&self.config, field.key);
                 h_flex()
-                    .w(px(224.))
+                    .map(|el| if self.stacked { el.w_full() } else { el.w(px(224.)) })
                     .gap(px(8.))
                     .child(Input::new(&input).small().flex_1().disabled(locked.is_some()))
                     .when(configured && locked.is_none(), |row| {
@@ -483,12 +503,13 @@ impl Render for ConfigForm {
             .into_iter()
             .map(|field| {
                 let control = self.render_control(field, &t, cx);
-                settings_row(
+                stackable_row(
                     SharedString::from(format!("{}-{}", self.id_prefix, field.key)),
                     field.label,
                     field.description.map(Into::into),
                     None,
                     Some(control),
+                    self.stacked,
                     &t,
                 )
                 .into_any_element()
@@ -538,7 +559,14 @@ impl Workspace {
                 form
             },
         );
-        form.update(cx, |form, cx| form.set_config(config, window, cx));
+        let stacked = self.settings_ui.provider_rows_stacked;
+        form.update(cx, |form, cx| {
+            if form.stacked != stacked {
+                form.stacked = stacked;
+                cx.notify();
+            }
+            form.set_config(config, window, cx);
+        });
         form.into_any_element()
     }
 }

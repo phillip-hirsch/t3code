@@ -872,6 +872,8 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            // `scrollbar-gutter-both`: the 6px scrollbar's room on both edges, as the web keeps it.
+            .px(px(6.))
             .track_scroll(&self.settings_ui.scroll)
             .child(
                 v_flex()
