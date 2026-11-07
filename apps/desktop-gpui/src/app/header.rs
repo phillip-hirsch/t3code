@@ -18,14 +18,14 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
-        // An open right panel owns the titlebar controls, so the header only keeps `pr-10`.
+        // An open right panel owns the titlebar controls, so the header keeps only its `px-5`.
         let panel_open = self.right_panel_open();
         let header = h_flex()
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
             .pl(if self.sidebar_open { px(20.) } else { titlebar::collapsed_content_left(window) })
-            .pr(if panel_open { px(0.) } else { controls_inset })
+            .pr(if panel_open { px(20.) } else { controls_inset })
             .bg(tokens.background);
         let header = titlebar::drag_region(header);
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
