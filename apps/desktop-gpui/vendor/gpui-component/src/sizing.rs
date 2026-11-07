@@ -154,6 +154,16 @@ impl Size {
         }
     }
 
+    /// Returns an input's height, as [`StyleSized::input_h`] sets it.
+    pub(crate) fn input_height(&self) -> Pixels {
+        match self {
+            Self::Large => px(44.),
+            Self::Medium => px(32.),
+            Self::XSmall => px(20.),
+            _ => px(24.),
+        }
+    }
+
     /// Returns the vertical input padding.
     pub fn input_py(&self) -> Pixels {
         match self {

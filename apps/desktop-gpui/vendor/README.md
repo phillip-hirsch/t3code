@@ -32,6 +32,13 @@ sidebar) under a newly opened overlay kept its hover card. The patch:
 - Tests in `div.rs`: `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`,
   `an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views`.
 
+**An element that appears under a still pointer unhovers when the pointer leaves.** 0.3.11 paints
+a `hover` style from the hitbox, but its mouse-move listener compares against a flag only mouse
+moves set, so an element drawn hovered without a move (a settings nav row back under the pointer
+after a search result closes) kept its hover until the pointer crossed it again. The patch, in
+`src/elements/div.rs`: painting records the hover state it drew. Test:
+`an_element_that_appears_under_a_still_mouse_unhovers_when_the_mouse_leaves`.
+
 **A press hides the pressed element's tooltip until the pointer leaves.** 0.3.11 clears a shown
 tooltip on mouse down but not one still waiting out its show delay, so a quick click opened a menu
 and the tooltip appeared over it; and the next mouse move over the element scheduled it again.
@@ -56,6 +63,18 @@ until focus leaves. 0.3.11 shows tooltips only on hover, placed at the pointer. 
 - `src/window.rs`: `prepaint_tooltip` centers an anchored tooltip above its trigger (below when
   there is no room) instead of at the pointer; `TooltipBounds::bounds` is crate-visible for tests.
 - Test: `a_trigger_focused_from_the_keyboard_shows_its_tooltip_until_it_loses_focus`.
+
+**Tooltips sit 4px off their trigger.** Base UI positions a tooltip from its trigger, not the
+pointer: `sideOffset` 4px above it (below when there is no room) and 5px in from the window's
+edges (`collisionPadding`). The patch:
+
+- `src/elements/div.rs`: a hovered element's tooltip shows anchored to the element's bounds too
+  (`register_tooltip_mouse_handlers` and `handle_tooltip_mouse_move` take the anchor); text-range
+  tooltips (`text.rs`) stay at the pointer.
+- `src/window.rs`: `prepaint_tooltip` keeps the 4px and 5px; a pointer-placed tooltip keeps 13px
+  from the pointer, the 1px plus the 12px margin gpui-component's tooltip used to carry.
+- Tests: the focus test above and `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`
+  check the placement.
 
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
@@ -201,3 +220,20 @@ on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always
 menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
+
+**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 4px taller
+with 16px text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
+an input the same at every width. Files:
+
+- `src/input/input.rs`: `Input::render` adds the 4px and `text_base` below 640px, before the
+  caller's style refinement, so a call site's own height or text size still wins.
+- `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
+
+**A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
+its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
+`Size`'s text size only when the caller set none.
+
+**The tooltip looks like the web's.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap
+from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
+trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
+`rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.

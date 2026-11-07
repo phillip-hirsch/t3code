@@ -350,6 +350,13 @@ impl Workspace {
                 crate::theme::sync(window, cx);
                 this.sync_composer_marks(cx);
             }),
+            cx.observe_window_bounds(window, |_, window, cx| {
+                if crate::theme::tokens(cx).breakpoint != crate::theme::Breakpoint::of(window.viewport_size().width) {
+                    crate::theme::sync(window, cx);
+                    // Cached views read the tokens too.
+                    window.refresh();
+                }
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);

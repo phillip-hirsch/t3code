@@ -848,11 +848,9 @@ fn select_button(
         .map_or(current.to_owned().into(), |(_, l)| l.clone());
     let current = SharedString::from(current.to_owned());
     let on_select = std::rc::Rc::new(on_select);
-    Button::new(id)
-        .outline()
-        .small()
-        .h(px(28.))
-        .w(px(width))
+    let trigger = Button::new(id).outline().small().h(px(t.breakpoint.pick(32., 28.))).w(px(width));
+    t.breakpoint
+        .control_text(trigger)
         .justify_between()
         .child(div().flex_1().truncate().text_left().child(label))
         .child(Icon::new(gpui_kit::assets::IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground))

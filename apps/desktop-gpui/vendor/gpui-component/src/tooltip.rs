@@ -8,7 +8,7 @@ use std::{
 use gpui::{
     Action, AnyElement, AnyView, App, AppContext, Bounds, Context, ElementId, GlobalElementId,
     IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
 pub use gpui_base::TooltipDefaults;
 use gpui_base::{
@@ -111,22 +111,23 @@ impl Render for Tooltip {
         };
 
         div().child(
-            // Wrap in a child, to ensure the left margin is applied to the tooltip
+            // t3code: no margin; the window places a tooltip its offset from the trigger or pointer.
             BaseTooltip::new("tooltip-popup")
                 .h_flex()
                 .font_family(cx.theme().font_family.clone())
-                .m_3()
                 .bg(cx.theme().tokens.popover)
                 .text_color(cx.theme().popover_foreground)
                 .bg(cx.theme().tokens.popover)
                 .border_1()
                 .border_color(cx.theme().border)
                 .shadow_md()
-                .rounded(cx.theme().radius)
+                // t3code: the web's `TooltipPopup`, `rounded-md text-xs leading-snug` and `px-2 py-1`.
+                .rounded(cx.theme().radius - px(2.))
                 .justify_between()
-                .py_0p5()
+                .py_1()
                 .px_2()
-                .text_sm()
+                .text_xs()
+                .line_height(relative(1.375))
                 .gap_3()
                 .refine_style(&self.style)
                 .map(|this| {

@@ -779,7 +779,10 @@ impl RenderOnce for Button {
             .whitespace_nowrap()
             .items_center()
             .justify_center()
-            .button_text_size(self.size)
+            // t3code: a text size the caller set on the button reaches its label.
+            .when(instance_style.text.font_size.is_none(), |this| {
+                this.button_text_size(self.size)
+            })
             .map(|this| match self.size {
                 Size::XSmall => this.gap_1(),
                 Size::Small => this.gap_1(),

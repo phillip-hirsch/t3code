@@ -67,6 +67,44 @@ pub struct Tokens {
     /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
     pub glass: f32,
     pub fonts: Fonts,
+    /// The window's side of the web's `sm` breakpoint, which sizes controls.
+    pub breakpoint: Breakpoint,
+}
+
+/// Which side of Tailwind's `sm` breakpoint (`min-width: 40rem`, 640px) the window is on. The web's
+/// controls grow below it (`h-9 sm:h-8`, `text-base sm:text-sm`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Breakpoint {
+    /// Narrower than 640px.
+    Base,
+    #[default]
+    Sm,
+}
+
+impl Breakpoint {
+    /// Tailwind's `--breakpoint-sm`, in CSS px. Media queries use the root's default 16px rem, so the
+    /// interface font size doesn't move it.
+    const SM: f32 = 640.;
+
+    pub fn of(viewport_width: gpui_kit::Pixels) -> Self {
+        if viewport_width < px(Self::SM) { Self::Base } else { Self::Sm }
+    }
+
+    /// `base` below `sm`, `sm` from it up, as a `<base> sm:<sm>` class pair picks.
+    pub fn pick<T>(self, base: T, sm: T) -> T {
+        match self {
+            Self::Base => base,
+            Self::Sm => sm,
+        }
+    }
+
+    /// `text-base sm:text-sm`, the controls' text.
+    pub fn control_text<E: gpui_kit::Styled>(self, element: E) -> E {
+        match self {
+            Self::Base => element.text_base(),
+            Self::Sm => element.text_sm(),
+        }
+    }
 }
 
 /// The `[data-app-sidebar]` palette override (`index.css:1234-1278`).
@@ -82,6 +120,10 @@ pub struct SidebarTokens {
     pub border: Hsla,
     pub row_hover: Hsla,
     pub row_active: Hsla,
+    /// The page's `--sidebar-row-hover` and `--sidebar-row-selected`, which rows on [`Self::sheet`]
+    /// (the settings nav) use.
+    pub sheet_row_hover: Hsla,
+    pub sheet_row_selected: Hsla,
     pub icon: Hsla,
 }
 
@@ -139,10 +181,14 @@ impl Tokens {
                 border: white(0.08),
                 row_hover: with_alpha(sidebar_foreground, 0.08),
                 row_active: with_alpha(sidebar_foreground, 0.11),
+                // `--accent` and `--muted`.
+                sheet_row_hover: white(0.04),
+                sheet_row_selected: white(0.03),
                 icon: hex(0x8b8b8b),
             },
             glass: 0.8,
             fonts: Fonts::default(),
+            breakpoint: Breakpoint::Sm,
         }
     }
 
@@ -184,10 +230,13 @@ impl Tokens {
                 border: hex(0xe4e4e7),
                 row_hover: hex(0xfcfcfc),
                 row_active: hex(0xffffff),
+                sheet_row_hover: hex(0xfcfcfc),
+                sheet_row_selected: hex(0xffffff),
                 icon: hex(0x86858e),
             },
             glass: 0.8,
             fonts: Fonts::default(),
+            breakpoint: Breakpoint::Sm,
         }
     }
 }
@@ -377,6 +426,8 @@ impl Tokens {
             border: c.sidebar_border,
             row_hover: c.sidebar_row_hover,
             row_active: c.sidebar_row_active,
+            sheet_row_hover: c.sidebar_row_hover,
+            sheet_row_selected: c.sidebar_row_active,
             icon: c.icon_muted,
         };
         self
@@ -536,7 +587,8 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         Some((dark, colors)) => if dark { Tokens::dark() } else { Tokens::light() }.themed(&colors),
         None => Tokens::for_choice(&choice, system_dark(window)),
     };
-    let tokens = base.with_appearance(appearance);
+    let tokens =
+        Tokens { breakpoint: Breakpoint::of(window.viewport_size().width), ..base.with_appearance(appearance) };
     let (dark, fonts) = (tokens.dark, tokens.fonts);
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     Theme::update(cx, |theme| {
@@ -633,6 +685,13 @@ mod tests {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a 0..=1 channel scaled to a byte")]
         let byte = |c: f32| (c * 255.).round() as u32;
         ((byte(rgb.r) << 16) | (byte(rgb.g) << 8) | byte(rgb.b), (rgb.a * 1000.).round() / 1000.)
+    }
+
+    #[test]
+    fn controls_take_their_larger_size_only_below_640px() {
+        assert_eq!(Breakpoint::of(px(639.5)), Breakpoint::Base);
+        assert_eq!(Breakpoint::of(px(640.)), Breakpoint::Sm);
+        assert_eq!(Breakpoint::of(px(639.5)).pick(36, 32), 36, "base below sm");
     }
 
     #[test]
