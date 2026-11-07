@@ -26,9 +26,9 @@ sidebar) under a newly opened overlay kept its hover card. The patch:
   this frame, set in `prepaint`; `check_is_hovered_during_prepaint` asks whether that hitbox is
   hovered, so moving away and being covered both hide the tooltip. `on_hover` also listens for
   `HoverRecheckEvent`.
-- `src/window.rs`: `draw_roots` hit-tests this frame's hitboxes before the tooltip prepaints, and
-  after the frame dispatches `HoverRecheckEvent` (`on_hover_recheck`) when a hitbox kept from the
-  last frame started or stopped being hovered.
+- `src/window.rs`: in a frame with a tooltip to show, `draw_roots` hit-tests this frame's hitboxes
+  before the tooltip prepaints, and after every frame it dispatches `HoverRecheckEvent`
+  (`on_hover_recheck`) when a hitbox kept from the last frame started or stopped being hovered.
 - Tests in `div.rs`: `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`,
   `an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views`.
 

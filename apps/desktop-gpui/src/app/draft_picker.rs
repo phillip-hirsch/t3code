@@ -8,9 +8,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, anchored, deferred, div, point, prelude::FluentBuilder as _, px, relative, svg,
 };
 
 use super::Workspace;
@@ -20,11 +20,18 @@ use crate::theme::Tokens;
 /// `ComboboxPopup className="w-72"`.
 const POPUP_WIDTH: f32 = 288.;
 
-#[derive(Default)]
 pub(super) struct DraftPicker {
     open: Option<Open>,
     /// When an outside press last closed it, so that press on the trigger doesn't reopen it.
     closed_at: Option<Instant>,
+    /// The project name that opens it, where Escape and a pick return focus.
+    pub(super) trigger: FocusHandle,
+}
+
+impl DraftPicker {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self { open: None, closed_at: None, trigger: cx.focus_handle().tab_stop(true) }
+    }
 }
 
 struct Open {
@@ -41,6 +48,17 @@ impl Open {
     fn highlight(&mut self, index: usize) {
         self.highlight = Some(index);
         self.scroll.scroll_to_item(index);
+    }
+
+    /// Moves the highlight one of `len` rows down or up, wrapping at the ends.
+    fn step(&mut self, len: usize, down: bool) {
+        let Some(last) = len.checked_sub(1) else { return };
+        self.highlight(match (down, self.highlight) {
+            (true, Some(i)) if i < last => i + 1,
+            (true, _) => 0,
+            (false, Some(i)) if i > 0 => i - 1,
+            (false, _) => last,
+        });
     }
 }
 
@@ -88,6 +106,18 @@ impl Workspace {
         rows(&groups, &open.order, &open.query.read(cx).value())
     }
 
+    /// `ComboboxTrigger`'s arrow keys: open the picker and move its highlight a row.
+    pub(super) fn open_draft_picker_from_key(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft_picker.open.is_none() {
+            self.toggle_draft_picker(window, cx);
+        }
+        let len = self.draft_picker_rows(cx).len();
+        if let Some(open) = &mut self.draft_picker.open {
+            open.step(len, down);
+            cx.notify();
+        }
+    }
+
     pub(super) fn draft_picker_open(&self) -> bool {
         self.draft_picker.open.is_some()
     }
@@ -128,13 +158,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes the picker and returns focus to its trigger, as a combobox does.
     fn close_draft_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dismiss_draft_picker(cx) {
-            self.focus_composer(window, cx);
+        if self.draft_picker.open.take().is_some() {
+            window.focus(&self.draft_picker.trigger, cx);
+            cx.notify();
         }
     }
 
-    /// Closes the picker without moving focus; whether it was open.
+    /// Closes the picker after focus or a press went elsewhere, leaving focus there; whether it
+    /// was open.
     fn dismiss_draft_picker(&mut self, cx: &mut Context<Self>) -> bool {
         if self.draft_picker.open.take().is_none() {
             return false;
@@ -191,14 +224,8 @@ impl Workspace {
         }
         match event.keystroke.key.as_str() {
             "escape" => self.close_draft_picker(window, cx),
-            "down" | "up" if !rows.is_empty() => {
-                let last = rows.len() - 1;
-                open.highlight(match (event.keystroke.key.as_str(), highlight) {
-                    ("down", Some(i)) if i < last => i + 1,
-                    ("down", _) => 0,
-                    (_, Some(i)) if i > 0 => i - 1,
-                    _ => last,
-                });
+            key @ ("down" | "up") => {
+                open.step(rows.len(), key == "down");
                 cx.notify();
             }
             "enter" => {
@@ -220,6 +247,8 @@ impl Workspace {
         let current = self.current_project().map(|p| p.id.clone());
         let rows = self.draft_picker_rows(cx);
         let pin_shortcut = self.shortcut_label("thread.pin");
+        let show_environments = crate::project_groups::span_environments(&self.project_groups());
+        let primary = self.primary_environment().map(ToString::to_string);
         let list = rows.iter().enumerate().map(|(i, entry)| {
             let highlighted = open.highlight == Some(i);
             let group = match entry {
@@ -282,6 +311,24 @@ impl Workspace {
                         this.toggle_draft_entry_pin(&key, cx);
                     }))
             });
+            let badge = group.filter(|_| show_environments).and_then(|g| {
+                let (description, environment) = g.environment_badge(primary.as_deref(), |env| {
+                    self.env_info(env).and_then(|info| info.environment_label.clone())
+                })?;
+                let machine = self.env_info(&environment).map_or("server", |info| info.machine_kind());
+                let description = SharedString::from(description);
+                Some(
+                    div()
+                        .id(SharedString::from(format!("draft-picker-env-{}", g.key)))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .child(
+                            svg().path(super::pages::settings::machine_icon(machine)).size(px(14.)).text_color(muted),
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx)),
+                )
+            });
             let pick = entry.clone();
             let row_id: SharedString = match entry {
                 Entry::Project(key) => format!("draft-picker-row-{key}").into(),
@@ -317,6 +364,7 @@ impl Workspace {
                         .child(name),
                 )
                 .children(pin)
+                .children(badge)
         });
         let popup = v_flex()
             .id("draft-project-picker-popup")
@@ -337,7 +385,9 @@ impl Workspace {
             .font_weight(FontWeight::NORMAL)
             .text_color(fg)
             .on_click(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_draft_picker(window, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.dismiss_draft_picker(cx);
+            }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.draft_picker_key(event, window, cx);
             }))

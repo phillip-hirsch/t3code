@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, settings_section, switch};
+use super::widgets::{SelectWidth, SettingRow, settings_section, switch};
 use crate::app::Workspace;
 use crate::app::git::{self, DiffColorScheme};
 use crate::app::pages::settings::widgets::SettingsView;
@@ -20,6 +20,12 @@ use crate::app::right_panel::DiffTint;
 use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
+
+/// `FontFamilyPicker`'s `sm:w-44`.
+const FAMILY_PICKER_WIDTH: f32 = 176.;
+/// The size select's `w-22`, held to the trigger's own `min-w-36`. Beside the title the web's
+/// row widens it to `min-w-40`, which a select in GPUI's popover wrapper can't follow.
+const SIZE_SELECT_WIDTH: f32 = 144.;
 
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
@@ -211,7 +217,7 @@ impl Workspace {
             format!("{}-size", row.id),
             sizes,
             format!("{size} px"),
-            SelectWidth::Full(ROW_SELECT_MIN_WIDTH),
+            SelectWidth::Fixed(SIZE_SELECT_WIDTH),
             window,
             cx,
             move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
@@ -221,7 +227,7 @@ impl Workspace {
             .child(
                 Select::new(&picker)
                     .small()
-                    .w(px(176.))
+                    .w(px(FAMILY_PICKER_WIDTH))
                     .menu_width(px(288.))
                     .placeholder(row.default_family.clone())
                     .search_placeholder("Search fonts…"),

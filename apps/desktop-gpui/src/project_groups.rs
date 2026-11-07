@@ -276,6 +276,40 @@ impl ProjectGroup {
             .and_then(|env| self.members.iter().find(|m| m.project.environment_id == env))
             .map_or_else(|| self.representative(), |m| &m.project)
     }
+
+    /// `ProjectEnvironmentBadge`: for a group with checkouts off `primary`, its tooltip ("On …",
+    /// or "Also on …" when one is on `primary` too) and the environment whose machine it shows.
+    /// `label` names an environment; an unnamed one reads "Remote".
+    pub fn environment_badge(
+        &self,
+        primary: Option<&str>,
+        label: impl Fn(&str) -> Option<String>,
+    ) -> Option<(String, SharedString)> {
+        let mut remote: Vec<(String, &SharedString)> = self
+            .members
+            .iter()
+            .map(|m| &m.project.environment_id)
+            .filter(|env| primary != Some(env.as_ref()))
+            .map(|env| (label(env).unwrap_or_else(|| "Remote".to_owned()), env))
+            .collect();
+        // `localeCompare`, near enough for environment names.
+        remote.sort_by_cached_key(|(label, _)| label.to_lowercase());
+        let environment = remote.first()?.1.clone();
+        let mut labels: Vec<&str> = Vec::new();
+        for (label, _) in &remote {
+            if !labels.contains(&label.as_str()) {
+                labels.push(label);
+            }
+        }
+        let lead = if remote.len() < self.members.len() { "Also on" } else { "On" };
+        Some((format!("{lead} {}", labels.join(", ")), environment))
+    }
+}
+
+/// `projectGroupsSpanEnvironments`: whether the groups hold checkouts on more than one environment.
+pub fn span_environments(groups: &[ProjectGroup]) -> bool {
+    let mut members = groups.iter().flat_map(|g| &g.members).map(|m| &m.project.environment_id);
+    members.next().is_some_and(|first| members.any(|env| env != first))
 }
 
 /// An environment's "No project" workspace (`scratchWorkspaceRoot`).
@@ -491,6 +525,38 @@ mod tests {
         assert_eq!(groups[0].target(Some("remote")).id, "b");
         assert_eq!(groups[0].target(Some("elsewhere")).id, "a");
         assert_eq!(groups[0].target(None).id, "a");
+    }
+
+    #[test]
+    fn the_environment_badge_names_the_checkouts_off_the_primary_environment() {
+        let checkout = |id: &str, env: &str| {
+            let mut project = project(id, "/src/app", repo("k", "/src/app"));
+            project.environment_id = env.into();
+            project
+        };
+        let label = |env: &str| (env != "unnamed").then(|| format!("{env} box"));
+        let badge = |projects: &[ProjectShell], primary: Option<&str>| {
+            let groups = build_groups(projects, &GroupingSettings::default(), &[], false);
+            groups[0].environment_badge(primary, label).map(|(text, env)| (text, env.to_string()))
+        };
+        let local = checkout("a", "env");
+        assert_eq!(badge(std::slice::from_ref(&local), Some("env")), None);
+        assert!(!span_environments(&build_groups(
+            std::slice::from_ref(&local),
+            &GroupingSettings::default(),
+            &[],
+            false
+        )));
+        let two = [local, checkout("b", "zeta"), checkout("c", "alpha"), checkout("d", "unnamed")];
+        assert!(span_environments(&build_groups(&two, &GroupingSettings::default(), &[], false)));
+        assert_eq!(
+            badge(&two, Some("env")),
+            Some(("Also on alpha box, Remote, zeta box".to_owned(), "alpha".to_owned())),
+            "remote labels sort and the first one's machine shows"
+        );
+        assert_eq!(badge(&two[1..2], Some("env")), Some(("On zeta box".to_owned(), "zeta".to_owned())));
+        // With no primary environment every checkout is remote.
+        assert_eq!(badge(&two[..1], None), Some(("On env box".to_owned(), "env".to_owned())));
     }
 
     fn repo(key: &str, root: &str) -> Value {

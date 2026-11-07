@@ -1748,6 +1748,8 @@ pub(in crate::app) enum SelectWidth {
     Small(f32),
     /// `w-full`: across a stacked row, else as wide as its label and at least this.
     Full(f32),
+    /// `w-*`: this wide.
+    Fixed(f32),
 }
 
 impl SelectWidth {
@@ -1758,6 +1760,7 @@ impl SelectWidth {
             Self::Small(width) if viewport >= px(640.) => trigger.w(px(width)),
             Self::Small(_) => trigger.w_full(),
             Self::Full(min) => trigger.w_full().min_w(px(min)),
+            Self::Fixed(width) => trigger.w(px(width)),
         }
     }
 }
