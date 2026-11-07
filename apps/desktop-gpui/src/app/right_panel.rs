@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffMode, DiffState};
+use gpui_kit::component::diff::{
+    Diff, DiffChangeIndicator, DiffEvent, DiffFile, DiffHunkSeparator, DiffMode, DiffState,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
@@ -1976,6 +1978,8 @@ impl Workspace {
                             // `--diffs-font-size`, the Code font size.
                             let (states, view) = (self.right_panel.patch_states.clone(), cx.entity());
                             let diff = Diff::new(&self.right_panel.diff)
+                                .hunk_separator(DiffHunkSeparator::LineInfo)
+                                .change_indicator(DiffChangeIndicator::Bars)
                                 .soft_wrap(wrap)
                                 .flex_1()
                                 .min_h_0()

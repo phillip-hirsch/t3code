@@ -91,3 +91,19 @@ Files:
 
 - `src/text/format/markdown.rs`: loose lists in `ast_to_node`.
 - `src/text/node.rs`: `render_list_item` and the list loop that calls it.
+
+## gpui-component 0.9.0
+
+**The diff view draws like the web's.** The web renders diffs with Pierre diffs, whose unified
+view shows one line number per row (the new line, or the old one for a deletion), marks changed
+rows with a 4px bar at the leading edge (dashed for deletions) and separates hunks with an
+"N unmodified lines" bar. 0.9.0's Unified mode always draws both number lanes, its bars sit after
+the numbers, and its line-info separator reads "N lines not in patch" on a flat strip. The patch
+draws one lane per Unified row, moves the bar to the row's edge, and draws the separator as the
+web's rounded bar with Pierre's wording. The app picks `DiffHunkSeparator::LineInfo` and
+`DiffChangeIndicator::Bars`, Pierre's defaults. Expanding unchanged lines needs the full files,
+which the app doesn't load, so the separator has no expand buttons. Files:
+
+- `src/diff/mod.rs`: `code_width`, the lanes and bar in `code_line`, `change_bar`, and the
+  `LineInfo` arm of `render_hunk_separator`.
+- `locales/ui.yml`: `Diff.HiddenLine` and the English `Diff.HiddenLines`.

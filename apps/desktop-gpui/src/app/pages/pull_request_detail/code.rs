@@ -4,7 +4,8 @@
 
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{
-    Diff, DiffAnnotation, DiffFile, DiffLinePosition, DiffMode, DiffParseOptions, DiffSide, DiffState,
+    Diff, DiffAnnotation, DiffChangeIndicator, DiffFile, DiffHunkSeparator, DiffLinePosition, DiffMode,
+    DiffParseOptions, DiffSide, DiffState,
 };
 
 use super::*;
@@ -665,6 +666,8 @@ impl Workspace {
             && self.pull_requests.panel.as_ref().is_some_and(|p| p.write.draft.is_none());
         let code = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()).expect("checked above");
         let diff = Diff::new(&code.diff)
+            .hunk_separator(DiffHunkSeparator::LineInfo)
+            .change_indicator(DiffChangeIndicator::Bars)
             .soft_wrap(code.wrap)
             .flex_1()
             .min_h_0()

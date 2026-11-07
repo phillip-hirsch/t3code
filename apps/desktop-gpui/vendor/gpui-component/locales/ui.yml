@@ -714,8 +714,10 @@ Diff:
     ru: "Скопирован"
     zh-CN: 已复制
     zh-HK: 已複製
+  HiddenLine:
+    en: "1 unmodified line"
   HiddenLines:
-    en: "%{count} lines not in patch"
+    en: "%{count} unmodified lines"
     pt-BR: "%{count} linhas fora do patch"
     ru: "Строк вне патча: %{count}"
     zh-CN: "patch 中未包含 %{count} 行"

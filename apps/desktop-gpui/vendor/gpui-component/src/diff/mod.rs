@@ -873,7 +873,7 @@ fn code_width(
     if mode == DiffMode::Split {
         (width + gutter_width + lane_width + rem * 2.) * 2.
     } else {
-        width + gutter_width * 2. + lane_width + rem * 2.
+        width + gutter_width + lane_width + rem * 2.
     }
 }
 
@@ -1030,9 +1030,24 @@ fn render_hunk_separator(
             if hidden == 0 {
                 return div().into_any_element();
             }
-            row.h_6()
-                .child(t!("Diff.HiddenLines", count = hidden).to_string())
-                .into_any_element()
+            let label = if hidden == 1 {
+                t!("Diff.HiddenLine").to_string()
+            } else {
+                t!("Diff.HiddenLines", count = hidden).to_string()
+            };
+            // A rounded bar inset from the edges, one step off the code surface.
+            h_flex().w_full().h_6().px_2().child(
+                h_flex()
+                    .flex_1()
+                    .h_full()
+                    .px(px(6.))
+                    .rounded(px(6.))
+                    .bg(cx.theme().foreground.opacity(0.03))
+                    .text_size(px(11.))
+                    .text_color(cx.theme().foreground.opacity(0.5))
+                    .child(div().truncate().child(label)),
+            )
+            .into_any_element()
         }
         DiffHunkSeparator::Simple => row.h_1().into_any_element(),
     }
@@ -1542,6 +1557,19 @@ fn render_unified_cell(
         .into_any_element()
 }
 
+/// Pierre's change bar: 4px at the row's leading edge, solid for an addition
+/// and in 1px dashes for a deletion.
+fn change_bar(side: DiffSide, status: Hsla, row_height: Pixels) -> impl IntoElement {
+    let bar = div().absolute().left_0().top_0().bottom_0().w(px(4.));
+    if side == DiffSide::Modified {
+        return bar.bg(status);
+    }
+    let dashes = (f32::from(row_height) / 2.).round().max(1.) as usize;
+    bar.flex()
+        .flex_col()
+        .children((0..dashes).map(|_| div().flex_1().child(div().h_1_2().bg(status))))
+}
+
 /// Syntax colors with inline-change and selection emphasis layered over them.
 #[allow(clippy::too_many_arguments)]
 fn line_highlights(
@@ -1721,8 +1749,16 @@ fn code_line(
                 code.geometry.clone(),
             )
         }));
+    // A Unified row shows one number, its own side's, as Pierre's unified view does.
+    let two_lanes = gutters.iter().flatten().count() == 2;
+    let lanes: Vec<(DiffSide, Option<usize>)> = gutters
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|(lane, _)| !two_lanes || code.mode != DiffMode::Unified || *lane == side)
+        .collect();
     let gutters_width = if code.line_number {
-        code.gutter_width * gutters.iter().flatten().count() as f32
+        code.gutter_width * lanes.len() as f32
     } else {
         px(0.)
     };
@@ -1740,9 +1776,7 @@ fn code_line(
                 (true, DiffSide::Original) => "−",
                 (true, DiffSide::Modified) => "+",
             }),
-        DiffChangeIndicator::Bars => div().w_4().h_full().flex_shrink_0().when(changed, |this| {
-            this.child(div().w(px(3.)).h_full().bg(status))
-        }),
+        DiffChangeIndicator::Bars => div().w_2().flex_shrink_0(),
         DiffChangeIndicator::None => div().w_2().flex_shrink_0(),
     };
     let hover_line = matches!(
@@ -1826,12 +1860,15 @@ fn code_line(
         })
         .when(code.line_number, |this| {
             this.children(
-                gutters
+                lanes
                     .into_iter()
-                    .flatten()
                     .map(|(side, ix)| render_gutter(file, side, ix, &code, cx)),
             )
         })
+        .when(
+            changed && code.change_indicator == DiffChangeIndicator::Bars,
+            |this| this.child(change_bar(side, status, code.row_height)),
+        )
         .children(marker_lane)
         .child(indicator)
         .child(
