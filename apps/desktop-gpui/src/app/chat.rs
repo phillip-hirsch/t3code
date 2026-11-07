@@ -1408,6 +1408,7 @@ fn markdown_view(
             cwd,
             kinds,
             suffixes: Default::default(),
+            code_background: alpha(t.foreground, 0.1),
         })
         .on_link_click(move |url, event, window, cx| {
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
