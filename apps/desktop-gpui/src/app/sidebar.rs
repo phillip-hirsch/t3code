@@ -1385,6 +1385,8 @@ impl Workspace {
                     .bg(sb.border),
             );
 
+        let sheet = self.sidebar_open.sheet();
+        let surface = if sheet { sb.sheet } else { sb.background };
         // `SidebarStageBackdrop`: 80 px of art behind the header, fading into the sidebar.
         let backdrop = self.stage_art().map(|art| {
             let fade = |from: Hsla, to: Hsla| {
@@ -1403,25 +1405,18 @@ impl Workspace {
                 .overflow_hidden()
                 .child(stage_backdrop(art, tokens.dark, 80.))
                 .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top(px(22.))
-                        .h(px(53.))
-                        .bg(fade(sb.background.opacity(0.), sb.background)),
+                    div().absolute().left_0().right_0().top(px(22.)).h(px(53.)).bg(fade(surface.opacity(0.), surface)),
                 )
-                .child(div().absolute().left_0().right_0().top(px(74.)).bottom_0().bg(sb.background))
+                .child(div().absolute().left_0().right_0().top(px(74.)).bottom_0().bg(surface))
         });
 
-        let sheet = self.sidebar_open.sheet();
         v_flex()
             .id("sidebar")
             .relative()
             .h_full()
             .when(!sheet, |el| el.w(self.sidebar_width()))
             .flex_none()
-            .bg(sb.background)
+            .bg(surface)
             .text_color(sb.foreground)
             .border_r_1()
             .border_color(sb.border)
