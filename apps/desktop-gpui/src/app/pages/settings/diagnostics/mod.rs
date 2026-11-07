@@ -12,8 +12,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -353,22 +351,15 @@ impl DiagnosticsState {
 }
 
 /// Asks before SIGKILL (`dialogs.confirm(..., { variant: "destructive" })`), then signals.
-fn confirm_kill(pid: u64, window: &mut Window, cx: &mut App, on_confirm: impl Fn(&mut App) + 'static) {
-    let on_confirm = std::rc::Rc::new(on_confirm);
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let on_confirm = on_confirm.clone();
-        alert
-            .entrance(DialogEntrance::None)
-            .title(format!("Send SIGKILL to process {pid}?"))
-            .description("This cannot be handled by the process.")
-            .show_cancel(true)
-            .ok_text("Confirm")
-            .ok_variant(ButtonVariant::Danger)
-            .on_ok(move |_, _, cx| {
-                on_confirm(cx);
-                true
-            })
-    });
+fn confirm_kill(pid: u64, window: &mut Window, cx: &mut App, on_confirm: impl FnOnce(&mut App) + 'static) {
+    let message = format!("Send SIGKILL to process {pid}? This cannot be handled by the process.");
+    let answer = crate::app::confirm::confirm(&message, true, window, cx);
+    cx.spawn(async move |cx| {
+        if answer.await == Ok(true) {
+            cx.update(on_confirm);
+        }
+    })
+    .detach();
 }
 
 // ---------------------------------------------------------------------------------------------

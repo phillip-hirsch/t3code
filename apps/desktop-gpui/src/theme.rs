@@ -579,6 +579,11 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.overlay = dialog_backdrop(&tokens);
         colors.danger = tokens.error;
         colors.danger_foreground = tokens.primary_foreground;
+        // The `destructive` Button: a solid red fill with white text, `bg-destructive/90` on hover.
+        colors.button_danger = tokens.error;
+        colors.button_danger_hover = with_alpha(tokens.error, 0.9);
+        colors.button_danger_active = with_alpha(tokens.error, 0.9);
+        colors.button_danger_foreground = white(1.);
         colors.warning = tokens.warning;
         colors.info = tokens.info;
         colors.link = tokens.info_foreground;
