@@ -116,17 +116,23 @@ impl Workspace {
     /// Moves focus into the sheet as it shows and back out as it hides, whichever way it closed:
     /// the backdrop, Escape, a pick, or a window widened past the breakpoint.
     pub(super) fn sync_sheet_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A press on the sheet's bare areas focuses the sheet itself, or leaves focus with the
+        // window; the list takes it so the arrows keep working.
+        let on_no_control =
+            window.focused(cx).is_none() || self.focus.is_focused(window) || self.sheet_trap.is_focused(window);
         let trap = &self.sheet_trap;
+        let shown = self.sidebar_open.sheet();
         let moved = self.sheet_focus.follow(
-            self.sidebar_open.sheet(),
+            shown,
             || window.focused(cx),
             // The last frame drew the sheet, so its focus path still tells.
-            || window.focused(cx).is_none() || trap.contains_focused(window, cx),
+            || on_no_control || trap.contains_focused(window, cx),
         );
         match moved {
             Some(FocusMove::IntoSheet) => self.sidebar.list_focus.focus(window, cx),
             Some(FocusMove::Back(Some(handle))) => handle.focus(window, cx),
             Some(FocusMove::Back(None)) => self.focus.focus(window, cx),
+            None if shown && on_no_control => self.sidebar.list_focus.focus(window, cx),
             None => {}
         }
     }
