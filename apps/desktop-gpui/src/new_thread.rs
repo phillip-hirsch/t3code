@@ -293,6 +293,17 @@ pub fn new_draft_model(
     carried.or_else(|| sticky.cloned())
 }
 
+/// The model a draft without a pick hands to a draft started from it: the web stores its
+/// project's default, or the usage fallback that replaced it, on the draft
+/// (`projectDefaultModelSelection`). A draft on an automatic provider default stores none.
+pub fn draft_carried_model(info: &ServerInfo, project: Option<&ProjectShell>, now_ms: i64) -> Option<ModelSelection> {
+    let default = info.new_thread_model(project)?;
+    if let Some(fallback) = usage_fallback(info, &default, project.map(|p| p.id.as_str()), now_ms) {
+        return Some(fallback.selection);
+    }
+    ModelSelection::deserialize(info.project_setting(project, "defaultModelSelection")).is_ok().then_some(default)
+}
+
 /// `resolveNewThreadModelSelection` for a draft without an explicit pick.
 pub fn usage_fallback(
     info: &ServerInfo,
@@ -478,6 +489,28 @@ mod tests {
         assert_eq!(new_draft_model(&bare, Some(&p), None, None), None);
         let configured = info(json!({"defaultModelSelection": {"instanceId": "codex", "model": "gpt"}}));
         assert_eq!(new_draft_model(&configured, Some(&p), Some(carried), Some(&sticky)), None);
+    }
+
+    #[test]
+    fn a_draft_on_its_project_default_carries_it_to_a_project_without_one() {
+        let mut info = ServerInfo::default();
+        info.apply(&json!({"type": "snapshot", "config": {
+            "providers": [{"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
+                "models": [{"slug": "gpt"}]}],
+            "settings": {"projectSettingsOverrides": {"a": {"defaultModelSelection": {"instanceId": "codex", "model": "pinned"}}}},
+        }}))
+        .unwrap();
+        let shell = |id: &str| -> ProjectShell {
+            serde_json::from_value(json!({"id": id, "title": id, "workspaceRoot": format!("H:/{id}")})).unwrap()
+        };
+        let (a, b) = (shell("a"), shell("b"));
+        let pinned = ModelSelection { instance_id: "codex".into(), model: "pinned".into(), options: None };
+        let carried = draft_carried_model(&info, Some(&a), 0);
+        assert_eq!(carried, Some(pinned.clone()));
+        let sticky = ModelSelection { instance_id: "codex".into(), model: "sticky".into(), options: None };
+        assert_eq!(new_draft_model(&info, Some(&b), carried, Some(&sticky)), Some(pinned));
+        // An automatic provider default is not stored on the draft, so the last pick applies.
+        assert_eq!(draft_carried_model(&info, Some(&b), 0), None);
     }
 
     #[test]

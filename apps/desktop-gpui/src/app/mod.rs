@@ -931,13 +931,20 @@ impl Workspace {
     }
 
     /// The model a new draft carries from where it was started: the composer's pick, else the open
-    /// thread's model (`carryModelSelection`).
+    /// thread's model or the draft's project default (`carryModelSelection`).
     fn carried_model(&self) -> Option<ModelSelection> {
         if let Some(selection) = &self.model_override {
             return Some(selection.clone());
         }
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+        match self.target.as_ref()? {
+            Target::Thread { id, .. } => {
+                self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+            }
+            Target::Draft { project_id, .. } => {
+                let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+                crate::new_thread::draft_carried_model(self.server_info(), project, crate::timestamp::now_ms())
+            }
+        }
     }
 
     /// The composer model's provider, borrowing the selection where one is stored.
