@@ -216,8 +216,9 @@ impl Workspace {
         Some(new_thread::launch_strategy(mode, &state.choice, refs, self.draft_start_from_origin()))
     }
 
+    /// `isGitRepo` as `ChatView` reads it: the checkout's live status, not its refs reply.
     pub(super) fn is_git_repo(&self) -> bool {
-        self.draft_workspace.refs.as_ref().and_then(|r| r.get("isRepo")).and_then(Value::as_bool).unwrap_or(true)
+        self.vcs.is_repo()
     }
 
     fn ref_list(&self) -> &[Value] {
@@ -502,7 +503,7 @@ impl Workspace {
     }
 
     fn render_thread_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let git = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
+        let git = self.is_git_repo();
         let persist = self.client_settings.values.bool("persistComposerContextStrip");
         let environment = self.render_host_picker(t, cx);
         if !persist || !(git || environment.is_some()) {

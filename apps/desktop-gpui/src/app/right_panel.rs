@@ -707,7 +707,7 @@ impl Workspace {
 
     /// `diffAvailable`: a server thread in a git repository.
     fn diff_available(&self) -> bool {
-        matches!(self.target, Some(Target::Thread { .. })) && self.vcs.status.as_ref().is_none_or(|s| s.local.is_repo)
+        matches!(self.target, Some(Target::Thread { .. })) && self.vcs.is_repo()
     }
 
     /// `diffLayout`, which the layout toggle also writes.

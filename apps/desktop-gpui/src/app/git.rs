@@ -2,6 +2,8 @@
 //! details card offers: Initialize Git, the quick action, Commit/Push/PR, Pull.
 //! The decision logic mirrors `apps/web/src/components/GitActionsControl.logic.ts`.
 
+use std::collections::HashMap;
+
 use gpui_kit::{Context, Hsla, SharedString, Task, Window, rgb};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -335,12 +337,25 @@ pub(super) struct VcsWatch {
     /// The label of the git action in flight, as its progress reports it.
     pub running: Option<SharedString>,
     task: Option<Task<()>>,
+    /// `rememberCheckoutIsRepo`: what each checkout reported this session, read while its status loads.
+    known_repo: HashMap<(Option<SharedString>, String), bool>,
 }
 
 impl VcsWatch {
     /// Whether a reply for `cwd` on `env` is about the checkout watched now.
     fn watches(&self, env: Option<&str>, cwd: &str) -> bool {
         self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
+    }
+
+    /// `liveIsGitRepo ?? recallCheckoutIsRepo(...) ?? true`.
+    pub(super) fn is_repo(&self) -> bool {
+        self.status.as_ref().map_or_else(
+            || {
+                let recalled = self.cwd.as_ref().and_then(|cwd| self.known_repo.get(&(self.env.clone(), cwd.clone())));
+                recalled.copied().unwrap_or(true)
+            },
+            |status| status.local.is_repo,
+        )
     }
 }
 
@@ -386,6 +401,9 @@ impl Workspace {
                         match event {
                             StreamEvent::Item(value) if this.vcs.watches(env.as_deref(), &cwd) => {
                                 this.vcs.status = VcsStatus::apply(this.vcs.status.take(), &value);
+                                if let Some(status) = &this.vcs.status {
+                                    this.vcs.known_repo.insert((env.clone(), cwd.clone()), status.local.is_repo);
+                                }
                             }
                             StreamEvent::Item(_) => {}
                             StreamEvent::End(result) => {
