@@ -3323,6 +3323,15 @@ impl Interactivity {
                 if let Some(focus) = focus {
                     if !focus.is_focused(window) {
                         opened_by_focus.set(false);
+                    } else if opened_by_focus.get() {
+                        // A focus-shown tooltip follows its trigger, which a scroll can move.
+                        if let Some(ActiveTooltip::Visible { tooltip, .. }) =
+                            active_tooltip.borrow_mut().as_mut()
+                            && tooltip.anchor.is_some_and(|anchor| anchor != hitbox.bounds)
+                        {
+                            tooltip.anchor = Some(hitbox.bounds);
+                            window.defer(cx, |window, _| window.refresh());
+                        }
                     } else if window.last_input_was_keyboard()
                         && !opened_by_focus.get()
                         && focus_may_show(&active_tooltip.borrow())
@@ -3357,6 +3366,7 @@ impl Interactivity {
                     check_is_hovered,
                     check_is_hovered_during_prepaint,
                     long_press_tooltip_active,
+                    opened_by_focus,
                     self.tooltip_show_delay,
                     window,
                 );
@@ -3806,10 +3816,10 @@ pub(crate) enum ActiveTooltip {
     Pressed,
 }
 
-/// Whether newly gained keyboard focus may show the tooltip: nothing is showing, or an earlier
-/// press only suppressed it while the pointer stayed.
+/// Whether newly gained keyboard focus may show the tooltip: nothing is showing, a hover is still
+/// waiting out its delay (dropping it cancels the timer), or a press only suppressed it.
 fn focus_may_show(state: &Option<ActiveTooltip>) -> bool {
-    matches!(state, None | Some(ActiveTooltip::Pressed))
+    matches!(state, None | Some(ActiveTooltip::Pressed | ActiveTooltip::WaitingForShow { .. }))
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -3860,6 +3870,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     long_press_tooltip_active: Rc<Cell<bool>>,
+    opened_by_focus: Rc<Cell<bool>>,
     show_delay: Option<Duration>,
     window: &mut Window,
 ) {
@@ -3953,7 +3964,8 @@ pub(crate) fn register_tooltip_mouse_handlers(
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
         move |_: &ScrollEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
+            // A tooltip keyboard focus opened lasts as long as the focus does.
+            if !opened_by_focus.get() && !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
         }
@@ -5535,6 +5547,15 @@ mod tests {
         focus(&mut test_app, 0);
         assert!(tooltip_shown(&mut test_app), "keyboard focus shows the tooltip");
         assert!(tooltip_shown(&mut test_app), "and keeps it without a hovering pointer");
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    ScrollEvent { position: point(px(30.), px(30.)), ..Default::default() }.to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(tooltip_shown(&mut test_app), "a scroll keeps it while the trigger has focus");
         let origin = test_app
             .update_window(any_window, |_, window, _| window.tooltip_bounds.as_ref().map(|t| t.bounds.origin))
             .unwrap();
@@ -5572,6 +5593,20 @@ mod tests {
         key_down(&mut test_app, any_window, "tab");
         focus(&mut test_app, 0);
         assert!(tooltip_shown(&mut test_app), "Tab back to the clicked trigger shows it");
+
+        // A hover still waiting out its delay gives way to keyboard focus at once.
+        focus(&mut test_app, 1);
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(point(px(50.), px(50.)), cx);
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(at, cx);
+            })
+            .unwrap();
+        key_down(&mut test_app, any_window, "tab");
+        focus(&mut test_app, 0);
+        assert!(tooltip_shown(&mut test_app), "focus shows it without waiting for the hover delay");
     }
 
     /// A tooltip target and its hover listener in a cached view, under an overlay the parent
