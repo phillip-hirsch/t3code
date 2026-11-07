@@ -547,7 +547,7 @@ mod tests {
             &[],
             false
         )));
-        let two = [local.clone(), checkout("b", "zeta"), checkout("c", "alpha"), checkout("d", "unnamed")];
+        let two = [local, checkout("b", "zeta"), checkout("c", "alpha"), checkout("d", "unnamed")];
         assert!(span_environments(&build_groups(&two, &GroupingSettings::default(), &[], false)));
         assert_eq!(
             badge(&two, Some("env")),

@@ -229,7 +229,7 @@ impl Workspace {
         let rows = self.draft_picker_rows(cx);
         let pin_shortcut = self.shortcut_label("thread.pin");
         let show_environments = crate::project_groups::span_environments(&self.project_groups());
-        let primary = self.primary_environment().map(|id| id.to_string());
+        let primary = self.primary_environment().map(ToString::to_string);
         let list = rows.iter().enumerate().map(|(i, entry)| {
             let highlighted = open.highlight == Some(i);
             let group = match entry {
