@@ -1003,7 +1003,7 @@ impl Workspace {
             .id(group.clone())
             .group(group)
             .relative()
-            .when(target, |el| el.bg(t.accent).child(self.scroll_target_marker()))
+            .when(target, |el| el.child(self.scroll_target_marker()).child(jump_pulse(self.settings_ui.jumps, &t)))
             .into_any_element()
     }
 
@@ -1816,6 +1816,34 @@ pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement,
     )
 }
 
+/// `settings-search-target-pulse 650ms ease-in-out 2`: the row a search jumped to flashes an
+/// inset 2px ring twice, then shows nothing.
+fn jump_pulse(jump: u64, t: &Tokens) -> impl IntoElement {
+    use gpui_kit::{Animation, AnimationExt as _, BoxShadow};
+    let color = t.primary.opacity(0.7);
+    div().absolute().inset_0().rounded(px(12.)).with_animation(
+        ElementId::NamedInteger("settings-jump-pulse".into(), jump),
+        Animation::new(JUMP_PULSE),
+        move |el, progress| {
+            let strength = jump_pulse_strength(progress);
+            el.shadow(vec![
+                BoxShadow::new(px(0.), px(0.), color.opacity(strength)).spread_radius(px(2. * strength)).inset(),
+            ])
+        },
+    )
+}
+
+/// Both iterations of the web's pulse.
+const JUMP_PULSE: std::time::Duration = std::time::Duration::from_millis(1300);
+
+/// The ring's strength `progress` through [`JUMP_PULSE`]: each iteration eases in to its
+/// midpoint and back out, like the keyframes' `ease-in-out` between 0%, 50% and 100%.
+fn jump_pulse_strength(progress: f32) -> f32 {
+    let phase = (progress.clamp(0., 1.) * 2.).fract();
+    let half = if phase < 0.5 { phase * 2. } else { (1. - phase) * 2. };
+    gpui_kit::ease_in_out(half)
+}
+
 /// How many frames a search jump keeps re-centering its row while the page settles.
 pub(super) const JUMP_SETTLE_FRAMES: u8 = 3;
 
@@ -2094,4 +2122,18 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
         })
         .child(body)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_search_jump_pulses_twice_then_shows_nothing() {
+        let at = |ms: f32| jump_pulse_strength(ms / JUMP_PULSE.as_millis() as f32);
+        assert!((at(325.) - 1.).abs() < 1e-4, "the first iteration peaks halfway: {}", at(325.));
+        assert!(at(650.) < 1e-4, "and clears before the second: {}", at(650.));
+        assert!((at(975.) - 1.).abs() < 1e-4, "the second peaks: {}", at(975.));
+        assert!(at(1300.) < 1e-4, "nothing remains once it ends: {}", at(1300.));
+    }
 }

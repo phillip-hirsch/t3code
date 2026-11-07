@@ -171,8 +171,10 @@ pub(in crate::app) struct SettingsUi {
     /// Below `md` the nav is an icon rail; searching expands it over the page (`compactSearchOpen`).
     compact_search_open: bool,
     active_result: usize,
-    /// The row a search result jumped to; highlighted until the next navigation.
+    /// The row a search result jumped to, kept centered while the page settles.
     target: Option<SharedString>,
+    /// Counts search jumps, so each one replays the target row's pulse.
+    jumps: u64,
     scroll: ScrollHandle,
     /// The frames a search jump still re-centers its target row for: a newly shown page's rows
     /// pick stacked or side by side one frame late (`RowLayout`), which moves the row.
@@ -228,6 +230,7 @@ impl SettingsUi {
             compact_search_open: false,
             active_result: 0,
             target: None,
+            jumps: 0,
             scroll: ScrollHandle::new(),
             scroll_pending: Rc::default(),
             sliders: HashMap::new(),
@@ -550,6 +553,7 @@ impl Workspace {
         }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());
+        self.settings_ui.jumps += 1;
         self.settings_ui.scroll_pending.set(widgets::JUMP_SETTLE_FRAMES);
         self.settings_ui.focus_on_render = true;
     }
