@@ -5,11 +5,12 @@ use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
 use gpui_kit::component::h_flex;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div,
+    AnyElement, App, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 
 use super::super::Workspace;
+use super::super::git::{self, DiffColorScheme};
 use super::super::markdown_ui::workspace_relative;
 use super::diff_load::FileStat;
 use crate::theme::Tokens;
@@ -100,14 +101,46 @@ fn header_counts(file: &DiffFile, stat: Option<&FileStat>) -> Option<(usize, usi
     counted.then(|| (file.additions(), file.deletions()))
 }
 
-/// The default diff header (path, `+n −n`, status) with the path opening the file and the
-/// rest of the row folding it. `stat` is the file's metadata when its patch loads on its own.
+/// Pierre's `getIconForType` icon and its colour (`diffRendering.ts`, `--diff-modified-icon`).
+fn change_icon(status: DiffFileStatus, tokens: &Tokens, scheme: DiffColorScheme) -> (&'static str, Hsla) {
+    let blue_orange = scheme == DiffColorScheme::BlueOrange;
+    match status {
+        DiffFileStatus::Added => (
+            "icons/app/diffs/symbol-added.svg",
+            if tokens.dark && !blue_orange { tokens.success_foreground } else { git::addition_color(tokens, scheme) },
+        ),
+        DiffFileStatus::Deleted => ("icons/app/diffs/symbol-deleted.svg", git::deletion_color(tokens, scheme)),
+        DiffFileStatus::Modified | DiffFileStatus::Renamed | DiffFileStatus::Copied => {
+            let icon = if status == DiffFileStatus::Modified {
+                "icons/app/diffs/symbol-modified.svg"
+            } else {
+                "icons/app/diffs/symbol-moved.svg"
+            };
+            let tint = if blue_orange { tokens.muted_foreground } else { tokens.info_foreground };
+            let color = if tokens.dark {
+                tint.opacity(0.65)
+            } else if blue_orange {
+                tint
+            } else {
+                tint.blend(tokens.muted_foreground.opacity(0.5))
+            };
+            (icon, color)
+        }
+        _ => ("icons/app/diffs/file-code.svg", tokens.foreground.opacity(0.6)),
+    }
+}
+
+/// The default diff header (change icon, path, counts, status) with the path opening the file
+/// and the rest of the row folding it. `stat` is the file's metadata when its patch loads on
+/// its own; it shows as `DiffStatLabel`, the patch's own counts as Pierre's `-n +n`.
+#[expect(clippy::too_many_arguments, reason = "the kit's header callback hands these over one by one")]
 pub(super) fn header(
     file: &DiffFile,
     stat: Option<&FileStat>,
     state: Entity<DiffState>,
     view: Entity<Workspace>,
     tokens: &Tokens,
+    scheme: DiffColorScheme,
     suffix: Option<AnyElement>,
     cx: &App,
 ) -> AnyElement {
@@ -123,7 +156,14 @@ pub(super) fn header(
         DiffFileStatus::Conflicted => Some("Conflicts"),
         _ => None,
     };
-    let counts = header_counts(file, stat);
+    let (icon, icon_color) = change_icon(file.status(), tokens, scheme);
+    let counts = match (stat, header_counts(file, None)) {
+        (Some(stat), _) => Some(
+            git::diff_stat_label(stat.additions as u64, stat.deletions as u64, 11., tokens, scheme).into_any_element(),
+        ),
+        (None, Some((additions, deletions))) => Some(pierre_counts(additions, deletions, tokens, scheme)),
+        (None, None) => None,
+    };
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
     let (open_path, fold_path, fold_view) = (path.clone(), path, view.clone());
@@ -135,6 +175,7 @@ pub(super) fn header(
         .w_full()
         .min_w_0()
         .gap_2()
+        .child(svg().path(icon).size(px(16.)).flex_none().text_color(icon_color))
         .on_click(move |_, _, cx| {
             state.update(cx, |state, cx| state.set_file_collapsed(&fold_path, !collapsed, cx));
             fold_view.update(cx, Workspace::remember_collapsed);
@@ -154,11 +195,27 @@ pub(super) fn header(
                 .child(name),
         )
         .child(div().flex_1())
-        .when_some(counts, |el, (additions, deletions)| {
-            el.child(div().text_xs().text_color(muted).child(format!("+{additions} −{deletions}")))
-        })
+        .children(counts)
         .when_some(status, |el, status| el.child(div().text_xs().text_color(muted).child(status)))
         .children(suffix)
+        .into_any_element()
+}
+
+/// Pierre's `createMetadataElement`: `-n` unless only lines were added, then `+n` unless only
+/// lines were removed, in the code font at 11px, 1ch apart.
+fn pierre_counts(additions: usize, deletions: usize, tokens: &Tokens, scheme: DiffColorScheme) -> AnyElement {
+    let count = |n: usize| git::group_thousands(n as u64);
+    h_flex()
+        .flex_none()
+        .gap(px(6.6))
+        .font_family(tokens.fonts.mono)
+        .text_size(px(11.))
+        .when(deletions > 0 || additions == 0, |el| {
+            el.child(div().text_color(git::deletion_color(tokens, scheme)).child(format!("-{}", count(deletions))))
+        })
+        .when(additions > 0 || deletions == 0, |el| {
+            el.child(div().text_color(git::addition_color(tokens, scheme)).child(format!("+{}", count(additions))))
+        })
         .into_any_element()
 }
 

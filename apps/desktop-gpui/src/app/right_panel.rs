@@ -2055,6 +2055,7 @@ impl Workspace {
                                         state.clone(),
                                         view.clone(),
                                         &header_tokens,
+                                        scheme,
                                         status,
                                         cx,
                                     )
