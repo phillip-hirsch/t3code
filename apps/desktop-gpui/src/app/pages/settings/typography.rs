@@ -21,11 +21,12 @@ use crate::app::terminal::TerminalTheme;
 use crate::settings::{TYPOGRAPHY_ADVANCED_KEY, contract};
 use crate::theme::{self, FONT_MONO, FONT_SANS_LABEL, Fonts, Tokens};
 
-/// `FontFamilyPicker`'s `sm:w-44`.
+/// `FontFamilyPicker`'s `sm:w-44`; below `sm` it is `min-w-36 flex-1`.
 const FAMILY_PICKER_WIDTH: f32 = 176.;
-/// The size select's `w-22`, held to the trigger's own `min-w-36`. Beside the title the web's
-/// row widens it to `min-w-40`, which a select in GPUI's popover wrapper can't follow.
+/// The size select's `w-22`, held to the trigger's own `min-w-36`.
 const SIZE_SELECT_WIDTH: f32 = 144.;
+/// Beside the title, `SettingsRow` widens every select trigger to `min-w-40`.
+const SIZE_SELECT_BESIDE_WIDTH: f32 = 160.;
 
 /// A font row's family picker, rebuilt when its default family changes.
 pub(super) struct FontPicker {
@@ -211,28 +212,36 @@ impl Workspace {
         let size = view.value(row.size_key).as_i64().unwrap_or(size_default);
         let picker = self.font_picker(&row, &family, window, cx);
         let size_key = row.size_key;
-        let sizes =
+        let sizes: Vec<_> =
             (row.sizes.0..=row.sizes.1).map(|px| (px, SharedString::from(format!("{px} px")), px == size)).collect();
-        let size_select = self.row_menu_select(
-            format!("{}-size", row.id),
-            sizes,
-            format!("{size} px"),
-            SelectWidth::Fixed(SIZE_SELECT_WIDTH),
-            window,
-            cx,
-            move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
-        );
-        let control = h_flex()
-            .gap(px(8.))
-            .child(
-                Select::new(&picker)
-                    .small()
-                    .w(px(FAMILY_PICKER_WIDTH))
-                    .menu_width(px(288.))
-                    .placeholder(row.default_family.clone())
-                    .search_placeholder("Search fonts…"),
+        let mut size_select = |width| {
+            self.row_menu_select(
+                format!("{}-size", row.id),
+                sizes.clone(),
+                format!("{size} px"),
+                SelectWidth::Fixed(width),
+                window,
+                cx,
+                move |this, px, window, cx| this.update_settings(json!({ size_key: px }), window, cx),
             )
-            .child(size_select);
+        };
+        let (stacked_size, beside_size) = (size_select(SIZE_SELECT_WIDTH), size_select(SIZE_SELECT_BESIDE_WIDTH));
+        let below_sm = window.viewport_size().width < px(640.);
+        // `min-w-36 flex-1 sm:w-44 sm:flex-none` on the picker's wrapper.
+        let family_picker = |stacked: bool| {
+            let select = Select::new(&picker)
+                .small()
+                .w_full()
+                .menu_width(px(288.))
+                .placeholder(row.default_family.clone())
+                .search_placeholder("Search fonts…");
+            div()
+                .map(|el| if stacked && below_sm { el.flex_1().min_w(px(144.)) } else { el.w(px(FAMILY_PICKER_WIDTH)) })
+                .child(select)
+        };
+        // `flex w-full flex-wrap sm:w-auto @min-[32rem]/settings-row:flex-nowrap`
+        let control = h_flex().w_full().flex_wrap().gap(px(8.)).child(family_picker(true)).child(stacked_size);
+        let control_beside = h_flex().gap(px(8.)).child(family_picker(false)).child(beside_size);
         let reset = (!family.is_empty() || size != size_default)
             .then(|| json!({ row.family_key: "", row.size_key: size_default }));
         let fonts = t.fonts;
@@ -249,6 +258,7 @@ impl Workspace {
             .setting(row.family_key)
             .setting(row.size_key)
             .control(control)
+            .control_beside(control_beside)
             .reset(reset);
         let setting = if row.previews.is_empty() { setting } else { setting.body(previews) };
         self.setting_row(view, setting, window, cx)
@@ -323,13 +333,18 @@ fn render_preview(
             .child(prompt_preview(t))
             .into_any_element(),
         Preview::Code => {
-            // `render_diff` sizes rows from the rem and the code font; its file header is a 20px
-            // button inside 4px padding over a 1px border.
+            // `render_diff` sizes rows from the rem and the code font; Pierre pads the code 8px
+            // below its last row.
             let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
+            // `--code-background`: `color-mix(in srgb, var(--card) 90%, var(--background))`.
+            let code_background = t.background.blend(t.card.opacity(0.9));
             let preview = Diff::new(diff)
+                .header_visible(false)
+                .border_0()
+                .bg(code_background)
                 .hunk_separator(DiffHunkSeparator::LineInfo)
                 .change_indicator(DiffChangeIndicator::Bars)
-                .h(px(29. + row * DIFF_PREVIEW_ROWS))
+                .h(px(8. + row * DIFF_PREVIEW_ROWS))
                 .text_size(px(fonts.code_size))
                 .into_any_element();
             let preview = match scheme {
@@ -340,10 +355,62 @@ fn render_preview(
                 }
                 .into_any_element(),
             };
-            frame().child(preview).into_any_element()
+            // Pierre's static HTML: no frame, its own header and no fold control.
+            v_flex()
+                .mt(px(4.))
+                .mb(px(8.))
+                .overflow_hidden()
+                .bg(code_background)
+                .child(diff_preview_header(fonts, t, scheme))
+                .child(preview)
+                .into_any_element()
         }
         Preview::Terminal => terminal_preview(fonts, t),
     }
+}
+
+/// Pierre's default file header for the preview patch (`createFileHeaderElement`): the
+/// change icon, the path and `-1 +1`, in the shadow root's own colors. Those are the syntax
+/// theme's `gitDecoration` colors (pierre-dark), Pierre's light defaults otherwise, and the
+/// app's diff colors once blue-orange overrides them.
+fn diff_preview_header(fonts: &Fonts, t: &Tokens, scheme: DiffColorScheme) -> impl IntoElement {
+    let (modified, addition, deletion) =
+        if t.dark { (0x009fff, 0x07c480, 0xff2e3f) } else { (0x009fff, 0x0dbe4e, 0xff2e3f) };
+    let (mut addition, mut deletion): (Hsla, Hsla) = (rgb(addition).into(), rgb(deletion).into());
+    if scheme == DiffColorScheme::BlueOrange {
+        (addition, deletion) = (git::addition_color(t, scheme), git::deletion_color(t, scheme));
+    }
+    // `min-height: calc(1lh + 3 * 8px)` at Pierre's 20px line height, `padding-inline: 16px`.
+    h_flex()
+        .min_h(px(44.))
+        .px(px(16.))
+        .gap(px(8.))
+        .justify_between()
+        .font_family(fonts.sans)
+        .text_size(px(fonts.code_size))
+        .line_height(px(20.))
+        .text_color(t.foreground)
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap(px(8.))
+                .child(
+                    gpui_kit::svg()
+                        .path("icons/app/diffs/symbol-modified.svg")
+                        .size(px(16.))
+                        .flex_none()
+                        .text_color(rgb(modified)),
+                )
+                .child(div().min_w_0().truncate().child("src/formatUser.ts")),
+        )
+        .child(
+            h_flex()
+                .flex_none()
+                .gap(px(fonts.code_size * 0.6))
+                .font_family(fonts.mono)
+                .child(div().text_color(deletion).child("-1"))
+                .child(div().text_color(addition).child("+1")),
+        )
 }
 
 /// `DIFF_PREVIEW_PATCH`: one file, one hunk.

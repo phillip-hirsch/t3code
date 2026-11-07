@@ -66,6 +66,8 @@ pub(super) struct SidebarState {
     /// The row whose hover card shows, after the web's 150 ms delay.
     hover_card: Option<String>,
     _hover_card_delay: Option<Task<()>>,
+    /// Where the rows were drawn last frame; `hovered` and `hover_card` belong to those rows.
+    rows_surface: super::sidebar_sheet::RowsSurface,
     /// A menu opened by a click rather than a right-click (the snooze menu).
     menu: Option<OpenMenu>,
     /// By environment, workspace root, then favicon path, so a lookup needs no key built.
@@ -182,6 +184,7 @@ impl SidebarState {
             hovered: None,
             hover_card: None,
             _hover_card_delay: None,
+            rows_surface: super::sidebar_sheet::RowsSurface::Docked,
             menu: None,
             favicons: HashMap::new(),
             renaming: None,
@@ -964,6 +967,18 @@ impl Workspace {
             return;
         }
         self.notify_sidebar(cx);
+    }
+
+    /// Forgets the pointer once the rows move to another surface (a resize hid the docked
+    /// sidebar, the sheet opened or closed): the web's row tooltips unmount with their rows.
+    pub(super) fn follow_rows_surface(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.rows_surface.follow(self.sidebar_open.surface()) {
+            self.sidebar._hover_card_delay = None;
+            let hovered = self.sidebar.hovered.take().is_some();
+            if self.sidebar.hover_card.take().is_some() || hovered {
+                self.notify_sidebar(cx);
+            }
+        }
     }
 
     /// A row's menu covers its hover card, as the native menu does; it shows again on the next hover.

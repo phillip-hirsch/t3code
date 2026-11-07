@@ -3283,20 +3283,32 @@ impl Interactivity {
                     .tooltip_source_hitbox
                     .get_or_insert_with(Default::default)
                     .clone();
+                let opened_by_focus = element_state
+                    .tooltip_opened_by_focus
+                    .get_or_insert_with(Default::default)
+                    .clone();
+                let focus = self.tracked_focus_handle.clone();
 
                 let tooltip_is_hoverable = tooltip_builder.hoverable;
-                let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
-                    Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
-                });
+                let build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>> =
+                    Rc::new(move |window: &mut Window, cx: &mut App| {
+                        Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
+                    });
                 // Called as the tooltip prepaints, after the window hit-tested this frame's
-                // hitboxes, so an element an overlay covers no longer counts as hovered.
-                let check_is_hovered_during_prepaint = Rc::new({
+                // hitboxes, so an element an overlay covers no longer counts as hovered. A
+                // tooltip keyboard focus opened stays while the element keeps focus.
+                let check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool> = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
+                    let opened_by_focus = opened_by_focus.clone();
+                    let focus = focus.clone();
                     move |window: &Window| {
-                        pending_mouse_down.borrow().is_none()
+                        let hovered = pending_mouse_down.borrow().is_none()
                             && tooltip_source_hitbox
                                 .get()
-                                .is_some_and(|hitbox| hitbox.is_hovered(window))
+                                .is_some_and(|hitbox| hitbox.is_hovered(window));
+                        hovered
+                            || (opened_by_focus.get()
+                                && focus.as_ref().is_some_and(|focus| focus.is_focused(window)))
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3305,6 +3317,38 @@ impl Interactivity {
                         pending_mouse_down.borrow().is_none() && hitbox.is_hovered(window)
                     }
                 });
+                // A trigger focused from the keyboard shows its tooltip at once, over itself,
+                // like a browser tooltip on `:focus-visible`. It shows after this draw, whose
+                // refresh would be lost, so a cached view still draws it next frame.
+                if let Some(focus) = focus {
+                    if !focus.is_focused(window) {
+                        opened_by_focus.set(false);
+                    } else if window.last_input_was_keyboard()
+                        && !opened_by_focus.get()
+                        && active_tooltip.borrow().is_none()
+                    {
+                        opened_by_focus.set(true);
+                        let (active_tooltip, build_tooltip, check) = (
+                            active_tooltip.clone(),
+                            build_tooltip.clone(),
+                            check_is_hovered_during_prepaint.clone(),
+                        );
+                        let anchor = hitbox.bounds;
+                        window.defer(cx, move |window, cx| {
+                            if active_tooltip.borrow().is_none() {
+                                show_tooltip(
+                                    &active_tooltip,
+                                    &build_tooltip,
+                                    &check,
+                                    None,
+                                    Some(anchor),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        });
+                    }
+                }
                 register_tooltip_mouse_handlers(
                     &active_tooltip,
                     self.tooltip_id,
@@ -3713,6 +3757,8 @@ pub struct InteractiveElementState {
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
     /// The element's hitbox this frame, read by its shown tooltip's hover check.
     tooltip_source_hitbox: Option<Rc<Cell<Option<HitboxId>>>>,
+    /// Set once keyboard focus opened the tooltip, until the element loses focus.
+    tooltip_opened_by_focus: Option<Rc<Cell<bool>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3874,6 +3920,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                         &build_tooltip,
                         &check_is_hovered_during_prepaint,
                         Some(long_press_tooltip_active.clone()),
+                        None,
                         window,
                         cx,
                     ) {
@@ -4009,6 +4056,7 @@ fn handle_tooltip_mouse_move(
                             &build_tooltip,
                             &check_is_hovered_during_prepaint,
                             None,
+                            None,
                             window,
                             cx,
                         );
@@ -4031,6 +4079,7 @@ fn show_tooltip(
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+    anchor: Option<Bounds<Pixels>>,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
@@ -4041,6 +4090,7 @@ fn show_tooltip(
             tooltip: AnyTooltip {
                 view,
                 mouse_position: window.mouse_position(),
+                anchor,
                 check_visible_and_update: Rc::new(move |tooltip_bounds, window, cx| {
                     if long_press_tooltip_active
                         .as_ref()
@@ -5425,6 +5475,66 @@ mod tests {
         assert!(!settle(&mut test_app, move_to(12.)), "moving over the pressed trigger keeps it hidden");
         assert!(!settle(&mut test_app, move_to(50.)));
         assert!(settle(&mut test_app, move_to(10.)), "it shows again once the pointer comes back");
+    }
+
+    struct FocusTargets {
+        handles: [FocusHandle; 2],
+    }
+
+    impl Render for FocusTargets {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children(self.handles.iter().enumerate().map(|(index, handle)| {
+                div()
+                    .id(("focus-target", index))
+                    .track_focus(handle)
+                    .size(px(20.))
+                    .when(index == 0, |el| el.tooltip(|_, cx| cx.new(|_| TestTooltipView).into()))
+            }))
+        }
+    }
+
+    #[test]
+    fn a_trigger_focused_from_the_keyboard_shows_its_tooltip_until_it_loses_focus() {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, cx| FocusTargets {
+            handles: [cx.focus_handle(), cx.focus_handle()],
+        });
+        let any_window: AnyWindowHandle = window.into();
+        let handles = window.update(&mut test_app, |view, _, _| view.handles.clone()).unwrap();
+        // Focus shows the tooltip after the frame that painted it, so it draws on the next one.
+        let tooltip_shown = |test_app: &mut TestAppContext| {
+            test_app
+                .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            test_app.run_until_parked();
+            test_app
+                .update_window(any_window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.tooltip_bounds.is_some()
+                })
+                .unwrap()
+        };
+        let focus = |test_app: &mut TestAppContext, index: usize| {
+            test_app
+                .update_window(any_window, |_, window, cx| window.focus(&handles[index], cx))
+                .unwrap();
+        };
+        assert!(!tooltip_shown(&mut test_app));
+
+        focus(&mut test_app, 0);
+        assert!(!tooltip_shown(&mut test_app), "focus from a click or code shows nothing");
+        focus(&mut test_app, 1);
+        key_down(&mut test_app, any_window, "tab");
+        focus(&mut test_app, 0);
+        assert!(tooltip_shown(&mut test_app), "keyboard focus shows the tooltip");
+        assert!(tooltip_shown(&mut test_app), "and keeps it without a hovering pointer");
+        let origin = test_app
+            .update_window(any_window, |_, window, _| window.tooltip_bounds.as_ref().map(|t| t.bounds.origin))
+            .unwrap();
+        assert_eq!(origin, Some(point(px(0.), px(20.))), "under the trigger, with no room above it");
+
+        focus(&mut test_app, 1);
+        assert!(!tooltip_shown(&mut test_app), "losing focus hides it");
     }
 
     /// A tooltip target and its hover listener in a cached view, under an overlay the parent

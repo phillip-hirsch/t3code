@@ -168,12 +168,15 @@ pub(in crate::app) struct SettingsUi {
     /// The provider editor is too narrow for its rows' controls to sit beside their titles.
     pub(in crate::app) provider_rows_stacked: bool,
     search: Entity<InputState>,
+    /// Below `md` the nav is an icon rail; searching expands it over the page (`compactSearchOpen`).
+    compact_search_open: bool,
     active_result: usize,
     /// The row a search result jumped to; highlighted until the next navigation.
     target: Option<SharedString>,
     scroll: ScrollHandle,
-    /// Set by a search jump, cleared once the target row scrolled into view.
-    scroll_pending: Rc<Cell<bool>>,
+    /// The frames a search jump still re-centers its target row for: a newly shown page's rows
+    /// pick stacked or side by side one frame late (`RowLayout`), which moves the row.
+    scroll_pending: Rc<Cell<u8>>,
     sliders: HashMap<&'static str, (Entity<SliderState>, Subscription)>,
     /// The row whose inheritance popover is open; its marker stays visible meanwhile.
     open_marker: Option<SharedString>,
@@ -208,11 +211,21 @@ impl SettingsUi {
                     this.open_settings_search_result(item, window, cx);
                 }
             }
-            _ => {}
+            InputEvent::Focus => {
+                this.settings_ui.compact_search_open = true;
+                cx.notify();
+            }
+            InputEvent::Blur => {
+                if this.settings_ui.search.read(cx).value().trim().is_empty() {
+                    this.settings_ui.compact_search_open = false;
+                    cx.notify();
+                }
+            }
         });
         Self {
             scope: ScopeSearch::default(),
             search,
+            compact_search_open: false,
             active_result: 0,
             target: None,
             scroll: ScrollHandle::new(),
@@ -352,6 +365,14 @@ fn restore_patch() -> Map<String, Value> {
         .collect()
 }
 
+/// `max-md:w-14`: the settings nav's width as an icon rail.
+const SETTINGS_RAIL_WIDTH: f32 = 56.;
+
+/// Below `md` (48rem of viewport) the settings nav is an icon rail.
+fn settings_nav_is_rail(viewport_width: gpui_kit::Pixels) -> bool {
+    viewport_width < px(768.)
+}
+
 /// `AppRouteModal`'s viewport padding.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ModalInsets {
@@ -433,15 +454,28 @@ impl Workspace {
                                         div().absolute().top_0().left_0().right_0().h(px(titlebar)),
                                     )),
                                 })
-                                .child(self.render_settings_nav(&section, window, cx))
-                                .child(
-                                    v_flex()
+                                .child({
+                                    let nav = self.render_settings_nav(&section, window, cx);
+                                    let page = v_flex()
                                         .flex_1()
                                         .min_w_0()
                                         .h_full()
-                                        .child(self.render_settings_header(&section, &view, cx))
-                                        .child(v_flex().flex_1().min_h_0().child(content)),
-                                ),
+                                        .child(self.render_settings_header(&section, &view, window, cx))
+                                        .child(v_flex().flex_1().min_h_0().child(content));
+                                    // The expanded rail lies over the page, so it paints after it. Its 56px
+                                    // stay in the flow so the page keeps its width and rows don't restack.
+                                    let over_page = settings_nav_is_rail(window.viewport_size().width)
+                                        && self.settings_ui.compact_search_open;
+                                    h_flex().relative().size_full().min_h_0().map(|el| {
+                                        if over_page {
+                                            el.child(div().w(px(SETTINGS_RAIL_WIDTH)).flex_none())
+                                                .child(page)
+                                                .child(nav)
+                                        } else {
+                                            el.child(nav).child(page)
+                                        }
+                                    })
+                                }),
                         ),
                 )
                 .into_any_element(),
@@ -477,6 +511,7 @@ impl Workspace {
         let find = keystroke.key == "f" && modifiers.secondary(cx) && !modifiers.alt && !modifiers.shift;
         let slash = keystroke.key == "/" && !modifiers.modified() && self.settings_ui.focus.is_focused(window);
         if find || slash {
+            self.settings_ui.compact_search_open = true;
             self.settings_ui.search.update(cx, |search, cx| search.focus(window, cx));
             cx.stop_propagation();
             return;
@@ -503,6 +538,7 @@ impl Workspace {
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).
     fn open_settings_search_result(&mut self, item: &SearchItem, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
+        self.settings_ui.compact_search_open = false;
         let target = item.target_id.clone().unwrap_or_else(|| item.id.clone());
         // A row inside a fold opens it first.
         if matches!(target.as_str(), "panel-animations" | "environment-identification" | "composer-context") {
@@ -514,11 +550,15 @@ impl Workspace {
         }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());
-        self.settings_ui.scroll_pending.set(true);
+        self.settings_ui.scroll_pending.set(widgets::JUMP_SETTLE_FRAMES);
         self.settings_ui.focus_on_render = true;
     }
 
     pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        // Pressing a section takes focus from the search, which closes the expanded rail.
+        if std::mem::take(&mut self.settings_ui.compact_search_open) {
+            self.settings_ui.focus_on_render = true;
+        }
         self.settings_ui.target = None;
         self.settings_ui.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.open_settings(id, cx);
@@ -530,47 +570,50 @@ impl Workspace {
         let query = self.settings_ui.search.read(cx).value();
         let searching = !query.trim().is_empty();
         let search_focused = self.settings_ui.search.read(cx).focus_handle(cx).is_focused(window);
-        let search_row = h_flex()
-            .id("settings-search")
-            .h(px(32.))
-            .px(px(8.))
-            .gap(px(8.))
-            .rounded(px(6.))
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(sb.muted_foreground)
-            .hover(|s| s.bg(sb.row_hover))
-            .when(search_focused, |el| el.bg(sb.row_hover))
-            .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.muted_foreground.opacity(0.8)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.settings_ui.search).appearance(false).px_0().py_0().h(px(20.)).text_sm()),
-            )
-            .map(|el| {
-                if searching {
-                    el.child(
-                        div()
-                            .id("settings-search-clear")
-                            .size(px(20.))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.))
-                            .hover(|s| s.bg(t.accent))
-                            .child(Icon::new(IconName::X).size(px(12.)).text_color(t.muted_foreground))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.settings_ui.search.update(cx, |search, cx| {
-                                    search.set_value("", window, cx);
-                                    search.focus(window, cx);
-                                });
-                            })),
-                    )
-                } else {
-                    el.child(kbd("/", &t))
-                }
+        let compact = settings_nav_is_rail(window.viewport_size().width);
+        // `compactSearchOpen` only changes the layout below `md`.
+        let expanded = !compact || self.settings_ui.compact_search_open;
+        let search_row =
+            expanded.then(|| {
+                h_flex()
+                    .id("settings-search")
+                    .h(px(32.))
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .rounded(px(6.))
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(sb.muted_foreground)
+                    .hover(|s| s.bg(sb.row_hover))
+                    .when(search_focused, |el| el.bg(sb.row_hover))
+                    .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.muted_foreground.opacity(0.8)))
+                    .child(div().flex_1().min_w_0().child(
+                        Input::new(&self.settings_ui.search).appearance(false).px_0().py_0().h(px(20.)).text_sm(),
+                    ))
+                    .map(|el| {
+                        if searching {
+                            el.child(
+                                div()
+                                    .id("settings-search-clear")
+                                    .size(px(20.))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .hover(|s| s.bg(t.accent))
+                                    .child(Icon::new(IconName::X).size(px(12.)).text_color(t.muted_foreground))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.settings_ui.search.update(cx, |search, cx| {
+                                            search.set_value("", window, cx);
+                                            search.focus(window, cx);
+                                        });
+                                    })),
+                            )
+                        } else {
+                            el.child(kbd("/", &t))
+                        }
+                    })
             });
         let body = if searching {
             let results = self.settings_results(cx);
@@ -637,13 +680,31 @@ impl Workspace {
                     .into_any_element()
             }
         } else {
-            v_flex()
-                .gap(px(16.))
-                .children(SETTINGS.iter().enumerate().map(|(index, (heading, items))| {
+            let rail_search = (compact && !expanded).then(|| {
+                div()
+                    .id("settings-rail-search")
+                    .h(px(32.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(sb.row_hover))
+                    .child(Icon::new(IconName::Search).size(px(16.)).text_color(sb.icon))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.settings_ui.compact_search_open = true;
+                        this.settings_ui.search.update(cx, |search, cx| search.focus(window, cx));
+                        cx.notify();
+                    }))
+            });
+            let groups =
+                v_flex().gap(px(16.)).children(SETTINGS.iter().enumerate().map(|(index, (heading, items))| {
                     v_flex()
                         .id(("settings-nav-group", index))
                         .gap(px(4.))
-                        .children(heading.map(|heading| {
+                        // `max-md:border-t max-md:pt-4 max-md:first:border-t-0`
+                        .when(compact && index > 0, |el| el.border_t_1().border_color(sb.border).pt(px(16.)))
+                        .children(heading.filter(|_| expanded).map(|heading| {
                             div()
                                 .px(px(8.))
                                 .text_xs()
@@ -673,30 +734,45 @@ impl Workspace {
                                 } else {
                                     sb.icon
                                 }))
-                                .child(div().truncate().child(*label))
+                                .when(expanded, |el| el.child(div().truncate().child(*label)))
                         }))
-                }))
-                .into_any_element()
+                }));
+            v_flex().gap(px(16.)).children(rail_search).child(groups).into_any_element()
         };
+        let overlay = compact && expanded;
         v_flex()
             .id("settings-nav")
-            .w(px(240.))
+            .map(|el| match (compact, overlay) {
+                // `max-md:absolute max-md:inset-y-0 max-md:start-0 max-md:z-10 max-md:w-full`
+                (_, true) => el.absolute().top_0().bottom_0().left_0().w_full().occlude(),
+                (true, false) => el.w(px(SETTINGS_RAIL_WIDTH)),
+                (false, _) => el.w(px(240.)),
+            })
             .flex_none()
             .h_full()
             .border_r_1()
             .border_color(sb.border)
-            .bg(sb.background)
+            // Outside `[data-app-sidebar]`, `bg-sidebar` is the page's own `--sidebar`.
+            .bg(sb.sheet)
             .text_color(sb.foreground)
             .overflow_y_scroll()
             .p(px(8.))
             .gap(px(8.))
-            .child(search_row)
+            .children(search_row)
             .child(body)
             .into_any_element()
     }
 
-    fn render_settings_header(&mut self, section: &str, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_header(
+        &mut self,
+        section: &str,
+        view: &SettingsView,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
+        // `max-sm:sr-only`: below `sm` the button is its icon alone.
+        let restore_label = window.viewport_size().width >= px(640.);
         let restore = (section == "general").then(|| {
             let changed = self.restore_defaults_changes(view);
             // `size="xs"`: the kit's XSmall content row carries the 12px label and 4px gap; the
@@ -710,7 +786,7 @@ impl Workspace {
                 .font_weight(FontWeight::MEDIUM)
                 .disabled(changed.is_empty())
                 .child(Icon::new(IconName::RotateCcw).size(px(14.)).mx(px(-2.)).text_color(t.muted_foreground))
-                .child("Restore device defaults")
+                .when(restore_label, |el| el.child("Restore device defaults"))
                 .on_click(cx.listener(|this, _, window, cx| this.confirm_restore_defaults(window, cx)))
         });
         h_flex()

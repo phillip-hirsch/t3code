@@ -42,6 +42,19 @@ while the pointer stays. The patch, in `src/elements/div.rs`:
   pending or shown tooltip; a mouse move with no button held and the pointer off the element ends it.
 - Test: `pressing_a_tooltip_trigger_hides_its_tooltip_until_the_pointer_leaves`.
 
+**Keyboard focus shows a tooltip.** Browsers (and Base UI's tooltips) open a trigger's tooltip
+when it gets focus from the keyboard (`:focus-visible`), centered over the trigger, and keep it
+until focus leaves. 0.3.11 shows tooltips only on hover, placed at the pointer. The patch:
+
+- `src/elements/div.rs`: `InteractiveElementState::tooltip_opened_by_focus`; an element with a
+  tooltip and a tracked focus handle that is focused while the last input was the keyboard shows
+  its tooltip at once, deferred past the draw so a cached view draws it, and its visibility check
+  also holds while that focus lasts. `show_tooltip` takes the anchor.
+- `src/app.rs`: `AnyTooltip::anchor`, the trigger's bounds for a focus-shown tooltip.
+- `src/window.rs`: `prepaint_tooltip` centers an anchored tooltip above its trigger (below when
+  there is no room) instead of at the pointer; `TooltipBounds::bounds` is crate-visible for tests.
+- Test: `a_trigger_focused_from_the_keyboard_shows_its_tooltip_until_it_loses_focus`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and

@@ -21,6 +21,8 @@ pub(super) struct RowLayout {
     id: ElementId,
     label: Option<AnyElement>,
     control: Option<AnyElement>,
+    /// `control` as drawn beside the title, when that differs.
+    beside: Option<AnyElement>,
     /// A `w-auto` control: as wide as its content under the title, and at least this wide (its
     /// content grows to fill) beside it.
     hug: Option<Pixels>,
@@ -29,7 +31,12 @@ pub(super) struct RowLayout {
 impl RowLayout {
     /// `id` keys the width remembered across frames; rows sharing one share a width.
     pub(super) fn new(id: ElementId, label: AnyElement, control: Option<AnyElement>) -> Self {
-        Self { id, label: Some(label), control, hug: None }
+        Self { id, label: Some(label), control, beside: None, hug: None }
+    }
+
+    pub(super) fn beside(mut self, control: Option<AnyElement>) -> Self {
+        self.beside = control;
+        self
     }
 
     pub(super) fn hugging(mut self, min: Option<Pixels>) -> Self {
@@ -73,6 +80,7 @@ impl Element for RowLayout {
         });
         let label = self.label.take().expect("RowLayout lays out once");
         let control = self.control.take();
+        let control = if stacked { control } else { self.beside.take().or(control) };
         let mut row = if stacked {
             v_flex()
                 .w_full()

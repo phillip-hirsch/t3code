@@ -1070,6 +1070,7 @@ impl Render for Workspace {
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
+        self.follow_rows_surface(cx);
         self.sync_sheet_focus(window, cx);
         self.sidebar.fit_window(window);
         // Widening to the inline layout closes the popover, as the web does.
