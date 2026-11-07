@@ -1179,7 +1179,7 @@ impl Workspace {
             &paths,
         );
         self.store_diff_files(files);
-        let shown = self.shown_diff_files();
+        let shown = self.shown_diff_files(Some(selection));
         self.right_panel.diff.update(cx, |state, cx| {
             match install {
                 Install::Replace => state.set_files(shown, cx),

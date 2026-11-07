@@ -13,9 +13,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, div, px, uniform_list,
 };
 
-use super::super::Workspace;
 use super::super::git;
 use super::super::titlebar::icon;
+use super::super::{Target, Workspace};
+use super::DiffScope;
 use crate::theme::Tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,11 +132,11 @@ fn shows_file(path: &str, hide_tests: bool, requested: Option<&str>) -> bool {
 }
 
 impl Workspace {
-    /// The loaded files the patch shows: test files leave while "Hide test files" is on, except
-    /// the one the chat asked the shown selection for.
-    pub(super) fn shown_diff_files(&self) -> Vec<DiffFile> {
+    /// The loaded files the patch shows for `selection` (the one being installed, not the one shown
+    /// before it): test files leave while "Hide test files" is on, except the one the chat asked for.
+    pub(super) fn shown_diff_files(&self, selection: Option<&(Target, DiffScope)>) -> Vec<DiffFile> {
         let hide = self.right_panel.hide_test_files;
-        let requested = self.right_panel.shown.as_ref().and_then(|selection| self.requested_diff_file(selection));
+        let requested = selection.and_then(|selection| self.requested_diff_file(selection));
         self.right_panel
             .all_diff_files
             .iter()
@@ -161,7 +162,7 @@ impl Workspace {
 
     /// Puts the filtered files back into the patch, keeping their folds.
     pub(super) fn apply_diff_files(&mut self, cx: &mut Context<Self>) {
-        let files = self.shown_diff_files();
+        let files = self.shown_diff_files(self.right_panel.shown.clone().as_ref());
         let folded: Vec<SharedString> = {
             let state = self.right_panel.diff.read(cx);
             state.files().iter().map(DiffFile::path).filter(|p| state.is_file_collapsed(p)).cloned().collect()
