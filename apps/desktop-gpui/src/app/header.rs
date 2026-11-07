@@ -73,8 +73,8 @@ impl Workspace {
                 .hover(|style| style.text_color(tokens.foreground))
         };
         let separator = || div().flex_none().text_color(tokens.muted_foreground).child("/");
-        let mut breadcrumb =
-            h_flex().flex_1().min_w_0().gap_3().pr(px(if panel_open { 40. } else { 96. })).text_sm().font_medium();
+        // `WorkspaceBreadcrumb`'s nav clips its row inside the container's `pr-10` / `pr-24`.
+        let mut breadcrumb = h_flex().flex_1().min_w_0().gap_3().overflow_hidden().text_sm().font_medium();
         if let Some(project) = project {
             // `ChatHeader.tsx` names the project by its title, not its repository.
             let name: SharedString = project.title.clone().into();
@@ -82,7 +82,9 @@ impl Workspace {
             let tooltip: SharedString = format!("New thread in {name}").into();
             breadcrumb = breadcrumb
                 .child(
+                    // `WorkspaceBreadcrumbItem className="shrink"`: the project gives way to the title's `min-w-10`.
                     crumb("crumb-project")
+                        .flex_shrink(1.)
                         .child(super::sidebar::project_icon(project, &tokens, false, 14., self.favicon(project)))
                         .child(div().max_w(px(160.)).truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -144,7 +146,8 @@ impl Workspace {
         // `WorkspaceBreadcrumbItem current` (`min-w-10 flex-1`) in the clipped breadcrumb: the title
         // gives way first, then the chip is cut at the edge.
         let current = h_flex().min_w(px(40.)).flex_1().overflow_hidden().child(title).children(origin);
-        header.child(breadcrumb.child(current)).children(self.render_title_menu())
+        let container = h_flex().flex_1().min_w_0().pr(px(if panel_open { 40. } else { 96. }));
+        header.child(container.child(breadcrumb.child(current))).children(self.render_title_menu())
     }
 
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
