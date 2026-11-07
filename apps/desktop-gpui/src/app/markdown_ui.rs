@@ -17,6 +17,9 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use serde_json::json;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use super::Workspace;
 use crate::file_links;
 use crate::theme::Tokens;
@@ -466,6 +469,30 @@ fn file_link(text: &str, url: &str) -> Option<(file_links::FilePosition, Option<
 pub(super) struct FileChips {
     pub workspace: WeakEntity<Workspace>,
     pub dark: bool,
+    pub suffixes: ParentSuffixes,
+}
+
+/// The parent suffixes of the source last parsed (`buildFileLinkParentSuffixByPath`), so its
+/// chips share one scan of the message.
+#[derive(Default)]
+pub(super) struct ParentSuffixes(Mutex<Option<ParsedSuffixes>>);
+
+struct ParsedSuffixes {
+    source: String,
+    suffixes: Arc<HashMap<String, String>>,
+}
+
+impl ParentSuffixes {
+    fn of(&self, source: &str) -> Arc<HashMap<String, String>> {
+        let mut cached = self.0.lock().expect("parent suffixes lock poisoned");
+        if let Some(parsed) = cached.as_ref().filter(|parsed| parsed.source == source) {
+            return parsed.suffixes.clone();
+        }
+        let paths = file_links::document_paths(source);
+        let suffixes = Arc::new(file_links::parent_suffixes(paths.iter().map(String::as_str)));
+        *cached = Some(ParsedSuffixes { source: source.to_owned(), suffixes: suffixes.clone() });
+        suffixes
+    }
 }
 
 impl MarkdownPlugin for FileChips {
@@ -500,8 +527,7 @@ impl MarkdownPlugin for FileChips {
             }
             _ => return None,
         };
-        let paths = file_links::document_paths(cx.source());
-        let label = file_links::chip_label(&file, &file_links::parent_suffixes(paths.iter().map(String::as_str)));
+        let label = file_links::chip_label(&file, &self.suffixes.of(cx.source()));
         let markdown = cx.node_source(node).unwrap_or_default().to_owned();
         let text = description.as_ref().map_or_else(|| label.clone(), |description| format!("{description} {label}"));
         let chip = FileChip { path, line: file.line, icon_path: file.path, label, description };
