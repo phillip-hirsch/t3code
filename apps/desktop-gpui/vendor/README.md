@@ -92,6 +92,21 @@ Files:
 - `src/text/format/markdown.rs`: loose lists in `ast_to_node`.
 - `src/text/node.rs`: `render_list_item` and the list loop that calls it.
 
+**Plugins can keep a node's children as prose.** A chat link to a file with its own text shows
+that text, then the file chip, and the text wraps like the sentence around it (the web's
+`whitespace-normal` span). 0.9.0's inline plugins replace the whole claimed node with one atomic
+object, so a sentence-long label could not wrap and overflowed the transcript. The patch adds
+`MarkdownNode::after_children()`: the converter lays the claimed node's children out as ordinary
+inline Markdown (their own text, marks and source ranges) before the object, which keeps the
+node's full source range for copying. Files:
+
+- `src/text/markdown_ext.rs`: the `after_children` flag and builder.
+- `src/text/format/markdown.rs`: `parse_paragraph`; one test, `inline_extensions_can_keep_a_nodes_children_as_prose`.
+
+The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
+above `src/text`, which this folder lacks: run them from a scratch copy laid out as
+`<dir>/crates/gpui-base` with a `<dir>/README.md`.
+
 ## gpui-component 0.9.0
 
 **The diff view draws like the web's.** The web renders diffs with Pierre diffs, whose unified

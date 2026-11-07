@@ -761,9 +761,15 @@ fn parse_paragraph(
 
     let parse_cx = MarkdownParseContext::new(source, cx.offset);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
+        let mut text = match node.children() {
+            Some(children) if custom.after_children => {
+                parse_inline_children(source, paragraph, children, cx)
+            }
+            _ => String::new(),
+        };
         custom.set_span(span);
         let custom = custom.with_inline_source(parse_cx.node_source(node).unwrap_or_default());
-        let text = custom.as_text().to_string();
+        text.push_str(custom.as_text());
         paragraph.push(InlineNode::custom(custom));
         return text;
     }
@@ -2400,6 +2406,52 @@ mod tests {
         assert_eq!(object.accessibility_name(), "x²");
         assert_eq!(document.text(), "中文 before x² after and $ignored$\n");
         assert!(document.to_markdown().contains("**before $x^2$ after**"));
+    }
+
+    #[test]
+    fn inline_extensions_can_keep_a_nodes_children_as_prose() {
+        let source = "See [the **long** label](a.rs) now";
+        let extensions = MarkdownExtensions::default().plugin(
+            crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(|node, _| {
+                let Node::Link(link) = node else {
+                    return None;
+                };
+                Some(
+                    MarkdownNode::new("chip", link.url.clone())
+                        .text(" a.rs")
+                        .after_children(),
+                )
+            }),
+        );
+        let mut cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..Default::default()
+        };
+        let document = parse(source, &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        let texts: Vec<_> = paragraph
+            .children
+            .iter()
+            .map(|node| (node.text.as_str(), node.custom.is_some()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("See ", false),
+                ("the ", false),
+                ("long", false),
+                (" label", false),
+                (" a.rs", true),
+                (" now", false)
+            ]
+        );
+        assert_eq!(bold_runs(paragraph), ["long"]);
+        let object = paragraph.children[4].custom.as_ref().unwrap();
+        assert_eq!(object.source_range(), Some(4..30));
+        assert_eq!(document.text(), "See the long label a.rs now
+");
     }
 
     #[test]

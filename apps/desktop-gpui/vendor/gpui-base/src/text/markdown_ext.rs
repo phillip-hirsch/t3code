@@ -112,6 +112,7 @@ pub struct MarkdownNode {
     accessibility_label: Option<SharedString>,
     data: Arc<dyn Any + Send + Sync>,
     pub(crate) span: Option<Span>,
+    pub(crate) after_children: bool,
 }
 
 impl MarkdownNode {
@@ -127,6 +128,7 @@ impl MarkdownNode {
             accessibility_label: None,
             data: Arc::new(data),
             span: None,
+            after_children: false,
         }
     }
 
@@ -187,6 +189,14 @@ impl MarkdownNode {
         self
     }
 
+    /// Lay the claimed node's children out first, as ordinary inline Markdown,
+    /// so they wrap like the prose around them and only this node is atomic.
+    /// The children keep their own text, marks and source ranges.
+    pub fn after_children(mut self) -> Self {
+        self.after_children = true;
+        self
+    }
+
     /// Set the text representation of this custom node.
     pub fn text(mut self, text: impl Into<SharedString>) -> Self {
         self.text = text.into();
@@ -238,6 +248,7 @@ impl PartialEq for MarkdownNode {
             && self.markdown == other.markdown
             && self.accessibility_label == other.accessibility_label
             && self.span == other.span
+            && self.after_children == other.after_children
     }
 }
 
