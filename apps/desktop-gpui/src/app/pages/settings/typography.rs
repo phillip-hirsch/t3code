@@ -392,11 +392,11 @@ fn render_preview(
 
 /// Pierre's default file header for the preview patch (`createFileHeaderElement`): the
 /// change icon, the path and `-1 +1`, in the shadow root's own colors. Those are the syntax
-/// theme's `gitDecoration` colors (pierre-dark), Pierre's light defaults otherwise, and the
-/// app's diff colors once blue-orange overrides them.
+/// theme's `gitDecoration` colors (pierre-dark or pierre-light), and the app's diff colors once
+/// blue-orange overrides them.
 fn diff_preview_header(fonts: &Fonts, t: &Tokens, scheme: DiffColorScheme) -> impl IntoElement {
     let (modified, addition, deletion) =
-        if t.dark { (0x009fff, 0x07c480, 0xff2e3f) } else { (0x009fff, 0x0dbe4e, 0xff2e3f) };
+        if t.dark { (0x009fff, 0x07c480, 0xff2e3f) } else { (0x009fff, 0x18a46c, 0xd52c36) };
     let (mut addition, mut deletion): (Hsla, Hsla) = (rgb(addition).into(), rgb(deletion).into());
     if scheme == DiffColorScheme::BlueOrange {
         (addition, deletion) = (git::addition_color(t, scheme), git::deletion_color(t, scheme));
