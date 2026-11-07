@@ -678,6 +678,15 @@ pub struct LinkOrigin {
     pub label: String,
 }
 
+/// `OrchestrationV2DelegatedFrom`: the thread on a linked environment whose agent delegated this one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedFrom {
+    pub environment_id: String,
+    pub thread_id: String,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lineage {
@@ -780,6 +789,8 @@ pub struct ThreadShell {
     /// `linkOrigin`: an agent on a linked environment started this thread.
     #[serde(default)]
     pub link_origin: Option<LinkOrigin>,
+    #[serde(default)]
+    pub delegated_from: Option<DelegatedFrom>,
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]
