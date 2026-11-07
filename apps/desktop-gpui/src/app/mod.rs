@@ -42,6 +42,7 @@ mod confirm;
 mod context_strip;
 mod desktop;
 mod details;
+mod draft_picker;
 pub(crate) mod environments;
 mod files;
 mod find;
@@ -272,6 +273,8 @@ pub struct Workspace {
     theme_editor: Option<Entity<theme_editor::ThemeEditor>>,
     /// The command palette, while open.
     palette: Option<palette::Palette>,
+    /// The draft hero's project picker.
+    draft_picker: draft_picker::DraftPicker,
     /// The thread find bar, while open.
     find: Option<find::ThreadFind>,
     /// Go to file, Search project contents, and the Files and file panel surfaces.
@@ -440,6 +443,7 @@ impl Workspace {
             keybindings_panel: None,
             theme_editor: None,
             palette: None,
+            draft_picker: draft_picker::DraftPicker::default(),
             find: None,
             files: files::FilesState::default(),
             focus: cx.focus_handle(),

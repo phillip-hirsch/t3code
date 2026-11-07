@@ -2443,16 +2443,17 @@ impl Interactivity {
                             } else {
                                 None
                             };
-                            // A shown tooltip checks the element's current bounds, so it hides
-                            // once a layout change moves the element out from under the pointer.
+                            // A shown tooltip checks the element's current hitbox, so it hides
+                            // once a layout change moves the element out from under the pointer
+                            // or an overlay covers it.
                             if let (Some(hitbox), Some(element_state)) =
                                 (hitbox.as_ref(), element_state.as_mut())
                             {
                                 if self.tooltip_builder.is_some() {
                                     element_state
-                                        .tooltip_source_bounds
+                                        .tooltip_source_hitbox
                                         .get_or_insert_with(Default::default)
-                                        .set(hitbox.bounds);
+                                        .set(Some(hitbox.id));
                                 }
                             }
 
@@ -3235,18 +3236,26 @@ impl Interactivity {
                     }
                 }
 
-                window.on_mouse_event({
+                let check_hover = Rc::new({
                     let update_hover = update_hover.clone();
                     let hitbox = hitbox.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        let is_hovered = has_mouse_down.borrow().is_none()
+                            && !cx.has_active_drag()
+                            && hover_listener_mode.is_hovered(&hitbox, window);
+                        update_hover(is_hovered, window, cx);
+                    }
+                });
+                window.on_mouse_event({
+                    let check_hover = check_hover.clone();
                     move |_: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
-                            let is_hovered = has_mouse_down.borrow().is_none()
-                                && !cx.has_active_drag()
-                                && hover_listener_mode.is_hovered(&hitbox, window);
-                            update_hover(is_hovered, window, cx);
+                            check_hover(window, cx);
                         }
                     }
                 });
+                // An overlay opening over a cached view under a still pointer.
+                window.on_hover_recheck(move |window, cx| check_hover(window, cx));
 
                 // The pointer can leave the window without a final MouseMove, so also
                 // clear hover on MouseExited.
@@ -3270,8 +3279,8 @@ impl Interactivity {
                     .long_press_tooltip_active
                     .get_or_insert_with(Default::default)
                     .clone();
-                let tooltip_source_bounds = element_state
-                    .tooltip_source_bounds
+                let tooltip_source_hitbox = element_state
+                    .tooltip_source_hitbox
                     .get_or_insert_with(Default::default)
                     .clone();
 
@@ -3279,15 +3288,15 @@ impl Interactivity {
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
                 });
-                // Use bounds instead of testing hitbox since this is called during prepaint.
+                // Called as the tooltip prepaints, after the window hit-tested this frame's
+                // hitboxes, so an element an overlay covers no longer counts as hovered.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
                     move |window: &Window| {
-                        !window.last_input_was_keyboard()
-                            && pending_mouse_down.borrow().is_none()
-                            && tooltip_source_bounds
+                        pending_mouse_down.borrow().is_none()
+                            && tooltip_source_hitbox
                                 .get()
-                                .contains(&window.mouse_position())
+                                .is_some_and(|hitbox| hitbox.is_hovered(window))
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3702,8 +3711,8 @@ pub struct InteractiveElementState {
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
-    /// The element's bounds this frame, read by its shown tooltip's hover check.
-    tooltip_source_bounds: Option<Rc<Cell<Bounds<Pixels>>>>,
+    /// The element's hitbox this frame, read by its shown tooltip's hover check.
+    tooltip_source_hitbox: Option<Rc<Cell<Option<HitboxId>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -5304,6 +5313,90 @@ mod tests {
             .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         assert!(!tooltip_shown(&mut test_app));
+    }
+
+    /// A tooltip target and its hover listener in a cached view, under an overlay the parent
+    /// draws on demand.
+    struct HoverTarget {
+        hovered: Rc<Cell<bool>>,
+    }
+
+    impl Render for HoverTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hovered = self.hovered.clone();
+            div().size_full().child(
+                div()
+                    .id("hover-target")
+                    .size(px(20.))
+                    .on_hover(move |is_hovered, _, _| hovered.set(*is_hovered))
+                    .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
+            )
+        }
+    }
+
+    struct OverlayOwner {
+        target: Entity<HoverTarget>,
+        overlay: bool,
+    }
+
+    impl Render for OverlayOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(AnyView::from(self.target.clone()).cached(StyleRefinement::default().size_full()))
+                .when(self.overlay, |el| {
+                    el.child(div().id("overlay").absolute().inset_0().occlude())
+                })
+        }
+    }
+
+    #[test]
+    fn an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views() {
+        let mut test_app = TestAppContext::single();
+        let hovered = Rc::new(Cell::new(false));
+        let window = test_app.add_window({
+            let hovered = hovered.clone();
+            move |_, cx| OverlayOwner {
+                target: cx.new(|_| HoverTarget { hovered }),
+                overlay: false,
+            }
+        });
+        let any_window: AnyWindowHandle = window.into();
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+            })
+            .unwrap();
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+        test_app
+            .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let tooltip_shown = |test_app: &mut TestAppContext| {
+            test_app
+                .update_window(any_window, |_, window, _| window.tooltip_bounds.is_some())
+                .unwrap()
+        };
+        assert!(tooltip_shown(&mut test_app));
+        assert!(hovered.get());
+
+        // Only the owner re-renders; the target's view is reused from the last frame.
+        window
+            .update(&mut test_app, |view, _, cx| {
+                view.overlay = true;
+                cx.notify();
+            })
+            .unwrap();
+        test_app
+            .update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        test_app.run_until_parked();
+        assert!(!tooltip_shown(&mut test_app), "the overlay covers the tooltip's element");
+        assert!(!hovered.get(), "the cached view's hover listener saw the overlay");
     }
 
     struct MouseDownOutOwner {

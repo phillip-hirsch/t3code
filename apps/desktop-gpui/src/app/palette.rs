@@ -184,8 +184,6 @@ pub(super) struct Palette {
     dark: bool,
     /// The root view's Threads group, ranked once per query and shell change.
     threads: Option<ThreadRanking>,
-    /// Opened from the draft hero: a picked project takes the composed draft along.
-    moves_draft: bool,
     _subscription: Subscription,
 }
 
@@ -279,7 +277,6 @@ impl Workspace {
             placeholder: "",
             dark: crate::theme::tokens(cx).dark,
             threads: None,
-            moves_draft: false,
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -477,7 +474,7 @@ impl Workspace {
     }
 
     /// The project of the open thread or draft.
-    fn current_project(&self) -> Option<&ProjectShell> {
+    pub(super) fn current_project(&self) -> Option<&ProjectShell> {
         let id = match &self.target {
             Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id),
             Some(Target::Draft { project_id, .. }) => Some(project_id),
@@ -777,17 +774,7 @@ impl Workspace {
         let tokens = search::fold_query(query);
         match palette.view {
             View::NewThreadIn => {
-                let mut rows = self.new_thread_rows();
-                // `DraftHeroHeadline`'s picker: the projects, then "Add project" unless searching.
-                // "No project" has its own link under the headline.
-                if palette.moves_draft {
-                    rows.retain(|row| !matches!(row.run, Run::ScratchThread(_)));
-                    if tokens.is_empty() {
-                        let icon = RowIcon::Lucide(IconName::FolderPlus);
-                        rows.push(Row::new("draft-add-project", icon, "Add project", Run::Open(View::AddProject)));
-                    }
-                }
-                return vec![Group { label: "Projects", rows: rank_rows(rows, &tokens) }];
+                return vec![Group { label: "Projects", rows: rank_rows(self.new_thread_rows(), &tokens) }];
             }
             View::Themes => {
                 return vec![Group { label: "Change theme", rows: rank_rows(self.theme_rows(palette.dark), &tokens) }];
@@ -1062,26 +1049,6 @@ impl Workspace {
             .or_else(|| Some(query.trim().to_owned()))
     }
 
-    /// `DraftHeroHeadline`'s project picker.
-    pub(super) fn open_draft_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_palette(View::NewThreadIn, window, cx);
-        if let Some(palette) = self.palette.as_mut() {
-            palette.moves_draft = true;
-        }
-    }
-
-    /// `selectProject`: a draft with content moves to the project; an empty one opens the project's draft,
-    /// since retargeting it would overwrite that one.
-    fn select_draft_project(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let composed = !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
-        match self.project_environment(&project_id) {
-            Some(env) if composed && matches!(self.target, Some(Target::Draft { .. })) => {
-                self.move_draft_to_project(env, project_id, window, cx);
-            }
-            _ => self.start_draft(project_id, window, cx),
-        }
-    }
-
     fn run_palette_row(&mut self, run: Run, window: &mut Window, cx: &mut Context<Self>) {
         match run {
             Run::Open(view) => return self.push_palette_view(view, window, cx),
@@ -1092,10 +1059,8 @@ impl Workspace {
             }
             _ => {}
         }
-        let moves_draft = self.palette.as_ref().is_some_and(|p| p.moves_draft);
         self.close_palette(window, cx);
         match run {
-            Run::NewThread(project_id) if moves_draft => self.select_draft_project(project_id, window, cx),
             Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
@@ -1233,6 +1198,15 @@ impl Workspace {
         let rows: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).collect();
         let modifiers = event.keystroke.modifiers;
         let highlight = palette.highlight;
+        // `thread.pin` pins the highlighted project row (`CommandPalette.tsx` handleKeyDown).
+        if self.is_pin_shortcut(&event.keystroke)
+            && let Some((ids, pinned)) =
+                marked_row(highlight, browsing, rows.len()).and_then(|i| rows.get(i)).and_then(|r| r.pin.clone())
+        {
+            self.set_projects_pinned(&ids, !pinned, cx);
+            cx.stop_propagation();
+            return;
+        }
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(window, cx),
             "up" | "down" if !rows.is_empty() => {
@@ -1304,6 +1278,7 @@ impl Workspace {
         // Only `highlightedItemValue` paints; Enter still runs the first row when it is `None`.
         let highlight = palette.highlight;
         let groups = self.palette_groups(&query);
+        let marked = marked_row(highlight, browsing, groups.iter().map(|g| g.rows.len()).sum());
         let input = palette.input.clone();
         let fg = tokens.foreground;
         let muted = tokens.muted_foreground;
@@ -1350,7 +1325,8 @@ impl Workspace {
             }
             for row in &group.rows {
                 let highlighted = highlight == Some(index);
-                list = list.child(self.render_palette_row(row, index, highlighted, &tokens, cx));
+                let mark = RowMark { highlighted, marked: marked == Some(index) };
+                list = list.child(self.render_palette_row(row, index, mark, &tokens, cx));
                 index += 1;
             }
         }
@@ -1492,7 +1468,7 @@ impl Workspace {
         &self,
         row: &Row,
         index: usize,
-        highlighted: bool,
+        RowMark { highlighted, marked }: RowMark,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1526,6 +1502,7 @@ impl Workspace {
                 .into_any_element(),
         });
         let run = row.run.clone();
+        let pin_shortcut = self.shortcut_label("thread.pin");
         // `CommandItem`: centred, with the icon held to the title line (`CommandPaletteTitleIcon`)
         // and the pin, time, shortcut and chevron beside the text, in that order.
         h_flex()
@@ -1584,9 +1561,14 @@ impl Workspace {
                             .map(|d| div().text_xs().line_height(px(16.)).text_color(muted.opacity(0.7)).child(d)),
                     ),
             )
-            .children(row.pin.clone().filter(|(_, pinned)| *pinned || highlighted).map(|(ids, pinned)| {
+            .children(row.pin.clone().filter(|(_, pinned)| *pinned || marked).map(|(ids, pinned)| {
                 // `ProjectPinButton`: shown while pinned or highlighted; a pinned one offers to unpin on hover.
                 let group: SharedString = format!("pin-{}", row.key).into();
+                let action = format!("{} {}", if pinned { "Unpin" } else { "Pin" }, row.title);
+                let title: SharedString = match &pin_shortcut {
+                    Some(shortcut) => format!("{action} ({shortcut})").into(),
+                    None => action.into(),
+                };
                 let glyph = |name: IconName| Icon::new(name).size(px(14.)).text_color(muted);
                 div()
                     .id(group.clone())
@@ -1599,6 +1581,9 @@ impl Workspace {
                     .rounded(px(6.))
                     .cursor_pointer()
                     .hover(|s| s.bg(tokens.foreground.opacity(0.04)))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                    })
                     .child(
                         div()
                             .when(pinned, |el| el.group_hover(group.clone(), gpui_kit::Styled::invisible))
@@ -1730,9 +1715,32 @@ fn rank_rows(rows: Vec<Row>, tokens: &[Vec<char>]) -> Vec<Row> {
     ranked.into_iter().map(|(row, _)| row).collect()
 }
 
+/// How a row shows the pointer or arrows on it.
+#[derive(Clone, Copy)]
+struct RowMark {
+    /// `highlightedItemValue`: the painted highlight.
+    highlighted: bool,
+    /// Base UI's `data-highlighted`, which shows an unpinned project's pin.
+    marked: bool,
+}
+
+/// The row Base UI highlights: the arrowed or hovered one, else the first (`autoHighlight="always"`
+/// outside browsing) even while no highlight paints.
+fn marked_row(highlight: Option<usize>, browsing: bool, rows: usize) -> Option<usize> {
+    highlight.or((!browsing && rows > 0).then_some(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_row_stays_highlighted_for_the_pin_until_another_is() {
+        assert_eq!(marked_row(None, false, 3), Some(0), "a fresh view marks its first row");
+        assert_eq!(marked_row(Some(2), false, 3), Some(2));
+        assert_eq!(marked_row(None, true, 3), None, "browsing highlights nothing on its own");
+        assert_eq!(marked_row(None, false, 0), None);
+    }
 
     #[test]
     fn no_project_follows_the_pinned_projects_unless_scratch_is_pinned_or_current() {

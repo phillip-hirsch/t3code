@@ -58,8 +58,9 @@ impl Workspace {
                 cx,
                 |this, text, window, cx| this.update_settings(json!({ "worktreesDirectory": text }), window, cx),
             )
-            // The web's `Input` has no width here: a text input's default 20 characters.
-            .sized(px(168.))
+            // The web's `Input` has no width here: beside the title a text input's default 20
+            // characters, across the row once it stacks.
+            .filling(px(168.))
         });
         let submodules = view.str("worktreeSubmodules");
         let submodules = if submodules.is_empty() { "recursive" } else { submodules };
@@ -108,7 +109,7 @@ impl Workspace {
                     "The model chooses a prefix that describes the work, such as feat/add-search, fix/login-timeout, or refactor/auth.",
                 ))
                 .setting("branchNamingMode")
-                .select(NAMING, 176.),
+                .select_full(NAMING, 176.),
         )];
         match mode.as_str() {
             "static" => branches.push(row(

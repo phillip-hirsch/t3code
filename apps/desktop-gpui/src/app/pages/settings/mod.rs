@@ -352,6 +352,23 @@ fn restore_patch() -> Map<String, Value> {
         .collect()
 }
 
+/// `AppRouteModal`'s viewport padding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModalInsets {
+    side: f32,
+    top: f32,
+}
+
+/// `sm:p-6 sm:pt-(--app-modal-sm-top) lg:p-10`, for a window `width` CSS px wide whose native
+/// caption strip is `titlebar` px tall; `None` below `sm`, where the modal fills the window.
+fn modal_insets(width: f32, titlebar: f32) -> Option<ModalInsets> {
+    match width {
+        w if w < 640. => None,
+        w if w < 1024. => Some(ModalInsets { side: 24., top: titlebar.max(24.) }),
+        _ => Some(ModalInsets { side: 40., top: 40. }),
+    }
+}
+
 impl Workspace {
     /// The modal layer, drawn over everything while Settings is open.
     pub(in crate::app) fn render_settings(
@@ -367,6 +384,8 @@ impl Workspace {
         let view = self.settings_view();
         self.sync_scope_project_picker(&view, window, cx);
         let content = self.render_settings_section(&section, &view, window, cx);
+        let titlebar = f32::from(crate::app::titlebar::native_titlebar_height(window));
+        let insets = modal_insets(f32::from(window.viewport_size().width), titlebar);
         Some(
             div()
                 .id("settings-modal")
@@ -382,32 +401,48 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
                 )
                 .child(
-                    div().absolute().inset_0().p(px(40.)).flex().items_center().justify_center().child(
-                        h_flex()
-                            .id("settings-popup")
-                            .track_focus(&self.settings_ui.focus)
-                            .key_context("SettingsModal")
-                            .on_key_down(cx.listener(Self::on_settings_key_down))
-                            .occlude()
-                            .size_full()
-                            .max_w(px(1280.))
-                            .max_h(px(960.))
-                            .rounded(px(16.))
-                            .border_1()
-                            .border_color(t.border)
-                            .bg(t.background)
-                            .shadow_2xl()
-                            .overflow_hidden()
-                            .child(self.render_settings_nav(&section, window, cx))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h_full()
-                                    .child(self.render_settings_header(&section, &view, cx))
-                                    .child(v_flex().flex_1().min_h_0().child(content)),
-                            ),
-                    ),
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .when_some(insets, |el, insets| el.px(px(insets.side)).pb(px(insets.side)).pt(px(insets.top)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            h_flex()
+                                .id("settings-popup")
+                                .track_focus(&self.settings_ui.focus)
+                                .key_context("SettingsModal")
+                                .on_key_down(cx.listener(Self::on_settings_key_down))
+                                .occlude()
+                                .relative()
+                                .size_full()
+                                .bg(t.background)
+                                .overflow_hidden()
+                                .map(|el| match insets {
+                                    Some(_) => el
+                                        .max_w(px(1280.))
+                                        .max_h(px(960.))
+                                        .rounded(px(16.))
+                                        .border_1()
+                                        .border_color(t.border)
+                                        .shadow_2xl(),
+                                    // Below `sm` it fills the window and leaves the caption strip
+                                    // empty, still moving the window as the titlebar does.
+                                    None => el.pt(px(titlebar)).child(crate::app::titlebar::drag_region(
+                                        div().absolute().top_0().left_0().right_0().h(px(titlebar)),
+                                    )),
+                                })
+                                .child(self.render_settings_nav(&section, window, cx))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .child(self.render_settings_header(&section, &view, cx))
+                                        .child(v_flex().flex_1().min_h_0().child(content)),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -869,6 +904,14 @@ fn kbd(key: &'static str, t: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_modal_insets_follow_the_sm_and_lg_breakpoints() {
+        assert_eq!(modal_insets(639., 40.), None, "below sm the modal fills the window");
+        assert_eq!(modal_insets(800., 40.), Some(ModalInsets { side: 24., top: 40. }), "it clears the caption strip");
+        assert_eq!(modal_insets(800., 0.), Some(ModalInsets { side: 24., top: 24. }));
+        assert_eq!(modal_insets(1024., 52.), Some(ModalInsets { side: 40., top: 40. }));
+    }
 
     #[test]
     fn restore_lists_changed_settings_and_resets_known_keys() {

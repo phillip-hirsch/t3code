@@ -747,6 +747,16 @@ pub(crate) struct HitTest {
     pub(crate) hover_hitbox_count: usize,
 }
 
+impl HitTest {
+    fn hovered(&self) -> &[HitboxId] {
+        &self.ids[..self.hover_hitbox_count]
+    }
+}
+
+/// Dispatched after a frame in which a hitbox kept from the last frame (a cached view's) started
+/// or stopped being hovered under a still pointer, so its hover listeners see the change.
+pub(crate) struct HoverRecheckEvent;
+
 /// A type of window control area that corresponds to the platform window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowControlArea {
@@ -1261,6 +1271,7 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    hover_recheck_pending: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2384,6 +2395,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            hover_recheck_pending: false,
             modifiers,
             capslock,
             scale_factor,
@@ -3788,6 +3800,12 @@ impl Window {
         if self.focus != focus_before_listeners {
             self.refresh();
         }
+        if mem::take(&mut self.hover_recheck_pending) {
+            self.defer(cx, |window, cx| {
+                cx.propagate_event = true;
+                window.dispatch_mouse_event(&HoverRecheckEvent, cx);
+            });
+        }
         self.needs_present.set(true);
 
         #[cfg(feature = "profiler")]
@@ -3896,6 +3914,8 @@ impl Window {
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
+        let hovered_before: SmallVec<[HitboxId; 8]> = self.mouse_hit_test.hovered().into();
+        let first_new_hitbox = self.next_hitbox_id;
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3944,6 +3964,8 @@ impl Window {
         let mut prompt_element = None;
         let mut active_drag_element = None;
         let mut tooltip_element = None;
+        // Shown tooltips check their element against this frame's hitboxes as they prepaint.
+        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
         if let Some(prompt) = self.prompt.take() {
             let mut element = prompt.view.any_view().into_any_element();
             let prompt_layout_id = element.request_layout(self, cx);
@@ -3965,6 +3987,18 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        // Painting checks hover for what it draws; a reused view's hitboxes keep their ids and
+        // skip painting, so they need the recheck.
+        let hovered_now = self.mouse_hit_test.hovered();
+        let reused = |id: &HitboxId| id.0 < first_new_hitbox.0;
+        self.hover_recheck_pending |= hovered_now
+            .iter()
+            .any(|id| reused(id) && !hovered_before.contains(id))
+            || hovered_before.iter().any(|id| {
+                reused(id)
+                    && !hovered_now.contains(id)
+                    && self.next_frame.hitboxes.iter().any(|hitbox| hitbox.id == *id)
+            });
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
@@ -5671,6 +5705,18 @@ impl Window {
                 .set_text_input_configuration(configuration.clone());
             self.last_text_input_configuration = Some(configuration);
         }
+    }
+
+    /// Registers a listener for the [`HoverRecheckEvent`] dispatched after a frame.
+    pub(crate) fn on_hover_recheck(&mut self, listener: impl Fn(&mut Window, &mut App) + 'static) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.mouse_listeners.push(Some(Box::new(
+            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                if phase == DispatchPhase::Bubble && event.is::<HoverRecheckEvent>() {
+                    listener(window, cx);
+                }
+            },
+        )));
     }
 
     /// Register a mouse event listener on the window for the next frame. The type of event

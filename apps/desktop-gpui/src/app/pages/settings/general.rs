@@ -141,12 +141,12 @@ impl Workspace {
             row(self, SettingRow::new("chat-width")
                 .description("Set how wide messages and the composer can grow on large screens.")
                 .setting("chatWidth")
-                .select(CHAT_WIDTHS, 160.)),
+                .select_full(CHAT_WIDTHS, 160.)),
             row(self, details_row),
             row(self, SettingRow::new("effort-display")
                 .description("Show reasoning effort in the composer as its name, such as High, or as bars.")
                 .setting("effortDisplay")
-                .select(EFFORT_DISPLAYS, 160.)),
+                .select_full(EFFORT_DISPLAYS, 160.)),
             row(self, SettingRow::new("math-rendering")
                 .description("Typeset LaTeX math, such as $x^2$ or \\[x^2\\], in messages and Markdown previews. The composer keeps TeX source editable.")
                 .setting("mathRenderingEnabled")

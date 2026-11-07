@@ -4,7 +4,7 @@
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ParentElement as _, Pixels, Styled as _, Window, px,
+    ParentElement as _, Pixels, Styled as _, Window, div, px,
 };
 
 /// `@min-[32rem]/settings-row`: below this content width the control sits under the title.
@@ -70,7 +70,8 @@ impl Element for RowLayout {
                 .w_full()
                 .gap(px(12.))
                 .child(label)
-                .children(control.map(|control| h_flex().w_full().min_w_0().gap(px(8.)).child(control)))
+                // A block box, so a `w-full` control spans the row.
+                .children(control.map(|control| div().w_full().min_w_0().child(control)))
                 .into_any_element()
         } else {
             h_flex()

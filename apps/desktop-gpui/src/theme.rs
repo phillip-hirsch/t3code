@@ -73,6 +73,9 @@ pub struct Tokens {
 #[derive(Clone, Copy)]
 pub struct SidebarTokens {
     pub background: Hsla,
+    /// The page's own `--sidebar` outside `[data-app-sidebar]`, which the narrow window's sheet
+    /// paints behind the rows (`SheetPopup` is portaled out of the sidebar).
+    pub sheet: Hsla,
     pub foreground: Hsla,
     pub muted_foreground: Hsla,
     pub secondary_label: Hsla,
@@ -129,6 +132,7 @@ impl Tokens {
             scrollbar_thumb_hover: white(0.12),
             sidebar: SidebarTokens {
                 background: hex(0x000000),
+                sheet: hex(0x111111),
                 foreground: sidebar_foreground,
                 muted_foreground: hex(0xa3a3a3),
                 secondary_label: hex(0x8f8f8f),
@@ -173,6 +177,7 @@ impl Tokens {
             scrollbar_thumb_hover: hex(0xbfbfbf),
             sidebar: SidebarTokens {
                 background: hex(0xfafafa),
+                sheet: hex(0xfafafa),
                 foreground,
                 muted_foreground: hex(0x71717b),
                 secondary_label: hex(0x71717b),
@@ -365,6 +370,7 @@ impl Tokens {
         self.warning_foreground = c.warning_foreground;
         self.sidebar = SidebarTokens {
             background: c.sidebar,
+            sheet: c.sidebar,
             foreground: c.sidebar_foreground,
             muted_foreground: c.sidebar_muted_foreground,
             secondary_label: c.secondary_label,

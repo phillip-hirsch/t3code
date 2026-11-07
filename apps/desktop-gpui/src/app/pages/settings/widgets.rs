@@ -155,7 +155,7 @@ enum Control {
     Switch,
     Select {
         options: &'static [(&'static str, &'static str)],
-        width: f32,
+        width: SelectWidth,
     },
     Slider {
         min: f32,
@@ -163,7 +163,7 @@ enum Control {
         step: f32,
         unit: &'static str,
     },
-    /// A field saved trimmed on blur or Enter (`DraftInput`), `width` px wide.
+    /// A field saved trimmed on blur or Enter (`DraftInput`), across a stacked row, else `width` px wide.
     Text {
         placeholder: &'static str,
         width: f32,
@@ -237,9 +237,17 @@ impl SettingRow {
         self
     }
 
-    /// A select over `(value, label)` pairs, `width` px wide like the web's `sm:w-*`; 0 sizes it to its label.
+    /// A select over `(value, label)` pairs, `width` px wide like the web's `w-full sm:w-*`; 0 sizes it
+    /// to its label (`w-auto`).
     pub(in crate::app) fn select(mut self, options: &'static [(&'static str, &'static str)], width: f32) -> Self {
+        let width = if width > 0. { SelectWidth::Small(width) } else { SelectWidth::Label };
         self.control = Control::Select { options, width };
+        self
+    }
+
+    /// A select with the web's plain `w-full`: across a stacked row, else at least `min` px wide.
+    pub(in crate::app) fn select_full(mut self, options: &'static [(&'static str, &'static str)], min: f32) -> Self {
+        self.control = Control::Select { options, width: SelectWidth::Full(min) };
         self
     }
 
@@ -1217,7 +1225,7 @@ impl Workspace {
         let element = match (control, key) {
             (Control::Text { placeholder, width }, Some(key)) => {
                 let field = self.setting_field(id, key, view.str(key), placeholder, false, window, cx);
-                field.sized(px(width)).into_any_element()
+                field.filling(px(width)).into_any_element()
             }
             (Control::Textarea { placeholder }, Some(key)) => {
                 let field = self.setting_field(id, key, view.str(key), placeholder, true, window, cx);
@@ -1242,7 +1250,8 @@ impl Workspace {
                 let workspace = cx.entity();
                 // `SelectValue` ellipsizes a label wider than the trigger.
                 let label = div().min_w_0().truncate().child(label);
-                select_trigger(id, label, width, &t)
+                width
+                    .apply(select_trigger(id, label, 0., &t), window.viewport_size().width)
                     .min_w(px(ROW_SELECT_MIN_WIDTH))
                     .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                         for (value, label) in options {
@@ -1324,7 +1333,8 @@ impl Workspace {
         Self::with_select_menu(trigger, options, cx, on_pick)
     }
 
-    /// [`Self::menu_select`] in a row's control, at least [`ROW_SELECT_MIN_WIDTH`] wide.
+    /// [`Self::menu_select`] in a row's control as the web's plain `SelectTrigger` (`w-full`): across a
+    /// stacked row, else as wide as its label and at least `width` and [`ROW_SELECT_MIN_WIDTH`].
     pub(in crate::app) fn row_menu_select<T: Clone + 'static>(
         &self,
         id: impl Into<SharedString>,
@@ -1334,7 +1344,8 @@ impl Workspace {
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let trigger = select_trigger(&id.into(), trigger, width, theme::tokens(cx)).min_w(px(ROW_SELECT_MIN_WIDTH));
+        let trigger = SelectWidth::Full(width.max(ROW_SELECT_MIN_WIDTH))
+            .apply(select_trigger(&id.into(), trigger, 0., theme::tokens(cx)), gpui_kit::Pixels::ZERO);
         Self::with_select_menu(trigger, options, cx, on_pick)
     }
 
@@ -1711,6 +1722,29 @@ impl gpui_kit::RenderOnce for Switch {
 
 /// `SettingsRow` gives a select in its control at least `min-w-40`.
 pub(in crate::app) const ROW_SELECT_MIN_WIDTH: f32 = 160.;
+
+/// A row select's width, as the web's classes on its `SelectTrigger` set it.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) enum SelectWidth {
+    /// `w-auto`: as wide as its label.
+    Label,
+    /// `w-full sm:w-*`: this wide from the `sm` breakpoint up, the row's width below it.
+    Small(f32),
+    /// `w-full`: across a stacked row, else as wide as its label and at least this.
+    Full(f32),
+}
+
+impl SelectWidth {
+    /// Sizes `trigger` in a window `viewport` wide.
+    fn apply(self, trigger: Button, viewport: gpui_kit::Pixels) -> Button {
+        match self {
+            Self::Label => trigger,
+            Self::Small(width) if viewport >= px(640.) => trigger.w(px(width)),
+            Self::Small(_) => trigger.w_full(),
+            Self::Full(min) => trigger.w_full().min_w(px(min)),
+        }
+    }
+}
 
 /// The web's `SelectTrigger size="sm"`.
 pub(in crate::app) fn select_trigger(id: &SharedString, label: impl IntoElement, width: f32, t: &Tokens) -> Button {

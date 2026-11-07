@@ -16,18 +16,27 @@ copy, so `git log -p -- vendor/<name>` shows it.
 
 GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
 
-**A tooltip hides once its element moves away from the pointer.** 0.3.11 checks a shown tooltip
-against the bounds its element had when the tooltip appeared, so a layout change under a still
-pointer (a panel opening, a row reflowing) left the tooltip floating where its button used to be
-until the pointer left that old spot. The patch keeps the element's bounds in its element state,
-updated every frame, and the tooltip's check reads them. Files:
+**Hover follows the layout under a still pointer.** 0.3.11 checks a shown tooltip against the
+bounds its element had when the tooltip appeared, ignoring anything drawn over it (its own TODO),
+so a tooltip stayed up where its button used to be, or over a palette that opened on top of it.
+And `on_hover` re-checks only on a mouse move or when its element paints, so a cached view (the
+sidebar) under a newly opened overlay kept its hover card. The patch:
 
-- `src/elements/div.rs`: `InteractiveElementState::tooltip_source_bounds`, set in `prepaint` and
-  read by `check_is_hovered_during_prepaint`; one test,
-  `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`.
+- `src/elements/div.rs`: `InteractiveElementState::tooltip_source_hitbox`, the element's hitbox
+  this frame, set in `prepaint`; `check_is_hovered_during_prepaint` asks whether that hitbox is
+  hovered, so moving away and being covered both hide the tooltip. `on_hover` also listens for
+  `HoverRecheckEvent`.
+- `src/window.rs`: `draw_roots` hit-tests this frame's hitboxes before the tooltip prepaints, and
+  after the frame dispatches `HoverRecheckEvent` (`on_hover_recheck`) when a hitbox kept from the
+  last frame started or stopped being hovered.
+- Tests in `div.rs`: `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`,
+  `an_overlay_over_a_still_mouse_hides_tooltips_and_unhovers_cached_views`.
 
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
-repository (`cargo test --features test-support --lib`).
+repository (`cargo test --features test-support --lib`). The copy needs the published crate's
+missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
+`assets/fonts/lilex` hold the fonts `svg_renderer.rs` includes (empty files compile, and only the
+`svg_renderer` tests then fail), and drop `style.rs`'s `util_macros::perf` attributes.
 
 ## gpui-pre-windows 0.3.11
 
