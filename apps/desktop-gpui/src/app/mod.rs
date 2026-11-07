@@ -171,6 +171,9 @@ pub struct Workspace {
     rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
+    /// The model the user last picked in the composer (`stickyModelSelectionByProvider`), which
+    /// new drafts start on. Kept for the session.
+    sticky_model: Option<ModelSelection>,
     /// Runtime mode a new thread launches with; open threads keep theirs on the server.
     runtime_mode_override: Option<String>,
     /// Tracked so typing only re-renders when the send button's state flips.
@@ -370,6 +373,7 @@ impl Workspace {
             sending: false,
             rewinding: HashSet::new(),
             model_override: None,
+            sticky_model: None,
             runtime_mode_override: None,
             composer_empty: true,
             composer_height: 0.,
@@ -852,11 +856,16 @@ impl Workspace {
         self.stash_composer(cx);
         let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
+        let carried = self.carried_model();
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
-        self.model_override = None;
+        if opened {
+            let project = self.target_project();
+            self.model_override =
+                crate::new_thread::new_draft_model(self.server_info(), project, carried, self.sticky_model.as_ref());
+        }
         self.runtime_mode_override = None;
         self.restore_composer(window, cx);
         if opened {
@@ -913,6 +922,16 @@ impl Workspace {
             }
             None => None,
         }
+    }
+
+    /// The model a new draft carries from where it was started: the composer's pick, else the open
+    /// thread's model (`carryModelSelection`).
+    fn carried_model(&self) -> Option<ModelSelection> {
+        if let Some(selection) = &self.model_override {
+            return Some(selection.clone());
+        }
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
     }
 
     /// The composer model's provider, borrowing the selection where one is stored.
