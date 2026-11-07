@@ -306,6 +306,8 @@ pub(super) struct RightPanel {
     tabs_scroll: ScrollHandle,
     /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
     diff_refs: ScrollHandle,
+    /// A frame was already spent waiting for `diff_refs` to be measured; zero after that is a real width.
+    diff_refs_waited: std::cell::Cell<bool>,
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
     /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
@@ -357,6 +359,7 @@ impl RightPanel {
             commits: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
             diff_refs: ScrollHandle::new(),
+            diff_refs_waited: std::cell::Cell::new(false),
             revealed_tab: None,
             observation: None,
             observed_pull_requests: HashMap::new(),
@@ -1859,9 +1862,10 @@ impl Workspace {
                 .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.clone()))
                 .unwrap_or_else(|| "HEAD".into());
             let base = base.or_else(|| self.diff_base_ref().map(str::to_owned)).unwrap_or_else(|| "Automatic".into());
-            // Under 20rem the head drops out and the base reads "vs …"; unmeasured, wait a frame.
+            // Under 20rem the head drops out and the base reads "vs …"; unmeasured, wait one frame,
+            // since a narrow panel can lay the area out at zero for good.
             let refs_width = self.right_panel.diff_refs.bounds().size.width;
-            if refs_width <= px(0.) {
+            if wait_for_measure(refs_width, &self.right_panel.diff_refs_waited) {
                 window.request_animation_frame();
             }
             let narrow = refs_width < window.rem_size() * 20.;
@@ -2400,6 +2404,16 @@ fn diff_file_status(path: &SharedString, state: diff_load::FileState, view: &Ent
         .into_any_element()
 }
 
+/// Whether to spend a frame waiting for an area to be measured: once at most, so an area laid
+/// out at zero width doesn't repaint every frame.
+fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
+    if width > px(0.) {
+        waited.set(false);
+        return false;
+    }
+    !waited.replace(true)
+}
+
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
 fn icon_toggle(
     id: &'static str,
@@ -2576,6 +2590,16 @@ mod tests {
         let turns = turn_summaries(state.projection.as_ref().unwrap());
         assert_eq!(turns.iter().map(|t| t.turn_count).collect::<Vec<_>>(), [2, 1]);
         assert_eq!(short_time(&turns[0].completed_at), "00:02");
+    }
+
+    #[test]
+    fn an_area_measured_at_zero_waits_one_frame_not_every_frame() {
+        let waited = std::cell::Cell::new(false);
+        assert!(wait_for_measure(px(0.), &waited), "the first unmeasured render waits a frame");
+        assert!(!wait_for_measure(px(0.), &waited), "zero after that is the real width");
+        assert!(!wait_for_measure(px(0.), &waited));
+        assert!(!wait_for_measure(px(120.), &waited));
+        assert!(wait_for_measure(px(0.), &waited), "a later collapse to zero gets one frame again");
     }
 
     #[test]
