@@ -484,7 +484,7 @@ impl Workspace {
     }
 
     /// The name of a project's group (`displayName`): the repository's name, not owner/repo.
-    fn group_name(&self, project: &ProjectShell) -> SharedString {
+    pub(super) fn group_name(&self, project: &ProjectShell) -> SharedString {
         let groups = self.project_groups();
         groups
             .iter()

@@ -32,7 +32,7 @@ use serde_json::json;
 
 use super::pages::settings::code::projects::icon as project_icons;
 use super::titlebar::{self, TITLEBAR_HEIGHT};
-use super::{Connection, Target, Workspace, project_name};
+use super::{Connection, Target, Workspace};
 use crate::inbox::{self, Facts, FolderDot, Status};
 use crate::model::{ProjectShell, ShellState, ThreadShell};
 use crate::project_groups::{self, GroupingSettings, ProjectGroup, ScratchRoot, SortOrder};
@@ -441,6 +441,9 @@ impl Item<'_> {
         }
     }
 }
+
+/// A card row's list item padding (`py-0.5`).
+const CARD_ITEM_INSET: f32 = 2.;
 
 /// The 2 px inset focus ring of the keyboard row.
 fn focus_ring(element: AnyElement, tokens: &Tokens) -> AnyElement {
@@ -1085,7 +1088,7 @@ impl Workspace {
                     .pl(px(2.))
                     .text_color(tokens.muted_foreground)
                     .children(
-                        project.map(|p| line(project_icon(p, tokens, false, 12., self.favicon(p)), project_name(p))),
+                        project.map(|p| line(project_icon(p, tokens, false, 12., self.favicon(p)), self.group_name(p))),
                     )
                     .children(
                         info.and_then(|info| info.environment_label.clone())
@@ -1961,10 +1964,13 @@ impl Workspace {
         let hover_id = thread.id.clone();
         let has_meta = meta.is_some();
         let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
-        let hover_card = self.render_hover_card(&facts, project, tokens);
+        // `align="start"` against the row, inside the list item's `py-0.5`.
+        let hover_card = self
+            .render_hover_card(&facts, project, tokens)
+            .map(|card| div().absolute().top(px(CARD_ITEM_INSET)).left_0().right_0().child(card));
         div()
             .relative()
-            .py(px(2.))
+            .py(px(CARD_ITEM_INSET))
             .children(hover_card)
             .child(
                 div()
