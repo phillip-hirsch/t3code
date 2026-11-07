@@ -330,7 +330,7 @@ pub(super) struct RightPanel {
     tree_selected: Option<String>,
     /// The tree's visible rows, rebuilt when the shown files or the folds change.
     tree_rows: std::rc::Rc<[diff_tree::Row]>,
-    /// The file `open_turn_diff` asked for, scrolled to once its selection loads.
+    /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     _diff_events: Subscription,
 }
@@ -868,7 +868,7 @@ impl Workspace {
         }
     }
 
-    /// Starts a fetch when the shown selection differs from the loaded one.
+    /// Starts a fetch when the shown selection differs from the loaded one, else reveals a pending file.
     fn sync_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_surface() != Some(&Surface::Diff) {
             return;
@@ -917,6 +917,7 @@ impl Workspace {
             refresh: self.right_panel.refresh,
         };
         if self.right_panel.loaded.as_ref() == Some(&key) {
+            self.reveal_pending_file(cx);
             return;
         }
         self.right_panel.loaded = Some(key);
@@ -1172,11 +1173,22 @@ impl Workspace {
                 state.set_file_collapsed(path, folded.contains(path), cx);
             }
         });
-        if let Some((_, file)) = self.right_panel.pending_reveal.take_if(|(asked, _)| *asked == *selection) {
-            let file = paths.iter().find(|path| path.replace('\\', "/") == file.as_ref()).cloned().unwrap_or(file);
-            self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(&file, cx));
-        }
         self.right_panel.shown = Some(selection.clone());
+        self.reveal_pending_file(cx);
+    }
+
+    /// `revealDiffFile` for the file `open_turn_diff` asked for: done once the shown selection's
+    /// patch holds it, whether that selection just loaded or was already loaded.
+    fn reveal_pending_file(&mut self, cx: &mut Context<Self>) {
+        let Some((selection, file)) = &self.right_panel.pending_reveal else { return };
+        if self.right_panel.shown.as_ref() != Some(selection) {
+            return;
+        }
+        let Some(path) = diff_tree::find_requested(self.right_panel.diff.read(cx).files(), file).cloned() else {
+            return;
+        };
+        self.right_panel.pending_reveal = None;
+        self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(&path, cx));
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {

@@ -112,6 +112,15 @@ pub(super) fn rows(files: &[(&str, Status)], folded: &HashSet<String>) -> Vec<Ro
     out
 }
 
+/// The patch's path for `requested`, a `/`-separated path from the chat, if the patch shows it.
+pub(super) fn find_requested<'a>(files: &'a [DiffFile], requested: &str) -> Option<&'a SharedString> {
+    let same = |path: &str| {
+        path.len() == requested.len()
+            && path.bytes().zip(requested.bytes()).all(|(a, b)| a == b || (a == b'\\' && b == b'/'))
+    };
+    files.iter().map(DiffFile::path).find(|path| same(path))
+}
+
 impl Workspace {
     /// The loaded files the patch shows: test files leave while "Hide test files" is on.
     pub(super) fn shown_diff_files(&self) -> Vec<DiffFile> {
@@ -266,5 +275,13 @@ mod tests {
             ]
         );
         assert_eq!(tree(&paths, &["src/"]), [(0, "src".to_owned()), (0, "README.md".to_owned())]);
+    }
+
+    #[test]
+    fn a_requested_file_is_found_only_among_the_files_the_patch_shows() {
+        let patch = "diff --git a/src\\app\\a.rs b/src\\app\\a.rs\n--- a/src\\app\\a.rs\n+++ b/src\\app\\a.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let files = DiffFile::parse(patch).expect("a one-file patch parses");
+        assert_eq!(find_requested(&files, "src/app/a.rs").map(SharedString::as_ref), Some("src\\app\\a.rs"));
+        assert_eq!(find_requested(&files, "src/app/a.test.rs"), None);
     }
 }
