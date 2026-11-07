@@ -101,7 +101,7 @@ impl Workspace {
             return;
         }
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
-        let subscription = cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
+        let subscription = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 // `autoHighlight`: typing highlights the first match.
                 if let Some(open) = &mut this.draft_picker.open {
@@ -110,7 +110,8 @@ impl Workspace {
                 cx.notify();
             }
             // Focus left the combobox (Tab, a click elsewhere): it closes and the focus stays there.
-            InputEvent::Blur => {
+            // Switching to another window leaves it open, as in the browser.
+            InputEvent::Blur if window.is_window_active() => {
                 this.dismiss_draft_picker(cx);
             }
             _ => {}
