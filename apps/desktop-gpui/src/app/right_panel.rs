@@ -264,6 +264,8 @@ struct FilePatches {
     client: RpcClient,
     request: diff_load::PatchRequest,
     files: Vec<diff_load::FileStat>,
+    /// `files` by path, for the headers' counts.
+    stats: std::rc::Rc<HashMap<SharedString, diff_load::FileStat>>,
     rows: Vec<Option<(Vec<DiffFile>, diff_load::FileState)>>,
     _retries: Vec<Task<()>>,
 }
@@ -1016,6 +1018,9 @@ impl Workspace {
                     selection: selection.clone(),
                     client: client.clone(),
                     request: request.clone(),
+                    stats: std::rc::Rc::new(
+                        deferred.iter().map(|file| (file.path.clone().into(), file.clone())).collect(),
+                    ),
                     files: deferred.clone(),
                     rows: vec![None; deferred.len()],
                     _retries: Vec::new(),
@@ -2012,6 +2017,7 @@ impl Workspace {
                         .items_start()
                         .child({
                             // `--diffs-font-size`, the Code font size.
+                            let stats = self.right_panel.patches.as_ref().map(|patches| patches.stats.clone());
                             let (states, state, view, header_tokens) = (
                                 self.right_panel.patch_states.clone(),
                                 self.right_panel.diff.clone(),
@@ -2023,7 +2029,16 @@ impl Workspace {
                                 .render_header(move |file, _, cx| {
                                     let status =
                                         states.get(file.path()).map(|load| diff_file_status(file.path(), *load, &view));
-                                    diff_open::header(file, state.clone(), view.clone(), &header_tokens, status, cx)
+                                    let stat = stats.as_ref().and_then(|stats| stats.get(file.path()));
+                                    diff_open::header(
+                                        file,
+                                        stat,
+                                        state.clone(),
+                                        view.clone(),
+                                        &header_tokens,
+                                        status,
+                                        cx,
+                                    )
                                 })
                                 .hunk_separator(DiffHunkSeparator::LineInfo)
                                 .change_indicator(DiffChangeIndicator::Bars)

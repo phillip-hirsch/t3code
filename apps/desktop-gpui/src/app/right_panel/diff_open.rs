@@ -11,6 +11,7 @@ use gpui_kit::{
 
 use super::super::Workspace;
 use super::super::markdown_ui::workspace_relative;
+use super::diff_load::FileStat;
 use crate::theme::Tokens;
 
 fn is_windows_absolute(path: &str) -> bool {
@@ -89,10 +90,21 @@ impl Workspace {
     }
 }
 
+/// The header's `+n −n`: a lazily read file's metadata counts, which cover changes a cut or
+/// failed patch is missing (`renderHeaderMetadata`), else the parsed patch's.
+fn header_counts(file: &DiffFile, stat: Option<&FileStat>) -> Option<(usize, usize)> {
+    if let Some(stat) = stat {
+        return Some((stat.additions, stat.deletions));
+    }
+    let counted = !matches!(file.status(), DiffFileStatus::Unchanged | DiffFileStatus::Conflicted);
+    counted.then(|| (file.additions(), file.deletions()))
+}
+
 /// The default diff header (path, `+n −n`, status) with the path opening the file and the
-/// rest of the row folding it.
+/// rest of the row folding it. `stat` is the file's metadata when its patch loads on its own.
 pub(super) fn header(
     file: &DiffFile,
+    stat: Option<&FileStat>,
     state: Entity<DiffState>,
     view: Entity<Workspace>,
     tokens: &Tokens,
@@ -111,7 +123,7 @@ pub(super) fn header(
         DiffFileStatus::Conflicted => Some("Conflicts"),
         _ => None,
     };
-    let statistics = !matches!(file.status(), DiffFileStatus::Unchanged | DiffFileStatus::Conflicted);
+    let counts = header_counts(file, stat);
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
     let (open_path, fold_path, fold_view) = (path.clone(), path, view.clone());
@@ -142,8 +154,8 @@ pub(super) fn header(
                 .child(name),
         )
         .child(div().flex_1())
-        .when(statistics, |el| {
-            el.child(div().text_xs().text_color(muted).child(format!("+{} −{}", file.additions(), file.deletions())))
+        .when_some(counts, |el, (additions, deletions)| {
+            el.child(div().text_xs().text_color(muted).child(format!("+{additions} −{deletions}")))
         })
         .when_some(status, |el, status| el.child(div().text_xs().text_color(muted).child(status)))
         .children(suffix)
@@ -152,7 +164,32 @@ pub(super) fn header(
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_path;
+    use serde_json::json;
+
+    use super::super::diff_load::{FileStat, settle_file};
+    use super::{header_counts, workspace_path};
+
+    #[test]
+    fn lazily_read_files_count_every_change_from_their_metadata() {
+        let stat = FileStat { path: "a.txt".into(), previous_path: None, additions: 40, deletions: 7 };
+        let patch = "--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,2 @@
+-old
++new
++more
+
+
+[truncated]";
+        let reply = json!({"sources": [{"kind": "branch-range", "diff": patch, "truncated": true}]});
+        // A patch cut at the size limit holds only some of the changes.
+        let (files, _) = settle_file(&stat, Some(&reply), "branch-range");
+        assert_eq!(header_counts(&files[0], Some(&stat)), Some((40, 7)));
+        assert_eq!(header_counts(&files[0], None), Some((2, 1)));
+        // A failed read shows a placeholder row with no lines.
+        let (failed, _) = settle_file(&stat, None, "branch-range");
+        assert_eq!(header_counts(&failed[0], Some(&stat)), Some((40, 7)));
+    }
 
     #[test]
     fn diff_paths_resolve_from_the_repository_into_the_workspace() {
