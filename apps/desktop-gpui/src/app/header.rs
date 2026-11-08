@@ -20,7 +20,8 @@ impl Workspace {
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
         // An open right panel owns the titlebar controls, so the header keeps only its `px-5`.
-        let panel_open = self.right_panel_open();
+        let panel_open = self.right_panel_open()
+            || (self.page == Some(super::pages::Page::PullRequests) && self.pull_request_panel_shown());
         let header = h_flex()
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)

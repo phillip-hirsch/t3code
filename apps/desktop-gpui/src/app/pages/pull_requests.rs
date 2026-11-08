@@ -805,6 +805,7 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .min_h_0()
+            .child(self.render_header(window, cx))
             .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
             .child(div().flex_1().min_h_0().child(body));
         if !self.pull_request_panel_shown() {
