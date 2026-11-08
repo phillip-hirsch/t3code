@@ -145,8 +145,8 @@ pub struct WorkspaceChoice {
     pub mode: Option<EnvMode>,
     /// Worktree mode: the base branch. Local mode: the branch switched to.
     pub branch: Option<String>,
-    /// A previous thread's worktree to reuse, with its branch.
-    pub existing_worktree: Option<(String, Option<String>)>,
+    /// A previous thread's worktree to reuse; its branch is `branch`.
+    pub existing_worktree: Option<String>,
     pub start_from_origin: Option<bool>,
 }
 
@@ -167,9 +167,9 @@ pub fn launch_strategy(
     refs: &Value,
     start_from_origin: bool,
 ) -> Result<Value, String> {
-    if let Some((worktree_path, branch)) = &choice.existing_worktree {
+    if let Some(worktree_path) = &choice.existing_worktree {
         let mut strategy = json!({"type": "existing_worktree", "worktreePath": worktree_path});
-        if let Some(branch) = branch {
+        if let Some(branch) = &choice.branch {
             strategy["branch"] = branch.clone().into();
         }
         return Ok(strategy);
@@ -446,10 +446,16 @@ mod tests {
         );
         assert_eq!(launch_strategy(Local, &picked, &refs, true).unwrap(), json!({"type": "root", "branch": "feature"}));
         assert_eq!(launch_strategy(Local, &none, &refs, true).unwrap(), json!({"type": "root"}));
-        let reuse = WorkspaceChoice { existing_worktree: Some(("C:/wt/a".into(), Some("a".into()))), ..none.clone() };
+        let reuse = WorkspaceChoice { existing_worktree: Some("C:/wt/a".into()), branch: Some("a".into()), ..none };
         assert_eq!(
             launch_strategy(Worktree, &reuse, &refs, true).unwrap(),
             json!({"type": "existing_worktree", "worktreePath": "C:/wt/a", "branch": "a"})
+        );
+        // A branch created in the reused worktree is the one the thread records.
+        let renamed = WorkspaceChoice { branch: Some("feature/new".into()), ..reuse };
+        assert_eq!(
+            launch_strategy(Worktree, &renamed, &refs, true).unwrap(),
+            json!({"type": "existing_worktree", "worktreePath": "C:/wt/a", "branch": "feature/new"})
         );
         assert!(launch_strategy(Worktree, &none, &json!({"isRepo": true, "refs": []}), false).is_err());
         assert_eq!(launch_strategy(Worktree, &none, &json!({"isRepo": false}), true).unwrap(), json!({"type": "root"}));

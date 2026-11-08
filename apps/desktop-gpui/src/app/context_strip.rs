@@ -116,7 +116,7 @@ pub(super) struct DraftWorkspaceState {
 impl DraftWorkspaceState {
     /// The existing worktree the draft of `project_id` picked (the web draft's `worktreePath`).
     pub(super) fn existing_worktree(&self, project_id: &str) -> Option<&str> {
-        let (path, _) = self.choice.existing_worktree.as_ref()?;
+        let path = self.choice.existing_worktree.as_ref()?;
         (self.project_id.as_deref() == Some(project_id)).then_some(path.as_str())
     }
 }
@@ -395,9 +395,7 @@ impl Workspace {
     /// The previous worktree a draft of `project_id` reuses, once picked.
     pub(super) fn draft_reused_worktree(&self, project_id: &str) -> Option<String> {
         let state = &self.draft_workspace;
-        let (path, _) =
-            state.choice.existing_worktree.as_ref().filter(|_| state.project_id.as_deref() == Some(project_id))?;
-        Some(path.clone())
+        state.choice.existing_worktree.clone().filter(|_| state.project_id.as_deref() == Some(project_id))
     }
 
     pub(super) fn draft_env_mode(&self) -> EnvMode {
@@ -461,8 +459,8 @@ impl Workspace {
     fn pick_previous_worktree(&mut self, path: String, branch: Option<String>, cx: &mut Context<Self>) {
         self.draft_workspace.choice = WorkspaceChoice {
             mode: Some(EnvMode::Worktree),
-            branch: branch.clone(),
-            existing_worktree: Some((path, branch)),
+            branch,
+            existing_worktree: Some(path),
             start_from_origin: None,
         };
         cx.notify();
@@ -494,8 +492,7 @@ impl Workspace {
         let root = self.composer_cwd();
         if let Some(path) = elsewhere {
             // Already checked out in a worktree: reuse it instead of switching.
-            self.draft_workspace.choice.existing_worktree =
-                (Some(&path) != root.as_ref()).then(|| (path, Some(name.clone())));
+            self.draft_workspace.choice.existing_worktree = (Some(&path) != root.as_ref()).then_some(path);
             self.draft_workspace.choice.branch = Some(name);
             cx.notify();
             return;
@@ -1426,7 +1423,7 @@ mod tests {
     fn a_draft_uses_the_worktree_it_picked_for_its_own_project() {
         let mut state = DraftWorkspaceState { project_id: Some("p".into()), ..Default::default() };
         assert_eq!(state.existing_worktree("p"), None);
-        state.choice.existing_worktree = Some(("/repo/wt".into(), Some("feature".into())));
+        state.choice.existing_worktree = Some("/repo/wt".into());
         assert_eq!(state.existing_worktree("p"), Some("/repo/wt"));
         assert_eq!(state.existing_worktree("other"), None, "another project's draft keeps its root");
     }
