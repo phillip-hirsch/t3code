@@ -339,7 +339,11 @@ impl Workspace {
 
     /// The fallback picker: the stored model, else the default shown as "None".
     /// `useScopedModelDisabledReason`: why `pick` cannot be every selected target's model.
-    fn scoped_model_denial(&self, view: &SettingsView, pick: &ModelSelection) -> Option<String> {
+    pub(in crate::app::pages::settings) fn scoped_model_denial(
+        &self,
+        view: &SettingsView,
+        pick: &ModelSelection,
+    ) -> Option<String> {
         let driver = self.settings_info().provider(&pick.instance_id).map(|p| p.driver.as_str());
         view.targets.iter().find_map(|target| {
             let info = &self.session(&target.environment_id).filter(|s| s.is_connected())?.server_info;
