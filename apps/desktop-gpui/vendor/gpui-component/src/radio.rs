@@ -1,7 +1,7 @@
 use std::{rc::Rc, time::Duration};
 
 use crate::{
-    ActiveTheme, AxisExt, Sizable, Size, StyledExt, checkbox::checkbox_check_icon, h_flex,
+    ActiveTheme, AxisExt, Sizable, Size, StyledExt, h_flex,
     text::Text, tooltip::ComponentTooltip, v_flex,
 };
 use crate::{StyleSized as _, ThemeStyled as _};
@@ -173,12 +173,18 @@ impl RenderOnce for Radio {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let checked = self.checked;
         let has_content = self.label.is_some() || !self.children.is_empty();
-        let indicator_size = rems(match self.size {
+        // t3code: the web's radio is `size-4.5 sm:size-4` with a `size-2 sm:size-1.5` dot.
+        let narrow =
+            matches!(self.size, Size::Medium) && window.viewport_size().width < gpui::px(640.);
+        let indicator_rems = match self.size {
             Size::XSmall => 0.75,
             Size::Small => 0.875,
             Size::Large => 1.125,
+            _ if narrow => 1.125,
             _ => 1.,
-        });
+        };
+        let indicator_size = rems(indicator_rems);
+        let dot_size = rems(if narrow { 0.5 } else { indicator_rems * 0.375 });
         let focus_handle = window
             .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
             .read(cx)
@@ -244,9 +250,16 @@ impl RenderOnce for Radio {
                         true if disabled => this.bg(bg),
                         true => this.bg(cx.theme().tokens.primary),
                     })
-                    .child(checkbox_check_icon(
-                        self.id, self.size, checked, disabled, window, cx,
-                    )),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(checked, |this| {
+                        this.child(div().size(dot_size).rounded_full().bg(if disabled {
+                            cx.theme().primary_foreground.opacity(0.5)
+                        } else {
+                            cx.theme().primary_foreground
+                        }))
+                    }),
             )
             .when(!self.children.is_empty() || self.label.is_some(), |this| {
                 this.child(
