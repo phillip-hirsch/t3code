@@ -33,6 +33,7 @@ use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::model::ModelSelection;
 use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
@@ -894,6 +895,7 @@ impl Workspace {
             (state.sign_in.clone(), state.copied, state.signed_in_revealed)
         };
         let failed = matches!(sign_in, SignIn::Failed(_)) && !signed_in;
+        let can_sign_in = self.can_sign_in();
         let input = json!({ "provider": kind, "host": app.host });
         let subtitle: AnyElement;
         let action: AnyElement;
@@ -930,6 +932,7 @@ impl Workspace {
                 .outline()
                 .xsmall()
                 .label("Sign out")
+                .disabled(!can_sign_in)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     state.update(cx, |state, _| state.sign_in = SignIn::Idle);
                     // The whole map: other hosts' redaction markers keep their sessions.
@@ -979,7 +982,7 @@ impl Workspace {
                 .xsmall()
                 .when(starting, |el| el.child(Spinner::new().xsmall()))
                 .label(if matches!(sign_in, SignIn::Failed(_)) { "Try again" } else { "Sign in with GitHub" })
-                .disabled(starting)
+                .disabled(!can_sign_in || starting)
                 .on_click(cx.listener(move |this, _, _, cx| this.start_sign_in(&state, input.clone(), cx)))
                 .into_any_element();
         }
@@ -1072,8 +1075,17 @@ impl Workspace {
         card.into_any_element()
     }
 
+    /// `sourceControl.signInStart`'s permission (`settings:write`) on the settings environment,
+    /// which sign-out shares.
+    fn can_sign_in(&self) -> bool {
+        self.settings_environment().is_some_and(|environment| self.environment_grants(&environment, SETTINGS_WRITE))
+    }
+
     /// `signIn`: start the device flow, show its code, then wait for the user to approve it.
     fn start_sign_in(&mut self, state: &Entity<SourceControlState>, input: Value, cx: &mut Context<Self>) {
+        if !self.can_sign_in() {
+            return;
+        }
         let Some(client) = self.settings_client() else { return };
         state.update(cx, |state, cx| {
             state.sign_in = SignIn::Starting;
