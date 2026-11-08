@@ -2164,7 +2164,9 @@ impl Workspace {
                         .rounded(px(16.))
                         .border_1()
                         .border_color(fg.opacity(0.08))
-                        .bg(tokens.popover)
+                        // `dialog-glass`: the background at the glass opacity over the dimmed,
+                        // blurred page, which reads as the background itself.
+                        .bg(tokens.background)
                         .shadow_2xl()
                         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .capture_key_down(
