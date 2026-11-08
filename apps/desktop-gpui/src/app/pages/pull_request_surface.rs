@@ -86,7 +86,8 @@ impl Workspace {
                 .into_any_element();
         }
         let open = visible.iter().filter(|l| l.snapshot.as_ref().is_none_or(|s| s.state == "open")).count();
-        let rows: Vec<AnyElement> = visible.iter().map(|link| linked_row(link, &project_id, &t, cx)).collect();
+        let rows: Vec<AnyElement> =
+            links::list_lines(&shell.pull_requests).iter().map(|line| linked_row(line, &project_id, &t, cx)).collect();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -127,8 +128,31 @@ fn state_glyph(link: &PullRequestLink, t: &Tokens) -> (Lucide, Hsla) {
     }
 }
 
-/// A `LinkRow`: state, number, title and repository; it opens in the Pull request surface.
-fn linked_row(link: &PullRequestLink, project_id: &str, t: &Tokens, cx: &mut Context<Workspace>) -> AnyElement {
+/// The stack chip's tooltip on a chain's base row.
+fn stack_tip(link: &PullRequestLink, native: bool, size: usize) -> String {
+    let parsed = crate::pull_request_detail::parse_change_request(&link.url);
+    let provider = parsed.as_ref().map_or("", |l| l.provider);
+    if native {
+        let host = match provider {
+            "github" => "GitHub",
+            "gitlab" => "GitLab",
+            "gitcafe" => "GitCafe",
+            "forgejo" => "Forgejo",
+            "bitbucket" => "Bitbucket",
+            "azure-devops" => "Azure DevOps",
+            _ => "the host",
+        };
+        format!("{host} stack of {size}: merging a layer lands the ones below it.")
+    } else {
+        let plural = if provider == "gitlab" { "merge requests" } else { "pull requests" };
+        format!("{size} {plural} chained by base branch.")
+    }
+}
+
+/// A `LinkRow`: state, number, title and repository, indented by its depth in its chain; it
+/// opens in the Pull request surface.
+fn linked_row(line: &links::ListLine, project_id: &str, t: &Tokens, cx: &mut Context<Workspace>) -> AnyElement {
+    let link = line.link;
     let (glyph, color) = state_glyph(link, t);
     let title: SharedString =
         link.snapshot.as_ref().map_or_else(|| link.repository.clone(), |s| s.title.clone()).into();
@@ -140,16 +164,31 @@ fn linked_row(link: &PullRequestLink, project_id: &str, t: &Tokens, cx: &mut Con
     };
     let source: SharedString = source_label(&link.source).into();
     let hover = t.accent.opacity(0.6);
+    let stack = line.stack.map(|(native, size)| {
+        let tip: SharedString = stack_tip(link, native, size).into();
+        h_flex()
+            .id(ElementId::Name(format!("linked-pr-stack:{}", link.number).into()))
+            .flex_none()
+            .gap(px(2.))
+            .text_color(t.foreground.opacity(0.7))
+            .child(Icon::new(Lucide::Layers).size(px(12.)))
+            .child(size.to_string())
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+    });
+    let depth = line.depth.min(3) as f32;
     h_flex()
         .id(ElementId::Name(format!("linked-pr:{}/{}#{}", link.host, link.repository, link.number).into()))
         .w_full()
         .gap_2()
         .py_1()
-        .pl_2()
+        .pl(px(8. + depth * 20.))
         .pr_1()
         .rounded(px(6.))
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
+        .when(line.depth > 0, |el| {
+            el.child(div().flex_none().ml(px(-8.)).h(px(24.)).w(px(1.)).bg(t.border.opacity(0.7)))
+        })
         .child(Icon::new(glyph).size(px(16.)).text_color(color))
         .child(
             v_flex()
@@ -173,13 +212,14 @@ fn linked_row(link: &PullRequestLink, project_id: &str, t: &Tokens, cx: &mut Con
                         .child(div().min_w_0().truncate().text_sm().child(title)),
                 )
                 .child(
-                    div()
-                        .truncate()
-                        .font_family(t.fonts.mono)
-                        .text_xs()
-                        .text_color(t.muted_foreground)
-                        .when(link.snapshot.is_none(), |el| el.child(format!("{}/{}", link.host, link.repository)))
-                        .when(link.snapshot.is_some(), |el| el.child(link.repository.clone())),
+                    h_flex().min_w_0().gap_1().text_xs().text_color(t.muted_foreground).children(stack).child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(t.fonts.mono)
+                            .when(link.snapshot.is_none(), |el| el.child(format!("{}/{}", link.host, link.repository)))
+                            .when(link.snapshot.is_some(), |el| el.child(link.repository.clone())),
+                    ),
                 ),
         )
         .on_click(cx.listener(move |this, _, window, cx| {
