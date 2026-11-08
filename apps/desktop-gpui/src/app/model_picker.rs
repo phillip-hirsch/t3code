@@ -51,7 +51,8 @@ pub(in crate::app) struct PickHost {
 pub(super) struct TriggerText {
     name: SharedString,
     effort: Option<String>,
-    fast: bool,
+    /// [`model_label::speed_label`].
+    speed: Option<&'static str>,
     ultracode: bool,
     logo: bool,
 }
@@ -66,7 +67,9 @@ impl TriggerText {
             .as_deref()
             .map(|e| measure(e).min(96.))
             .into_iter()
-            .chain([self.fast, self.ultracode].into_iter().filter(|on| *on).map(|_| 12.))
+            // `FastBolt`: 12px, or 15px for Ultrafast's two bolts.
+            .chain(self.speed.map(|speed| if speed == "Ultrafast" { 15. } else { 12. }))
+            .chain(self.ultracode.then_some(12.))
             .collect();
         let suffix = if parts.is_empty() {
             0.
@@ -183,6 +186,12 @@ impl Workspace {
             self.focus_composer(window, cx);
         }
         cx.notify();
+    }
+
+    /// The driver of `current`'s provider in the open picker's environment.
+    fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
+        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
+        provider.map_or("", |p| p.driver.as_str())
     }
 
     /// The selection the open picker marks: its host's, else the composer's.
@@ -419,8 +428,8 @@ impl Workspace {
         true
     }
 
-    /// The composer trigger's model name, effort, and whether the fast and ultracode marks show.
-    fn trigger_labels(&self) -> (SharedString, Option<String>, bool, bool) {
+    /// The composer trigger's model name, effort, speed, and whether the ultracode mark shows.
+    fn trigger_labels(&self) -> (SharedString, Option<String>, Option<&'static str>, bool) {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
@@ -433,20 +442,20 @@ impl Workspace {
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
-        let fast = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "fastMode", s));
+        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, driver, s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
-        (name, effort, fast, ultracode)
+        (name, effort, speed, ultracode)
     }
 
     /// What the composer trigger shows, for measuring it.
     pub(super) fn model_trigger_text(&self) -> TriggerText {
-        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let (name, effort, speed, ultracode) = self.trigger_labels();
         let logo = self
             .composer_model()
             .and_then(|s| self.server_info().provider(&s.instance_id))
             .and_then(|p| crate::assets::provider_icon(&p.driver))
             .is_some();
-        TriggerText { name, effort, fast, ultracode, logo }
+        TriggerText { name, effort, speed, ultracode, logo }
     }
 
     /// The trigger and, while open, the popover.
@@ -456,7 +465,7 @@ impl Workspace {
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
-        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let (name, effort, speed, ultracode) = self.trigger_labels();
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
@@ -485,7 +494,7 @@ impl Workspace {
                             .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
                             .child(name.clone()),
                     )
-                    .when(effort.is_some() || fast || ultracode, |el| {
+                    .when(effort.is_some() || speed.is_some() || ultracode, |el| {
                         el.child(
                             h_flex()
                                 .flex_none()
@@ -493,7 +502,7 @@ impl Workspace {
                                 .gap(px(6.))
                                 .text_color(suffix_color)
                                 .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
-                                .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
+                                .children(speed.map(|speed| fast_bolt(speed == "Ultrafast")))
                                 .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
                         )
                     }),
@@ -846,12 +855,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
+        let speed = model_label::speed_select(descriptors, self.picker_driver(current));
         let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
         let others: Vec<&OptionDescriptor> = descriptors
             .iter()
             .filter(|d| {
                 Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
-                    && !matches!(d.id.as_str(), "fastMode" | "serviceTier" | "ultracode")
+                    && Some(d.id.as_str()) != speed.map(|s| s.id.as_str())
+                    && !matches!(d.id.as_str(), "fastMode" | "ultracode")
             })
             .collect();
         let heading = match (effort, others.is_empty()) {
@@ -1039,32 +1050,53 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
+        // `SpeedControl`: Codex's service tiers, else Standard and Fast for a `fastMode` toggle.
+        let tier = model_label::speed_select(descriptors, self.picker_driver(current));
         let fast = descriptors.iter().find(|d| d.id == "fastMode" && d.kind == "boolean");
-        let speed = fast.zip(current).map(|(descriptor, selection)| {
-            let on = model_label::current_value(descriptor, selection) == Some(Value::Bool(true));
-            let segment = |label: &'static str, checked: bool, value: bool| {
-                h_flex()
-                    .id(label)
-                    .h(px(24.))
-                    .px(px(8.))
-                    .gap(px(4.))
-                    .rounded(px(6.))
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(if checked { t.foreground } else { t.muted_foreground })
-                    .when(checked, |el| el.bg(t.foreground.opacity(0.079)))
-                    .when(label == "Fast", |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
-                    .child(label)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_model_option("fastMode", Value::Bool(value), cx)),
-                    )
-            };
-            h_flex()
-                .p(px(2.))
-                .rounded(px(8.))
-                .bg(t.foreground.opacity(0.044))
-                .child(segment("Standard", !on, false))
-                .child(segment("Fast", on, true))
+        let segments: Vec<(String, bool, &'static str, Value, Option<String>)> = match (tier, fast, current) {
+            (Some(tier), _, Some(selection)) => {
+                let value = model_label::current_value(tier, selection);
+                tier.options
+                    .iter()
+                    .filter(|o| !tier.prompt_injected_values.contains(&o.id))
+                    .map(|o| {
+                        let choice = Value::String(o.id.clone());
+                        (o.label.clone(), value.as_ref() == Some(&choice), "serviceTier", choice, o.description.clone())
+                    })
+                    .collect()
+            }
+            (None, Some(fast), Some(selection)) => {
+                let on = model_label::current_value(fast, selection) == Some(Value::Bool(true));
+                vec![
+                    ("Standard".into(), !on, "fastMode", Value::Bool(false), None),
+                    ("Fast".into(), on, "fastMode", Value::Bool(true), None),
+                ]
+            }
+            _ => Vec::new(),
+        };
+        let speed = (!segments.is_empty()).then(|| {
+            h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).children(segments.into_iter().map(
+                |(label, checked, option, value, description)| {
+                    let bolt = matches!(label.as_str(), "Fast" | "Ultrafast").then(|| fast_bolt(label == "Ultrafast"));
+                    h_flex()
+                        .id(ElementId::Name(format!("speed-{label}").into()))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .gap(px(4.))
+                        .rounded(px(6.))
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(if checked { t.foreground } else { t.muted_foreground })
+                        .hover(|s| s.text_color(t.foreground))
+                        .when(checked, |el| el.bg(t.foreground.opacity(0.079)))
+                        .children(bolt)
+                        .child(label)
+                        .when_some(description.filter(|d| !d.is_empty()), |el, description| {
+                            el.tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(option, value.clone(), cx)))
+                },
+            ))
         });
         // `UltracodeControl`: one segment that toggles it.
         let ultracode = descriptors.iter().find(|d| d.id == "ultracode" && d.kind == "boolean");
@@ -1111,6 +1143,21 @@ impl Workspace {
             ))
             .into_any_element()
     }
+}
+
+/// `FastBolt`: one bolt for Fast, two overlapping for Ultrafast.
+fn fast_bolt(ultra: bool) -> AnyElement {
+    if !ultra {
+        return Icon::new(Lucide::Zap).with_size(px(12.)).into_any_element();
+    }
+    div()
+        .relative()
+        .w(px(15.))
+        .h(px(12.))
+        .flex_none()
+        .child(Icon::new(Lucide::Zap).with_size(px(12.)).absolute().top_0().left(px(3.)))
+        .child(Icon::new(Lucide::Zap).with_size(px(12.)).absolute().top_0().left_0())
+        .into_any_element()
 }
 
 fn option_row(id: ElementId, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {

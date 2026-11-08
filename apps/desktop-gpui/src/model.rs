@@ -102,6 +102,8 @@ pub struct OptionChoice {
     pub label: String,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

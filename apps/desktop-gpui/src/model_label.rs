@@ -200,6 +200,26 @@ pub fn with_legacy_ultracode(descriptors: &[OptionDescriptor], selection: ModelS
     next
 }
 
+/// Codex's service tier, which the picker's footer offers as speed segments (`splitSpeed`).
+pub fn speed_select<'a>(descriptors: &'a [OptionDescriptor], driver: &str) -> Option<&'a OptionDescriptor> {
+    descriptors.iter().find(|d| driver == "codex" && d.id == "serviceTier" && d.kind == "select")
+}
+
+/// `buildTraitsTriggerDisplay`'s `speedLabel`: "Fast" or "Ultrafast" while a speed option is on.
+pub fn speed_label(descriptors: &[OptionDescriptor], driver: &str, selection: &ModelSelection) -> Option<&'static str> {
+    if toggle_on(descriptors, "fastMode", selection) {
+        return Some("Fast");
+    }
+    let tier = speed_select(descriptors, driver)?;
+    let value = current_value(tier, selection)?;
+    let labelled = |label: &str| tier.options.iter().find(|o| o.label == label).map(|o| o.id.as_str());
+    match value.as_str() {
+        Some(id) if labelled("Ultrafast") == Some(id) => Some("Ultrafast"),
+        Some(id) if labelled("Fast") == Some(id) => Some("Fast"),
+        _ => None,
+    }
+}
+
 /// Whether the boolean option `id` is on for `selection`.
 pub fn toggle_on(descriptors: &[OptionDescriptor], id: &str, selection: &ModelSelection) -> bool {
     descriptors.iter().find(|d| d.id == id && d.kind == "boolean").and_then(|d| current_value(d, selection))
@@ -354,6 +374,26 @@ mod tests {
         let mut sub = model("Moonshot Kimi K3");
         sub.sub_provider = Some("Moonshot".into());
         assert_eq!(trigger_model_name(&sub, "opencode"), "Kimi K3");
+    }
+
+    #[test]
+    fn codex_service_tiers_are_speeds_and_name_the_fast_ones() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "serviceTier", "label": "Service Tier", "type": "select", "currentValue": "default", "options": [
+                {"id": "default", "label": "Standard", "isDefault": true},
+                {"id": "fast", "label": "Fast"}, {"id": "priority", "label": "Ultrafast"}
+            ]}
+        ]))
+        .unwrap();
+        let selection = ModelSelection { instance_id: "codex".into(), model: "m".into(), options: None };
+        assert!(speed_select(&descriptors, "codex").is_some());
+        assert!(speed_select(&descriptors, "opencode").is_none(), "only Codex's tier is a speed");
+        assert_eq!(speed_label(&descriptors, "codex", &selection), None);
+        let fast = with_option(&selection, "serviceTier", json!("fast"));
+        assert_eq!(speed_label(&descriptors, "codex", &fast), Some("Fast"));
+        let ultra = with_option(&selection, "serviceTier", json!("priority"));
+        assert_eq!(speed_label(&descriptors, "codex", &ultra), Some("Ultrafast"));
+        assert_eq!(speed_label(&descriptors, "opencode", &ultra), None);
     }
 
     #[test]
