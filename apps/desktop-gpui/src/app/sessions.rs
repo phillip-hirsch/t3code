@@ -476,6 +476,12 @@ impl Workspace {
         scratch_environment_of(&self.sessions, self.target.as_ref().map(|target| target.environment().as_ref()))
     }
 
+    /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is
+    /// offline; the primary counts only once its id is known.
+    pub(super) fn shells_bootstrapped(&self) -> bool {
+        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.sequence(id) > 0 || !s.is_connected()))
+    }
+
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.
     pub(super) fn scratch_roots_match(&self, cached: &[ScratchRoot]) -> bool {
         let current = self
