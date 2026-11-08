@@ -662,7 +662,7 @@ impl Workspace {
             path: thread.worktree_path.clone().or_else(|| project.map(|p| p.workspace_root.clone())),
             branch: thread.branch.clone(),
             link: info.environment_id.as_deref().map(|env| hosted_thread_link(env, &thread.id)),
-            running: matches!(facts.status(), inbox::Status::Working | inbox::Status::Preparing),
+            running: !facts.can_archive(),
         })
     }
 

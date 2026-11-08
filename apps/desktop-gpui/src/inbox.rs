@@ -241,6 +241,15 @@ impl<'a> Facts<'a> {
         })
     }
 
+    /// `threadRuntimeCanArchive`: the server refuses to archive a thread with a live provider run.
+    pub fn can_archive(&self) -> bool {
+        match self.runtime_status() {
+            Some("queued") => self.thread.active_run_id.is_none(),
+            Some(status) => !matches!(status, "preparing" | "starting" | "running"),
+            None => true,
+        }
+    }
+
     pub fn latest_run_status(&self) -> Option<&'a str> {
         self.thread.latest_run_id.as_ref()?;
         Some(if self.thread.status == "idle" { "completed" } else { &self.thread.status })
@@ -1077,6 +1086,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn archive_follows_the_runtime_not_the_inbox_status() {
+        let can_archive = |fields: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "id": "t", "projectId": "p", "title": "t", "status": "idle", "updatedAt": "2026-01-01T00:00:00.000Z",
+            });
+            value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let thread: ThreadShell = serde_json::from_value(value).unwrap();
+            Facts::new(&thread, &HashMap::new()).can_archive()
+        };
+        assert!(can_archive(serde_json::json!({})));
+        for status in ["preparing", "starting", "running"] {
+            assert!(!can_archive(serde_json::json!({"latestRunId": "r", "status": status})), "{status}");
+        }
+        // A run waiting on an approval is still live.
+        let approval = serde_json::json!({"latestRunId": "r", "status": "running",
+            "pendingRuntimeRequest": {"kind": "approval", "createdAt": "2026-01-01T00:00:00.000Z"}});
+        assert!(!can_archive(approval));
+        assert!(can_archive(serde_json::json!({"latestRunId": "r", "status": "waiting"})));
+        assert!(can_archive(serde_json::json!({"latestRunId": "r", "status": "queued"})));
+        assert!(!can_archive(serde_json::json!({"latestRunId": "r", "status": "queued", "activeRunId": "r"})));
+        // The activity run outranks the thread's status.
+        let activity = serde_json::json!({"latestRunId": "r", "status": "completed", "activityRunStatus": "running"});
+        assert!(!can_archive(activity));
+    }
 
     #[test]
     fn launch_opens_a_draft_in_the_most_recently_active_project() {
