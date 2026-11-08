@@ -10,8 +10,8 @@ use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
-    px,
+    KeyDownEvent, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -98,10 +98,25 @@ pub(super) fn value(choice: &Choice, selected: Option<&str>) -> String {
     }
 }
 
+/// The combobox's arrow keys over `len` items: past either end the highlight returns to the
+/// search box (`loopFocus`), and the next press enters the list again.
+fn step_highlight(len: usize, current: Option<usize>, down: bool) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    match (current, down) {
+        (None, true) => Some(0),
+        (None, false) => Some(last),
+        (Some(i), true) => (i < last).then_some(i + 1),
+        (Some(i), false) => i.checked_sub(1),
+    }
+}
+
 #[derive(Default)]
 pub(in crate::app) struct BasePicker {
     open: bool,
     query: String,
+    /// The row the arrow keys reached (`data-highlighted`); Enter picks it.
+    highlight: Option<usize>,
+    list_scroll: ScrollHandle,
     search: Option<Entity<InputState>>,
     local: Vec<Ref>,
     remote: Vec<Ref>,
@@ -135,6 +150,7 @@ impl Workspace {
                     Some(cx.subscribe_in(&search, window, |this, search, event, _, cx| {
                         if let InputEvent::Change = event {
                             this.right_panel.base_picker.query = search.read(cx).value().trim().to_owned();
+                            this.right_panel.base_picker.highlight = None;
                             this.fetch_base_refs(cx);
                         }
                     }));
@@ -147,6 +163,7 @@ impl Workspace {
             search.focus(window, cx);
         });
         self.right_panel.base_picker.query.clear();
+        self.right_panel.base_picker.highlight = None;
         self.right_panel.base_picker.open = true;
         self.fetch_base_refs(cx);
         cx.notify();
@@ -259,17 +276,56 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_base_ref_list(&self, head: &str, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The rows the picker lists for `head`, Automatic (`None`) first while nothing is searched.
+    fn base_ref_items(&self, head: &str) -> (bool, Vec<Choice>) {
         let picker = &self.right_panel.base_picker;
         let local: Vec<Ref> = picker.local.iter().filter(|r| r.name != head).cloned().collect();
-        let all = choices(&local, &picker.remote);
+        let shown = choices(&local, &picker.remote).into_iter().filter(|c| matches(c, &picker.query)).collect();
+        (picker.query.is_empty(), shown)
+    }
+
+    /// Up and Down move the highlight from the search box, Enter picks the highlighted row.
+    fn base_picker_key(&mut self, head: &str, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if event.keystroke.modifiers.modified() {
+            return false;
+        }
+        let (automatic, shown) = self.base_ref_items(head);
+        let len = usize::from(automatic) + shown.len();
+        let picker = &mut self.right_panel.base_picker;
+        match event.keystroke.key.as_str() {
+            key @ ("down" | "up") => {
+                picker.highlight = step_highlight(len, picker.highlight, key == "down");
+                if let Some(index) = picker.highlight {
+                    picker.list_scroll.scroll_to_item(index);
+                }
+                cx.notify();
+            }
+            "enter" => {
+                let Some(index) = picker.highlight.filter(|i| *i < len) else { return false };
+                let pick = match index.checked_sub(usize::from(automatic)) {
+                    None => None,
+                    Some(row) => Some(value(&shown[row], self.diff_base_ref())),
+                };
+                self.select_base_ref(pick, cx);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn render_base_ref_list(&self, head: &str, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let picker = &self.right_panel.base_picker;
+        let (automatic, all) = self.base_ref_items(head);
         let selected = self.diff_base_ref().map(str::to_owned);
-        let shown: Vec<&Choice> = all.iter().filter(|c| matches(c, &picker.query)).collect();
+        let shown: Vec<&Choice> = all.iter().collect();
+        let highlight = picker.highlight;
+        let offset = usize::from(automatic);
         // `ComboboxItem`: the picked row keeps a faint fill; hover takes a stronger one.
         let (picked_bg, hover_bg) = (tokens.foreground.opacity(0.06), tokens.foreground.opacity(0.09));
-        let row = |id: ElementId, picked: bool| {
+        let row = |id: ElementId, picked: bool, index: usize| {
             h_flex()
                 .id(id)
+                .when(highlight == Some(index), |el| el.bg(hover_bg))
                 .min_h(px(28.))
                 .flex_none()
                 .px(px(8.))
@@ -281,19 +337,19 @@ impl Workspace {
                 .when(picked, |el| el.bg(picked_bg))
                 .hover(move |s| s.bg(hover_bg))
         };
-        let automatic = picker.query.is_empty().then(|| {
-            row("diff-base-automatic".into(), selected.is_none())
+        let automatic = automatic.then(|| {
+            row("diff-base-automatic".into(), selected.is_none(), 0)
                 .child(div().flex_1().min_w_0().truncate().child("Automatic"))
                 .on_click(cx.listener(|this, _, _, cx| this.select_base_ref(None, cx)))
         });
-        let rows = shown.iter().map(|choice| {
+        let rows = shown.iter().enumerate().map(|(index, choice)| {
             let value = value(choice, selected.as_deref());
             let checked = selected.as_deref() == Some(value.as_str());
             let both = choice.local.as_ref().zip(choice.remote.as_ref()).map(|(l, r)| (l.name.clone(), r.name.clone()));
             let use_remote = choice.remote.as_ref().is_some_and(|r| r.name == value);
             let remote_only = choice.local.is_none();
             let pick = value;
-            row(ElementId::Name(format!("diff-base-{}", choice.label).into()), checked)
+            row(ElementId::Name(format!("diff-base-{}", choice.label).into()), checked, index + offset)
                 .child(div().flex_1().min_w_0().truncate().child(choice.label.clone()))
                 .child(div().w(px(32.)).flex_none().flex().justify_end().map(|el| {
                     match both {
@@ -324,10 +380,16 @@ impl Workspace {
         // `ComboboxSearchInput`: a search glyph and an underline that turns the ring color on focus.
         let focused = picker.search.as_ref().is_some_and(|search| search.focus_handle(cx).is_focused(window));
         let underline = if focused { tokens.ring } else { tokens.border.opacity(0.7) };
+        let key_head = head.to_owned();
         v_flex()
             .id("diff-base-ref-body")
             .w(px(288.))
             .bg(tokens.popover)
+            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if this.base_picker_key(&key_head, event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(div().px(px(12.)).pt(px(10.)).children(picker.search.clone().map(|search| {
                 h_flex()
                     .pb(px(6.))
@@ -361,6 +423,7 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("diff-base-ref-list")
+                    .track_scroll(&picker.list_scroll)
                     .max_h(px(256.))
                     .overflow_y_scrollbar()
                     .p(px(4.))
@@ -415,5 +478,15 @@ mod tests {
         assert_eq!(value(&all[0], Some("origin/main")), "origin/main");
         assert_eq!(value(&all[2], None), "upstream/main");
         assert!(matches(&all[0], "ORIGIN/m") && !matches(&all[1], "origin"));
+    }
+
+    #[test]
+    fn arrows_walk_the_refs_and_return_to_the_search_box() {
+        assert_eq!(step_highlight(3, None, true), Some(0));
+        assert_eq!(step_highlight(3, Some(1), true), Some(2));
+        assert_eq!(step_highlight(3, Some(2), true), None);
+        assert_eq!(step_highlight(3, None, false), Some(2));
+        assert_eq!(step_highlight(3, Some(0), false), None);
+        assert_eq!(step_highlight(0, None, true), None);
     }
 }
