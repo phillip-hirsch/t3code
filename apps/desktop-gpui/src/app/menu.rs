@@ -13,6 +13,10 @@
 //! key binding only matches outside every window's `Root` context. It still becomes the menu's
 //! ⌘Q, which quits directly when no window has focus, like Electron's `role: "quit"`.
 
+use std::io::Write as _;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use gpui_kit::component::input;
 use gpui_kit::{
     App, Context, Div, Focusable as _, Global, InteractiveElement as _, KeyBinding, Menu, MenuItem, OsAction,
@@ -221,23 +225,38 @@ impl Workspace {
     }
 }
 
-/// The speech Start Speaking began, which Stop Speaking (or the next start) ends.
+/// One Start Speaking's `say` process, shared with the background task that feeds it.
 #[derive(Default)]
-struct Speech(Option<std::process::Child>);
+struct Utterance {
+    child: Option<Child>,
+    stopped: bool,
+}
+
+/// The utterance Start Speaking began, which Stop Speaking (or the next start) ends.
+struct Speech(Arc<Mutex<Utterance>>);
 
 impl Global for Speech {}
 
-/// AppKit's `startSpeaking:`, through macOS's `say`, which reads the text from its input.
+fn lock(utterance: &Mutex<Utterance>) -> MutexGuard<'_, Utterance> {
+    utterance.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// AppKit's `startSpeaking:`, through macOS's `say`, which reads the text from its input. The
+/// process starts, is fed and is reaped off the UI thread: a long text fills the pipe while `say`
+/// is still speaking its start.
 fn start_speaking(text: String, cx: &mut App) {
     stop_speaking(cx);
     if !cfg!(target_os = "macos") {
         return;
     }
-    let spawned = std::process::Command::new("/usr/bin/say")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let utterance = Arc::new(Mutex::new(Utterance::default()));
+    cx.set_global(Speech(utterance.clone()));
+    cx.background_executor().spawn(async move { speak(&utterance, &text) }).detach();
+}
+
+fn speak(utterance: &Mutex<Utterance>, text: &str) {
+    let spawned =
+        Command::new("/usr/bin/say").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
@@ -245,23 +264,41 @@ fn start_speaking(text: String, cx: &mut App) {
             return;
         }
     };
-    // Dropping the input closes it, so `say` reads all of it and speaks.
-    if let Some(mut input) = child.stdin.take()
-        && let Err(error) = std::io::Write::write_all(&mut input, text.as_bytes())
+    let input = child.stdin.take();
+    {
+        let mut state = lock(utterance);
+        if state.stopped {
+            drop(state);
+            end_speech(child);
+            return;
+        }
+        state.child = Some(child);
+    }
+    // Dropping the input closes it, so `say` reads all of it and speaks. Stopping breaks the pipe.
+    if let Some(mut input) = input
+        && let Err(error) = input.write_all(text.as_bytes())
+        && !lock(utterance).stopped
     {
         log::warn!("could not hand the text to speech: {error}");
     }
-    cx.set_global(Speech(Some(child)));
+}
+
+/// Already finished is fine; the wait reaps it either way.
+fn end_speech(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn stop_speaking(cx: &mut App) {
-    let Some(mut child) = cx.try_global::<Speech>().is_some().then(|| cx.global_mut::<Speech>().0.take()).flatten()
-    else {
-        return;
+    let Some(utterance) = cx.try_global::<Speech>().map(|speech| speech.0.clone()) else { return };
+    let child = {
+        let mut state = lock(&utterance);
+        state.stopped = true;
+        state.child.take()
     };
-    // Already finished is fine; the wait reaps it either way.
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Some(child) = child {
+        cx.background_executor().spawn(async move { end_speech(child) }).detach();
+    }
 }
 
 /// Acts on the focused window. GPUI runs app-level action handlers while it holds that window
