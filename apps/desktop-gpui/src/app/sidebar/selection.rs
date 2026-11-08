@@ -296,11 +296,41 @@ impl Workspace {
         }
         let ids = ids.to_vec();
         let count = ids.len();
+        // `deleteSelectedThreadEntries`: a failure leaves the rest deleting and its row selected.
         let run = move |this: &mut Self, cx: &mut Context<Self>| {
-            let commands = ids.iter().map(|id| Self::thread_command_value("thread.delete", id, json!({}))).collect();
-            this.dispatch_batch(commands, true, |_, _| "Failed to delete threads".into(), cx);
-            this.sidebar.selection.remove(&ids);
-            this.notify_sidebar(cx);
+            let steps: Vec<_> = ids
+                .iter()
+                .filter_map(|id| {
+                    let command = Self::thread_command_value("thread.delete", id, json!({}));
+                    Some((id.clone(), this.thread_client(id)?, command))
+                })
+                .collect();
+            cx.spawn(async move |this, cx| {
+                let (mut deleted, mut first_error) = (HashSet::new(), None);
+                for (id, client, command) in steps {
+                    match client.request("orchestration.dispatchCommand", command).await {
+                        Ok(_) => {
+                            deleted.insert(id);
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error.to_string());
+                        }
+                    }
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(error) = first_error {
+                        let message = super::actions::failure_message(Some("Failed to delete threads"), &error);
+                        this.error = Some(message.into());
+                        cx.notify();
+                    }
+                    let gone = deselect_after_delete(&ids, &deleted, |id| {
+                        this.shell.threads.iter().any(|t| t.id == id && t.deleted_at.is_none())
+                    });
+                    this.sidebar.selection.remove(&gone);
+                    this.notify_sidebar(cx);
+                });
+            })
+            .detach();
         };
         if self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(false) {
             run(self, cx);
@@ -319,6 +349,11 @@ This permanently clears conversation history for these threads.",
         })
         .detach();
     }
+}
+
+/// `getThreadKeysToDeselectAfterDelete`: the deleted threads and any already gone.
+fn deselect_after_delete(selected: &[String], deleted: &HashSet<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    selected.iter().filter(|id| deleted.contains(*id) || !exists(id)).cloned().collect()
 }
 
 #[cfg(test)]
@@ -376,5 +411,12 @@ mod tests {
         assert_eq!(selection.anchor, None);
         assert!(selection.clear());
         assert!(!selection.clear());
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_its_row_selected() {
+        let deleted = HashSet::from(["a".to_owned()]);
+        let gone = deselect_after_delete(&ordered()[..3], &deleted, |id| id != "c");
+        assert_eq!(gone, ["a", "c"], "b failed and still exists, so it stays selected");
     }
 }
