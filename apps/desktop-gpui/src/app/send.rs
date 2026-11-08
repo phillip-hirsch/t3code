@@ -4,6 +4,8 @@
 
 use std::rc::Rc;
 
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::{Context, Keystroke, SharedString, Window};
 use serde_json::{Value, json};
 
@@ -288,6 +290,10 @@ impl Workspace {
                 ("orchestration.dispatchCommand", command, None, None)
             }
             Target::Draft { project_id, .. } => {
+                if let Some((title, description)) = self.load_balancing_send_block() {
+                    window.push_notification(Notification::warning(description).title(title), cx);
+                    return;
+                }
                 let Some(model) = self.composer_model() else {
                     self.error = Some("No provider is ready. Set one up in the T3 server first.".into());
                     cx.notify();
