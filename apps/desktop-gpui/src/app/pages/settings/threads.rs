@@ -157,7 +157,7 @@ fn offers_model(
         Some(provider.driver.as_str()) == driver
             && provider.availability.as_deref() != Some("unavailable")
             && crate::settings::scope::provider_instance_enabled(settings, project_id, &pick.instance_id)
-            && provider.models.iter().any(|m| m.slug == pick.model)
+            && provider.models.iter().any(|m| m.slug == pick.model && !m.is_unavailable)
     })
 }
 
@@ -984,7 +984,8 @@ mod tests {
     #[test]
     fn a_target_must_offer_the_picked_model() {
         let env = info(json!([
-            {"instanceId": "codex", "driver": "codex", "enabled": true, "models": [{"slug": "gpt"}]},
+            {"instanceId": "codex", "driver": "codex", "enabled": true,
+                "models": [{"slug": "gpt"}, {"slug": "retired", "isUnavailable": true}]},
             {"instanceId": "grok", "driver": "grok", "enabled": true, "availability": "unavailable", "models": [{"slug": "g"}]}
         ]));
         let settings = crate::settings::Settings::layered(
@@ -1004,6 +1005,7 @@ mod tests {
             "disabled for the project"
         );
         assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("codex", "other")), "no such model");
+        assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("codex", "retired")), "listed unavailable");
         assert!(!offers_model(&env, &settings, None, Some("claudeAgent"), &pick("codex", "gpt")), "another driver");
         assert!(!offers_model(&env, &settings, None, Some("grok"), &pick("grok", "g")), "unavailable");
         assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("missing", "gpt")));
