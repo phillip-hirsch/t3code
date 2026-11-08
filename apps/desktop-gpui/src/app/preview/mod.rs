@@ -8,10 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::base::actions::{Confirm, SelectDown, SelectUp};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     Disableable as _, Icon, Selectable as _, Side, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -110,6 +111,8 @@ pub(super) struct PreviewState {
     pub(super) menu_open: bool,
     /// The address bar's "Open in system browser" button, shown while it has focus.
     external_focus: FocusHandle,
+    /// The More menu's Zoom row, which keeps Tab among its buttons.
+    zoom_focus: FocusHandle,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
     reported_profiles: profiles::ReportedProfiles,
@@ -151,6 +154,7 @@ impl PreviewState {
             address_tab: None,
             menu_open: false,
             external_focus: cx.focus_handle().tab_stop(true),
+            zoom_focus: cx.focus_handle(),
             stale: HashSet::new(),
             reported_profiles: profiles::ReportedProfiles::default(),
             server: Default::default(),
@@ -204,39 +208,61 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
 }
 
 /// The menu's Zoom row (`closeOnClick={false}`): its buttons step the active tab's zoom, read
-/// live so the label follows, without closing the menu.
-fn zoom_row(view: &Entity<Workspace>, window: &mut Window, cx: &mut App) -> AnyElement {
+/// live so the label follows, without closing the menu. Tab moves from the menu into them and
+/// cycles there; Enter and Space press them, and the arrow keys go back to the menu's items.
+fn zoom_row(view: &Entity<Workspace>, menu: &FocusHandle, window: &mut Window, cx: &mut App) -> AnyElement {
     let tokens = *theme::tokens(cx);
-    let zoom = view.read(cx).active_zoom();
-    let set_zoom = |zoom: fn(f64) -> f64| {
-        window.listener_for(view, move |this: &mut Workspace, _: &ClickEvent, _, cx| {
-            let zoom = zoom(this.active_zoom());
-            this.adjust_preview("preview.adjust", json!({"zoomFactor": zoom}), cx);
-        })
+    let workspace = view.read(cx);
+    let zoom = workspace.active_zoom();
+    let trap = workspace.preview.zoom_focus.clone();
+    let apply = |this: &mut Workspace, zoom: fn(f64) -> f64, cx: &mut Context<Workspace>| {
+        let zoom = zoom(this.active_zoom());
+        this.adjust_preview("preview.adjust", json!({"zoomFactor": zoom}), cx);
     };
-    let step = |id: &'static str, icon: IconName, label: &'static str, zoom: fn(f64) -> f64| {
-        icon_button(id, icon, true, &tokens, cx).tab_stop(false).tooltip(label).on_click(set_zoom(zoom))
+    let wire = |button: Button, label: &'static str, zoom: fn(f64) -> f64| {
+        button
+            .tooltip(label)
+            .on_click(window.listener_for(view, move |this, _: &ClickEvent, _, cx| apply(this, zoom, cx)))
+            // The menu binds Enter to picking its highlighted item.
+            .on_action(window.listener_for(view, move |this, _: &Confirm, _, cx| apply(this, zoom, cx)))
     };
+    let step = |id: &'static str, icon: IconName| {
+        Button::new(id).outline().xsmall().size(px(24.)).rounded(px(6.)).icon(Icon::new(icon).size(px(14.)))
+    };
+    let zoom_out = wire(step("menu-zoom-out", IconName::Minus), "Zoom out", |zoom| preview::step_zoom(zoom, -1));
+    let zoom_in = wire(step("menu-zoom-in", IconName::Plus), "Zoom in", |zoom| preview::step_zoom(zoom, 1));
+    let reset = wire(icon_button("menu-zoom-reset", IconName::RotateCcw, true, &tokens, cx), "Reset zoom", |_| 1.);
+    let (up_menu, down_menu) = (menu.clone(), menu.clone());
     h_flex()
         .id("menu-zoom")
         .flex_1()
-        .gap_1()
+        .justify_between()
         .on_click(|_, _, cx| cx.stop_propagation())
-        .child(div().flex_1().child("Zoom"))
-        .child(step("menu-zoom-out", IconName::Minus, "Zoom out", |zoom| preview::step_zoom(zoom, -1)))
+        .on_action(move |_: &SelectUp, window, cx| {
+            window.focus(&up_menu, cx);
+            cx.propagate();
+        })
+        .on_action(move |_: &SelectDown, window, cx| {
+            window.focus(&down_menu, cx);
+            cx.propagate();
+        })
+        .child(div().text_color(tokens.foreground).child("Zoom"))
         .child(
-            div()
-                .id("menu-zoom-reset")
-                .w(px(44.))
-                .text_center()
-                .text_xs()
-                .cursor_pointer()
-                .text_color(tokens.muted_foreground)
-                .child(format!("{}%", (zoom * 100.).round()))
-                .tooltip(|window, cx| Tooltip::new("Reset zoom").build(window, cx))
-                .on_click(set_zoom(|_| 1.)),
+            h_flex()
+                .gap_1()
+                .child(zoom_out)
+                .child(
+                    div()
+                        .min_w(px(48.))
+                        .text_center()
+                        .text_xs()
+                        .text_color(tokens.muted_foreground)
+                        .child(format!("{}%", (zoom * 100.).round())),
+                )
+                .child(zoom_in)
+                .child(reset),
         )
-        .child(step("menu-zoom-in", IconName::Plus, "Zoom in", |zoom| preview::step_zoom(zoom, 1)))
+        .focus_trap("menu-zoom-trap", &trap)
         .into_any_element()
 }
 
@@ -1224,7 +1250,7 @@ impl Workspace {
         let fill = session.viewport.size().is_none();
         let view = cx.entity();
         trigger
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, _| {
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, cx| {
                 let adjust = |method: &'static str, change: Value| {
                     window.listener_for(&view, move |this: &mut Self, _: &ClickEvent, _, cx| {
                         this.adjust_preview(method, change.clone(), cx);
@@ -1267,9 +1293,14 @@ impl Workspace {
                     );
                 }
                 let zoom_view = view.clone();
+                let menu_focus = menu.focus_handle(cx);
                 menu = menu
                     .separator()
-                    .item(PopupMenuItem::element(move |window, cx| zoom_row(&zoom_view, window, cx)))
+                    // Not an item the arrow keys stop on: Enter there would close the menu.
+                    .item(
+                        PopupMenuItem::element(move |window, cx| zoom_row(&zoom_view, &menu_focus, window, cx))
+                            .disabled(true),
+                    )
                     .separator()
                     .label("Viewport")
                     .item(
