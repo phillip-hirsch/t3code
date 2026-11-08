@@ -199,6 +199,14 @@ impl Workspace {
         }
     }
 
+    /// The previous worktree a draft of `project_id` reuses, once picked.
+    pub(super) fn draft_reused_worktree(&self, project_id: &str) -> Option<String> {
+        let state = &self.draft_workspace;
+        let (path, _) =
+            state.choice.existing_worktree.as_ref().filter(|_| state.project_id.as_deref() == Some(project_id))?;
+        Some(path.clone())
+    }
+
     pub(super) fn draft_env_mode(&self) -> EnvMode {
         let state = &self.draft_workspace;
         state.choice.mode.or(state.default_mode).unwrap_or(EnvMode::Local)

@@ -43,13 +43,15 @@ pub(super) struct MenuState {
 }
 
 impl Workspace {
-    /// The checkout a thread or draft works in: its worktree, else the project root.
+    /// The checkout a thread or draft works in: its worktree (a draft's reused one), else the
+    /// project root.
     pub(super) fn composer_cwd(&self) -> Option<String> {
         let worktree = match &self.target {
             Some(Target::Thread { .. }) => {
                 self.thread.as_ref()?.state.projection.as_ref().and_then(|p| p.thread.worktree_path.clone())
             }
-            _ => None,
+            Some(Target::Draft { project_id, .. }) => self.draft_reused_worktree(project_id),
+            None => None,
         };
         worktree.or_else(|| self.target_project().map(|p| p.workspace_root.clone()))
     }
