@@ -215,6 +215,16 @@ struct RankedThreads {
     strong: bool,
 }
 
+/// `filterCommandPaletteGroups`: a leading `>` searches the actions alone, for the rest of the query.
+fn actions_filter(query: &str) -> (bool, &str) {
+    query.strip_prefix('>').map_or((false, query), |rest| (true, rest))
+}
+
+/// A submenu with no row for a typed query searches everything instead.
+fn submenu_falls_back(scoped: &[Group], query: &str) -> bool {
+    !query.trim().is_empty() && scoped.iter().all(|group| group.rows.is_empty())
+}
+
 /// `isFilesystemBrowseQuery`: the query reads as a path.
 pub(super) fn is_browse_query(query: &str) -> bool {
     let bytes = query.as_bytes();
@@ -374,6 +384,7 @@ impl Workspace {
         if browsing {
             self.browse_folder(split_browse(&query).0.to_owned(), cx);
         } else if palette.view == View::Root {
+            let query = if actions_filter(&query).0 { String::new() } else { query };
             self.search_messages(query, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
         }
         cx.notify();
@@ -773,21 +784,17 @@ impl Workspace {
 
     fn palette_groups(&self, query: &str) -> Vec<Group> {
         let Some(palette) = &self.palette else { return Vec::new() };
-        let now = super::sidebar::now_ms();
         if palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query)) {
             return self.browse_groups(query);
         }
-        let tokens = search::fold_query(query);
-        match palette.view {
-            View::NewThreadIn => {
-                return vec![Group { label: "Projects", rows: rank_rows(self.new_thread_rows(), &tokens) }];
-            }
-            View::Themes => {
-                return vec![Group { label: "Change theme", rows: rank_rows(self.theme_rows(palette.dark), &tokens) }];
-            }
-            View::Appearance => {
-                return vec![Group { label: "Change appearance", rows: rank_rows(self.appearance_rows(), &tokens) }];
-            }
+        let (actions_only, search_query) = actions_filter(query);
+        let tokens = search::fold_query(search_query);
+        // A `>` query matches no submenu row, so it searches the root's actions.
+        let scope = |rows| if actions_only { Vec::new() } else { rank_rows(rows, &tokens) };
+        let scoped = match palette.view {
+            View::NewThreadIn => vec![Group { label: "Projects", rows: scope(self.new_thread_rows()) }],
+            View::Themes => vec![Group { label: "Change theme", rows: scope(self.theme_rows(palette.dark)) }],
+            View::Appearance => vec![Group { label: "Change appearance", rows: scope(self.appearance_rows()) }],
             View::AddProject => {
                 let mut row = Row::new(
                     "local-folder",
@@ -796,9 +803,25 @@ impl Workspace {
                     Run::Open(View::Browse),
                 );
                 row.description = Some(Description::Text("Browse a folder on disk".into()));
-                return vec![Group { label: "", rows: rank_rows(vec![row], &tokens) }];
+                vec![Group { label: "", rows: scope(vec![row]) }]
             }
-            _ => {}
+            View::Root | View::Browse => return self.search_groups(query, true),
+        };
+        if submenu_falls_back(&scoped, query) {
+            // Submenus search no messages (`threadSearchQuery` is empty there).
+            return self.search_groups(query, false);
+        }
+        scoped
+    }
+
+    /// The root view's results for `query`: everything, or only the actions after a `>`.
+    fn search_groups(&self, query: &str, messages: bool) -> Vec<Group> {
+        let Some(palette) = &self.palette else { return Vec::new() };
+        let now = super::sidebar::now_ms();
+        let (actions_only, search_query) = actions_filter(query);
+        let tokens = search::fold_query(search_query);
+        if actions_only {
+            return vec![Group { label: "Actions", rows: rank_rows(self.action_rows(), &tokens) }];
         }
         let Some(ranking) = &palette.threads else { return Vec::new() };
         if tokens.is_empty() {
@@ -901,9 +924,8 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let messages: Vec<Row> = palette
-            .messages
-            .matches
+        let matches = if messages { palette.messages.matches.as_slice() } else { &[] };
+        let message_rows: Vec<Row> = matches
             .iter()
             .filter(|m| !listed.contains(&m.thread_id))
             .filter_map(|m| {
@@ -922,8 +944,8 @@ impl Workspace {
             })
             .take(MESSAGE_LIMIT)
             .collect();
-        if !messages.is_empty() {
-            groups.push(Group { label: "In messages", rows: messages });
+        if !message_rows.is_empty() {
+            groups.push(Group { label: "In messages", rows: message_rows });
         }
         groups
     }
@@ -931,7 +953,8 @@ impl Workspace {
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
     fn rank_palette_threads(&mut self, query: &str) {
         let Some(palette) = &self.palette else { return };
-        if palette.view != View::Root || is_browse_query(query) {
+        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query));
+        if browsing || actions_filter(query).0 {
             return;
         }
         let now = super::sidebar::now_ms();
@@ -1350,11 +1373,11 @@ impl Workspace {
             None
         };
         let empty = (total_rows == 0).then(|| {
-            let text = if !browsing && palette.messages.pending {
+            let text = if !browsing && view == View::Root && palette.messages.pending {
                 "Searching thread messages…"
             } else if browsing {
                 "Press Enter to add this folder as a project."
-            } else if query.trim_start().starts_with('>') {
+            } else if actions_filter(&query).0 {
                 "No matching actions."
             } else {
                 "No matching commands, projects, or threads."
@@ -1771,6 +1794,18 @@ mod tests {
         let mut current: Vec<_> = projects(0, 3).collect();
         current.push(entry(true, false, true));
         assert_eq!(no_project_index(&current), 3);
+    }
+
+    #[test]
+    fn a_leading_angle_searches_actions_and_an_empty_submenu_searches_everything() {
+        assert_eq!(actions_filter(">new"), (true, "new"));
+        assert_eq!(actions_filter(">"), (true, ""));
+        assert_eq!(actions_filter(" >new"), (false, " >new"), "only a leading `>` counts");
+        let group = |rows: Vec<Row>| vec![Group { label: "Projects", rows }];
+        let row = Row::new("p", RowIcon::Lucide(IconName::Folder), "t3code", Run::Open(View::Browse));
+        assert!(submenu_falls_back(&group(Vec::new()), "settings"));
+        assert!(!submenu_falls_back(&group(vec![row]), "t3"));
+        assert!(!submenu_falls_back(&group(Vec::new()), "  "), "a blank query keeps the submenu");
     }
 
     #[test]
