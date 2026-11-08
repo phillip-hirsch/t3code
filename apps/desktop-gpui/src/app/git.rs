@@ -375,17 +375,47 @@ pub(super) struct VcsWatch {
     pub env: Option<SharedString>,
     pub cwd: Option<String>,
     pub status: Option<VcsStatus>,
-    /// The label of the git action in flight, as its progress reports it.
-    pub running: Option<SharedString>,
+    /// The label of each checkout's git action in flight, as its progress reports it; the web
+    /// keys action state by environment and cwd, so another checkout's operation never shows here.
+    running: HashMap<Checkout, SharedString>,
     task: Option<Task<()>>,
     /// `rememberCheckoutIsRepo`: what each checkout reported this session, read while its status loads.
-    known_repo: HashMap<(Option<SharedString>, String), bool>,
+    known_repo: HashMap<Checkout, bool>,
 }
+
+/// A checkout: its environment and cwd.
+pub(super) type Checkout = (Option<SharedString>, String);
 
 impl VcsWatch {
     /// Whether a reply for `cwd` on `env` is about the checkout watched now.
     fn watches(&self, env: Option<&str>, cwd: &str) -> bool {
         self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
+    }
+
+    fn checkout(&self) -> Option<Checkout> {
+        Some((self.env.clone(), self.cwd.clone()?))
+    }
+
+    /// The watched checkout's git action in flight.
+    pub(super) fn running(&self) -> Option<&SharedString> {
+        self.running.get(&self.checkout()?)
+    }
+
+    /// Marks an action started on the watched checkout; `None` while one already runs there.
+    pub(super) fn start(&mut self, label: impl Into<SharedString>) -> Option<Checkout> {
+        let checkout = self.checkout().filter(|checkout| !self.running.contains_key(checkout))?;
+        self.running.insert(checkout.clone(), label.into());
+        Some(checkout)
+    }
+
+    fn progress(&mut self, checkout: &Checkout, label: SharedString) {
+        if let Some(running) = self.running.get_mut(checkout) {
+            *running = label;
+        }
+    }
+
+    pub(super) fn finish(&mut self, checkout: &Checkout) {
+        self.running.remove(checkout);
     }
 
     /// `liveIsGitRepo ?? recallCheckoutIsRepo(...) ?? true`.
@@ -482,11 +512,9 @@ impl Workspace {
         commit_message: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
-        if self.vcs.running.is_some() {
-            return;
-        }
-        let mut input = json!({"actionId": new_id(), "cwd": cwd, "action": action});
+        let Some(client) = self.vcs_client() else { return };
+        let Some(checkout) = self.vcs.start("Starting source control action...") else { return };
+        let mut input = json!({"actionId": new_id(), "cwd": checkout.1, "action": action});
         if let Some(message) = commit_message {
             input["commitMessage"] = message.into();
         }
@@ -496,7 +524,6 @@ impl Workspace {
         if let Some(project) = self.target_project() {
             input["projectId"] = project.id.clone().into();
         }
-        self.vcs.running = Some("Starting source control action...".into());
         let stream = client.stream("git.runStackedAction", input);
         cx.spawn(async move |this, cx| {
             let mut outcome: Result<(), String> = Ok(());
@@ -506,7 +533,7 @@ impl Workspace {
                         Some("phase_started") => {
                             let label = value["label"].as_str().unwrap_or_default().to_owned();
                             let _ = this.update(cx, |this, cx| {
-                                this.vcs.running = Some(label.into());
+                                this.vcs.progress(&checkout, label.into());
                                 cx.notify();
                             });
                         }
@@ -519,14 +546,7 @@ impl Workspace {
                     StreamEvent::End(Ok(())) => break,
                 }
             }
-            let _ = this.update(cx, |this, cx| {
-                this.vcs.running = None;
-                if let Err(error) = outcome {
-                    this.error = Some(error.into());
-                }
-                this.refresh_vcs(cx);
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_vcs(client, checkout, outcome.err(), cx));
         })
         .detach();
         cx.notify();
@@ -534,30 +554,41 @@ impl Workspace {
 
     /// A one-shot git RPC (`vcs.init`, `vcs.pull`) on the current cwd.
     pub(super) fn run_vcs_request(&mut self, method: &'static str, label: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
-        if self.vcs.running.is_some() {
-            return;
-        }
-        self.vcs.running = Some(label.into());
+        let Some(client) = self.vcs_client() else { return };
+        let Some(checkout) = self.vcs.start(label) else { return };
         cx.spawn(async move |this, cx| {
-            let result = client.request(method, json!({"cwd": cwd})).await;
-            let _ = this.update(cx, |this, cx| {
-                this.vcs.running = None;
-                if let Err(error) = result {
-                    this.error = Some(error.to_string().into());
-                }
-                this.refresh_vcs(cx);
-                cx.notify();
-            });
+            let result = client.request(method, json!({"cwd": checkout.1})).await;
+            let _ =
+                this.update(cx, |this, cx| this.finish_vcs(client, checkout, result.err().map(|e| e.to_string()), cx));
         })
         .detach();
         cx.notify();
     }
 
+    /// Ends `checkout`'s git action: reports its error and refreshes that checkout's status,
+    /// which lands only if it is still the one watched.
+    pub(super) fn finish_vcs(
+        &mut self,
+        client: RpcClient,
+        checkout: Checkout,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.vcs.finish(&checkout);
+        if let Some(error) = error {
+            self.error = Some(error.into());
+        }
+        self.refresh_checkout(client, checkout, cx);
+        cx.notify();
+    }
+
     /// `vcs.refreshStatus` after a git operation, so the card does not wait on the watcher.
     pub(super) fn refresh_vcs(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
-        let env = self.vcs.env.clone();
+        let (Some(client), Some(checkout)) = (self.vcs_client(), self.vcs.checkout()) else { return };
+        self.refresh_checkout(client, checkout, cx);
+    }
+
+    fn refresh_checkout(&mut self, client: RpcClient, (env, cwd): Checkout, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let value = match client.request("vcs.refreshStatus", json!({"cwd": cwd})).await {
                 Ok(value) => value,
@@ -587,6 +618,29 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_action_belongs_to_the_checkout_it_started_on() {
+        let mut vcs = VcsWatch { env: Some("env".into()), cwd: Some("/repo".into()), ..VcsWatch::default() };
+        let pull = vcs.start("Pulling...").unwrap();
+        assert!(vcs.start("Pushing...").is_none(), "one action per checkout at a time");
+        // Another checkout is free while the first one's action runs.
+        vcs.cwd = Some("/repo/wt".into());
+        assert_eq!(vcs.running(), None);
+        let push = vcs.start("Pushing...").unwrap();
+        vcs.env = Some("other".into());
+        vcs.cwd = Some("/repo".into());
+        assert_eq!(vcs.running(), None, "the same path on another machine is another checkout");
+        vcs.env = Some("env".into());
+        vcs.progress(&pull, "Fetching".into());
+        assert_eq!(vcs.running().map(SharedString::as_ref), Some("Fetching"));
+        vcs.finish(&pull);
+        assert_eq!(vcs.running(), None);
+        vcs.cwd = Some("/repo/wt".into());
+        assert_eq!(vcs.running().map(SharedString::as_ref), Some("Pushing..."));
+        vcs.finish(&push);
+        assert_eq!(vcs.running(), None);
+    }
 
     #[test]
     fn diff_counts_compact_like_the_web() {

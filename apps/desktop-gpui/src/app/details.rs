@@ -708,14 +708,14 @@ impl Workspace {
         let (actions_shown, changes_shown) =
             (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
         if status.local.is_repo {
-            let quick = git::quick_action(Some(status), self.vcs.running.is_some());
+            let quick = git::quick_action(Some(status), self.vcs.running().is_some());
             let (insertions, deletions, _) = git::changes_totals(status);
             let quiet_empty_draft = matches!(self.target, Some(Target::Draft { .. }))
-                && self.vcs.running.is_none()
+                && self.vcs.running().is_none()
                 && quick.disabled()
                 && insertions == 0
                 && deletions == 0;
-            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
+            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running().is_some()) {
                 rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
             }
             if changes_shown && !quiet_empty_draft {
@@ -729,7 +729,7 @@ impl Workspace {
                     min_density: Density::Essential,
                 });
             }
-            let running = self.vcs.running.is_some();
+            let running = self.vcs.running().is_some();
             rows.push(
                 action_row("details-init-git", colors, cx)
                     .when(running, |el| el.opacity(0.64))
@@ -759,7 +759,7 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if let Some(progress) = self.vcs.running.clone() {
+        if let Some(progress) = self.vcs.running().cloned() {
             return row(colors)
                 .bg(if tokens.dark { hsla(0., 0., 1., 0.055) } else { hsla(0., 0., 0., 0.035) })
                 .child(icon("icons/refresh-cw.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
@@ -949,26 +949,20 @@ impl Workspace {
 
     /// `sourceControl.publishRepository` with the web's defaults: `origin` over SSH.
     fn publish_repository(&mut self, provider: String, repository: String, visibility: &str, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
+        let Some(client) = self.vcs_client() else { return };
+        let Some(checkout) = self.vcs.start("Publishing repository...") else { return };
         let input = json!({
-            "cwd": cwd,
+            "cwd": checkout.1,
             "provider": provider,
             "repository": repository,
             "visibility": visibility,
             "remoteName": "origin",
             "protocol": "ssh",
         });
-        self.vcs.running = Some("Publishing repository...".into());
         cx.spawn(async move |this, cx| {
             let result = client.request("sourceControl.publishRepository", input).await;
-            let _ = this.update(cx, |this, cx| {
-                this.vcs.running = None;
-                if let Err(error) = result {
-                    this.error = Some(error.to_string().into());
-                }
-                this.refresh_vcs(cx);
-                cx.notify();
-            });
+            let _ =
+                this.update(cx, |this, cx| this.finish_vcs(client, checkout, result.err().map(|e| e.to_string()), cx));
         })
         .detach();
         cx.notify();
