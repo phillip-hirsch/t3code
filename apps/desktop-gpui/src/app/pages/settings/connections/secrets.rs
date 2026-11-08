@@ -21,6 +21,7 @@ use super::{SessionLoad, check_session, error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::RpcClient;
+use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
 /// What the page keeps: the session (for `providers:manage`) and revealed accounts.
@@ -55,7 +56,8 @@ impl Workspace {
         let section = if connected && config["secretProviderSettings"] != true {
             message_section(format!("Update T3 Code on {label} to manage its secret providers."), &t)
         } else if connected {
-            self.secret_providers(&state, label, cx, &t)
+            let project_scoped = matches!(view.scope.kind, ScopeKind::Project { .. });
+            self.secret_providers(&state, label, project_scoped, cx, &t)
         } else {
             message_section(
                 "Connect an environment to manage the secret providers its provider variables read from.".into(),
@@ -65,10 +67,17 @@ impl Workspace {
         self.settings_page("secrets", view, [section], cx)
     }
 
-    fn secret_providers(&self, state: &Entity<SecretsState>, environment: String, cx: &App, t: &Tokens) -> AnyElement {
+    fn secret_providers(
+        &self,
+        state: &Entity<SecretsState>,
+        environment: String,
+        project_scoped: bool,
+        cx: &App,
+        t: &Tokens,
+    ) -> AnyElement {
         let s = state.read(cx);
-        // Provider settings and secret providers need the same grant.
-        let read_only = !s.session.grants(PROVIDERS_MANAGE);
+        // Provider settings and secret providers need the same grant; a project can't own them.
+        let read_only = !s.session.grants(PROVIDERS_MANAGE) || project_scoped;
         let empty = serde_json::Map::new();
         let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
         let ids: Vec<String> = providers.keys().cloned().collect();
@@ -80,6 +89,11 @@ impl Workspace {
                 .on_click(move |_, window, cx| {
                     open_provider_dialog(client.clone(), environment.clone(), ids.clone(), None, window, cx);
                 })
+                .into_any_element()
+        });
+        let note = project_scoped.then(|| {
+            text_xs(div().px(px(16.)).pt(px(12.)).text_color(t.muted_foreground))
+                .child("Environment-wide setting. Select an environment to change it.")
                 .into_any_element()
         });
         let rows = if providers.is_empty() {
@@ -155,7 +169,7 @@ impl Workspace {
                 })
                 .collect()
         };
-        section_with_action("secret-providers", "Secret providers", add, rows, t)
+        section_with_action("secret-providers", "Secret providers", add, note.into_iter().chain(rows), t)
     }
 }
 
