@@ -431,7 +431,7 @@ impl VcsWatch {
 }
 
 impl Workspace {
-    /// `gitCwd`: the thread's worktree, else its project root.
+    /// `gitCwd`: the thread's worktree (a draft's picked existing worktree), else its project root.
     pub(super) fn git_cwd(&self) -> Option<String> {
         let worktree = match self.target.as_ref()? {
             Target::Thread { id, .. } => self
@@ -441,7 +441,7 @@ impl Workspace {
                 .find(|thread| &thread.id == id)
                 .and_then(|thread| thread.worktree_path.clone())
                 .or_else(|| self.open_projection().and_then(|p| p.thread.worktree_path.clone())),
-            Target::Draft { .. } => None,
+            Target::Draft { project_id, .. } => self.draft_workspace.existing_worktree(project_id).map(str::to_owned),
         };
         worktree.or_else(|| self.target_project().map(|project| project.workspace_root.clone()))
     }
