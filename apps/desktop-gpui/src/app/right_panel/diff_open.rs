@@ -197,7 +197,8 @@ pub(super) fn header(
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
     let copy = copy_path_button(&path, &view, tokens, cx);
-    let (open_path, fold_path, fold_view) = (path.clone(), path, view.clone());
+    let (open_path, menu_path, fold_path, fold_view) = (path.clone(), path.clone(), path, view.clone());
+    let menu_view = view.clone();
     // `[data-title]:hover`: the code foreground mixed 16% toward primary.
     let hover = tokens.foreground.blend(tokens.primary.opacity(0.16));
     let muted = tokens.muted_foreground;
@@ -222,6 +223,11 @@ pub(super) fn header(
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
                     view.update(cx, |this, cx| this.open_diff_file(&open_path, window, cx));
+                })
+                .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
+                    cx.stop_propagation();
+                    menu_view
+                        .update(cx, |this, cx| this.open_changed_file_menu(&menu_path, event.position, window, cx));
                 })
                 .child(name),
         )
