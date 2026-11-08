@@ -574,11 +574,12 @@ impl Render for TaskEditor {
                         let item = PopupMenuItem::new(label.clone())
                             .icon(gpui_kit::component::Icon::empty().path(*icon))
                             .checked(id == current_environment);
-                        menu = menu.item(item.on_click(
-                            window.listener_for(&editor, move |this: &mut TaskEditor, _, window, cx| {
-                                this.set_environment(id.clone(), window, cx)
-                            }),
-                        ));
+                        menu = menu.item(item.on_click(window.listener_for(
+                            &editor,
+                            move |this: &mut TaskEditor, _, window, cx| {
+                                this.set_environment(id.clone(), window, cx);
+                            },
+                        )));
                     }
                     menu
                 }
