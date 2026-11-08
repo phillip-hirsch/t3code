@@ -1201,15 +1201,17 @@ impl Workspace {
         let open = code.orphans_open;
         let partial = code.next_cursor().is_some();
         let count = threads.len();
-        let heading = h_flex()
-            .id("pr-code-orphans")
+        let heading = gpui_kit::base::Button::new("pr-code-orphans")
             .w_full()
+            .justify_start()
             .gap(px(6.))
             .px(px(16.))
             .py(px(8.))
             .text_xs()
+            .line_height(gpui_kit::rems(1.))
             .text_color(t.muted_foreground)
             .cursor_pointer()
+            .focus_visible(outline_ring(t))
             .child(if partial {
                 "Conversations not on the diff loaded so far"
             } else {
@@ -1312,10 +1314,11 @@ impl Workspace {
                     .when(thread.is_resolved, |icon| icon.text_color(success)),
             )
             .child(
-                div()
-                    .id(ElementId::Name(format!("pr-thread-toggle:{}", thread.id).into()))
+                gpui_kit::base::Button::new(ElementId::Name(format!("pr-thread-toggle:{}", thread.id).into()))
+                    .line_height(gpui_kit::rems(1.))
                     .cursor_pointer()
                     .hover(|s| s.text_color(t.foreground))
+                    .focus_visible(outline_ring(t))
                     .child(format!(
                         "{} · {count} {}",
                         if thread.is_resolved { "Resolved" } else { "Open" },

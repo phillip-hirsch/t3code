@@ -2217,16 +2217,18 @@ impl Workspace {
                                 )))
                             })
                             .child(
-                                h_flex()
-                                    .id(ElementId::Name(format!("pr-fold-{}", item.id()).into()))
+                                gpui_kit::base::Button::new(ElementId::Name(format!("pr-fold-{}", item.id()).into()))
+                                    .flex_none()
                                     .gap(px(6.))
                                     .px(px(8.))
                                     .py(px(4.))
                                     .rounded(px(6.))
                                     .text_xs()
+                                    .line_height(gpui_kit::rems(1.))
                                     .text_color(t.muted_foreground)
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.muted).text_color(t.foreground))
+                                    .focus_visible(outline_ring(t))
                                     .child(label)
                                     .child(
                                         Icon::new(if open { Lucide::ChevronUp } else { Lucide::ChevronDown })
@@ -2883,18 +2885,20 @@ fn section(
         .w_full()
         .pr(px(16.))
         .child(
-            h_flex()
-                .id(ElementId::Name(format!("pr-section-{index}").into()))
+            gpui_kit::base::Button::new(ElementId::Name(format!("pr-section-{index}").into()))
                 .flex_1()
                 .min_w_0()
+                .justify_start()
                 .gap(px(6.))
                 .px(px(16.))
                 .py(px(12.))
                 .text_xs()
+                .line_height(gpui_kit::rems(1.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(t.muted_foreground)
                 .cursor_pointer()
                 .hover(|s| s.text_color(t.foreground))
+                .focus_visible(outline_ring(t))
                 .child(title.to_owned())
                 .child(
                     Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
@@ -3354,13 +3358,15 @@ fn conversation_group(
         .pl(px(48.))
         .child(actor_marker(actors.first().copied(), Lucide::MessageSquare, !open, Some(8.), t))
         .child(
-            h_flex()
-                .id(ElementId::Name(key.clone().into()))
+            gpui_kit::base::Button::new(ElementId::Name(key.clone().into()))
                 .w_full()
                 .min_w_0()
+                .justify_start()
                 .gap(px(12.))
                 .py(px(8.))
+                .line_height(gpui_kit::rems(1.))
                 .cursor_pointer()
+                .focus_visible(outline_ring(t))
                 .text_color(if open { t.foreground } else { t.muted_foreground })
                 .when(!open, |el| el.opacity(0.55))
                 .hover(|s| s.opacity(1.))
@@ -3374,11 +3380,18 @@ fn conversation_group(
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(format!("{count} {}", if count == 1 { "comment" } else { "comments" })),
                         )
-                        .child(div().truncate().text_size(px(10.)).text_color(t.muted_foreground).child(format!(
-                            "{authors} {} · {}",
-                            if authors == 1 { "author" } else { "authors" },
-                            time_label(&first.at, now)
-                        ))),
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.))
+                                .line_height(px(14.))
+                                .text_color(t.muted_foreground)
+                                .child(format!(
+                                    "{authors} {} · {}",
+                                    if authors == 1 { "author" } else { "authors" },
+                                    time_label(&first.at, now)
+                                )),
+                        ),
                 )
                 .child(
                     Icon::new(if open { Lucide::ChevronUp } else { Lucide::ChevronDown })
@@ -3442,17 +3455,19 @@ fn thread_event(
         .pl(px(48.))
         .child(actor_marker(event.actor.as_ref(), Lucide::MessageSquare, !expanded, Some(0.), t))
         .child(
-            h_flex()
-                .id(ElementId::Name(key.clone().into()))
+            gpui_kit::base::Button::new(ElementId::Name(key.clone().into()))
                 .w_full()
                 .min_w_0()
+                .justify_start()
                 .gap(px(8.))
                 .px(px(8.))
                 .py(px(8.))
                 .text_size(px(11.))
+                .line_height(gpui_kit::rems(1.))
                 .text_color(t.muted_foreground)
                 .cursor_pointer()
                 .hover(|s| s.text_color(t.foreground))
+                .focus_visible(outline_ring(t))
                 .child(Icon::new(Lucide::FileCode).with_size(px(12.)))
                 .child(div().min_w_0().truncate().font_family(FONT_MONO).child(location))
                 .when(thread.is_resolved, |el| {
