@@ -312,14 +312,42 @@ pub struct EnvironmentUsage {
     pub summary: Summary,
 }
 
+/// An answer left out of the totals because its contract version differs (`UsageContractMismatch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractMismatch {
+    pub environment_id: String,
+    /// The server is older than this client, rather than newer.
+    pub server_behind: bool,
+}
+
+impl ContractMismatch {
+    /// `formatUsageContractMismatch`.
+    pub fn message(&self, environment: &str) -> String {
+        if self.server_behind {
+            format!("{environment} runs an older server version and is excluded from totals.")
+        } else {
+            format!("This client is older than the server on {environment}; its usage is excluded from totals.")
+        }
+    }
+}
+
 /// `claimSources` and `ownedContribution` of `mergeUsage`: every machine's answer as one summary
-/// in which a usage directory read by several machines counts once, for the newest healthy read.
-/// Incompatible answers are left out. The web's top-up from newer partial scans is not ported.
-pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
-    let mut current: Vec<EnvironmentUsage> = environments.into_iter().filter(|e| e.summary.compatible()).collect();
-    if current.is_empty() {
+/// in which a usage directory read by several machines counts once, for the newest healthy read,
+/// with the incompatible answers it left out. `None` only without answers. The web's top-up from
+/// newer partial scans is not ported.
+pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<(Summary, Vec<ContractMismatch>)> {
+    if environments.is_empty() {
         return None;
     }
+    let (mut current, incompatible): (Vec<EnvironmentUsage>, Vec<EnvironmentUsage>) =
+        environments.into_iter().partition(|e| e.summary.compatible());
+    let mismatches = incompatible
+        .into_iter()
+        .map(|e| ContractMismatch {
+            server_behind: e.summary.contract_version < CONTRACT_VERSION,
+            environment_id: e.environment_id,
+        })
+        .collect();
     let read_at = |e: &EnvironmentUsage| e.summary.read_at.as_deref().and_then(crate::timestamp::parse_ms).unwrap_or(0);
     current.sort_by(|a, b| read_at(b).cmp(&read_at(a)).then_with(|| a.environment_id.cmp(&b.environment_id)));
     let mut owners: HashMap<String, usize> = HashMap::new();
@@ -348,7 +376,7 @@ pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
         }));
         combined.sources.extend(owned);
     }
-    Some(combined)
+    Some((combined, mismatches))
 }
 
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
@@ -1670,18 +1698,42 @@ mod tests {
             .unwrap()
         };
         let usage = |id: &str, summary: Summary| EnvironmentUsage { environment_id: id.into(), summary };
-        let shared = combine(vec![
+        let (shared, _) = combine(vec![
             usage("old", summary("2026-11-01T00:00:00Z", "box", 1.)),
             usage("new", summary("2026-11-02T00:00:00Z", "box", 2.)),
         ])
         .unwrap();
         assert_eq!((shared.buckets.len(), shared.buckets[0].cost_usd, shared.sources.len()), (1, 2., 1));
-        let separate = combine(vec![
+        let (separate, _) = combine(vec![
             usage("a", summary("2026-11-01T00:00:00Z", "box-a", 1.)),
             usage("b", summary("2026-11-01T00:00:00Z", "box-b", 2.)),
         ])
         .unwrap();
         assert_eq!(merge(&separate, &[]).sessions, 4, "different machines both count");
+    }
+
+    #[test]
+    fn incompatible_answers_settle_as_excluded_environments() {
+        let versioned = |id: &str, version: f64| EnvironmentUsage {
+            environment_id: id.into(),
+            summary: serde_json::from_value(json!({"contractVersion": version, "buckets": [], "sources": []})).unwrap(),
+        };
+        assert!(combine(Vec::new()).is_none());
+        let (summary, mismatches) =
+            combine(vec![versioned("old", 3.), versioned("new", CONTRACT_VERSION + 1.)]).unwrap();
+        assert!(summary.buckets.is_empty(), "nothing counts, but the answer settles");
+        assert_eq!(
+            mismatches,
+            [
+                ContractMismatch { environment_id: "old".into(), server_behind: true },
+                ContractMismatch { environment_id: "new".into(), server_behind: false },
+            ]
+        );
+        assert_eq!(mismatches[0].message("Box"), "Box runs an older server version and is excluded from totals.");
+        assert_eq!(
+            mismatches[1].message("Box"),
+            "This client is older than the server on Box; its usage is excluded from totals."
+        );
     }
 
     fn source(provider: &str, status: &str, sessions: u64) -> Value {

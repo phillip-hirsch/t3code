@@ -39,6 +39,8 @@ pub(in crate::app) struct UsageState {
     /// The answer on screen and the window it answers; a new window keeps it until it lands.
     summary: Option<(Rc<Summary>, UsageWindow)>,
     merged: Rc<Merged>,
+    /// Answers left out of the totals for their contract version.
+    mismatches: Vec<logic::ContractMismatch>,
     error: Option<SharedString>,
     loading: bool,
     refreshing: bool,
@@ -157,6 +159,7 @@ impl Default for UsageState {
             window: local_window(30),
             summary: None,
             merged: Rc::default(),
+            mismatches: Vec::new(),
             error: None,
             loading: false,
             refreshing: false,
@@ -327,8 +330,9 @@ impl Workspace {
                     again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
                     let answered = !answers.is_empty();
                     match (logic::combine(answers), failure) {
-                        (Some(summary), _) => {
+                        (Some((summary, mismatches)), _) => {
                             usage.error = None;
+                            usage.mismatches = mismatches;
                             usage.summary = Some((Rc::new(summary), window.clone()));
                             this.remerge_usage();
                         }
@@ -519,12 +523,25 @@ impl Workspace {
         let environment: SharedString =
             if labels.is_empty() { "This environment".into() } else { labels.join(", ").into() };
         let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
-        let has_issue = !limits && (usage.error.is_some() || summary.as_ref().is_some_and(|s| !s.compatible()));
+        let has_issue = !limits && (usage.error.is_some() || !usage.mismatches.is_empty());
+        let mismatch_lines: Vec<String> = self
+            .usage
+            .mismatches
+            .iter()
+            .map(|mismatch| {
+                let label = self
+                    .limit_environments()
+                    .into_iter()
+                    .find(|(id, ..)| id.as_ref() == mismatch.environment_id)
+                    .map_or_else(|| mismatch.environment_id.clone(), |(_, label, _)| label.to_string());
+                mismatch.message(&label)
+            })
+            .collect();
         let env_label =
             if usage.environment_selected { "All environments".to_owned() } else { "0 environments".into() };
         let env_status: SharedString = if usage.error.is_some() {
             "Unavailable".into()
-        } else if summary.as_ref().is_some_and(|s| !s.compatible()) {
+        } else if !usage.mismatches.is_empty() {
             "Update required".into()
         } else if usage.loading && summary.is_none() {
             "Scanning…".into()
@@ -574,7 +591,12 @@ impl Workspace {
                             cx.notify();
                         })),
                     )
-                    .when_some(error_line.filter(|_| !limits), |menu, error| menu.separator().label(error))
+                    // `UsageEnvironmentStatus`: why environments are missing from the totals.
+                    .when(!limits && (error_line.is_some() || !mismatch_lines.is_empty()), |menu| {
+                        let lines =
+                            error_line.iter().map(SharedString::to_string).chain(mismatch_lines.iter().cloned());
+                        lines.fold(menu.separator(), gpui_kit::component::menu::PopupMenu::label)
+                    })
                     .separator()
                     .item(
                         PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
