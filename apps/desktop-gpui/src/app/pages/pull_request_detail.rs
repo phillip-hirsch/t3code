@@ -121,6 +121,8 @@ pub(in crate::app) struct Panel {
     /// The last stack lookup answered and no other is in flight (`nativeStackQuery.isFresh`).
     stack_fresh: bool,
     stack_failed: bool,
+    /// The checks poll while the pull request is open (`usePullRequestChecksRefresh`).
+    _checks_poll: Option<Task<()>>,
     linked: Option<Vec<header::LinkedThread>>,
     checks_all: bool,
     maintainer_saving: bool,
@@ -184,6 +186,7 @@ impl Panel {
             stack: None,
             stack_fresh: false,
             stack_failed: false,
+            _checks_poll: None,
             linked: None,
             checks_all: false,
             maintainer_saving: false,
@@ -1031,7 +1034,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_header(
         &mut self,
         detail: &Rc<Detail>,
@@ -1281,7 +1284,7 @@ impl Workspace {
     }
 
     /// `PullRequestPrimaryAction`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_primary(
         &self,
         detail: &Detail,
@@ -1343,7 +1346,7 @@ impl Workspace {
                 let blocked = stack.blocked_reason();
                 out.push(
                     button(if primary == Primary::Merge { "pr-merge" } else { "pr-enable-auto-merge" }, icon, label)
-                        .when_some(blocked, |el, reason| el.tooltip(reason))
+                        .when_some(blocked, Button::tooltip)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if blocked.is_none() {
                                 this.press_pr_action(action, Some(method), window, cx);
@@ -1382,7 +1385,7 @@ impl Workspace {
     }
 
     /// `PullRequestActionsMenu`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_menu(
         &self,
         detail: &Rc<Detail>,

@@ -180,6 +180,67 @@ impl Workspace {
         })
     }
 
+    /// `usePullRequestChecksRefresh`: an open pull request's checks are read through
+    /// `pullRequests.checks` every 45 seconds while any run, else every minute, while it is on
+    /// screen and the app is in front. A server without the read, or a host that answers none,
+    /// ends the poll.
+    pub(super) fn follow_pr_checks(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(panel) = self.pr_panel_ref(key) else { return };
+        if panel._checks_poll.is_some()
+            || !self.pull_request_info(&panel.reference.project_id).is_some_and(|i| i.capability("pullRequestChecks"))
+        {
+            return;
+        }
+        let key = key.to_owned();
+        let task = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                loop {
+                    let wait = this.update(cx, |this, _| {
+                        let detail = this.pr_panel_ref(&key)?.detail.clone()?;
+                        Some(logic::checks_refresh_interval(&detail.checks))
+                    });
+                    let Ok(Some(wait)) = wait else { break };
+                    cx.background_executor().timer(wait).await;
+                    let read = this.update(cx, |this, cx| {
+                        let shown = this.shown_pr_key().as_deref() == Some(key.as_str()) && this.pr_panel_on_screen();
+                        let panel = this.pr_panel_ref(&key)?;
+                        let detail = panel.detail.as_ref()?;
+                        let idle = detail.state == list_logic::State::Open && !panel.detail_loading;
+                        let client = this.pull_request_client_of(&key)?;
+                        Some(
+                            (shown && idle && cx.active_window().is_some())
+                                .then(|| (client, panel.reference.to_json())),
+                        )
+                    });
+                    let Ok(Some(read)) = read else { break };
+                    let Some((client, reference)) = read else { continue };
+                    let answer = client.request("pullRequests.checks", reference).await;
+                    let keep = this.update(cx, |this, cx| {
+                        let Ok(value) = answer else { return true };
+                        if value.is_null() {
+                            return false;
+                        }
+                        let Ok(read) = serde_json::from_value::<logic::ChecksRead>(value) else { return true };
+                        let Some(panel) = this.pr_panel(&key) else { return false };
+                        // Never under a detail read in flight, so a checks answer always lands after the detail.
+                        if let Some(merged) = panel.detail.as_deref().and_then(|d| logic::with_checks(d, &read, true)) {
+                            panel.detail = Some(Rc::new(merged));
+                            cx.notify();
+                        }
+                        true
+                    });
+                    if !matches!(keep, Ok(true)) {
+                        break;
+                    }
+                }
+            }
+        });
+        if let Some(panel) = self.pr_panel(&key) {
+            panel._checks_poll = Some(task);
+        }
+    }
+
     /// Condenses the header once the shown tab has scrolled past its fold, and back near the top.
     fn track_pr_scroll(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };

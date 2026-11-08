@@ -100,7 +100,7 @@ pub struct Chain<'a> {
 
 impl<'a> Chain<'a> {
     /// `layersFromTop`: deepest first, the later sibling first.
-    fn from_top(&self) -> Vec<&'a PullRequestLink> {
+    fn top_down(&self) -> Vec<&'a PullRequestLink> {
         let mut order: Vec<usize> = (0..self.layers.len()).collect();
         order.sort_by(|&l, &r| self.depths[r].cmp(&self.depths[l]).then(r.cmp(&l)));
         order.into_iter().map(|i| self.layers[i]).collect()
@@ -210,7 +210,7 @@ fn current(links: &[PullRequestLink]) -> Option<&PullRequestLink> {
     if open.len() > 1 {
         let mut open_chains: Vec<Vec<&PullRequestLink>> = chains
             .iter()
-            .map(|chain| chain.from_top().into_iter().filter(|l| l.is_open()).collect::<Vec<_>>())
+            .map(|chain| chain.top_down().into_iter().filter(|l| l.is_open()).collect::<Vec<_>>())
             .filter(|layers| !layers.is_empty())
             .collect();
         let newest = |layers: &[&PullRequestLink]| {
@@ -220,7 +220,7 @@ fn current(links: &[PullRequestLink]) -> Option<&PullRequestLink> {
         return open_chains.into_iter().flatten().next();
     }
     if let [chain] = chains.as_slice() {
-        return chain.from_top().first().copied();
+        return chain.top_down().first().copied();
     }
     visible.into_iter().reduce(|latest, link| if link.updated_ms() > latest.updated_ms() { link } else { latest })
 }
@@ -234,7 +234,7 @@ pub struct ListLine<'a> {
 }
 
 /// `pullRequestListLines`: chains by their latest update, newest first.
-pub fn list_lines<'a>(links: &'a [PullRequestLink]) -> Vec<ListLine<'a>> {
+pub fn list_lines(links: &[PullRequestLink]) -> Vec<ListLine<'_>> {
     let mut chains = chains(links);
     let latest = |chain: &Chain| chain.layers.iter().map(|l| l.updated_ms()).max().unwrap_or(0);
     chains.sort_by_key(|chain| std::cmp::Reverse(latest(chain)));
@@ -456,8 +456,7 @@ mod tests {
             chained(3, "c", "a", "2026-01-01T00:00:00Z", None),
         ];
         assert_eq!(panel_target("p", &links, None, None).unwrap().number, 3, "the later sibling tops the chain");
-        let lines: Vec<(u64, usize, Option<(bool, usize)>)> =
-            list_lines(&links).iter().map(|l| (l.link.number, l.depth, l.stack)).collect();
+        let lines: Vec<_> = list_lines(&links).iter().map(|l| (l.link.number, l.depth, l.stack)).collect();
         assert_eq!(lines, vec![(1, 0, Some((false, 3))), (2, 1, None), (3, 1, None)]);
 
         // A native stack orders its members by the host's layers, not by link time or branch.

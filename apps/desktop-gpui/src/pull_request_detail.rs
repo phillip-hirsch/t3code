@@ -722,6 +722,38 @@ pub fn menu_actions(detail: &Detail, primary: Option<Primary>, stack: StackMerge
     }
 }
 
+/// `PullRequestChecks`: the lighter `pullRequests.checks` read of a pull request's state and checks.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksRead {
+    #[serde(default)]
+    pub observed_at: Option<f64>,
+    pub state: State,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+
+/// `pullRequestChecksRefreshIntervalMs`: checks still running are worth a tighter poll.
+pub fn checks_refresh_interval(checks: &[Check]) -> std::time::Duration {
+    let running =
+        checks.is_empty() || checks.iter().any(|c| matches!(c.status.as_str(), "pending" | "action-required"));
+    std::time::Duration::from_secs(if running { 45 } else { 60 })
+}
+
+/// `resolvePullRequestDetailChecks`: the detail with a checks read that is not older than it;
+/// without both observation times, `landed_later` decides.
+pub fn with_checks(detail: &Detail, read: &ChecksRead, landed_later: bool) -> Option<Detail> {
+    let newer = match (detail.observed_at, read.observed_at) {
+        (Some(detail), Some(checks)) => checks >= detail,
+        _ => landed_later,
+    };
+    newer.then(|| Detail {
+        state: if detail.state == State::Merged { State::Merged } else { read.state },
+        checks: read.checks.clone(),
+        ..detail.clone()
+    })
+}
+
 /// `pullRequestChecksState`.
 pub fn checks_state(checks: &[Check]) -> Option<&'static str> {
     let has = |status: &str| checks.iter().any(|c| c.status == status);
@@ -1924,8 +1956,8 @@ fn route_match(segments: &[&str], route: &[&[&str]], repository: impl Fn(&[&str]
     })
 }
 
-/// `sourceControlClients.parseChangeRequestUrl`: GitCafe and Azure DevOps claim a link first, then
-/// GitHub (`/pull/`), GitLab (`/-/merge_requests/`), Forgejo (`/pulls/`) and Bitbucket (`/pull-requests/`).
+/// `sourceControlClients.parseChangeRequestUrl`: the git.cafe and Azure DevOps routes claim a link
+/// first, then `/pull/`, `/-/merge_requests/`, `/pulls/` and Bitbucket's `/pull-requests/`.
 pub fn parse_change_request(url: &str) -> Option<ChangeRequestLink> {
     let parsed = url::Url::parse(url.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -2124,6 +2156,28 @@ mod tests {
         assert!(!permissions.comment && !permissions.resolve && !permissions.request_reviewers);
         assert!(permissions.verdicts.is_empty() && permissions.update_methods.is_empty());
         assert_eq!((permissions.labels, open.capabilities.reactions), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn a_checks_read_refreshes_the_detail_unless_it_is_older() {
+        let check = |status: &str| Check { name: "ci".into(), status: status.into(), url: None };
+        assert_eq!(checks_refresh_interval(&[]).as_secs(), 45);
+        assert_eq!(checks_refresh_interval(&[check("success"), check("pending")]).as_secs(), 45);
+        assert_eq!(checks_refresh_interval(&[check("success"), check("failure")]).as_secs(), 60);
+        let base = detail(json!({"observedAt": 100.0, "checks": [{"name": "ci", "status": "pending"}]}));
+        let read: ChecksRead = serde_json::from_value(
+            json!({"observedAt": 120.0, "state": "closed", "checks": [{"name": "ci", "status": "success"}]}),
+        )
+        .unwrap();
+        let merged = with_checks(&base, &read, false).unwrap();
+        assert_eq!((merged.state, merged.checks[0].status.as_str()), (State::Closed, "success"));
+        let stale: ChecksRead =
+            serde_json::from_value(json!({"observedAt": 90.0, "state": "open", "checks": []})).unwrap();
+        assert!(with_checks(&base, &stale, true).is_none(), "an older observation loses");
+        let unordered: ChecksRead = serde_json::from_value(json!({"state": "open", "checks": []})).unwrap();
+        assert!(with_checks(&base, &unordered, true).is_some() && with_checks(&base, &unordered, false).is_none());
+        let landed = detail(json!({"state": "merged"}));
+        assert_eq!(with_checks(&landed, &read, true).unwrap().state, State::Merged, "a merge stays merged");
     }
 
     #[test]

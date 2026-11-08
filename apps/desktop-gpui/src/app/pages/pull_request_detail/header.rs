@@ -84,6 +84,7 @@ impl Workspace {
 
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.follow_pr_checks(key, cx);
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let Some(detail) = panel.detail.clone() else { return };
