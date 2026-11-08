@@ -463,6 +463,7 @@ impl Workspace {
         let (_, _, icon_color) = colors(variant, t);
         let name = provider_name(provider);
         let instance = provider.instance_id.clone();
+        let setup_instance = instance.clone();
         let key = provider_banner_key(provider);
         let refreshing = self.banners.refreshing_provider;
         let tooltip: SharedString = message.clone().into();
@@ -488,7 +489,10 @@ impl Workspace {
                                 .text_color(t.foreground)
                                 .hover(gpui_kit::Styled::underline)
                                 .child("Open provider setup")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_settings("providers", cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let environment = this.active_environment().map(ToString::to_string);
+                                    this.open_provider_setup(environment, setup_instance.clone(), cx);
+                                })),
                         )
                     })
                     .child(

@@ -95,6 +95,19 @@ fn card_height(window: &Window) -> f32 {
 }
 
 impl Workspace {
+    /// `openProviderSetup`: Providers on `environment` with `instance_id` selected; like the
+    /// web's navigation, which replaces the search, it leaves the project axis.
+    pub(in crate::app) fn open_provider_setup(
+        &mut self,
+        environment: Option<String>,
+        instance_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_ui.scope = crate::settings::scope::ScopeSearch::default().with_machine(environment);
+        self.settings_ui.provider_target = Some(instance_id);
+        self.open_settings("providers", cx);
+    }
+
     pub(super) fn render_providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
@@ -108,6 +121,9 @@ impl Workspace {
         }
         let page =
             window.use_keyed_state(self.settings_state_key("settings-providers"), cx, |_, _| ProvidersPage::default());
+        if let Some(target) = self.settings_ui.provider_target.take() {
+            page.update(cx, |page, _| page.selected = Some(target));
+        }
         let override_projects =
             instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);

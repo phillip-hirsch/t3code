@@ -219,6 +219,8 @@ pub(in crate::app) struct SettingsUi {
     /// The modal surface, focused on open like the web's popup so Escape and `/` reach it.
     focus: FocusHandle,
     focus_on_render: bool,
+    /// The provider instance the Providers page selects when it next renders (`instanceId`).
+    provider_target: Option<String>,
     /// The nav's section rows, one focus handle each.
     nav_focus: HashMap<&'static str, FocusHandle>,
     /// The section the arrow keys last moved to and the page that was open then: the nav's one
@@ -273,6 +275,7 @@ impl SettingsUi {
             diff_preview: None,
             focus: cx.focus_handle(),
             focus_on_render: false,
+            provider_target: None,
             nav_focus: HashMap::new(),
             nav_tab_stop: None,
             _search_subscription: subscription,
