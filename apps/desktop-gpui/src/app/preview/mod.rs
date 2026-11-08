@@ -460,9 +460,10 @@ impl Workspace {
         let (zoom, _) = self.tab_look(session);
         let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
         match command {
-            "preview.refresh" => self.with_active_view(cx, |view| {
-                let _ = view.reload();
-            }),
+            "preview.refresh" => {
+                let tab_id = session.tab_id.clone();
+                self.refresh_preview_tab(&tab_id, cx);
+            }
             "preview.focusUrl" => self.preview.address.update(cx, |input, cx| {
                 input.focus(window, cx);
                 input.select_all(window, cx);
@@ -856,6 +857,20 @@ impl Workspace {
         .detach();
     }
 
+    /// `handleRefresh`: an agent tab reloads over its stream, this client's own tab in its view.
+    pub(super) fn refresh_preview_tab(&self, tab_id: &str, cx: &App) {
+        let server = self
+            .preview_thread_id()
+            .and_then(|thread_id| self.preview.threads.get(thread_id))
+            .and_then(|previews| previews.get(tab_id))
+            .is_some_and(Session::server_hosted);
+        if server {
+            self.send_server_input(tab_id, json!({"type": "reload"}));
+        } else if let Some(tab) = self.preview.tabs.get(tab_id) {
+            let _ = tab.view.read(cx).raw().reload();
+        }
+    }
+
     fn with_active_view(&self, cx: &App, action: impl FnOnce(&wry::WebView)) {
         let Some(thread_id) = self.preview_thread_id() else { return };
         let Some(session) = self.active_session(thread_id) else { return };
@@ -1005,8 +1020,9 @@ impl Workspace {
         };
         let url = self.active_url();
         let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
+        let reload_tab = session.map(|s| s.tab_id.clone());
         let server_tab = server_tab.map(|s| s.tab_id.clone());
-        let (back_tab, forward_tab, reload_tab) = (server_tab.clone(), server_tab.clone(), server_tab);
+        let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
         // The menu's top-right corner: under the trigger at the chrome row's right end.
         let menu_corner = point(window.viewport_size().width - RIGHT_RESIZE_INSET - px(8.), TITLEBAR_HEIGHT + px(32.));
@@ -1053,13 +1069,10 @@ impl Workspace {
                         icon_button("preview-reload", IconName::RotateCw, has_page, tokens)
                             .tooltip(tooltip(if loading { "Loading…" } else { "Refresh" }))
                             .when(has_page, |el| {
-                                el.on_click(cx.listener(move |this, _, _, cx| match &reload_tab {
-                                    Some(tab) => {
-                                        this.send_server_input(tab, json!({"type": "reload"}));
+                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(tab) = &reload_tab {
+                                        this.refresh_preview_tab(tab, cx);
                                     }
-                                    None => this.with_active_view(cx, |view| {
-                                        let _ = view.reload();
-                                    }),
                                 }))
                             }),
                     ),

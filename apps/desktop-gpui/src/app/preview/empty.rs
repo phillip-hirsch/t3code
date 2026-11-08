@@ -524,9 +524,7 @@ impl Workspace {
                                         .small()
                                         .label("Reload")
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(tab) = this.preview.tabs.get(&reload_tab) {
-                                                let _ = tab.view.read(cx).raw().reload();
-                                            }
+                                            this.refresh_preview_tab(&reload_tab, cx);
                                         })),
                                 ),
                         ),
