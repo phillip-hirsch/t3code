@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
-use crate::app::pages::settings::widgets::{SelectedEnvironment, SettingsView};
 use crate::app::pages::settings::widgets::{RowFrame, settings_section};
+use crate::app::pages::settings::widgets::{SelectedEnvironment, SettingsView};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcClient;
 use crate::rpc::RpcError;

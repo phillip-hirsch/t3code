@@ -571,21 +571,21 @@ impl Workspace {
 
         let name_reset = can_reset_scratch_title.then(|| {
             let ids = ids.clone();
-            reset_button(&"reset-project-name".into(), "Reset to default", cx).disabled(!can_edit).on_click(cx.listener(
-                move |this, _, window, cx| {
+            reset_button(&"reset-project-name".into(), "Reset to default", cx).disabled(!can_edit).on_click(
+                cx.listener(move |this, _, window, cx| {
                     let update = json!({"title": groups::SCRATCH_PROJECT_TITLE});
                     this.update_projects(ids.clone(), update, "Failed to rename project", window, cx, |_, _| {});
-                },
-            ))
+                }),
+            )
         });
         let icon_reset = icon_customized.then(|| {
             let (ids, panel) = (ids.clone(), panel.clone());
             let update = groups::default_icon_update(representative.is_scratch);
-            reset_button(&"reset-project-icon".into(), "Reset to default", cx).disabled(saving_icon || !can_edit).on_click(
-                cx.listener(move |this, _, window, cx| {
+            reset_button(&"reset-project-icon".into(), "Reset to default", cx)
+                .disabled(saving_icon || !can_edit)
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx);
-                }),
-            )
+                }))
         });
 
         let icon_controls = {
