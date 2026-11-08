@@ -83,6 +83,25 @@ impl Launch {
         env
     }
 
+    /// The output stream a pane subscribes to: `terminal.attach` (which starts the shell when
+    /// `resume` is unset), or `terminal.observe` without `terminal:operate`.
+    fn stream_request(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        read_only: bool,
+        resume: bool,
+    ) -> (&'static str, Value) {
+        if read_only {
+            return ("terminal.observe", json!({"threadId": thread_id, "terminalId": terminal_id}));
+        }
+        let mut input = self.payload(thread_id, terminal_id);
+        if resume {
+            input["resume"] = true.into();
+        }
+        ("terminal.attach", input)
+    }
+
     pub fn payload(&self, thread_id: &str, terminal_id: &str) -> Value {
         let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd, "env": self.env()});
         if let Some(path) = &self.worktree_path {
@@ -208,6 +227,7 @@ impl TerminalSession {
         terminal_id: String,
         launch: Launch,
         client: Option<RpcClient>,
+        read_only: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -228,7 +248,7 @@ impl TerminalSession {
             size: None,
             sent_size: None,
             running: false,
-            read_only: false,
+            read_only,
             exited: false,
             attached: false,
             client: None,
@@ -270,15 +290,13 @@ impl TerminalSession {
         self.pointer.hovered.as_ref()
     }
 
-    /// Subscribes to the terminal's output; called again after a reconnect.
+    /// Subscribes to the terminal's output; called again after a reconnect or a grant change.
     pub fn attach(&mut self, client: RpcClient, cx: &mut Context<Self>) {
-        let mut input = self.launch.payload(&self.thread_id, &self.terminal_id);
-        if self.attached {
-            input["resume"] = true.into();
-        }
+        let (method, input) =
+            self.launch.stream_request(&self.thread_id, &self.terminal_id, self.read_only, self.attached);
         self.client = Some(client.clone());
         self.sent_size = None;
-        let stream = client.stream("terminal.attach", input);
+        let stream = client.stream(method, input);
         self._attach = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = stream.next().await {
                 let mut events = vec![first];
@@ -445,10 +463,13 @@ impl TerminalSession {
         }));
     }
 
-    /// Follows the environment's `terminal:operate` grant; a granted terminal sends its size.
+    /// Follows the environment's `terminal:operate` grant, switching between observing and
+    /// attaching; the new stream's snapshot sends the size when granted.
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
-        if std::mem::replace(&mut self.read_only, read_only) && !read_only {
-            self.send_size(cx);
+        if std::mem::replace(&mut self.read_only, read_only) != read_only
+            && let Some(client) = self.client.clone()
+        {
+            self.attach(client, cx);
         }
     }
 
@@ -662,5 +683,18 @@ mod tests {
     fn paste_brackets_when_asked_and_otherwise_sends_carriage_returns() {
         assert_eq!(paste_input("a\r\nb\nc", false), "a\rb\rc");
         assert_eq!(paste_input("ls\x1b[201~\n", true), "\x1b[200~ls[201~\n\x1b[201~");
+    }
+
+    #[test]
+    fn read_only_panes_observe_instead_of_attaching() {
+        let launch =
+            Launch { cwd: "/repo".into(), worktree_path: None, project_root: "/repo".into(), stop_on_settle: None };
+        let (method, input) = launch.stream_request("t", "default", true, true);
+        assert_eq!((method, input), ("terminal.observe", json!({"threadId": "t", "terminalId": "default"})));
+        let (method, input) = launch.stream_request("t", "default", false, false);
+        assert_eq!(method, "terminal.attach");
+        assert_eq!(input["cwd"], "/repo");
+        assert!(input.get("resume").is_none());
+        assert_eq!(launch.stream_request("t", "default", false, true).1["resume"], true);
     }
 }
