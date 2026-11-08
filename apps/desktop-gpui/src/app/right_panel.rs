@@ -419,10 +419,13 @@ pub(super) struct RightPanel {
 impl RightPanel {
     pub(super) fn new(cx: &mut Context<Workspace>) -> Self {
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
-        let diff_events = cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
-            if matches!(event, DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_)) {
-                this.remember_collapsed(cx);
+        let diff_events = cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| match event {
+            // The kit's chevron on a file still loading: unfold it and read it now.
+            DiffEvent::FileExpanded(path) if this.pending_patch(path).is_some() => {
+                this.fold_diff_file(path, false, cx);
             }
+            DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_) => this.remember_collapsed(cx),
+            _ => {}
         });
         Self {
             panels: HashMap::new(),
