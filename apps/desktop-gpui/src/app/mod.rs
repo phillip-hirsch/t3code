@@ -226,6 +226,7 @@ pub struct Workspace {
     sheet_focus: sidebar_sheet::SheetFocus<gpui_kit::FocusHandle>,
     /// The sheet's focus trap: Tab cycles inside it while it shows.
     sheet_trap: gpui_kit::FocusHandle,
+    titlebar_focus: titlebar::TitlebarFocus,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -426,6 +427,7 @@ impl Workspace {
             ),
             sheet_focus: sidebar_sheet::SheetFocus::default(),
             sheet_trap: cx.focus_handle(),
+            titlebar_focus: titlebar::TitlebarFocus::new(cx),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,

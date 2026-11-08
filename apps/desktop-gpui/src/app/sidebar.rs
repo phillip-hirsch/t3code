@@ -106,6 +106,8 @@ pub(super) struct SidebarState {
     header_focus: [FocusHandle; 3],
     /// The sheet's "Toggle main sidebar" button, its first tab stop.
     pub(super) sheet_toggle: FocusHandle,
+    /// The chrome row's brand ("T3 Code home"), Go back and Go forward.
+    chrome_focus: [FocusHandle; 3],
     /// The keyboard row (`thread:<id>`, `shelf:<name>`, `settled:more`), and the rows in order.
     cursor: Option<SharedString>,
     nav_rows: Vec<SharedString>,
@@ -162,6 +164,7 @@ impl SidebarState {
         let list_focus = cx.focus_handle().tab_stop(true);
         let header_focus: [FocusHandle; 3] = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         let sheet_toggle = cx.focus_handle().tab_stop(true);
+        let chrome_focus: [FocusHandle; 3] = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         // The sidebar is a cached view: focus moving in or out of the search box, the
         // header buttons or the list changes what it draws, so it re-renders on those too.
         let mut subscriptions = vec![cx.subscribe(&search, |this, _, event: &InputEvent, cx| match event {
@@ -169,7 +172,7 @@ impl SidebarState {
             InputEvent::Focus | InputEvent::Blur => this.notify_sidebar(cx),
             InputEvent::PressEnter { .. } => {}
         })];
-        for focus in header_focus.iter().chain([&list_focus, &sheet_toggle]) {
+        for focus in header_focus.iter().chain(&chrome_focus).chain([&list_focus, &sheet_toggle]) {
             subscriptions.push(cx.on_focus(focus, window, |this, _, cx| this.notify_sidebar(cx)));
             subscriptions.push(cx.on_blur(focus, window, |this, _, cx| this.notify_sidebar(cx)));
         }
@@ -208,6 +211,7 @@ impl SidebarState {
             list_focus,
             header_focus,
             sheet_toggle,
+            chrome_focus,
             cursor: None,
             nav_rows: Vec::new(),
             search,
@@ -1489,7 +1493,9 @@ impl Workspace {
         } else {
             (sb.foreground, sb.muted_foreground, sb.muted_foreground, sb.row_hover)
         };
-        let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool| {
+        let ring = tokens.ring;
+        let [brand_focus, back_focus, forward_focus] = &self.sidebar.chrome_focus;
+        let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool, focus: &FocusHandle| {
             div()
                 .id(id)
                 .size(px(28.))
@@ -1498,7 +1504,10 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .when(!enabled, |el| el.opacity(0.64))
-                .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(arrow_hover)))
+                // A disabled button is no tab stop.
+                .when(enabled, |el| {
+                    titlebar::keyboard_control(el.cursor_pointer().hover(|s| s.bg(arrow_hover)), focus, ring)
+                })
                 // Inside the drag region a button must occlude, or Windows takes the press as a drag.
                 .occlude()
                 .tooltip(tooltip(label))
@@ -1512,22 +1521,32 @@ impl Workspace {
         }
         titlebar::drag_region(chrome)
             .child(
-                h_flex()
-                    .ml(titlebar::collapsed_content_left(window))
-                    .h(px(28.))
-                    .gap(px(4.))
-                    .child(svg().path("icons/app/t3-wordmark.svg").w(px(16.9)).h(px(10.2)).mt(px(1.)).text_color(brand))
-                    .child(text_sm(div()).font_weight(FontWeight::MEDIUM).text_color(brand_muted).child("Code")),
+                // `SidebarBrand`: a link to `/`, labelled "T3 Code home".
+                titlebar::keyboard_control(
+                    h_flex()
+                        .id("sidebar-brand")
+                        .ml(titlebar::collapsed_content_left(window))
+                        .h(px(28.))
+                        .gap(px(4.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .occlude(),
+                    brand_focus,
+                    ring,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx)))
+                .child(svg().path("icons/app/t3-wordmark.svg").w(px(16.9)).h(px(10.2)).mt(px(1.)).text_color(brand))
+                .child(text_sm(div()).font_weight(FontWeight::MEDIUM).text_color(brand_muted).child("Code")),
             )
             .child(
                 h_flex()
                     .ml(px(4.))
                     .child(
-                        arrow("sidebar-back", IconName::ArrowLeft, "Go back", back)
+                        arrow("sidebar-back", IconName::ArrowLeft, "Go back", back, back_focus)
                             .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
                     )
                     .child(
-                        arrow("sidebar-forward", IconName::ArrowRight, "Go forward", forward)
+                        arrow("sidebar-forward", IconName::ArrowRight, "Go forward", forward, forward_focus)
                             .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
                     ),
             )
