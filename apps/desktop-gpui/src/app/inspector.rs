@@ -33,6 +33,8 @@ struct ToolText {
     item: Rc<TurnItem>,
     input: Option<ToolInput>,
     output: Option<SharedString>,
+    /// A task list's steps, one per line with its status mark.
+    steps: Option<SharedString>,
 }
 
 enum ToolInput {
@@ -50,7 +52,8 @@ impl ToolText {
             None => format_value(input.get("summary").unwrap_or(input)).map(|text| ToolInput::Text(text.into())),
         });
         let output = item.raw.get("output").and_then(format_value).map(Into::into);
-        Self { item, input, output }
+        let steps = todo_steps(&item).map(Into::into);
+        Self { item, input, output, steps }
     }
 }
 
@@ -100,6 +103,7 @@ pub(super) fn has_inspector(entry: &Entry) -> bool {
     let item = &entry.item.0;
     match item.item_type.as_str() {
         "command_execution" => true,
+        "todo_list" => item.raw.get("steps").and_then(Value::as_array).is_some_and(|steps| !steps.is_empty()),
         "dynamic_tool" => {
             item.raw.get("input").is_some_and(|input| !is_empty_value(input))
                 || item.raw.get("output").is_some_and(|output| !is_empty_value(output))
@@ -285,6 +289,26 @@ fn format_value(value: &Value) -> Option<String> {
     }
 }
 
+/// A task list's steps as the inspector lists them: done, running or waiting, then the text.
+fn todo_steps(item: &TurnItem) -> Option<String> {
+    if item.item_type != "todo_list" {
+        return None;
+    }
+    let steps = item.raw.get("steps")?.as_array()?;
+    let lines: Vec<String> = steps
+        .iter()
+        .map(|step| {
+            let mark = match step.get("status").and_then(Value::as_str) {
+                Some("completed") => '✓',
+                Some("running") => '◉',
+                _ => '○',
+            };
+            format!("{mark} {}", step.get("text").and_then(Value::as_str).unwrap_or_default())
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// `toolCallLines`: `key value`, strings raw and everything else as JSON.
 fn arg_lines(input: &Value) -> Option<Vec<(String, String)>> {
     let object =
@@ -331,6 +355,9 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
     };
     let foreground = gpui_kit::Hsla { a: t.foreground.a * 0.85, ..t.foreground };
     let mut body = v_flex().gap(px(6.));
+    if let Some(steps) = &tool.steps {
+        body = body.child(structured(&format!("steps:{}", entry.id), steps.clone(), t));
+    }
     if item.item_type == "command_execution" {
         if let Some(command) = item.str("input").map(str::trim).filter(|c| !c.is_empty()) {
             body = body.child(mono().text_color(foreground).child(control_pictures(command)));
@@ -489,5 +516,16 @@ mod tests {
         );
         assert!(arg_lines(&json!({"summary": "x", "truncated": true})).is_none());
         assert_eq!(control_pictures("a\u{1}b\tc"), "a\u{2401}b\tc");
+    }
+
+    #[test]
+    fn task_lists_list_every_step_with_its_status() {
+        let tasks = item(json!({"id": "t", "type": "todo_list", "status": "running", "steps": [
+            {"text": "Read", "status": "completed"}, {"text": "Write", "status": "running"},
+            {"text": "Ship", "status": "pending"},
+        ]}));
+        assert_eq!(todo_steps(&tasks).as_deref(), Some("✓ Read\n◉ Write\n○ Ship"));
+        let empty = item(json!({"id": "t", "type": "todo_list", "status": "running", "steps": []}));
+        assert_eq!(todo_steps(&empty), None);
     }
 }
