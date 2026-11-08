@@ -8,6 +8,7 @@ mod chrome;
 mod crumbs;
 mod document;
 mod logic;
+mod media;
 mod notebook;
 mod office;
 mod open_in;
@@ -72,6 +73,8 @@ pub(super) struct FilesState {
     /// A menu of the file surfaces is open; native document views hide so it shows.
     pub(super) menu_open: bool,
     _menu: Option<gpui_kit::Subscription>,
+    /// A workspace image's or video's actions menu.
+    media_menu: Option<media::MediaMenu>,
     /// The crumb menu that is open and the folder it lists.
     crumb_menu: Option<crumbs::CrumbMenu>,
     /// Workspace images, per environment: a draft's resource names only its path.

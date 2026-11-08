@@ -49,6 +49,13 @@ enum FullFile {
     Failed,
 }
 
+/// A workspace image's fetch (`useAssetUrlState` and the image's own load).
+enum WorkspaceImage {
+    Loading,
+    Ready(std::sync::Arc<gpui_kit::Image>),
+    Failed,
+}
+
 /// A loaded full file as drawn: its text, and its table in table mode.
 type FullView = (Entity<EditorState>, Option<std::rc::Rc<super::table::Table>>);
 
@@ -915,6 +922,7 @@ impl Workspace {
         }
         let image = matches!(self.files.previews.get(key).map(|s| &s.load), Some(Load::Image))
             .then(|| self.workspace_image(key, cx));
+        let media_menu = image.is_some().then(|| self.render_media_menu()).flatten();
         // A truncated read, a host file or a connection without write access shows the source read-only.
         let editable = self.can_write_files(&key.checkout.env, cx) == Some(true) && !logic::is_host_path(&key.path);
         let Some(state) = self.files.previews.get_mut(key) else { return div().into_any_element() };
@@ -932,10 +940,53 @@ impl Workspace {
         };
         match &state.load {
             Load::Loading => centered(Spinner::new().large().color(tokens.muted_foreground).into_any_element()),
-            Load::Image => centered(match image.flatten() {
-                Some(image) => img(image).max_w_full().max_h_full().object_fit(ObjectFit::Contain).into_any_element(),
-                None => Spinner::new().large().color(tokens.muted_foreground).into_any_element(),
-            }),
+            Load::Image => match image.unwrap_or(WorkspaceImage::Loading) {
+                WorkspaceImage::Loading => {
+                    centered(Spinner::new().large().color(tokens.muted_foreground).into_any_element())
+                }
+                // `MediaActions`: a right click opens the image's menu; hovering names its path.
+                loaded => {
+                    let ready = match &loaded {
+                        WorkspaceImage::Ready(image) => Some(image.clone()),
+                        _ => None,
+                    };
+                    let tooltip: SharedString = logic::absolute_path(&key.checkout.cwd, &key.path).into();
+                    let menu_key = key.clone();
+                    let menu_image = ready.clone();
+                    div()
+                        .id("workspace-image")
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .px(px(24.))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .on_mouse_down(
+                            gpui_kit::MouseButton::Right,
+                            cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                                let kind = super::media::MediaKind::Image;
+                                let image = menu_image.clone();
+                                this.open_media_menu(&menu_key, kind, image, event.position, window, cx);
+                            }),
+                        )
+                        .child(match ready {
+                            Some(image) => {
+                                img(image).max_w_full().max_h_full().object_fit(ObjectFit::Contain).into_any_element()
+                            }
+                            None => div()
+                                .text_center()
+                                .text_xs()
+                                .line_height(gpui_kit::relative(1.625))
+                                .text_color(tokens.error)
+                                .child("Unable to load workspace image.")
+                                .into_any_element(),
+                        })
+                        .children(media_menu)
+                        .into_any_element()
+                }
+            },
             Load::Binary | Load::Asset => div().into_any_element(),
             Load::Failed { message, attempted, cwd } => {
                 let workspace = cwd.clone().unwrap_or_else(|| key.checkout.cwd.clone());
@@ -1103,12 +1154,16 @@ impl Workspace {
     }
 
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.
-    fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
+    fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> WorkspaceImage {
         let resource = self.image_resource(key);
         let env = &key.checkout.env;
         let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
         let images = self.files.images.entry(env.clone()).or_insert_with(|| cx.new(|_| Default::default())).clone();
-        images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
+        images.update(cx, |images, cx| match images.get(resource.clone(), client, endpoint, cx) {
+            Some(image) => WorkspaceImage::Ready(image),
+            None if images.failed(&resource) => WorkspaceImage::Failed,
+            None => WorkspaceImage::Loading,
+        })
     }
 
     fn image_resource(&self, key: &FileKey) -> Value {

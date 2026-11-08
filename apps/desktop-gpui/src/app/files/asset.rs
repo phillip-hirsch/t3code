@@ -178,8 +178,16 @@ impl Workspace {
         );
     }
 
-    /// Save file: the file's bytes, written where the user picks.
-    fn save_asset_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+    /// Save file: the file's bytes, written where the user picks. A failure shows `failure`;
+    /// `saved`, when given, confirms the write.
+    pub(super) fn save_asset_file(
+        &mut self,
+        key: &FileKey,
+        failure: String,
+        saved: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((client, endpoint)) = self.file_connection(key) else { return };
         let resource = self.document_asset(key, true);
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
@@ -196,11 +204,14 @@ impl Workspace {
                 },
                 Err(_) => Err("Reconnect to the environment and try again.".to_owned()),
             };
-            if let Err(error) = written {
-                let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(error).title("Could not save file"), cx);
-                });
-            }
+            let _ = cx.update(|window, cx| match written {
+                Err(error) => window.push_notification(Notification::error(error).title(failure), cx),
+                Ok(()) => {
+                    if let Some(saved) = saved {
+                        window.push_notification(Notification::success(saved), cx);
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -251,10 +262,11 @@ impl Workspace {
                             .child(name),
                     ),
             )
-            .child(
-                chrome::action("asset-save", IconName::Download, "Save file", &tokens)
-                    .on_click(cx.listener(move |this, _, window, cx| this.save_asset_file(&save_key, window, cx))),
-            );
+            .child(chrome::action("asset-save", IconName::Download, "Save file", &tokens).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.save_asset_file(&save_key, "Could not save file".into(), None, window, cx);
+                },
+            )));
         let body = self.render_asset_body(key, kind, width, &tokens, window, cx);
         v_flex().flex_1().min_h_0().overflow_hidden().child(header).child(body).into_any_element()
     }
