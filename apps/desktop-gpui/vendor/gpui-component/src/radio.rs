@@ -1,8 +1,8 @@
 use std::{rc::Rc, time::Duration};
 
 use crate::{
-    ActiveTheme, AxisExt, Sizable, Size, StyledExt, h_flex,
-    text::Text, tooltip::ComponentTooltip, v_flex,
+    ActiveTheme, AxisExt, Sizable, Size, StyledExt, h_flex, text::Text, tooltip::ComponentTooltip,
+    v_flex,
 };
 use crate::{StyleSized as _, ThemeStyled as _};
 use gpui::{
