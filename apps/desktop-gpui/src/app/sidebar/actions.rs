@@ -784,8 +784,7 @@ impl Workspace {
                 .text_color(tokens.sidebar.muted_foreground)
                 .child(label)
                 .child(
-                    div()
-                        .id("sidebar-undo")
+                    super::keyboard_button(div().id("sidebar-undo"), tokens.ring)
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(tokens.foreground)
                         .cursor_pointer()

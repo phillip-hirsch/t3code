@@ -514,6 +514,11 @@ fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
 }
 
+/// A `<button>`: Tab reaches it, Enter or Space clicks it, and keyboard focus shows the ring.
+pub(super) fn keyboard_button(el: gpui_kit::Stateful<gpui_kit::Div>, ring: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    el.focusable().tab_stop(true).focus_visible(move |s| s.border_2().border_color(ring))
+}
+
 fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
     move |window, cx| Tooltip::new(label).build(window, cx)
 }
@@ -1551,6 +1556,7 @@ impl Workspace {
         } else {
             (sb.foreground, sb.muted_foreground, sb.muted_foreground, sb.row_hover)
         };
+        let ring = tokens.ring;
         let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool| {
             div()
                 .id(id)
@@ -1560,6 +1566,7 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .when(!enabled, |el| el.opacity(0.64))
+                .map(|el| if enabled { keyboard_button(el, ring) } else { el })
                 .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(arrow_hover)))
                 // Inside the drag region a button must occlude, or Windows takes the press as a drag.
                 .occlude()
@@ -1645,8 +1652,7 @@ impl Workspace {
                     )
                     .when(searching, |el| {
                         el.child(
-                            div()
-                                .id("sidebar-search-clear")
+                            keyboard_button(div().id("sidebar-search-clear"), tokens.ring)
                                 .size(px(20.))
                                 .flex()
                                 .flex_none()
@@ -1674,8 +1680,7 @@ impl Workspace {
         // Settings covers these buttons; a tooltip left from the click would sit over it.
         let covered = self.settings.is_some();
         let button = |id: &'static str, name: IconName, label: &'static str| {
-            div()
-                .id(id)
+            keyboard_button(div().id(id), tokens.ring)
                 .size(px(32.))
                 .flex()
                 .items_center()
@@ -1707,8 +1712,7 @@ impl Workspace {
             // On a utility page the three shortcuts become one "Back" (`SidebarChrome.tsx`).
             .map(|el| match self.page {
                 Some(_) => el.child(
-                    text_sm(h_flex())
-                        .id("sidebar-back-to-chat")
+                    keyboard_button(text_sm(h_flex()).id("sidebar-back-to-chat"), tokens.ring)
                         .flex_1()
                         .h(px(32.))
                         .px(px(8.))
@@ -1793,8 +1797,7 @@ impl Workspace {
         };
         let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
         let tip = label.clone();
-        div()
-            .id("sidebar-update")
+        keyboard_button(div().id("sidebar-update"), tokens.ring)
             .ml_auto()
             .size(px(32.))
             .flex_none()
@@ -1858,8 +1861,7 @@ impl Workspace {
         let color = tokens.sidebar.muted_foreground;
         let chevron = icon(IconName::ChevronDown, 12., color)
             .when(!expanded, |i| i.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2)));
-        text_xs(h_flex())
-            .id(shelf.label())
+        keyboard_button(text_xs(h_flex()).id(shelf.label()), tokens.ring)
             .when(first, gpui_kit::Styled::mt_auto)
             .mx(px(2.))
             .h(px(32.))
@@ -1880,8 +1882,7 @@ impl Workspace {
 
     fn render_show_more(&self, count: usize, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
-        text_sm(h_flex())
-            .id("sidebar-settled-more")
+        keyboard_button(text_sm(h_flex()).id("sidebar-settled-more"), tokens.ring)
             .h(px(36.))
             .flex_none()
             .px(px(10.))
