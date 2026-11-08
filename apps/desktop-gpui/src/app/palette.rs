@@ -131,6 +131,10 @@ enum Run {
     FileSearch(super::files::OverlayMode),
     /// `workspace.focusNext` (`true`) or `workspace.focusPrevious`, once the palette has closed.
     WorkspaceFocus(bool),
+    /// "Link pull request to thread" for this thread.
+    LinkPullRequest(String),
+    /// "Show linked pull requests": the right panel's Linked pull requests surface.
+    LinkedPullRequests,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,8 @@ struct Row {
     data_terms: Vec<SharedString>,
     /// Ranking, while a query is typed.
     quality: f32,
+    /// Shown dimmed, and neither highlighted nor run (`DisabledCommandPaletteResultRow`).
+    disabled: bool,
 }
 
 impl Row {
@@ -184,6 +190,7 @@ impl Row {
             terms: &[],
             data_terms: Vec::new(),
             quality: 0.,
+            disabled: false,
         }
     }
 }
@@ -862,6 +869,21 @@ impl Workspace {
             row.terms = &["copy", "thread", "thread id", "reference"];
             row.shortcut = self.shortcut("thread.copyReference");
             rows.push(row);
+            if self.pull_request_linking(&thread.id) {
+                let link = Run::LinkPullRequest(thread.id.clone());
+                let mut row = lucide("link-pull-request", IconName::Link2, "Link pull request to thread", link);
+                row.terms = &["link", "pull request", "pr", "attach", "stack"];
+                rows.push(row);
+                let mut row = lucide(
+                    "open-thread-pull-requests",
+                    IconName::Link2,
+                    "Show linked pull requests",
+                    Run::LinkedPullRequests,
+                );
+                row.terms = &["pull requests", "linked", "stack", "prs"];
+                row.disabled = !self.thread_links_pull_requests();
+                rows.push(row);
+            }
             let mut row =
                 lucide("restart-agent-session", IconName::RotateCcw, "Restart agent session", Run::RestartSession);
             row.terms = &["restart", "reset", "reload", "agent", "session", "skills", "plugins", "mcp"];
@@ -1394,6 +1416,8 @@ impl Workspace {
             }
             Run::ThemeEditor => self.toggle_theme_editor(window, cx),
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
+            Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
+            Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
             Run::FindIn { thread_id, query, message_id } => {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
@@ -1506,7 +1530,8 @@ impl Workspace {
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
         let groups = self.palette_groups(&query);
-        let rows: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).collect();
+        // A disabled row is not an item: the arrows, Enter and the pointer pass over it.
+        let rows: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).collect();
         let modifiers = event.keystroke.modifiers;
         let highlight = palette.highlight;
         // `thread.pin` pins the highlighted project row (`CommandPalette.tsx` handleKeyDown).
@@ -1589,7 +1614,8 @@ impl Workspace {
         // Only `highlightedItemValue` paints; Enter still runs the first row when it is `None`.
         let highlight = palette.highlight;
         let groups = self.palette_groups(&query);
-        let marked = marked_row(highlight, browsing, groups.iter().map(|g| g.rows.len()).sum());
+        let items = groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).count();
+        let marked = marked_row(highlight, browsing, items);
         let input = palette.input.clone();
         let fg = tokens.foreground;
         let muted = tokens.muted_foreground;
@@ -1635,6 +1661,10 @@ impl Workspace {
                 );
             }
             for row in &group.rows {
+                if row.disabled {
+                    list = list.child(self.render_disabled_palette_row(row, &tokens));
+                    continue;
+                }
                 let highlighted = highlight == Some(index);
                 let mark = RowMark { highlighted, marked: marked == Some(index) };
                 list = list.child(self.render_palette_row(row, index, mark, &tokens, cx));
@@ -1776,6 +1806,56 @@ impl Workspace {
         )
     }
 
+    fn palette_row_icon(&self, row: &Row, tokens: &Tokens) -> AnyElement {
+        match &row.icon {
+            RowIcon::Lucide(name) => {
+                Icon::new(*name).size(px(16.)).text_color(tokens.muted_foreground).into_any_element()
+            }
+            RowIcon::Project(project_id) => match self.shell.projects.iter().find(|p| &p.id == project_id) {
+                Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
+                None => div().size(px(16.)).into_any_element(),
+            },
+        }
+    }
+
+    /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity.
+    fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens) -> AnyElement {
+        let description = match &row.description {
+            Some(Description::Text(text)) => Some(text.clone()),
+            _ => None,
+        };
+        h_flex()
+            .id(row.key.clone())
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(6.))
+            .opacity(0.64)
+            .child(div().flex_none().self_start().h(px(20.)).pt(px(2.)).child(self.palette_row_icon(row, tokens)))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .text_color(tokens.foreground)
+                            .child(row.title.clone()),
+                    )
+                    .children(description.map(|text| {
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .line_height(px(16.))
+                            .text_color(tokens.muted_foreground.opacity(0.7))
+                            .child(text)
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_palette_row(
         &self,
         row: &Row,
@@ -1785,13 +1865,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = tokens.muted_foreground;
-        let icon: AnyElement = match &row.icon {
-            RowIcon::Lucide(name) => Icon::new(*name).size(px(16.)).text_color(muted).into_any_element(),
-            RowIcon::Project(project_id) => match self.shell.projects.iter().find(|p| &p.id == project_id) {
-                Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
-                None => div().size(px(16.)).into_any_element(),
-            },
-        };
+        let icon = self.palette_row_icon(row, tokens);
         let description: Option<AnyElement> = row.description.as_ref().map(|d| match d {
             Description::Text(text) => div().truncate().child(text.clone()).into_any_element(),
             Description::Snippet(user, parts) => h_flex()
