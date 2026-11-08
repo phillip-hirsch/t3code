@@ -1077,14 +1077,28 @@ impl Workspace {
         typos: bool,
     ) -> Option<search::Match> {
         let pull_requests = crate::thread_pull_requests::search_entries(thread);
+        // Environment names match only when there are several to tell apart.
+        let environment = (self.sessions().len() > 1).then(|| self.location_label(&thread.environment_id));
         let subject = search::ThreadSubject {
             id: &thread.id,
             title: &thread.title,
             branch: thread.branch.as_deref(),
             project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
+            environment: environment.as_deref(),
             pull_requests: &pull_requests,
         };
         search::match_thread(tokens, &subject, typos)
+    }
+
+    /// `projectEnvironmentLocationById`'s label: "Local" for this machine's server, else the
+    /// environment's name.
+    pub(super) fn location_label(&self, environment_id: &str) -> SharedString {
+        if self.primary_environment().is_some_and(|primary| primary == environment_id) {
+            return "Local".into();
+        }
+        self.env_info(environment_id)
+            .and_then(|info| info.environment_label.clone())
+            .map_or_else(|| "Remote".into(), SharedString::from)
     }
 
     /// Ranks the root view's threads for `query` unless the last ranking still holds.

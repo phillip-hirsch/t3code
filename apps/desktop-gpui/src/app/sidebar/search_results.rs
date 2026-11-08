@@ -114,6 +114,7 @@ impl Workspace {
                         title: &thread.title,
                         branch: thread.branch.as_deref(),
                         project: None,
+                        environment: None,
                         pull_requests,
                     };
                     let found = search::match_thread(&tokens, &subject, typos)?;

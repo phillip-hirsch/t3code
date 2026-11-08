@@ -426,11 +426,13 @@ pub struct ThreadSubject<'a> {
     pub title: &'a str,
     pub branch: Option<&'a str>,
     pub project: Option<&'a str>,
+    /// Only with two or more environments; it tells same-named threads apart.
+    pub environment: Option<&'a str>,
     pub pull_requests: &'a [crate::thread_pull_requests::SearchPullRequest],
 }
 
 /// `scoreThreadSearch` without picks: titles and pull request numbers count fully, pull request
-/// titles and branches less, the project least. `ranges` are the title's.
+/// titles and branches less, project and environment names least. `ranges` are the title's.
 pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> Option<Match> {
     let query: String = tokens.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>().join(" ");
     let field_tokens = fold_query(thread_field_query(&query));
@@ -440,13 +442,16 @@ pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -
         thread.pull_requests.iter().map(|pr| pr.title.as_deref().map(Field::new)).collect();
     let branch = thread.branch.map(|b| Field::new(searchable_branch(b)));
     let project = thread.project.map(Field::new);
+    let environment = thread.environment.map(Field::new);
     let mut fields = vec![Weighted { mid_word: true, ..Weighted::new(&title, 1.) }];
     for (number, title) in numbers.iter().zip(&titles) {
         fields.push(Weighted::new(number, 1.));
         fields.extend(title.as_ref().map(|title| Weighted::new(title, 0.5)));
     }
     fields.extend(branch.as_ref().map(|branch| Weighted::new(branch, 0.6)));
-    fields.extend(project.as_ref().map(|project| Weighted { context: true, ..Weighted::new(project, 0.25) }));
+    for context in [&project, &environment].into_iter().flatten() {
+        fields.push(Weighted { context: true, ..Weighted::new(context, 0.25) });
+    }
     if let Some(found) = match_fields(&field_tokens, &fields, typos) {
         // A multi-word match the title shows none of must sit in one field to explain it.
         let explained = !found.ranges.is_empty() || field_tokens.len() < 2 || has_hint(&field_tokens, thread, typos);
@@ -461,7 +466,7 @@ pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -
 }
 
 /// `matchHint` found a field: the first that holds the whole query, else, past the words the
-/// project holds, the first that holds the rest.
+/// project or environment holds, the first that holds the rest.
 fn has_hint(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> bool {
     let holds = |text: &str, tokens: &[Vec<char>]| {
         match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos).is_some()
@@ -475,6 +480,7 @@ fn has_hint(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> bool {
         })
         .chain(thread.branch.map(|b| searchable_branch(b).to_owned()))
         .chain(thread.project.map(str::to_owned))
+        .chain(thread.environment.map(str::to_owned))
         .collect();
     let hint_for = |tokens: &[Vec<char>]| candidates.iter().any(|text| !text.is_empty() && holds(text, tokens));
     if hint_for(tokens) {
@@ -482,7 +488,12 @@ fn has_hint(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> bool {
     }
     let rest: Vec<Vec<char>> = tokens
         .iter()
-        .filter(|token| !thread.project.is_some_and(|project| holds(project, std::slice::from_ref(token))))
+        .filter(|token| {
+            ![thread.project, thread.environment]
+                .into_iter()
+                .flatten()
+                .any(|context| holds(context, std::slice::from_ref(token)))
+        })
         .cloned()
         .collect();
     !rest.is_empty() && rest.len() != tokens.len() && hint_for(&rest)
@@ -633,6 +644,7 @@ mod tests {
             title: "Sidebar polish",
             branch: Some("t3/fix-flaky-ci"),
             project: Some("t3code"),
+            environment: Some("Studio Mac"),
             pull_requests: &pull_requests,
         };
         let finds = |query: &str| match_thread(&fold_query(query), &thread, false).is_some();
@@ -644,6 +656,7 @@ mod tests {
         assert!(!finds("github.com/pingdotgg/t3code/pull/2288"), "a number is never cut short");
         assert!(!finds("c0ffee"), "a short ID prefix matches nothing");
         assert!(finds("t3code diff worker"), "the project's words, then a field holding the rest");
+        assert!(finds("studio sidebar") && finds("studio mac diff worker"), "the environment's name, as context");
         assert!(!finds("speed flaky"), "words spread over unrelated fields are a coincidence");
         assert_eq!(searchable_branch("t3/"), "t3/", "the prefix stays until more text follows");
     }
