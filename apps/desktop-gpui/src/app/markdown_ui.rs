@@ -110,8 +110,11 @@ impl Workspace {
             .clone()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "No description is available for this skill.".into());
+        // The instructions open in the thread's file panel, on the machine the skill lives on.
+        let path = skill.path.clone().filter(|p| !p.is_empty() && self.preview_thread_id().is_some());
+        let view = cx.weak_entity();
         self.open_chat_menu(position, window, cx, move |menu, _, _| {
-            let (label, path) = (skill.label.clone(), skill.path.clone());
+            let label = skill.label.clone();
             let menu = menu.item(
                 PopupMenuItem::element(move |_, _| {
                     v_flex()
@@ -124,12 +127,12 @@ impl Workspace {
                 })
                 .disabled(true),
             );
-            match path.filter(|p| !p.is_empty()) {
-                // There is no file preview panel yet, so the instructions open where the system opens Markdown.
-                Some(path) => menu.separator().item(
-                    PopupMenuItem::new("View instructions")
-                        .on_click(move |_, _, cx| cx.open_url(&format!("file:///{}", path.replace('\\', "/")))),
-                ),
+            match path {
+                Some(path) => menu.separator().item(PopupMenuItem::new("View instructions").on_click(
+                    move |_, window, cx| {
+                        let _ = view.update(cx, |w, cx| w.open_file(&path, None, window, cx));
+                    },
+                )),
                 None => menu,
             }
         });
