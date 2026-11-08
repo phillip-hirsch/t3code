@@ -15,7 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::git::{self, QuickKind};
+use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
 use crate::model::{DelegatedFrom, ThreadShell, TokenUsage, UsageLimits};
@@ -26,6 +26,8 @@ pub(super) mod automations;
 pub(super) mod servers;
 
 const CARD_WIDTH: f32 = 280.;
+/// `quickActionDisabledReason` without `source-control:write`.
+const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
 const CARD_INSET: f32 = 12.;
 const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
@@ -730,12 +732,13 @@ impl Workspace {
                 });
             }
             let running = self.vcs.running().is_some();
+            let enabled = !running && self.can_write_source_control();
             rows.push(
                 action_row("details-init-git", colors, cx)
-                    .when(running, |el| el.opacity(0.64))
+                    .when(!enabled, |el| el.opacity(0.64))
                     .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .child(div().ml(px(2.)).child(if running { "Initializing..." } else { "Initialize Git" }))
-                    .when(!running, |el| {
+                    .when(enabled, |el| {
                         el.on_click(
                             cx.listener(|this, _, _, cx| this.run_vcs_request("vcs.init", "Initializing...", cx)),
                         )
@@ -766,27 +769,31 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().truncate().child(progress))
                 .into_any_element();
         }
-        let disabled = quick.disabled();
+        let can_write = self.can_write_source_control();
+        let disabled = quick.disabled() || !can_write;
         let kind = quick.kind.clone();
+        // `quickActionDisabledReason`: the missing grant first, then the action's own hint.
         let hint = match &quick.kind {
+            _ if !can_write => Some(SharedString::from(NO_SOURCE_CONTROL_WRITE)),
             QuickKind::Hint(hint) => Some(SharedString::from(hint.clone())),
             _ => None,
         };
         let view = cx.entity();
         let items = git::menu_actions(status, false);
-        let can_publish = status.local.is_repo && !status.local.has_primary_remote;
+        let can_publish = can_write && status.local.is_repo && !status.local.has_primary_remote;
         let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
             // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
             view.update(cx, super::Workspace::refresh_vcs);
             for item in &items {
                 let action = item.action;
                 menu = menu.item(
-                    PopupMenuItem::new(item.label.clone()).icon(icon(item.icon)).disabled(!item.enabled).on_click(
-                        window.listener_for(&view, move |this, _, window, cx| match action {
+                    PopupMenuItem::new(item.label.clone())
+                        .icon(icon(item.icon))
+                        .disabled(!can_write || !item.enabled)
+                        .on_click(window.listener_for(&view, move |this, _, window, cx| match action {
                             "commit" => this.open_commit_dialog(window, cx),
-                            action => this.run_git_action(action, None, cx),
-                        }),
-                    ),
+                            action => this.request_git_action(GitRequest::new(action), window, cx),
+                        })),
                 );
             }
             if can_publish {
@@ -806,7 +813,8 @@ impl Workspace {
                         el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| match &kind {
-                        QuickKind::Run(action) => this.run_git_action(action, None, cx),
+                        _ if !this.can_write_source_control() => {}
+                        QuickKind::Run(action) => this.request_git_action(GitRequest::new(action), window, cx),
                         QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
                         QuickKind::Publish => this.open_publish_dialog(window, cx),
                         QuickKind::Hint(_) => {}
@@ -837,6 +845,18 @@ impl Workspace {
                 message.focus_handle(cx).focus(window, cx);
             }
             let (message, view) = (message.clone(), view.clone());
+            let (can_write, can_branch) = {
+                let this = view.read(cx);
+                (this.can_write_source_control(), this.can_change_thread_branch())
+            };
+            let on_new_branch = {
+                let (message, view) = (message.clone(), view.clone());
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    let text = message.read(cx).value().trim().to_owned();
+                    view.update(cx, |this, cx| this.run_commit(text, true, cx));
+                    window.close_dialog(cx);
+                }
+            };
             dialog
                 .title("Commit changes")
                 .w(px(512.))
@@ -852,17 +872,100 @@ impl Workspace {
                         .child(field("Branch", div().text_sm().child(branch.clone())))
                         .child(field("Commit message (optional)", Input::new(&message))),
                 )
-                .footer(dialog_footer("commit-confirm", "Commit"))
+                .footer({
+                    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
+                        .child(
+                            Button::new("commit-new-branch")
+                                .outline()
+                                .label("Commit on new branch")
+                                .disabled(!can_branch)
+                                .on_click(on_new_branch),
+                        )
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("commit-confirm").primary().label("Commit").disabled(!can_write)),
+                        )
+                })
                 .on_ok(move |_, _, cx: &mut App| {
                     let text = message.read(cx).value().trim().to_owned();
-                    view.update(cx, |this, cx| this.run_commit(text, cx));
+                    view.update(cx, |this, cx| this.run_commit(text, false, cx));
                     true
                 })
         });
     }
 
-    fn run_commit(&mut self, message: String, cx: &mut Context<Self>) {
-        self.run_git_action("commit", (!message.is_empty()).then_some(message), cx);
+    /// `runDialogAction`, or `runDialogActionOnNewBranch` with `feature_branch`; neither asks
+    /// about the default ref.
+    fn run_commit(&mut self, message: String, feature_branch: bool, cx: &mut Context<Self>) {
+        let commit_message = (!message.is_empty()).then_some(message);
+        self.run_git_action(GitRequest { action: "commit", commit_message, feature_branch }, cx);
+    }
+
+    /// The default-ref confirmation: Abort, continue on `branch`, or continue on a feature branch.
+    pub(super) fn confirm_default_ref(
+        &mut self,
+        request: GitRequest,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+        let Some(status) = self.vcs.status.as_ref() else { return };
+        let has_changes = status.local.has_working_tree_changes;
+        let includes_commit = matches!(request.action, "commit" | "commit_push" | "commit_push_pr")
+            && (request.action == "commit" || has_changes || request.feature_branch);
+        let copy = git::default_ref_copy(request.action, &branch, includes_commit, status);
+        let unavailable: Option<SharedString> = git::feature_branch_unavailable(&branch, has_changes).map(Into::into);
+        let (title, description, continue_label): (SharedString, SharedString, SharedString) =
+            (copy.title.into(), copy.description.into(), copy.continue_label.into());
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = theme::tokens(cx).muted_foreground;
+            let (can_write, can_branch) = {
+                let this = view.read(cx);
+                (this.can_write_source_control(), this.can_change_thread_branch() && unavailable.is_none())
+            };
+            let run = |feature_branch: bool| {
+                let (view, request) = (view.clone(), request.clone());
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    let request = GitRequest { feature_branch, ..request.clone() };
+                    view.update(cx, |this, cx| this.run_git_action(request, cx));
+                    window.close_dialog(cx);
+                }
+            };
+            dialog
+                .title(title.clone())
+                .w(px(576.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child(description.clone()))
+                        .children(unavailable.clone().map(|reason| div().text_xs().text_color(muted).child(reason))),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            div().mr_auto().child(DialogClose::new().trigger(|button| button.outline().label("Abort"))),
+                        )
+                        .child(
+                            Button::new("default-ref-continue")
+                                .outline()
+                                .label(continue_label.clone())
+                                .disabled(!can_write)
+                                .on_click(run(false)),
+                        )
+                        .child(
+                            Button::new("default-ref-feature-branch")
+                                .primary()
+                                .label("Check out feature branch & continue")
+                                .disabled(!can_branch)
+                                .on_click(run(true)),
+                        ),
+                )
+        });
     }
 
     /// `PublishRepositoryDialog`: the first signed-in source-control provider, `account/` prefilled.

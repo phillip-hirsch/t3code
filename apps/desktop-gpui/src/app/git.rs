@@ -117,6 +117,85 @@ impl VcsStatus {
             _ => "change request",
         }
     }
+
+    /// `changeRequestTerminologyFor(...).singular`.
+    pub fn pr_singular(&self) -> &'static str {
+        match self.pr_label() {
+            "MR" => "merge request",
+            "PR" => "pull request",
+            _ => "change request",
+        }
+    }
+}
+
+/// `requiresDefaultBranchConfirmation`: what a push from the default ref asks about first.
+pub fn requires_default_ref_confirmation(action: &str, is_default_ref: bool) -> bool {
+    is_default_ref && matches!(action, "push" | "create_pr" | "commit_push" | "commit_push_pr")
+}
+
+/// The default-ref dialog's title, description and continue label.
+#[derive(Debug, PartialEq)]
+pub struct DefaultRefCopy {
+    pub title: String,
+    pub description: String,
+    pub continue_label: String,
+}
+
+/// `resolveDefaultBranchActionDialogCopy` (`GitActionsControl.logic.ts`).
+pub fn default_ref_copy(action: &str, branch: &str, includes_commit: bool, status: &VcsStatus) -> DefaultRefCopy {
+    let suffix = format!(
+        " on \"{branch}\". You can continue on this ref or create a feature ref and run the same action there."
+    );
+    let (pr, singular) = (status.pr_label(), status.pr_singular());
+    let (title, description, continue_label) = match (action, includes_commit) {
+        ("push" | "commit_push", true) => (
+            "Commit & push to default ref?".to_owned(),
+            format!("This action will commit and push changes{suffix}"),
+            format!("Commit & push to {branch}"),
+        ),
+        ("push" | "commit_push", false) => (
+            "Push to default ref?".to_owned(),
+            format!("This action will push local commits{suffix}"),
+            format!("Push to {branch}"),
+        ),
+        (_, true) => (
+            format!("Commit, push & create {pr} from default ref?"),
+            format!("This action will commit, push, and create a {singular}{suffix}"),
+            format!("Commit, push & create {pr}"),
+        ),
+        (_, false) => (
+            format!("Push & create {pr} from default ref?"),
+            format!("This action will push local commits and create a {singular}{suffix}"),
+            format!("Push & create {pr}"),
+        ),
+    };
+    DefaultRefCopy { title, description, continue_label }
+}
+
+/// `resolveFeatureBranchUnavailableReason`: the server names a feature branch from the
+/// uncommitted changes, so a clean tree can't get one.
+pub fn feature_branch_unavailable(branch: &str, has_working_tree_changes: bool) -> Option<String> {
+    (!has_working_tree_changes).then(|| {
+        format!(
+            "There are no changes to commit, so a feature branch can't be named. Create a branch yourself or continue on {branch}."
+        )
+    })
+}
+
+/// `resolveThreadBranchUpdate` on a `git.runStackedAction` event: the branch an
+/// `action_finished` result says the action created.
+pub fn created_branch(event: &Value) -> Option<String> {
+    if event["kind"].as_str() != Some("action_finished") {
+        return None;
+    }
+    let branch = &event["result"]["branch"];
+    (branch["status"].as_str() == Some("created")).then(|| branch["name"].as_str()).flatten().map(str::to_owned)
+}
+
+/// `persistThreadBranchSync` for a server thread: the `thread.metadata.update` fields that record
+/// `branch`, guarded by the branch the thread had (`expectedBranch`); `None` when it already has it.
+pub fn branch_metadata_patch(branch: &str, thread_branch: Option<&str>) -> Option<Value> {
+    (thread_branch != Some(branch)).then(|| json!({"branch": branch, "expectedBranch": thread_branch}))
 }
 
 /// The Changes row's counts and the ref they compare against (`resolveChangesTotals`):
@@ -186,8 +265,7 @@ pub fn quick_action(status: Option<&VcsStatus>, busy: bool) -> QuickAction {
     let default_delta = remote.ahead_of_default_count.unwrap_or(remote.ahead_count) > 0;
     let up_to_date = "Branch is up to date. No action needed.";
     if local.ref_name.is_none() {
-        let singular = if pr == "change request" { "change request".to_owned() } else { "pull request".to_owned() };
-        let singular = if pr == "MR" { "merge request".to_owned() } else { singular };
+        let singular = status.pr_singular();
         return hint("Commit", &format!("Create and checkout a ref before pushing or opening a {singular}."));
     }
     if local.has_working_tree_changes {
@@ -368,6 +446,31 @@ pub fn diff_stat_label(
         .child(column(format!("-{}", compact_diff_count(deletions)), deletion_color(tokens, scheme)))
 }
 
+/// `AuthSourceControlWriteScope`: commit, push, PR, init, pull and publish need it.
+const SOURCE_CONTROL_WRITE: &str = "source-control:write";
+
+/// One `git.runStackedAction` request (`RunGitActionWithToastInput`).
+#[derive(Clone, Debug)]
+pub(super) struct GitRequest {
+    pub action: &'static str,
+    /// Blank lets the server write one.
+    pub commit_message: Option<String>,
+    /// `featureBranch`: check out a new branch named from the changes, then run the action there.
+    pub feature_branch: bool,
+}
+
+impl GitRequest {
+    pub(super) fn new(action: &'static str) -> Self {
+        Self { action, commit_message: None, feature_branch: false }
+    }
+}
+
+/// The thread (with the branch it had when the action started) or draft a git action ran for.
+enum BranchOwner {
+    Thread { id: String, env: SharedString, branch: Option<String> },
+    Draft(String),
+}
+
 /// The open target's status subscription; it follows the git cwd and its environment.
 #[derive(Default)]
 pub(super) struct VcsWatch {
@@ -505,18 +608,48 @@ impl Workspace {
         self.env_client(self.vcs.env.as_deref()?)
     }
 
-    /// `git.runStackedAction` with the server writing the commit message, as the quick action does.
-    pub(super) fn run_git_action(
-        &mut self,
-        action: &'static str,
-        commit_message: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
+    /// `useEnvironmentScope(…, "source-control:write")` on the watched checkout's environment.
+    pub(super) fn can_write_source_control(&self) -> bool {
+        self.vcs.env.as_deref().is_some_and(|env| self.env_grants(env, SOURCE_CONTROL_WRITE))
+    }
+
+    /// `canChangeThreadBranch`: a feature branch also moves a server thread to it.
+    pub(super) fn can_change_thread_branch(&self) -> bool {
+        self.can_write_source_control()
+            && match &self.target {
+                Some(Target::Thread { env, .. }) => self.can_operate(env),
+                _ => true,
+            }
+    }
+
+    /// `runGitActionWithToast`: a push or PR from the default ref asks first.
+    pub(super) fn request_git_action(&mut self, request: GitRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_write_source_control() {
+            return;
+        }
+        let status = self.vcs.status.as_ref();
+        let is_default_ref = !request.feature_branch && status.is_some_and(|s| s.local.is_default_ref);
+        let branch = status.and_then(|s| s.local.ref_name.clone());
+        match branch.filter(|_| requires_default_ref_confirmation(request.action, is_default_ref)) {
+            Some(branch) => self.confirm_default_ref(request, branch, window, cx),
+            None => self.run_git_action(request, cx),
+        }
+    }
+
+    /// `git.runStackedAction` on the watched checkout, past the default-ref prompt. The grants are
+    /// checked again, since they can change while a dialog is open.
+    pub(super) fn run_git_action(&mut self, request: GitRequest, cx: &mut Context<Self>) {
+        if !self.can_write_source_control() || (request.feature_branch && !self.can_change_thread_branch()) {
+            return;
+        }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start("Starting source control action...") else { return };
-        let mut input = json!({"actionId": new_id(), "cwd": checkout.1, "action": action});
-        if let Some(message) = commit_message {
+        let mut input = json!({"actionId": new_id(), "cwd": checkout.1, "action": request.action});
+        if let Some(message) = request.commit_message {
             input["commitMessage"] = message.into();
+        }
+        if request.feature_branch {
+            input["featureBranch"] = true.into();
         }
         if let Some(Target::Thread { id, .. }) = &self.target {
             input["threadId"] = id.clone().into();
@@ -524,9 +657,11 @@ impl Workspace {
         if let Some(project) = self.target_project() {
             input["projectId"] = project.id.clone().into();
         }
+        let owner = self.branch_owner();
         let stream = client.stream("git.runStackedAction", input);
         cx.spawn(async move |this, cx| {
             let mut outcome: Result<(), String> = Ok(());
+            let mut created = None;
             while let Some(event) = stream.next().await {
                 match event {
                     StreamEvent::Item(value) => match value.get("kind").and_then(Value::as_str) {
@@ -537,6 +672,7 @@ impl Workspace {
                                 cx.notify();
                             });
                         }
+                        Some("action_finished") => created = created_branch(&value),
                         Some("action_failed") => {
                             outcome = Err(value["message"].as_str().unwrap_or("Git action failed.").to_owned());
                         }
@@ -546,14 +682,51 @@ impl Workspace {
                     StreamEvent::End(Ok(())) => break,
                 }
             }
-            let _ = this.update(cx, |this, cx| this.finish_vcs(client, checkout, outcome.err(), cx));
+            let _ = this.update(cx, |this, cx| {
+                if let (Some(branch), Some(owner), Ok(())) = (created, owner, &outcome) {
+                    this.record_created_branch(owner, branch, cx);
+                }
+                this.finish_vcs(client, checkout, outcome.err(), cx);
+            });
         })
         .detach();
         cx.notify();
     }
 
+    /// The thread or draft a git action starts from, which its created branch belongs to.
+    fn branch_owner(&self) -> Option<BranchOwner> {
+        match self.target.as_ref()? {
+            Target::Thread { id, env } => {
+                let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
+                let branch = match shell {
+                    Some(thread) => thread.branch.clone(),
+                    None => self.open_projection().and_then(|p| p.thread.branch.clone()),
+                };
+                Some(BranchOwner::Thread { id: id.clone(), env: env.clone(), branch })
+            }
+            Target::Draft { project_id, .. } => Some(BranchOwner::Draft(project_id.clone())),
+        }
+    }
+
+    /// `syncThreadBranchAfterGitAction`: a server thread records the branch, guarded by the one
+    /// it had; a draft picks it.
+    fn record_created_branch(&mut self, owner: BranchOwner, branch: String, cx: &mut Context<Self>) {
+        match owner {
+            BranchOwner::Thread { id, env, branch: had } => {
+                let fields = branch_metadata_patch(&branch, had.as_deref());
+                if let Some(fields) = fields.filter(|_| self.can_operate(&env)) {
+                    self.thread_command("thread.metadata.update", &id, fields, cx);
+                }
+            }
+            BranchOwner::Draft(project_id) => self.set_draft_branch(&project_id, branch, cx),
+        }
+    }
+
     /// A one-shot git RPC (`vcs.init`, `vcs.pull`) on the current cwd.
     pub(super) fn run_vcs_request(&mut self, method: &'static str, label: &'static str, cx: &mut Context<Self>) {
+        if !self.can_write_source_control() {
+            return;
+        }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start(label) else { return };
         cx.spawn(async move |this, cx| {
@@ -751,6 +924,56 @@ mod tests {
             VcsStatus::apply(Some(first), &json!({"_tag": "localUpdated", "local": local(true, json!({}))})).unwrap();
         assert!(next.local.has_working_tree_changes);
         assert_eq!(next.remote.ahead_count, 2);
+    }
+
+    #[test]
+    fn pushes_from_the_default_ref_ask_first_with_the_web_copy() {
+        assert!(requires_default_ref_confirmation("commit_push_pr", true));
+        assert!(!requires_default_ref_confirmation("commit", true), "a plain commit never asks");
+        assert!(!requires_default_ref_confirmation("push", false));
+        let github = status(local(true, json!({"isDefaultRef": true, "refName": "main"})), Value::Null);
+        let copy = default_ref_copy("commit_push_pr", "main", true, &github);
+        assert_eq!(copy.title, "Commit, push & create PR from default ref?");
+        assert_eq!(
+            copy.description,
+            "This action will commit, push, and create a pull request on \"main\". You can continue on this ref or create a feature ref and run the same action there."
+        );
+        assert_eq!(copy.continue_label, "Commit, push & create PR");
+        let push = default_ref_copy("commit_push", "main", false, &github);
+        assert_eq!((push.title.as_str(), push.continue_label.as_str()), ("Push to default ref?", "Push to main"));
+        let gitlab =
+            status(local(false, json!({"sourceControlProvider": {"kind": "gitlab"}})), json!({"hasUpstream": true}));
+        let create = default_ref_copy("create_pr", "main", false, &gitlab);
+        assert_eq!(create.title, "Push & create MR from default ref?");
+        assert!(create.description.starts_with("This action will push local commits and create a merge request"));
+        assert_eq!(feature_branch_unavailable("main", true), None);
+        assert_eq!(
+            feature_branch_unavailable("main", false).as_deref(),
+            Some(
+                "There are no changes to commit, so a feature branch can't be named. Create a branch yourself or continue on main."
+            )
+        );
+    }
+
+    #[test]
+    fn a_created_branch_is_recorded_once_and_guarded_by_the_old_one() {
+        let finished =
+            |branch: Value| json!({"kind": "action_finished", "actionId": "a", "result": {"branch": branch}});
+        assert_eq!(
+            created_branch(&finished(json!({"status": "created", "name": "t3/fix-login"}))).as_deref(),
+            Some("t3/fix-login")
+        );
+        assert_eq!(created_branch(&finished(json!({"status": "skipped_not_requested"}))), None);
+        assert_eq!(created_branch(&json!({"kind": "phase_started", "label": "Committing"})), None);
+        assert_eq!(
+            branch_metadata_patch("t3/fix-login", Some("main")),
+            Some(json!({"branch": "t3/fix-login", "expectedBranch": "main"}))
+        );
+        assert_eq!(
+            branch_metadata_patch("t3/fix-login", None),
+            Some(json!({"branch": "t3/fix-login", "expectedBranch": null}))
+        );
+        assert_eq!(branch_metadata_patch("main", Some("main")), None);
     }
 
     #[test]

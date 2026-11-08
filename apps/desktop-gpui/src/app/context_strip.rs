@@ -302,6 +302,14 @@ impl Workspace {
         self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
     }
 
+    /// `setDraftThreadContext` after a git action created `branch` for the draft of `project_id`.
+    pub(super) fn set_draft_branch(&mut self, project_id: &str, branch: String, cx: &mut Context<Self>) {
+        if self.draft_workspace.project_id.as_deref() == Some(project_id) {
+            self.draft_workspace.choice.branch = Some(branch);
+            cx.notify();
+        }
+    }
+
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
