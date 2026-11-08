@@ -140,8 +140,7 @@ impl Workspace {
     /// address when it is not this machine's own server.
     pub(in crate::app) fn resolve_server_url(&self, environment: Option<&str>, url: String) -> String {
         let primary = self.primary_environment().map(SharedString::as_ref);
-        let remote = environment.filter(|environment| primary != Some(*environment));
-        match remote.map(|environment| self.env_endpoint(environment)) {
+        match hosting_environment(environment, primary, self.environment_remote).map(|e| self.env_endpoint(e)) {
             Some(Some(endpoint)) => crate::preview::resolve_discovered_server_url(&url, Some(&endpoint.http_base)),
             Some(None) => url,
             None => crate::preview::resolve_discovered_server_url(&url, None),
@@ -300,9 +299,27 @@ impl Workspace {
     }
 }
 
+/// The environment whose address `environment`'s loopback servers open at: `None` for this
+/// machine's own server, the primary unless `T3_SERVER_URL` points it elsewhere.
+fn hosting_environment<'a>(
+    environment: Option<&'a str>,
+    primary: Option<&str>,
+    primary_remote: bool,
+) -> Option<&'a str> {
+    environment.filter(|environment| primary_remote || primary != Some(*environment))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_this_machines_own_server_reaches_loopback_directly() {
+        assert_eq!(hosting_environment(Some("primary"), Some("primary"), false), None);
+        assert_eq!(hosting_environment(Some("primary"), Some("primary"), true), Some("primary"), "T3_SERVER_URL");
+        assert_eq!(hosting_environment(Some("linked"), Some("primary"), false), Some("linked"));
+        assert_eq!(hosting_environment(None, Some("primary"), true), None);
+    }
 
     #[test]
     fn servers_belong_to_the_thread_their_terminal_or_agent_runs_in() {
