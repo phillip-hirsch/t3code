@@ -24,7 +24,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::widgets::{RowFrame, card, select_trigger, settings_section};
+use super::widgets::{RowFrame, SectionTarget, card, select_trigger, settings_section, with_target};
 
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
@@ -206,6 +206,13 @@ fn filter_rows<'a>(rows: &'a [KeyRow], query: &str) -> Vec<&'a KeyRow> {
                     .any(|field| field.to_lowercase().contains(&query))
         })
         .collect()
+}
+
+/// The row a search result for `target` lands on: the first shown with its command
+/// (`keybindingAnchorIds`).
+fn jump_row<'a>(rows: &[&'a KeyRow], target: &str) -> Option<&'a str> {
+    let command = target.strip_prefix("keybinding-")?;
+    rows.iter().find(|row| row.command == command).map(|row| row.id.as_str())
 }
 
 const GROUPS: &[(&str, &str, &[&str])] = &[
@@ -577,6 +584,9 @@ pub(super) struct KeybindingsPanel {
     /// The row whose When builder is open, and that builder's expression field.
     when_open: Option<String>,
     when_input: Entity<InputState>,
+    /// The settings search jump in progress, and the last one whose filter was cleared.
+    jump: Option<SectionTarget>,
+    handled_jump: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -645,8 +655,29 @@ impl KeybindingsPanel {
             saving: None,
             when_open: None,
             when_input,
+            jump: None,
+            handled_jump: 0,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Follows the settings search jump; a jump to a binding clears the filter so its row shows.
+    fn follow_jump(&mut self, jump: Option<SectionTarget>, window: &mut Window, cx: &mut Context<Self>) {
+        let jumps = jump.as_ref().map(SectionTarget::jumps);
+        if jumps == self.jump.as_ref().map(SectionTarget::jumps) {
+            return;
+        }
+        if let Some(jump) = &jump
+            && jump.jumps() != self.handled_jump
+        {
+            self.handled_jump = jump.jumps();
+            if jump.id().starts_with("keybinding-") {
+                self.search.update(cx, |search, cx| search.set_value("", window, cx));
+                self.query.clear();
+            }
+        }
+        self.jump = jump;
+        cx.notify();
     }
 
     fn clear_editing(&mut self) {
@@ -970,6 +1001,22 @@ impl Render for KeybindingsPanel {
         let t = *theme::tokens(cx);
         let rows = filter_rows(&self.catalog.rows, &self.query);
         let groups = group_rows(&rows);
+        let jump = self.jump.clone();
+        let jump_row = jump.as_ref().and_then(|jump| jump_row(&rows, jump.id()));
+        with_target(jump.clone(), || self.render_rows(&groups, jump, jump_row, &t, cx))
+    }
+}
+
+impl KeybindingsPanel {
+    fn render_rows(
+        &self,
+        groups: &[(&str, &'static str, Vec<&KeyRow>)],
+        jump: Option<SectionTarget>,
+        jump_row: Option<&str>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let t = *t;
         let mut children = vec![settings_section("keybindings", "Keybindings", [self.render_toolbar(&t, cx)], &t)];
         if !self.connected {
             children.push(
@@ -997,8 +1044,14 @@ impl Render for KeybindingsPanel {
                 &t,
             ));
         }
-        for (_, title, rows) in groups {
-            let rendered: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, &t, cx)).collect();
+        for &(_, title, ref rows) in groups {
+            let rendered: Vec<AnyElement> = rows
+                .iter()
+                .map(|row| {
+                    let landed = jump.clone().filter(|_| jump_row == Some(row.id.as_str()));
+                    self.render_row(row, landed, &t, cx)
+                })
+                .collect();
             body.push(settings_section(SharedString::from(title), title, rendered, &t));
         }
         children.push(v_flex().gap(px(32.)).children(body).into_any_element());
@@ -1059,7 +1112,7 @@ impl KeybindingsPanel {
             .into_any_element()
     }
 
-    fn render_row(&self, row: &KeyRow, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, row: &KeyRow, jump: Option<SectionTarget>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let (key, when, when_valid) = self.draft_parts(row);
         let expression = when_expression(when);
         let dirty = key != row.key || expression != row.when;
@@ -1096,7 +1149,12 @@ impl KeybindingsPanel {
             }))
             .child(self.render_key_control(&row.id, key, &row.key, dirty, t, cx));
         let rendered = RowFrame::new(title).description(description).control(control);
-        div().group("kb-row").child(rendered.render(t)).into_any_element()
+        div()
+            .group("kb-row")
+            .relative()
+            .child(rendered.render(t))
+            .when_some(jump, |el, jump| jump.mark(el))
+            .into_any_element()
     }
 
     fn render_row_menu(&self, row: &KeyRow, saving: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1748,6 +1806,10 @@ impl Workspace {
                 cx.new(|cx| KeybindingsPanel::new(workspace, environment, source, connected, window, cx)).into()
             })
             .clone();
+        let jump = self.section_target(theme::tokens(cx));
+        if let Ok(panel) = panel.clone().downcast::<KeybindingsPanel>() {
+            panel.update(cx, |panel, cx| panel.follow_jump(jump, window, cx));
+        }
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.
         self.settings_page("keybindings", view, [div().child(panel).into_any_element()], cx)
@@ -1817,6 +1879,10 @@ mod tests {
         let found = filter_rows(&rows, "  COPY link ");
         assert_eq!(found.iter().map(|r| r.command.as_str()).collect::<Vec<_>>(), ["thread.copyReference"]);
         assert!(filter_rows(&rows, "custom").is_empty(), "the source is searchable");
+        let chat_new: Vec<&KeyRow> = all.iter().copied().filter(|r| r.command == "chat.new").collect();
+        assert!(chat_new.len() > 1, "chat.new has two default keys");
+        assert_eq!(jump_row(&all, "keybinding-chat.new"), Some(chat_new[0].id.as_str()), "the first row is the anchor");
+        assert_eq!(jump_row(&all, "keybindings"), None, "the section, not a row");
     }
 
     #[test]

@@ -409,7 +409,7 @@ fn row_lock(
 
 /// A search target as the page's sections see it while they build.
 #[derive(Clone)]
-struct SectionTarget {
+pub(super) struct SectionTarget {
     id: SharedString,
     jumps: u64,
     pending: Rc<Cell<u8>>,
@@ -420,6 +420,29 @@ struct SectionTarget {
 thread_local! {
     /// Set by [`Workspace::with_section_target`]; the section builders take no workspace.
     static SECTION_TARGET: RefCell<Option<SectionTarget>> = const { RefCell::new(None) };
+}
+
+impl SectionTarget {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn jumps(&self) -> u64 {
+        self.jumps
+    }
+
+    /// Scrolls the row the jump lands on into view and pulses it.
+    pub(super) fn mark<E: gpui_kit::ParentElement>(self, el: E) -> E {
+        el.child(scroll_target_marker(self.pending, self.scroll)).child(jump_pulse(self.jumps, &self.tokens))
+    }
+}
+
+/// Builds with `target` visible to [`section_frame`], for content a child entity renders.
+pub(super) fn with_target<R>(target: Option<SectionTarget>, build: impl FnOnce() -> R) -> R {
+    let previous = SECTION_TARGET.replace(target);
+    let built = build();
+    SECTION_TARGET.set(previous);
+    built
 }
 
 /// The jump target when it names section `id`.
@@ -1639,17 +1662,18 @@ impl Workspace {
     /// Builds a settings page's content with `self.settings_ui.target` visible to its sections,
     /// which [`section_frame`] reads to scroll to and pulse a section a search jumped to.
     pub(super) fn with_section_target<R>(&mut self, build: impl FnOnce(&mut Self) -> R, t: &Tokens) -> R {
-        let target = self.settings_ui.target.clone().map(|id| SectionTarget {
+        with_target(self.section_target(t), || build(self))
+    }
+
+    /// The search jump in progress, as a page's sections see it.
+    pub(super) fn section_target(&self, t: &Tokens) -> Option<SectionTarget> {
+        self.settings_ui.target.clone().map(|id| SectionTarget {
             id,
             jumps: self.settings_ui.jumps,
             pending: self.settings_ui.scroll_pending.clone(),
             scroll: self.settings_ui.scroll.clone(),
             tokens: *t,
-        });
-        let previous = SECTION_TARGET.replace(target);
-        let built = build(self);
-        SECTION_TARGET.set(previous);
-        built
+        })
     }
 
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
