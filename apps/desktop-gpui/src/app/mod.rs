@@ -816,8 +816,7 @@ impl Workspace {
     /// Electron always opens the index route, which starts a draft in the most
     /// recently active project (`IndexDraftLanding`); this is that landing.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let primary_sequence = self.primary_environment().map_or(0, |id| self.shell.sequence(id));
-        if self.landed || primary_sequence == 0 {
+        if self.landed || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
             return;
         }
         self.landed = true;

@@ -1055,12 +1055,19 @@ struct ShellCursor {
     live: bool,
     /// A full snapshot failed to decode, so deltas wait for the next one.
     needs_snapshot: bool,
+    /// A full snapshot was applied; a fresh environment's is valid at sequence 0.
+    has_snapshot: bool,
 }
 
 impl ShellState {
     /// The last applied sequence of one environment's subscription, 0 before its snapshot.
     pub fn sequence(&self, environment_id: &str) -> u64 {
         self.cursors.get(environment_id).map_or(0, |cursor| cursor.sequence)
+    }
+
+    /// `environmentShell.hasSnapshotAtom`: the environment's shell snapshot arrived.
+    pub fn has_snapshot(&self, environment_id: &str) -> bool {
+        self.cursors.get(environment_id).is_some_and(|cursor| cursor.has_snapshot)
     }
 
     /// Some environment's subscription caught up with its server.
@@ -1156,6 +1163,7 @@ impl ShellState {
                         self.threads.extend(threads);
                         cursor.sequence = snapshot.snapshot_sequence;
                         cursor.needs_snapshot = false;
+                        cursor.has_snapshot = true;
                     }
                 }
             }
@@ -2274,6 +2282,20 @@ mod tests {
         assert_eq!(ids, ["t2", "t3", "t4"]);
         shell.remove_environment("env-b");
         assert_eq!((shell.projects.len(), shell.threads.len(), shell.sequence("env-b")), (1, 1, 0));
+        assert!(!shell.has_snapshot("env-b"));
+    }
+
+    #[test]
+    fn a_fresh_environments_empty_snapshot_at_sequence_zero_counts_as_received() {
+        let mut shell = ShellState::default();
+        assert!(!shell.has_snapshot(ENV));
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"snapshot","snapshot":{"snapshotSequence":0,"projects":[],"threads":[]}}),
+            )
+            .unwrap();
+        assert!(shell.has_snapshot(ENV));
     }
 
     fn item(id: &str, item_type: &str, run_id: &str, ordinal: i64) -> Value {

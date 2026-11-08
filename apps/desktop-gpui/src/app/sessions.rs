@@ -132,7 +132,7 @@ impl Workspace {
         let state = &saved.session(environment)?.state;
         let muted = |text: &str| Some((SharedString::from(text.to_owned()), tokens.muted_foreground));
         match state.presented() {
-            Presented::Connected if self.shell.sequence(environment) > 0 => None,
+            Presented::Connected if self.shell.has_snapshot(environment) => None,
             Presented::Connected => muted("Syncing…"),
             Presented::Available => None,
             Presented::Connecting => muted("Connecting…"),
@@ -491,7 +491,7 @@ impl Workspace {
     /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is
     /// offline; the primary counts only once its id is known.
     pub(super) fn shells_bootstrapped(&self) -> bool {
-        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.sequence(id) > 0 || !s.is_connected()))
+        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.has_snapshot(id) || !s.is_connected()))
     }
 
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.

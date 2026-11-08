@@ -646,7 +646,7 @@ This permanently clears its conversation history."
                     ),
             );
         let body = match (shell, self.side_chat.view.as_ref()) {
-            (None, _) if self.active_environment().is_some_and(|id| self.shell.sequence(id) > 0) => div()
+            (None, _) if self.active_environment().is_some_and(|id| self.shell.has_snapshot(id)) => div()
                 .p_3()
                 .text_xs()
                 .text_color(t.muted_foreground)
