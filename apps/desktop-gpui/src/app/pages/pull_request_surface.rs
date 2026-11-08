@@ -66,6 +66,7 @@ impl Workspace {
         if self.pull_requests.panel.as_ref().is_none_or(|panel| panel.reference() != reference) {
             let seed = self.pull_requests.entry_for(reference);
             self.open_pull_request_panel(reference.clone(), seed, cx);
+            self.follow_pull_requests(cx);
         }
         let thread = self.open_thread_shell().map(|shell| PanelThread {
             id: shell.id.clone(),

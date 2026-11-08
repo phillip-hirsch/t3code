@@ -70,9 +70,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The panel is on screen: beside the Pull requests list, or as a thread's Pull request surface.
+    fn pr_panel_on_screen(&self) -> bool {
+        self.page == Some(super::super::Page::PullRequests)
+            || matches!(self.active_surface(), Some(super::super::super::right_panel::Surface::PullRequest(_)))
+    }
+
     /// Reads the shown pull request again in place, as a refresh from the host's side does;
     /// a refresh from one environment's host touches only a pull request on that environment.
     fn refresh_pr_in_place(&mut self, environment: Option<&str>, cx: &mut Context<Self>) {
+        if !self.pr_panel_on_screen() {
+            return;
+        }
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         if panel.detail.is_none() || panel.detail_loading {
             return;
@@ -86,17 +95,20 @@ impl Workspace {
         self.refresh_pr_code(cx);
     }
 
-    /// Starts following the hosts once the page opens: turn refreshes as they happen, and a slow
-    /// read while the app is in front. Neither repaints anything until an answer lands.
+    /// Starts following the hosts once the page or a thread's Pull request surface opens: turn
+    /// refreshes as they happen, and a slow read of what is on screen while the app is in front.
+    /// Neither repaints anything until an answer lands.
     pub(in crate::app) fn follow_pull_requests(&mut self, cx: &mut Context<Self>) {
         if self.pull_requests._live_interval.is_none() {
             self.pull_requests._live_interval = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(LIVE_REFRESH).await;
                     let alive = this.update(cx, |this, cx| {
-                        if cx.active_window().is_some() && this.page == Some(super::super::Page::PullRequests) {
+                        if cx.active_window().is_some() {
                             this.refresh_pr_in_place(None, cx);
-                            this.live_refresh_pull_requests(cx);
+                            if this.page == Some(super::super::Page::PullRequests) {
+                                this.live_refresh_pull_requests(cx);
+                            }
                         }
                     });
                     if alive.is_err() {
