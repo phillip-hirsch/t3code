@@ -137,6 +137,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
     pub(super) _live_interval: Option<Task<()>>,
+    /// This connection's `source-control:write` per environment, `None` until its session answers.
+    pub(super) write_grants: std::collections::HashMap<SharedString, (Option<bool>, Task<()>)>,
     /// The detail read for a row the pointer rested on, so opening it paints from it, and the
     /// read in flight for the row it rests on now (`usePullRequestIntentPrefetch`).
     prefetched: Option<(String, Rc<crate::pull_request_detail::Detail>, Instant)>,
@@ -198,6 +200,7 @@ impl PullRequestsState {
             panel_width: None,
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
+            write_grants: std::collections::HashMap::new(),
             prefetched: None,
             prefetch: None,
             facet_search: None,

@@ -445,6 +445,22 @@ pub fn can(detail: &Detail, action: &str) -> bool {
         && detail.viewer_permissions.actions.iter().any(|a| a == action)
 }
 
+/// `usePullRequestDetail` without the connection's `source-control:write`: the reader can look
+/// at the pull request but not act on it.
+pub fn read_only(mut detail: Detail) -> Detail {
+    detail.capabilities.reactions = Some(false);
+    detail.capabilities.edit = Some(EditCapabilities { change_request: false, comment: false, maintainer_edits: None });
+    let permissions = &mut detail.viewer_permissions;
+    permissions.actions.clear();
+    permissions.comment = false;
+    permissions.resolve = false;
+    permissions.verdicts.clear();
+    permissions.request_reviewers = false;
+    permissions.update_methods.clear();
+    permissions.labels = Some(false);
+    detail
+}
+
 fn same_login(a: Option<&str>, b: Option<&str>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
 }
@@ -2093,6 +2109,21 @@ mod tests {
         assert!(actions.merge_now && actions.disable_auto_merge);
         let unsupported = detail(json!({}));
         assert_eq!(StackMerge::of(&unsupported, false, false, true).blocked_reason(), None);
+    }
+
+    #[test]
+    fn a_connection_without_write_access_reads_but_cannot_act() {
+        let open = read_only(detail(json!({"capabilities": {"actions": ["merge", "close"], "mergeMethods": ["merge"],
+            "reactions": true, "edit": {"changeRequest": true, "comment": true, "maintainerEdits": true}},
+            "viewerPermissions": {"actions": ["merge", "close"], "verdicts": ["approve"], "updateMethods": ["merge"]},
+            "maintainerCanModify": true})));
+        assert!(!can(&open, "merge") && !can(&open, "close"));
+        assert_eq!(primary_control(&open, None, StackMerge::default()), None);
+        assert!(!can_edit_change_request(&open) && !can_edit_maintainer_edits(&open));
+        let permissions = &open.viewer_permissions;
+        assert!(!permissions.comment && !permissions.resolve && !permissions.request_reviewers);
+        assert!(permissions.verdicts.is_empty() && permissions.update_methods.is_empty());
+        assert_eq!((permissions.labels, open.capabilities.reactions), (Some(false), Some(false)));
     }
 
     #[test]

@@ -296,6 +296,8 @@ impl Workspace {
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
+        self.check_pr_write_grant(&reference.project_id, cx);
+        let writable = self.pr_write_grant(&reference.project_id) == Some(true);
         let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
             return;
@@ -304,7 +306,7 @@ impl Workspace {
             // Paints from the detail the row's prefetch read; the rest is read as on a first answer.
             Some(detail) => {
                 if let Some(panel) = self.pull_requests.panel.as_mut() {
-                    panel.detail = Some(detail);
+                    panel.detail = Some(if writable { detail } else { Rc::new(logic::read_only((*detail).clone())) });
                     panel.rebuild_timeline();
                 }
                 self.read_pr_reads_of(&key, false, cx);
@@ -349,6 +351,56 @@ impl Workspace {
         let seed = self.pull_requests.entry_for(&reference);
         self.open_pull_request_panel(reference, seed, cx);
         true
+    }
+
+    /// The connection's `source-control:write` on the pull request's environment
+    /// (`useEnvironmentScope`); `None` while its session check runs.
+    fn pr_write_grant(&self, project_id: &str) -> Option<bool> {
+        self.pull_requests.write_grants.get(&self.project_environment(project_id)?)?.0
+    }
+
+    /// The pull request `key` names may be acted on.
+    fn pr_panel_writable(&self, key: &str) -> bool {
+        self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference.project_id) == Some(true))
+    }
+
+    /// Asks the pull request's environment, once, what this connection may do there.
+    fn check_pr_write_grant(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(environment) = self.project_environment(project_id) else { return };
+        if self.pull_requests.write_grants.contains_key(&environment) {
+            return;
+        }
+        let Some(endpoint) = self.env_endpoint(&environment).cloned() else { return };
+        let answered = environment.clone();
+        let task = super::settings::check_source_control_write(endpoint, cx, move |this: &mut Self, grant, cx| {
+            this.apply_pr_write_grant(&answered, grant, cx);
+        });
+        self.pull_requests.write_grants.insert(environment, (None, task));
+    }
+
+    /// A newly granted environment reads its pull requests again; one that grants nothing shows
+    /// them read-only.
+    fn apply_pr_write_grant(&mut self, environment: &SharedString, grant: Option<bool>, cx: &mut Context<Self>) {
+        let Some(entry) = self.pull_requests.write_grants.get_mut(environment) else { return };
+        let before = std::mem::replace(&mut entry.0, grant);
+        let keys: Vec<String> = self
+            .pull_requests
+            .panel
+            .iter()
+            .chain(self.pull_requests.parked.values())
+            .filter(|p| p.detail.is_some())
+            .filter(|p| self.project_environment(&p.reference.project_id).as_ref() == Some(environment))
+            .map(|p| p.reference.key())
+            .collect();
+        for key in keys {
+            if grant == Some(true) {
+                if before != Some(true) {
+                    self.read_pr_detail_of(&key, cx);
+                }
+            } else if let Some(panel) = self.pr_panel(&key) {
+                panel.detail = panel.detail.take().map(|d| Rc::new(logic::read_only((*d).clone())));
+            }
+        }
     }
 
     /// The open pull request `key` names, shown or parked in its tab, for an answer to land in.
@@ -415,6 +467,7 @@ impl Workspace {
             cx.spawn(async move |this, cx| {
                 let result = detail_client.request("pullRequests.detail", detail_input).await;
                 let _ = this.update(cx, |this, cx| {
+                    let writable = this.pr_panel_writable(&detail_key);
                     let Some(panel) = this.pr_panel(&detail_key) else { return };
                     panel.detail_loading = false;
                     let (mut first, mut landed) = (false, false);
@@ -422,7 +475,7 @@ impl Workspace {
                         Ok(Ok(detail)) => {
                             first = panel.detail.is_none();
                             landed = true;
-                            panel.detail = Some(Rc::new(detail));
+                            panel.detail = Some(Rc::new(if writable { detail } else { logic::read_only(detail) }));
                             panel.detail_error = None;
                             panel.maintainer_choice = None;
                         }
@@ -542,6 +595,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.pull_request_client_of(key) else { return };
+        if !self.pr_panel_writable(key) {
+            return;
+        }
         let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
