@@ -2278,7 +2278,7 @@ impl Workspace {
                 TimelineRow::Comments(events) => conversation_group(events, &toggled, &view, now, &t, window, cx),
                 TimelineRow::Event(event) => match (&event.thread, event.kind) {
                     (Some(_), _) => thread_event(event, &toggled, &view, now, &t, window, cx),
-                    (None, EventKind::Commit) => commit_event(event, now, &t),
+                    (None, EventKind::Commit) => commit_event(event, &view, now, &t),
                     (None, EventKind::Opened | EventKind::Merged | EventKind::Closed) => {
                         lifecycle_event(event, term, now, &t)
                     }
@@ -3257,11 +3257,24 @@ fn thread_event(
         .into_any_element()
 }
 
-fn commit_event(event: &Event, now: i64, t: &Tokens) -> AnyElement {
-    div()
+/// `CommitEvent`: opens the commit's diff in Code.
+fn commit_event(event: &Event, view: &Entity<Workspace>, now: i64, t: &Tokens) -> AnyElement {
+    let (oid, view, ring, primary) = (event.id.clone(), view.clone(), t.ring, t.primary);
+    let group: SharedString = format!("pr-commit:{}", event.id).into();
+    gpui_kit::base::Button::new(ElementId::Name(group.clone()))
+        .group(group.clone())
+        .accessibility_label(format!("View commit {}", event.id))
+        .focus_visible(move |s| {
+            s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
+        })
+        .block()
+        .w_full()
+        .rounded(px(2.))
+        .cursor_pointer()
         .relative()
         .mb(px(20.))
         .pl(px(48.))
+        .on_click(move |_, _, cx| view.update(cx, |this, cx| this.open_pr_commit(oid.clone(), cx)))
         .child(actor_marker(event.commit_authors.first(), Lucide::GitCommitHorizontal, false, None, t))
         .child(
             h_flex()
@@ -3278,6 +3291,7 @@ fn commit_event(event: &Event, now: i64, t: &Tokens) -> AnyElement {
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(t.foreground)
+                                .group_hover(group, move |s| s.text_color(primary))
                                 .child(event.body.clone().unwrap_or_else(|| "Untitled commit".into())),
                         )
                         .child(

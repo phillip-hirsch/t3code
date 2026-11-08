@@ -395,6 +395,15 @@ impl Workspace {
         });
     }
 
+    /// A timeline commit: Code, scoped to that commit (`openCommit`).
+    pub(super) fn open_pr_commit(&mut self, oid: String, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.tab = Tab::Code;
+        self.open_pr_code(cx);
+        self.set_pr_code_commit(Some(oid), cx);
+        cx.notify();
+    }
+
     fn set_pr_code_commit(&mut self, commit: Option<String>, cx: &mut Context<Self>) {
         let Some(code) = self.pr_code() else { return };
         if code.commit == commit {
