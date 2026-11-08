@@ -237,3 +237,18 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
 `rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
+
+**A dropdown menu can be opened from code.** The web's `rightPanel.new` shortcut opens the
+panel's "+" menu. 0.9.0's `DropdownMenuPopover` opens only from its trigger. The patch adds
+`DropdownMenuPopover::open`, passed to the `Popover`'s controlled `open`; pair it with
+`on_open_change`. `src/menu/dropdown_menu.rs`.
+
+**A diff says which files are near the viewport, and pins the current file's header.** The web
+reads a large diff's patches as their headers come within 600px of the viewport, and its file
+headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
+
+- `DiffState::files_near_viewport`: the file indices with a row in the viewport or within a margin
+  below it, counting rows never laid out at the row height.
+- `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
+  scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
+  the next file's header as it arrives; a canvas records its height for the push.

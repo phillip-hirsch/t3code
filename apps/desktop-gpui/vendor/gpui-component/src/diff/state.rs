@@ -220,6 +220,8 @@ pub struct DiffState {
     file_rows: Vec<FileRows>,
     header_rows: Vec<usize>,
     rows: Rc<Vec<DisplayRow>>,
+    /// The pinned header's height as last painted.
+    sticky_height: Rc<std::cell::Cell<Pixels>>,
     change_rows: Vec<usize>,
     list: ListState,
     horizontal_scroll: ScrollHandle,
@@ -351,6 +353,7 @@ impl DiffState {
             file_rows: Vec::new(),
             header_rows: Vec::new(),
             rows: Rc::default(),
+            sticky_height: Rc::default(),
             change_rows: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(0.)),
             horizontal_scroll: ScrollHandle::new(),
@@ -600,6 +603,31 @@ impl DiffState {
     pub(crate) fn rows(&self) -> &Rc<Vec<DisplayRow>> {
         &self.rows
     }
+    pub(crate) fn sticky_height(&self) -> &Rc<std::cell::Cell<Pixels>> {
+        &self.sticky_height
+    }
+
+    /// The file whose header pins to the top once the list scrolls past the top of
+    /// that header (`stickyHeaders`), and how far up the next file's header pushes
+    /// it as it arrives.
+    pub(crate) fn sticky_header(&self) -> Option<(usize, Pixels)> {
+        let top = self.list.logical_scroll_top();
+        let file = self.rows.get(top.item_ix)?.file();
+        let header = *self.header_rows.get(file)?;
+        if top.item_ix == header && top.offset_in_item <= px(0.) {
+            return None;
+        }
+        let viewport = self.list.viewport_bounds();
+        let push = self
+            .header_rows
+            .get(file + 1)
+            .and_then(|next| self.list.bounds_for_item(*next))
+            .map_or(px(0.), |next| {
+                (next.top() - viewport.top() - self.sticky_height.get()).min(px(0.))
+            });
+        Some((file, push))
+    }
+
     pub(crate) fn list(&self) -> &ListState {
         &self.list
     }
