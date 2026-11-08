@@ -222,6 +222,36 @@ pub(super) fn normalize_open_path(requested: &str) -> String {
     if trimmed.is_empty() { requested.to_owned() } else { trimmed.to_owned() }
 }
 
+/// `taskListMarkerOffset` then `setMarkdownTaskChecked`: `markdown` with the task of the list
+/// item starting at byte `item_start` checked or cleared, or `None` when there is no task
+/// marker there or it already reads so.
+pub(super) fn set_markdown_task(markdown: &str, item_start: usize, checked: bool) -> Option<String> {
+    let line = markdown.get(item_start..)?.split('\n').next()?;
+    // `^\s*(?:[-+*]|\d+[.)])\s+\[[ xX]\]`
+    let rest = line.trim_start();
+    let rest = match rest.strip_prefix(['-', '+', '*']) {
+        Some(rest) => rest,
+        None => rest
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix(['.', ')'])
+            .filter(|_| rest.starts_with(|c: char| c.is_ascii_digit()))?,
+    };
+    let marker = rest.trim_start();
+    if marker.len() == rest.len() {
+        return None;
+    }
+    let state = marker.strip_prefix('[')?.chars().next().filter(|c| matches!(c, ' ' | 'x' | 'X'))?;
+    if !marker[2..].starts_with(']') || (state != ' ') == checked {
+        return None;
+    }
+    let offset = item_start + (line.len() - marker.len()) + 1;
+    let mut next = String::with_capacity(markdown.len());
+    next.push_str(&markdown[..offset]);
+    next.push(if checked { 'x' } else { ' ' });
+    next.push_str(&markdown[offset + 1..]);
+    Some(next)
+}
+
 /// `isMarkdownPreviewFile`.
 pub(super) fn is_markdown(path: &str) -> bool {
     let lower = path.to_lowercase();
@@ -612,6 +642,29 @@ pub(super) fn list_entries_input(cwd: &str, folder: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_checkboxes_toggle_their_own_marker() {
+        let text = "intro\n- [ ] one\n  2. [x] two\n* [X] three\n- plain [ ] not a task\n";
+        assert_eq!(
+            set_markdown_task(text, 6, true).as_deref(),
+            Some("intro\n- [x] one\n  2. [x] two\n* [X] three\n- plain [ ] not a task\n")
+        );
+        assert_eq!(
+            set_markdown_task(text, 16, false).as_deref(),
+            Some("intro\n- [ ] one\n  2. [ ] two\n* [X] three\n- plain [ ] not a task\n")
+        );
+        assert_eq!(
+            set_markdown_task(text, 29, false).as_deref(),
+            Some("intro\n- [ ] one\n  2. [x] two\n* [ ] three\n- plain [ ] not a task\n")
+        );
+        assert_eq!(set_markdown_task(text, 6, false), None, "already clear");
+        assert_eq!(set_markdown_task(text, 41, true), None, "a bracket later in the item is no task");
+        assert_eq!(set_markdown_task(text, 0, true), None, "not a list item");
+        assert_eq!(set_markdown_task("-[ ] x", 0, true), None, "the marker needs a space after it");
+        assert_eq!(set_markdown_task("1) [ ] x", 0, true).as_deref(), Some("1) [x] x"));
+        assert_eq!(set_markdown_task("- [ ] é", 99, true), None, "an offset past the end");
+    }
 
     #[test]
     fn the_root_listing_names_its_folder_so_ignored_entries_come_back() {

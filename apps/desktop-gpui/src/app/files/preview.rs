@@ -494,6 +494,24 @@ impl Workspace {
         }
     }
 
+    fn toggle_markdown_task(
+        &mut self,
+        key: &FileKey,
+        item_start: usize,
+        checked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.files.previews.get(key) else { return };
+        let (Some(editor), markdown) = (state.editor.clone(), state.markdown.clone()) else { return };
+        let Some(next) = logic::set_markdown_task(&editor.read(cx).value(), item_start, checked) else { return };
+        if let Some(markdown) = markdown {
+            markdown.update(cx, |view, cx| view.set_text(&next, cx));
+        }
+        editor.update(cx, |editor, cx| editor.set_value(next, window, cx));
+        self.change_file(key, cx);
+    }
+
     /// An environment's socket is back: its grants are asked again, and its files' unsaved
     /// edits write again once it may write, like the web's `subscribeWritable` recovery.
     pub(in crate::app) fn resume_file_saves(&mut self, env: &str, cx: &mut Context<Self>) {
@@ -966,6 +984,15 @@ impl Workspace {
                     let saved = state.saved.clone();
                     let view =
                         state.markdown.get_or_insert_with(|| cx.new(|cx| TextViewState::markdown(&saved, cx))).clone();
+                    // `onTaskListChange`: a task's checkbox edits the file, which saves as typing does.
+                    let toggle = (editable && !*truncated).then(|| {
+                        let (this, key) = (cx.entity().downgrade(), key.clone());
+                        move |item_start: usize, checked: bool, window: &mut Window, cx: &mut gpui_kit::App| {
+                            let _ = this.update(cx, |this, cx| {
+                                this.toggle_markdown_task(&key, item_start, checked, window, cx);
+                            });
+                        }
+                    });
                     return div()
                         .id("file-markdown")
                         .flex_1()
@@ -973,7 +1000,7 @@ impl Workspace {
                         .overflow_y_scroll()
                         .px(px(24.))
                         .py(px(16.))
-                        .child(TextView::new(&view))
+                        .child(TextView::new(&view).when_some(toggle, TextView::on_task_toggle))
                         .into_any_element();
                 }
                 let Some(editor) = state.editor.clone() else { return div().into_any_element() };
