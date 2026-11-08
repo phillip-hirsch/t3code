@@ -79,7 +79,9 @@ impl Workspace {
         let in_preview = self.preview_thread_id().map(str::to_owned);
         let thread_link = in_preview.as_deref().and_then(|thread_id| {
             let thread = self.shell_thread(thread_id)?;
-            let supported = self.env_info(&thread.environment_id).is_some_and(|info| info.capabilities.is_object());
+            let env = &thread.environment_id;
+            let supported =
+                self.can_operate(env) && self.env_info(env).is_some_and(|info| info.capabilities.is_object());
             Some((thread_id.to_owned(), pr_link_state(url, &thread.pull_requests).filter(|_| supported)?))
         });
         let view = cx.weak_entity();
@@ -117,6 +119,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let environment = self.thread_environment(thread_id);
+        if !environment.is_some_and(|environment| self.can_operate(&environment)) {
+            return;
+        }
         let (Some(client), Some(mut command)) =
             (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
         else {
