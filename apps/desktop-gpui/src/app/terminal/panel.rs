@@ -128,6 +128,7 @@ impl Workspace {
 
     /// Drops a closed terminal from its tab; the tab closes with its last terminal.
     pub(super) fn close_panel_terminal(&mut self, thread_id: &str, terminal_id: &str) {
+        let shown = self.shown_terminal_thread() == Some(thread_id);
         let mut emptied = Vec::new();
         for (surface, group) in self.terminals.panel.iter_mut().filter(|(_, g)| g.thread_id == thread_id) {
             let Some(index) = group.terminal_ids.iter().position(|id| id == terminal_id) else { continue };
@@ -137,7 +138,9 @@ impl Workspace {
                     if group.active == terminal_id {
                         group.active = next.clone();
                     }
-                    self.terminals.focus_pending = Some(group.active.clone());
+                    if shown {
+                        self.terminals.focus_pending = Some((thread_id.to_owned(), group.active.clone()));
+                    }
                 }
                 None => emptied.push(surface.clone()),
             }

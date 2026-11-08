@@ -112,7 +112,8 @@ pub(super) struct Terminals {
     summary_environments: HashMap<String, SharedString>,
     /// The id a draft's thread will launch with, so its terminals carry over.
     draft_threads: HashMap<String, String>,
-    focus_pending: Option<String>,
+    /// The terminal to focus once it mounts, by thread: another thread's request never lands.
+    focus_pending: Option<(String, String)>,
     /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
     pub(super) contexts: HashMap<String, Value>,
     /// Right-panel terminal tabs, by surface id.
@@ -188,6 +189,15 @@ impl Terminals {
     pub(super) fn restored() -> Self {
         let drawers = drawers_path().map(|path| read_drawers(&path)).unwrap_or_default();
         Self { persisted: stored_drawers(&drawers), drawers, ..Self::default() }
+    }
+
+    fn focus_later(&mut self, thread_id: &str, terminal_id: &str) {
+        self.focus_pending = Some((thread_id.to_owned(), terminal_id.to_owned()));
+    }
+
+    /// The pending focus when it is `thread_id`'s; another thread's is dropped.
+    fn take_focus(&mut self, thread_id: &str) -> Option<String> {
+        self.focus_pending.take().filter(|(pending, _)| pending == thread_id).map(|(_, terminal_id)| terminal_id)
     }
 
     fn drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
@@ -436,8 +446,8 @@ impl Workspace {
             // A setup or agent-started shell already runs: show it instead of starting another.
             match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
-                    self.terminals.drawer(thread_id).ensure(&id);
-                    self.terminals.focus_pending = Some(id);
+                    self.terminals.drawer(thread_id.clone()).ensure(&id);
+                    self.terminals.focus_later(&thread_id, &id);
                 }
                 // Without the grant the drawer opens on its empty state.
                 None if !self.terminal_operable(&thread_id) => {
@@ -447,7 +457,8 @@ impl Workspace {
             }
         } else {
             drawer.open = true;
-            self.terminals.focus_pending = Some(drawer.active_id.clone());
+            let active = drawer.active_id.clone();
+            self.terminals.focus_later(&thread_id, &active);
         }
         cx.notify();
     }
@@ -557,7 +568,7 @@ impl Workspace {
         let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
             return Task::ready(false);
         };
-        self.terminals.focus_pending = Some(terminal_id.clone());
+        self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
@@ -582,7 +593,7 @@ impl Workspace {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
         if let Some(drawer) = self.terminals.drawer_mut(&thread_id) {
             drawer.set_active(terminal_id);
-            self.terminals.focus_pending = Some(terminal_id.to_owned());
+            self.terminals.focus_later(&thread_id, terminal_id);
             cx.notify();
         }
     }
@@ -625,10 +636,13 @@ impl Workspace {
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
         self.close_panel_terminal(thread_id, terminal_id);
+        // Only a shown drawer hands focus on, as the web's `visible` guard does.
+        let shown = self.shown_terminal_thread() == Some(thread_id);
         if let Some(drawer) = self.terminals.drawer_mut(thread_id) {
             drawer.close(terminal_id);
-            if drawer.open {
-                self.terminals.focus_pending = Some(drawer.active_id.clone());
+            if drawer.open && shown {
+                let active = drawer.active_id.clone();
+                self.terminals.focus_later(thread_id, &active);
             }
         }
         if let Some(client) = self.thread_client(thread_id) {
@@ -719,7 +733,7 @@ impl Workspace {
         for pane in self.terminals.panes.values() {
             pane.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
         }
-        if let Some(pending) = self.terminals.focus_pending.take() {
+        if let Some(pending) = self.terminals.take_focus(&thread_id) {
             match self.terminals.panes.get(&pending) {
                 Some(pane) => {
                     let focus = pane.session.read(cx).focus.clone();
@@ -727,7 +741,7 @@ impl Workspace {
                 }
                 // Not mounted yet (another group or a closed drawer): keep the request.
                 None if shown.is_empty() => {}
-                None => self.terminals.focus_pending = Some(pending),
+                None => self.terminals.focus_later(&thread_id, &pending),
             }
         }
     }
@@ -1131,7 +1145,7 @@ impl Workspace {
             return;
         }
         self.activate_panel_terminal(thread_id, terminal_id, cx);
-        self.terminals.focus_pending = Some(terminal_id.to_owned());
+        self.terminals.focus_later(thread_id, terminal_id);
         cx.notify();
     }
 
@@ -1372,8 +1386,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.select_thread(thread_id.clone(), window, cx);
-        self.terminals.drawer(thread_id).ensure(&terminal_id);
-        self.terminals.focus_pending = Some(terminal_id);
+        self.terminals.drawer(thread_id.clone()).ensure(&terminal_id);
+        self.terminals.focus_later(&thread_id, &terminal_id);
         cx.notify();
     }
 }
@@ -1447,6 +1461,16 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn a_hidden_threads_focus_request_never_lands_on_the_shown_one() {
+        let mut terminals = Terminals::default();
+        terminals.focus_later("hidden", "term-2");
+        assert_eq!(terminals.take_focus("shown"), None);
+        assert_eq!(terminals.take_focus("hidden"), None, "dropped, not kept for later");
+        terminals.focus_later("shown", "term-2");
+        assert_eq!(terminals.take_focus("shown").as_deref(), Some("term-2"));
     }
 
     #[test]
