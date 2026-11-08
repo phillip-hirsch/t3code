@@ -293,7 +293,7 @@ impl Workspace {
             .child(card);
         let content = [
             providers.into_any_element(),
-            self.render_usage_limit_sources(window, cx),
+            self.render_usage_limit_sources(cx),
             self.render_providers_advanced(window, cx).into_any_element(),
         ];
         self.settings_page("providers", &view, content, cx)

@@ -1,9 +1,7 @@
 //! "Usage providers" on the Providers page (`UsageProviderSettings.tsx`):
-//! CLIProxyAPI hubs whose pooled quotas show beside the providers, and the
-//! macOS-only Cursor keychain switch. Adding a hub sends its management key
+//! CLIProxyAPI hubs whose pooled quotas show beside the providers. Adding a hub sends its management key
 //! once to the server's secret storage (`AddUsageLimitSourceDialog.tsx`).
 
-use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -53,44 +51,11 @@ fn source_id_from_url(url: &str, sources: &Map<String, Value>) -> String {
     id
 }
 
-/// Whether the Cursor switch is saving, kept with the section.
-#[derive(Default)]
-struct UsageSourcesState {
-    updating_cursor: bool,
-}
-
 impl Workspace {
-    pub(in crate::app) fn render_usage_limit_sources(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(in crate::app) fn render_usage_limit_sources(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let state =
-            window.use_keyed_state(self.settings_state_key("usage-sources"), cx, |_, _| UsageSourcesState::default());
         let sources = self.settings_info().settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
-        let cursor_enabled = self.settings_info().settings["cursorKeychainUsageEnabled"].as_bool() == Some(true);
-        let darwin = self.settings_info().platform_os.as_deref() == Some("darwin");
-        let updating = state.read(cx).updating_cursor;
-
         let mut rows = v_flex();
-        if darwin {
-            let state = state;
-            rows = rows.child(settings_row(
-                &t,
-                "Cursor account usage",
-                Some(div().child("Read your existing Cursor CLI login from macOS Keychain to show account history and monthly limits. macOS may ask you to allow access.").into_any_element()),
-                Some(
-                    Switch::new("cursor-keychain-usage")
-                        .checked(cursor_enabled)
-                        .disabled(updating)
-                        .on_change(cx.listener(move |this, enabled: &bool, _, cx| {
-                            this.set_cursor_usage(*enabled, state.clone(), cx);
-                        }))
-                        .into_any_element(),
-                ),
-            ));
-        }
         if sources.is_empty() {
             rows = rows.child(settings_row(&t, "No hubs configured.", None, None));
         }
@@ -144,29 +109,6 @@ impl Workspace {
             )
             .child(super::group(rows, true, &t))
             .into_any_element()
-    }
-
-    fn set_cursor_usage(&mut self, enabled: bool, state: Entity<UsageSourcesState>, cx: &mut Context<Self>) {
-        let Some(client) = self.settings_client() else { return };
-        state.update(cx, |state, cx| {
-            state.updating_cursor = true;
-            cx.notify();
-        });
-        cx.spawn(async move |this, cx| {
-            let saved = client
-                .request("server.updateSettings", json!({ "patch": { "cursorKeychainUsageEnabled": enabled } }))
-                .await;
-            if saved.is_ok() {
-                let _ = client.request("server.refreshProviders", json!({})).await;
-            }
-            let _ = this.update(cx, |_, cx| {
-                state.update(cx, |state, cx| {
-                    state.updating_cursor = false;
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
     }
 
     fn confirm_remove_hub(&mut self, id: String, label: String, window: &mut Window, cx: &mut Context<Self>) {

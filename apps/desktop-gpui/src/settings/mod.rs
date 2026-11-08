@@ -52,7 +52,6 @@ pub struct SearchItem {
     pub wsl_available_only: bool,
     pub managed_tunnel_only: bool,
     pub peer_links_only: bool,
-    pub mac_provider_settings_only: bool,
 }
 
 pub fn contract() -> &'static Contract {

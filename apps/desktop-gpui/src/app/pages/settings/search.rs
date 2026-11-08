@@ -51,15 +51,14 @@ pub(super) fn shipped() -> &'static [(&'static SearchItem, Indexed)] {
 pub(super) fn available(item: &SearchItem) -> bool {
     (!item.mac_only || cfg!(target_os = "macos"))
         && (!item.windows_only || cfg!(target_os = "windows"))
-        // Features the web gates on a hosted config, a local backend it manages, WSL, tunnels,
-        // peer links or a Mac environment are not offered by this client yet.
+        // Features the web gates on a hosted config, a local backend it manages, WSL, tunnels
+        // or peer links are not offered by this client yet.
         && (!item.secrets_feature_only || super::secrets_enabled())
         && !item.cloud_only
         && !item.local_backend_management_only
         && !item.wsl_available_only
         && !item.managed_tunnel_only
         && !item.peer_links_only
-        && !item.mac_provider_settings_only
         // Browser rows for surfaces this client doesn't have (see `browser.rs`).
         && !matches!(
             item.id.as_str(),
