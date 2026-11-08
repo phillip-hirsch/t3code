@@ -60,7 +60,7 @@ impl Visible {
 }
 
 /// `MenuRadioGroup`'s arrow keys: they loop past either end.
-fn step_highlight(highlight: Option<usize>, len: usize, down: bool) -> Option<usize> {
+pub(in crate::app::pages) fn step_highlight(highlight: Option<usize>, len: usize, down: bool) -> Option<usize> {
     if len == 0 {
         return None;
     }

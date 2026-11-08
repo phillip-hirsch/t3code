@@ -115,6 +115,18 @@ struct Picker {
     /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
     searches: HashMap<String, Result<Value, String>>,
     searching: HashSet<String>,
+    /// The candidate the arrow keys rest on, which Enter picks; the first after each keystroke.
+    highlight: Option<usize>,
+    scroll: ScrollHandle,
+}
+
+/// What the picker lists for what is typed: the matching candidates, whether a host search is
+/// in flight, its error, and a note on candidates left out.
+struct Matches {
+    candidates: Vec<Value>,
+    pending: bool,
+    error: Option<String>,
+    truncated: Option<String>,
 }
 
 #[derive(Default)]
@@ -1590,6 +1602,9 @@ impl Workspace {
                 if kind == PickerKind::Reviewers {
                     this.debounce_pr_reviewer_search(cx);
                 }
+                if let Some(picker) = this.pr_write().and_then(|w| w.picker.as_mut()) {
+                    picker.highlight = Some(0);
+                }
                 cx.notify();
             }
         });
@@ -1603,6 +1618,8 @@ impl Workspace {
                 _debounce: None,
                 searches: HashMap::new(),
                 searching: HashSet::new(),
+                highlight: Some(0),
+                scroll: ScrollHandle::new(),
             });
             write._watch.push(sub);
         }
@@ -1786,6 +1803,69 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn pr_picker_matches(&self, picker: &Picker, value: &Value, cx: &App) -> Matches {
+        let typed = picker.search.read(cx).value().to_string();
+        let query = typed.trim().to_lowercase();
+        if picker.kind == PickerKind::Reviewers {
+            let input = reviewer_search::SearchInput {
+                loaded: Some(value),
+                searchable: self.shown_pr_key().is_some_and(|key| self.pr_reviewers_searchable(&key)),
+                query: &typed,
+                debounced: &picker.debounced,
+            };
+            let search = reviewer_search::host_query(&input)
+                .and_then(|q| picker.searches.get(&q))
+                .map(|answer| answer.as_ref().map_err(String::as_str));
+            let view = reviewer_search::candidate_view(&input, search);
+            let error = view.candidates.is_empty().then(|| view.search_error.clone()).flatten();
+            let truncated = view.truncation.map(|why| why.label(view.search_error.as_deref()));
+            Matches { candidates: view.candidates, pending: view.search_pending, error, truncated }
+        } else {
+            let text = |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_lowercase();
+            let matching: Vec<Value> = value["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| {
+                    query.is_empty() || text(c, "name").contains(&query) || text(c, "description").contains(&query)
+                })
+                .cloned()
+                .collect();
+            let truncated = (value["truncated"].as_bool() == Some(true)).then(|| {
+                "This repository has more labels than are listed here. Apply the rest on the host.".to_owned()
+            });
+            Matches { candidates: matching, pending: false, error: None, truncated }
+        }
+    }
+
+    /// The combobox's keys: the arrows move the highlight, Enter picks the highlighted candidate.
+    fn pr_picker_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !matches!(key, "up" | "down" | "enter") {
+            return false;
+        }
+        let Some(picker) = self.pull_requests.panel.as_ref().and_then(|p| p.write.picker.as_ref()) else {
+            return false;
+        };
+        let Some(Ok(value)) = picker.candidates.as_ref() else { return true };
+        let matches = self.pr_picker_matches(picker, value, cx);
+        let (kind, highlight) = (picker.kind, picker.highlight.filter(|i| *i < matches.candidates.len()));
+        if key == "enter" {
+            if let Some(candidate) = highlight.and_then(|i| matches.candidates.get(i)).cloned() {
+                self.pick_pr_candidate(kind, candidate, window, cx);
+            }
+            return true;
+        }
+        let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()) else { return true };
+        picker.highlight =
+            super::super::pull_requests::facets::step_highlight(highlight, matches.candidates.len(), key == "down");
+        if let Some(index) = picker.highlight {
+            // A search in flight shows its "Loading..." row above the candidates.
+            picker.scroll.scroll_to_item(index + usize::from(matches.pending));
+        }
+        cx.notify();
+        true
+    }
+
     fn render_pr_picker_list(&self, picker: &Picker, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let reviewers = picker.kind == PickerKind::Reviewers;
         let typed = picker.search.read(cx).value().to_string();
@@ -1798,38 +1878,8 @@ impl Workspace {
             None => vec![note("Loading...".into())],
             Some(Err(error)) => vec![note(format!("{error_label} {error}"))],
             Some(Ok(value)) => {
-                let (matching, pending, error, truncated) = if reviewers {
-                    let input = reviewer_search::SearchInput {
-                        loaded: Some(value),
-                        searchable: self.shown_pr_key().is_some_and(|key| self.pr_reviewers_searchable(&key)),
-                        query: &typed,
-                        debounced: &picker.debounced,
-                    };
-                    let search = reviewer_search::host_query(&input)
-                        .and_then(|q| picker.searches.get(&q))
-                        .map(|answer| answer.as_ref().map_err(String::as_str));
-                    let view = reviewer_search::candidate_view(&input, search);
-                    let error = view.candidates.is_empty().then(|| view.search_error.clone()).flatten();
-                    let truncated = view.truncation.map(|why| why.label(view.search_error.as_deref()));
-                    (view.candidates, view.search_pending, error, truncated)
-                } else {
-                    let text = |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_lowercase();
-                    let matching: Vec<Value> = value["candidates"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|c| {
-                            query.is_empty()
-                                || text(c, "name").contains(&query)
-                                || text(c, "description").contains(&query)
-                        })
-                        .cloned()
-                        .collect();
-                    let truncated = (value["truncated"].as_bool() == Some(true)).then(|| {
-                        "This repository has more labels than are listed here. Apply the rest on the host.".to_owned()
-                    });
-                    (matching, false, None, truncated)
-                };
+                let Matches { candidates: matching, pending, error, truncated } =
+                    self.pr_picker_matches(picker, value, cx);
                 let mut rows: Vec<AnyElement> = Vec::new();
                 if pending {
                     rows.push(note("Loading...".into()));
@@ -1846,7 +1896,8 @@ impl Workspace {
                         .into(),
                     ));
                 }
-                for candidate in matching {
+                let highlight = picker.highlight.filter(|i| *i < matching.len());
+                for (index, candidate) in matching.into_iter().enumerate() {
                     let key = if reviewers {
                         format!(
                             "{}:{}",
@@ -1891,7 +1942,15 @@ impl Workspace {
                             .py(px(6.))
                             .rounded(px(4.))
                             .text_xs()
-                            .when(!busy, |el| el.cursor_pointer().hover(|s| s.bg(t.accent)))
+                            .when(!busy, gpui_kit::Styled::cursor_pointer)
+                            .when(highlight == Some(index), |el| el.bg(t.accent))
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                let Some(picker) = this.pr_write().and_then(|w| w.picker.as_mut()) else { return };
+                                if *hovered && picker.highlight != Some(index) {
+                                    picker.highlight = Some(index);
+                                    cx.notify();
+                                }
+                            }))
                             .child(content)
                             .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(14.))))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1905,8 +1964,21 @@ impl Workspace {
             }
         };
         v_flex()
+            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                if this.pr_picker_key(event.keystroke.key.as_str(), window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(div().p(px(8.)).border_b_1().border_color(t.border).child(Input::new(&picker.search).small()))
-            .child(v_flex().id("pr-candidates").max_h(px(288.)).overflow_y_scroll().p(px(4.)).children(rows))
+            .child(
+                v_flex()
+                    .id("pr-candidates")
+                    .max_h(px(288.))
+                    .overflow_y_scroll()
+                    .track_scroll(&picker.scroll)
+                    .p(px(4.))
+                    .children(rows),
+            )
             .into_any_element()
     }
 }

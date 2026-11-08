@@ -3,7 +3,7 @@
 //! `pullRequests.list` (plus `pullRequests.listStats` for diff sizes the listing leaves out),
 //! and Refresh asks the host again through `pullRequests.invalidate`.
 
-mod facets;
+pub(super) mod facets;
 mod row_popovers;
 use facets::FacetKind;
 use std::rc::Rc;
