@@ -3,7 +3,7 @@
 
 use url::Url;
 
-use crate::model::{ModelSelection, ProjectShell, Provider};
+use crate::model::{ModelSelection, ProjectShell, Provider, ThreadShell};
 
 /// `PROMPT_LINK_MAX_PROMPT_LENGTH`.
 const MAX_PROMPT_LENGTH: usize = 8_000;
@@ -288,6 +288,31 @@ pub fn find_projects<'a>(projects: &[&'a ProjectShell], repository: &Repository)
         .collect()
 }
 
+/// `findPromptLinkPullRequestThread`: the most recently updated listed thread linked to the
+/// pull request. Side chats inherit their parent's links but stay hidden.
+pub fn find_pull_request_thread<'a>(threads: &'a [ThreadShell], pull_request: &PullRequest) -> Option<&'a ThreadShell> {
+    let repository = format!("{}/{}", pull_request.repository.owner, pull_request.repository.name).to_lowercase();
+    let names = |host: &str, repo: &str, number: u64| {
+        host.eq_ignore_ascii_case("github.com") && repo.to_lowercase() == repository && number == pull_request.number
+    };
+    let linked = |thread: &ThreadShell| match &thread.linked_pull_request {
+        // `threadPullRequestsOf`: older payloads carry one legacy link.
+        Some(legacy) if thread.pull_requests.is_empty() => {
+            let host = Url::parse(&legacy.url).ok().and_then(|url| url.host_str().map(str::to_owned));
+            names(host.as_deref().unwrap_or_default(), &legacy.repository, legacy.number)
+        }
+        _ => crate::thread_pull_requests::visible(&thread.pull_requests)
+            .any(|link| names(&link.host, &link.repository, link.number)),
+    };
+    threads.iter().filter(|t| t.lineage.side_chat != Some(true) && linked(t)).fold(
+        None,
+        |latest, thread| match latest {
+            Some(latest) if thread.updated_at <= latest.updated_at => Some(latest),
+            _ => Some(thread),
+        },
+    )
+}
+
 /// `resolvePromptLinkModelSelection`: the first ready (else warning) enabled instance of the
 /// provider, with the named model or its default. `exact` is false when the model was not found.
 pub fn resolve_model(providers: &[Provider], provider: &str, model: Option<&str>) -> Option<(ModelSelection, bool)> {
@@ -444,6 +469,44 @@ mod tests {
         assert_eq!(pick(Some("gpt")), Some(("c2".into(), "m2".into(), false)));
         assert_eq!(pick(None), Some(("c2".into(), "m2".into(), true)));
         assert_eq!(resolve_model(&providers, "codex", None), None);
+    }
+
+    #[test]
+    fn a_pull_request_link_finds_the_latest_listed_thread_linked_to_it() {
+        let thread = |id: &str, updated_at: &str, extra: serde_json::Value| -> ThreadShell {
+            let mut value =
+                serde_json::json!({"id": id, "projectId": "p", "title": id, "status": "idle", "updatedAt": updated_at});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let link = |repository: &str, number: u64, source: &str| {
+            serde_json::json!({"host": "github.com", "repository": repository, "number": number,
+                "url": format!("https://github.com/{repository}/pull/{number}"), "source": source, "linkedAt": "2026-01-01T00:00:00Z"})
+        };
+        let threads = [
+            thread("old", "2026-01-01", serde_json::json!({"pullRequests": [link("Owner/Repo", 7, "manual")]})),
+            thread(
+                "legacy",
+                "2026-01-02",
+                serde_json::json!({"linkedPullRequest":
+                {"projectId": "p", "repository": "owner/repo", "number": 7, "url": "https://github.com/owner/repo/pull/7"}}),
+            ),
+            thread(
+                "side",
+                "2026-01-05",
+                serde_json::json!({"lineage": {"sideChat": true}, "pullRequests": [link("owner/repo", 7, "manual")]}),
+            ),
+            thread(
+                "dismissed",
+                "2026-01-04",
+                serde_json::json!({"pullRequests": [link("owner/repo", 7, "stack-dismissed")]}),
+            ),
+            thread("other", "2026-01-06", serde_json::json!({"pullRequests": [link("owner/repo", 8, "manual")]})),
+        ];
+        let pull_request = PullRequest { repository: repo("owner", "repo"), number: 7 };
+        assert_eq!(find_pull_request_thread(&threads, &pull_request).map(|t| t.id.as_str()), Some("legacy"));
+        assert_eq!(find_pull_request_thread(&threads[..1], &pull_request).map(|t| t.id.as_str()), Some("old"));
+        assert!(find_pull_request_thread(&threads[2..], &pull_request).is_none());
     }
 
     #[test]

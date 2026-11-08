@@ -195,8 +195,13 @@ impl Workspace {
         match &link {
             NewThreadLink::New { repository: None, .. } => self.open_scratch_draft(link, window, cx),
             NewThreadLink::New { repository: Some(repository), .. } => {
-                match links::find_projects(&recent, repository).first().map(|p| p.id.clone()) {
-                    Some(project_id) => self.open_link_draft(project_id, &link, None, window, cx),
+                match links::find_projects(&recent, repository)
+                    .first()
+                    .map(|p| (p.environment_id.clone(), p.id.clone()))
+                {
+                    Some((environment, project_id)) => {
+                        self.open_link_draft(environment, project_id, &link, None, window, cx);
+                    }
                     None => {
                         let repository = repository.clone();
                         self.show_link_page(LinkPage::MissingRepository { link, repository }, cx);
@@ -204,6 +209,11 @@ impl Workspace {
                 }
             }
             NewThreadLink::PullRequest { pull_request, .. } => {
+                if let Some(thread) = links::find_pull_request_thread(&self.shell.threads, pull_request) {
+                    let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
+                    self.open_link_thread(link, environment, thread_id, window, cx);
+                    return;
+                }
                 let found = links::find_projects(&recent, &pull_request.repository);
                 if found.is_empty() {
                     let repository = pull_request.repository.clone();
@@ -242,12 +252,7 @@ impl Workspace {
                         let NewThreadLink::PullRequest { pull_request, prompt } = &link else { return };
                         match found {
                             Some((environment, thread_id)) => {
-                                this.desktop.link_page = Some(LinkPage::Opened { link: link.clone() });
-                                let prompt = prompt.clone();
-                                this.select_thread_in(environment, thread_id, window, cx);
-                                if let Some(prompt) = prompt {
-                                    this.place_linked_prompt(prompt, Vec::new(), window, cx);
-                                }
+                                this.open_link_thread(link.clone(), environment, thread_id, window, cx);
                             }
                             None => {
                                 if let Some(prompt) = prompt {
@@ -270,10 +275,43 @@ impl Workspace {
         }
     }
 
+    /// The link's `thread` launch: the pull request's thread, with the link's prompt in its composer.
+    fn open_link_thread(
+        &mut self,
+        link: NewThreadLink,
+        environment: SharedString,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = match &link {
+            NewThreadLink::PullRequest { prompt, .. } => prompt.clone(),
+            NewThreadLink::New { prompt, .. } => Some(prompt.clone()),
+        };
+        self.desktop.link_page = Some(LinkPage::Opened { link });
+        self.select_thread_in(environment, thread_id, window, cx);
+        if let Some(prompt) = prompt {
+            self.place_linked_prompt(prompt, Vec::new(), window, cx);
+        }
+    }
+
     /// `openScratchDraft`: the "No project" workspace, with the pull request's URL when the
-    /// link names one.
+    /// link names one, on `scratchEnvironmentId(lastActiveEnvironmentId())`.
     fn open_scratch_draft(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client().filter(|_| self.server_info().scratch_workspace_root.is_some()) else {
+        let last_active = self
+            .shell
+            .threads
+            .iter()
+            .fold(None, |latest: Option<&crate::model::ThreadShell>, thread| match latest {
+                Some(latest) if thread.updated_at <= latest.updated_at => Some(latest),
+                _ => Some(thread),
+            })
+            .map(|thread| thread.environment_id.clone())
+            .or_else(|| self.primary_environment().cloned());
+        let environment = self.scratch_environment_from(last_active.as_deref());
+        let Some((environment, client)) =
+            environment.and_then(|environment| Some((environment.clone(), self.env_client(&environment)?)))
+        else {
             let message = "None of your machines can start a thread without a project right now.";
             self.show_link_page(
                 LinkPage::Failed { title: "Could not open the link".into(), message: message.into() },
@@ -291,7 +329,7 @@ impl Workspace {
                             NewThreadLink::PullRequest { pull_request, .. } => Some(pull_request.url()),
                             NewThreadLink::New { .. } => None,
                         };
-                        this.open_link_draft(project_id.to_owned(), &link, extra, window, cx);
+                        this.open_link_draft(environment, project_id.to_owned(), &link, extra, window, cx);
                     }
                     None => this.link_failed("T3 Code could not open a new thread.", cx),
                 },
@@ -310,6 +348,7 @@ impl Workspace {
     /// `openDraft`: a new thread in the project with the link's model and prompt.
     fn open_link_draft(
         &mut self,
+        environment: SharedString,
         project_id: String,
         link: &NewThreadLink,
         extra: Option<String>,
@@ -317,7 +356,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.desktop.link_page = Some(LinkPage::Opened { link: link.clone() });
-        self.start_draft(project_id, window, cx);
+        // A scratch project made just now may not be listed yet.
+        self.start_draft_in(environment, project_id, window, cx);
         let mut notes = Vec::new();
         if let NewThreadLink::New { provider: Some(provider), model, .. } = link {
             let resolved = links::resolve_model(&self.server_info().providers, provider, model.as_deref());
