@@ -528,7 +528,8 @@ impl Workspace {
     /// the menu; "Actions" when no script can be primary; "Add project script" with none at all.
     fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         use super::pages::settings::code::projects::scripts::{
-            ScriptInput, importable_scripts, resolve_project_scripts, script_icon,
+            ScriptInput, command_for_project_script, importable_scripts, resolve_project_scripts, script_icon,
+            shortcut_label_for_command,
         };
         let project = self.target_project()?;
         let project_id = project.id.clone();
@@ -564,18 +565,31 @@ impl Workspace {
         }
         let primary = primary_script(&saved, self.last_invoked_script(&project_id))
             .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)));
-        let scripts: Vec<(SharedString, ScriptRun)> = saved
+        let keybindings = self.server_info().keybindings_json();
+        let scripts: Vec<ScriptItem> = saved
             .iter()
-            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)))
+            .map(|script| ScriptItem {
+                label: project_script_menu_label(script).into(),
+                name: script.name.clone().into(),
+                icon: script.icon.clone(),
+                shortcut: shortcut_label_for_command(keybindings, command_for_project_script(&script.id).as_deref())
+                    .map(Into::into),
+                run: ScriptRun::new(&project_id, script),
+            })
             .collect();
         // `scriptItems`: the scripts, then the `t3.json` ones to import, then "Add project script".
         let view = cx.entity();
-        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            for (name, run) in &scripts {
-                let run = run.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).icon(icon("icons/play.svg")).on_click(
-                    window.listener_for(&view, move |this, _, window, cx| this.run_project_script(&run, window, cx)),
-                ));
+        let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            let popup = cx.entity();
+            for item in &scripts {
+                let run = item.run.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(script_item_row(item, &view, &popup))
+                        .icon(gpui_kit::component::Icon::new(script_icon(&item.icon)))
+                        .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                            this.run_project_script(&run, window, cx);
+                        })),
+                );
             }
             if !importable.is_empty() {
                 if !scripts.is_empty() {
@@ -1839,6 +1853,84 @@ pub(super) fn format_context_tokens(value: u64) -> String {
 }
 
 /// A project script's run from the details card.
+/// One saved script in the card's menu.
+struct ScriptItem {
+    label: SharedString,
+    name: SharedString,
+    icon: String,
+    shortcut: Option<SharedString>,
+    run: ScriptRun,
+}
+
+/// `projectScriptMenuLabel`: the name with its setup and settle roles.
+fn project_script_menu_label(script: &ProjectScript) -> String {
+    let roles: Vec<&str> =
+        [(script.run_on_worktree_create, "setup"), (script.run_on_settle == Some(true), "on settle")]
+            .into_iter()
+            .filter_map(|(on, role)| on.then_some(role))
+            .collect();
+    if roles.is_empty() { script.name.clone() } else { format!("{} ({})", script.name, roles.join(", ")) }
+}
+
+/// A script's menu row: the label, its shortcut, and on hover the "Edit {name}" settings button
+/// in the shortcut's place, which opens the script's editor instead of running it.
+fn script_item_row(
+    item: &ScriptItem,
+    view: &gpui_kit::Entity<Workspace>,
+    popup: &gpui_kit::Entity<PopupMenu>,
+) -> impl Fn(&mut Window, &mut App) -> AnyElement + 'static {
+    let (label, name, shortcut) = (item.label.clone(), item.name.clone(), item.shortcut.clone());
+    let (project_id, script_id) = (item.run.project_id.clone(), item.run.id.clone());
+    let (view, popup) = (view.clone(), popup.clone());
+    move |_, cx| {
+        let tokens = *theme::tokens(cx);
+        let group: SharedString = format!("details-script-{script_id}").into();
+        let (view, popup, project_id, script_id) = (view.clone(), popup.clone(), project_id.clone(), script_id.clone());
+        let tooltip: SharedString = format!("Edit {name}").into();
+        let edit = div()
+            .id(ElementId::Name(format!("{group}-edit").into()))
+            .absolute()
+            .right_0()
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .invisible()
+            .group_hover(group.clone(), gpui_kit::Styled::visible)
+            .hover(move |style| style.bg(tokens.accent))
+            .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Settings).size(px(14.)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                view.update(cx, |this, cx| this.open_project_script_editor(&project_id, Some(&script_id), window, cx));
+                popup.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
+            });
+        h_flex()
+            .w_full()
+            .gap_2()
+            .group(group.clone())
+            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+            .child(
+                h_flex()
+                    .relative()
+                    .flex_none()
+                    .h(px(24.))
+                    .min_w(px(24.))
+                    .justify_end()
+                    .children(shortcut.clone().map(|shortcut| {
+                        div()
+                            .text_xs()
+                            .text_color(tokens.muted_foreground)
+                            .group_hover(group.clone(), |style| style.opacity(0.))
+                            .child(shortcut)
+                    }))
+                    .child(edit),
+            )
+            .into_any_element()
+    }
+}
+
 #[derive(Clone)]
 struct ScriptRun {
     project_id: String,
