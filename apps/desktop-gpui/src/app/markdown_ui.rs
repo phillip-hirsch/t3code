@@ -251,7 +251,7 @@ pub(super) fn file_link_target(href: &str, cwd: Option<&str>) -> Option<String> 
 }
 
 /// The path without its `:line:column` (`splitFilePathPosition`).
-fn without_position(target: &str) -> &str {
+pub(super) fn without_position(target: &str) -> &str {
     let mut path = target;
     for _ in 0..2 {
         match path.rsplit_once(':') {
@@ -335,6 +335,18 @@ impl Workspace {
         })
     }
 
+    /// `onOpenInBrowser`: an HTML or PDF file of a thread, which has the integrated browser.
+    fn can_open_file_in_browser(&self, target: &str) -> bool {
+        self.preview_thread_id().is_some() && is_browser_preview_file(without_position(target))
+    }
+
+    /// A file link's click: a PDF opens in the integrated browser unless the platform modifier
+    /// asks for the editor (`shouldUseMarkdownFileBrowserPrimaryAction`).
+    pub(super) fn opens_file_link_in_browser(&self, target: &str, editor: bool) -> bool {
+        let editor = editor && self.preferred_editor().is_some();
+        !editor && self.can_open_file_in_browser(target) && opens_in_browser_by_default(without_position(target))
+    }
+
     /// `showFileContextMenu`: open, reveal, and copy the relative or full path.
     pub(super) fn open_file_menu(
         &mut self,
@@ -353,6 +365,7 @@ impl Workspace {
             _ => "Open in editor".into(),
         };
         let can_open = self.preferred_editor().is_some();
+        let in_browser = self.can_open_file_in_browser(&target);
         let reveal = self.reveal_label();
         let view = cx.weak_entity();
         self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
@@ -360,6 +373,12 @@ impl Workspace {
                 let (view, target) = (view.clone(), target.clone());
                 menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(move |_, window, cx| {
                     let _ = view.update(cx, |w, cx| w.open_file_link(&target, window, cx));
+                }));
+            }
+            if in_browser {
+                let (view, path) = (view.clone(), without_position(&target).to_owned());
+                menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
+                    let _ = view.update(cx, |w, cx| w.open_host_file_in_browser(&path, window, cx));
                 }));
             }
             if let Some(label) = reveal {
@@ -411,6 +430,22 @@ fn pr_link_command(thread_id: &str, url: &str, linked: bool) -> Option<serde_jso
         json!({"type": "thread.pull-request.unlink", "threadId": thread_id, "host": host, "repository": repository,
             "number": number})
     })
+}
+
+/// The path without its query or fragment, lowercased.
+fn bare_path(path: &str) -> String {
+    path.split(['?', '#']).next().unwrap_or_default().to_lowercase()
+}
+
+/// `isBrowserPreviewFile`.
+fn is_browser_preview_file(path: &str) -> bool {
+    let path = bare_path(path);
+    [".html", ".htm", ".pdf"].iter().any(|ext| path.ends_with(ext))
+}
+
+/// `shouldOpenMarkdownFileLinkInBrowserByDefault`.
+fn opens_in_browser_by_default(path: &str) -> bool {
+    bare_path(path).ends_with(".pdf")
 }
 
 /// `resolveExternalWebLink`: only http(s) links get the menu.
@@ -765,6 +800,10 @@ impl Workspace {
     ) {
         let Some(target) = file_links::resolve_target(path, self.git_cwd().as_deref()) else { return };
         self.with_workspace_match(path, target, window, cx, move |this, target, window, cx| {
+            if this.opens_file_link_in_browser(&target, editor) {
+                this.open_host_file_in_browser(without_position(&target), window, cx);
+                return;
+            }
             let relative = workspace_relative(without_position(&target), this.git_cwd().as_deref());
             match relative {
                 Some(relative) if !editor && matches!(this.target, Some(super::Target::Thread { .. })) => {
@@ -1159,5 +1198,13 @@ mod tests {
             json!({"type": "thread.pull-request.unlink", "threadId": "t", "host": "gitlab.com", "repository": "g/p",
                 "number": 3})
         );
+    }
+
+    #[test]
+    fn pdfs_and_pages_open_in_the_integrated_browser() {
+        assert!(is_browser_preview_file("/r/docs/Guide.PDF") && is_browser_preview_file("/r/site/index.htm#top"));
+        assert!(!is_browser_preview_file("/r/a.md") && !is_browser_preview_file("/r/pdf"));
+        assert!(opens_in_browser_by_default("/r/a.pdf?page=2"));
+        assert!(!opens_in_browser_by_default("/r/index.html"), "a page opens in the panel first");
     }
 }

@@ -1613,6 +1613,7 @@ fn markdown_view(
                     .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
                 if let Some(target) = target {
                     let position = event.position();
+                    let secondary = event.modifiers().secondary(cx);
                     // A relative link may name a file by its basename alone (`findWorkspaceFileMatch`).
                     let authored = url.split(['?', '#']).next().unwrap_or_default().replace("%20", " ");
                     let _ = link_this.update(cx, |workspace, cx| {
@@ -1624,6 +1625,9 @@ fn markdown_view(
                             move |workspace, target, window, cx| {
                                 if right {
                                     workspace.open_file_menu(target, position, window, cx);
+                                } else if workspace.opens_file_link_in_browser(&target, secondary) {
+                                    let path = super::markdown_ui::without_position(&target).to_owned();
+                                    workspace.open_host_file_in_browser(&path, window, cx);
                                 } else {
                                     workspace.open_file_link(&target, window, cx);
                                 }
