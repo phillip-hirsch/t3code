@@ -10,6 +10,7 @@ mod provider_update;
 mod scope_store;
 mod search_results;
 mod selection;
+mod update_plan;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1753,19 +1754,13 @@ impl Workspace {
     }
 
     /// The footer's update control (`SidebarUpdatePill.tsx`): "update everything" while a
-    /// provider can be updated in one click (`isProviderUpdateCandidate`), else the desktop
+    /// provider on a connected machine can be updated in one click (`useProviderUpdates`), else the desktop
     /// app's "Check for updates", which this build always shows as unavailable since it has
     /// no update feed (`getDesktopUpdateIdleTooltip`).
     fn render_update_button(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let candidates: Vec<(String, String)> = self
-            .server_info()
-            .providers
-            .iter()
-            .filter(|p| inbox::is_provider_update_candidate(p))
-            .map(|p| (p.driver.clone(), p.instance_id.clone()))
-            .collect();
+        let plan = self.provider_update_plan();
         let sb = tokens.sidebar;
-        if candidates.is_empty() {
+        if plan.is_empty() {
             let detail: SharedString = self.about_update_description().into();
             return div()
                 .id("sidebar-check-updates")
@@ -1791,12 +1786,8 @@ impl Workspace {
                 .child(icon(IconName::RefreshCw, 16., sb.icon))
                 .into_any_element();
         }
-        let label: SharedString = match candidates.len() {
-            1 => "Update 1 provider".into(),
-            n => format!("Update {n} providers").into(),
-        };
         let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
-        let tip = label.clone();
+        let tip = Self::provider_update_summary(&plan);
         keyboard_button(div().id("sidebar-update"), tokens.ring)
             .ml_auto()
             .size(px(32.))
@@ -1810,45 +1801,13 @@ impl Workspace {
             .hover(|s| s.bg(sb.row_hover))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.update_providers(label.clone(), candidates.clone(), window, cx);
+                this.confirm_provider_updates(plan.clone(), window, cx);
             }))
             .child(icon(IconName::CircleArrowUp, 16., sb.foreground))
             .into_any_element()
     }
 
     /// Confirms (`UpdateEverythingDialog`), then `server.updateProvider` for each candidate.
-    fn update_providers(
-        &mut self,
-        summary: SharedString,
-        candidates: Vec<(String, String)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.client() else { return };
-        let answer = window.prompt(
-            gpui_kit::PromptLevel::Info,
-            &format!("{summary}?"),
-            Some("Each provider updates to its latest version."),
-            &["Update", "Cancel"],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            for (driver, instance_id) in candidates {
-                let input = json!({"provider": driver, "instanceId": instance_id});
-                if let Err(error) = client.request("server.updateProvider", input).await {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(format!("Provider update failed: {error}").into());
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
     fn render_shelf_header(
         &self,
         shelf: Shelf,

@@ -78,7 +78,7 @@ fn provider_list(providers: &[&Provider]) -> String {
 }
 
 /// `dedupeProvidersByDriver`: per driver, the default instance, else the latest checked.
-fn dedupe_by_driver<'a>(providers: impl Iterator<Item = &'a Provider>) -> Vec<&'a Provider> {
+pub(super) fn dedupe_by_driver<'a>(providers: impl Iterator<Item = &'a Provider>) -> Vec<&'a Provider> {
     let mut by_driver: Vec<&Provider> = Vec::new();
     for provider in providers {
         match by_driver.iter_mut().find(|p| p.driver == provider.driver) {
