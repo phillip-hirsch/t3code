@@ -39,6 +39,8 @@ pub(super) struct ComposerUi {
     /// them until that changes.
     pub(super) footer_widths:
         std::cell::RefCell<Option<(super::composer::FooterText, super::composer_fit::ControlsWidths)>>,
+    /// The chip under the pointer and its window bounds, for its details tooltip.
+    pub(super) chip_hover: Option<(String, gpui_kit::Bounds<gpui_kit::Pixels>)>,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.
