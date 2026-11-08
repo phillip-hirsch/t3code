@@ -1,6 +1,7 @@
 //! The add/edit action dialog (`ProjectScriptEditorDialog` in `apps/web/src/components/projectScriptEditor.tsx`).
 //! Settings and the chat's "Add project script" both open it through
-//! [`Workspace::open_project_script_editor`]; it saves into the project's settings overrides.
+//! [`Workspace::open_project_script_editor`]; it saves into the project's settings overrides on
+//! the project's own environment.
 
 use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -58,8 +59,9 @@ impl Workspace {
         let initial = match script_id {
             None => ScriptInput::default(),
             Some(id) => {
-                match resolve_project_scripts(&self.settings_info().settings, project).iter().find(|s| s.id == id) {
-                    Some(script) => ScriptInput::from_script(script, self.settings_info().keybindings_json()),
+                let info = self.project_info(project);
+                match resolve_project_scripts(&info.settings, project).iter().find(|s| s.id == id) {
+                    Some(script) => ScriptInput::from_script(script, info.keybindings_json()),
                     None => return,
                 }
             }
@@ -78,7 +80,7 @@ impl Workspace {
     ) {
         let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
         let script_ids =
-            resolve_project_scripts(&self.settings_info().settings, project).into_iter().map(|s| s.id).collect();
+            resolve_project_scripts(&self.project_info(project).settings, project).into_iter().map(|s| s.id).collect();
         let workspace = cx.weak_entity();
         let editor =
             cx.new(|cx| ScriptEditor::new(workspace, project_id, script_id, script_ids, initial, error, window, cx));
