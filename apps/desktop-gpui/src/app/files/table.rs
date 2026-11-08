@@ -1,14 +1,15 @@
 //! CSV and TSV tables (`DelimitedTablePreview`, `LargeTextViewer`, `VirtualTablePreview.tsx`):
 //! the first row heads the columns, rows are numbered, and only the visible rows render.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px, uniform_list,
+    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ListAlignment, ListState,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, div, list, px,
 };
 
 use crate::app::Workspace;
@@ -45,6 +46,9 @@ pub(super) struct Table {
     columns: usize,
     /// The horizontal scroll, which picks the columns that render (the web's column window).
     scroll: ScrollHandle,
+    /// The rows, which grow to their wrapped cells; measured for the columns last in view.
+    list: ListState,
+    measured: RefCell<Range<usize>>,
 }
 
 /// The columns in view at horizontal `offset` (zero or negative), with one spare each side.
@@ -158,11 +162,12 @@ impl Table {
     pub(super) fn grid(rows: &[Vec<String>]) -> Self {
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         let rows = rows.iter().map(|row| row.iter().map(|c| SharedString::from(c.clone())).collect()).collect();
-        Self { header: Vec::new(), rows, columns, scroll: ScrollHandle::new() }
+        Self::new(Cells { header: Vec::new(), rows, columns })
     }
 
     pub(super) fn new(Cells { header, rows, columns }: Cells) -> Self {
-        Self { header, rows, columns, scroll: ScrollHandle::new() }
+        let list = ListState::new(rows.len(), ListAlignment::Top, px(300.)).with_uniform_item_height(px(ROW_HEIGHT));
+        Self { header, rows, columns, scroll: ScrollHandle::new(), list, measured: RefCell::new(0..0) }
     }
 
     pub(super) fn parse(text: &str, delimiter: char) -> Self {
@@ -191,6 +196,10 @@ impl Workspace {
         let table_width = (ROW_HEADER + column_width * table.columns as f32).max(width);
         let border = tokens.border;
         let visible = visible_columns(f32::from(table.scroll.offset().x), width, column_width, table.columns);
+        // A row is as tall as its tallest cell in view, so other columns measure it again.
+        if table.measured.replace(visible.clone()) != visible {
+            table.list.remeasure();
+        }
         let spacer = |columns: usize| div().flex_none().w(px(column_width * columns as f32));
         let header = h_flex()
             .flex_none()
@@ -214,48 +223,43 @@ impl Workspace {
                     .child(label)
             }));
         let rows = table.clone();
-        let scroll = table.scroll.clone();
-        let list = uniform_list(
-            ElementId::Name(format!("table:{id}").into()),
-            table.rows.len(),
-            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+        let list = list(
+            table.list.clone(),
+            cx.processor(move |_, index: usize, _, cx| {
                 let tokens = *crate::theme::tokens(cx);
-                let visible = visible_columns(f32::from(scroll.offset().x), width, column_width, rows.columns);
-                range
-                    .map(|index| {
-                        let row = &rows.rows[index];
-                        h_flex()
-                            .h(px(ROW_HEIGHT))
-                            .border_b_1()
-                            .border_color(tokens.border.opacity(0.6))
-                            .when(index % 2 == 1, |el| el.bg(tokens.muted.opacity(0.3)))
-                            .child(
-                                div()
-                                    .w(px(ROW_HEADER))
-                                    .h_full()
-                                    .flex_none()
-                                    .px(px(8.))
-                                    .py(px(6.))
-                                    .border_r_1()
-                                    .border_color(tokens.border)
-                                    .bg(tokens.background)
-                                    .text_right()
-                                    .text_color(tokens.muted_foreground)
-                                    .child(SharedString::from((index + 1).to_string())),
-                            )
-                            .child(div().flex_none().w(px(column_width * visible.start as f32)))
-                            .children(visible.clone().map(|column| {
-                                div()
-                                    .w(px(column_width))
-                                    .flex_none()
-                                    .px(px(12.))
-                                    .py(px(6.))
-                                    .truncate()
-                                    .child(row.get(column).cloned().unwrap_or_default())
-                            }))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>()
+                let visible = rows.measured.borrow().clone();
+                let row = &rows.rows[index];
+                div()
+                    .flex()
+                    .min_h(px(ROW_HEIGHT))
+                    .border_b_1()
+                    .border_color(tokens.border.opacity(0.6))
+                    .when(index % 2 == 1, |el| el.bg(tokens.muted.opacity(0.3)))
+                    .child(
+                        div()
+                            .w(px(ROW_HEADER))
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .border_r_1()
+                            .border_color(tokens.border)
+                            .bg(tokens.background)
+                            .text_right()
+                            .text_color(tokens.muted_foreground)
+                            .child(SharedString::from((index + 1).to_string())),
+                    )
+                    .child(div().flex_none().w(px(column_width * visible.start as f32)))
+                    .children(visible.map(|column| {
+                        div()
+                            .w(px(column_width))
+                            .flex_none()
+                            .px(px(12.))
+                            .py(px(6.))
+                            .border_r_1()
+                            .border_color(tokens.border.opacity(0.4))
+                            .child(row.get(column).cloned().unwrap_or_default())
+                    }))
+                    .into_any_element()
             }),
         )
         .flex_1();
