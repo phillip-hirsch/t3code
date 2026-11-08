@@ -371,8 +371,7 @@ impl Workspace {
         }
         if self.pr_review().is_some_and(|r| r.summary.is_none()) {
             let input = cx.new(|cx| TextareaState::new(window, cx).rows(3));
-            let sub =
-                watch(&input, Some(|this, window, cx| this.submit_pr_review_from_summary(window, cx)), window, cx);
+            let sub = watch(&input, Some(crate::app::Workspace::submit_pr_review_from_summary), window, cx);
             if let Some(review) = self.pr_review() {
                 review.summary = Some(input);
             }
@@ -1114,7 +1113,7 @@ impl Workspace {
                                         .disabled(pending || empty)
                                         .child("Reply")
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.send_pr_reply(&send, window, cx)
+                                            this.send_pr_reply(&send, window, cx);
                                         })),
                                 ),
                         )

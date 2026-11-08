@@ -1224,7 +1224,7 @@ impl Workspace {
         let view = cx.entity();
         let t = *t;
         let now = now_ms();
-        let selected = self.pull_request_panel_shown().then(|| self.pull_requests.panel.as_ref()).flatten();
+        let selected = self.pull_requests.panel.as_ref().filter(|_| self.pull_request_panel_shown());
         let selected = selected.map(|p| p.reference().clone());
         // Rows name their host once several answer, and their server once several are connected.
         let show_provider = self.pull_requests.list.as_ref().is_some_and(|l| l.providers.len() > 1);
