@@ -592,6 +592,9 @@ impl Workspace {
         } else {
             0.
         };
+        // `@4xl/usage-header` (56rem) on the header's content box, inside the border and `ps-5 pe-2`.
+        let panel = (f32::from(viewport.width) - 2. * padding).min(1280.);
+        let compact = panel - 2. - 28. < 896.;
         div()
             .id("usage-modal")
             .absolute()
@@ -617,7 +620,7 @@ impl Workspace {
                     .shadow_2xl()
                     .text_color(t.foreground)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_usage_header(&t, window, cx))
+                    .child(self.render_usage_header(&t, compact, window, cx))
                     .child(
                         div()
                             .id("usage-scroll")
@@ -641,7 +644,13 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_usage_header(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_usage_header(
+        &self,
+        t: &Tokens,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         let view = cx.entity();
@@ -774,7 +783,7 @@ impl Workspace {
             .child(provider_label)
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.6, ..t.muted_foreground }))
             .dropdown_menu({
-                let view = view;
+                let view = view.clone();
                 move |mut menu, window, _| {
                     let none_hidden = hidden.is_empty();
                     menu =
@@ -811,24 +820,21 @@ impl Workspace {
                 }
             });
 
-        let periods = segmented(
-            "usage-period",
-            logic::WINDOWS.iter().map(|(days, label)| (*days, *label)),
-            usage.days,
-            t,
-            window,
-            cx,
-            super::super::Workspace::select_usage_window,
-        );
-        let metrics = segmented(
-            "usage-metric",
-            logic::METRICS.iter().map(|(value, label)| (*value, *label)),
-            usage.metric,
-            t,
-            window,
-            cx,
-            super::super::Workspace::select_usage_metric,
-        );
+        let periods = logic::WINDOWS.iter().map(|(days, label)| (*days, *label));
+        let metrics = logic::METRICS.iter().map(|(value, label)| (*value, *label));
+        let (periods, metrics) = if compact {
+            // Below 56rem the groups fold into compact selects.
+            let period = compact_select("usage-period", periods, usage.days, t, &view, Workspace::select_usage_window);
+            let metric =
+                compact_select("usage-metric", metrics, usage.metric, t, &view, Workspace::select_usage_metric);
+            (period.into_any_element(), metric.into_any_element())
+        } else {
+            let pick_period = Workspace::select_usage_window;
+            let period = segmented("usage-period", periods, usage.days, t, window, cx, pick_period);
+            let metric =
+                segmented("usage-metric", metrics, usage.metric, t, window, cx, Workspace::select_usage_metric);
+            (period.into_any_element(), metric.into_any_element())
+        };
         let disabled = usage.refreshing || (!limits && selected.is_empty());
         h_flex()
             .min_h(px(48.))
@@ -852,12 +858,17 @@ impl Workspace {
                     .child(provider_filter),
             )
             .child(
-                h_flex().flex_none().gap(px(8.)).when(!limits, |el| el.child(periods)).child(metrics).child(
-                    ghost_icon_button("usage-refresh", Lucide::RefreshCw, 14., t)
-                        .disabled(disabled)
-                        .tooltip(if limits { "Refresh limits" } else { "Refresh usage" })
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(cx))),
-                ),
+                h_flex()
+                    .flex_none()
+                    .gap(px(if compact { 4. } else { 8. }))
+                    .when(!limits, |el| el.child(periods))
+                    .child(metrics)
+                    .child(
+                        ghost_icon_button("usage-refresh", Lucide::RefreshCw, 14., t)
+                            .disabled(disabled)
+                            .tooltip(if limits { "Refresh limits" } else { "Refresh usage" })
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(cx))),
+                    ),
             )
             .child(
                 ghost_icon_button("usage-close", Lucide::X, 16., t)
@@ -1691,6 +1702,43 @@ fn inline_menu_button(id: &'static str, t: &Tokens) -> Button {
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.muted_foreground)
+}
+
+/// `Select` with a compact ghost `SelectTrigger`: the picked option's label over a menu of the options.
+fn compact_select<V: Copy + PartialEq + 'static>(
+    id: &'static str,
+    options: impl Iterator<Item = (V, &'static str)>,
+    current: V,
+    t: &Tokens,
+    view: &gpui_kit::Entity<Workspace>,
+    pick: fn(&mut Workspace, V, &mut Context<Workspace>),
+) -> impl IntoElement {
+    let options: Vec<(V, &'static str)> = options.collect();
+    let label = options.iter().find(|(value, _)| *value == current).map_or("", |(_, label)| *label);
+    let view = view.clone();
+    Button::new(id)
+        .ghost()
+        .small()
+        .h(px(28.))
+        .px(px(7.))
+        .gap(px(4.))
+        .rounded(px(6.))
+        .text_xs()
+        .text_color(t.sidebar.secondary_label)
+        .child(label)
+        .child(
+            Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.7, ..t.sidebar.secondary_label }),
+        )
+        .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, _| {
+            options.iter().fold(menu, |menu, (value, label)| {
+                let value = *value;
+                menu.item(
+                    PopupMenuItem::new(*label)
+                        .checked(value == current)
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| pick(this, value, cx))),
+                )
+            })
+        })
 }
 
 fn ghost_icon_button(id: &'static str, icon: Lucide, size: f32, t: &Tokens) -> Button {
