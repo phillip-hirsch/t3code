@@ -373,9 +373,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let t = *tokens(cx);
         let days = view.value("sidebarAutoSettleAfterDays").as_i64();
-        let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false, &t).on_click(cx.listener(
+        let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false).on_click(cx.listener(
             move |this, _, window, cx| {
                 let days = days.is_none().then_some(AUTO_SETTLE_DEFAULT_DAYS);
                 this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx);

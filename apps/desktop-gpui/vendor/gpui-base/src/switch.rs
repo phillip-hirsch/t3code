@@ -25,6 +25,7 @@ pub struct Switch {
     style: StyleRefinement,
     semantic_styles: SwitchStyles,
     checked: bool,
+    mixed: bool,
     disabled: bool,
     children: SmallVec<[AnyElement; 2]>,
     on_change: Option<ChangeHandler>,
@@ -249,6 +250,7 @@ impl Switch {
             style: StyleRefinement::default(),
             semantic_styles: SwitchStyles::default(),
             checked: false,
+            mixed: false,
             disabled: false,
             children: SmallVec::new(),
             on_change: None,
@@ -262,6 +264,12 @@ impl Switch {
     /// Sets the application-controlled checked value.
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    /// Reports the switch as neither on nor off (`aria-checked="mixed"`).
+    pub fn mixed(mut self, mixed: bool) -> Self {
+        self.mixed = mixed;
         self
     }
 
@@ -365,7 +373,9 @@ impl RenderOnce for Switch {
         self.base
             .test_support()
             .role(Role::Switch)
-            .aria_toggled(if checked {
+            .aria_toggled(if self.mixed {
+                Toggled::Mixed
+            } else if checked {
                 Toggled::True
             } else {
                 Toggled::False

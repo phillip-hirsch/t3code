@@ -1030,15 +1030,22 @@ impl ThemeEditor {
                             .gap(px(8.))
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .cursor_pointer()
-                            .child("Advanced")
-                            .child(super::pages::settings::widgets::switch(
-                                &"theme-editor-advanced".into(),
-                                advanced,
-                                false,
-                                t,
+                            // A `<label>`: its text toggles the switch too.
+                            .child(div().id("theme-editor-advanced-label").cursor_pointer().child("Advanced").on_click(
+                                cx.listener(move |this, _, window, cx| this.set_advanced(!advanced, window, cx)),
                             ))
-                            .on_click(cx.listener(move |this, _, window, cx| this.set_advanced(!advanced, window, cx))),
+                            .child(
+                                super::pages::settings::widgets::switch(
+                                    &"theme-editor-advanced".into(),
+                                    advanced,
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, next: &bool, window, cx| {
+                                        this.set_advanced(*next, window, cx);
+                                    },
+                                )),
+                            ),
                     ),
             );
         let fields: AnyElement = if advanced {

@@ -61,12 +61,13 @@ impl Workspace {
         let (enabled, editable) = (saved.local_environment_enabled(), saved.editable());
         let saved = self.saved_environments.downgrade();
         // Until the catalog is read it is neither on nor off.
-        let toggle = switch(&"local-environment".into(), enabled.unwrap_or(true), enabled.is_none(), t);
+        let toggle = switch(&"local-environment".into(), enabled.unwrap_or(true), enabled.is_none())
+            .accessibility_label("Local environment");
         let toggle = match enabled.filter(|_| editable) {
             Some(enabled) => {
                 toggle.on_click(move |_, window, cx| confirm_local_environment(saved.clone(), enabled, window, cx))
             }
-            None => toggle.cursor_default().opacity(0.5),
+            None => toggle.disabled(true),
         };
         let description = if enabled.unwrap_or(true) {
             "Run agents on this computer. Turn off to use T3 Code only with remote environments."
@@ -300,13 +301,15 @@ fn saved_row(
 
     let toggle = {
         let (entity, id) = (entity.downgrade(), id.clone());
-        switch(&format!("saved-env-{id}").into(), enabled, false, t)
-            .tooltip(ui::tooltip(if enabled { "Switch off" } else { "Switch on" }))
+        let tooltip = if enabled { "Switch off" } else { "Switch on" };
+        let switch = switch(&format!("saved-env-{id}").into(), enabled, false)
+            .accessibility_label(format!("{tooltip} {label}"))
             .on_click(move |_, window, cx| {
                 let saving = entity.update(cx, |saved, cx| saved.set_enabled(&id, !enabled, cx));
                 let title = format!("Failed to switch the backend {}.", if enabled { "off" } else { "on" });
                 toast_failure(saving, title, window, cx);
-            })
+            });
+        div().id(element_id("switch-tooltip")).tooltip(ui::tooltip(tooltip)).child(switch)
     };
     let menu = row_menu(entity.downgrade(), environment, element_id("menu"));
     let mut row = v_flex().px(px(16.)).py(px(10.)).child(

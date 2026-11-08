@@ -7,9 +7,7 @@
 
 use gpui_kit::component::input::NumberInput;
 use gpui_kit::component::{Sizable as _, h_flex};
-use gpui_kit::{
-    AnyElement, Context, IntoElement, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
-};
+use gpui_kit::{AnyElement, Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
 use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
@@ -207,7 +205,7 @@ impl Workspace {
         }
         let toggle = |field: &'static str, cx: &mut Context<Self>| {
             let on = cleanup[field] == true;
-            switch(&field.into(), on, false, &t)
+            switch(&field.into(), on, false)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.update_settings(cleanup_patch(project_scope, field, json!(!on)), window, cx);
                 }))
@@ -312,7 +310,7 @@ impl Workspace {
         h_flex()
             .gap(px(12.))
             .child(value)
-            .child(switch(&field.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            .child(switch(&field.into(), on, false).on_click(cx.listener(move |this, _, window, cx| {
                 let days = if on { Value::Null } else { json!(8) };
                 this.update_settings(cleanup_patch(project_scope, field, days), window, cx);
             })))

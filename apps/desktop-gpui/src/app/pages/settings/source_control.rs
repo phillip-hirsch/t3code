@@ -1804,7 +1804,7 @@ impl Workspace {
             ));
         }
         let follow = style["followChangeRequestTemplates"] != false;
-        let follow = switch(&"follow-change-request-templates".into(), follow, false, &t).on_click(cx.listener(
+        let follow = switch(&"follow-change-request-templates".into(), follow, false).on_click(cx.listener(
             move |this, _, window, cx| {
                 this.update_settings(
                     json!({ "sourceControlWritingStyle": { "followChangeRequestTemplates": !follow } }),
@@ -1849,7 +1849,6 @@ impl Workspace {
         note: Option<gpui_kit::Div>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let t = *tokens(cx);
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ key: value }), window, cx);
         };
@@ -1877,7 +1876,7 @@ impl Workspace {
                     move |this, pick, window, cx| set(this, pick.to_json(), window, cx),
                 ))
             })
-            .child(switch(&id.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            .child(switch(&id.into(), on, false).on_click(cx.listener(move |this, _, window, cx| {
                 match (on, &enable_with) {
                     (true, _) => set(this, Value::Null, window, cx),
                     (false, Some(selection)) => set(this, selection.to_json(), window, cx),

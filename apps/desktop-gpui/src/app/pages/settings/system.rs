@@ -143,7 +143,7 @@ impl Workspace {
         // The web also shows this on while the removed legacy sidebar's opt-in
         // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
         let boring = view.bool("boringSidebarEnabled") || view.bool("legacySidebarEnabled");
-        let boring_switch = super::widgets::switch(&"boring-sidebar".into(), boring, false, &t).on_click(cx.listener(
+        let boring_switch = super::widgets::switch(&"boring-sidebar".into(), boring, false).on_click(cx.listener(
             move |this, _, window, cx| {
                 let patch = json!({ "boringSidebarEnabled": !boring, "legacySidebarEnabled": false });
                 this.update_settings(patch, window, cx);

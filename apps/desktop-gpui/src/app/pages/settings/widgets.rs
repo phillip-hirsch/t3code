@@ -26,7 +26,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    AnyElement, AppContext as _, BoxShadow, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 use serde_json::{Map, Value};
@@ -1260,9 +1260,9 @@ impl Workspace {
             (Control::Element(element), _) => element,
             (Control::Switch, Some(key)) => {
                 let checked = view.bool(key);
-                switch(id, checked, mixed, &t)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.update_settings(serde_json::json!({ key: !checked || mixed }), window, cx);
+                switch(id, checked, mixed)
+                    .on_click(cx.listener(move |this, next: &bool, window, cx| {
+                        this.update_settings(serde_json::json!({ key: *next }), window, cx);
                     }))
                     .into_any_element()
             }
@@ -1641,37 +1641,9 @@ pub(in crate::app) fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoEl
         )
 }
 
-/// The web's `Switch`: a 30×18 track and a 14px thumb (38×22 and 18px below `sm`).
-pub(in crate::app) fn switch(
-    id: &SharedString,
-    checked: bool,
-    mixed: bool,
-    t: &Tokens,
-) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let on = checked && !mixed;
-    let thumb: Hsla = if on || !t.dark { t.background } else { t.muted_foreground };
-    let size = switch_thumb_size(false, t);
-    div()
-        .id(SharedString::from(format!("{id}-switch")))
-        .flex_none()
-        .w(px(size * 2. - 2.))
-        .h(px(size + 2.))
-        .p(px(2.))
-        .rounded_full()
-        .cursor_pointer()
-        .bg(if on { t.primary } else { t.input })
-        .flex()
-        .items_center()
-        .map(|el| {
-            if mixed {
-                el.justify_center()
-            } else if on {
-                el.justify_end()
-            } else {
-                el.justify_start()
-            }
-        })
-        .child(div().size(px(size - 2.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
+/// The web's `Switch` for row `id`; a mixed one turns on when pressed.
+pub(in crate::app) fn switch(id: &SharedString, checked: bool, mixed: bool) -> Switch {
+    Switch::new(SharedString::from(format!("{id}-switch"))).checked(checked).mixed(mixed)
 }
 
 /// `--thumb-size`: `--spacing(5) sm:--spacing(4)`, or `--spacing(4) sm:--spacing(3.5)` at `size="sm"`.
@@ -1685,6 +1657,7 @@ fn switch_thumb_size(small: bool, t: &Tokens) -> f32 {
 pub(in crate::app) struct Switch {
     id: ElementId,
     checked: bool,
+    mixed: bool,
     disabled: bool,
     small: bool,
     label: Option<SharedString>,
@@ -1696,11 +1669,25 @@ type OnToggle = Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>;
 
 impl Switch {
     pub(in crate::app) fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, disabled: false, small: false, label: None, on_change: None }
+        Self {
+            id: id.into(),
+            checked: false,
+            mixed: false,
+            disabled: false,
+            small: false,
+            label: None,
+            on_change: None,
+        }
     }
 
     pub(in crate::app) fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    /// Neither on nor off (`mixed`): the thumb centered, and a press turns it on.
+    pub(in crate::app) fn mixed(mut self, mixed: bool) -> Self {
+        self.mixed = mixed;
         self
     }
 
@@ -1740,15 +1727,21 @@ impl gpui_kit::RenderOnce for Switch {
         let size = switch_thumb_size(self.small, &t);
         // `disabled:opacity-64` on the track and thumb alike.
         let fade = if self.disabled { 0.64 } else { 1. };
-        let track = if self.checked { t.primary } else { t.input };
+        let mixed = self.mixed;
+        // `data-[mixed]:bg-input`; the thumb keeps its checked color.
+        let track = if self.checked && !mixed { t.primary } else { t.input };
         let thumb = if self.checked || !t.dark { t.background } else { t.muted_foreground };
+        // `focus-visible:ring-2 ring-inset ring-ring`
+        let ring = BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset();
         gpui_kit::base::Switch::new(self.id)
             .checked(self.checked)
+            .mixed(mixed)
             .disabled(self.disabled)
             .when_some(self.label, gpui_kit::base::Switch::accessibility_label)
             .when_some(self.on_change, |el, on_change| {
-                el.on_change(move |checked, _, window, cx| on_change(&checked, window, cx))
+                el.on_change(move |checked, _, window, cx| on_change(&(checked || mixed), window, cx))
             })
+            .focus_visible(move |s| s.shadow(vec![ring]))
             .flex_none()
             .w(px(size * 2. - 2.))
             .h(px(size + 2.))
@@ -1756,10 +1749,14 @@ impl gpui_kit::RenderOnce for Switch {
             .rounded_full()
             .flex()
             .items_center()
-            .when(self.checked, gpui_kit::Styled::justify_end)
+            .map(|el| match (mixed, self.checked) {
+                (true, _) => el.justify_center(),
+                (false, true) => el.justify_end(),
+                (false, false) => el,
+            })
             .bg(track.opacity(fade))
             .when(!self.disabled, gpui_kit::Styled::cursor_pointer)
-            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade)))
+            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade * if mixed { 0.7 } else { 1. })))
     }
 }
 

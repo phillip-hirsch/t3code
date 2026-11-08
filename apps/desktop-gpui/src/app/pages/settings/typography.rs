@@ -8,7 +8,7 @@ use gpui_kit::component::{Icon, IndexPath, Sizable as _, WindowExt as _, h_flex,
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative, rems, rgb,
+    Styled as _, Subscription, Window, div, px, relative, rems, rgb,
 };
 use serde_json::{Map, Value, json};
 
@@ -186,7 +186,7 @@ impl Workspace {
             ),
         );
         let separate_switch =
-            switch(&"separate-fonts".into(), separate, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            switch(&"separate-fonts".into(), separate, false).on_click(cx.listener(move |this, _, window, cx| {
                 let patch = Map::from_iter([(TYPOGRAPHY_ADVANCED_KEY.to_owned(), Value::Bool(!separate))]);
                 this.client_settings.apply(&patch);
                 theme::set_appearance(theme::Appearance::from_settings(&this.client_settings.values), window, cx);
