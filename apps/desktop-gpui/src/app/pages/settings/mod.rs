@@ -48,7 +48,7 @@ use serde_json::{Map, Value};
 
 use crate::app::Workspace;
 use crate::settings::scope::{ScopeKind, ScopeSearch};
-use crate::settings::{SearchItem, ThemePreference, contract};
+use crate::settings::{SearchItem, TYPOGRAPHY_ADVANCED_KEY, ThemePreference, contract};
 use crate::theme::{self, Tokens};
 use crate::themes::ThemeChoice;
 use widgets::SettingsView;
@@ -617,13 +617,15 @@ impl Workspace {
         self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
         self.settings_ui.compact_search_open = false;
         let target = item.target_id.clone().unwrap_or_else(|| item.id.clone());
-        // A row inside a fold opens it first.
-        if matches!(target.as_str(), "panel-animations" | "environment-identification" | "composer-context") {
-            self.settings_ui.advanced_open.insert("appearance");
+        if let Some(fold) = advanced_fold_for(&target) {
+            self.settings_ui.advanced_open.insert(fold);
         }
-        if matches!(target.as_str(), "browser-default-viewport" | "browser-default-zoom" | "browser-default-appearance")
-        {
-            self.settings_ui.advanced_open.insert("browser");
+        // `revealSettingsSearchTarget`: these rows exist only with separate fonts on, and the
+        // terminal reads the same flag, so it stays on.
+        if matches!(target.as_str(), "prompt-font" | "terminal-font") {
+            let patch = Map::from_iter([(TYPOGRAPHY_ADVANCED_KEY.to_owned(), Value::Bool(true))]);
+            self.client_settings.apply(&patch);
+            theme::set_appearance(theme::Appearance::from_settings(&self.client_settings.values), window, cx);
         }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());
@@ -1148,9 +1150,36 @@ fn kbd(key: &'static str, t: &Tokens) -> impl IntoElement {
         .child(key)
 }
 
+/// The `AdvancedSettings` fold each search target sits in (its `targetIds`), so a jump opens it
+/// before the row is laid out.
+fn advanced_fold_for(target: &str) -> Option<&'static str> {
+    const FOLDS: &[(&str, &[&str])] = &[
+        ("appearance", &["panel-animations", "environment-identification", "appearance-interface", "composer-context"]),
+        ("browser", &["browser-default-viewport", "browser-default-zoom", "browser-default-appearance"]),
+        ("chat", &["skills-in-slash-menu"]),
+        ("threads", &["thread-title-instructions", "response-streaming"]),
+        ("typography", &["separate-fonts", "font-smoothing"]),
+        ("source-control", &["follow-change-request-templates", "source-control-writer-model"]),
+        ("worktree-creation", &["worktree-submodules"]),
+        ("worktree-cleanup", &["storage-worktrees", "storage-worktree-keep-when"]),
+    ];
+    FOLDS.iter().find(|(_, targets)| targets.contains(&target)).map(|(fold, _)| *fold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_jump_opens_the_fold_its_target_sits_in() {
+        assert_eq!(advanced_fold_for("skills-in-slash-menu"), Some("chat"));
+        assert_eq!(advanced_fold_for("response-streaming"), Some("threads"));
+        assert_eq!(advanced_fold_for("separate-fonts"), Some("typography"));
+        assert_eq!(advanced_fold_for("appearance-interface"), Some("appearance"));
+        assert_eq!(advanced_fold_for("storage-worktrees"), Some("worktree-cleanup"));
+        assert_eq!(advanced_fold_for("prompt-font"), None, "shown by separate fonts, not a fold");
+        assert_eq!(advanced_fold_for("word-wrap"), None);
+    }
 
     #[test]
     fn arrow_keys_walk_the_settings_sections_and_stop_at_the_ends() {
