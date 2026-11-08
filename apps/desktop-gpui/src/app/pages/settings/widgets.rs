@@ -98,6 +98,20 @@ impl SettingsView {
             .collect()
     }
 
+    /// The selected environments, connected or not (`useSettingsScope().environments`).
+    pub(in crate::app) fn selected_environments(&self) -> Vec<SelectedEnvironment<'_>> {
+        self.environments
+            .iter()
+            .filter(|e| self.scope.environment_ids.contains(&e.id))
+            .map(|e| SelectedEnvironment {
+                id: &e.id,
+                label: &e.label,
+                settings: e.settings.as_ref(),
+                can_write: e.can_write,
+            })
+            .collect()
+    }
+
     /// Some environment is connected and this connection may write settings on each one.
     pub(in crate::app) fn can_write_connected(&self) -> bool {
         let authorities = self.row_authorities();
@@ -161,6 +175,16 @@ impl SettingsView {
     fn group_of(&self, project_id: &str) -> Option<&ProjectGroup> {
         self.groups.iter().find(|g| g.members.iter().any(|m| m.project.id == project_id))
     }
+}
+
+/// A selected environment as a page that acts on each one sees it.
+pub(in crate::app) struct SelectedEnvironment<'a> {
+    pub(in crate::app) id: &'a str,
+    pub(in crate::app) label: &'a str,
+    /// `None` while disconnected.
+    pub(in crate::app) settings: Option<&'a Settings>,
+    /// This connection's session grants `settings:write` there.
+    pub(in crate::app) can_write: bool,
 }
 
 /// A server write on its way, with what the toast and the dropped-key check need.
