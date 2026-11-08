@@ -101,6 +101,8 @@ pub struct OptionChoice {
     pub id: String,
     pub label: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub is_default: bool,
 }
 
