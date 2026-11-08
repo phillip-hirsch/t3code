@@ -129,16 +129,22 @@ impl Workspace {
         let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let m = event.modifiers();
         if m.control || m.platform {
-            let primary = self.primary_environment().map(SharedString::as_ref);
-            let remote = self.servers.environment.as_deref().filter(|environment| primary != Some(*environment));
-            let url = match remote.map(|environment| self.env_endpoint(environment)) {
-                Some(Some(endpoint)) => crate::preview::resolve_discovered_server_url(&url, Some(&endpoint.http_base)),
-                Some(None) => url,
-                None => crate::preview::resolve_discovered_server_url(&url, None),
-            };
+            let url = self.resolve_server_url(self.servers.environment.as_deref(), url);
             cx.open_url(&url);
         } else {
             self.open_preview_tab(thread_id, Some(url), window, cx);
+        }
+    }
+
+    /// `resolveDiscoveredServerUrl`: a loopback server of `environment`, at that environment's
+    /// address when it is not this machine's own server.
+    pub(in crate::app) fn resolve_server_url(&self, environment: Option<&str>, url: String) -> String {
+        let primary = self.primary_environment().map(SharedString::as_ref);
+        let remote = environment.filter(|environment| primary != Some(*environment));
+        match remote.map(|environment| self.env_endpoint(environment)) {
+            Some(Some(endpoint)) => crate::preview::resolve_discovered_server_url(&url, Some(&endpoint.http_base)),
+            Some(None) => url,
+            None => crate::preview::resolve_discovered_server_url(&url, None),
         }
     }
 

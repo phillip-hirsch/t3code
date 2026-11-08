@@ -500,7 +500,8 @@ impl Workspace {
             }
             None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
         };
-        match run.preview_url.clone() {
+        let environment = self.thread_environment(&thread_id);
+        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)) {
             Some(url) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
