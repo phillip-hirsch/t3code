@@ -1107,20 +1107,20 @@ impl Workspace {
                 Group { label: "Recent Threads", rows: recent },
             ];
         }
-        let stem: Vec<char> = "new thread in".chars().collect();
-        let names_stem = stem.starts_with(&tokens.join(&' ')[..]);
-        let suggestions: Vec<Row> = if names_stem {
-            Vec::new()
-        } else {
-            self.new_thread_rows()
-                .into_iter()
-                .filter(|row| matches!(row.run, Run::NewThread(_)))
-                .map(|mut row| {
-                    row.title = format!("New thread in {}", row.title).into();
-                    row
-                })
-                .collect()
-        };
+        let action_rows = self.action_rows();
+        let submenus = action_rows
+            .iter()
+            .filter_map(|parent| {
+                let children = match parent.run {
+                    Run::Open(View::NewThreadIn) => self.new_thread_rows(),
+                    Run::Open(View::Themes) => self.theme_rows(palette.dark),
+                    Run::Open(View::Appearance) => self.appearance_rows(),
+                    _ => return None,
+                };
+                Some((parent, children))
+            })
+            .collect();
+        let suggestions = nested_rows(&action_rows, submenus, &tokens);
         let project_rows = self.project_search_rows();
         let settings: Vec<Row> = super::pages::settings_sections()
             .map(|(group, id, label)| {
@@ -1133,7 +1133,6 @@ impl Workspace {
                 row
             })
             .collect();
-        let action_rows = self.action_rows();
         let linked = palette.linked.as_ref().filter(|linked| linked.query == query).map(LinkedSearch::rows);
         let rank = |typos: bool| {
             let actions = score_rows(action_rows.clone(), &tokens, typos);
@@ -2061,10 +2060,7 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
     let mut scored: Vec<(Row, bool)> = rows
         .into_iter()
         .filter_map(|mut row| {
-            let title = match &row.strong {
-                Some(strong) => format!("{} {strong}", row.title),
-                None => row.title.to_string(),
-            };
+            let title = row_name(&row);
             // The title names the item; its terms are keywords, the best one counts.
             let found = std::iter::once(title.as_str())
                 .chain(row.terms.iter().copied())
@@ -2105,6 +2101,42 @@ fn no_project_index(entries: &[NoProjectEntry]) -> usize {
         return entries[..at].iter().filter(|e| !e.scratch).count();
     }
     (entries.iter().filter(|e| !e.scratch && e.pinned).count() + 1).min(projects)
+}
+
+/// A row's name as a query reads it: the title and the bold part after it.
+fn row_name(row: &Row) -> String {
+    match &row.strong {
+        Some(strong) => format!("{} {strong}", row.title),
+        None => row.title.to_string(),
+    }
+}
+
+/// `buildNestedSearchItems`: every option of each submenu as one root row ("New thread in t3code",
+/// "Change theme: Dracula"), matched by that combined title alone. A query that only names the
+/// submenu wants the submenu itself, and a combined title an action already has is left out.
+fn nested_rows(actions: &[Row], submenus: Vec<(&Row, Vec<Row>)>, tokens: &[Vec<char>]) -> Vec<Row> {
+    let query = tokens.join(&' ');
+    let top_level: Vec<String> = actions.iter().map(row_name).collect();
+    let mut rows = Vec::new();
+    for (parent, children) in submenus {
+        let stem = parent.title.trim_end_matches("...").trim_end_matches('…');
+        if search::fold_query(stem).join(&' ').starts_with(&query[..]) {
+            continue;
+        }
+        let prefix = if stem == parent.title.as_ref() { format!("{stem}: ") } else { format!("{} ", stem.trim_end()) };
+        for mut child in children {
+            let title = format!("{prefix}{}", row_name(&child));
+            if top_level.contains(&title) {
+                continue;
+            }
+            child.title = title.into();
+            child.strong = None;
+            child.terms = &[];
+            child.data_terms = Vec::new();
+            rows.push(child);
+        }
+    }
+    rows
 }
 
 /// Submenu rows filtered by the query, in their own order when it is empty.
@@ -2179,6 +2211,37 @@ mod tests {
             .collect();
         assert_eq!(shown, [("Speed up diffs", Some("Linked thread")), ("Untitled thread", Some("Archived thread"))]);
         assert!(matches!(&rows[1].0.run, Run::ThreadIn(env, id) if env == "env" && id == "t2"));
+    }
+
+    #[test]
+    fn submenu_options_join_the_root_search_under_their_combined_titles() {
+        let row = |title: &str, run: Run| {
+            Row::new(title.to_owned(), RowIcon::Lucide(IconName::Palette), title.to_owned(), run)
+        };
+        let mut here = row("New thread in", Run::NewThread("p1".into()));
+        here.strong = Some("t3code".into());
+        let new_in = row("New thread in...", Run::Open(View::NewThreadIn));
+        let themes = row("Change theme", Run::Open(View::Themes));
+        let actions = vec![here, new_in.clone(), themes.clone()];
+        let mut project = row("t3code", Run::NewThread("p1".into()));
+        project.data_terms = vec![r"H:\Developer\t3code".into()];
+        let children = || {
+            vec![
+                (
+                    &new_in,
+                    vec![project.clone(), row("docs", Run::NewThread("p2".into())), row("No project", Run::Triage)],
+                ),
+                (&themes, vec![row("Dracula", Run::Theme(Some("dracula".into())))]),
+            ]
+        };
+        let titles = |query: &str| -> Vec<String> {
+            nested_rows(&actions, children(), &search::fold_query(query)).iter().map(|r| r.title.to_string()).collect()
+        };
+        // The open project's option is the "New thread in t3code" action already.
+        assert_eq!(titles("drac"), ["New thread in docs", "New thread in No project", "Change theme: Dracula"]);
+        assert_eq!(titles("new thread"), ["Change theme: Dracula"], "a query naming the submenu wants the submenu");
+        let suggestions = nested_rows(&actions, children(), &search::fold_query("x"));
+        assert!(suggestions.iter().all(|r| r.terms.is_empty() && r.data_terms.is_empty()), "only the combined title");
     }
 
     #[test]
