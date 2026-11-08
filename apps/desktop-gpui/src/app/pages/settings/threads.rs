@@ -16,7 +16,7 @@ use gpui_kit::{
     AnyElement, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
 use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
@@ -40,6 +40,15 @@ const RUNTIME_MODES: [(&str, &str, &str, Lucide); 4] = [
     ("full-access", "Full access", "Allow commands and edits without prompts.", Lucide::ShieldOff),
 ];
 const DEFAULT_RUNTIME_MODE: &str = "full-access";
+
+/// `managedRuntimeModeDenial`: why the policy's `maxRuntimeMode` rules out `mode`.
+fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
+    let organization = policy["organization"].as_str()?;
+    let ceiling = policy.pointer("/limits/maxRuntimeMode").and_then(Value::as_str)?;
+    let rank = |mode: &str| RUNTIME_MODES.iter().position(|(id, ..)| *id == mode);
+    let (_, label, ..) = RUNTIME_MODES[rank(ceiling)?];
+    (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
+}
 const AUTO_SETTLE_DEFAULT_DAYS: i64 = 3;
 
 /// The snooze editor's draft. Rows keep a key across edits and sorts so a row's own fields
@@ -328,13 +337,19 @@ impl Workspace {
         };
         let (_, label, _, icon) =
             RUNTIME_MODES.iter().find(|(id, ..)| *id == current).copied().unwrap_or(RUNTIME_MODES[3]);
+        let denials: Vec<Option<SharedString>> = RUNTIME_MODES
+            .iter()
+            .map(|(mode, ..)| view.first_managed_denial(|policy| runtime_mode_denial(policy, mode)).map(Into::into))
+            .collect();
         let view = cx.entity();
         trigger("default-permissions", &t)
             .children((!mixed).then(|| Icon::new(icon).with_size(px(14.)).text_color(t.muted_foreground)))
             .child(div().flex_1().child(if mixed { "Mixed" } else { label }))
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
-                for (mode, label, description, icon) in RUNTIME_MODES {
+                for ((mode, label, description, icon), denial) in RUNTIME_MODES.into_iter().zip(denials.clone()) {
+                    let disabled = denial.is_some();
+                    let description: SharedString = denial.unwrap_or_else(|| description.into());
                     menu = menu.item(
                         PopupMenuItem::element(move |_, cx| {
                             let t = tokens(cx);
@@ -353,9 +368,10 @@ impl Workspace {
                                         .text_xs()
                                         .line_height(px(16.))
                                         .text_color(t.muted_foreground)
-                                        .child(description),
+                                        .child(description.clone()),
                                 )
                         })
+                        .disabled(disabled)
                         .checked(mode == current)
                         .on_click(window.listener_for(&view, move |this, _, window, cx| {
                             this.update_settings(json!({ "defaultRuntimeMode": mode }), window, cx);
@@ -752,4 +768,21 @@ impl Workspace {
 
 fn env_mode_label(mode: &str) -> &'static str {
     if mode == "worktree" { "New worktree" } else { "Current checkout" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_policy_ceiling_rules_out_the_broader_permissions() {
+        let policy = json!({"organization": "Acme", "limits": {"maxRuntimeMode": "auto-accept-edits"}});
+        assert_eq!(runtime_mode_denial(&policy, "approval-required"), None);
+        assert_eq!(runtime_mode_denial(&policy, "auto-accept-edits"), None);
+        assert_eq!(
+            runtime_mode_denial(&policy, "full-access").as_deref(),
+            Some("Acme limits threads to Auto-accept edits.")
+        );
+        assert_eq!(runtime_mode_denial(&Value::Null, "full-access"), None);
+    }
 }

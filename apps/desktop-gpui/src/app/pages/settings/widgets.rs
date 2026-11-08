@@ -34,7 +34,8 @@ use gpui_kit::{
 use serde_json::{Map, Value};
 
 use super::code::projects::icon::project_icon;
-use super::connections::logic::machine_icon;
+use super::connections::SessionLoad;
+use super::connections::logic::{SETTINGS_WRITE, machine_icon};
 use super::row_layout::RowLayout;
 use crate::app::{Workspace, project_name};
 use crate::project_groups::ProjectGroup;
@@ -65,6 +66,10 @@ struct ViewEnvironment {
     machine: String,
     /// `None` while disconnected.
     settings: Option<Settings>,
+    /// This connection's session grants `settings:write`; not while its check is pending.
+    can_write: bool,
+    /// The server's `managedPolicy` summary, `Null` when unmanaged.
+    policy: Value,
 }
 
 impl ViewEnvironment {
@@ -74,6 +79,21 @@ impl ViewEnvironment {
 }
 
 impl SettingsView {
+    /// The selected environments that are connected (`connectedEnvironments`), for whether a
+    /// row may write and what an administrator locks.
+    fn row_authorities(&self) -> Vec<RowAuthority<'_>> {
+        self.environments
+            .iter()
+            .filter(|e| e.settings.is_some() && self.scope.environment_ids.contains(&e.id))
+            .map(|e| RowAuthority { label: &e.label, can_write: e.can_write, policy: &e.policy })
+            .collect()
+    }
+
+    /// `firstManagedDenial` over the selected, connected environments' policies.
+    pub(in crate::app) fn first_managed_denial(&self, deny: impl Fn(&Value) -> Option<String>) -> Option<String> {
+        self.row_authorities().iter().find_map(|authority| deny(authority.policy))
+    }
+
     pub(in crate::app) fn environments(&self) -> Vec<scope::Environment<'_>> {
         self.environments.iter().map(ViewEnvironment::scoped).collect()
     }
@@ -152,6 +172,10 @@ pub(in crate::app) struct SettingRow {
     /// A reset the row works out itself, replacing the bound keys' default.
     reset: Option<Option<Value>>,
     unavailable: bool,
+    /// Edits server settings although no key is bound (`serverScoped`).
+    server_scoped: bool,
+    /// Dot paths inside a setting an administrator can lock (`managedPaths`).
+    managed_paths: Vec<String>,
 }
 
 enum Control {
@@ -200,7 +224,21 @@ impl SettingRow {
             control_beside: None,
             unavailable: false,
             reset: None,
+            server_scoped: false,
+            managed_paths: Vec::new(),
         }
+    }
+
+    /// The row edits server settings (`serverScoped`), so it needs a connected, writable target.
+    pub(in crate::app) fn server_scoped(mut self) -> Self {
+        self.server_scoped = true;
+        self
+    }
+
+    /// Dot paths an administrator's policy can lock besides the bound keys (`managedPaths`).
+    pub(in crate::app) fn managed_paths(mut self, paths: impl IntoIterator<Item = String>) -> Self {
+        self.managed_paths.extend(paths);
+        self
     }
 
     pub(in crate::app) fn tip(mut self, tip: impl Into<SharedString>) -> Self {
@@ -321,6 +359,52 @@ pub(in crate::app) fn loose_section(
     blocks: impl IntoIterator<Item = AnyElement>,
 ) -> AnyElement {
     section_frame(id, title, None, v_flex().gap(px(4.)).children(blocks).into_any_element())
+}
+
+/// A selected, connected environment as a row's availability sees it.
+struct RowAuthority<'a> {
+    label: &'a str,
+    can_write: bool,
+    policy: &'a Value,
+}
+
+/// `isManagedSettingPath`: `path` is locked, or inside or around a locked path.
+fn is_managed_path(policy: &Value, path: &str) -> bool {
+    let within = |inner: &str, outer: &str| inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('.'));
+    policy["lockedSettings"].as_array().is_some_and(|locked| {
+        locked
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|locked| locked == path || within(locked, path) || within(path, locked))
+    })
+}
+
+/// Why a row's control is inert, in `SettingsRow`'s order: an administrator's lock on any
+/// target, then no connected target, then a target this connection may not write. A locked
+/// row offers no reset either.
+fn row_lock(
+    authorities: &[RowAuthority],
+    lockable: &[&str],
+    server_scoped: bool,
+    disconnected: bool,
+) -> Option<SharedString> {
+    let managed_by = authorities
+        .iter()
+        .find(|authority| lockable.iter().any(|path| is_managed_path(authority.policy, path)))
+        .map(|authority| authority.policy["organization"].as_str().unwrap_or_default());
+    if let Some(organization) = managed_by {
+        return Some(format!("Managed by {organization}.").into());
+    }
+    if !server_scoped {
+        return None;
+    }
+    if disconnected {
+        return Some("Reconnect the selected environment to change this setting.".into());
+    }
+    let denied: Vec<&str> =
+        authorities.iter().filter(|authority| !authority.can_write).map(|authority| authority.label).collect();
+    (!denied.is_empty())
+        .then(|| format!("This connection lacks permission to change settings on {}.", denied.join(", ")).into())
 }
 
 /// A search target as the page's sections see it while they build.
@@ -646,10 +730,14 @@ impl Workspace {
             .filter_map(|session| {
                 let id = session.id.as_ref()?.to_string();
                 let info = &session.server_info;
+                let can_write =
+                    self.settings_ui.grants.get(&id).is_some_and(|(_, session)| session.grants(SETTINGS_WRITE));
                 Some(ViewEnvironment {
                     label: info.environment_label.clone().unwrap_or_else(|| id.clone()),
                     machine: info.machine_kind().to_owned(),
                     settings: session.is_connected().then(|| info.settings.clone()),
+                    can_write,
+                    policy: info.managed_policy.clone(),
                     id,
                 })
             })
@@ -674,6 +762,31 @@ impl Workspace {
         view.scope = scope;
         view.targets = targets;
         view
+    }
+
+    /// Checks each connected environment's session for `settings:write` once per connection
+    /// (`useEnvironmentsWithScope`); a disconnected one is asked again when it returns.
+    pub(super) fn check_settings_grants(&mut self, cx: &mut Context<Self>) {
+        let connected: Vec<(String, crate::backend::Endpoint)> = self
+            .sessions
+            .iter()
+            .filter(|session| session.is_connected())
+            .filter_map(|session| Some((session.id.as_ref()?.to_string(), session.endpoint.clone()?)))
+            .collect();
+        let grants = &mut self.settings_ui.grants;
+        grants.retain(|id, _| connected.iter().any(|(connected, _)| connected == id));
+        for (id, endpoint) in connected {
+            if grants.contains_key(&id) {
+                continue;
+            }
+            let key = id.clone();
+            let task = super::connections::check_session(endpoint, cx, move |this: &mut Self, session, _| {
+                if let Some((_, load)) = this.settings_ui.grants.get_mut(&key) {
+                    *load = session;
+                }
+            });
+            grants.insert(id, (task, SessionLoad::Pending));
+        }
     }
 
     /// Starts reading the selected checkouts' `t3.json` for the file tier (`useMemberProjectFiles`).
@@ -985,19 +1098,20 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let keys = row.keys.clone();
-        let server_scoped = keys.iter().any(|k| contract().is_server_key(k));
+        let server_scoped = row.server_scoped || keys.iter().any(|k| contract().is_server_key(k));
         let project_scope = view.scope.is_project();
         let scoped_keys: Vec<&'static str> = keys.iter().copied().filter(|k| contract().is_project_scoped(k)).collect();
         let mixed = !keys.is_empty() && view.mixed(&keys);
         let environment_wide = project_scope && server_scoped && scoped_keys.is_empty();
-        let disconnected = server_scoped && view.targets.is_empty();
+        let lockable: Vec<&str> = keys.iter().copied().chain(row.managed_paths.iter().map(String::as_str)).collect();
+        let lock = row_lock(&view.row_authorities(), &lockable, server_scoped, view.targets.is_empty());
         let overriding: Vec<String> = match (view.environment().and_then(|e| e.settings), project_scope) {
             (Some(settings), false) => scope::overriding_projects(settings, &scoped_keys),
             _ => Vec::new(),
         };
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
-        let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
+        let reset = self.render_reset(view, &row, &scoped_keys, mixed, lock.is_some(), cx);
         let SettingRow { id, title, description, status, tip, body, control, control_beside, unavailable, .. } = row;
         let (state, summary) = match view.environment() {
             Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
@@ -1008,13 +1122,10 @@ impl Workspace {
         let quiet_marker = quiet_marker
             && self.settings_ui.open_marker.as_ref() != Some(&id)
             && matches!(state, InheritanceState::Default | InheritanceState::Environment);
-        let inert = if disconnected {
-            Some("Reconnect the selected environment to change this setting.")
-        } else if environment_wide {
-            Some("Environment-wide setting. Select an environment to change it.")
-        } else {
-            None
-        };
+        let inert = lock.or_else(|| {
+            environment_wide
+                .then(|| SharedString::from("Environment-wide setting. Select an environment to change it."))
+        });
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
         let (control, hug, body) = match control {
             Some(RowControl::Body(field)) => (None, None, Some(field)),
@@ -1022,7 +1133,7 @@ impl Workspace {
             Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body),
             None => (None, None, body),
         };
-        let inert = if unavailable { Some("") } else { inert };
+        let inert = if unavailable { Some(SharedString::default()) } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
         let title = h_flex().gap(px(6.)).child(title).when_some(tip, |el, tip| {
@@ -1048,13 +1159,15 @@ impl Workspace {
         frame.description = description;
         frame.body = body;
         frame.hug = hug;
-        let inert_control = |control: AnyElement| match inert {
+        let inert_control = |control: AnyElement| match inert.clone() {
             Some(message) => div()
                 .id(SharedString::from(format!("{id}-inert")))
                 .flex_none()
                 .opacity(0.5)
                 .occlude()
-                .when(!message.is_empty(), |el| el.tooltip(move |window, cx| Tooltip::new(message).build(window, cx)))
+                .when(!message.is_empty(), |el| {
+                    el.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
+                })
                 .child(control)
                 .into_any_element(),
             None => control,
@@ -1076,10 +1189,10 @@ impl Workspace {
         row: &SettingRow,
         scoped_keys: &[&'static str],
         mixed: bool,
-        disconnected: bool,
+        locked: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if disconnected {
+        if locked {
             return None;
         }
         // At project scope a scoped row only resets its override, whatever its own reset.
@@ -2186,6 +2299,7 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_search_jump_pulses_twice_then_shows_nothing() {
@@ -2194,6 +2308,32 @@ mod tests {
         assert!(at(650.) < 1e-4, "and clears before the second: {}", at(650.));
         assert!((at(975.) - 1.).abs() < 1e-4, "the second peaks: {}", at(975.));
         assert!(at(1300.) < 1e-4, "nothing remains once it ends: {}", at(1300.));
+    }
+
+    #[test]
+    fn a_row_locks_for_policy_first_then_for_write_grants() {
+        let acme =
+            json!({"organization": "Acme", "lockedSettings": ["storageCleanup.logsAfterDays", "worktreeCleanup"]});
+        let open = Value::Null;
+        let env = |label, can_write, policy| RowAuthority { label, can_write, policy };
+        assert!(is_managed_path(&acme, "storageCleanup"), "a parent of a locked path");
+        assert!(is_managed_path(&acme, "worktreeCleanup.mode"), "inside a locked path");
+        assert!(!is_managed_path(&acme, "storageCleanup.logs"), "a sibling sharing a prefix");
+
+        let both = [env("Studio", true, &open), env("Laptop", false, &acme)];
+        let lock = |lockable: &[&str], server_scoped| row_lock(&both, lockable, server_scoped, false);
+        assert_eq!(lock(&["worktreeCleanup"], true).as_deref(), Some("Managed by Acme."));
+        assert_eq!(
+            lock(&["defaultRuntimeMode"], true).as_deref(),
+            Some("This connection lacks permission to change settings on Laptop.")
+        );
+        assert_eq!(lock(&["defaultRuntimeMode"], false), None, "device rows need no grant");
+        let writable = [env("Studio", true, &open)];
+        assert_eq!(row_lock(&writable, &["defaultRuntimeMode"], true, false), None);
+        assert_eq!(
+            row_lock(&[], &["defaultRuntimeMode"], true, true).as_deref(),
+            Some("Reconnect the selected environment to change this setting.")
+        );
     }
 
     #[test]

@@ -261,6 +261,8 @@ pub(in crate::app) struct SettingsUi {
     nav_reveal: Rc<Cell<Option<&'static str>>>,
     /// The last focused field's pending commit, run before Settings closes.
     focused_field: Option<fields::FieldFlush>,
+    /// Each connected environment's session check, for its `settings:write` grant.
+    grants: HashMap<String, (gpui_kit::Task<()>, connections::SessionLoad)>,
     _search_subscription: Subscription,
 }
 
@@ -315,6 +317,7 @@ impl SettingsUi {
             nav_scroll: ScrollHandle::new(),
             nav_reveal: Rc::default(),
             focused_field: None,
+            grants: HashMap::new(),
             _search_subscription: subscription,
         }
     }
@@ -476,6 +479,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
         self.load_scope_project_files(&view, cx);
+        self.check_settings_grants(cx);
         self.sync_scope_project_picker(&view, window, cx);
         let content = self.with_section_target(|this| this.render_settings_section(&section, &view, window, cx), &t);
         let titlebar = f32::from(crate::app::titlebar::native_titlebar_height(window));
