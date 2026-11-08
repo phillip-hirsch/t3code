@@ -1314,12 +1314,7 @@ impl Workspace {
         input.update(cx, |input, cx| input.focus(window, cx));
         let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } => this.save_pr_title(window, cx),
-            InputEvent::Blur => {
-                if let Some(write) = this.pr_write().filter(|w| !w.saving) {
-                    write.title = None;
-                    cx.notify();
-                }
-            }
+            InputEvent::Change => cx.notify(),
             _ => {}
         });
         if let Some(write) = self.pr_write() {
@@ -1345,28 +1340,64 @@ impl Workspace {
         self.run_pr_write(
             "pullRequests.update",
             payload,
-            "Could not save the title".into(),
-            None,
+            "The title could not be saved".into(),
+            Some("The host refused the new title."),
             window,
             cx,
-            |this, key, _, _, _| {
+            // A refused title stays in the editor to try again.
+            |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
                     write.saving = false;
-                    write.title = None;
+                    if ok {
+                        write.title = None;
+                    }
                 }
             },
         );
     }
 
-    pub(super) fn render_pr_title_input(&self, t: &Tokens) -> Option<AnyElement> {
-        let input = self.pull_requests.panel.as_ref()?.write.title.as_ref()?;
+    fn cancel_pr_title_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(write) = self.pr_write().filter(|w| !w.saving) {
+            write.title = None;
+            cx.notify();
+        }
+    }
+
+    /// The title being renamed, with Cancel and Save under it; Escape cancels.
+    pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let write = &self.pull_requests.panel.as_ref()?.write;
+        let input = write.title.as_ref()?;
+        let saving = write.saving;
+        let empty = input.read(cx).value().trim().is_empty();
         Some(
-            div()
+            v_flex()
                 .min_w_0()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.foreground)
-                .child(Input::new(input).small())
+                .gap(px(8.))
+                .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.cancel_pr_title_edit(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(Input::new(input).small().disabled(saving))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            ghost_button("pr-title-cancel", t)
+                                .text_color(t.foreground)
+                                .disabled(saving)
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_pr_title_edit(cx))),
+                        )
+                        .child(
+                            xs_outline("pr-title-save", t)
+                                .disabled(saving || empty)
+                                .child(if saving { "Saving..." } else { "Save" })
+                                .on_click(cx.listener(|this, _, window, cx| this.save_pr_title(window, cx))),
+                        ),
+                )
                 .into_any_element(),
         )
     }

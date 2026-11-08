@@ -1198,7 +1198,7 @@ impl Workspace {
                     .children(diff_stat(detail.additions, detail.deletions, 12., t)),
             );
 
-        let title = match self.render_pr_title_input(t) {
+        let title = match self.render_pr_title_input(t, cx) {
             Some(input) => input,
             None => h_flex()
                 .min_h(px(24.))
