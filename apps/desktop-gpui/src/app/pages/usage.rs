@@ -2257,9 +2257,14 @@ fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Se
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!("{}%", window.remaining_percent)),
                             )
-                            .child(div().text_sm().text_color(t.muted_foreground).child("left"))
-                            .children(
-                                window.pace.map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                            // One baseline item, as the web's `inline-flex items-center` span: the
+                            // pace icon centers on "left" instead of hanging below the line.
+                            .child(
+                                h_flex().gap(px(8.)).text_sm().text_color(t.muted_foreground).child("left").children(
+                                    window
+                                        .pace
+                                        .map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                                ),
                             ),
                     )
                     .when_some(window.next_refill.filter(|_| several), |el, refill| {
@@ -2346,6 +2351,11 @@ fn pool_segment(
     let name = account_name(account);
     let open = segments.card.open.as_deref() == Some(key.as_str());
     let fill = Hsla { a: color.a * 0.35, ..color };
+    // What the next reset gives back, hatched at the bar's spent end.
+    #[expect(clippy::cast_possible_truncation, reason = "a percentage")]
+    let refill = (100. - f64::from(remaining)).min(member.refill_percent) as f32;
+    let hatched = (remaining < 100 && logic::reset_ms(&member.window).is_some() && refill > 0.)
+        .then(|| hatch(Hsla { a: color.a * 0.2, ..color }, refill / 100.));
     let ring = t.ring;
     let view = segments.view.clone();
     let mut segment = div()
@@ -2363,6 +2373,7 @@ fn pool_segment(
         .child(
             div().absolute().top_0().bottom_0().left_0().w(relative(remaining as f32 / 100.)).rounded(px(6.)).bg(fill),
         )
+        .children(hatched)
         .children(time_left.map(|left| {
             div()
                 .absolute()
@@ -2571,6 +2582,31 @@ fn legend_row(
             });
         })
         .into_any_element()
+}
+
+/// `repeating-linear-gradient(135deg, color 0 1px, transparent 1px 5px)` over the right
+/// `width` of a bar.
+fn hatch(color: Hsla, width: f32) -> impl IntoElement {
+    const PERIOD: f32 = 5. * std::f32::consts::SQRT_2;
+    div().absolute().top_0().bottom_0().right_0().w(relative(width)).overflow_hidden().child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let mut offset = 0.;
+                while offset < width + height {
+                    let mut line = PathBuilder::stroke(px(1.));
+                    line.move_to(bounds.origin + point(px(offset), px(0.)));
+                    line.line_to(bounds.origin + point(px(offset - height), px(height)));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, color);
+                    }
+                    offset += PERIOD;
+                }
+            },
+        )
+        .size_full(),
+    )
 }
 
 /// `SegmentPopover`: the account, its plan and where it is signed in, the window, and its reset credits.

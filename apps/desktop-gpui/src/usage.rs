@@ -849,7 +849,7 @@ pub fn remaining_percent(window: &UsageWindow) -> u32 {
     window.remaining_percent()
 }
 
-fn reset_ms(window: &UsageWindow) -> Option<i64> {
+pub fn reset_ms(window: &UsageWindow) -> Option<i64> {
     window.resets_at.as_deref().and_then(parse_ms)
 }
 
