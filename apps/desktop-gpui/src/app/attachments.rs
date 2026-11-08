@@ -272,6 +272,7 @@ impl Workspace {
 
     pub(super) fn attachments_busy(&self) -> bool {
         self.attachments.iter().any(|a| a.upload == Upload::Uploading)
+            || self.target.as_ref().is_some_and(|target| self.reading_attachments.contains(target))
     }
 
     pub(super) fn has_attachments(&self) -> bool {
@@ -399,6 +400,9 @@ impl Workspace {
         if files.is_empty() {
             return;
         }
+        // The files belong to the composer they were added to, even if the user leaves it meanwhile.
+        let Some(origin) = self.target.clone() else { return };
+        self.reading_attachments.push(origin.clone());
         let read = cx.background_executor().spawn(async move {
             files
                 .into_iter()
@@ -412,28 +416,34 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let files = read.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(at) = this.reading_attachments.iter().position(|target| target == &origin) {
+                    this.reading_attachments.swap_remove(at);
+                }
+                let here = this.target.as_ref() == Some(&origin);
                 for (name, read) in files {
-                    let (kind, mime) = match classify(&name) {
-                        Ok(classified) => classified,
-                        Err(error) => {
-                            this.error = Some(error.into());
-                            continue;
-                        }
-                    };
-                    match read {
-                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => {
-                            this.add_attachment(name, kind, mime, bytes, window, cx);
-                        }
-                        Ok(Read::TooLarge(size)) => {
-                            this.error = this.attachment_error(&name, kind, size).map(Into::into);
-                        }
-                        Ok(Read::Bytes(_)) => {
-                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
-                        }
+                    let added = classify(&name).and_then(|(kind, mime)| match read {
+                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => Ok((kind, mime, bytes)),
+                        Ok(Read::TooLarge(size)) => Err(this.attachment_error(&name, kind, size).unwrap_or_default()),
+                        Ok(Read::Bytes(_)) => Err(format!("'{name}' is empty or could not be read.")),
                         Err(error) => {
                             log::warn!("could not read {name:?}: {error}");
-                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
+                            Err(format!("'{name}' is empty or could not be read."))
                         }
+                    });
+                    let result = match added {
+                        Ok((kind, mime, bytes)) if here => {
+                            this.add_attachment(name, kind, mime, bytes, window, cx);
+                            Ok(())
+                        }
+                        Ok((kind, mime, bytes)) => {
+                            this.stash_attachment(origin.clone(), name, kind, mime, bytes, cx).map(|_| ())
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Err(error) if here && !error.is_empty() => this.error = Some(error.into()),
+                        Err(error) if !error.is_empty() => log::warn!("an attachment for a left draft failed: {error}"),
+                        _ => {}
                     }
                 }
                 cx.notify();
@@ -546,19 +556,49 @@ impl Workspace {
         if let Some(error) = self.attachment_error(&name, Kind::Image, bytes.len() as u64) {
             return Err(error);
         }
+        let local_id = self
+            .stash_attachment(target, name, Kind::Image, mime, bytes, cx)
+            .map_err(|_| "Remove an attachment, then try this capture again.".to_owned())?;
+        if let Some((_, attachment)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) {
+            attachment.source = Some(source);
+        }
+        Ok(())
+    }
+
+    /// An attachment for `target`'s set-aside draft, with a file's chip at the end of its
+    /// prompt as the composer would add it; its local id, or why the draft can't take it.
+    fn stash_attachment(
+        &mut self,
+        target: Target,
+        name: String,
+        kind: Kind,
+        mime: &str,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if let Some(error) = self.attachment_error(&name, kind, bytes.len() as u64) {
+            return Err(error);
+        }
+        let full = || format!("You can attach up to {MAX_ATTACHMENTS} files per message.");
         let draft =
             self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
-        let full = || "Remove an attachment, then try this capture again.".to_owned();
-        let ComposerDraft::Prompt(_, kept) = draft else { return Err(full()) };
+        let ComposerDraft::Prompt(prompt, kept) = draft else { return Err(full()) };
         if kept.len() >= MAX_ATTACHMENTS {
             return Err(full());
         }
-        let mut attachment = Attachment::restored(Kind::Image.as_str(), name, mime.to_owned(), bytes);
-        attachment.source = Some(source);
+        let attachment = Attachment::restored(kind.as_str(), name, mime.to_owned(), bytes);
+        if kind == Kind::File {
+            let link = composer_text::context_link(kind.as_str(), &attachment.context_id(), &attachment.name);
+            if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
+                prompt.push(' ');
+            }
+            prompt.push_str(&link);
+            prompt.push(' ');
+        }
         let local_id = attachment.local_id.clone();
         kept.push(attachment);
-        self.upload(local_id, cx);
-        Ok(())
+        self.upload(local_id.clone(), cx);
+        Ok(local_id)
     }
 
     /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.

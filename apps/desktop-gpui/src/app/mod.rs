@@ -223,6 +223,8 @@ pub struct Workspace {
     environment_remote: bool,
     /// Files from the OS are being dragged over the chat canvas.
     dragging_files: bool,
+    /// Targets whose dropped or picked files are still being read, one entry per read.
+    reading_attachments: Vec<Target>,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
     sidebar_view: Entity<sidebar::SidebarView>,
@@ -424,6 +426,7 @@ impl Workspace {
             ctrl_held: false,
             environment_remote: false,
             dragging_files: false,
+            reading_attachments: Vec::new(),
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
             visit: visits::VisitTracker::default(),
