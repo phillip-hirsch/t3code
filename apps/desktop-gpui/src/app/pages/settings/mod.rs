@@ -259,6 +259,8 @@ pub(in crate::app) struct SettingsUi {
     nav_scroll: ScrollHandle,
     /// The row the arrow keys just moved to, scrolled into view on its next paint.
     nav_reveal: Rc<Cell<Option<&'static str>>>,
+    /// The last focused field's pending commit, run before Settings closes.
+    focused_field: Option<fields::FieldFlush>,
     _search_subscription: Subscription,
 }
 
@@ -312,6 +314,7 @@ impl SettingsUi {
             nav_tab_stop: None,
             nav_scroll: ScrollHandle::new(),
             nav_reveal: Rc::default(),
+            focused_field: None,
             _search_subscription: subscription,
         }
     }
@@ -488,7 +491,7 @@ impl Workspace {
                         .absolute()
                         .inset_0()
                         .bg(theme::dialog_backdrop(&t))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx))),
                 )
                 .child(
                     div()
@@ -570,7 +573,7 @@ impl Workspace {
             self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
             return true;
         }
-        self.close_settings(cx);
+        self.close_settings(window, cx);
         true
     }
 
@@ -652,6 +655,13 @@ impl Workspace {
             }
         }
         cx.stop_propagation();
+    }
+
+    /// Commits the focused field's draft before Settings unmounts it.
+    pub(in crate::app) fn flush_settings_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(flush) = self.settings_ui.focused_field.take() {
+            flush(self, window, cx);
+        }
     }
 
     pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
@@ -972,7 +982,7 @@ impl Workspace {
                         .rounded(px(8.))
                         .child(Icon::new(IconName::X).size(px(16.)))
                         .tooltip("Close (Esc)")
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx))),
                 ),
             )
             .into_any_element()

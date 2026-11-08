@@ -15,6 +15,34 @@ use crate::app::Workspace;
 
 type OnCommit<T> = Rc<dyn Fn(&mut Workspace, T, &mut Window, &mut Context<Workspace>)>;
 
+/// Commits the last focused field's draft. Closing Settings unmounts a focused field without a
+/// blur, so it runs this first (`AppRouteModal` blurs the focused element before closing).
+pub(super) type FieldFlush = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+/// A field's commit callback and the value it commits.
+type Pending<T> = Option<(OnCommit<T>, T)>;
+
+/// Records `field` as the one [`FieldFlush`] commits; `take` gives its pending commit.
+fn register_flush<F: 'static, T: 'static>(
+    field: WeakEntity<F>,
+    workspace: &WeakEntity<Workspace>,
+    take: fn(&mut F, &mut Window, &mut Context<F>) -> Pending<T>,
+    cx: &mut gpui_kit::App,
+) {
+    let flush: FieldFlush = Box::new(move |this, window, cx| {
+        if let Ok(Some((on_commit, value))) = field.update(cx, |field, cx| take(field, window, cx)) {
+            on_commit(this, value, window, cx);
+        }
+    });
+    let _ = workspace.update(cx, |this, _| this.settings_ui.focused_field = Some(flush));
+}
+
+/// Runs a commit [`TextField::take_commit`] or [`NumberField::take_commit`] gave.
+fn run_commit<T>(pending: Pending<T>, workspace: &WeakEntity<Workspace>, window: &mut Window, cx: &mut gpui_kit::App) {
+    let (Some((on_commit, value)), Some(workspace)) = (pending, workspace.upgrade()) else { return };
+    workspace.update(cx, |this, cx| on_commit(this, value, window, cx));
+}
+
 impl Workspace {
     /// A text field kept across frames, synced to `saved` and committing trimmed text on blur
     /// or Enter when it was edited (`DraftInput` and the uncontrolled `Textarea`s in the web).
@@ -128,11 +156,13 @@ impl NumberField {
         });
         input.update(cx, |input, cx| input.set_value(value.to_string(), window, cx));
         let subscriptions = [
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let typed = parse_number(&this.input.read(cx).value());
-                    this.commit(typed, window, cx);
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Focus => register_flush(cx.weak_entity(), &this.workspace, Self::take_commit, cx),
+                InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                    let pending = this.take_commit(window, cx);
+                    run_commit(pending, &this.workspace, window, cx);
                 }
+                InputEvent::Change => {}
             }),
             cx.subscribe_in(&input, window, |this, _, NumberInputEvent::Step(action), window, cx| {
                 let current = parse_number(&this.input.read(cx).value()).unwrap_or(this.value);
@@ -152,14 +182,24 @@ impl NumberField {
         }
     }
 
+    /// The typed number's commit, if it changed the value.
+    fn take_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Pending<i64> {
+        let typed = parse_number(&self.input.read(cx).value());
+        self.pending(typed, window, cx)
+    }
+
     fn commit(&mut self, next: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.pending(next, window, cx);
+        run_commit(pending, &self.workspace, window, cx);
+    }
+
+    fn pending(&mut self, next: Option<i64>, window: &mut Window, cx: &mut Context<Self>) -> Pending<i64> {
         let next = next.map_or(self.value, |next| next.clamp(self.min, self.max));
         self.input.update(cx, |input, cx| input.set_value(next.to_string(), window, cx));
         if next == self.value {
-            return;
+            return None;
         }
-        let (Some(on_commit), Some(workspace)) = (self.on_commit.clone(), self.workspace.upgrade()) else { return };
-        workspace.update(cx, |this, cx| on_commit(this, next, window, cx));
+        Some((self.on_commit.clone()?, next))
     }
 }
 
@@ -276,7 +316,6 @@ impl TextField {
     }
 
     fn on_event(&mut self, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let enter = matches!(event, InputEvent::PressEnter { .. }) && matches!(self.input, FieldInput::Line(_));
         match event {
             InputEvent::Change => {
                 self.edited = true;
@@ -289,22 +328,33 @@ impl TextField {
                 self.previous = next;
                 return;
             }
+            InputEvent::Focus => {
+                register_flush(cx.weak_entity(), &self.workspace, Self::take_commit, cx);
+                return;
+            }
             InputEvent::Blur => {}
-            _ if enter => {}
-            _ => return,
+            // A textarea's Enter is a newline.
+            InputEvent::PressEnter { .. } if matches!(self.input, FieldInput::Line(_)) => {}
+            InputEvent::PressEnter { .. } => return,
         }
+        let pending = self.take_commit(window, cx);
+        run_commit(pending, &self.workspace, window, cx);
+    }
+
+    /// The edited text's commit, if it differs from the saved value. A credential clears.
+    fn take_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Pending<String> {
         if !std::mem::take(&mut self.edited) {
-            return;
+            return None;
         }
         let value = self.input.value(cx).trim().to_owned();
         if value == self.saved {
-            return;
+            return None;
         }
-        let (Some(on_commit), Some(workspace)) = (self.on_commit.clone(), self.workspace.upgrade()) else { return };
-        workspace.update(cx, |this, cx| on_commit(this, value, window, cx));
+        let on_commit = self.on_commit.clone()?;
         if self.secret {
             self.input.set_value("", window, cx);
         }
+        Some((on_commit, value))
     }
 }
 

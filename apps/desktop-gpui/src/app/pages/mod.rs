@@ -143,8 +143,10 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
-        if self.settings.take().is_some() {
+    pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.flush_settings_field(window, cx);
+            self.settings = None;
             self.record_location();
             cx.notify();
         }
@@ -165,6 +167,9 @@ impl Workspace {
     /// Shows a history entry. The push that follows each step lands on the
     /// entry itself, so history is left where the step put it.
     fn go_to(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.flush_settings_field(window, cx);
+        }
         self.settings = None;
         self.page = None;
         match location {

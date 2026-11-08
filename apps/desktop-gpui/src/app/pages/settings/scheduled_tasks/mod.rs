@@ -227,7 +227,7 @@ impl ScheduledTasksView {
                 .hover(move |style| style.text_color(fg))
                 .on_click(move |_, window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.close_settings(cx);
+                        this.close_settings(window, cx);
                         this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
                     });
                 })

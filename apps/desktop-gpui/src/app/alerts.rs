@@ -67,7 +67,7 @@ impl Workspace {
         let thread_id = alert.thread_id.clone();
         let open_thread: Callback = Rc::new(move |window, cx| {
             let _ = workspace.update(cx, |this, cx| {
-                this.close_settings(cx);
+                this.close_settings(window, cx);
                 this.select_thread(thread_id.clone(), window, cx);
             });
         });
