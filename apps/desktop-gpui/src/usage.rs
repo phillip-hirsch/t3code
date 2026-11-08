@@ -312,6 +312,15 @@ pub struct EnvironmentUsage {
     pub summary: Summary,
 }
 
+/// `usageSummary`'s `staleTimeMs`: a cold transcript scan takes seconds, so an answer this fresh is reused.
+const SUMMARY_STALE_MS: i64 = 60_000;
+
+/// Whether the page reads usage again: nothing answered yet, the answer went stale, or the
+/// prices or model aliases it was priced with changed (`refreshTrigger: usageScanSettingsAtom`).
+pub fn needs_read(answered_at: Option<i64>, now: i64, scan_settings_changed: bool) -> bool {
+    answered_at.is_none_or(|at| now - at >= SUMMARY_STALE_MS) || scan_settings_changed
+}
+
 /// An answer left out of the totals because its contract version differs (`UsageContractMismatch`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContractMismatch {
@@ -1710,6 +1719,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(merge(&separate, &[]).sessions, 4, "different machines both count");
+    }
+
+    #[test]
+    fn usage_is_read_again_once_stale_or_repriced() {
+        assert!(needs_read(None, 0, false), "nothing answered yet");
+        assert!(!needs_read(Some(1_000), 1_000 + SUMMARY_STALE_MS - 1, false));
+        assert!(needs_read(Some(1_000), 1_000 + SUMMARY_STALE_MS, false), "a minute old");
+        assert!(needs_read(Some(1_000), 1_000, true), "prices or aliases changed");
     }
 
     #[test]

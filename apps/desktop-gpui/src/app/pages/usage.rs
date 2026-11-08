@@ -41,6 +41,9 @@ pub(in crate::app) struct UsageState {
     merged: Rc<Merged>,
     /// Answers left out of the totals for their contract version.
     mismatches: Vec<logic::ContractMismatch>,
+    /// When the last answer landed, and each environment's prices and aliases the read went out with.
+    answered_at: Option<i64>,
+    scan_settings: Vec<(SharedString, Value)>,
     error: Option<SharedString>,
     loading: bool,
     refreshing: bool,
@@ -160,6 +163,8 @@ impl Default for UsageState {
             summary: None,
             merged: Rc::default(),
             mismatches: Vec::new(),
+            answered_at: None,
+            scan_settings: Vec::new(),
             error: None,
             loading: false,
             refreshing: false,
@@ -186,13 +191,18 @@ impl UsageState {
     }
 }
 
+/// What a usage read is priced with on one environment (`usageScanSettingsAtom`).
+fn scan_settings(info: &crate::model::ServerInfo) -> Value {
+    json!([info.settings.get("usagePriceOverrides"), info.settings.get("usageModelAliases")])
+}
+
 impl Workspace {
     pub(in crate::app) fn usage_opened(&mut self, cx: &mut Context<Self>) {
         self.usage.limits_now = now_ms();
         if self.usage.metric == "limits" {
             self.refresh_limits(true, cx);
-        } else if self.usage.summary.is_none() && !self.usage.loading {
-            self.read_usage(false, cx);
+        } else {
+            self.revalidate_usage(cx);
         }
     }
 
@@ -202,10 +212,30 @@ impl Workspace {
         if metric == "limits" {
             self.usage.limits_now = now_ms();
             self.refresh_limits(true, cx);
-        } else if self.usage.summary.is_none() && !self.usage.loading {
-            self.read_usage(false, cx);
+        } else {
+            self.revalidate_usage(cx);
         }
         cx.notify();
+    }
+
+    /// Reads usage again when the shown answer is stale or was priced differently; the old one
+    /// stays on screen until the new one lands.
+    fn revalidate_usage(&mut self, cx: &mut Context<Self>) {
+        if !self.usage.loading
+            && logic::needs_read(self.usage.answered_at, now_ms(), self.usage_scan_settings_changed())
+        {
+            self.read_usage(false, cx);
+        }
+    }
+
+    /// A connected environment's prices or model aliases differ from what the last read went out with.
+    fn usage_scan_settings_changed(&self) -> bool {
+        let environments = self.limit_environments();
+        environments.len() != self.usage.scan_settings.len()
+            || environments
+                .iter()
+                .zip(&self.usage.scan_settings)
+                .any(|((id, _, info), (read_id, read))| id != read_id || scan_settings(info) != *read)
     }
 
     /// `usage.*` on the open Usage page (`UsagePage.tsx`): `None` when `command` is not one;
@@ -288,7 +318,10 @@ impl Workspace {
         if machines.is_empty() {
             return;
         }
+        let scan: Vec<(SharedString, Value)> =
+            self.limit_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
         let usage = &mut self.usage;
+        usage.scan_settings = scan;
         usage.generation += 1;
         let generation = usage.generation;
         usage.loading = true;
@@ -329,6 +362,9 @@ impl Workspace {
                     }
                     again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
                     let answered = !answers.is_empty();
+                    if answered {
+                        usage.answered_at = Some(now_ms());
+                    }
                     match (logic::combine(answers), failure) {
                         (Some((summary, mismatches)), _) => {
                             usage.error = None;
@@ -720,6 +756,12 @@ impl Workspace {
         if limits {
             return self.render_limits(t, cx);
         }
+        // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
+        if usage.summary.is_some() && !usage.loading && self.usage_scan_settings_changed() {
+            let view = cx.entity();
+            cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
+        }
+        let usage = &self.usage;
         match (&usage.summary, &usage.error) {
             (None, Some(error)) => v_flex()
                 .py(px(48.))
