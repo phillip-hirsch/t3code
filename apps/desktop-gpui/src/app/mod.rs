@@ -48,6 +48,7 @@ mod files;
 mod find;
 mod fresh_session;
 mod git;
+mod guest_share;
 mod header;
 mod host_picker;
 mod inspector;
@@ -242,6 +243,7 @@ pub struct Workspace {
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
+    share_header: guest_share::ShareHeader,
     /// The composer's "Run on" picker and each draft's machine choice.
     host: host_picker::HostUi,
     _connection_task: Task<()>,
@@ -431,6 +433,7 @@ impl Workspace {
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::new(cx),
+            share_header: Default::default(),
             host: Default::default(),
             _connection_task: Self::connect(window, cx),
             landed: false,

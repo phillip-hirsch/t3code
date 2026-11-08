@@ -1078,6 +1078,19 @@ pub struct AppThread {
     /// Why the last `checkpoint.rollback` failed, keyed by its command id.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
+    /// The thread's guest link, kept after it expires until the owner stops sharing.
+    #[serde(default)]
+    pub guest_share: Option<GuestShare>,
+}
+
+/// `ThreadGuestShare`: what the header shows of a guest link.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestShare {
+    pub expires_at: String,
+    /// Set once the guest redeems the link.
+    #[serde(default)]
+    pub guest_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

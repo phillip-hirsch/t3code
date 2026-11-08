@@ -156,9 +156,11 @@ impl Workspace {
         let container = h_flex()
             .flex_1()
             .min_w_0()
+            .gap_3()
             .pr(px(if panel_open { 40. } else { 96. }))
             .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx));
-        header.child(container.child(breadcrumb.child(current))).children(self.render_title_menu())
+        let share = self.render_guest_share_indicator(cx);
+        header.child(container.child(breadcrumb.child(current)).children(share)).children(self.render_title_menu())
     }
 
     /// `onContextMenu` on the breadcrumb container. On Windows only its buttons get the click:

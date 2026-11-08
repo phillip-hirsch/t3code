@@ -756,6 +756,7 @@ impl Workspace {
             path: thread.worktree_path.clone().or_else(|| project.map(|p| p.workspace_root.clone())),
             branch: thread.branch.clone(),
             link: info.environment_id.as_deref().map(|env| hosted_thread_link(env, &thread.id)),
+            share: self.can_share_with_guest(&thread.environment_id),
             running: !facts.can_archive(),
         })
     }
@@ -901,6 +902,8 @@ pub(in crate::app) struct ThreadMenu {
     link: Option<String>,
     running: bool,
     find: bool,
+    /// "Share with guest": its own grant, so read-only connections keep it (`canShareWithGuest`).
+    share: bool,
     /// A No project thread with its own folder, on a server that can promote it.
     turn_into_project: bool,
 }
@@ -1059,6 +1062,10 @@ impl ThreadMenu {
             json!({}),
             cx
         )));
+        if self.share {
+            menu = menu
+                .item(act!(item("Share with guest"), |this, window, cx, id| this.open_guest_share(&id, window, cx)));
+        }
         if let Some((label, scope)) = self.filter {
             menu = menu.item(op!(item(&label), false, |this, _w, cx, _id| this.set_scope(scope.clone(), cx)));
         }
