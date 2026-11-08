@@ -1451,9 +1451,14 @@ impl Workspace {
         if shown.is_empty() && !can_react {
             return None;
         }
+        // `focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring`
+        let ring = t.ring;
+        let focus_ring = move |s: gpui_kit::StyleRefinement| {
+            s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
+        };
         let pill = |id: String| {
-            h_flex()
-                .id(ElementId::Name(id.into()))
+            gpui_kit::base::Button::new(ElementId::Name(id.into()))
+                .focus_visible(focus_ring)
                 .h(px(24.))
                 .flex_none()
                 .gap(px(4.))
@@ -1483,6 +1488,8 @@ impl Workspace {
                         }
                     })
                     .when(can_react, |el| el.cursor_pointer().hover(|s| s.border_color(Hsla { a: 0.6, ..t.primary })))
+                    .disabled(!can_react)
+                    .accessibility_label(format!("{name}, {}", reaction.count))
                     .child(emoji)
                     .child(reaction.count.to_string())
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -1516,12 +1523,11 @@ impl Workspace {
                     .children(REACTIONS.iter().map(|(content, emoji, _)| {
                         let pressed = reacted.iter().any(|(c, r)| c == content && *r);
                         let (subject, content) = (subject.clone(), (*content).to_owned());
-                        div()
-                            .id(ElementId::Name(format!("pr-react-pick:{content}").into()))
+                        let name = REACTIONS.iter().find(|r| r.0 == content).map_or("", |r| r.2);
+                        gpui_kit::base::Button::new(ElementId::Name(format!("pr-react-pick:{content}").into()))
+                            .focus_visible(focus_ring)
+                            .accessibility_label(name)
                             .size(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
                             .rounded(px(6.))
                             .text_base()
                             .cursor_pointer()
