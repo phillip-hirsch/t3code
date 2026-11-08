@@ -50,6 +50,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/github.svg", include_bytes!("../assets/icons/github.svg")),
     // Lucide's star with `fill-current`.
     ("icons/app/star-filled.svg", include_bytes!("../assets/icons/star-filled.svg")),
+    // Lucide's play with `fill-current`.
+    ("icons/app/play-filled.svg", include_bytes!("../assets/icons/play-filled.svg")),
 ];
 
 /// Lucide icons outside gpui-kit's default bundle, or redrawn at the web's 1.75
