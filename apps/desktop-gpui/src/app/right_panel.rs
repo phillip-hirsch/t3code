@@ -413,6 +413,7 @@ pub(super) struct RightPanel {
     tree_rows: std::rc::Rc<[diff_tree::Row]>,
     /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
+    toolbar_focus: DiffToolbarFocus,
     _diff_events: Subscription,
 }
 
@@ -468,7 +469,37 @@ impl RightPanel {
             tree_selected: None,
             tree_rows: std::rc::Rc::new([]),
             pending_reveal: None,
+            toolbar_focus: DiffToolbarFocus::new(cx),
             _diff_events: diff_events,
+        }
+    }
+}
+
+/// The diff toolbar's Tab stops (`Button` and `Toggle`); the layout segments are one stop
+/// between them, like the web's `ToggleGroup`.
+struct DiffToolbarFocus {
+    refresh: FocusHandle,
+    collapse: FocusHandle,
+    stacked: FocusHandle,
+    split: FocusHandle,
+    wrap: FocusHandle,
+    whitespace: FocusHandle,
+    tests: FocusHandle,
+    tree: FocusHandle,
+}
+
+impl DiffToolbarFocus {
+    fn new(cx: &mut App) -> Self {
+        let stop = || cx.focus_handle().tab_stop(true);
+        Self {
+            refresh: stop(),
+            collapse: stop(),
+            stacked: stop(),
+            split: stop(),
+            wrap: stop(),
+            whitespace: stop(),
+            tests: stop(),
+            tree: stop(),
         }
     }
 }
@@ -2343,6 +2374,7 @@ impl Workspace {
         let (test_files, hide_tests, tree_open) =
             (self.right_panel.diff_test_files, self.right_panel.hide_test_files, self.right_panel.tree_open);
         let has_files = !self.right_panel.all_diff_files.is_empty();
+        let focus = &self.right_panel.toolbar_focus;
         let header = h_flex()
             .h(px(28.))
             .mb_3()
@@ -2374,7 +2406,7 @@ impl Workspace {
                     }))
                     .when(can_refresh, |el| {
                         el.child(
-                            icon_toggle("diff-refresh", "icons/refresh-cw.svg", false, tokens, cx)
+                            icon_toggle("diff-refresh", "icons/refresh-cw.svg", false, tokens, &focus.refresh)
                                 .tooltip(|window, cx| Tooltip::new("Refresh diff").build(window, cx))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.right_panel.refresh += 1;
@@ -2387,7 +2419,7 @@ impl Workspace {
                         let path =
                             if all_collapsed { "icons/chevrons-up-down.svg" } else { "icons/chevrons-down-up.svg" };
                         el.child(
-                            icon_toggle("diff-collapse", path, false, tokens, cx)
+                            icon_toggle("diff-collapse", path, false, tokens, &focus.collapse)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let shown: Vec<SharedString> = this
@@ -2411,7 +2443,7 @@ impl Workspace {
                     .child(self.render_layout_toggle(tokens, cx))
                     .child({
                         let label = if wrap { "Disable line wrapping" } else { "Enable line wrapping" };
-                        icon_toggle("diff-wrap", "icons/text-wrap.svg", wrap, tokens, cx)
+                        icon_toggle("diff-wrap", "icons/text-wrap.svg", wrap, tokens, &focus.wrap)
                             .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.right_panel.wrap = Some(!wrap);
@@ -2421,12 +2453,18 @@ impl Workspace {
                     .child({
                         let label =
                             if ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" };
-                        icon_toggle("diff-whitespace", "icons/pilcrow.svg", ignore_whitespace, tokens, cx)
-                            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
-                                cx.notify();
-                            }))
+                        icon_toggle(
+                            "diff-whitespace",
+                            "icons/pilcrow.svg",
+                            ignore_whitespace,
+                            tokens,
+                            &focus.whitespace,
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
+                            cx.notify();
+                        }))
                     })
                     .when(test_files > 0, |el| {
                         let label: SharedString = match (hide_tests, test_files) {
@@ -2435,18 +2473,24 @@ impl Workspace {
                             (false, _) => "Hide test files".into(),
                         };
                         el.child(
-                            icon_toggle("diff-hide-tests", "icons/flask-conical-off.svg", hide_tests, tokens, cx)
-                                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.right_panel.hide_test_files = !hide_tests;
-                                    this.apply_diff_files(cx);
-                                })),
+                            icon_toggle(
+                                "diff-hide-tests",
+                                "icons/flask-conical-off.svg",
+                                hide_tests,
+                                tokens,
+                                &focus.tests,
+                            )
+                            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.right_panel.hide_test_files = !hide_tests;
+                                this.apply_diff_files(cx);
+                            })),
                         )
                     })
                     .when(has_files, |el| {
                         let label = if tree_open { "Hide file tree" } else { "Show file tree" };
                         el.child(
-                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, cx)
+                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, &focus.tree)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.right_panel.tree_open = !tree_open;
@@ -2570,11 +2614,29 @@ impl Workspace {
     /// The stacked / split segmented toggle (`ToggleGroup variant="segmented"`), saved as `diffLayout`.
     fn render_layout_toggle(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let split = self.diff_mode() == DiffMode::Split;
+        let focus = &self.right_panel.toolbar_focus;
+        let ring = tokens.ring;
         let segment = |id: &'static str, path: &'static str, pressed: bool, value: bool, cx: &mut Context<Self>| {
             let pressed_bg = tokens.input.opacity(0.72);
             let hover = tokens.input.opacity(0.32);
+            // One Tab stop on the pressed segment; the arrows, Home and End move between them.
+            let own = if value { &focus.split } else { &focus.stacked };
+            let (stacked, split_focus) = (focus.stacked.clone(), focus.split.clone());
             div()
                 .id(id)
+                .track_focus(&own.clone().tab_stop(pressed))
+                .focus_visible(move |s| s.border_2().border_color(ring))
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    let to_split = match event.keystroke.key.as_str() {
+                        _ if event.keystroke.modifiers.modified() => return,
+                        "left" | "right" | "up" | "down" => !value,
+                        "home" => false,
+                        "end" => true,
+                        _ => return,
+                    };
+                    window.focus(if to_split { &split_focus } else { &stacked }, cx);
+                    cx.stop_propagation();
+                })
                 .h(px(24.))
                 .px(px(10.))
                 .flex()
@@ -2900,16 +2962,19 @@ fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
 }
 
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
+/// A toolbar button or toggle: a Tab stop that Enter and Space press, ringed while focused by key.
 fn icon_toggle(
     id: &'static str,
     path: &'static str,
     pressed: bool,
     tokens: &Tokens,
-    _: &mut Context<Workspace>,
+    focus: &FocusHandle,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let accent = tokens.accent;
+    let (accent, ring) = (tokens.accent, tokens.ring);
     div()
         .id(id)
+        .track_focus(focus)
+        .focus_visible(move |s| s.border_2().border_color(ring))
         .size(px(28.))
         .flex_none()
         .flex()
