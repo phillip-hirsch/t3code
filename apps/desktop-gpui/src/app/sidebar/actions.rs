@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{MenuMetrics, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -1000,8 +1000,23 @@ pub(in crate::app) struct ThreadMenu {
 
 /// Electron shows a thread's menu natively: on Windows, Segoe UI at 9pt in 28px rows (26px plus
 /// the menu's 2px row gap). macOS keeps the reviewed look.
-fn native_rows(menu: PopupMenu) -> PopupMenu {
-    if cfg!(windows) { menu.item_text(Some("Segoe UI".into()), px(12.), px(26.)) } else { menu }
+/// Electron's Windows menu: Segoe UI rows 28px tall, 21px text inset, 17px separators, and its
+/// own dark colors (the light ones follow the theme).
+fn native_rows(menu: PopupMenu, cx: &gpui_kit::App) -> PopupMenu {
+    if !cfg!(windows) {
+        return menu;
+    }
+    let dark = gpui_kit::component::ActiveTheme::theme(cx).is_dark();
+    menu.metrics(MenuMetrics {
+        font_family: Some("Segoe UI".into()),
+        text_size: px(12.),
+        row_height: px(28.),
+        padding_y: px(11.),
+        item_padding_x: px(17.),
+        separator_height: px(17.),
+        background: dark.then(|| gpui_kit::rgb(0x1f1f1f).into()),
+        separator: dark.then(|| gpui_kit::rgb(0x5e5e5e).into()),
+    })
 }
 
 /// `getOrphanedWorktreePathForThread`: the thread's worktree when no other listed thread uses it.
@@ -1064,7 +1079,7 @@ impl ThreadMenu {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         // Electron shows this as a native menu: plain rows, a trash icon on Delete only (macOS).
-        menu = native_rows(menu);
+        menu = native_rows(menu, cx);
         let item = |label: &str| PopupMenuItem::new(label.to_owned());
         let origin = self.origin;
         let advance = origin == MenuOrigin::Sidebar;
@@ -1123,8 +1138,8 @@ impl ThreadMenu {
                 (Some(_), false) if !can_operate => menu.item(locked_submenu("Snooze", window, cx)),
                 (Some(snooze), false) => {
                     let (snooze, view) = (snooze.clone(), view.clone());
-                    menu.submenu("Snooze", window, cx, move |menu, _, _| {
-                        snooze.add_to(&view, native_rows(menu).min_w(px(160.)))
+                    menu.submenu("Snooze", window, cx, move |menu, _, cx| {
+                        snooze.add_to(&view, native_rows(menu, cx).min_w(px(160.)))
                     })
                 }
                 (None, false) => menu.item(item("Snooze").disabled(true)),
@@ -1167,8 +1182,8 @@ impl ThreadMenu {
             menu = menu.item(locked_submenu("Auto-settle behavior", window, cx));
         } else if let Some(enabled) = self.auto_settle {
             let (view, id) = (view.clone(), self.thread_id.clone());
-            menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, _| {
-                let mut menu = native_rows(menu);
+            menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, cx| {
+                let mut menu = native_rows(menu, cx);
                 for (label, on) in [("Enabled", true), ("Disabled", false)] {
                     let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
@@ -1183,8 +1198,8 @@ impl ThreadMenu {
         menu = menu.separator();
         let (path, branch, link, id) =
             (self.path.clone(), self.branch.clone(), self.link.clone(), self.thread_id.clone());
-        menu = menu.submenu("Copy", window, cx, move |menu, _, _| {
-            let mut menu = native_rows(menu);
+        menu = menu.submenu("Copy", window, cx, move |menu, _, cx| {
+            let mut menu = native_rows(menu, cx);
             let copy = |text: String| {
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));

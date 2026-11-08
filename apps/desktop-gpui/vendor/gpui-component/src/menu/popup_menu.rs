@@ -7,7 +7,7 @@ use crate::{ActiveTheme, ElementExt, Icon, IconName, Sizable as _, h_flex, v_fle
 use crate::{Side, Size, kbd::Kbd};
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
+    EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
     Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
 };
@@ -18,6 +18,25 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 const CONTEXT: &str = "PopupMenu";
+
+/// A menu's rows and chrome in place of the theme's, e.g. to match a platform's native menus.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuMetrics {
+    /// The items' font family; the theme's when `None`.
+    pub font_family: Option<SharedString>,
+    pub text_size: Pixels,
+    pub row_height: Pixels,
+    /// The rows' inset from the menu's top and bottom edges, with no gap between rows.
+    pub padding_y: Pixels,
+    /// Each row's text inset, inside the menu's 4px side padding.
+    pub item_padding_x: Pixels,
+    /// A separator's height, its 1px line in the middle.
+    pub separator_height: Pixels,
+    /// The menu's background; the theme's popover when `None`.
+    pub background: Option<Hsla>,
+    /// The separator line; the theme's border when `None`.
+    pub separator: Option<Hsla>,
+}
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -300,9 +319,7 @@ pub struct PopupMenu {
     max_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
     size: Size,
-    /// The items' font and text size and the rows' height, in place of the theme's `text_sm`
-    /// rows, e.g. to match a platform's native menus.
-    item_text: Option<(Option<SharedString>, Pixels, Pixels)>,
+    metrics: Option<MenuMetrics>,
     check_side: Side,
     /// Indexes of the items added as options that can be checked, so an
     /// unchecked one reports its state rather than reading as a command.
@@ -357,7 +374,7 @@ impl PopupMenu {
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
             size: Size::default(),
-            item_text: None,
+            metrics: None,
             submenu_anchor: (Anchor::TopLeft, Pixels::ZERO),
             priority: gpui_base::POPUP_PRIORITY,
             _subscriptions: vec![],
@@ -442,9 +459,9 @@ impl PopupMenu {
         self
     }
 
-    /// Set the items' font family (the theme's when `None`), text size and row height.
-    pub fn item_text(mut self, family: Option<SharedString>, size: Pixels, height: Pixels) -> Self {
-        self.item_text = Some((family, size, height));
+    /// Rows and chrome in place of the theme's, see [`MenuMetrics`].
+    pub fn metrics(mut self, metrics: MenuMetrics) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -1292,16 +1309,17 @@ impl PopupMenu {
             Size::Small => (px(20.), options.radius.half()),
             _ => (px(26.), options.radius),
         };
-        let item_height = self.item_text.as_ref().map_or(item_height, |(_, _, height)| *height);
+        let metrics = self.metrics.as_ref();
+        let item_height = metrics.map_or(item_height, |m| m.row_height);
 
         let this = MenuItemElement::new(ix)
             .relative()
-            .map(|this| match &self.item_text {
-                Some((_, size, _)) => this.text_size(*size),
+            .map(|this| match metrics {
+                Some(m) => this.text_size(m.text_size),
                 None => this.text_sm(),
             })
             .py_0()
-            .px(INNER_PADDING)
+            .px(metrics.map_or(INNER_PADDING, |m| m.item_padding_x))
             .rounded(radius)
             .items_center()
             .selected(selected)
@@ -1335,14 +1353,22 @@ impl PopupMenu {
             );
 
         match item {
-            PopupMenuItem::Separator => this
-                .h_auto()
-                .p_0()
-                .my_0p5()
-                .mx_neg_1()
-                .border_b(px(2.))
-                .border_color(cx.theme().border)
-                .disabled(true),
+            PopupMenuItem::Separator => match metrics {
+                Some(m) => this.h(m.separator_height).p_0().mx_neg_1().disabled(true).child(
+                    div()
+                        .w_full()
+                        .h(px(1.))
+                        .bg(m.separator.unwrap_or(cx.theme().border)),
+                ),
+                None => this
+                    .h_auto()
+                    .p_0()
+                    .my_0p5()
+                    .mx_neg_1()
+                    .border_b(px(2.))
+                    .border_color(cx.theme().border)
+                    .disabled(true),
+            },
             PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
                 h_flex()
                     .cursor_default()
@@ -1572,7 +1598,11 @@ impl Render for PopupMenu {
             .popover_style(cx)
             .text_color(cx.theme().popover_foreground)
             .when_some(
-                self.item_text.as_ref().and_then(|(family, ..)| family.clone()),
+                self.metrics.as_ref().and_then(|m| m.background),
+                |this, background| this.bg(background),
+            )
+            .when_some(
+                self.metrics.as_ref().and_then(|m| m.font_family.clone()),
                 |this, family| this.font_family(family),
             )
             .relative()
@@ -1580,8 +1610,10 @@ impl Render for PopupMenu {
             .child(
                 v_flex()
                     .id("items")
-                    .p_1()
-                    .gap_y_0p5()
+                    .map(|this| match &self.metrics {
+                        Some(m) => this.px_1().py(m.padding_y),
+                        None => this.p_1().gap_y_0p5(),
+                    })
                     .min_w(rems(8.))
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                     .max_w(max_width)
