@@ -306,6 +306,10 @@ impl Workspace {
                             this.remember_interaction_mode(origin.clone(), mode);
                         }
                         this.record_prompt_sent(window, cx);
+                        if new_thread_id.is_some() {
+                            // The launched draft's picks went with it.
+                            this.composer_selections.remove(&origin);
+                        }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {
                             // A background launch leaves a fresh draft in its place.

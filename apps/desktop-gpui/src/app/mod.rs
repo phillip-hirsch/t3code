@@ -191,6 +191,8 @@ pub struct Workspace {
     question: Option<QuestionDraft>,
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
+    /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
+    composer_selections: HashMap<Target, composer::ComposerSelection>,
     /// The request whose response is in flight.
     responding: Option<String>,
     /// The `@` / `$` / `/` menu.
@@ -398,6 +400,7 @@ impl Workspace {
             timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
             composer_drafts: HashMap::new(),
+            composer_selections: HashMap::new(),
             responding: None,
             menu: Default::default(),
             picker: Default::default(),
@@ -770,6 +773,7 @@ impl Workspace {
         // Its draft has nowhere to go: drop it rather than leave it in the editor.
         if let Some(target) = self.target.take() {
             self.composer_drafts.remove(&target);
+            self.composer_selections.remove(&target);
         }
         self.attachments.clear();
         self.set_composer_text("", window, cx);
@@ -852,8 +856,9 @@ impl Workspace {
             retried: false,
             _subscription: None,
         });
-        self.model_override = None;
-        self.model_explicit = false;
+        let saved = self.target.as_ref().and_then(|target| self.composer_selections.remove(target));
+        self.model_override = saved.as_ref().and_then(|saved| saved.model.clone());
+        self.model_explicit = saved.is_some_and(|saved| saved.explicit);
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
@@ -884,13 +889,27 @@ impl Workspace {
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
-        if opened {
-            let project = self.target_project();
-            self.model_override =
-                crate::new_thread::new_draft_model(self.server_info(), project, carried, self.sticky_model.as_ref());
-            self.model_explicit = false;
+        let saved = self.target.as_ref().and_then(|target| self.composer_selections.remove(target));
+        match saved.filter(|_| opened) {
+            Some(saved) => {
+                self.model_override = saved.model;
+                self.model_explicit = saved.explicit;
+                self.runtime_mode_override = saved.runtime_mode;
+            }
+            None => {
+                if opened {
+                    let project = self.target_project();
+                    self.model_override = crate::new_thread::new_draft_model(
+                        self.server_info(),
+                        project,
+                        carried,
+                        self.sticky_model.as_ref(),
+                    );
+                    self.model_explicit = false;
+                }
+                self.runtime_mode_override = None;
+            }
         }
-        self.runtime_mode_override = None;
         self.restore_composer(window, cx);
         if opened {
             self.freeze_open_draft(cx);

@@ -113,6 +113,13 @@ pub(super) enum ComposerDraft {
     Question(QuestionDraft),
 }
 
+/// A target's model and permissions picks while another one is on screen.
+pub(super) struct ComposerSelection {
+    pub(super) model: Option<ModelSelection>,
+    pub(super) explicit: bool,
+    pub(super) runtime_mode: Option<String>,
+}
+
 impl Workspace {
     /// A user edit. While a question is open the editor holds its custom answer;
     /// programmatic changes (`set_composer_text`) never reach the draft.
@@ -212,6 +219,16 @@ impl Workspace {
     /// Keeps the leaving target's composer; call before the target changes.
     pub(super) fn stash_composer(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
+        if self.model_override.is_some() || self.runtime_mode_override.is_some() {
+            let selection = ComposerSelection {
+                model: self.model_override.clone(),
+                explicit: self.model_explicit,
+                runtime_mode: self.runtime_mode_override.clone(),
+            };
+            self.composer_selections.insert(target.clone(), selection);
+        } else {
+            self.composer_selections.remove(&target);
+        }
         let attachments = std::mem::take(&mut self.attachments);
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
             (Some(question), _) => ComposerDraft::Question(question),
