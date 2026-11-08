@@ -238,10 +238,19 @@ struct Group {
     rows: Vec<Row>,
 }
 
+/// What a folder listing answers: the machine, the folder relative paths start from, and the
+/// directory. A listing for another key is stale.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BrowseKey {
+    environment: Option<SharedString>,
+    cwd: Option<String>,
+    directory: String,
+}
+
 /// The folder listing behind the browse view (`filesystem.browse`).
 #[derive(Default)]
 struct Browse {
-    directory: String,
+    key: BrowseKey,
     parent: Option<String>,
     entries: Vec<(String, String)>,
     loading: bool,
@@ -457,6 +466,27 @@ pub(super) fn project_title_from_path(path: &str) -> String {
 }
 
 /// `filterFilesystemBrowseEntries`: prefix match on the leaf; dot folders only for a dot leaf.
+impl Browse {
+    /// The listing, when it answers `key`.
+    fn of(&self, key: &BrowseKey) -> Option<&Self> {
+        (self.key == *key).then_some(self)
+    }
+}
+
+/// What Enter adds for `query`: the folder the listing resolved it to, else the typed path. Pass
+/// only the listing of `query`'s own directory on the browse machine and cwd.
+fn submit_path(browse: Option<&Browse>, query: &str) -> Option<String> {
+    let leaf = split_browse(query).1;
+    let resolved = browse.and_then(|browse| {
+        if leaf.is_empty() {
+            browse.parent.clone()
+        } else {
+            browse.entries.iter().find(|(name, _)| name == leaf).map(|(_, full)| full.clone())
+        }
+    });
+    resolved.or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()))
+}
+
 pub(super) fn filter_entries<'a>(entries: &'a [(String, String)], leaf: &str) -> Vec<&'a (String, String)> {
     let lower = leaf.to_lowercase();
     entries
@@ -594,6 +624,15 @@ impl Workspace {
         Some(project.workspace_root.clone())
     }
 
+    fn browse_key(&self, directory: &str) -> BrowseKey {
+        BrowseKey { environment: self.browse_environment(), cwd: self.browse_cwd(), directory: directory.to_owned() }
+    }
+
+    /// The listing of `directory` on the current browse machine and cwd, once it was asked for.
+    fn current_browse(&self, directory: &str) -> Option<&Browse> {
+        self.palette.as_ref()?.browse.of(&self.browse_key(directory))
+    }
+
     /// `relativePathNeedsActiveProject`.
     fn relative_needs_project(&self, query: &str) -> bool {
         is_explicit_relative(query.trim()) && self.browse_cwd().is_none()
@@ -708,30 +747,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Lists `directory` through `filesystem.browse`, once per directory.
+    /// Lists `directory` through `filesystem.browse`, once per machine, cwd and directory.
     fn browse_folder(&mut self, directory: String, cx: &mut Context<Self>) {
-        let cwd = self.browse_cwd();
-        let Some(client) = self.browse_environment().and_then(|environment| self.env_client(&environment)) else {
+        let key = self.browse_key(&directory);
+        let Some(client) = key.environment.as_ref().and_then(|environment| self.env_client(environment)) else {
             return;
         };
         let Some(palette) = &mut self.palette else { return };
-        if palette.browse.directory == directory && (palette.browse.loading || palette.browse.error.is_none()) {
+        if palette.browse.key == key && (palette.browse.loading || palette.browse.error.is_none()) {
             return;
         }
-        palette.browse = Browse { directory: directory.clone(), loading: true, ..Browse::default() };
+        palette.browse = Browse { key: key.clone(), loading: true, ..Browse::default() };
         if directory.is_empty() {
             palette.browse.loading = false;
             return;
         }
         let mut input = json!({"partialPath": directory});
-        if let Some(cwd) = cwd {
-            input["cwd"] = cwd.into();
+        if let Some(cwd) = &key.cwd {
+            input["cwd"] = cwd.clone().into();
         }
         palette.browse._task = Some(cx.spawn(async move |this, cx| {
             let result = client.request("filesystem.browse", input).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(browse) = this.palette.as_mut().map(|p| &mut p.browse).filter(|b| b.directory == directory)
-                else {
+                let Some(browse) = this.palette.as_mut().map(|p| &mut p.browse).filter(|b| b.key == key) else {
                     return;
                 };
                 browse.loading = false;
@@ -1502,20 +1540,18 @@ impl Workspace {
     }
 
     fn browse_groups(&self, query: &str) -> Vec<Group> {
-        let Some(palette) = &self.palette else { return Vec::new() };
         // A relative path lists nothing until there is a project to start from.
-        if self.relative_needs_project(query) {
+        if self.palette.is_none() || self.relative_needs_project(query) {
             return Vec::new();
         }
         let (directory, leaf) = split_browse(query);
-        let browse = &palette.browse;
         let mut rows = Vec::new();
         if leaf.is_empty()
             && let Some(parent) = up_path(directory)
         {
             rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
         }
-        if browse.directory == directory {
+        if let Some(browse) = self.current_browse(directory) {
             for (name, _) in filter_entries(&browse.entries, leaf) {
                 rows.push(Row::new(
                     format!("dir-{name}"),
@@ -1534,16 +1570,18 @@ impl Workspace {
         let connected = self.browse_environment().is_some_and(|environment| self.env_client(&environment).is_some());
         let can_submit = connected && !self.relative_needs_project(query);
         let Some(palette) = &self.palette else { return BrowseSubmit::default() };
-        let browse = &palette.browse;
         let (directory, leaf) = split_browse(query);
-        let settled = browse.directory == directory && !browse.loading;
+        let browse = self.current_browse(directory);
+        let settled = browse.is_some_and(|browse| !browse.loading);
         // A folder that could not be read is one Enter creates.
-        let found = browse.error.is_none()
-            && if leaf.is_empty() {
-                browse.parent.is_some()
-            } else {
-                browse.entries.iter().any(|(name, _)| name == leaf)
-            };
+        let found = browse.is_some_and(|browse| {
+            browse.error.is_none()
+                && if leaf.is_empty() {
+                    browse.parent.is_some()
+                } else {
+                    browse.entries.iter().any(|(name, _)| name == leaf)
+                }
+        });
         let will_create = can_submit && settled && !query.trim().is_empty() && palette.highlight.is_none() && !found;
         BrowseSubmit { can_submit, will_create }
     }
@@ -1564,12 +1602,12 @@ impl Workspace {
             self.browse_groups(&query).into_iter().flat_map(|group| group.rows).nth(index).map(|row| row.run)
         });
         let (directory, leaf) = split_browse(&query);
-        let next = match highlighted {
-            Some(Run::BrowseTo(path)) => Some(path),
-            _ if palette.browse.directory != directory => None,
-            _ => {
+        let next = match (highlighted, self.current_browse(directory)) {
+            (Some(Run::BrowseTo(path)), _) => Some(path),
+            (_, None) => None,
+            (_, Some(browse)) => {
                 let names: Vec<&str> =
-                    filter_entries(&palette.browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
+                    filter_entries(&browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
                 tab_completion(&names, leaf).map(|(name, complete)| {
                     if complete { browse_into(directory, &name) } else { format!("{directory}{name}") }
                 })
@@ -1583,23 +1621,8 @@ impl Workspace {
 
     /// The path Enter adds while browsing (`CommandPalette.tsx` submit).
     fn browse_submit_path(&self, query: &str) -> Option<String> {
-        let palette = self.palette.as_ref()?;
-        let (directory, leaf) = split_browse(query);
-        if leaf.is_empty() {
-            return palette
-                .browse
-                .parent
-                .clone()
-                .filter(|_| palette.browse.directory == directory)
-                .or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()));
-        }
-        palette
-            .browse
-            .entries
-            .iter()
-            .find(|(name, _)| name == leaf)
-            .map(|(_, full)| full.clone())
-            .or_else(|| Some(query.trim().to_owned()))
+        self.palette.as_ref()?;
+        submit_path(self.current_browse(split_browse(query).0), query)
     }
 
     /// Adds the typed path as a project on the browse environment.
@@ -3018,6 +3041,27 @@ mod tests {
         assert_eq!(tab_completion(&[], "x"), None);
         assert_eq!(browse_into("C:\\dev\\", "app"), "C:\\dev\\app\\");
         assert_eq!(browse_into("~/code/", "app"), "~/code/app/");
+    }
+
+    #[test]
+    fn a_folder_listing_resolves_paths_only_for_its_own_machine_cwd_and_directory() {
+        let key = |environment: &str, cwd: Option<&str>| BrowseKey {
+            environment: Some(environment.to_owned().into()),
+            cwd: cwd.map(str::to_owned),
+            directory: "~/".into(),
+        };
+        let browse = Browse {
+            key: key("a", None),
+            parent: Some("/home/a".into()),
+            entries: vec![("code".into(), "/home/a/code".into())],
+            ..Browse::default()
+        };
+        assert_eq!(submit_path(browse.of(&key("a", None)), "~/code").as_deref(), Some("/home/a/code"));
+        assert_eq!(submit_path(browse.of(&key("a", None)), "~/").as_deref(), Some("/home/a"));
+        // Machine B's add never takes machine A's folders, nor a listing from another cwd.
+        assert_eq!(submit_path(browse.of(&key("b", None)), "~/code").as_deref(), Some("~/code"));
+        assert_eq!(submit_path(browse.of(&key("b", None)), "~/").as_deref(), Some("~/"));
+        assert_eq!(submit_path(browse.of(&key("a", Some("/repo"))), "~/code").as_deref(), Some("~/code"));
     }
 
     #[test]
