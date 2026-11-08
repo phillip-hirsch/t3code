@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::app::Target;
+use crate::app::git::SOURCE_CONTROL_WRITE;
 use crate::model::ProjectShell;
 use crate::new_thread::{EnvMode, WorkspaceChoice};
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
@@ -76,6 +77,28 @@ pub(super) fn environment_items(
     menu
 }
 
+/// What a checkout on the acting environment may do: check out in place with `source-control:write`
+/// (`prepareThread.isAllowed`), and in a worktree only with `orchestration:operate` too, since the
+/// worktree is pointed at a new thread (`canPrepareWorktree`). Unconfirmed grants allow nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HandoffAccess {
+    check_out_here: bool,
+    worktree: bool,
+}
+
+impl HandoffAccess {
+    fn new(write: bool, operate: bool) -> Self {
+        Self { check_out_here: write, worktree: write && operate }
+    }
+
+    pub(super) fn allows(self, mode: CheckoutMode) -> bool {
+        match mode {
+            CheckoutMode::Local => self.check_out_here,
+            CheckoutMode::Worktree => self.worktree,
+        }
+    }
+}
+
 /// `pullRequestHandoffLabels`: beside a thread's composer the fixes land in that thread.
 pub(super) struct FixLabels {
     pub(super) finding: &'static str,
@@ -115,6 +138,20 @@ impl Workspace {
             .into_iter()
             .find(|p| Some(p.project_id.as_str()) == chosen)
             .map_or_else(|| detail.project_id.clone(), |p| p.project_id)
+    }
+
+    /// [`HandoffAccess`] on the environment `project_id` lives on.
+    pub(super) fn pr_handoff_access(&self, project_id: &str) -> HandoffAccess {
+        let environment = self.project_environment(project_id);
+        let grants = |scope| environment.as_deref().is_some_and(|env| self.env_grants(env, scope));
+        HandoffAccess::new(grants(SOURCE_CONTROL_WRITE), grants("orchestration:operate"))
+    }
+
+    /// `canFixFindings`: into the composer beside the panel, or a worktree checkout of the pull request.
+    pub(super) fn pr_can_fix(&self, detail: &Detail) -> bool {
+        self.pr_attaches_to_composer()
+            || (self.shell.projects.iter().any(|p| p.id == detail.project_id)
+                && self.pr_handoff_access(&self.pr_acting_project(detail)).allows(CheckoutMode::Worktree))
     }
 
     fn pick_pr_acting_project(&mut self, project_id: String, cx: &mut Context<Self>) {
@@ -192,7 +229,7 @@ impl Workspace {
             return;
         }
         let project_id = self.pr_acting_project(&detail);
-        if self.pr_write_grant(&project_id) == Some(false) {
+        if !self.pr_handoff_access(&project_id).allows(mode) {
             return;
         }
         let request = CheckoutRequest {
@@ -382,6 +419,7 @@ impl Workspace {
         let checking = handoff.as_deref().is_some_and(|h| h.starts_with("checkout"));
         let root = self.pr_checkout_root(detail);
         let (pickable, acting) = (self.pr_pickable_environments(detail), self.pr_acting_project(detail));
+        let access = self.pr_handoff_access(&acting);
         let view = cx.entity();
         xs_outline("pr-checkout", t)
             .disabled(handoff.is_some() || root.is_none())
@@ -407,12 +445,14 @@ impl Workspace {
                             "Its own folder and thread. Nothing you have open moves.",
                             Lucide::GitBranch,
                         )
+                        .disabled(!access.allows(CheckoutMode::Worktree))
                         .on_click(window.listener_for(&view, |this, _, window, cx| {
                             this.start_pr_handoff("checkout:worktree".into(), None, CheckoutMode::Worktree, window, cx);
                         })),
                     )
                     .item(
                         entry("In this repository", "Switches the branch you are working in.", Lucide::FolderGit2)
+                            .disabled(!access.allows(CheckoutMode::Local))
                             .on_click(window.listener_for(&view, |this, _, window, cx| {
                                 this.start_pr_handoff("checkout:local".into(), None, CheckoutMode::Local, window, cx);
                             })),
@@ -432,8 +472,11 @@ impl Workspace {
         let handoff = self.pull_requests.panel.as_ref().and_then(|p| p.handoff.clone());
         let preparing = handoff.as_deref() == Some("conflicts");
         let label = if preparing { "Preparing..." } else { "Resolve conflicts" };
+        let access = self.pr_handoff_access(&self.pr_acting_project(detail));
+        let unavailable = !self.pr_attaches_to_composer()
+            && (self.pr_checkout_root(detail).is_none() || !access.allows(CheckoutMode::Worktree));
         xs_outline("pr-resolve-conflicts", t)
-            .disabled(handoff.is_some() || self.pr_checkout_root(detail).is_none())
+            .disabled(handoff.is_some() || unavailable)
             .text_color(t.error)
             .border_color(Hsla { a: 0.4, ..t.error })
             .tooltip(label)
@@ -447,6 +490,16 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkout_needs_write_access_and_a_worktree_needs_operate_too() {
+        let (here, worktree) = (CheckoutMode::Local, CheckoutMode::Worktree);
+        let cases = [((true, true), (true, true)), ((true, false), (true, false)), ((false, true), (false, false))];
+        for ((write, operate), expected) in cases {
+            let access = HandoffAccess::new(write, operate);
+            assert_eq!((access.allows(here), access.allows(worktree)), expected, "write {write}, operate {operate}");
+        }
+    }
 
     fn project(environment: &str, id: &str, key: Option<&str>) -> ProjectShell {
         let mut project: ProjectShell = serde_json::from_value(json!({

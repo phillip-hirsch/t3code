@@ -1485,7 +1485,7 @@ impl Workspace {
             thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
         let attaches = self.pr_attaches_to_composer();
-        let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let can_fix = self.pr_can_fix(detail);
         let fix_findings = handoff::fix_labels(attaches).findings;
         let pickable = self.pr_pickable_environments(detail);
         let acting = self.pr_acting_project(detail);
