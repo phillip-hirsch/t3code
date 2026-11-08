@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::{Session, Viewport};
+use crate::preview::{self, NavStatus, Session, Viewport};
 use crate::theme::Tokens;
 
 const TAB_GONE: u16 = 4404;
@@ -162,17 +162,37 @@ impl ServerStream {
     }
 }
 
+/// A server tab's PDF (`pdfUrl`), shown in a native view over its stream as the web's `<embed>`.
+struct PdfView {
+    url: String,
+    view: Option<Entity<gpui_webview::WebView>>,
+    shown: bool,
+}
+
 #[derive(Default)]
 pub(super) struct ServerStreams {
     streams: HashMap<String, ServerStream>,
-    /// The agent tabs the panel and the mini player drew this frame.
+    pdfs: HashMap<String, PdfView>,
+    /// The agent tabs the panel and the mini player drew this frame, and those drawn as PDFs.
     pub(super) drawn: Vec<String>,
+    pdf_drawn: Vec<String>,
 }
 
 impl Workspace {
-    /// Keeps the stream of the agent tab on screen and closes the others.
-    pub(super) fn retain_server_streams(&mut self, cx: &mut App) {
+    /// Keeps the streams of the agent tabs on screen and closes the others; shows their PDFs
+    /// unless GPUI draws over them (`covered`).
+    pub(super) fn retain_server_streams(&mut self, covered: bool, cx: &mut App) {
         let drawn = std::mem::take(&mut self.preview.server.drawn);
+        let pdf_drawn = std::mem::take(&mut self.preview.server.pdf_drawn);
+        self.preview.server.pdfs.retain(|tab, _| pdf_drawn.contains(tab));
+        for pdf in self.preview.server.pdfs.values_mut() {
+            if let Some(view) = &pdf.view
+                && pdf.shown == covered
+            {
+                pdf.shown = !covered;
+                let _ = view.read(cx).set_visible(pdf.shown);
+            }
+        }
         self.preview.server.streams.retain(|tab, stream| {
             let keep = drawn.contains(tab);
             if !keep {
@@ -332,6 +352,51 @@ impl Workspace {
         }
     }
 
+    /// The tab's PDF view while it shows a signed PDF asset: `None` otherwise, `Some(None)` while
+    /// its view starts.
+    fn server_pdf_view(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<Entity<gpui_webview::WebView>>> {
+        let session = self.preview.threads.get(thread_id)?.get(tab_id)?;
+        let NavStatus::Success { url, .. } = &session.nav_status else { return None };
+        let endpoint = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned())?;
+        let url = preview::pdf_asset_url(url, &endpoint.http_base)?;
+        self.preview.server.pdf_drawn.push(tab_id.to_owned());
+        if let Some(pdf) = self.preview.server.pdfs.get_mut(tab_id) {
+            if pdf.url != url {
+                if let Some(view) = &pdf.view {
+                    view.update(cx, |view, _| view.load_url(&url));
+                }
+                pdf.url = url;
+            }
+            return Some(pdf.view.clone());
+        }
+        self.preview.server.pdfs.insert(tab_id.to_owned(), PdfView { url, view: None, shown: false });
+        let tab = tab_id.to_owned();
+        // `build_view` runs only from a task.
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(url) = this.preview.server.pdfs.get(&tab).map(|pdf| pdf.url.clone()) else { return };
+                let builder = wry::WebViewBuilder::new().with_url(url).with_visible(false).with_focused(false);
+                match super::build_view(builder, window, cx) {
+                    Ok(view) => {
+                        if let Some(pdf) = this.preview.server.pdfs.get_mut(&tab) {
+                            pdf.view = Some(cx.new(|_| view));
+                        }
+                    }
+                    Err(error) => log::warn!("could not show the PDF: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        Some(None)
+    }
+
     /// Sends `input` to the agent tab on screen, if this viewer may.
     pub(super) fn send_server_input(&self, tab_id: &str, input: Value) -> bool {
         self.preview.server.streams.get(tab_id).is_some_and(|stream| stream.send(input))
@@ -398,9 +463,17 @@ impl Workspace {
                         this.send_server_input(&tab, json!({"type": claim}));
                     }))
             }));
+        // The native view would cover GPUI's dialog and stop overlays.
+        let overlay = self.render_server_overlay(tab_id, tokens, cx);
+        let pdf = if overlay.is_none() { self.server_pdf_view(thread_id, tab_id, window, cx) } else { None };
+        let stream = &self.preview.server.streams[tab_id];
         let fit = page_fit(stream.bounds.get(), stream.frame_size, stream.viewport);
-        let cursor = stream.agent_pointer.filter(|_| !mine).zip(fit).map(|((x, y), fit)| fit.to_local(x, y)).map(
-            |(left, top)| {
+        let cursor = stream
+            .agent_pointer
+            .filter(|_| !mine && pdf.is_none())
+            .zip(fit)
+            .map(|((x, y), fit)| fit.to_local(x, y))
+            .map(|(left, top)| {
                 div()
                     .absolute()
                     .left(px(left - 6.))
@@ -410,8 +483,7 @@ impl Workspace {
                     .border_2()
                     .border_color(tokens.background)
                     .bg(tokens.primary)
-            },
-        );
+            });
         let frame = stream.frame.clone().map(|frame| img(frame).size_full().object_fit(ObjectFit::Contain));
         let bounds_cell = stream.bounds.clone();
         let tab = tab_id.to_owned();
@@ -426,6 +498,7 @@ impl Workspace {
             .track_focus(&stream.focus)
             .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .children(frame)
+            .children(pdf.flatten().map(|view| div().absolute().inset_0().child(view)))
             .children(cursor)
             .on_mouse_down(
                 MouseButton::Left,
@@ -467,7 +540,6 @@ impl Workspace {
                     cx.stop_propagation();
                 }
             }));
-        let overlay = self.render_server_overlay(tab_id, tokens, cx);
         let body = body.children(overlay);
         let page = v_flex().flex_1().min_h_0().relative();
         if bar_below { page.child(body).child(bar) } else { page.child(bar).child(body) }.into_any_element()

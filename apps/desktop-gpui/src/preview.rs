@@ -773,6 +773,27 @@ pub fn resolve_discovered_url(raw: &str, environment_base: Option<&str>) -> Stri
     parsed.into()
 }
 
+/// `previewPdfAssetUrl`: a PDF of the server's signed assets that a server tab opened, as this
+/// client fetches it. The server's browser may reach it on its host's loopback, so such a URL goes
+/// through this client's own connection to the environment instead.
+pub fn pdf_asset_url(raw: &str, http_base: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let base = url::Url::parse(http_base).ok()?;
+    let path = url.path();
+    let pdf = path.len() > 4 && path.get(path.len() - 4..).is_some_and(|ext| ext.eq_ignore_ascii_case(".pdf"));
+    if !matches!(url.scheme(), "http" | "https") || !path.starts_with("/api/assets/") || !pdf {
+        return None;
+    }
+    let host = url.host_str().unwrap_or_default();
+    if url.origin() != base.origin() && !is_local_loopback_host(host) && host != "0.0.0.0" {
+        return Some(url.into());
+    }
+    let mut local = base.join(path).ok()?;
+    local.set_query(url.query());
+    local.set_fragment(url.fragment());
+    Some(local.into())
+}
+
 /// The address bar's text: the page URL, or nothing for a blank tab.
 pub fn display_url(session: &Session) -> &str {
     session.nav_status.url().filter(|url| *url != "about:blank").unwrap_or_default()
@@ -986,6 +1007,24 @@ pub fn profile_report(settings: &crate::settings::Settings) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pdf_asset_urls_go_through_this_clients_connection() {
+        let base = "http://env.test:3773";
+        assert_eq!(
+            pdf_asset_url("http://127.0.0.1:3773/api/assets/t/a.PDF?sig=1#page=2", base).as_deref(),
+            Some("http://env.test:3773/api/assets/t/a.PDF?sig=1#page=2"),
+            "the host's loopback is reached through the environment"
+        );
+        assert_eq!(
+            pdf_asset_url("https://cdn.test/api/assets/a.pdf", base).as_deref(),
+            Some("https://cdn.test/api/assets/a.pdf"),
+            "another public origin stays as it is"
+        );
+        assert_eq!(pdf_asset_url("http://env.test:3773/files/a.pdf", base), None, "not a signed asset");
+        assert_eq!(pdf_asset_url("http://env.test:3773/api/assets/a.png", base), None);
+        assert_eq!(pdf_asset_url("file:///api/assets/a.pdf", base), None);
+    }
+
     use super::*;
 
     fn session(tab: &str, updated_at: &str) -> Value {
