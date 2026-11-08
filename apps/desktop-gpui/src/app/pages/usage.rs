@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
@@ -65,6 +66,8 @@ pub(in crate::app) struct UsageState {
     /// The limit pools and what they were built from: each environment's config revision,
     /// the hidden drivers, `limits_now`.
     pools: Option<(PoolsKey, Rc<[Pool]>)>,
+    /// The page just opened, so its surface takes focus on the next render.
+    focus_on_open: bool,
 }
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
@@ -217,6 +220,7 @@ impl Default for UsageState {
             redeemed: Vec::new(),
             pools: None,
             chart: RefCell::default(),
+            focus_on_open: false,
         }
     }
 }
@@ -267,6 +271,7 @@ fn scan_settings(info: &crate::model::ServerInfo) -> Value {
 
 impl Workspace {
     pub(in crate::app) fn usage_opened(&mut self, cx: &mut Context<Self>) {
+        self.usage.focus_on_open = true;
         self.usage.limits_now = now_ms();
         if self.usage.metric == "limits" {
             self.refresh_limits(true, cx);
@@ -595,6 +600,11 @@ impl Workspace {
         // `@4xl/usage-header` (56rem) on the header's content box, inside the border and `ps-5 pe-2`.
         let panel = (f32::from(viewport.width) - 2. * padding).min(1280.);
         let compact = panel - 2. - 28. < 896.;
+        // `AppRouteModal` focuses its surface, not its first control, and keeps Tab inside it.
+        let focus = window.use_keyed_state("usage-modal-focus", cx, |_, cx| cx.focus_handle()).read(cx).clone();
+        if std::mem::take(&mut self.usage.focus_on_open) {
+            focus.focus(window, cx);
+        }
         div()
             .id("usage-modal")
             .absolute()
@@ -609,6 +619,7 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("usage-panel")
+                    .focus_trap("usage-trap", &focus)
                     .size_full()
                     .max_w(px(1280.))
                     .max_h(px(960.))
