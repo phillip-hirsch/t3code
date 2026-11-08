@@ -77,9 +77,21 @@ impl Workspace {
             return false;
         }
         let in_preview = self.preview_thread_id().map(str::to_owned);
+        let thread_link = in_preview.as_deref().and_then(|thread_id| {
+            let thread = self.shell_thread(thread_id)?;
+            let supported = self.env_info(&thread.environment_id).is_some_and(|info| info.capabilities.is_object());
+            Some((thread_id.to_owned(), pr_link_state(url, &thread.pull_requests).filter(|_| supported)?))
+        });
         let view = cx.weak_entity();
         let url = url.to_owned();
         self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
+            if let Some((thread_id, linked)) = thread_link {
+                let (view, url) = (view.clone(), url.clone());
+                let label = if linked { "Unlink from thread" } else { "Link to thread" };
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = view.update(cx, |w, cx| w.change_pr_thread_link(&thread_id, &url, !linked, window, cx));
+                }));
+            }
             if let Some(thread_id) = in_preview {
                 let (view, url) = (view.clone(), url.clone());
                 menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
@@ -94,6 +106,31 @@ impl Workspace {
             )
         });
         true
+    }
+
+    /// `pullRequestLinking.changeLink`: links or unlinks the change request `url` names.
+    fn change_pr_thread_link(
+        &mut self,
+        thread_id: &str,
+        url: &str,
+        linked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(mut command)) = (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
+        else {
+            return;
+        };
+        command["commandId"] = json!(super::new_id());
+        let title = if linked { "Unable to link pull request" } else { "Unable to unlink pull request" };
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(error.to_string()).title(title), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// A skill chip's popover (`SkillChipPopover`): its name, description and instructions.
@@ -352,6 +389,28 @@ pub(super) struct InlineSkill {
     pub label: String,
     pub description: Option<String>,
     pub path: Option<String>,
+}
+
+/// Whether the thread links the change request `url` names, among its visible links
+/// (`pullRequestLinking.isLinked`); `None` when `url` names none.
+fn pr_link_state(url: &str, links: &[crate::thread_pull_requests::PullRequestLink]) -> Option<bool> {
+    let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
+    Some(crate::thread_pull_requests::visible(links).any(|link| {
+        link.number == number && link.host.eq_ignore_ascii_case(&host) && link.repository.eq_ignore_ascii_case(&repository)
+    }))
+}
+
+/// `planThreadPullRequestMutation` (multiple links), without its command id.
+fn pr_link_command(thread_id: &str, url: &str, linked: bool) -> Option<serde_json::Value> {
+    let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
+    let repository = repository.to_lowercase();
+    Some(if linked {
+        json!({"type": "thread.pull-request.link", "threadId": thread_id, "host": host, "repository": repository,
+            "number": number, "url": url, "source": "manual"})
+    } else {
+        json!({"type": "thread.pull-request.unlink", "threadId": thread_id, "host": host, "repository": repository,
+            "number": number})
+    })
 }
 
 /// `resolveExternalWebLink`: only http(s) links get the menu.
@@ -1074,5 +1133,31 @@ mod tests {
         assert_eq!(open("t3-thread://v1/only"), Some(("there".into(), "only".into())), "or a unique match");
         assert_eq!(open("t3-thread://v2/here/only"), None, "a scoped link never jumps machines");
         assert_eq!(open("https://example.com"), None);
+    }
+
+    #[test]
+    fn change_request_links_link_and_unlink_the_thread() {
+        let link: crate::thread_pull_requests::PullRequestLink = serde_json::from_value(json!({
+            "host": "github.com", "repository": "Acme/App", "number": 7, "url": "https://github.com/Acme/App/pull/7",
+            "source": "manual", "linkedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let links = [link];
+        assert_eq!(pr_link_state("https://GitHub.com/acme/app/pull/7/files", &links), Some(true));
+        assert_eq!(pr_link_state("https://github.com/acme/app/pull/8", &links), Some(false));
+        assert_eq!(pr_link_state("https://github.com/acme/app/issues/7", &links), None);
+        let mut dismissed = links.clone();
+        dismissed[0].source = "stack-dismissed".into();
+        assert_eq!(pr_link_state("https://github.com/acme/app/pull/7", &dismissed), Some(false));
+        assert_eq!(
+            pr_link_command("t", "https://github.com/Acme/App/pull/7", true).unwrap(),
+            json!({"type": "thread.pull-request.link", "threadId": "t", "host": "github.com", "repository": "acme/app",
+                "number": 7, "url": "https://github.com/Acme/App/pull/7", "source": "manual"})
+        );
+        assert_eq!(
+            pr_link_command("t", "https://gitlab.com/g/p/-/merge_requests/3", false).unwrap(),
+            json!({"type": "thread.pull-request.unlink", "threadId": "t", "host": "gitlab.com", "repository": "g/p",
+                "number": 3})
+        );
     }
 }
