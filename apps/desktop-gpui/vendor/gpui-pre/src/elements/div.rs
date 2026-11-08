@@ -4653,11 +4653,11 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
-        MouseMoveEvent, PlatformInput, TestAppContext, TouchEvent, TouchId, canvas,
-        util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, InputHandler,
+        Keystroke, MouseMoveEvent, PlatformInput, TestAppContext, TouchEvent, TouchId,
+        UTF16Selection, canvas, util::FluentBuilder as _,
     };
-    use std::{cell::Cell, rc::Weak};
+    use std::{cell::Cell, ops::Range, rc::Weak};
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,
@@ -6268,16 +6268,101 @@ mod tests {
         assert_eq!(focused, Some(item_b.id));
     }
 
-    /// t3code: three tab stops, the middle one inside an inert subtree.
-    struct InertFocus([FocusHandle; 3]);
+    /// t3code: three tab stops, the middle one a text input inside a subtree that is inert
+    /// while `inert` is set.
+    struct InertFocus {
+        handles: [FocusHandle; 3],
+        inert: Rc<Cell<bool>>,
+        typed: Rc<RefCell<String>>,
+    }
 
     impl Render for InertFocus {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let [before, inside, after] = &self.0;
+            let [before, inside, after] = &self.handles;
+            let text_input = {
+                let (focus, typed) = (inside.clone(), self.typed.clone());
+                canvas(
+                    |_, _, _| {},
+                    move |_, (), window, cx| window.handle_input(&focus, TypedText(typed), cx),
+                )
+            };
             div()
                 .child(div().track_focus(before))
-                .child(div().inert().child(div().track_focus(inside)))
+                .child(
+                    div()
+                        .when(self.inert.get(), |this| this.inert())
+                        .child(div().track_focus(inside).child(text_input)),
+                )
                 .child(div().track_focus(after))
+        }
+    }
+
+    /// t3code: an input handler that records the text the platform delivers to it.
+    struct TypedText(Rc<RefCell<String>>);
+
+    impl InputHandler for TypedText {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            None
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            self.0.borrow_mut().push_str(text);
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            text: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            self.0.borrow_mut().push_str(text);
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
         }
     }
 
@@ -6287,7 +6372,18 @@ mod tests {
         let mut cx = TestAppContext::single();
         let handles = cx.update(|cx| [(); 3].map(|()| cx.focus_handle().tab_stop(true)));
         let [before, inside, after] = handles.clone();
-        let window: AnyWindowHandle = cx.add_window(move |_, _| InertFocus(handles)).into();
+        let inert = Rc::new(Cell::new(true));
+        let typed = Rc::<RefCell<String>>::default();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (inert, typed) = (inert.clone(), typed.clone());
+                move |_, _| InertFocus {
+                    handles,
+                    inert,
+                    typed,
+                }
+            })
+            .into();
         cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
 
@@ -6302,16 +6398,107 @@ mod tests {
         assert_eq!(focused, Some(after.id));
         assert_ne!(focused, Some(inside.id));
 
-        // Focus already inside a subtree when it is drawn inert is dropped, so keys stop
-        // reaching a control that was locked while focused.
+        inert.set(false);
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&inside, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.simulate_input(window, "a");
+        assert_eq!(*typed.borrow(), "a");
+
+        // Focus inside a subtree when it is drawn inert is dropped, so a control locked while
+        // focused stops taking keys. That includes the text the platform delivers straight to
+        // its input handler (WM_CHAR, IME) after the keydown whose draw locked it.
+        inert.set(true);
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.simulate_input(window, "x");
         let focused = cx
             .update_window(window, |_, window, cx| {
-                window.focus(&inside, cx);
-                window.draw(cx).clear(cx);
                 window.focused(cx).map(|handle| handle.id)
             })
             .unwrap();
         assert_eq!(focused, None);
+        assert_eq!(*typed.borrow(), "a");
+    }
+
+    /// t3code: a replayed cached view takes its inertness from its own inert subtrees plus
+    /// the parent it is replayed in, not from the parent it was painted in.
+    #[test]
+    fn cached_view_replay_recomputes_inertness() {
+        struct Leaf {
+            outer: FocusHandle,
+            inner: FocusHandle,
+            renders: Rc<Cell<usize>>,
+        }
+
+        impl Render for Leaf {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div()
+                    .child(div().track_focus(&self.outer))
+                    .child(div().inert().child(div().track_focus(&self.inner)))
+            }
+        }
+
+        struct Parent {
+            inert: bool,
+            leaf: crate::Entity<Leaf>,
+        }
+
+        impl Render for Parent {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .when(self.inert, |this| this.inert())
+                    .child(self.leaf.clone().cached(StyleRefinement::default()))
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let [outer, inner] = cx.update(|cx| [(); 2].map(|()| cx.focus_handle().tab_stop(true)));
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let (outer, inner, renders) = (outer.clone(), inner.clone(), renders.clone());
+            move |_, cx| Parent {
+                inert: true,
+                leaf: cx.new(|_| Leaf {
+                    outer,
+                    inner,
+                    renders,
+                }),
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let painted_renders = renders.get();
+
+        window
+            .update(&mut cx, |parent, _, cx| {
+                parent.inert = false;
+                cx.notify();
+            })
+            .unwrap();
+        let (replayed, outer_inert, focused) = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let replayed = renders.get() == painted_renders;
+                let outer_inert = window.rendered_frame.tab_stops.is_inert(outer.id);
+                let focused = [(); 2].map(|()| {
+                    window.focus_next(cx);
+                    window.focused(cx).map(|handle| handle.id)
+                });
+                (replayed, outer_inert, focused)
+            })
+            .unwrap();
+
+        assert!(replayed, "the leaf view is replayed from its cache");
+        assert!(!outer_inert, "the parent is no longer inert");
+        assert_eq!(
+            focused,
+            [Some(outer.id); 2],
+            "Tab skips the leaf's own inert subtree"
+        );
     }
 
     #[gpui::test]

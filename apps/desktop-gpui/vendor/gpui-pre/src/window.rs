@@ -3721,17 +3721,34 @@ impl Window {
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
+        // t3code: like HTML `inert`, a subtree that turns inert drops the focus inside it, so
+        // keys stop reaching a control that was locked while focused. This runs before the
+        // input handler is chosen because platforms deliver text to it without checking focus.
+        if self
+            .focus
+            .is_some_and(|focus| self.next_frame.tab_stops.is_inert(focus))
+        {
+            self.focus = None;
+            self.next_frame.focus = None;
+            self.focus_generation = self.focus_generation.wrapping_add(1);
+        }
+
         // Register requested input handler with the platform window.
         // Use .take() instead of .pop() to preserve Vec length, so that cached
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
+        // t3code: skip a handler registered for an element that no longer holds focus.
+        let focus = self.focus;
+        let registered_for_focus = |handler: &mut PlatformInputHandler| {
+            handler.focus_id().is_none_or(|id| focus == Some(id))
+        };
         let focused_text_input = if let Some(mut input_handler) = self
             .next_frame
             .input_handlers
             .iter_mut()
             .rev()
-            .find_map(|h| h.take())
+            .find_map(|slot| slot.take_if(registered_for_focus))
         {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
@@ -3753,17 +3770,6 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
-
-        // t3code: like HTML `inert`, a subtree that turns inert drops the focus inside it, so
-        // keys stop reaching a control that was locked while focused.
-        if self
-            .focus
-            .is_some_and(|focus| self.next_frame.tab_stops.is_inert(focus))
-        {
-            self.focus = None;
-            self.next_frame.focus = None;
-            self.focus_generation = self.focus_generation.wrapping_add(1);
-        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
