@@ -13,6 +13,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::Workspace;
+use super::markdown_images::Source::WorkspaceFile;
 use crate::model::TurnItem;
 use crate::rpc::StreamEvent;
 use crate::terminal_text::TerminalText;
@@ -145,6 +146,12 @@ impl Workspace {
         for entry in &open {
             self.details.format_tool(entry);
         }
+        let viewed: Vec<(SharedString, String)> = open_entries(&self.rows)
+            .filter_map(|entry| Some((super::chat::thought_key(&entry.id), self.viewed_image(entry)?)))
+            .collect();
+        for (key, path) in viewed {
+            self.load_images(&key, vec![path], cx);
+        }
         for entry in open {
             let item = entry.item.0.clone();
             let streams = item.item_type == "command_execution" && streams_output;
@@ -228,6 +235,16 @@ impl Workspace {
         }
     }
 
+    /// The workspace image a tool viewed, as its row previews it (`workEntryViewedImagePath`,
+    /// `resolveViewedImageAsset`): only a file on the thread's host.
+    pub(super) fn viewed_image(&self, entry: &Entry) -> Option<String> {
+        let path = viewed_image_path(entry)?;
+        matches!(self.target, Some(super::Target::Thread { .. })).then_some(())?;
+        let workspace_file =
+            matches!(super::markdown_images::classify(path, self.git_cwd().as_deref()), WorkspaceFile(_));
+        workspace_file.then(|| path.to_owned())
+    }
+
     /// The thread and item an item was projected from, for the item RPCs.
     fn source_of(&self, item_id: &str) -> Option<(String, String)> {
         let projection = self.thread.as_ref()?.state.projection.as_ref()?;
@@ -256,6 +273,17 @@ impl Details {
             self.tools.insert(entry.id.clone(), ToolText::new(item));
         }
     }
+}
+
+/// `workEntryViewedImagePath`: the image a tool viewed, else a read's detail naming one.
+fn viewed_image_path(entry: &Entry) -> Option<&str> {
+    let image = |path: &str| !path.contains(['\r', '\n']) && super::files::is_image(path);
+    let viewed = entry.item.0.raw.get("viewedImagePath").and_then(Value::as_str).map(str::trim);
+    if let Some(path) = viewed.filter(|path| image(path)) {
+        return Some(path);
+    }
+    let detail = entry.detail.as_deref().map(str::trim);
+    detail.filter(|detail| entry.action == crate::work_log::Action::Read && image(detail))
 }
 
 /// `reduceCommandOutputFrame`: a `replace` starts over, an `append` extends.
@@ -516,6 +544,20 @@ mod tests {
         );
         assert!(arg_lines(&json!({"summary": "x", "truncated": true})).is_none());
         assert_eq!(control_pictures("a\u{1}b\tc"), "a\u{2401}b\tc");
+    }
+
+    #[test]
+    fn viewed_images_preview_only_image_files() {
+        let viewed = |value: Value| viewed_image_path(&crate::work_log::entry_from_item(&Rc::new(item(value)))).map(str::to_owned);
+        let tool = |extra: Value| {
+            let mut value = json!({"id": "i", "type": "dynamic_tool", "status": "completed", "toolName": "view_image"});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            value
+        };
+        assert_eq!(viewed(tool(json!({"viewedImagePath": " shots/a.PNG "}))).as_deref(), Some("shots/a.PNG"));
+        assert_eq!(viewed(tool(json!({"viewedImagePath": "notes.txt"}))), None);
+        assert_eq!(viewed(tool(json!({"viewedImagePath": "a\nb.png"}))), None);
+        assert_eq!(viewed(tool(json!({}))), None);
     }
 
     #[test]

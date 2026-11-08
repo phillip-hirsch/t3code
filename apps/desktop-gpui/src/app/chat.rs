@@ -222,7 +222,8 @@ struct MarkdownState {
 }
 
 /// The key a row's markdown is cached under: its message id, or `thought:{entry}`.
-fn thought_key(entry_id: &str) -> SharedString {
+/// The key an open entry's markdown and images load under, so its row remeasures when they land.
+pub(super) fn thought_key(entry_id: &str) -> SharedString {
     format!("thought:{entry_id}").into()
 }
 
@@ -2199,8 +2200,8 @@ fn has_body(entry: &Entry, label: &str) -> bool {
     entry.command.as_deref().is_some_and(shows) || entry.detail.as_deref().is_some_and(shows) || files_show
 }
 
-fn expandable(entry: &Entry, label: &str) -> bool {
-    if entry.question.is_some() {
+fn expandable(entry: &Entry, label: &str, this: &WeakEntity<Workspace>, cx: &App) -> bool {
+    if entry.question.is_some() || this.upgrade().is_some_and(|w| w.read(cx).viewed_image(entry).is_some()) {
         true
     } else if entry.is_reasoning() {
         entry.detail.is_some()
@@ -2223,7 +2224,36 @@ fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// The image a tool viewed, once it loads (`WorkLogDetails kind="media"`).
+fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option<AnyElement> {
+    use gpui_kit::StyledImage as _;
+    let workspace = this.upgrade()?;
+    let workspace = workspace.read(cx);
+    let image = workspace.markdown_images.get(&workspace.viewed_image(entry)?)?;
+    Some(
+        div()
+            .mt(px(4.))
+            .child(gpui_kit::img(image).max_w_full().max_h(px(256.)).object_fit(gpui_kit::ObjectFit::Contain))
+            .into_any_element(),
+    )
+}
+
 fn entry_details(
+    entry: &Entry,
+    label: &str,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let image = viewed_image(entry, this, cx);
+    let details = entry_text_details(entry, label, this, t, cx);
+    match (image, details) {
+        (Some(image), Some(details)) => Some(v_flex().child(image).child(details).into_any_element()),
+        (image, details) => image.or(details),
+    }
+}
+
+fn entry_text_details(
     entry: &Entry,
     label: &str,
     this: &WeakEntity<Workspace>,
@@ -2426,7 +2456,7 @@ fn single_entry(
     let label_text = entry_label(entry, label_text, (expanded, true), this, t, cx);
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
-    let expandable = expandable(entry, label);
+    let expandable = expandable(entry, label, this, cx);
     let trailing =
         h_flex().gap(px(6.)).children(entry_open_link(entry, this, t)).child(chevron(expandable, expanded, t));
     let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
@@ -2445,7 +2475,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
     let failed = entry.failed() && entry.status != Some(Status::Declined);
     let color = if failed { failed_icon_color(t) } else { icon_color(t) };
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
-    let expandable = expandable(entry, label);
+    let expandable = expandable(entry, label, this, cx);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
     let shown = entry_label(entry, shown, (expanded, true), this, t, cx);
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };

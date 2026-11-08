@@ -29,6 +29,11 @@ static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
 pub(super) struct ImageCache(Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>);
 
 impl ImageCache {
+    /// The loaded image for `destination`, if it has loaded.
+    pub(super) fn get(&self, destination: &str) -> Option<Arc<Image>> {
+        self.0.lock().ok()?.get(destination).cloned().flatten()
+    }
+
     /// `TextView`'s `image_source`: the loaded image, else a blank one.
     pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
         let cache = self.0.clone();
@@ -208,10 +213,16 @@ impl Workspace {
         if !may_hold_images(markdown) {
             return;
         }
+        self.load_images(key, image_destinations(markdown), cx);
+    }
+
+    /// Starts loading the image at each destination the cache has not seen yet, for the row
+    /// that shows `key` to remeasure once it lands.
+    pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
         let root = self.git_cwd();
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
-        for destination in image_destinations(markdown) {
+        for destination in destinations {
             {
                 let Ok(mut cache) = cache.0.lock() else { return };
                 if cache.contains_key(&destination) {
