@@ -435,7 +435,7 @@ impl Workspace {
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
-            host: Default::default(),
+            host: host_picker::HostUi::new(cx),
             _connection_task: Self::connect(window, cx),
             landed: false,
             page: None,
