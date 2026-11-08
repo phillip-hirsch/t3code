@@ -669,7 +669,11 @@ impl Workspace {
             ),
             _ => None,
         });
-        let body = if folder {
+        let body = if folder && logic::is_host_path(&path) {
+            // A host folder roots its own tree (`hostFolderPath`).
+            let root = super::Checkout { env: checkout.env.clone(), cwd: path.clone() };
+            self.render_tree(&root, None, reveal, window, cx)
+        } else if folder {
             self.render_tree(&checkout, Some(&path), reveal, window, cx)
         } else {
             let max = EXPLORER_MAX.min(width - CONTENT_MIN).max(EXPLORER_MIN);

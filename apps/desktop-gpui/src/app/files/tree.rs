@@ -453,6 +453,7 @@ impl Workspace {
         self.ensure_tree(root, window, cx);
         self.sync_tree(root, selected, reveal, window, cx);
         let tokens = *crate::theme::tokens(cx);
+        let host = self.is_host_tree(root);
         let Some(tree) = self.tree(root) else { return div().into_any_element() };
         if tree.rows_dirty {
             tree.rebuild_rows();
@@ -525,7 +526,7 @@ impl Workspace {
                     // `InputGroupInput size="sm"` in a `sm:text-sm` group.
                     .child(Input::new(&query).appearance(false).text_sm().h(px(28.)).px(px(8.))),
             )
-            .when(has_folders, |el| {
+            .when(has_folders && !host, |el| {
                 el.child(
                     icon_button(
                         "files-expand-all",
@@ -677,7 +678,8 @@ impl Workspace {
         if let Some(tree) = self.tree(root) {
             tree.reveal.from_tree = Some(path.to_owned());
         }
-        self.open_file(path, None, window, cx);
+        let path = if self.is_host_tree(root) { logic::absolute_path(&root.cwd, path) } else { path.to_owned() };
+        self.open_file(&path, None, window, cx);
     }
 
     fn tree_row(
@@ -763,7 +765,9 @@ impl Workspace {
             )
         });
         let absolute = logic::absolute_path(cwd, path);
-        let path = path.to_owned();
+        // A host folder's rows are mentioned by their host paths.
+        let host = self.project_target().is_none_or(|target| target.checkout.cwd != cwd);
+        let mention_path = if host { absolute.clone() } else { path.to_owned() };
         move |mut menu, window, cx| {
             super::track_menu(&view, cx);
             let open_in = |editor: String, reveal: bool, title: String| {
@@ -813,8 +817,8 @@ impl Workspace {
                     sub
                 });
             }
-            let mention = composer_text::file_link(&path);
-            let (copy_path, add_path) = (path.clone(), path.clone());
+            let mention = composer_text::file_link(&mention_path);
+            let (copy_path, add_path) = (mention_path.clone(), mention_path.clone());
             menu.item(PopupMenuItem::new("Copy mention").on_click(move |_, window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(mention.clone()));
                 window.push_notification(Notification::success(copy_path.clone()).title("Mention copied"), cx);

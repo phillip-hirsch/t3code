@@ -113,7 +113,20 @@ pub(super) fn track_menu(view: &Entity<Workspace>, cx: &mut gpui_kit::Context<gp
     });
 }
 
+/// `panelPath` for a link outside the workspace: a host file or folder opens in the panel,
+/// except media, which the web shows in its media viewer.
+pub(super) fn opens_host_path_in_panel(path: &str) -> bool {
+    logic::is_host_path(path)
+        && !matches!(logic::file_kind(path), logic::FileKind::Image | logic::FileKind::Video | logic::FileKind::Audio)
+}
+
 impl Workspace {
+    /// A tree rooted at a host folder (`hostFolder`), not at the open project's checkout: its
+    /// rows open and mention their host paths.
+    pub(super) fn is_host_tree(&self, root: &Checkout) -> bool {
+        self.project_target().is_none_or(|target| target.checkout != *root)
+    }
+
     /// Whether the dark theme is showing, for icons with a colour per theme.
     pub(super) fn dark_theme(&self, cx: &gpui_kit::App) -> bool {
         gpui_kit::component::ActiveTheme::theme(cx).is_dark()
@@ -124,5 +137,19 @@ impl Workspace {
         let cwd = self.composer_cwd().filter(|cwd| !cwd.is_empty())?;
         let env = self.target.as_ref()?.environment().clone();
         Some(ProjectTarget { checkout: Checkout { env, cwd }, project_name: super::project_name(project) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opens_host_path_in_panel;
+
+    #[test]
+    fn host_links_open_in_the_panel_except_media() {
+        assert!(opens_host_path_in_panel("/tmp/report.md"));
+        assert!(opens_host_path_in_panel(r"C:\Users\me\notes"));
+        assert!(!opens_host_path_in_panel("/tmp/plot.png"));
+        assert!(!opens_host_path_in_panel("/tmp/clip.mp4"));
+        assert!(!opens_host_path_in_panel("src/main.rs"), "workspace paths are not host paths");
     }
 }
