@@ -177,9 +177,22 @@ impl Workspace {
         self.sidebar.search_highlight = None;
     }
 
+    /// A row listed for a message match opens find on it, as the palette does.
     fn open_search_result(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.sidebar.search.read(cx).value().trim().to_owned();
+        let message_row = self
+            .search_results(&self.search_query(cx), now_ms())
+            .iter()
+            .any(|r| r.thread.id == thread_id && r.snippet.is_some());
+        let find = message_row
+            .then(|| self.sidebar.messages.matches.iter().find(|m| m.thread_id == thread_id))
+            .flatten()
+            .map(|m| (crate::app::find::query_for_message(&m.snippet, &query), m.message_id.clone()));
         self.clear_search(window, cx);
         self.select_thread(thread_id, window, cx);
+        if let Some((query, message_id)) = find {
+            self.open_thread_find_on(&query, message_id, window, cx);
+        }
     }
 
     pub(super) fn render_search_results(
