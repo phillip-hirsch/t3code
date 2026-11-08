@@ -1,7 +1,7 @@
 //! The macOS menu bar, as Electron's `DesktopApplicationMenu` builds it for darwin: the app
 //! menu (About, Check for Updates, Settings, Services, Hide, Quit), File › Close Window, Edit,
 //! View › Toggle Full Screen, Window and Help. Windows and Linux hide Electron's menu bar,
-//! so they get none.
+//! so they get none, but keep its Settings (Ctrl+,) and Toggle Full Screen (F11) accelerators.
 //!
 //! Inside a window, ⌘Q goes through the workspace's hold-to-quit gate (`confirmQuit`), so Quit's
 //! key binding only matches outside every window's `Root` context. It still becomes the menu's
@@ -32,19 +32,20 @@ gpui_kit::actions!(
 
 const APP_NAME: &str = "T3 Code";
 
-/// Installs the menu bar and its handlers; nothing off macOS.
+/// Installs the menu bar (macOS only), its key bindings and its handlers.
 pub fn init(cx: &mut App) {
-    if !cfg!(target_os = "macos") {
-        return;
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("alt-cmd-h", HideOtherApps, None),
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("cmd-q", QuitApp, Some("!Root")),
+        ]);
+    } else {
+        cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None), KeyBinding::new("f11", ToggleFullScreen, None)]);
     }
-    cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("alt-cmd-h", HideOtherApps, None),
-        KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-q", QuitApp, Some("!Root")),
-    ]);
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOtherApps, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
@@ -70,7 +71,9 @@ pub fn init(cx: &mut App) {
             ));
         });
     });
-    cx.set_menus(menus());
+    if cfg!(target_os = "macos") {
+        cx.set_menus(menus());
+    }
 }
 
 fn menus() -> Vec<Menu> {
