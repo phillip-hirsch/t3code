@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::NavStatus;
+use crate::preview::{self, NavStatus, Session};
 use crate::theme::Tokens;
 
 /// `PREVIEW_ERROR_CODE_MESSAGES`.
@@ -163,9 +163,39 @@ impl Workspace {
         self.preview.discovery.subscribed = Some(((environment, urls), task));
     }
 
-    /// Opens a card's URL in the blank tab (`handleOpenServerUrl`).
-    fn open_in_blank_tab(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_address(&url, window, cx);
+    /// Opens a card's URL in the blank tab (`handleOpenServerUrl`); a tab this computer hosts
+    /// reaches a remote environment's loopback servers through the environment's host.
+    fn open_in_blank_tab(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let server = self.active_session(&thread_id).is_some_and(Session::server_hosted);
+        let url = if server {
+            preview::normalize_url(&raw).map_err(str::to_owned)
+        } else {
+            Ok(self.discovered_url(&thread_id, &raw))
+        };
+        match url {
+            Ok(url) => {
+                self.record_visit(&thread_id, &raw);
+                self.navigate_preview(thread_id, url, window, cx);
+            }
+            Err(message) => {
+                self.error = Some(format!("Could not open this address. {message}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// `resolveDiscoveredServerUrl` for `thread_id`'s environment: only this app's own server
+    /// shares this computer's loopback.
+    pub(super) fn discovered_url(&self, thread_id: &str, raw: &str) -> String {
+        let environment = self.thread_environment(thread_id);
+        if !self.environment_remote && environment.as_ref() == self.primary_environment() {
+            return preview::resolve_discovered_url(raw, None);
+        }
+        match environment.as_ref().and_then(|environment| self.env_endpoint(environment)) {
+            Some(endpoint) => preview::resolve_discovered_url(raw, Some(&endpoint.http_base)),
+            None => raw.to_owned(),
+        }
     }
 
     /// `PreviewEmptyState`: recents and live servers, else the "No preview yet" note.

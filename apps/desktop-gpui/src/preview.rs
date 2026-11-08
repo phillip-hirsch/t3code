@@ -635,6 +635,80 @@ fn encode_uri_component(input: &str) -> String {
     out
 }
 
+/// `normalizeHostname`.
+fn normalize_hostname(host: &str) -> String {
+    host.to_ascii_lowercase().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_owned()
+}
+
+/// `isLocalLoopbackHost`.
+fn is_local_loopback_host(host: &str) -> bool {
+    let host = normalize_hostname(host);
+    host == "localhost" || host == "::1" || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.octets()[0] == 127)
+}
+
+/// `isPrivateNetworkHost` (`packages/shared/src/hostClassification.ts`).
+fn is_private_network_host(host: &str) -> bool {
+    let host = normalize_hostname(host);
+    if host == "::"
+        || host == "home.arpa"
+        || is_local_loopback_host(&host)
+        || [".localhost", ".local", ".home.arpa", ".ts.net"].iter().any(|suffix| host.ends_with(suffix))
+        || (!host.contains('.') && !host.contains(':'))
+    {
+        return true;
+    }
+    let private_v4 = |ip: std::net::Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        matches!(a, 0 | 10 | 127)
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254)
+            || (a == 198 && (18..=19).contains(&b))
+    };
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return private_v4(ip);
+    }
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80, private_v4),
+        Err(_) => false,
+    }
+}
+
+/// `resolveDiscoveredServerUrl`: a loopback server URL from the environment's scan, pointed at the
+/// environment's host when this computer's loopback is another machine's (`environment_base` is
+/// its HTTP base then; `None` for this app's own server). What it can't map stays as given.
+pub fn resolve_discovered_url(raw: &str, environment_base: Option<&str>) -> String {
+    let Ok(normalized) = normalize_url(raw) else { return raw.to_owned() };
+    let Ok(mut parsed) = url::Url::parse(&normalized) else { return raw.to_owned() };
+    let loopback =
+        parsed.host_str().is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]"));
+    let Some(base) = environment_base.filter(|_| loopback) else { return normalized };
+    let Some(environment_host) = url::Url::parse(base).ok().and_then(|url| url.host_str().map(normalize_hostname))
+    else {
+        return raw.to_owned();
+    };
+    // Past the private network this needs the planned authenticated preview gateway.
+    if !is_private_network_host(&environment_host) {
+        return raw.to_owned();
+    }
+    // localhost lets the browser reach loopback servers bound to either IPv4 or IPv6.
+    let host = if is_local_loopback_host(&environment_host) {
+        "localhost".to_owned()
+    } else if environment_host.contains(':') {
+        format!("[{environment_host}]")
+    } else {
+        environment_host
+    };
+    let port = parsed.port_or_known_default();
+    if parsed.set_host(Some(&host)).is_err() || parsed.set_port(port).is_err() {
+        return raw.to_owned();
+    }
+    parsed.into()
+}
+
 /// The address bar's text: the page URL, or nothing for a blank tab.
 pub fn display_url(session: &Session) -> &str {
     session.nav_status.url().filter(|url| *url != "about:blank").unwrap_or_default()
@@ -885,6 +959,53 @@ mod tests {
         assert!(after.fresh_reveals(&after).is_empty(), "already shown");
         let again = previews(true, vec![quiet, forced]);
         assert_eq!(again.fresh_reveals(&after), [("b".to_owned(), true)], "a new request reveals again");
+    }
+
+    #[test]
+    fn discovered_servers_resolve_against_the_environment_host() {
+        let local = resolve_discovered_url("localhost:5173", None);
+        assert_eq!(local, "http://localhost:5173/", "this app's own server keeps loopback");
+        let lan = Some("http://192.168.1.20:3773");
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/app?x=1#h", lan),
+            "http://192.168.1.20:5173/app?x=1#h"
+        );
+        assert_eq!(resolve_discovered_url("0.0.0.0:3000", lan), "http://192.168.1.20:3000/");
+        assert_eq!(resolve_discovered_url("http://[::1]:8080/", lan), "http://192.168.1.20:8080/");
+        assert_eq!(
+            resolve_discovered_url("http://localhost/", lan),
+            "http://192.168.1.20/",
+            "the default port stays implicit"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("https://box.tail1.ts.net")),
+            "http://box.tail1.ts.net:5173/"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("http://[fd7a:115c::5]:3773")),
+            "http://[fd7a:115c::5]:5173/"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://127.0.0.1:5173/", Some("http://127.0.0.1:4100")),
+            "http://localhost:5173/",
+            "a tunnel's loopback"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("https://t3.example.com")),
+            "http://localhost:5173/",
+            "a public host has no route yet"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://10.0.0.5:5173/", lan),
+            "http://10.0.0.5:5173/",
+            "only loopback URLs move"
+        );
+        assert!(
+            is_private_network_host("nas")
+                && is_private_network_host("::ffff:10.1.2.3")
+                && is_private_network_host("fe80::1")
+        );
+        assert!(!is_private_network_host("8.8.8.8") && !is_private_network_host("2001:db8::1"));
     }
 
     #[test]

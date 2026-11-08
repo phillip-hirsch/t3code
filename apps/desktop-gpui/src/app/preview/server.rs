@@ -681,7 +681,10 @@ impl Workspace {
         let Some(client) = self.thread_client(&session.thread_id) else { return };
         let mut input = json!({"threadId": session.thread_id, "viewport": viewport_json(&session.viewport)});
         if let Some(url) = session.nav_status.url() {
-            input["url"] = url.into();
+            // A page moving to this computer reaches the environment's loopback servers on its host.
+            input["url"] =
+                if session.server_hosted() { self.discovered_url(&session.thread_id, url) } else { url.to_owned() }
+                    .into();
         }
         if !session.server_hosted() {
             input["runtime"] = "server".into();

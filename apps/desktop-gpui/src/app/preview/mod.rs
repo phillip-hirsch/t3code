@@ -648,6 +648,11 @@ impl Workspace {
             }
         };
         self.record_visit(&thread_id, &url);
+        self.navigate_preview(thread_id, url, window, cx);
+    }
+
+    /// `navigateToResolvedUrl`: the active tab loads `url`, or a new tab opens on it.
+    fn navigate_preview(&mut self, thread_id: String, url: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some((tab_id, server)) = self.active_session(&thread_id).map(|s| (s.tab_id.clone(), s.server_hosted()))
         else {
             return self.open_preview_tab(thread_id, Some(url), window, cx);
