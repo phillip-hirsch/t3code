@@ -53,6 +53,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 }
 
 const MIN_DRAWER_HEIGHT: f32 = 180.;
+/// `MAX_HIDDEN_MOUNTED_TERMINAL_THREADS`: hidden threads whose open drawers keep their sessions.
+const MAX_HIDDEN_THREADS: usize = 10;
 const MAX_DRAWER_HEIGHT_RATIO: f32 = 0.75;
 
 /// A `TerminalSummary` from `subscribeTerminalMetadata`.
@@ -91,6 +93,9 @@ pub(super) struct Terminals {
     drawers: HashMap<String, DrawerLayout>,
     /// Sessions of the shown group, by terminal id.
     panes: HashMap<String, Pane>,
+    /// Hidden threads' open drawer sessions, kept so switching back finds them as they were;
+    /// least recently shown first.
+    parked: Vec<(String, HashMap<String, Pane>)>,
     /// By thread, in server order; `None` until the first snapshot.
     summaries: Option<HashMap<String, Vec<Summary>>>,
     /// The environment whose metadata stream reported each thread's terminals.
@@ -216,6 +221,14 @@ impl Terminals {
     }
 }
 
+/// Keeps `value` as `thread_id`'s, the most recent of at most `max`.
+fn park<T>(parked: &mut Vec<(String, T)>, thread_id: String, value: T, max: usize) {
+    parked.retain(|(id, _)| *id != thread_id);
+    parked.push((thread_id, value));
+    let excess = parked.len().saturating_sub(max);
+    parked.drain(..excess);
+}
+
 fn sort_summaries(list: &mut [Summary]) {
     list.sort_by(|a, b| layout::numeric_order(&a.terminal_id, &b.terminal_id));
 }
@@ -305,7 +318,8 @@ impl Workspace {
                 this.notify_sidebar(cx);
             },
         );
-        for pane in self.terminals.panes.values() {
+        let parked = self.terminals.parked.iter().flat_map(|(_, panes)| panes.values());
+        for pane in self.terminals.panes.values().chain(parked) {
             let thread_id = &pane.session.read(cx).thread_id;
             if self.thread_environment(thread_id).as_ref() == Some(&environment) {
                 pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
@@ -543,8 +557,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Mounts sessions for the shown group and unmounts the rest. Hidden
-    /// terminals keep running on the server and replay their history on return.
+    /// Parks the sessions of a thread that stopped showing while its drawer is open, unparks the
+    /// shown thread's, and drops parked threads whose drawers closed.
+    fn park_terminal_panes(&mut self, shown_thread: Option<&str>, cx: &App) {
+        let terminals = &mut self.terminals;
+        let previous = terminals.panes.values().next().map(|pane| pane.session.read(cx).thread_id.clone());
+        if let Some(previous) = previous.filter(|previous| Some(previous.as_str()) != shown_thread) {
+            let group = terminals.drawers.get(&previous).filter(|d| d.open).and_then(|d| d.active_group());
+            let ids = group.map(|group| group.terminal_ids.clone()).unwrap_or_default();
+            let mut panes = std::mem::take(&mut terminals.panes);
+            panes.retain(|id, _| ids.contains(id));
+            if !panes.is_empty() {
+                park(&mut terminals.parked, previous, panes, MAX_HIDDEN_THREADS);
+            }
+        }
+        if let Some(shown) = shown_thread
+            && let Some(index) = terminals.parked.iter().position(|(thread_id, _)| thread_id == shown)
+        {
+            terminals.panes.extend(terminals.parked.remove(index).1);
+        }
+        let drawers = &terminals.drawers;
+        terminals.parked.retain(|(thread_id, _)| drawers.get(thread_id).is_some_and(|d| d.open));
+    }
+
+    /// Mounts sessions for the shown group and unmounts the rest (hidden threads' open drawers are
+    /// parked). Unmounted terminals keep running on the server and replay their history on return.
     fn sync_terminal_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread_id = self.shown_terminal_thread().map(str::to_owned);
         let shown: Vec<String> = match (&thread_id, self.page) {
@@ -561,6 +598,7 @@ impl Workspace {
                 .collect(),
             _ => Vec::new(),
         };
+        self.park_terminal_panes(thread_id.as_deref().filter(|_| self.page.is_none()), cx);
         let thread_id = thread_id.unwrap_or_default();
         self.terminals.panes.retain(|id, pane| shown.contains(id) && pane.session.read(cx).thread_id == thread_id);
         for terminal_id in &shown {
@@ -1233,6 +1271,17 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn hidden_threads_keep_their_sessions_up_to_the_limit() {
+        let mut parked = Vec::new();
+        for thread in ["a", "b", "c"] {
+            park(&mut parked, thread.to_owned(), thread, 2);
+        }
+        assert_eq!(parked, [("b".to_owned(), "b"), ("c".to_owned(), "c")], "the oldest is dropped");
+        park(&mut parked, "b".to_owned(), "b2", 2);
+        assert_eq!(parked, [("c".to_owned(), "c"), ("b".to_owned(), "b2")]);
     }
 
     #[test]
