@@ -132,6 +132,8 @@ pub(in crate::app) struct Panel {
     _picker_search: Option<Subscription>,
     /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
     handoff: Option<String>,
+    /// The project a handoff runs in, picked from another environment's copy (`actingScope`).
+    acting: Option<String>,
     /// The header's fold scrolled away.
     condensed: bool,
     guide_head: Option<String>,
@@ -194,6 +196,7 @@ impl Panel {
             maintainer_choice: None,
             _picker_search: None,
             handoff: None,
+            acting: None,
             condensed: false,
             guide_head: None,
             guide_position: 0,
@@ -1410,6 +1413,8 @@ impl Workspace {
         let attaches = self.pr_attaches_to_composer();
         let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
         let fix_findings = handoff::fix_labels(attaches).1;
+        let pickable = self.pr_pickable_environments(detail);
+        let acting = self.pr_acting_project(detail);
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1510,6 +1515,7 @@ impl Workspace {
                             .on_click(on(super::super::Workspace::write_pr_guide)),
                     );
                 }
+                menu = handoff::environment_items(menu, &pickable, &acting, busy_handoff, &view, window);
                 menu = menu.separator();
                 if let Some((allowed, saving)) = maintainer {
                     let label = if saving { "Allow edits from maintainers (saving…)" } else { "Allow edits from maintainers" };

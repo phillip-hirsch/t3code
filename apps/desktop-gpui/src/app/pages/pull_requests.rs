@@ -1191,7 +1191,7 @@ impl Workspace {
     }
 
     /// `capableEnvironments`: each connected server, with its label and machine kind.
-    fn pull_request_servers(&self) -> Vec<(SharedString, SharedString, String)> {
+    pub(super) fn pull_request_servers(&self) -> Vec<(SharedString, SharedString, String)> {
         let mut servers: Vec<_> = self
             .sessions()
             .iter()
