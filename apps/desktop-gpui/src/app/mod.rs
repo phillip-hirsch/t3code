@@ -182,6 +182,8 @@ pub struct Workspace {
     runtime_mode_override: Option<String>,
     /// Tracked so typing only re-renders when the send button's state flips.
     composer_empty: bool,
+    /// Where the prompt says "ultrathink", which can own the model's effort level.
+    composer_ultrathink: crate::model_label::Ultrathink,
     /// The floating composer's height last frame: the transcript reserves it at its end, and the
     /// "Scroll to end" pill sits above it (`composerTimelineInset`).
     composer_height: f32,
@@ -408,6 +410,7 @@ impl Workspace {
             sticky_model: None,
             runtime_mode_override: None,
             composer_empty: true,
+            composer_ultrathink: Default::default(),
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
             question: None,

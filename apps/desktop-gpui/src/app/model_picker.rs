@@ -255,6 +255,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Drops the prompt's leading `Ultrathink:`, which a picked level replaces.
+    fn strip_ultrathink_prefix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer.read(cx).value().to_string();
+        let stripped = model_label::strip_ultrathink_prefix(&prompt);
+        if stripped.len() != prompt.len() {
+            let stripped = stripped.to_owned();
+            self.set_composer_text(stripped, window, cx);
+        }
+    }
+
     fn toggle_favorite(&mut self, selection: &ModelSelection, cx: &mut Context<Self>) {
         let Some(environment) = self.picker_environment() else { return };
         let Some(client) = self.env_client(&environment) else { return };
@@ -441,7 +451,13 @@ impl Workspace {
         };
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
-        let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
+        let ultrathink = model_label::ultrathink_select(descriptors, self.composer_ultrathink)
+            .is_some_and(|primary| model_label::reasoning(descriptors).is_some_and(|r| r.id == primary.id));
+        let effort = if ultrathink {
+            Some("Ultrathink".to_owned())
+        } else {
+            current.as_ref().and_then(|s| model_label::effort_label(descriptors, s))
+        };
         let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, driver, s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
         (name, effort, speed, ultracode)
@@ -905,9 +921,18 @@ impl Workspace {
             (None, false) => "Options".into(),
             (None, true) => "Effort".into(),
         };
+        // An Ultrathink prompt owns the levels; one in the text locks them until it goes.
+        let ultrathink = self.composer_ultrathink;
+        let owned = model_label::ultrathink_select(descriptors, ultrathink)
+            .is_some_and(|primary| effort.is_some_and(|effort| effort.id == primary.id));
+        let locked = owned && ultrathink == model_label::Ultrathink::Body;
         let rows: Vec<AnyElement> = match (effort, current) {
             (Some(descriptor), Some(selection)) => {
-                let value = model_label::current_value(descriptor, selection);
+                let value = if owned {
+                    Some(Value::String("ultrathink".into()))
+                } else {
+                    model_label::current_value(descriptor, selection)
+                };
                 let choices: Vec<(Value, String, bool)> = if descriptor.kind == "boolean" {
                     vec![(Value::Bool(true), "On".into(), false), (Value::Bool(false), "Off".into(), false)]
                 } else {
@@ -918,9 +943,17 @@ impl Workspace {
                         .map(|o| (Value::String(o.id.clone()), o.label.clone(), o.is_default))
                         .collect()
                 };
-                choices
-                    .into_iter()
-                    .map(|(choice, label, default)| {
+                let note = locked.then(|| {
+                    div()
+                        .px(px(8.))
+                        .pb(px(6.))
+                        .text_xs()
+                        .text_color(t.muted_foreground.opacity(0.8))
+                        .child("Your prompt contains \"ultrathink\" in the text. Remove it to change this option.")
+                        .into_any_element()
+                });
+                note.into_iter()
+                    .chain(choices.into_iter().map(|(choice, label, default)| {
                         let selected = value.as_ref() == Some(&choice);
                         let id = descriptor.id.clone();
                         option_row(ElementId::Name(format!("effort-{id}-{label}").into()), t)
@@ -929,9 +962,20 @@ impl Workspace {
                             .when(!selected && default, |el| {
                                 el.child(div().text_xs().text_color(t.muted_foreground.opacity(0.7)).child("Default"))
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(&id, choice.clone(), cx)))
+                            .map(|el| {
+                                if locked {
+                                    return el.opacity(0.64).cursor_not_allowed();
+                                }
+                                el.on_click(cx.listener(move |this, _, window, cx| {
+                                    // `getTraitSelectChange`: a level replaces the prompt's `Ultrathink:`.
+                                    if owned {
+                                        this.strip_ultrathink_prefix(window, cx);
+                                    }
+                                    this.set_model_option(&id, choice.clone(), cx);
+                                }))
+                            })
                             .into_any_element()
-                    })
+                    }))
                     .collect()
             }
             _ if others.is_empty() => {

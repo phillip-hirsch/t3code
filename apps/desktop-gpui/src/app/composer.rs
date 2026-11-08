@@ -177,8 +177,14 @@ impl Workspace {
 
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
-        if empty != self.composer_empty {
+        let ultrathink = if empty {
+            Default::default()
+        } else {
+            crate::model_label::prompt_ultrathink(&self.composer.read(cx).value())
+        };
+        if empty != self.composer_empty || ultrathink != self.composer_ultrathink {
             self.composer_empty = empty;
+            self.composer_ultrathink = ultrathink;
             cx.notify();
         }
     }

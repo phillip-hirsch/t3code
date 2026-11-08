@@ -200,6 +200,53 @@ pub fn with_legacy_ultracode(descriptors: &[OptionDescriptor], selection: ModelS
     next
 }
 
+/// Where a prompt says "ultrathink" (`readPromptUltrathink`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ultrathink {
+    #[default]
+    None,
+    /// Only in its leading `Ultrathink:`, which a level pick removes.
+    Prefix,
+    /// In the text itself, which locks the levels until it goes.
+    Body,
+}
+
+pub fn prompt_ultrathink(prompt: &str) -> Ultrathink {
+    if !says_ultrathink(prompt) {
+        Ultrathink::None
+    } else if says_ultrathink(strip_ultrathink_prefix(prompt)) {
+        Ultrathink::Body
+    } else {
+        Ultrathink::Prefix
+    }
+}
+
+/// `prompt` without a leading `Ultrathink:` and the whitespace after it.
+pub fn strip_ultrathink_prefix(prompt: &str) -> &str {
+    const PREFIX: &str = "ultrathink:";
+    match prompt.get(..PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(PREFIX) => prompt[PREFIX.len()..].trim_start(),
+        _ => prompt,
+    }
+}
+
+/// `isClaudeUltrathinkPrompt`: "ultrathink" as a whole word, in any case.
+fn says_ultrathink(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let word = |at: Option<&u8>| at.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+    lower
+        .match_indices("ultrathink")
+        .any(|(at, found)| !word(at.checked_sub(1).and_then(|i| bytes.get(i))) && !word(bytes.get(at + found.len())))
+}
+
+/// The select an Ultrathink prompt owns (`ultrathinkPromptControlled`): the model's first select,
+/// when it offers prompt-injected values.
+pub fn ultrathink_select(descriptors: &[OptionDescriptor], prompt: Ultrathink) -> Option<&OptionDescriptor> {
+    let primary = descriptors.iter().find(|d| d.kind == "select")?;
+    (prompt != Ultrathink::None && !primary.prompt_injected_values.is_empty()).then_some(primary)
+}
+
 /// Codex's service tier, which the picker's footer offers as speed segments (`splitSpeed`).
 pub fn speed_select<'a>(descriptors: &'a [OptionDescriptor], driver: &str) -> Option<&'a OptionDescriptor> {
     descriptors.iter().find(|d| driver == "codex" && d.id == "serviceTier" && d.kind == "select")
@@ -374,6 +421,30 @@ mod tests {
         let mut sub = model("Moonshot Kimi K3");
         sub.sub_provider = Some("Moonshot".into());
         assert_eq!(trigger_model_name(&sub, "opencode"), "Kimi K3");
+    }
+
+    #[test]
+    fn an_ultrathink_prompt_owns_the_first_select_that_injects_it() {
+        assert_eq!(prompt_ultrathink("fix it"), Ultrathink::None);
+        assert_eq!(prompt_ultrathink("Ultrathink: fix it"), Ultrathink::Prefix);
+        assert_eq!(prompt_ultrathink("ULTRATHINK:   fix it"), Ultrathink::Prefix);
+        assert_eq!(prompt_ultrathink("please ultrathink about it"), Ultrathink::Body);
+        assert_eq!(prompt_ultrathink("Ultrathink: and ultrathink"), Ultrathink::Body);
+        assert_eq!(prompt_ultrathink("ultrathinking"), Ultrathink::None, "a whole word only");
+        assert_eq!(strip_ultrathink_prefix("Ultrathink:  fix it"), "fix it");
+        assert_eq!(strip_ultrathink_prefix("fix it"), "fix it");
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "promptInjectedValues": ["ultrathink"],
+             "options": [{"id": "high", "label": "High"}, {"id": "ultrathink", "label": "Ultrathink"}]},
+        ]))
+        .unwrap();
+        assert_eq!(ultrathink_select(&descriptors, Ultrathink::Prefix).map(|d| d.id.as_str()), Some("effort"));
+        assert!(ultrathink_select(&descriptors, Ultrathink::None).is_none());
+        let plain: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "high", "label": "High"}]},
+        ]))
+        .unwrap();
+        assert!(ultrathink_select(&plain, Ultrathink::Body).is_none(), "the model must inject it");
     }
 
     #[test]
