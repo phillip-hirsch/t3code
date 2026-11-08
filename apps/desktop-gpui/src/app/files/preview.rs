@@ -27,6 +27,9 @@ use crate::app::{Target, Workspace};
 use crate::rpc::RpcError;
 use crate::theme::Tokens;
 
+/// `AuthFilesystemWriteScope`.
+const FILESYSTEM_WRITE: &str = "filesystem:write";
+
 /// `LARGE_TEXT_MAX_BYTES`.
 const FULL_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -491,9 +494,35 @@ impl Workspace {
         }
     }
 
-    /// An environment's socket is back: its files' unsaved edits write again, like the web's
-    /// `subscribeWritable` recovery, after the usual debounce.
+    /// An environment's socket is back: its grants are asked again, and its files' unsaved
+    /// edits write again once it may write, like the web's `subscribeWritable` recovery.
     pub(in crate::app) fn resume_file_saves(&mut self, env: &str, cx: &mut Context<Self>) {
+        self.files.writable.remove(env);
+        self.resume_pending_saves(env, cx);
+    }
+
+    /// `useEnvironmentScope(environmentId, AuthFilesystemWriteScope)`: whether files on `env`
+    /// are editable, `None` while its session is being asked.
+    fn can_write_files(&mut self, env: &SharedString, cx: &mut Context<Self>) -> Option<bool> {
+        if let Some((granted, _)) = self.files.writable.get(env) {
+            return *granted;
+        }
+        let endpoint = self.env_endpoint(env)?.clone();
+        let answered = env.clone();
+        let task =
+            crate::app::pages::settings::check_scope(endpoint, FILESYSTEM_WRITE, cx, move |this, granted, cx| {
+                if let Some((writable, _)) = this.files.writable.get_mut(&answered) {
+                    *writable = Some(granted);
+                }
+                if granted {
+                    this.resume_pending_saves(&answered, cx);
+                }
+            });
+        self.files.writable.insert(env.clone(), (None, task));
+        None
+    }
+
+    fn resume_pending_saves(&mut self, env: &str, cx: &mut Context<Self>) {
         for (key, state) in &mut self.files.previews {
             if key.checkout.env != env || !state.save.pending() {
                 continue;
@@ -523,8 +552,12 @@ impl Workspace {
         }));
     }
 
-    /// The write's socket is the environment the file was opened on, whatever is open now.
+    /// The write's socket is the environment the file was opened on, whatever is open now. Without
+    /// write access the edits stay unsaved until it returns.
     fn start_write(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<(crate::rpc::RpcClient, u64, String)> {
+        if self.files.writable.get(&key.checkout.env).and_then(|(granted, _)| *granted) != Some(true) {
+            return None;
+        }
         let client = self.env_client(&key.checkout.env)?;
         let state = self.files.previews.get_mut(key)?;
         let contents = state.editor.as_ref()?.read(cx).value().to_string();
@@ -588,6 +621,18 @@ impl Workspace {
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
         let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
         let draft = !matches!(self.target, Some(Target::Thread { .. }));
+        let read_only =
+            (self.can_write_files(&checkout.env, cx) == Some(false) && !logic::is_host_path(&path)).then(|| {
+                div()
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(tokens.border)
+                    .text_size(gpui_kit::rems(0.625))
+                    .text_color(tokens.muted_foreground)
+                    .child("Read-only connection. Unsaved edits are kept until write access returns.")
+            });
         let notice = self.files.previews.get(&key).and_then(|state| match state.load {
             Load::Text { truncated: true, byte_length } if !logic::loads_full_file(&path, draft) => Some(
                 div()
@@ -657,6 +702,7 @@ impl Workspace {
             .min_h_0()
             .bg(tokens.background)
             .child(subheader)
+            .children(read_only)
             .children(notice)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .into_any_element()
@@ -847,6 +893,8 @@ impl Workspace {
         }
         let image = matches!(self.files.previews.get(key).map(|s| &s.load), Some(Load::Image))
             .then(|| self.workspace_image(key, cx));
+        // A truncated read, a host file or a connection without write access shows the source read-only.
+        let editable = self.can_write_files(&key.checkout.env, cx) == Some(true) && !logic::is_host_path(&key.path);
         let Some(state) = self.files.previews.get_mut(key) else { return div().into_any_element() };
         let centered = |child: AnyElement| {
             div()
@@ -932,7 +980,7 @@ impl Workspace {
                 Editor::new(&editor)
                     .appearance(false)
                     .bordered(false)
-                    .readonly(*truncated)
+                    .readonly(*truncated || !editable)
                     .h_full()
                     .font_family(tokens.fonts.mono)
                     .into_any_element()

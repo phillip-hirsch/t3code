@@ -59,6 +59,17 @@ impl SessionLoad {
     }
 }
 
+/// `useEnvironmentScope` for views outside Settings: whether this client's session on
+/// `endpoint` grants `scope`, answered as `check_session` answers (a failed check grants nothing).
+pub(in crate::app) fn check_scope<T: 'static>(
+    endpoint: Endpoint,
+    scope: &'static str,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, bool, &mut Context<T>) + 'static,
+) -> Task<()> {
+    check_session(endpoint, cx, move |this, load, cx| apply(this, load.grants(scope), cx))
+}
+
 /// The session check every page that gates on grants uses: `apply` gets each answer, and a
 /// failure is retried every few seconds until one succeeds or the task is dropped.
 pub(super) fn check_session<T: 'static>(

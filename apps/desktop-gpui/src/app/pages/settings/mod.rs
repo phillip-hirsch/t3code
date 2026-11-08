@@ -6,6 +6,7 @@ pub(in crate::app) mod agents;
 mod chat;
 pub(in crate::app) mod code;
 mod connections;
+pub(in crate::app) use connections::check_scope;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
 mod desktop_rows;
 mod diagnostics;

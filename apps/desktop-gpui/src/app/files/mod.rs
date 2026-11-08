@@ -76,6 +76,9 @@ pub(super) struct FilesState {
     crumb_menu: Option<crumbs::CrumbMenu>,
     /// Workspace images, per environment: a draft's resource names only its path.
     images: HashMap<SharedString, Entity<super::pages::settings::code::projects::icon::Images>>,
+    /// `filesystem:write` on each environment, `None` until its session answers; asked again
+    /// when its socket returns.
+    writable: HashMap<SharedString, (Option<bool>, gpui_kit::Task<()>)>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.
     mutation: (Option<String>, Option<String>),
 }
