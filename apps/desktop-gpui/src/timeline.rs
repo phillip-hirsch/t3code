@@ -70,6 +70,8 @@ pub enum Row {
         key: SharedString,
         label: SharedString,
         expanded: bool,
+        /// When the folded work started, shown on hover.
+        created_at: SharedString,
     },
     /// A centered label between hairlines, e.g. a context compaction.
     Divider {
@@ -621,7 +623,15 @@ pub enum WorkRowKind {
     /// One entry on its own: a lone tool call, an error, a notice.
     Single { entry: Rc<Entry>, label: SharedString, expanded: bool },
     /// A collapsed group's summary, "Ran 2 commands and read 1 file".
-    Toggle { group: SharedString, summary: SharedString, icon: WorkIcon, expanded: bool, run_id: Option<SharedString> },
+    Toggle {
+        group: SharedString,
+        summary: SharedString,
+        icon: WorkIcon,
+        expanded: bool,
+        run_id: Option<SharedString>,
+        /// The group's first entry's time, shown on hover.
+        created_at: SharedString,
+    },
     /// The open list under an expanded group header.
     Details { entries: Vec<DetailEntry> },
     /// The running turn's latest activity.
@@ -648,6 +658,49 @@ impl Row {
 
     fn is_own_user_message(&self) -> bool {
         matches!(self, Row::User { attribution: None, .. })
+    }
+
+    /// The image attachments of the answers this row shows open.
+    pub fn open_answer_images(&self) -> impl Iterator<Item = &str> {
+        let entries: Vec<&Entry> = match self {
+            Row::Work(WorkRow { kind: WorkRowKind::Single { entry, expanded: true, .. }, .. }) => vec![entry],
+            Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
+                entries.iter().filter(|detail| detail.expanded).map(|detail| &*detail.entry).collect()
+            }
+            _ => Vec::new(),
+        };
+        entries.into_iter().filter_map(|entry| entry.question.as_ref()).flat_map(work_log::QuestionAnswer::image_ids)
+    }
+
+    /// The row's identity across rebuilds (the web's `row.id`), which survives rows added or
+    /// folded above it.
+    pub fn key(&self) -> String {
+        match self {
+            Row::User { id, .. } => format!("user:{id}"),
+            Row::Assistant { id, .. } => format!("assistant:{id}"),
+            Row::AssistantMeta { id, .. } => format!("meta:{id}"),
+            Row::Plan { id, .. } => format!("plan:{id}"),
+            Row::Work(work) => format!("work:{}", work.id),
+            Row::Working { .. } => "working".into(),
+            Row::TurnFold { key, .. } | Row::SubagentGroup { key, .. } | Row::AttemptFold { key, .. } => {
+                key.to_string()
+            }
+            Row::Divider { id, .. } => format!("divider:{id}"),
+            Row::Event { id, .. } => format!("event:{id}"),
+            Row::System(divider) => format!("system:{}", divider.id),
+            Row::Workflow { row, .. } => format!("workflow:{}", row.opening.message_id),
+            Row::Subagent(card) => format!("subagent:{}", card.id),
+            Row::Embed(embed) => format!("embed:{}", embed.id),
+            Row::CreatedThread { id, .. } => format!("created:{id}"),
+            Row::Request(card) => format!("request:{}", card.item_id),
+            Row::ModelSwitch { id, .. } => format!("model-switch:{id}"),
+            Row::Handoff(handoff) => format!("handoff:{}", handoff.id),
+            Row::Approval { id, .. } => format!("approval:{id}"),
+            Row::Queued { message, .. } => format!("queued:{}", message.message_id),
+            Row::Now(_) => "now".into(),
+            Row::WorktreeSetup { .. } => "worktree-setup".into(),
+            Row::QueueToggle { .. } => "queue-toggle".into(),
+        }
     }
 }
 
@@ -972,6 +1025,7 @@ struct Fold {
     key: SharedString,
     hidden: HashSet<usize>,
     label: SharedString,
+    created_at: SharedString,
 }
 
 /// Index of each turn's last assistant message (`deriveTerminalAssistantMessageIds`).
@@ -1146,9 +1200,11 @@ fn turn_folds(
         let segment_end = group.steers.first().map_or(group.entries.len(), |(start, _)| *start);
         let segment_hidden =
             |segment: &[usize]| segment.iter().copied().filter(|index| hidden.contains(index)).collect::<HashSet<_>>();
+        let created_at = group.start.clone().unwrap_or_else(|| entries[first].created_at.clone());
+        let hidden_before_steer = segment_hidden(&group.entries[..segment_end]);
         folds.insert(
             group.anchor,
-            Fold { key: run.clone(), hidden: segment_hidden(&group.entries[..segment_end]), label: label.into() },
+            Fold { key: run.clone(), hidden: hidden_before_steer, label: label.into(), created_at },
         );
         for (position, &(start, steer)) in group.steers.iter().enumerate() {
             let end = group.steers.get(position + 1).map_or(group.entries.len(), |(next, _)| *next);
@@ -1165,7 +1221,8 @@ fn turn_folds(
                 Some(ms) => format!("Continued for {}", work_log::format_duration(ms)),
                 None => "Continued".into(),
             };
-            folds.insert(anchor, Fold { key: format!("{run}:steer:{}", steer.id).into(), hidden, label: label.into() });
+            let key = format!("{run}:steer:{}", steer.id).into();
+            folds.insert(anchor, Fold { key, hidden, label: label.into(), created_at: steer.created_at.clone() });
         }
     }
     folds
@@ -1887,7 +1944,12 @@ pub fn rows(
         }
         if let Some(fold) = folds.get(&index) {
             let key = fold_key(&fold.key);
-            rows.push(Row::TurnFold { expanded: expanded.contains(&key), key, label: fold.label.clone() });
+            rows.push(Row::TurnFold {
+                expanded: expanded.contains(&key),
+                key,
+                label: fold.label.clone(),
+                created_at: fold.created_at.clone(),
+            });
         }
         if collapsed.contains(&index) || active_ids.contains(&index) {
             index += 1;
@@ -2321,6 +2383,7 @@ fn toggle_row(id: &str, group: &SharedString, summary: SharedString, entries: &[
             icon: work_log::summary_icon(work_log::summary_kind(entries)),
             expanded,
             run_id: entries.first().and_then(|e| e.run_id.clone()),
+            created_at: entries.first().map(|e| e.created_at.clone()).unwrap_or_default(),
         },
         continues: false,
     })

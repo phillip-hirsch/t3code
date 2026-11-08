@@ -161,6 +161,7 @@ pub struct TextView {
     inline_code_style: Option<StyleRefinement>,
     list_style: Option<StyleRefinement>,
     blockquote_style: Option<StyleRefinement>,
+    link_underline: Option<bool>,
     style: StyleRefinement,
     selectable: bool,
     selection_format: SelectionFormat,
@@ -212,6 +213,7 @@ impl TextView {
             inline_code_style: None,
             list_style: None,
             blockquote_style: None,
+            link_underline: None,
             style: StyleRefinement::default(),
             selectable: true,
             selection_format: SelectionFormat::default(),
@@ -239,6 +241,7 @@ impl TextView {
             inline_code_style: None,
             list_style: None,
             blockquote_style: None,
+            link_underline: None,
             style: StyleRefinement::default(),
             state: None,
             selectable: true,
@@ -267,6 +270,7 @@ impl TextView {
             inline_code_style: None,
             list_style: None,
             blockquote_style: None,
+            link_underline: None,
             style: StyleRefinement::default(),
             state: None,
             selectable: true,
@@ -319,6 +323,13 @@ impl TextView {
     /// Unspecified properties are inherited.
     pub fn blockquote_style(mut self, style: StyleRefinement) -> Self {
         self.blockquote_style = Some(style);
+        self
+    }
+
+    /// Sets whether links draw their underline over the resolved style. See
+    /// [`TextViewStyle::with_link_underline`].
+    pub fn link_underline(mut self, underline: bool) -> Self {
+        self.link_underline = Some(underline);
         self
     }
 
@@ -754,6 +765,11 @@ impl Element for TextView {
             }
             block_style = style;
             text_view_style = &block_style;
+        }
+        let link_style;
+        if let Some(underline) = self.link_underline.filter(|u| *u != text_view_style.link_underline()) {
+            link_style = text_view_style.clone().with_link_underline(underline);
+            text_view_style = &link_style;
         }
         let foreground = text_view_style.foreground();
         let text_view_style = (*state.read(cx).text_view_style != *text_view_style)

@@ -311,7 +311,8 @@ fn scroll_to_end_button(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-        .bg(Hsla { a: 0.8, ..t.background })
+        // `surface-glass` blurs what it covers; with no backdrop blur, an opaque fill stands in.
+        .bg(t.background)
         .text_color(t.foreground)
 }
 
@@ -830,7 +831,7 @@ pub(super) fn render_row(
             lane(6., rule_row(&t).child(h_flex().h(px(24.)).px(px(4.)).text_color(t.muted_foreground).child(label)))
                 .into_any_element()
         }
-        Row::TurnFold { key, label, expanded } => {
+        Row::TurnFold { key, label, expanded, created_at } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
             let button = h_flex()
                 .id(ElementId::Name(key.clone()))
@@ -843,7 +844,9 @@ pub(super) fn render_row(
                 .child(label.clone())
                 .child(Icon::new(chevron).size(px(14.)))
                 .on_click(toggle(this, key.clone()));
-            lane(6., rule_row(&t).child(button)).into_any_element()
+            let time = hover_timestamp(this, format!("time:{key}"), created_at, &t, cx);
+            lane(6., rule_row(&t).group("timeline-row").flex().items_center().child(button).children(time))
+                .into_any_element()
         }
         Row::Divider { label, failed, failure, .. } => {
             let color = if *failed { t.error } else { t.muted_foreground };
@@ -1439,6 +1442,22 @@ fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tok
 }
 
 impl Workspace {
+    /// Opens a file sent with an answer through a signed URL, as its link does on the web.
+    fn open_answer_attachment(&mut self, attachment_id: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let resource = serde_json::json!({"_tag": "attachment", "attachmentId": attachment_id});
+        cx.spawn(async move |_, cx| {
+            match client.request("assets.createUrl", serde_json::json!({"resource": resource})).await {
+                Ok(signed) => match signed["relativeUrl"].as_str() {
+                    Some(url) => cx.update(|cx| cx.open_url(&format!("{base}{url}"))),
+                    None => log::debug!("assets.createUrl for an answer attachment returned no URL"),
+                },
+                Err(error) => log::debug!("assets.createUrl for an answer attachment: {error}"),
+            }
+        })
+        .detach();
+    }
+
     /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
     fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
         let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
@@ -1479,6 +1498,27 @@ fn compaction_label(label: &SharedString) -> Vec<AnyElement> {
 }
 
 /// The working row and turn folds: a hairline under a 24px label line.
+/// `TimelineRowTimestamp`: the row's time at its end, shown while the row is hovered.
+fn hover_timestamp(
+    this: &WeakEntity<Workspace>,
+    id: String,
+    iso: &SharedString,
+    t: &Tokens,
+    cx: &App,
+) -> Option<AnyElement> {
+    let time = message_actions::timestamp(this, id.into(), iso, t, cx)?;
+    Some(
+        div()
+            .flex_none()
+            .ml_auto()
+            .mr(px(4.))
+            .opacity(0.)
+            .group_hover("timeline-row", |s| s.opacity(1.))
+            .child(time)
+            .into_any_element(),
+    )
+}
+
 fn rule_row(t: &Tokens) -> gpui_kit::Div {
     div()
         .pt(px(4.))
@@ -1523,7 +1563,11 @@ struct FoldedMessage {
 /// "Open thread" on an agent's message, "Open automation" on a scheduled task's.
 enum FoldLink {
     Thread(SharedString),
-    Automation,
+    /// The task, on the open thread's environment (`?environmentId&taskId`).
+    Automation {
+        environment: Option<SharedString>,
+        task_id: String,
+    },
 }
 
 /// `UserTimelineRow`'s "agent" fold and `AutomationMessageRow`, for the attributions that fold.
@@ -1566,7 +1610,10 @@ fn folded_message(
                 icon: IconName::CalendarClock,
                 label: "Automation".into(),
                 summary: title.unwrap_or_else(|| text.trim().lines().next().unwrap_or_default().to_owned().into()),
-                link: scheduled_task_id.as_ref().map(|_| FoldLink::Automation),
+                link: scheduled_task_id.as_ref().map(|task| FoldLink::Automation {
+                    environment: workspace.and_then(|workspace| workspace.active_environment().cloned()),
+                    task_id: task.to_string(),
+                }),
                 actions_when_folded: false,
             })
         }
@@ -1735,7 +1782,7 @@ fn folded_row(
         let this = this.clone();
         let label = match link {
             FoldLink::Thread(_) => "Open thread",
-            FoldLink::Automation => "Open automation",
+            FoldLink::Automation { .. } => "Open automation",
         };
         div()
             .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
@@ -1748,7 +1795,10 @@ fn folded_row(
             .on_click(move |_, window, cx| {
                 let _ = this.update(cx, |workspace, cx| match &link {
                     FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
-                    FoldLink::Automation => workspace.open_settings("scheduled-tasks", cx),
+                    FoldLink::Automation { environment: Some(environment), task_id } => {
+                        workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
+                    }
+                    FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
                 });
             })
     });
@@ -1792,6 +1842,8 @@ fn markdown_view(
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
+        // `.chat-markdown a`: links show by color, with no underline.
+        .link_underline(false)
         .selectable(true)
         .stream_fade(streaming)
         // The user's typed newlines break lines (`lineBreaks`, remark-breaks).
@@ -2298,16 +2350,25 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
         WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
-        WorkRowKind::Toggle { group, summary, icon, .. } => row
+        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => row
             .id(ElementId::Name(work.id.clone()))
+            .group("timeline-row")
             .cursor_pointer()
-            .child(work_line(*icon, icon_color(t), summary.clone(), muted, None))
+            .child(work_line(
+                *icon,
+                icon_color(t),
+                summary.clone(),
+                muted,
+                hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
+            ))
             .on_click(toggle(this, group.clone()))
             .into_any_element(),
         WorkRowKind::Details { entries } => v_flex()
             .id(ElementId::Name(work.id.clone()))
             .max_h(px(288.))
             .overflow_y_scroll()
+            // `scrollbar-gutter-stable`: the 6px scrollbar's lane stays reserved.
+            .pr(px(6.))
             .rounded(px(6.))
             .children(entries.iter().map(|detail| detail_entry(detail, this, t, cx)).collect::<Vec<_>>())
             .into_any_element(),
@@ -2484,7 +2545,7 @@ fn entry_text_details(
         );
     }
     if let Some(question) = &entry.question {
-        return Some(question_history(&entry.id, question, t));
+        return Some(question_history(&entry.id, question, this, t, cx));
     }
     // `WorkLogDetails`: a click or a text selection inside leaves the row open.
     if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
@@ -2597,8 +2658,44 @@ fn thread_read_label(
 }
 
 /// `QuestionAnswerHistory`: each question, its answer, and the files sent with it.
-fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -> AnyElement {
+fn question_history(
+    id: &str,
+    question: &work_log::QuestionAnswer,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    use gpui_kit::StyledImage as _;
     let text = || div().text_size(px(TEXT)).line_height(px(LINE)).text_color(t.muted_foreground);
+    let workspace = this.upgrade();
+    let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
+    let attachment = |index: usize, file: &work_log::AnswerAttachment| {
+        let image = file.id.as_deref().filter(|_| file.image).and_then(|id| workspace?.attachment_image(id));
+        let link = text()
+            .id(ElementId::Name(format!("answer-file:{id}:{index}").into()))
+            .text_color(t.foreground)
+            .underline()
+            .child(match image {
+                Some(image) => gpui_kit::img(image)
+                    .h(px(80.))
+                    .max_w(px(128.))
+                    .rounded(px(4.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .into_any_element(),
+                None => file.name.clone().into_any_element(),
+            });
+        match file.id.clone() {
+            Some(attachment_id) => {
+                let this = this.clone();
+                link.cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |workspace, cx| workspace.open_answer_attachment(&attachment_id, cx));
+                    })
+                    .into_any_element()
+            }
+            None => link.into_any_element(),
+        }
+    };
     v_flex()
         .id(ElementId::Name(format!("answers:{id}").into()))
         .ml(px(28.))
@@ -2613,11 +2710,10 @@ fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -
                 .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
                 .when(!q.attachments.is_empty(), |el| {
                     el.child(
-                        h_flex().flex_wrap().gap(px(8.)).children(
-                            q.attachments
-                                .iter()
-                                .map(|name| text().text_color(t.foreground).underline().child(name.clone())),
-                        ),
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .children(q.attachments.iter().enumerate().map(|(index, file)| attachment(index, file))),
                     )
                 })
         }))

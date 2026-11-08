@@ -94,7 +94,8 @@ fn pick_stripped_match(stripped: &str, cwd: &str, files: &[&str]) -> Option<Stri
 impl Workspace {
     /// Runs `then` with the absolute target of the file reference `authored` (as the message wrote
     /// it, maybe with `:line:col`): the workspace file it names when it names no real path, else
-    /// `target`. A newer lookup cancels the one before it, so the latest click wins.
+    /// `target`. A newer lookup cancels the one before it, so the latest click wins, and one that
+    /// finishes after the open thread or its folder changed is dropped.
     pub(super) fn with_workspace_match(
         &mut self,
         authored: &str,
@@ -115,6 +116,7 @@ impl Workspace {
         let query = stripped.clone().unwrap_or_else(|| path.trim().to_owned());
         let literal = file_links::resolve_target(path, Some(&cwd));
         let search = json!({"cwd": cwd, "query": query, "limit": LOOKUP_LIMIT, "kind": "file"});
+        let scope = self.target.clone();
         let lookup: Task<()> = cx.spawn_in(window, async move |this, cx| {
             let answer = client.request("projects.searchEntries", search).await.ok();
             let files = answer.as_ref().map(file_entries).unwrap_or_default();
@@ -135,6 +137,9 @@ impl Workspace {
                 .map_or(target, |found| format!("{found}{suffix}"));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.file_lookup = None;
+                if this.target != scope || this.git_cwd().as_deref() != Some(cwd.as_str()) {
+                    return;
+                }
                 then(this, resolved, window, cx);
             });
         });

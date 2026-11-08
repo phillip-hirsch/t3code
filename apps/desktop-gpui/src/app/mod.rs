@@ -177,7 +177,7 @@ pub struct Workspace {
     details: inspector::Details,
     /// Where each timeline was left, and where the open one scrolls once its rows arrive.
     positions: positions::Positions,
-    pending_position: Option<gpui_kit::ListOffset>,
+    pending_position: Option<positions::Remembered>,
     copy_feedback: message_actions::CopyFeedback,
     /// The minimap tick under the pointer.
     minimap_hover: Option<usize>,
@@ -885,6 +885,8 @@ impl Workspace {
             queue.splice(at..at, queued);
         }
         new_rows.extend(queue);
+        let answer_images: Vec<String> = new_rows.iter().flat_map(Row::open_answer_images).map(str::to_owned).collect();
+        self.load_attachment_images(answer_images.iter().map(String::as_str), cx);
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
         self.sync_subagent_tick(cx);

@@ -157,7 +157,24 @@ pub struct QuestionAnswer {
 pub struct AnsweredQuestion {
     pub text: Option<SharedString>,
     pub answer: Option<SharedString>,
-    pub attachments: Vec<SharedString>,
+    pub attachments: Vec<AnswerAttachment>,
+}
+
+/// A file sent with an answer, which its row opens through a signed URL.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnswerAttachment {
+    pub id: Option<SharedString>,
+    pub name: SharedString,
+    /// `type === "image"`, shown as a thumbnail.
+    pub image: bool,
+}
+
+impl QuestionAnswer {
+    /// The image attachments' ids, whose thumbnails the open row shows.
+    pub fn image_ids(&self) -> impl Iterator<Item = &str> {
+        let attachments = self.questions.iter().flat_map(|q| &q.attachments);
+        attachments.filter(|a| a.image).filter_map(|a| a.id.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -390,9 +407,18 @@ fn question_answer(payload: &Value) -> Option<QuestionAnswer> {
     let texts = record("questionTextById");
     let answers = record("answers")?;
     let attachments = record("attachmentsByQuestionId");
-    let names = |id: &str| -> Vec<SharedString> {
+    let files = |id: &str| -> Vec<AnswerAttachment> {
         let list = attachments.and_then(|a| a.get(id)).and_then(Value::as_array);
-        list.into_iter().flatten().filter_map(|a| str_at(a, "name")).map(|n| n.to_owned().into()).collect()
+        list.into_iter()
+            .flatten()
+            .filter_map(|a| {
+                Some(AnswerAttachment {
+                    id: str_at(a, "id").map(|id| id.to_owned().into()),
+                    name: str_at(a, "name")?.to_owned().into(),
+                    image: str_at(a, "type") == Some("image"),
+                })
+            })
+            .collect()
     };
     let mut ids: Vec<&str> = Vec::new();
     for map in [texts, Some(answers), attachments].into_iter().flatten() {
@@ -411,7 +437,7 @@ fn question_answer(payload: &Value) -> Option<QuestionAnswer> {
                 .filter(|t| !t.is_empty())
                 .map(|t| t.to_owned().into()),
             answer: answers.get(*id).map(answer_text).filter(|t| !t.is_empty()).map(Into::into),
-            attachments: names(id),
+            attachments: files(id),
         })
         .collect();
     let heading = texts
@@ -423,11 +449,11 @@ fn question_answer(payload: &Value) -> Option<QuestionAnswer> {
         .collect::<Vec<_>>()
         .join(" · ");
     let answered: Vec<String> = answers.values().map(answer_text).filter(|t| !t.is_empty()).collect();
-    let attached: Vec<SharedString> = questions.iter().flat_map(|q| q.attachments.iter().cloned()).collect();
+    let attached: Vec<&str> = questions.iter().flat_map(|q| q.attachments.iter().map(|a| a.name.as_ref())).collect();
     let preview = if !answered.is_empty() {
         Some(answered.join(" · "))
     } else if !attached.is_empty() {
-        Some(attached.iter().map(SharedString::as_ref).collect::<Vec<_>>().join(", "))
+        Some(attached.join(", "))
     } else {
         None
     };
@@ -1983,6 +2009,7 @@ mod tests {
         }}));
         let question = e.question.unwrap();
         assert_eq!(question.heading, "Which color? Pick one · Why?");
+        assert_eq!(question.image_ids().collect::<Vec<_>>(), ["a"]);
         assert_eq!(question.preview.as_deref(), Some("Red, Blue · Extra"));
         let rows: Vec<_> =
             question.questions.iter().map(|q| (q.text.as_deref(), q.answer.as_deref(), q.attachments.len())).collect();

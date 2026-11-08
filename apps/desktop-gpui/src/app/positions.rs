@@ -1,18 +1,22 @@
 //! Where each timeline was left (`rememberTimelinePosition`, `timelineListStateFor`): the row
 //! and offset at the top of the viewport, whether it followed the end, and its open folds and
-//! entries, so a thread opens again as it was.
+//! entries, so a thread opens again as it was. The row is kept by identity, since a turn that
+//! finishes in the background can add or fold rows above it.
 
 use std::collections::{HashSet, VecDeque};
 
 use gpui_kit::{Context, ListOffset, SharedString};
 
 use super::{Target, Workspace};
+use crate::timeline::Row;
 
 /// The web keeps this many threads' positions.
 const LIMIT: usize = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Remembered {
+    /// The top row's [`Row::key`].
+    pub row: Option<String>,
     pub top: ListOffset,
     pub at_end: bool,
     pub expanded: HashSet<SharedString>,
@@ -44,8 +48,10 @@ impl Workspace {
             return;
         }
         let scroller = self.scroller.read(cx);
+        let top = scroller.logical_scroll_top();
         let position = Remembered {
-            top: scroller.logical_scroll_top(),
+            row: self.rows.get(top.item_ix).map(Row::key),
+            top,
             at_end: scroller.is_following_tail(),
             expanded: self.expanded.clone(),
         };
@@ -55,24 +61,33 @@ impl Workspace {
     /// The open target's folds as it was left, and where to scroll once its rows arrive.
     pub(super) fn recall_position(&mut self) {
         let remembered = self.target.as_ref().and_then(|target| self.positions.get(target)).cloned();
-        self.pending_position = remembered.as_ref().filter(|position| !position.at_end).map(|position| position.top);
         if let Some(remembered) = remembered {
-            self.expanded = remembered.expanded;
+            self.expanded = remembered.expanded.clone();
+            self.pending_position = (!remembered.at_end).then_some(remembered);
+        } else {
+            self.pending_position = None;
         }
     }
 
     /// Scrolls a timeline that just got its rows to where it was left.
     pub(super) fn restore_position(&mut self, cx: &mut Context<Self>) {
-        let Some(top) = self.pending_position.take() else { return };
-        let Some(last) = self.rows.len().checked_sub(1) else { return };
-        let top = restored_top(top, last);
+        let Some(remembered) = self.pending_position.take() else { return };
+        let Some(top) = restored_top(&remembered, &self.rows) else { return };
         self.scroller.update(cx, |scroller, cx| scroller.scroll_to_offset(top, cx));
     }
 }
 
-/// A row past the end (the timeline lost rows meanwhile) clamps to its last row's top.
-fn restored_top(top: ListOffset, last: usize) -> ListOffset {
-    if top.item_ix <= last { top } else { ListOffset { item_ix: last, offset_in_item: gpui_kit::px(0.) } }
+/// The remembered row where it is now; a row that is gone falls back to its old index, and one
+/// past the end (the timeline lost rows meanwhile) to the last row's top.
+fn restored_top(remembered: &Remembered, rows: &[Row]) -> Option<ListOffset> {
+    let last = rows.len().checked_sub(1)?;
+    let found = remembered.row.as_ref().and_then(|key| rows.iter().position(|row| row.key() == *key));
+    let top = remembered.top;
+    Some(match found {
+        Some(item_ix) => ListOffset { item_ix, ..top },
+        None if top.item_ix <= last => top,
+        None => ListOffset { item_ix: last, offset_in_item: gpui_kit::px(0.) },
+    })
 }
 
 #[cfg(test)]
@@ -85,7 +100,16 @@ mod tests {
     }
 
     fn at(row: usize, offset: f32, at_end: bool) -> Remembered {
-        Remembered { top: ListOffset { item_ix: row, offset_in_item: px(offset) }, at_end, expanded: HashSet::new() }
+        Remembered {
+            row: None,
+            top: ListOffset { item_ix: row, offset_in_item: px(offset) },
+            at_end,
+            expanded: HashSet::new(),
+        }
+    }
+
+    fn event(id: &str) -> Row {
+        Row::Event { id: id.into(), label: id.into() }
     }
 
     #[test]
@@ -106,9 +130,21 @@ mod tests {
     }
 
     #[test]
-    fn a_row_past_the_end_restores_to_the_last_row() {
-        let top = ListOffset { item_ix: 9, offset_in_item: px(30.) };
-        assert_eq!(restored_top(top, 12), top);
-        assert_eq!(restored_top(top, 4), ListOffset { item_ix: 4, offset_in_item: px(0.) });
+    fn the_remembered_row_restores_where_it_is_now() {
+        let rows: Vec<Row> = ["a", "b", "c"].map(event).into();
+        let left = Remembered { row: Some(rows[1].key()), ..at(1, 30., false) };
+        let grown: Vec<Row> = ["a", "work", "fold", "b", "c"].map(event).into();
+        assert_eq!(restored_top(&left, &grown), Some(ListOffset { item_ix: 3, offset_in_item: px(30.) }));
+        let folded: Vec<Row> = ["b", "c"].map(event).into();
+        assert_eq!(restored_top(&left, &folded), Some(ListOffset { item_ix: 0, offset_in_item: px(30.) }));
+        assert_eq!(restored_top(&left, &[]), None);
+    }
+
+    #[test]
+    fn a_row_that_is_gone_restores_by_index_up_to_the_last_row() {
+        let rows: Vec<Row> = (0..13).map(|index| event(&index.to_string())).collect();
+        let left = Remembered { row: Some("event:gone".into()), ..at(9, 30., false) };
+        assert_eq!(restored_top(&left, &rows), Some(left.top));
+        assert_eq!(restored_top(&left, &rows[..5]), Some(ListOffset { item_ix: 4, offset_in_item: px(0.) }));
     }
 }
