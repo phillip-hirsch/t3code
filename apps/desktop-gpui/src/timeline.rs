@@ -359,11 +359,41 @@ pub struct SubagentCard {
     pub started_at: Option<SharedString>,
     pub completed_at: Option<SharedString>,
     pub child_thread_id: Option<SharedString>,
+    /// The thread in a linked environment that runs the task, when it runs there.
+    pub remote: Option<RemoteChild>,
     pub driver: SharedString,
     pub status: SharedString,
     /// Subagents one provider turn started together group into one row.
     pub run_id: Option<SharedString>,
     pub provider_turn_id: Option<SharedString>,
+}
+
+/// `OrchestrationV2RemoteTaskChild`: where a task runs in a linked environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteChild {
+    pub environment_id: SharedString,
+    pub thread_id: SharedString,
+    /// The environment's name, shown as "on <label>".
+    pub label: SharedString,
+}
+
+/// The thread a subagent card opens.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubagentTarget<'a> {
+    Local(&'a SharedString),
+    Remote(&'a RemoteChild),
+}
+
+impl SubagentCard {
+    /// `SubagentTimelineLink`'s `open`: the child thread here, else the remote one when this
+    /// client is connected to its environment.
+    pub fn target(&self, connected: impl Fn(&str) -> bool) -> Option<SubagentTarget<'_>> {
+        match (&self.child_thread_id, &self.remote) {
+            (Some(child), _) => Some(SubagentTarget::Local(child)),
+            (None, Some(remote)) if connected(&remote.environment_id) => Some(SubagentTarget::Remote(remote)),
+            _ => None,
+        }
+    }
 }
 
 /// `subagentGroupSummary` + `summarizeSubagentStatuses`: "2 working · 1 done", and whether
@@ -503,6 +533,14 @@ fn subagent_card(item: &TurnItem) -> SubagentCard {
         started_at: text("startedAt").map(|s| s.to_owned().into()),
         completed_at: text("completedAt").map(|s| s.to_owned().into()),
         child_thread_id: text("childThreadId").map(|s| s.to_owned().into()),
+        remote: item.raw.get("remoteChild").and_then(|remote| {
+            let text = |key: &str| remote.get(key).and_then(Value::as_str).map(|v| SharedString::from(v.to_owned()));
+            Some(RemoteChild {
+                environment_id: text("environmentId")?,
+                thread_id: text("threadId")?,
+                label: text("label").unwrap_or_default(),
+            })
+        }),
         driver: text("driver").unwrap_or_default().to_owned().into(),
         status: item.status.clone().into(),
         run_id: item.run_id.clone().map(Into::into),
@@ -3002,6 +3040,14 @@ mod tests {
         let generic = card(json!({"status": "failed", "result": "Child task ended with status failed"}));
         assert_eq!((generic.detail, generic.failed), (None, true));
         assert_eq!([5_000, 185_000, 3_725_000].map(agent_elapsed), ["5s", "3m 05s", "1h 02m"]);
+        assert!(matches!(done.target(|_| false), Some(SubagentTarget::Local(child)) if child == "child"));
+        let remote = card(
+            json!({"childThreadId": null, "remoteChild": {"environmentId": "mac", "threadId": "t9", "label": "MacBook"}}),
+        );
+        let linked = remote.remote.clone().expect("a remote child");
+        assert_eq!((&*linked.environment_id, &*linked.thread_id, &*linked.label), ("mac", "t9", "MacBook"));
+        assert_eq!(remote.target(|env| env == "mac"), Some(SubagentTarget::Remote(&linked)));
+        assert_eq!(remote.target(|_| false), None);
     }
 
     #[test]

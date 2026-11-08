@@ -46,6 +46,7 @@ fn card(member: &Member, driver: &str) -> Rc<SubagentCard> {
         started_at: iso(member.started_ms),
         completed_at: iso(member.completed_ms),
         child_thread_id: member.child_thread_id.clone().map(Into::into),
+        remote: None,
         driver: driver.to_owned().into(),
         status: member.status.clone().into(),
         run_id: None,
@@ -158,23 +159,30 @@ pub(super) fn workflow_row(
                 .children(description.map(|d| div().text_xs().text_color(muted).child(d))),
         )
         .children(agents.map(|a| div().flex_none().text_size(px(10.)).text_color(muted).child(a)));
-    let phases = row.phases.iter().map(|(title, settled, cards)| {
-        v_flex()
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .pb(px(2.))
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted)
-                    .child(div().min_w_0().truncate().child(title.clone()))
-                    .child(
-                        div().flex_none().font_weight(FontWeight::NORMAL).child(format!("{settled}/{}", cards.len())),
-                    ),
-            )
-            .children(cards.iter().map(|card| super::chat::subagent_card(card, this, t)))
-    });
+    let phases: Vec<_> = row
+        .phases
+        .iter()
+        .map(|(title, settled, cards)| {
+            v_flex()
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .pb(px(2.))
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .child(div().min_w_0().truncate().child(title.clone()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::NORMAL)
+                                .child(format!("{settled}/{}", cards.len())),
+                        ),
+                )
+                .children(cards.iter().map(|card| super::chat::subagent_card(card, this, t, cx)))
+        })
+        .collect();
     let key = timeline::entry_key(&format!("workflow-script:{}", opening.message_id));
     let markdown_key: SharedString = format!("workflow-script:{}", opening.message_id).into();
     let script = super::chat::markdown(this, markdown_key, &row.script_markdown, false, t, cx);
@@ -190,7 +198,7 @@ pub(super) fn workflow_row(
         .child(header)
         .children(phases)
         .when(!row.unphased.is_empty(), |el| {
-            el.child(v_flex().children(row.unphased.iter().map(|card| super::chat::subagent_card(card, this, t))))
+            el.child(v_flex().children(row.unphased.iter().map(|card| super::chat::subagent_card(card, this, t, cx))))
         })
         .child(
             v_flex()

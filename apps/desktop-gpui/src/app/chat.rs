@@ -744,9 +744,9 @@ pub(super) fn render_row(
             lane(8., div().px(px(2.)).py(px(2.)).child(line)).into_any_element()
         }
         // Subagent rows carry no bottom space of their own.
-        Row::Subagent(card) => lane(0., subagent_card(card, this, &t)).into_any_element(),
+        Row::Subagent(card) => lane(0., subagent_card(card, this, &t, cx)).into_any_element(),
         Row::SubagentGroup { key, cards, expanded } => {
-            lane(0., subagent_group(key, cards, *expanded, this, &t)).into_any_element()
+            lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
         }
         Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
         Row::CreatedThread { id, title, thread_id, .. } => {
@@ -977,7 +977,12 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
 
 /// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
 /// chevron when the subagent's thread can open.
-pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+pub(super) fn subagent_card(
+    card: &timeline::SubagentCard,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
     let muted = t.muted_foreground;
     let detail_color = if card.failed { t.error } else { muted };
     let dot = match card.dot {
@@ -1019,16 +1024,16 @@ pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Wor
         };
         Some(timeline::agent_elapsed(end - start))
     });
+    let title = div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground);
     let text = v_flex()
         .flex_1()
         .min_w_0()
         .child(
-            div()
-                .truncate()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(t.foreground)
-                .child(card.title.clone()),
+            h_flex().min_w_0().gap(px(8.)).text_xs().child(title.child(card.title.clone())).children(
+                card.remote
+                    .as_ref()
+                    .map(|remote| div().flex_none().text_color(muted).child(format!("on {}", remote.label))),
+            ),
         )
         .child(
             div()
@@ -1053,14 +1058,24 @@ pub(super) fn subagent_card(card: &timeline::SubagentCard, this: &WeakEntity<Wor
                 .then(|| div().flex_none().text_xs().text_color(detail_color).child(card.status_label)),
         )
         .children(elapsed.map(|elapsed| div().flex_none().text_xs().text_color(muted).child(elapsed)));
-    match card.child_thread_id.clone() {
-        Some(child) => {
+    // A task in a linked environment opens there, if this client is connected to it.
+    let connected = |env: &str| this.upgrade().is_some_and(|workspace| workspace.read(cx).session(env).is_some());
+    let target = card.target(connected).map(|target| match target {
+        timeline::SubagentTarget::Local(child) => (None, child.to_string()),
+        timeline::SubagentTarget::Remote(remote) => (Some(remote.environment_id.clone()), remote.thread_id.to_string()),
+    });
+    match target {
+        Some((env, thread_id)) => {
             let this = this.clone();
             row.cursor_pointer()
                 .hover(|style| style.bg(alpha(t.accent, 0.2)))
                 .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(alpha(muted, 0.6)))
                 .on_click(move |_, window, cx| {
-                    let _ = this.update(cx, |workspace, cx| workspace.select_thread(child.to_string(), window, cx));
+                    let (env, thread_id) = (env.clone(), thread_id.clone());
+                    let _ = this.update(cx, |workspace, cx| match env {
+                        Some(env) => workspace.select_thread_in(env, thread_id, window, cx),
+                        None => workspace.select_thread(thread_id, window, cx),
+                    });
                 })
                 .into_any_element()
         }
@@ -1076,6 +1091,7 @@ fn subagent_group(
     expanded: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
+    cx: &App,
 ) -> AnyElement {
     let muted = t.muted_foreground;
     let (summary, active, failed) = timeline::subagent_group_status(cards);
@@ -1177,7 +1193,7 @@ fn subagent_group(
                     .border_1()
                     .border_color(alpha(t.border, 0.6))
                     .bg(alpha(t.card, 0.3))
-                    .children(cards.iter().map(|card| subagent_card(card, this, t))),
+                    .children(cards.iter().map(|card| subagent_card(card, this, t, cx))),
             )
         })
         .into_any_element()
