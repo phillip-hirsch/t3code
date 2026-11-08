@@ -8,7 +8,10 @@ use futures::channel::oneshot;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogEntrance, DialogFooter};
 use gpui_kit::component::{WindowExt as _, v_flex};
-use gpui_kit::{App, FontWeight, ParentElement as _, SharedString, Styled as _, Window, div, px, relative, white};
+use gpui_kit::{
+    AnyElement, App, FontWeight, IntoElement as _, ParentElement as _, SharedString, Styled as _, Window, div, px,
+    relative, white,
+};
 
 use crate::theme;
 
@@ -39,7 +42,30 @@ pub(in crate::app) fn confirm(
     cx: &mut App,
 ) -> oneshot::Receiver<bool> {
     let (title, description) = copy(message);
-    let (title, description) = (SharedString::from(title), description.map(SharedString::from));
+    let title = SharedString::from(title);
+    let ask = Ask {
+        title: Rc::new(move |_, _| title.clone().into_any_element()),
+        description: description.map(SharedString::from),
+        confirm_label: "Confirm".into(),
+        destructive,
+    };
+    ask_confirmation(ask, window, cx)
+}
+
+/// Builds a confirmation title's content on each render.
+pub(in crate::app) type Title = Rc<dyn Fn(&theme::Tokens, &Window) -> AnyElement>;
+
+/// A confirmation whose question needs markup (a `<code>` branch name) or its own button label.
+pub(in crate::app) struct Ask {
+    pub title: Title,
+    pub description: Option<SharedString>,
+    pub confirm_label: SharedString,
+    pub destructive: bool,
+}
+
+/// [`confirm`] with the copy spelled out.
+pub(in crate::app) fn ask_confirmation(ask: Ask, window: &mut Window, cx: &mut App) -> oneshot::Receiver<bool> {
+    let Ask { title, description, confirm_label, destructive } = ask;
     let (sender, receiver) = oneshot::channel();
     let sender = Rc::new(RefCell::new(Some(sender)));
     // Closing any other way drops the sender, which reads as Cancel.
@@ -53,14 +79,15 @@ pub(in crate::app) fn confirm(
     let cancel_focus = cx.focus_handle();
     let ok_focus = cx.focus_handle();
     let focus = cancel_focus.clone();
-    window.open_dialog(cx, move |dialog, _, cx| {
+    window.open_dialog(cx, move |dialog, window, cx| {
         let t = theme::tokens(cx);
         let ok = send.clone();
-        let action =
-            Button::new("confirm-dialog-ok").label("Confirm").track_focus(&ok_focus).on_click(move |_, window, cx| {
+        let action = Button::new("confirm-dialog-ok").label(confirm_label.clone()).track_focus(&ok_focus).on_click(
+            move |_, window, cx| {
                 ok(true);
                 window.close_dialog(cx);
-            });
+            },
+        );
         let action = if destructive { action.danger() } else { action.primary() };
         let enter = send.clone();
         let (enter_ok, enter_cancel) = (ok_focus.clone(), cancel_focus.clone());
@@ -86,7 +113,7 @@ pub(in crate::app) fn confirm(
                             .line_height(relative(1.375))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.foreground)
-                            .child(title.clone()),
+                            .child(title(t, window)),
                     )
                     .children(
                         description.clone().map(|text| div().text_sm().text_color(t.muted_foreground).child(text)),

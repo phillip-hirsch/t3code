@@ -669,7 +669,7 @@ impl Workspace {
                     .label(if restoring { "Restoring..." } else { "Restore branch" })
                     .disabled(restoring)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
+                        this.request_restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
                     })),
             )
             .child(
@@ -691,6 +691,54 @@ impl Workspace {
             Some(actions.into_any_element()),
             t,
         ))
+    }
+
+    /// `handleRestoreThreadBranch`: a checkout with uncommitted changes asks first
+    /// (`BranchRestoreConfirmHost`), since they carry over or block the switch.
+    fn request_restore_thread_branch(
+        &mut self,
+        key: String,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_write_source_control() {
+            return;
+        }
+        if !self.vcs.status.as_ref().is_some_and(|status| status.local.has_working_tree_changes) {
+            return self.restore_thread_branch(key, branch, window, cx);
+        }
+        let name = branch.clone();
+        let ask = super::confirm::Ask {
+            title: std::rc::Rc::new(move |t, window| {
+                let text = format!("Switch to {name}?");
+                let base = gpui_kit::Font { weight: FontWeight::SEMIBOLD, ..window.text_style().font() };
+                let code = gpui_kit::Font { family: t.fonts.mono.into(), weight: FontWeight::MEDIUM, ..base.clone() };
+                let run = |len, font| gpui_kit::TextRun {
+                    len,
+                    font,
+                    color: t.foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let runs = vec![run("Switch to ".len(), base.clone()), run(name.len(), code), run(1, base)];
+                gpui_kit::StyledText::new(text).with_runs(runs).into_any_element()
+            }),
+            description: Some(
+                "You have uncommitted changes. They'll carry over to the other branch, or block the switch if they conflict."
+                    .into(),
+            ),
+            confirm_label: "Switch branch".into(),
+            destructive: false,
+        };
+        let answer = super::confirm::ask_confirmation(ask, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(true) {
+                let _ = this.update_in(cx, |this, window, cx| this.restore_thread_branch(key, branch, window, cx));
+            }
+        })
+        .detach();
     }
 
     /// `handleSwitchCheckoutToThread`: checks the branch out again, then points the thread at it.
