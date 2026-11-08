@@ -446,6 +446,28 @@ fn row_lock(
         .then(|| format!("This connection lacks permission to change settings on {}.", denied.join(", ")).into())
 }
 
+/// Each dot path a patch writes: the leaves of its nested objects.
+fn patch_paths(patch: &Map<String, Value>) -> Vec<String> {
+    fn walk(prefix: String, value: &Value, out: &mut Vec<String>) {
+        match value.as_object().filter(|object| !object.is_empty()) {
+            Some(object) => object.iter().for_each(|(key, value)| walk(format!("{prefix}.{key}"), value, out)),
+            None => out.push(prefix),
+        }
+    }
+    let mut paths = Vec::new();
+    patch.iter().for_each(|(key, value)| walk(key.clone(), value, &mut paths));
+    paths
+}
+
+/// [`row_lock`] for a patch on its way, so a control that an inert row still lets act
+/// (keyboard focus, a section's own control) never writes what its row locks.
+fn patch_lock(authorities: &[RowAuthority], patch: &Map<String, Value>) -> Option<SharedString> {
+    let paths = patch_paths(patch);
+    let lockable: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let server_scoped = patch.keys().any(|key| contract().is_server_key(key));
+    row_lock(authorities, &lockable, server_scoped, false)
+}
+
 /// A search target as the page's sections see it while they build.
 #[derive(Clone)]
 pub(super) struct SectionTarget {
@@ -920,6 +942,10 @@ impl Workspace {
     ) {
         let Value::Object(patch) = patch else { return done(self, false, cx) };
         let view = self.settings_view();
+        if let Some(reason) = patch_lock(&view.row_authorities(), &patch) {
+            window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+            return done(self, false, cx);
+        }
         let plan = scope::plan_patch(&view.scope, &view.environments(), &patch);
         self.run_settings_plan(plan, window, cx, done);
     }
@@ -1221,16 +1247,23 @@ impl Workspace {
         frame.description = description;
         frame.body = body;
         frame.hug = hug;
+        // `inert`: a cover over the control takes its pointer events and carries the tooltip;
+        // `patch_lock` refuses what keyboard focus could still send.
         let inert_control = |control: AnyElement| match inert.clone() {
             Some(message) => div()
-                .id(SharedString::from(format!("{id}-inert")))
                 .flex_none()
-                .opacity(0.5)
-                .occlude()
-                .when(!message.is_empty(), |el| {
-                    el.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
-                })
-                .child(control)
+                .relative()
+                .child(div().opacity(0.5).child(control))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}-inert")))
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .when(!message.is_empty(), |el| {
+                            el.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
+                        }),
+                )
                 .into_any_element(),
             None => control,
         };
@@ -2396,6 +2429,24 @@ mod tests {
         assert_eq!(
             row_lock(&[], &["defaultRuntimeMode"], true, true).as_deref(),
             Some("Reconnect the selected environment to change this setting.")
+        );
+
+        let patch = |value: Value| value.as_object().cloned().unwrap_or_default();
+        let managed = [env("Studio", true, &acme)];
+        assert_eq!(
+            patch_lock(&managed, &patch(json!({"storageCleanup": {"logsAfterDays": 3}}))).as_deref(),
+            Some("Managed by Acme."),
+            "a write to a locked leaf"
+        );
+        assert_eq!(
+            patch_lock(&managed, &patch(json!({"worktreeCleanup": {"mode": "off"}}))).as_deref(),
+            Some("Managed by Acme."),
+            "a write inside a locked setting"
+        );
+        assert_eq!(patch_lock(&managed, &patch(json!({"storageCleanup": {"logs": 3}}))), None, "an unlocked sibling");
+        assert_eq!(
+            patch_lock(&both, &patch(json!({"defaultRuntimeMode": "full-access"}))).as_deref(),
+            Some("This connection lacks permission to change settings on Laptop.")
         );
     }
 
