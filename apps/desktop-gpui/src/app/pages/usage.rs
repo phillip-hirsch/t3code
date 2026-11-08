@@ -14,9 +14,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Bounds, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
+    AnyElement, Bounds, BoxShadow, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative,
+    rgb, svg,
 };
 use serde_json::{Value, json};
 
@@ -616,7 +617,7 @@ impl Workspace {
                     .shadow_2xl()
                     .text_color(t.foreground)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_usage_header(&t, cx))
+                    .child(self.render_usage_header(&t, window, cx))
                     .child(
                         div()
                             .id("usage-scroll")
@@ -633,14 +634,14 @@ impl Workspace {
                                     .pt(px(24.))
                                     .pb(px(48.))
                                     .gap(px(24.))
-                                    .child(self.render_usage_body(&t, cx)),
+                                    .child(self.render_usage_body(&t, window, cx)),
                             ),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_usage_header(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_usage_header(&self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         let view = cx.entity();
@@ -815,6 +816,7 @@ impl Workspace {
             logic::WINDOWS.iter().map(|(days, label)| (*days, *label)),
             usage.days,
             t,
+            window,
             cx,
             super::super::Workspace::select_usage_window,
         );
@@ -823,6 +825,7 @@ impl Workspace {
             logic::METRICS.iter().map(|(value, label)| (*value, *label)),
             usage.metric,
             t,
+            window,
             cx,
             super::super::Workspace::select_usage_metric,
         );
@@ -863,7 +866,7 @@ impl Workspace {
             )
     }
 
-    fn render_usage_body(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_usage_body(&mut self, t: &Tokens, win: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         if self.limit_environments().is_empty() {
@@ -891,7 +894,7 @@ impl Workspace {
                 .child(error.to_owned())
                 .into_any_element(),
             (None, None) => usage_skeleton(t).into_any_element(),
-            (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, cx),
+            (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, win, cx),
         }
     }
 
@@ -993,6 +996,7 @@ impl Workspace {
         summary: &Summary,
         window: &UsageWindow,
         t: &Tokens,
+        win: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let usage = &self.usage;
@@ -1199,7 +1203,9 @@ impl Workspace {
             );
         }
 
-        overview.child(self.render_usage_breakdown(&merged, window, &providers, t, cx).mt(px(18.))).into_any_element()
+        overview
+            .child(self.render_usage_breakdown(&merged, window, &providers, t, win, cx).mt(px(18.)))
+            .into_any_element()
     }
 
     fn render_usage_chart(
@@ -1433,6 +1439,7 @@ impl Workspace {
         window: &UsageWindow,
         providers: &[&'static str],
         t: &Tokens,
+        win: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Div {
         let usage = &self.usage;
@@ -1445,6 +1452,7 @@ impl Workspace {
             [(false, "Model"), (true, if hourly { "Hour" } else { "Day" })].into_iter(),
             by_time,
             t,
+            win,
             cx,
             |this, by_time, cx| {
                 this.usage.by_time = by_time;
@@ -1695,44 +1703,95 @@ fn ghost_icon_button(id: &'static str, icon: Lucide, size: f32, t: &Tokens) -> B
         .child(Icon::new(icon).with_size(px(size)).text_color(t.muted_foreground))
 }
 
-/// `ToggleGroup variant="segmented"`.
+/// A segmented group's toggles' focus handles, kept while the group renders.
+#[derive(Default)]
+struct SegmentFocus(Vec<FocusHandle>);
+
+/// `ToggleGroup`'s arrow keys: the toggle `key` moves focus to from `from` of `len`, wrapping.
+fn segment_step(key: &str, from: usize, len: usize) -> Option<usize> {
+    match key {
+        "left" => Some((from + len - 1) % len),
+        "right" => Some((from + 1) % len),
+        "home" => Some(0),
+        "end" => Some(len - 1),
+        _ => None,
+    }
+}
+
+/// `ToggleGroup variant="segmented"`: one tab stop (the pressed toggle until the arrow keys move
+/// on), arrows and Home/End move between toggles, and Enter or Space presses the focused one.
 pub(super) fn segmented<V: Copy + PartialEq + std::fmt::Debug + 'static>(
     id: &'static str,
     options: impl Iterator<Item = (V, &'static str)>,
     current: V,
     t: &Tokens,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
     pick: fn(&mut Workspace, V, &mut Context<Workspace>),
 ) -> gpui_kit::Div {
+    let options: Vec<(V, &'static str)> = options.collect();
+    let state = window.use_keyed_state(SharedString::from(format!("{id}-focus")), cx, |_, _| SegmentFocus::default());
+    let handles = state.update(cx, |state, cx| {
+        state.0.resize_with(options.len(), || cx.focus_handle());
+        state.0.clone()
+    });
+    let focused = handles.iter().position(|handle| handle.is_focused(window));
+    let stop = focused.or_else(|| options.iter().position(|(value, _)| *value == current)).unwrap_or(0);
+    let keyboard = window.last_input_was_keyboard();
     let track = Hsla { a: t.input.a * 0.4, ..t.input };
-    h_flex().flex_none().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(track).children(options.map(|(value, label)| {
-        let pressed = value == current;
-        div()
-            .id(ElementId::Name(format!("{id}-{value:?}").into()))
-            .h(px(24.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .rounded(px(6.))
-            // `text-xs` with the base's `sm:text-sm`, which wins at desktop widths.
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer()
-            .map(|el| {
-                if pressed {
-                    el.text_color(t.foreground).bg(if t.dark {
-                        Hsla { a: t.input.a * 0.72, ..t.input }
+    let len = options.len();
+    h_flex().flex_none().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(track).children(options.into_iter().enumerate().map(
+        |(index, (value, label))| {
+            let pressed = value == current;
+            let focus = handles[index].clone().tab_stop(index == stop);
+            // `focus-visible:ring-2 focus-visible:ring-inset ring-ring`
+            let ring = (keyboard && focus.is_focused(window))
+                .then(|| vec![BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset()]);
+            let handles = handles.clone();
+            div()
+                .id(ElementId::Name(format!("{id}-{value:?}").into()))
+                .track_focus(&focus)
+                .when_some(ring, gpui_kit::Styled::shadow)
+                .h(px(24.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                // `text-xs` with the base's `sm:text-sm`, which wins at desktop widths.
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .map(|el| {
+                    if pressed {
+                        el.text_color(t.foreground).bg(if t.dark {
+                            Hsla { a: t.input.a * 0.72, ..t.input }
+                        } else {
+                            t.background
+                        })
                     } else {
-                        t.background
-                    })
-                } else {
-                    el.text_color(t.muted_foreground)
-                        .hover(|s| s.text_color(t.foreground).bg(Hsla { a: t.input.a * 0.32, ..t.input }))
-                }
-            })
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| pick(this, value, cx)))
-    }))
+                        el.text_color(t.muted_foreground)
+                            .hover(|s| s.text_color(t.foreground).bg(Hsla { a: t.input.a * 0.32, ..t.input }))
+                    }
+                })
+                .child(label)
+                .on_key_down(cx.listener(move |_, event: &KeyDownEvent, window, cx| {
+                    let keystroke = &event.keystroke;
+                    if keystroke.modifiers.modified() {
+                        return;
+                    }
+                    if let Some(next) = segment_step(&keystroke.key, index, len) {
+                        window.focus(&handles[next], cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                // A pressed button takes focus in a browser, so the arrow keys go on from it.
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    window.focus(&focus, cx);
+                    pick(this, value, cx);
+                }))
+        },
+    ))
 }
 
 /// `UsageShareBar`: one bar split by share, with a legend.
@@ -2150,6 +2209,14 @@ fn usage_skeleton(t: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segmented_arrows_wrap_and_home_end_jump() {
+        assert_eq!(segment_step("right", 2, 3), Some(0));
+        assert_eq!(segment_step("left", 0, 3), Some(2));
+        assert_eq!((segment_step("home", 2, 3), segment_step("end", 0, 3)), (Some(0), Some(2)));
+        assert_eq!(segment_step("down", 0, 3), None, "a horizontal group leaves up and down alone");
+    }
 
     #[test]
     fn page_preferences_survive_a_restart_and_bad_ones_fall_back() {
