@@ -99,8 +99,7 @@ impl Workspace {
     /// without the No project home, which has its own link.
     fn draft_picker_groups(&self) -> Vec<crate::project_groups::ProjectGroup> {
         let groups = self.project_groups();
-        let current = self.current_project().map(|p| p.id.clone());
-        crate::project_groups::picker(&groups, current.as_deref())
+        crate::project_groups::picker(&groups, self.current_project())
             .into_iter()
             .filter(|g| !g.members[0].is_scratch)
             .cloned()
@@ -160,9 +159,9 @@ impl Workspace {
         });
         query.update(cx, |query, cx| query.focus(window, cx));
         let groups = self.draft_picker_groups();
-        let current = self.current_project().map(|p| p.id.clone());
+        let current = self.current_project();
         // The selected project starts highlighted, as Base UI opens a combobox on its value.
-        let highlight = current.and_then(|id| groups.iter().position(|g| g.contains(&id))).unwrap_or(0);
+        let highlight = current.and_then(|p| groups.iter().position(|g| g.contains_project(p))).unwrap_or(0);
         let order = groups.into_iter().map(|g| g.key).collect();
         let mut open = Open {
             query,
@@ -202,24 +201,29 @@ impl Workspace {
             Entry::AddProject => return self.open_palette(View::AddProject, window, cx),
             Entry::Project(key) => key,
         };
-        let current = self.current_project().map(|p| (p.id.clone(), p.environment_id.clone()));
         let Some(group) = self.draft_picker_groups().into_iter().find(|g| g.key == key) else { return };
-        if current.as_ref().is_some_and(|(id, _)| group.contains(id)) {
+        let current = self.current_project();
+        if current.is_some_and(|p| group.contains_project(p)) {
             return;
         }
-        let target = group.target(current.as_ref().map(|(_, env)| env.as_ref()));
-        self.select_draft_project(target.id.clone(), window, cx);
+        let target = group.target(current.map(|p| p.environment_id.as_ref()));
+        let (env, project_id) = (target.environment_id.clone(), target.id.clone());
+        self.select_draft_project(env, project_id, window, cx);
     }
 
     /// `selectProject`: a draft with content moves to the project; an empty one opens the
     /// project's draft, since retargeting it would overwrite that one.
-    fn select_draft_project(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let composed = !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
-        match self.project_environment(&project_id) {
-            Some(env) if composed && matches!(self.target, Some(super::Target::Draft { .. })) => {
-                self.move_draft_to_project(env, project_id, window, cx);
-            }
-            _ => self.start_draft(project_id, window, cx),
+    fn select_draft_project(
+        &mut self,
+        env: SharedString,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_has_user_content(cx) && matches!(self.target, Some(super::Target::Draft { .. })) {
+            self.move_draft_to_project(env, project_id, window, cx);
+        } else {
+            self.start_draft_in(env, project_id, window, cx);
         }
     }
 
@@ -272,7 +276,7 @@ impl Workspace {
         let fg = t.foreground;
         let muted = t.muted_foreground;
         let groups = self.draft_picker_groups();
-        let current = self.current_project().map(|p| p.id.clone());
+        let current = self.current_project();
         let rows = self.draft_picker_rows(cx);
         let pin_shortcut = self.shortcut_label("thread.pin");
         let show_environments = crate::project_groups::span_environments(&self.project_groups());
@@ -283,7 +287,7 @@ impl Workspace {
                 Entry::Project(key) => groups.iter().find(|g| &g.key == key),
                 Entry::AddProject => None,
             };
-            let selected = group.is_some_and(|g| current.as_ref().is_some_and(|id| g.contains(id)));
+            let selected = group.is_some_and(|g| current.is_some_and(|p| g.contains_project(p)));
             let row_icon: AnyElement = match group {
                 Some(g) => {
                     let project = g.representative();

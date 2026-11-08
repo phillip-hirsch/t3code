@@ -500,6 +500,7 @@ mod tests {
             display_name: key.into(),
             members: Vec::new(),
             project_ids: vec![key.into()],
+            project_refs: vec![("env".into(), key.into())],
             pinned: false,
             archived,
         };

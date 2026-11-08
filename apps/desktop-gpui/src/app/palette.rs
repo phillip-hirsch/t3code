@@ -792,13 +792,13 @@ impl Workspace {
     }
 
     /// The project of the open thread or draft.
+    /// The open thread's or draft's project, on the target's environment.
     pub(super) fn current_project(&self) -> Option<&ProjectShell> {
-        let id = match &self.target {
-            Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id),
-            Some(Target::Draft { project_id, .. }) => Some(project_id),
-            None => None,
-        }?;
-        self.shell.projects.iter().find(|p| &p.id == id)
+        let (env, id) = match self.target.as_ref()? {
+            Target::Thread { env, id } => (env, &self.shell.threads.iter().find(|t| &t.id == id)?.project_id),
+            Target::Draft { env, project_id } => (env, project_id),
+        };
+        self.shell.projects.iter().find(|p| &p.id == id && p.environment_id == *env)
     }
 
     /// The name of a project's group (`displayName`): the repository's name, not owner/repo.
@@ -814,7 +814,7 @@ impl Workspace {
     fn new_thread_rows(&self) -> Vec<Row> {
         let groups = self.project_groups();
         let contextual = self.contextual_project();
-        let pickable = crate::project_groups::picker(&groups, contextual.map(|p| p.id.as_str()));
+        let pickable = crate::project_groups::picker(&groups, contextual);
         let entries: Vec<NoProjectEntry> = pickable
             .iter()
             .map(|g| NoProjectEntry {
@@ -898,7 +898,7 @@ impl Workspace {
     fn project_search_rows(&self) -> Vec<Row> {
         let groups = self.project_groups();
         let contextual = self.contextual_project();
-        let rows = crate::project_groups::picker(&groups, contextual.map(|p| p.id.as_str()))
+        let rows = crate::project_groups::picker(&groups, contextual)
             .into_iter()
             .map(|g| {
                 let p = g.target_for(contextual);
@@ -1086,7 +1086,7 @@ impl Workspace {
         row.terms = &["settings", "preferences", "configuration", "keybindings"];
         rows.push(row);
         let groups = self.project_groups();
-        if let Some(group) = self.current_project().and_then(|p| groups.iter().find(|g| g.contains(&p.id))) {
+        if let Some(group) = self.current_project().and_then(|p| groups.iter().find(|g| g.contains_project(p))) {
             let (title, icon) =
                 if group.pinned { ("Unpin project", IconName::PinOff) } else { ("Pin project", IconName::Pin) };
             let ids = group.members.iter().map(|m| m.project.id.clone()).collect();
@@ -1096,7 +1096,8 @@ impl Workspace {
             rows.push(row);
         }
         // `contextualProjectGroup`: the open project's group, else the first.
-        let current_group = self.current_project().and_then(|p| Some((groups.iter().find(|g| g.contains(&p.id))?, p)));
+        let current_group =
+            self.current_project().and_then(|p| Some((groups.iter().find(|g| g.contains_project(p))?, p)));
         let contextual = current_group.or_else(|| groups.first().map(|g| (g, g.representative())));
         if let Some((group, project)) = contextual {
             let run = Run::ProjectSettings(project.id.clone());
