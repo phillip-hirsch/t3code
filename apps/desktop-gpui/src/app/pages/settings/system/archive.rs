@@ -119,19 +119,28 @@ impl Workspace {
             return self.settings_page(
                 "archived",
                 view,
-                [settings_section("archived", "Archived threads", [row], &t)],
+                [settings_section(
+                    if loaded.is_some() { "archive" } else { "archived" },
+                    "Archived threads",
+                    [row],
+                    &t,
+                )],
                 cx,
             );
         };
         let now = now_ms();
         let sections: Vec<AnyElement> = groups
             .iter()
-            .map(|(project, threads)| {
+            .enumerate()
+            .map(|(index, (project, threads))| {
                 let rows: Vec<AnyElement> =
                     threads.iter().map(|thread| self.archived_row(thread, &state, now, &t, cx)).collect();
                 let icon = sidebar::project_icon(project, &t, false, 16., self.favicon(project));
                 let title = h_flex().gap_2().child(icon).child(project.title.clone());
-                settings_section(SharedString::from(format!("archived-{}", project.id)), title, rows, &t)
+                // The first group is the search's "Archived threads" target.
+                let id =
+                    if index == 0 { "archive".into() } else { SharedString::from(format!("archived-{}", project.id)) };
+                settings_section(id, title, rows, &t)
             })
             .collect();
         self.settings_page("archived", view, sections, cx)

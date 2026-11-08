@@ -205,7 +205,7 @@ impl Workspace {
                 "Update the selected environments to use storage cleanup, or choose a machine that supports it.",
                 &t,
             );
-            sections.push(loose_section("artifacts-and-logs", "Artifacts and logs", [notice]));
+            sections.push(loose_section("storage-artifacts", "Artifacts and logs", [notice]));
             return sections;
         }
         let rows = [
@@ -234,7 +234,7 @@ impl Workspace {
             let control = self.retention_control(key, title, field.as_ref(), &t, cx);
             RowFrame::new(title).description(text(description)).control(control).render(&t).into_any_element()
         });
-        sections.push(settings_section("artifacts-and-logs", "Artifacts and logs", rows, &t));
+        sections.push(settings_section("storage-artifacts", "Artifacts and logs", rows, &t));
         if cleanup_run {
             sections.push(self.render_cleanup(&state, &t, cx));
         }

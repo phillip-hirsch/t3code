@@ -283,7 +283,7 @@ impl Workspace {
                 cx,
             ),
         );
-        settings_section("new-threads", "New threads", rows, &t)
+        settings_section("project-defaults", "New threads", rows, &t)
     }
 
     /// The fallback picker: the stored model, else the default shown as "None".

@@ -133,7 +133,7 @@ impl Workspace {
         let sections = [
             settings_section("creation", "Creation", creation, &t),
             settings_section("branches", "Branches", branches, &t),
-            settings_section("cleanup", "Cleanup", cleanup, &t),
+            settings_section("storage-worktrees", "Cleanup", cleanup, &t),
         ];
         self.settings_page("worktrees", view, sections, cx)
     }

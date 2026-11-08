@@ -476,7 +476,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let view = self.settings_view();
         self.sync_scope_project_picker(&view, window, cx);
-        let content = self.render_settings_section(&section, &view, window, cx);
+        let content = self.with_section_target(|this| this.render_settings_section(&section, &view, window, cx), &t);
         let titlebar = f32::from(crate::app::titlebar::native_titlebar_height(window));
         let insets = modal_insets(f32::from(window.viewport_size().width), titlebar);
         Some(

@@ -229,8 +229,12 @@ impl Workspace {
                 });
             })
             .child(div().grid().grid_cols(columns.unwrap_or(2)).gap(px(CARD_GAP)).children(rendered));
+        // `SettingsSection id="appearance"`: Color scheme and Themes are its search targets.
+        let target = self.settings_ui.target.as_deref() == Some("appearance");
         v_flex()
-            .id("theme")
+            .id("appearance")
+            .relative()
+            .when(target, |el| el.child(self.scroll_target_marker()))
             .gap(px(12.))
             .child(subheading(title("color-scheme", "Color scheme")))
             .child(tiles)

@@ -13,6 +13,7 @@
 //! values from `view` (`SettingsView::value`). See `general.rs` for both kinds. Rows that are
 //! not one setting (a keybinding, a host, a task) draw the same chrome with [`RowFrame`].
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -27,7 +28,8 @@ use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, BoxShadow, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
+    ParentElement as _, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px, svg,
 };
 use serde_json::{Map, Value};
 
@@ -321,17 +323,66 @@ pub(in crate::app) fn loose_section(
     section_frame(id, title, None, v_flex().gap(px(4.)).children(blocks).into_any_element())
 }
 
+/// A search target as the page's sections see it while they build.
+#[derive(Clone)]
+struct SectionTarget {
+    id: SharedString,
+    jumps: u64,
+    pending: Rc<Cell<u8>>,
+    scroll: ScrollHandle,
+    tokens: Tokens,
+}
+
+thread_local! {
+    /// Set by [`Workspace::with_section_target`]; the section builders take no workspace.
+    static SECTION_TARGET: RefCell<Option<SectionTarget>> = const { RefCell::new(None) };
+}
+
+/// The jump target when it names section `id`.
+fn section_target(id: &ElementId) -> Option<SectionTarget> {
+    SECTION_TARGET
+        .with_borrow(|target| target.as_ref().filter(|target| *id == ElementId::Name(target.id.clone())).cloned())
+}
+
+/// Scrolls its parent to the middle of the page's viewport on the jump's first paints.
+fn scroll_target_marker(pending: Rc<Cell<u8>>, scroll: ScrollHandle) -> impl IntoElement {
+    gpui_kit::canvas(
+        move |bounds, window, _| {
+            let Some(left) = pending.get().checked_sub(1) else { return };
+            pending.set(left);
+            if left > 0 {
+                window.request_animation_frame();
+            }
+            let viewport = scroll.bounds();
+            let offset = scroll.offset();
+            let centered = viewport.center().y - bounds.center().y;
+            scroll.set_offset(gpui_kit::point(offset.x, (offset.y + centered).min(px(0.))));
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 fn section_frame(
     id: impl Into<ElementId>,
     title: impl IntoElement,
     action: Option<AnyElement>,
     body: AnyElement,
 ) -> AnyElement {
+    let id = id.into();
+    let target = section_target(&id);
     v_flex()
         .id(id)
         .gap(px(10.))
         .child(
+            // A section a search jumps to centers and pulses its header (`data-settings-scroll-target`).
             h_flex()
+                .relative()
+                .when_some(target, |el, target| {
+                    el.child(scroll_target_marker(target.pending, target.scroll))
+                        .child(jump_pulse(target.jumps, &target.tokens))
+                })
                 .min_h(px(28.))
                 .px(px(16.))
                 .justify_between()
@@ -1456,25 +1507,24 @@ impl Workspace {
     }
 
     /// Marks the row a search jumped to; scrolls it into view on its first paint.
-    fn scroll_target_marker(&self) -> impl IntoElement {
-        let pending = self.settings_ui.scroll_pending.clone();
-        let scroll = self.settings_ui.scroll.clone();
-        gpui_kit::canvas(
-            move |bounds, window, _| {
-                let Some(left) = pending.get().checked_sub(1) else { return };
-                pending.set(left);
-                if left > 0 {
-                    window.request_animation_frame();
-                }
-                let viewport = scroll.bounds();
-                let offset = scroll.offset();
-                let centered = viewport.center().y - bounds.center().y;
-                scroll.set_offset(gpui_kit::point(offset.x, (offset.y + centered).min(px(0.))));
-            },
-            |_, (), _, _| {},
-        )
-        .absolute()
-        .size_full()
+    pub(super) fn scroll_target_marker(&self) -> impl IntoElement {
+        scroll_target_marker(self.settings_ui.scroll_pending.clone(), self.settings_ui.scroll.clone())
+    }
+
+    /// Builds a settings page's content with `self.settings_ui.target` visible to its sections,
+    /// which [`section_frame`] reads to scroll to and pulse a section a search jumped to.
+    pub(super) fn with_section_target<R>(&mut self, build: impl FnOnce(&mut Self) -> R, t: &Tokens) -> R {
+        let target = self.settings_ui.target.clone().map(|id| SectionTarget {
+            id,
+            jumps: self.settings_ui.jumps,
+            pending: self.settings_ui.scroll_pending.clone(),
+            scroll: self.settings_ui.scroll.clone(),
+            tokens: *t,
+        });
+        let previous = SECTION_TARGET.replace(target);
+        let built = build(self);
+        SECTION_TARGET.set(previous);
+        built
     }
 
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
@@ -2132,5 +2182,22 @@ mod tests {
         assert!(at(650.) < 1e-4, "and clears before the second: {}", at(650.));
         assert!((at(975.) - 1.).abs() < 1e-4, "the second peaks: {}", at(975.));
         assert!(at(1300.) < 1e-4, "nothing remains once it ends: {}", at(1300.));
+    }
+
+    #[test]
+    fn a_search_target_reaches_only_the_section_it_names_while_the_page_builds() {
+        let name = |id: &str| ElementId::Name(SharedString::from(id.to_owned()));
+        let target = SectionTarget {
+            id: "project-defaults".into(),
+            jumps: 1,
+            pending: Rc::default(),
+            scroll: ScrollHandle::new(),
+            tokens: Tokens::light(),
+        };
+        assert!(section_target(&name("project-defaults")).is_none(), "no page is building");
+        SECTION_TARGET.set(Some(target));
+        assert!(section_target(&name("project-defaults")).is_some());
+        assert!(section_target(&name("new-threads")).is_none());
+        SECTION_TARGET.set(None);
     }
 }
