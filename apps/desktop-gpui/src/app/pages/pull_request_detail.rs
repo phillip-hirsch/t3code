@@ -24,6 +24,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::super::Workspace;
+use super::super::git::SOURCE_CONTROL_WRITE;
 use super::super::sidebar::now_ms;
 use super::pull_requests::{label_chip, outline_button, relative_time, tone};
 use crate::pull_request_detail::{
@@ -320,7 +321,6 @@ impl Workspace {
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
-        self.check_pr_write_grant(&reference.project_id, cx);
         let writable = self.pr_write_grant(&reference.project_id) == Some(true);
         let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
@@ -370,9 +370,9 @@ impl Workspace {
     }
 
     /// The connection's `source-control:write` on the pull request's environment
-    /// (`useEnvironmentScope`); `None` while its session check runs.
+    /// (`useEnvironmentScope`), from its current session; `None` until that session's check answers.
     fn pr_write_grant(&self, project_id: &str) -> Option<bool> {
-        self.pull_requests.write_grants.get(&self.project_environment(project_id)?)?.0
+        self.env_grant(&self.project_environment(project_id)?, SOURCE_CONTROL_WRITE)
     }
 
     /// The pull request `key` names may be acted on.
@@ -380,25 +380,15 @@ impl Workspace {
         self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference.project_id) == Some(true))
     }
 
-    /// Asks the pull request's environment, once, what this connection may do there.
-    fn check_pr_write_grant(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let Some(environment) = self.project_environment(project_id) else { return };
-        if self.pull_requests.write_grants.contains_key(&environment) {
-            return;
-        }
-        let Some(endpoint) = self.env_endpoint(&environment).cloned() else { return };
-        let answered = environment.clone();
-        let task = super::settings::check_source_control_write(endpoint, cx, move |this: &mut Self, grant, cx| {
-            this.apply_pr_write_grant(&answered, grant, cx);
-        });
-        self.pull_requests.write_grants.insert(environment, (None, task));
-    }
-
-    /// A newly granted environment reads its pull requests again; one that grants nothing shows
-    /// them read-only.
-    fn apply_pr_write_grant(&mut self, environment: &SharedString, grant: Option<bool>, cx: &mut Context<Self>) {
-        let Some(entry) = self.pull_requests.write_grants.get_mut(environment) else { return };
-        let before = std::mem::replace(&mut entry.0, grant);
+    /// An environment's session answered (`before` was its grant): a newly granted environment
+    /// reads its pull requests again; one that grants nothing shows them read-only.
+    pub(in crate::app) fn apply_pr_write_grant(
+        &mut self,
+        environment: &SharedString,
+        before: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let grant = self.env_grant(environment, SOURCE_CONTROL_WRITE);
         let keys: Vec<String> = self
             .pull_requests
             .panel

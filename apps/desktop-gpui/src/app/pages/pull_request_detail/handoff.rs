@@ -118,7 +118,6 @@ impl Workspace {
     }
 
     fn pick_pr_acting_project(&mut self, project_id: String, cx: &mut Context<Self>) {
-        self.check_pr_write_grant(&project_id, cx);
         if let Some(panel) = self.pull_requests.panel.as_mut() {
             panel.acting = Some(project_id);
         }

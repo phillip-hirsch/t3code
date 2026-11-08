@@ -447,7 +447,7 @@ pub fn diff_stat_label(
 }
 
 /// `AuthSourceControlWriteScope`: commit, push, PR, init, pull and publish need it.
-const SOURCE_CONTROL_WRITE: &str = "source-control:write";
+pub(super) const SOURCE_CONTROL_WRITE: &str = "source-control:write";
 
 /// One `git.runStackedAction` request (`RunGitActionWithToastInput`).
 #[derive(Clone, Debug)]
