@@ -3,7 +3,7 @@
 //! composer's usage-limit recovery and offline notices (`UsageLimitRecoveryBanner.tsx`,
 //! `useSystemComposerBanners.tsx`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -48,6 +48,48 @@ pub(super) struct BannerUi {
     /// The mismatch the banner showed for; it stays until the mismatch changes.
     revealed_branch: Option<String>,
     restoring_branch: Option<String>,
+    errors: ScopedErrors,
+}
+
+/// `localServerErrorsByThreadKey` / `localDraftErrorsByDraftId`: `Workspace::error` is the
+/// error of the thread or draft on screen; the others wait here until it shows again.
+#[derive(Default)]
+struct ScopedErrors {
+    /// The target key `Workspace::error` belongs to.
+    scope: String,
+    stashed: HashMap<String, SharedString>,
+}
+
+impl ScopedErrors {
+    /// Swaps `error` for the stashed one of `key` when the target on screen changed.
+    fn follow(&mut self, key: &str, error: &mut Option<SharedString>) {
+        if self.scope == key {
+            return;
+        }
+        if let Some(previous) = error.take() {
+            self.stashed.insert(std::mem::take(&mut self.scope), previous);
+        }
+        *error = self.stashed.remove(key);
+        key.clone_into(&mut self.scope);
+    }
+
+    /// Records a failure of the target `key`, on screen or not.
+    fn set(&mut self, key: &str, current: &str, error: &mut Option<SharedString>, value: SharedString) {
+        self.follow(current, error);
+        if key == current {
+            *error = Some(value);
+        } else {
+            self.stashed.insert(key.to_owned(), value);
+        }
+    }
+}
+
+fn target_key(target: Option<&Target>) -> String {
+    match target {
+        Some(Target::Thread { id, .. }) => id.clone(),
+        Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
+        None => String::new(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -277,11 +319,19 @@ impl Workspace {
     }
 
     fn thread_key(&self) -> String {
-        match &self.target {
-            Some(Target::Thread { id, .. }) => id.clone(),
-            Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
-            None => String::new(),
-        }
+        target_key(self.target.as_ref())
+    }
+
+    /// Keeps `error` with the thread or draft it was raised on; render calls it.
+    pub(super) fn sync_error_scope(&mut self) {
+        let key = self.thread_key();
+        self.banners.errors.follow(&key, &mut self.error);
+    }
+
+    /// A failure of `target`'s work that may land after the window moved elsewhere.
+    pub(super) fn set_error_for(&mut self, target: &Target, error: SharedString) {
+        let current = self.thread_key();
+        self.banners.errors.set(&target_key(Some(target)), &current, &mut self.error, error);
     }
 
     /// The error the banner shows: this client's last failure, else the thread's runtime error.
@@ -1025,6 +1075,24 @@ mod tests {
             "usageLimitResetAt": "2026-01-01T12:00:00Z"});
         base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn local_errors_stay_with_the_thread_they_were_raised_on() {
+        let mut errors = ScopedErrors::default();
+        let mut error = None;
+        errors.follow("a", &mut error);
+        error = Some(SharedString::from("send failed"));
+        errors.follow("b", &mut error);
+        assert_eq!(error, None, "thread b doesn't show a's error");
+        errors.set("a", "b", &mut error, "later failure".into());
+        assert_eq!(error, None, "a background failure of a waits for a");
+        errors.set("b", "b", &mut error, "b failed".into());
+        assert_eq!(error.as_deref(), Some("b failed"));
+        errors.follow("a", &mut error);
+        assert_eq!(error.as_deref(), Some("later failure"));
+        errors.follow("b", &mut error);
+        assert_eq!(error.as_deref(), Some("b failed"));
     }
 
     #[test]
