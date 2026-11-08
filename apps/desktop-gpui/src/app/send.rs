@@ -104,8 +104,7 @@ impl ThreadMessage<'_> {
 impl Workspace {
     /// `followUpBehavior`, except that a send declines a waiting approval, so it steers.
     pub(super) fn follow_up_behavior(&self) -> &str {
-        let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
-        if projection.is_some_and(|p| !p.pending_approvals().is_empty()) {
+        if !self.shown_approvals().is_empty() {
             return "steer";
         }
         self.client_settings.values.get("followUpBehavior").as_str().unwrap_or("steer")
@@ -263,6 +262,7 @@ impl Workspace {
         let sent_attachments = std::mem::take(&mut self.attachments);
         self.sending = true;
         self.set_composer_text("", window, cx);
+        self.release_typing_hold(false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             // Declines land first; a failed one keeps the text and sends nothing more.
             let mut result = Ok(Value::Null);

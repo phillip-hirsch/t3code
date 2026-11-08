@@ -189,6 +189,9 @@ pub struct Workspace {
     timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
+    /// Requests that arrived mid-typing, kept out of sight for now.
+    typing_guard: crate::composer_guard::TypingGuard,
+    _typing_idle: Option<Task<()>>,
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
@@ -330,10 +333,11 @@ impl Workspace {
         let saved_environments = cx.new(environments::SavedEnvironments::new);
         let subscriptions = vec![
             cx.observe_in(&saved_environments, window, |this, _, window, cx| this.sync_saved_sessions(window, cx)),
-            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
-                if let InputEvent::Change = event {
-                    this.on_composer_change(cx);
-                }
+            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.on_composer_change(window, cx),
+                InputEvent::Focus => this.typing_guard.focus(),
+                InputEvent::Blur => this.release_typing_hold(true, window, cx),
+                InputEvent::PressEnter { .. } => {}
             }),
             // Caret moves re-read the completion trigger.
             cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
@@ -399,6 +403,8 @@ impl Workspace {
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
+            typing_guard: Default::default(),
+            _typing_idle: None,
             composer_drafts: HashMap::new(),
             composer_selections: HashMap::new(),
             responding: None,
@@ -743,6 +749,7 @@ impl Workspace {
                 }
                 this.refresh_rows(cx);
                 this.refresh_thread_find(cx);
+                this.sync_typing_guard(window, cx);
                 this.sync_question(window, cx);
                 this.sync_queue_edit(window, cx);
                 this.observe_proactive_panels(cx);

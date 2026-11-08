@@ -123,7 +123,9 @@ pub(super) struct ComposerSelection {
 impl Workspace {
     /// A user edit. While a question is open the editor holds its custom answer;
     /// programmatic changes (`set_composer_text`) never reach the draft.
-    pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn on_composer_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.typing_guard.typed(std::time::Instant::now());
+        self.schedule_typing_idle(window, cx);
         self.close_stash_menu(cx);
         if self.composer_ui.length_error.is_some() {
             let error = composer_text::prompt_length_error(&self.composer.read(cx).value());
@@ -281,6 +283,9 @@ impl Workspace {
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_draft_workspace(cx);
+        self.typing_guard.reset();
+        self._typing_idle = None;
+        self.sync_typing_guard(window, cx);
         match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
             Some(ComposerDraft::Question(question)) => {
                 self.question = Some(question);
@@ -552,12 +557,59 @@ impl Workspace {
         true
     }
 
+    /// `useComposerTypingGuard`: the open thread's pending requests, minding the ones new mid-typing.
+    pub(super) fn sync_typing_guard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
+        let approvals = projection.pending_approvals().into_iter().map(|(request, _)| request.id.as_str());
+        let questions = projection.pending_user_inputs().into_iter().map(|(request, _)| request.id.as_str());
+        let ids: Vec<&str> = approvals.chain(questions).collect();
+        if self.typing_guard.requests(ids, std::time::Instant::now()) {
+            self.schedule_typing_idle(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Shows what the guard held once typing has rested.
+    fn schedule_typing_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.typing_guard.idle_at() else {
+            self._typing_idle = None;
+            return;
+        };
+        self._typing_idle = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(at.saturating_duration_since(std::time::Instant::now())).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.typing_guard.idle_at() == Some(at) {
+                    this.release_typing_hold(false, window, cx);
+                }
+            });
+        }));
+    }
+
+    /// Blur, a send or rested typing shows the held requests.
+    pub(super) fn release_typing_hold(&mut self, blur: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self._typing_idle = None;
+        if self.typing_guard.release(blur) {
+            self.sync_question(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Pending approvals the composer shows: those the typing guard isn't holding.
+    pub(super) fn shown_approvals(&self) -> Vec<(&RuntimeRequest, Option<&TurnItem>)> {
+        let Some(projection) = self.open_projection() else { return Vec::new() };
+        let mut approvals = projection.pending_approvals();
+        approvals.retain(|(request, _)| !self.typing_guard.is_held(&request.id));
+        approvals
+    }
+
     /// Opens a fresh draft when the first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
     pub(super) fn sync_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let first = projection.pending_user_inputs().into_iter().next();
+        // A question that arrived mid-typing waits; the composer keeps the prompt meanwhile.
+        let first = first.filter(|(request, _)| !self.typing_guard.is_held(&request.id));
         if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
             return;
         }
@@ -661,11 +713,9 @@ impl Workspace {
     /// `true` comes back), else every live approval is declined before the
     /// message goes out.
     pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
-        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
-            return (Vec::new(), false);
-        };
+        // Approvals the typing guard holds stay unseen and pending.
         let live: Vec<_> =
-            projection.pending_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+            self.shown_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
         match live.first() {
             None => (Vec::new(), false),
             Some(first) if first.supports_feedback() => {
@@ -763,8 +813,7 @@ impl Workspace {
     pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (lane, _) = self.chat_layout(window);
         let t = *tokens(cx);
-        let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
-        let approvals = projection.map(|p| p.pending_approvals()).unwrap_or_default();
+        let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
         let outline = if t.dark { white(0.05) } else { black(0.08) };
