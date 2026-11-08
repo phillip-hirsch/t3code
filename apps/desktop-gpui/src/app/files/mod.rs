@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use gpui_kit::{Entity, SharedString};
 
+pub(super) use logic::is_image;
 pub(super) use overlay::{FileOverlay, OverlayMode};
 pub(super) use tree::MentionDrag;
 

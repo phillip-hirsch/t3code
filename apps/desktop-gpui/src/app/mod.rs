@@ -67,6 +67,7 @@ mod pages;
 mod palette;
 mod palette_actions;
 mod plan_actions;
+mod positions;
 mod preview;
 mod prompt_stash;
 mod queue;
@@ -89,6 +90,7 @@ mod thread_now;
 mod titlebar;
 mod visits;
 mod workflow;
+mod workspace_lookup;
 mod worktree_setup;
 
 gpui_kit::actions!(
@@ -174,6 +176,9 @@ pub struct Workspace {
     markdown: chat::MarkdownStates,
     /// Output of the open tool entries.
     details: inspector::Details,
+    /// Where each timeline was left, and where the open one scrolls once its rows arrive.
+    positions: positions::Positions,
+    pending_position: Option<gpui_kit::ListOffset>,
     copy_feedback: message_actions::CopyFeedback,
     /// The minimap tick under the pointer.
     minimap_hover: Option<usize>,
@@ -262,6 +267,7 @@ pub struct Workspace {
     details_visibility: details::DetailsVisibility,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
+    lineage: details::lineage::LineageUi,
     /// The git status of the open target's workspace.
     vcs: git::VcsWatch,
     /// Local servers, while the details card's Servers section can show.
@@ -311,6 +317,8 @@ pub struct Workspace {
     find: Option<find::ThreadFind>,
     /// Go to file, Search project contents, and the Files and file panel surfaces.
     files: files::FilesState,
+    /// The workspace search for the file a chat reference names, while it runs.
+    file_lookup: Option<gpui_kit::Task<()>>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
     /// The F6 stops that are regions rather than controls.
@@ -417,6 +425,8 @@ impl Workspace {
             rows_notice_run: None,
             markdown: chat::MarkdownStates::default(),
             details: inspector::Details::default(),
+            positions: positions::Positions::default(),
+            pending_position: None,
             copy_feedback: message_actions::CopyFeedback::default(),
             minimap_hover: None,
             _working_tick: None,
@@ -473,6 +483,7 @@ impl Workspace {
                 client_settings.values.get(details::DETAILS_VISIBILITY_KEY),
             ),
             lineage_expanded: None,
+            lineage: Default::default(),
             vcs: git::VcsWatch::default(),
             servers: Default::default(),
             automations: Default::default(),
@@ -502,6 +513,7 @@ impl Workspace {
             draft_picker: draft_picker::DraftPicker::new(cx),
             find: None,
             files: files::FilesState::default(),
+            file_lookup: None,
             focus: cx.focus_handle(),
             areas: commands::WorkspaceAreas::new(cx),
             scheduled_tasks_view: None,
@@ -859,6 +871,8 @@ impl Workspace {
         self.apply_workflow_opening(&mut new_rows, cx);
         self.sync_worktree_setup(cx);
         self.insert_worktree_setup(&mut new_rows);
+        // The footer: a pending handoff, what the thread is doing now, then the queue.
+        new_rows.extend(self.pending_handoff_row());
         new_rows.extend(self.now_rows(cx));
         let mut queue = self.queue_rows();
         self.load_queue_images(cx);
@@ -874,6 +888,7 @@ impl Workspace {
         self.sync_working_tick(&new_rows, cx);
         self.sync_subagent_tick(cx);
         self.sync_child_approvals(cx);
+        self.sync_lineage_titles(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::from(new_rows);
@@ -886,6 +901,9 @@ impl Workspace {
                 scroller.splice(range, count, cx);
             }
         });
+        if self.open_projection().is_some() {
+            self.restore_position(cx);
+        }
     }
 
     /// Opens a listed thread on the environment it lives on.
@@ -905,6 +923,7 @@ impl Workspace {
         }
         self.page = None;
         self.stash_composer(cx);
+        self.remember_position(cx);
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
@@ -950,6 +969,9 @@ impl Workspace {
             self.forget_draft_routing(&target);
         }
         let carried = self.carried_model();
+        if opened {
+            self.remember_position(cx);
+        }
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
@@ -997,6 +1019,7 @@ impl Workspace {
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
+        self.recall_position();
     }
 
     fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1030,6 +1053,25 @@ impl Workspace {
             }
             None => None,
         }
+    }
+
+    /// `resolvePendingHandoff` for the composer's pick, when its provider can take a turn.
+    fn pending_handoff_row(&self) -> Option<timeline::Row> {
+        let projection = self.thread.as_ref()?.state.projection.as_ref()?;
+        let selection = self.composer_model()?;
+        let providers = &self.server_info().providers;
+        let usable = providers.iter().any(|provider| {
+            provider.instance_id == selection.instance_id
+                && provider.enabled
+                && provider.availability.as_deref() != Some("unavailable")
+        });
+        let endpoints = crate::handoff::pending(projection, usable.then_some(&selection), providers)?;
+        Some(timeline::Row::Handoff(Rc::new(timeline::HandoffRow {
+            id: "pending-handoff".into(),
+            endpoints,
+            failed: false,
+            pending: true,
+        })))
     }
 
     /// The model a new draft carries from where it was started: the composer's pick, else the open

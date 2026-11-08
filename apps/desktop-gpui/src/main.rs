@@ -15,6 +15,7 @@ mod device;
 mod environments;
 mod file_icons;
 mod file_links;
+mod handoff;
 mod hex;
 mod inbox;
 mod keybindings;

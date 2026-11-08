@@ -2,6 +2,9 @@
 //! left gutter. Hovering magnifies the ticks near the pointer and previews that
 //! turn; clicking scrolls to its message.
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
     AnyElement, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
@@ -14,8 +17,26 @@ use crate::timeline::Row;
 /// The column the minimap owns at the timeline's left edge (`w-18`).
 const WIDTH: f32 = 72.;
 const PITCH: f32 = 8.;
+/// Previous and Next turn (`Button size="icon-micro"`), above and below the ticks.
+const NAV_BUTTON: f32 = 20.;
 /// A gutter this wide keeps the minimap on screen; a narrower one shows it on hover.
 const PERSISTENT_GUTTER: f32 = 48.;
+/// The ticks' hit strip starts this far into the gutter (`left-3`) and is at most 40px wide.
+const HIT_STRIP_LEFT: f32 = 12.;
+const HIT_STRIP_MAX_WIDTH: f32 = 40.;
+/// The strip must reach this far for Previous and Next turn to take the pointer.
+const NAVIGATION_REACH: f32 = 14.;
+
+/// `resolveTimelineMinimapNavigationInteractive` of `resolveTimelineMinimapHitStripWidth`.
+fn navigation_interactive(gutter: f32) -> bool {
+    (gutter.floor() - HIT_STRIP_LEFT).clamp(0., HIT_STRIP_MAX_WIDTH) >= NAVIGATION_REACH
+}
+
+/// The ticks before and after the current turn, for Previous and Next turn.
+fn neighbors(current: Option<usize>, count: usize) -> (Option<usize>, Option<usize>) {
+    let Some(current) = current.filter(|current| *current < count) else { return (None, None) };
+    (current.checked_sub(1), Some(current + 1).filter(|next| *next < count))
+}
 
 /// The row index of each user message.
 pub(super) fn ticks(rows: &[Row]) -> Vec<usize> {
@@ -126,6 +147,33 @@ impl Workspace {
                         div().mt(px(4.)).line_clamp(3).text_sm().text_color(t.muted_foreground).child(reply)
                     }))
             });
+        let (previous, next) = neighbors(current, ticks.len());
+        let interactive = navigation_interactive(gutter);
+        let navigation = [(previous, true), (next, false)].into_iter().filter_map(|(tick, up)| {
+            let row = ticks[tick.filter(|_| interactive)?];
+            let label = if up { "Previous turn" } else { "Next turn" };
+            let icon = if up { IconName::ChevronUp } else { IconName::ChevronDown };
+            Some(
+                div()
+                    .id(label)
+                    .absolute()
+                    .left(px(-6.))
+                    .top(px(if up { -(NAV_BUTTON + 2.) } else { height + 2. }))
+                    .size(px(NAV_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(0.)
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(1.).bg(t.accent))
+                    .child(Icon::new(icon).size(px(16.)).text_color(Hsla { a: t.foreground.a * 0.9, ..t.foreground }))
+                    .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroller.update(cx, |scroller, cx| scroller.scroll_to_item(row, cx));
+                    })),
+            )
+        });
         Some(
             div()
                 .absolute()
@@ -139,7 +187,7 @@ impl Workspace {
                 .when(gutter < PERSISTENT_GUTTER, |minimap| {
                     minimap.opacity(0.).group_hover("minimap", |style| style.opacity(1.))
                 })
-                .child(div().relative().ml(px(12.)).child(strip).children(card))
+                .child(div().relative().ml(px(12.)).child(strip).children(navigation).children(card))
                 .into_any_element(),
         )
     }
@@ -155,5 +203,16 @@ mod tests {
         assert_eq!(scale(4, None), 0.333);
         let ticks = [0, 4, 9];
         assert_eq!([0, 3, 4, 20].map(|top| current(&ticks, top)), [Some(0), Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn turn_navigation_stops_at_the_ends_and_needs_a_wide_enough_gutter() {
+        assert_eq!(neighbors(Some(0), 3), (None, Some(1)));
+        assert_eq!(neighbors(Some(1), 3), (Some(0), Some(2)));
+        assert_eq!(neighbors(Some(2), 3), (Some(1), None));
+        assert_eq!(neighbors(None, 3), (None, None));
+        assert!(!navigation_interactive(25.9));
+        assert!(navigation_interactive(26.));
+        assert!(navigation_interactive(200.));
     }
 }

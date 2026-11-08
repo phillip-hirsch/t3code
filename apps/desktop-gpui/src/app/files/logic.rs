@@ -236,7 +236,7 @@ pub(super) fn loads_full_file(path: &str, draft: bool) -> bool {
 }
 
 /// `isWorkspaceImagePreviewPath`; the formats GPUI decodes render, the rest fall back to "binary".
-pub(super) fn is_image(path: &str) -> bool {
+pub(in crate::app) fn is_image(path: &str) -> bool {
     let lower = path.to_lowercase();
     [".avif", ".bmp", ".gif", ".ico", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"]
         .iter()

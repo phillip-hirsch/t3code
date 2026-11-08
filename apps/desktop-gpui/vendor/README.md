@@ -189,6 +189,22 @@ chips inside it. Files:
 - `src/text/node.rs`: `InlineNode::covered`, `Paragraph::to_markdown`, `selected_markdown`; one
   test, `selected_object_copies_the_label_it_keeps_as_prose_once`.
 
+**Soft breaks can render as line breaks.** A user message keeps its typed newlines, as the web's
+`lineBreaks` (`remark-breaks`) does after parsing. 0.9.0 always reflows a soft break to a space,
+and breaking lines before parsing changed headings and tables. The patch adds
+`MarkdownExtensions::line_breaks()` (and `TextView::markdown_line_breaks`), a parser setting: a
+soft break inside a text node becomes a newline. Files:
+
+- `src/text/markdown_ext.rs`: the `line_breaks` flag, its builder, and its place in the parser
+  configuration.
+- `src/text/text_view.rs`: `markdown_line_breaks`.
+- `src/text/format/markdown.rs`: the `Node::Text` arm of `parse_paragraph`; one test,
+  `test_line_breaks_keep_soft_breaks_and_structure`.
+
+**Selectable text takes highlights.** A tool call's arguments read `key value` with the key muted,
+and stay selectable. `src/selectable_text.rs`: `SelectableText::highlights`, passing through to its
+`StyledText`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -283,3 +299,10 @@ gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed 
 `composer.workspace` (Mod+Shift+X). 0.9.0's `DropdownMenuPopover` opens only from its trigger.
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
+
+**Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
+passing through to gpui-base's (see its "Soft breaks can render as line breaks").
+
+**A thread's timeline reopens where it was left.** 0.9.0's `MessageScrollerState` scrolls only to
+a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
+it, the `logical_scroll_top` it reported.

@@ -142,6 +142,24 @@ pub struct T3Call {
     pub guides: Vec<bool>,
 }
 
+/// An answered question request (`UserInputAttachmentAnswerPayload`), as its row shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestionAnswer {
+    /// `getQuestionTextPreview`: the questions on one line.
+    pub heading: SharedString,
+    /// `getQuestionAnswerPreview`, when anything was answered (`hasQuestionAnswer`).
+    pub preview: Option<SharedString>,
+    pub questions: Vec<AnsweredQuestion>,
+}
+
+/// One question of a [`QuestionAnswer`], as `QuestionAnswerHistory` lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnsweredQuestion {
+    pub text: Option<SharedString>,
+    pub answer: Option<SharedString>,
+    pub attachments: Vec<SharedString>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub id: SharedString,
@@ -163,6 +181,7 @@ pub struct Entry {
     pub output_failed: bool,
     pub viewed_image: bool,
     pub question_answered: bool,
+    pub question: Option<QuestionAnswer>,
     pub provider_retry: bool,
     pub approval_request_id: Option<SharedString>,
     /// `source.kind` of a notification, or `"failed"` when it failed.
@@ -219,6 +238,7 @@ pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
         output_failed: raw.get("outputIndicatesFailure").and_then(Value::as_bool) == Some(true),
         viewed_image: str_at(raw, "viewedImagePath").is_some_and(|p| !p.trim().is_empty() && !p.contains('\n')),
         question_answered: false,
+        question: None,
         provider_retry: false,
         approval_request_id: None,
         notification: None,
@@ -342,6 +362,7 @@ pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
             entry.approval_request_id = text("requestId");
         }
         "user_input_request" => {
+            entry.question = raw.get("questionAnswer").and_then(question_answer);
             entry.question_answered = raw.get("questionAnswer").is_some_and(|a| !a.is_null());
             let label = if entry.question_answered { "Answered questions" } else { "Input requested" };
             entry.label = fallback(&title, label);
@@ -351,6 +372,70 @@ pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
     entry.t3 = t3_call(&entry, raw);
     entry.action = compute_action(&entry);
     entry
+}
+
+/// `getQuestionAnswerText`: an answer's text, a list's joined, an object's `answers`.
+fn answer_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items.iter().map(answer_text).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", "),
+        Value::Object(record) => record.get("answers").map(answer_text).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// The question history of a `questionAnswer` payload (`QuestionAnswerHistory`, `userInput.ts`).
+fn question_answer(payload: &Value) -> Option<QuestionAnswer> {
+    let record = |key: &str| payload.get(key).and_then(Value::as_object);
+    let texts = record("questionTextById");
+    let answers = record("answers")?;
+    let attachments = record("attachmentsByQuestionId");
+    let names = |id: &str| -> Vec<SharedString> {
+        let list = attachments.and_then(|a| a.get(id)).and_then(Value::as_array);
+        list.into_iter().flatten().filter_map(|a| str_at(a, "name")).map(|n| n.to_owned().into()).collect()
+    };
+    let mut ids: Vec<&str> = Vec::new();
+    for map in [texts, Some(answers), attachments].into_iter().flatten() {
+        for id in map.keys() {
+            if !ids.contains(&id.as_str()) {
+                ids.push(id);
+            }
+        }
+    }
+    let questions: Vec<AnsweredQuestion> = ids
+        .iter()
+        .map(|id| AnsweredQuestion {
+            text: texts
+                .and_then(|t| t.get(*id))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_owned().into()),
+            answer: answers.get(*id).map(answer_text).filter(|t| !t.is_empty()).map(Into::into),
+            attachments: names(id),
+        })
+        .collect();
+    let heading = texts
+        .into_iter()
+        .flat_map(|t| t.values())
+        .filter_map(Value::as_str)
+        .map(collapse_whitespace)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let answered: Vec<String> = answers.values().map(answer_text).filter(|t| !t.is_empty()).collect();
+    let attached: Vec<SharedString> = questions.iter().flat_map(|q| q.attachments.iter().cloned()).collect();
+    let preview = if !answered.is_empty() {
+        Some(answered.join(" · "))
+    } else if !attached.is_empty() {
+        Some(attached.iter().map(SharedString::as_ref).collect::<Vec<_>>().join(", "))
+    } else {
+        None
+    };
+    Some(QuestionAnswer {
+        heading: heading.into(),
+        preview: preview.map(|p| collapse_whitespace(&p)).filter(|p| !p.is_empty()).map(Into::into),
+        questions,
+    })
 }
 
 fn str_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -1246,6 +1331,14 @@ impl Entry {
         self.t3.as_ref().map(|t3| t3.tool.icon)
     }
 
+    /// The thread a `t3_thread_read` call read (`threadReadTargetId`).
+    pub fn thread_read_target(&self) -> Option<&str> {
+        let reads =
+            self.item_type == "dynamic_tool" && self.t3.as_ref().is_some_and(|t3| t3.tool.summary == "thread-read");
+        let id = self.item.0.raw.pointer("/input/threadId").and_then(Value::as_str).map(str::trim);
+        id.filter(|id| reads && !id.is_empty())
+    }
+
     /// The per-entry icon (`workEntryIconName`).
     pub fn icon(&self) -> WorkIcon {
         if self.item_type == "notification" {
@@ -1593,6 +1686,11 @@ pub fn summary_kind(entries: &[&Entry]) -> SummaryKind {
 // ---------------------------------------------------------------------------
 // Row labels
 
+/// `threadReadLabelPrefix`: "Read a T3 thread" becomes "Read thread", for the title to follow.
+pub fn thread_read_prefix(label: &str) -> Option<String> {
+    label.strip_suffix(" a T3 thread").map(|head| format!("{head} thread"))
+}
+
 /// Single-line labels collapse whitespace like CSS `white-space: nowrap`.
 pub fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1873,6 +1971,53 @@ mod tests {
         value["status"] = value.get("status").cloned().unwrap_or(json!("completed"));
         value["id"] = value.get("id").cloned().unwrap_or(json!("item"));
         entry_from_item(&Rc::new(serde_json::from_value::<TurnItem>(value).unwrap()))
+    }
+
+    #[test]
+    fn answered_questions_keep_their_questions_and_answers() {
+        let e = entry(json!({"type": "user_input_request", "questions": [], "questionAnswer": {
+            "requestId": "r",
+            "questionTextById": {"q1": "Which  color?\nPick one", "q2": "Why?"},
+            "answers": {"q1": ["Red", "Blue"], "q2": {"answers": ""}, "q3": "Extra"},
+            "attachmentsByQuestionId": {"q2": [{"type": "image", "id": "a", "name": "shot.png"}]},
+        }}));
+        let question = e.question.unwrap();
+        assert_eq!(question.heading, "Which color? Pick one · Why?");
+        assert_eq!(question.preview.as_deref(), Some("Red, Blue · Extra"));
+        let rows: Vec<_> =
+            question.questions.iter().map(|q| (q.text.as_deref(), q.answer.as_deref(), q.attachments.len())).collect();
+        assert_eq!(
+            rows,
+            [
+                (Some("Which  color?\nPick one"), Some("Red, Blue"), 0),
+                (Some("Why?"), None, 1),
+                (None, Some("Extra"), 0)
+            ]
+        );
+        let only_files = entry(json!({"type": "user_input_request", "questions": [], "questionAnswer": {
+            "requestId": "r", "answers": {}, "attachmentsByQuestionId": {"q": [{"name": "a.txt"}, {"name": "b.txt"}]},
+        }}));
+        assert_eq!(only_files.question.unwrap().preview.as_deref(), Some("a.txt, b.txt"));
+        let pending = entry(json!({"type": "user_input_request", "status": "waiting", "questions": []}));
+        assert_eq!(pending.question, None);
+    }
+
+    #[test]
+    fn thread_reads_name_the_thread_they_read() {
+        let read = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_read",
+            "input": {"threadId": " t-1 "}}));
+        assert_eq!(read.thread_read_target(), Some("t-1"));
+        let label = display_label(&read);
+        assert_eq!(label, "Read a T3 thread");
+        assert_eq!(thread_read_prefix(&label).as_deref(), Some("Read thread"));
+        assert_eq!(thread_read_prefix("Reading a T3 thread").as_deref(), Some("Reading thread"));
+        assert_eq!(thread_read_prefix("Listed T3 threads"), None);
+        let list = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_list",
+            "input": {"threadId": "t-1"}}));
+        assert_eq!(list.thread_read_target(), None);
+        let blank = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_read",
+            "input": {"threadId": "  "}}));
+        assert_eq!(blank.thread_read_target(), None);
     }
 
     #[test]

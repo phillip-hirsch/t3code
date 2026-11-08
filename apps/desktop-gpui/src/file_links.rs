@@ -70,14 +70,15 @@ const EXTENSIONLESS: [&str; 27] = [
     "CODEOWNERS",
 ];
 
-const GENERIC_TLDS: [&str; 25] = [
-    "com", "net", "org", "io", "dev", "app", "ai", "co", "edu", "gov", "mil", "info", "biz", "xyz", "me", "tv", "cc",
-    "gg", "chat", "cloud", "site", "online", "tech", "store", "link",
+const GENERIC_TLDS: [&str; 24] = [
+    "com", "net", "org", "io", "dev", "app", "ai", "co", "edu", "gov", "mil", "info", "biz", "xyz", "me", "tv", "gg",
+    "chat", "cloud", "site", "online", "tech", "store", "link",
 ];
 
-const COUNTRY_TLDS: [&str; 31] = [
+// C++ sources end in `.cc`, so `allocator.cc:217` names a file, not a host and port.
+const COUNTRY_TLDS: [&str; 32] = [
     "uk", "de", "fr", "nl", "se", "no", "fi", "dk", "pl", "ch", "at", "be", "es", "it", "pt", "eu", "us", "ca", "au",
-    "nz", "jp", "kr", "cn", "br", "ru", "mx", "ie", "cz", "tr", "sg", "hk",
+    "nz", "jp", "kr", "cn", "br", "ru", "mx", "ie", "cz", "tr", "sg", "hk", "cc",
 ];
 
 fn is_digits(text: &str) -> bool {
@@ -104,7 +105,8 @@ fn split_suffix(path: &str) -> Option<(&str, u32, Option<u32>)> {
     }
 }
 
-fn without_position(path: &str) -> &str {
+/// The path without its `:line` or `:line:column` (`splitFilePathPosition`).
+pub(crate) fn without_position(path: &str) -> &str {
     split_suffix(path).map_or(path, |(path, ..)| path)
 }
 
@@ -141,6 +143,34 @@ pub fn with_position(file: &FilePosition) -> String {
         (Some(line), None) => format!("{}:{line}", file.path),
         _ => file.path.clone(),
     }
+}
+
+/// `formatWorkspaceRelativePath`: a path in the workspace reads from the workspace folder's name.
+pub fn workspace_display_path(path_with_position: &str, workspace_root: Option<&str>) -> String {
+    let mut position = split_position(path_with_position, "");
+    let normalized = strip_slash_drive(&position.path.replace('\\', "/")).to_owned();
+    position.path = match workspace_root {
+        Some(raw_root) => {
+            let root = strip_slash_drive(&raw_root.trim_end_matches(['/', '\\']).replace('\\', "/")).to_owned();
+            let label = root.rsplit('/').next().unwrap_or_default().to_owned();
+            let insensitive = is_windows_absolute(strip_slash_drive(raw_root));
+            let fold = |text: &str| if insensitive { text.to_lowercase() } else { text.to_owned() };
+            let (path_key, root_key) = (fold(&normalized), fold(&root));
+            if path_key == root_key {
+                label
+            } else if path_key.starts_with(&format!("{root_key}/")) {
+                format!("{label}/{}", normalized.get(root.len() + 1..).unwrap_or_default())
+            } else if normalized.starts_with('/') || path_key.starts_with(&format!("{}/", fold(&label))) {
+                normalized
+            } else {
+                let relative =
+                    normalized.strip_prefix("./").map_or(normalized.as_str(), |rest| rest.trim_start_matches('/'));
+                format!("{label}/{relative}")
+            }
+        }
+        None => normalized,
+    };
+    with_position(&position)
 }
 
 /// `ELIDED_PATH_SEGMENT_PATTERN`: a `...` or `…` segment that shortened the path.
@@ -547,6 +577,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_paths_read_from_the_workspace_folder() {
+        let root = Some("/home/me/repo");
+        assert_eq!(workspace_display_path("/home/me/repo/src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("/home/me/repo", root), "repo");
+        assert_eq!(workspace_display_path("src/a.rs:12:3", root), "repo/src/a.rs:12:3");
+        assert_eq!(workspace_display_path("./src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("repo/src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("/etc/hosts", root), "/etc/hosts");
+        assert_eq!(workspace_display_path("C:\\Repo\\src\\a.rs", Some("c:\\repo\\")), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("src\\a.rs", None), "src/a.rs");
+    }
+
+    #[test]
     fn inline_code_reads_as_a_file_only_when_it_looks_like_one() {
         let yes = [
             "/Users/me/.t3/bin/t3",
@@ -557,6 +600,7 @@ mod tests {
             "/Users/me/a.txt",
             "C:\\repo\\a.rs",
             "main.rs:4:2",
+            "allocator.cc:217",
         ];
         for code in yes {
             assert!(inline_code_candidate(code).is_some(), "{code} is a file");

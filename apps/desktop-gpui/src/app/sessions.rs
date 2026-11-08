@@ -364,6 +364,7 @@ impl Workspace {
                 this.track_visit(cx);
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
+                this.sync_lineage_titles(cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {
@@ -479,7 +480,12 @@ impl Workspace {
     /// `scratchEnvironmentId(currentProjectEnvironmentId)`: where "start without a project"
     /// opens its draft from the open thread or draft; `None` hides the way in.
     pub(super) fn scratch_environment(&self) -> Option<SharedString> {
-        scratch_environment_of(&self.sessions, self.target.as_ref().map(|target| target.environment().as_ref()))
+        self.scratch_environment_from(self.target.as_ref().map(|target| target.environment().as_ref()))
+    }
+
+    /// `scratchEnvironmentId(fallback)`.
+    pub(super) fn scratch_environment_from(&self, fallback: Option<&str>) -> Option<SharedString> {
+        scratch_environment_of(&self.sessions, fallback)
     }
 
     /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is

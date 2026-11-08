@@ -77,9 +77,21 @@ impl Workspace {
             return false;
         }
         let in_preview = self.preview_thread_id().map(str::to_owned);
+        let thread_link = in_preview.as_deref().and_then(|thread_id| {
+            let thread = self.shell_thread(thread_id)?;
+            let supported = self.env_info(&thread.environment_id).is_some_and(|info| info.capabilities.is_object());
+            Some((thread_id.to_owned(), pr_link_state(url, &thread.pull_requests).filter(|_| supported)?))
+        });
         let view = cx.weak_entity();
         let url = url.to_owned();
         self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
+            if let Some((thread_id, linked)) = thread_link {
+                let (view, url) = (view.clone(), url.clone());
+                let label = if linked { "Unlink from thread" } else { "Link to thread" };
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = view.update(cx, |w, cx| w.change_pr_thread_link(&thread_id, &url, !linked, window, cx));
+                }));
+            }
             if let Some(thread_id) = in_preview {
                 let (view, url) = (view.clone(), url.clone());
                 menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
@@ -96,6 +108,32 @@ impl Workspace {
         true
     }
 
+    /// `pullRequestLinking.changeLink`: links or unlinks the change request `url` names.
+    fn change_pr_thread_link(
+        &mut self,
+        thread_id: &str,
+        url: &str,
+        linked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(mut command)) =
+            (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
+        else {
+            return;
+        };
+        command["commandId"] = json!(super::new_id());
+        let title = if linked { "Unable to link pull request" } else { "Unable to unlink pull request" };
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(error.to_string()).title(title), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// A skill chip's popover (`SkillChipPopover`): its name, description and instructions.
     pub(super) fn open_skill_menu(
         &mut self,
@@ -110,8 +148,11 @@ impl Workspace {
             .clone()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "No description is available for this skill.".into());
+        // The instructions open in the thread's file panel, on the machine the skill lives on.
+        let path = skill.path.clone().filter(|p| !p.is_empty() && self.preview_thread_id().is_some());
+        let view = cx.weak_entity();
         self.open_chat_menu(position, window, cx, move |menu, _, _| {
-            let (label, path) = (skill.label.clone(), skill.path.clone());
+            let label = skill.label.clone();
             let menu = menu.item(
                 PopupMenuItem::element(move |_, _| {
                     v_flex()
@@ -124,12 +165,12 @@ impl Workspace {
                 })
                 .disabled(true),
             );
-            match path.filter(|p| !p.is_empty()) {
-                // There is no file preview panel yet, so the instructions open where the system opens Markdown.
-                Some(path) => menu.separator().item(
-                    PopupMenuItem::new("View instructions")
-                        .on_click(move |_, _, cx| cx.open_url(&format!("file:///{}", path.replace('\\', "/")))),
-                ),
+            match path {
+                Some(path) => {
+                    menu.separator().item(PopupMenuItem::new("View instructions").on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |w, cx| w.open_file(&path, None, window, cx));
+                    }))
+                }
                 None => menu,
             }
         });
@@ -211,7 +252,7 @@ pub(super) fn file_link_target(href: &str, cwd: Option<&str>) -> Option<String> 
 }
 
 /// The path without its `:line:column` (`splitFilePathPosition`).
-fn without_position(target: &str) -> &str {
+pub(super) fn without_position(target: &str) -> &str {
     let mut path = target;
     for _ in 0..2 {
         match path.rsplit_once(':') {
@@ -295,6 +336,18 @@ impl Workspace {
         })
     }
 
+    /// `onOpenInBrowser`: an HTML or PDF file of a thread, which has the integrated browser.
+    fn can_open_file_in_browser(&self, target: &str) -> bool {
+        self.preview_thread_id().is_some() && is_browser_preview_file(without_position(target))
+    }
+
+    /// A file link's click: a PDF opens in the integrated browser unless the platform modifier
+    /// asks for the editor (`shouldUseMarkdownFileBrowserPrimaryAction`).
+    pub(super) fn opens_file_link_in_browser(&self, target: &str, editor: bool) -> bool {
+        let editor = editor && self.preferred_editor().is_some();
+        !editor && self.can_open_file_in_browser(target) && opens_in_browser_by_default(without_position(target))
+    }
+
     /// `showFileContextMenu`: open, reveal, and copy the relative or full path.
     pub(super) fn open_file_menu(
         &mut self,
@@ -313,6 +366,7 @@ impl Workspace {
             _ => "Open in editor".into(),
         };
         let can_open = self.preferred_editor().is_some();
+        let in_browser = self.can_open_file_in_browser(&target);
         let reveal = self.reveal_label();
         let view = cx.weak_entity();
         self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
@@ -320,6 +374,12 @@ impl Workspace {
                 let (view, target) = (view.clone(), target.clone());
                 menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(move |_, window, cx| {
                     let _ = view.update(cx, |w, cx| w.open_file_link(&target, window, cx));
+                }));
+            }
+            if in_browser {
+                let (view, path) = (view.clone(), without_position(&target).to_owned());
+                menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
+                    let _ = view.update(cx, |w, cx| w.open_host_file_in_browser(&path, window, cx));
                 }));
             }
             if let Some(label) = reveal {
@@ -349,6 +409,46 @@ pub(super) struct InlineSkill {
     pub label: String,
     pub description: Option<String>,
     pub path: Option<String>,
+}
+
+/// Whether the thread links the change request `url` names, among its visible links
+/// (`pullRequestLinking.isLinked`); `None` when `url` names none.
+fn pr_link_state(url: &str, links: &[crate::thread_pull_requests::PullRequestLink]) -> Option<bool> {
+    let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
+    Some(crate::thread_pull_requests::visible(links).any(|link| {
+        link.number == number
+            && link.host.eq_ignore_ascii_case(&host)
+            && link.repository.eq_ignore_ascii_case(&repository)
+    }))
+}
+
+/// `planThreadPullRequestMutation` (multiple links), without its command id.
+fn pr_link_command(thread_id: &str, url: &str, linked: bool) -> Option<serde_json::Value> {
+    let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
+    let repository = repository.to_lowercase();
+    Some(if linked {
+        json!({"type": "thread.pull-request.link", "threadId": thread_id, "host": host, "repository": repository,
+            "number": number, "url": url, "source": "manual"})
+    } else {
+        json!({"type": "thread.pull-request.unlink", "threadId": thread_id, "host": host, "repository": repository,
+            "number": number})
+    })
+}
+
+/// The path without its query or fragment, lowercased.
+fn bare_path(path: &str) -> String {
+    path.split(['?', '#']).next().unwrap_or_default().to_lowercase()
+}
+
+/// `isBrowserPreviewFile`.
+fn is_browser_preview_file(path: &str) -> bool {
+    let path = bare_path(path);
+    [".html", ".htm", ".pdf"].iter().any(|ext| path.ends_with(ext))
+}
+
+/// `shouldOpenMarkdownFileLinkInBrowserByDefault`.
+fn opens_in_browser_by_default(path: &str) -> bool {
+    bare_path(path).ends_with(".pdf")
 }
 
 /// `resolveExternalWebLink`: only http(s) links get the menu.
@@ -679,7 +779,9 @@ impl MarkdownPlugin for FileChips {
                 let _ = menu.update(cx, |w, cx| {
                     let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
                     if let Some(target) = target {
-                        w.open_file_menu(target, position, window, cx);
+                        w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
+                            w.open_file_menu(target, position, window, cx);
+                        });
                     }
                 });
             });
@@ -699,15 +801,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.git_cwd();
-        let Some(target) = file_links::resolve_target(path, cwd.as_deref()) else { return };
-        let relative = workspace_relative(without_position(&target), cwd.as_deref());
-        match relative {
-            Some(relative) if !editor && matches!(self.target, Some(super::Target::Thread { .. })) => {
-                self.open_file(&relative, line, window, cx);
+        let Some(target) = file_links::resolve_target(path, self.git_cwd().as_deref()) else { return };
+        self.with_workspace_match(path, target, window, cx, move |this, target, window, cx| {
+            if this.opens_file_link_in_browser(&target, editor) {
+                this.open_host_file_in_browser(without_position(&target), window, cx);
+                return;
             }
-            _ => self.open_file_link(&target, window, cx),
-        }
+            let relative = workspace_relative(without_position(&target), this.git_cwd().as_deref());
+            match relative {
+                Some(relative) if !editor && matches!(this.target, Some(super::Target::Thread { .. })) => {
+                    this.open_file(&relative, line, window, cx);
+                }
+                _ => this.open_file_link(&target, window, cx),
+            }
+        });
     }
 }
 
@@ -789,6 +896,18 @@ impl MarkdownPlugin for ThreadChips {
             })
             .into_any_element()
     }
+}
+
+/// Where a chat link to a thread opens: the thread's environment and id, as [`ThreadChips`]
+/// resolves it, so a reference-style link keeps the environment it names (`MarkdownThreadLink`).
+pub(super) fn thread_link_destination(
+    url: &str,
+    message_environment: Option<&str>,
+    threads: &[crate::model::ThreadShell],
+) -> Option<(SharedString, String)> {
+    let link = crate::thread_links::parse(url)?;
+    let thread = resolve_thread_link(&link, message_environment, threads)?;
+    Some((thread.environment_id.clone(), thread.id.clone()))
 }
 
 /// The thread a link names: in its own environment (or the message's), as written then
@@ -1035,5 +1154,60 @@ mod tests {
         let headers = vec!["Step".to_owned(), "Result".to_owned()];
         let rows = vec![vec!["Read".to_owned(), "1, 2".to_owned()], vec!["Say \"hi\"".to_owned(), "a\n  b".to_owned()]];
         assert_eq!(table_csv(&headers, &rows), "Step,Result\nRead,\"1, 2\"\n\"Say \"\"hi\"\"\",a b");
+    }
+
+    fn thread(environment: &str, id: &str) -> crate::model::ThreadShell {
+        let mut thread: crate::model::ThreadShell = serde_json::from_value(json!({
+            "id": id, "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        thread.environment_id = environment.to_owned().into();
+        thread
+    }
+
+    #[test]
+    fn thread_links_open_in_the_environment_they_name() {
+        let threads = [thread("here", "abc"), thread("there", "abc"), thread("there", "only")];
+        let open = |url: &str| thread_link_destination(url, Some("here"), &threads).map(|(e, id)| (e.to_string(), id));
+        assert_eq!(open("t3-thread://v2/there/abc"), Some(("there".into(), "abc".into())));
+        assert_eq!(open("https://app.t3.codes/threads/there/abc"), Some(("there".into(), "abc".into())));
+        assert_eq!(open("t3-thread://v1/abc"), Some(("here".into(), "abc".into())), "v1 takes the message's");
+        assert_eq!(open("t3-thread://v1/only"), Some(("there".into(), "only".into())), "or a unique match");
+        assert_eq!(open("t3-thread://v2/here/only"), None, "a scoped link never jumps machines");
+        assert_eq!(open("https://example.com"), None);
+    }
+
+    #[test]
+    fn change_request_links_link_and_unlink_the_thread() {
+        let link: crate::thread_pull_requests::PullRequestLink = serde_json::from_value(json!({
+            "host": "github.com", "repository": "Acme/App", "number": 7, "url": "https://github.com/Acme/App/pull/7",
+            "source": "manual", "linkedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let links = [link];
+        assert_eq!(pr_link_state("https://GitHub.com/acme/app/pull/7/files", &links), Some(true));
+        assert_eq!(pr_link_state("https://github.com/acme/app/pull/8", &links), Some(false));
+        assert_eq!(pr_link_state("https://github.com/acme/app/issues/7", &links), None);
+        let mut dismissed = links;
+        dismissed[0].source = "stack-dismissed".into();
+        assert_eq!(pr_link_state("https://github.com/acme/app/pull/7", &dismissed), Some(false));
+        assert_eq!(
+            pr_link_command("t", "https://github.com/Acme/App/pull/7", true).unwrap(),
+            json!({"type": "thread.pull-request.link", "threadId": "t", "host": "github.com", "repository": "acme/app",
+                "number": 7, "url": "https://github.com/Acme/App/pull/7", "source": "manual"})
+        );
+        assert_eq!(
+            pr_link_command("t", "https://gitlab.com/g/p/-/merge_requests/3", false).unwrap(),
+            json!({"type": "thread.pull-request.unlink", "threadId": "t", "host": "gitlab.com", "repository": "g/p",
+                "number": 3})
+        );
+    }
+
+    #[test]
+    fn pdfs_and_pages_open_in_the_integrated_browser() {
+        assert!(is_browser_preview_file("/r/docs/Guide.PDF") && is_browser_preview_file("/r/site/index.htm#top"));
+        assert!(!is_browser_preview_file("/r/a.md") && !is_browser_preview_file("/r/pdf"));
+        assert!(opens_in_browser_by_default("/r/a.pdf?page=2"));
+        assert!(!opens_in_browser_by_default("/r/index.html"), "a page opens in the panel first");
     }
 }

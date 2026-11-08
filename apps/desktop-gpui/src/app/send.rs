@@ -59,8 +59,7 @@ impl PendingSend {
             continues_steer: false,
             created_at: self.created_at.clone(),
             revert: None,
-            sent_by_t3code: false,
-            from_agent: None,
+            attribution: None,
         }
     }
 }

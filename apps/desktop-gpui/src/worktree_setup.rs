@@ -180,8 +180,7 @@ mod tests {
             continues_steer: false,
             created_at: "".into(),
             revert: None,
-            sent_by_t3code: false,
-            from_agent: None,
+            attribution: None,
         };
         let running = snapshot("running", json!([stage("fetch", "running")]));
         let mut rows = vec![user.clone()];

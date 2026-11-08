@@ -69,6 +69,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "history",
     "radio-tower",
     "arrow-down-up",
+    "arrow-right-left",
     "app-window",
     "blocks",
     "bot",

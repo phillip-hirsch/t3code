@@ -487,6 +487,13 @@ impl TextView {
         self
     }
 
+    /// Render soft line breaks as hard ones (`remark-breaks`).
+    pub fn markdown_line_breaks(mut self) -> Self {
+        let extensions = Arc::make_mut(&mut self.markdown_extensions);
+        *extensions = extensions.clone().line_breaks();
+        self
+    }
+
     /// Register a custom block-level Markdown parser.
     ///
     /// The parser runs during Markdown AST conversion and must be independent

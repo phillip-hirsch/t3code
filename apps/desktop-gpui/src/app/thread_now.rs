@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex};
 use gpui_kit::{
-    AnyElement, App, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, ElementId, Font, FontWeight, HighlightStyle, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, StyledText, Task, TextRun,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use serde_json::{Value, json};
 
@@ -327,13 +328,88 @@ pub(super) fn inline_button(
         .into_any_element()
 }
 
-fn clock(start_ms: i64) -> AnyElement {
+fn clock_text(start_ms: i64) -> String {
     let elapsed = (super::sidebar::now_ms() - start_ms).max(1000);
-    div().flex_none().child(crate::work_log::format_duration(elapsed / 1000 * 1000)).into_any_element()
+    crate::work_log::format_duration(elapsed / 1000 * 1000)
+}
+
+const UNRESPONSIVE_DETAIL: &str = "It may be short on memory. Force stop kills its processes.";
+
+/// `NoticeText`'s overflow check: the title and detail are wider than the line leaves them
+/// beside its icon and actions (`texts`, with their weights).
+fn notice_overflows(
+    title: &str,
+    detail: Option<&str>,
+    texts: &[(String, FontWeight)],
+    lane_width: f32,
+    window: &Window,
+) -> bool {
+    let font = window.text_style().font();
+    let size = rems(0.75).to_pixels(window.rem_size());
+    let measure = |text: &str, weight: FontWeight| {
+        let run = TextRun {
+            len: text.len(),
+            font: Font { weight, ..font.clone() },
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(window.text_system().shape_line(text.to_owned().into(), size, &[run], None).width)
+    };
+    let needed =
+        measure(title, FontWeight::NORMAL) + detail.map_or(0., |detail| 6. + measure(detail, FontWeight::NORMAL));
+    let actions = match texts.len() {
+        0 => 0.,
+        count => 6. + texts.iter().map(|(text, weight)| measure(text, *weight)).sum::<f32>() + 10. * (count - 1) as f32,
+    };
+    // The lane's 4px insets, the 14px icon and its gap.
+    needed > lane_width - 8. - 14. - 6. - actions + 0.5
+}
+
+/// `NoticeText`'s details button: the line's full text, on hover.
+fn notice_details(title: SharedString, detail: Option<String>, t: &Tokens) -> AnyElement {
+    let (fg, accent, detail_color) = (t.foreground, t.accent, t.muted_foreground.opacity(0.6));
+    let text: SharedString = match &detail {
+        Some(detail) => format!("{title} {detail}").into(),
+        None => title.clone(),
+    };
+    let detail_range = detail.map(|_| title.len() + 1..text.len());
+    div()
+        .id("now-details")
+        .flex_none()
+        .size(px(24.))
+        // A details button must not make its line taller than the others.
+        .my(px(-6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .text_color(t.muted_foreground)
+        .hover(move |style| style.bg(accent).text_color(fg))
+        .child(Icon::new(IconName::Info).size(px(14.)))
+        .tooltip(move |window, cx| {
+            let (text, detail_range) = (text.clone(), detail_range.clone());
+            Tooltip::element(move |_, _| {
+                let highlight = HighlightStyle { color: Some(detail_color), ..Default::default() };
+                div().max_w(px(480.)).whitespace_normal().child(
+                    StyledText::new(text.clone()).with_highlights(detail_range.clone().map(|range| (range, highlight))),
+                )
+            })
+            .build(window, cx)
+        })
+        .into_any_element()
 }
 
 /// One `ThreadNowLine` or `ThreadStatusLine`: icon, title and detail, then actions.
-pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+pub(super) fn now_row(
+    line: &NowLine,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut App,
+) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let workspace = workspace.read(cx);
     let thread_id = match &workspace.target {
@@ -354,6 +430,13 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
         }
     };
     let mut actions: Vec<AnyElement> = Vec::new();
+    // What the actions read, to measure the room they leave the text.
+    let mut texts: Vec<(String, FontWeight)> = Vec::new();
+    let clock = |start_ms: i64, texts: &mut Vec<(String, FontWeight)>| {
+        let text = clock_text(start_ms);
+        texts.push((text.clone(), FontWeight::NORMAL));
+        div().flex_none().child(text).into_any_element()
+    };
     let (icon, icon_color, title, description): (IconName, Hsla, SharedString, Option<AnyElement>) = match line {
         NowLine::ChildInput { title, approvals, children } => {
             let names =
@@ -370,49 +453,50 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
                 }));
             let label = if *approvals { "Open approval" } else { "Open question" };
             if let Some((first, _)) = children.first() {
+                texts.push((label.into(), FontWeight::MEDIUM));
                 actions.push(inline_button("now-open-child", label, fg, fg, false, open(first.clone())));
             }
             let icon = if *approvals { IconName::ShieldQuestionMark } else { IconName::MessageCircle };
             (icon, t.info_foreground, title.clone(), Some(names.into_any_element()))
         }
         NowLine::RunStop(stop) => {
-            actions.push(clock(stop.requested_at_ms));
+            actions.push(clock(stop.requested_at_ms, &mut texts));
             if stop.unresponsive && workspace.server_info().capability("threadForceStop") {
                 let stopping = workspace.now.force_stopping.as_deref() == Some(thread_id.as_str());
                 let run_id = stop.run_id.clone();
                 let this = this.clone();
-                actions.push(inline_button(
-                    "now-force-stop",
-                    if stopping { "Force stopping..." } else { "Force stop" },
-                    fg,
-                    fg,
-                    stopping,
-                    move |window, cx| {
-                        let run_id = run_id.clone();
-                        let _ = this.update(cx, |workspace, cx| workspace.force_stop(run_id, window, cx));
-                    },
-                ));
+                let label = if stopping { "Force stopping..." } else { "Force stop" };
+                texts.push((label.into(), FontWeight::MEDIUM));
+                actions.push(inline_button("now-force-stop", label, fg, fg, stopping, move |window, cx| {
+                    let run_id = run_id.clone();
+                    let _ = this.update(cx, |workspace, cx| workspace.force_stop(run_id, window, cx));
+                }));
             }
             if stop.unresponsive {
                 (
                     IconName::TriangleAlert,
                     t.warning_foreground,
                     "Agent not responding to Stop".into(),
-                    Some(div().child("It may be short on memory. Force stop kills its processes.").into_any_element()),
+                    Some(div().child(UNRESPONSIVE_DETAIL).into_any_element()),
                 )
             } else {
                 (IconName::CircleStop, muted, "Stopping".into(), None)
             }
         }
         NowLine::Background(work) => {
-            actions.extend(work.started_at_ms.map(clock));
+            if let Some(start_ms) = work.started_at_ms {
+                actions.push(clock(start_ms, &mut texts));
+            }
             if let Some(child) = &work.open_thread {
+                texts.push(("Open".into(), FontWeight::MEDIUM));
                 actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child.clone())));
             }
             let stopping = workspace.background_stop_pending(&thread_id);
+            let label = if stopping { "Stopping..." } else { "Stop" };
+            texts.push((label.into(), FontWeight::MEDIUM));
             actions.push(inline_button(
                 "now-stop-background",
-                if stopping { "Stopping..." } else { "Stop" },
+                label,
                 fg,
                 fg,
                 stopping,
@@ -424,6 +508,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
         NowLine::Goal(goal) => {
             let working = workspace.open_projection().is_some_and(super::super::model::ThreadProjection::is_running);
             if goal.can_resume && !working {
+                texts.extend([("Resume".into(), FontWeight::MEDIUM), ("·".into(), FontWeight::NORMAL)]);
                 actions.push(inline_button(
                     "now-goal-resume",
                     "Resume",
@@ -434,6 +519,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
                 ));
                 actions.push(div().child("·").into_any_element());
             }
+            texts.push(("Clear".into(), FontWeight::MEDIUM));
             actions.push(inline_button(
                 "now-goal-clear",
                 "Clear",
@@ -499,6 +585,18 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
             .into_any_element();
         }
     };
+    let detail = match line {
+        NowLine::ChildInput { children, .. } => {
+            Some(children.iter().map(|(_, name)| name.to_string()).collect::<Vec<_>>().join(", "))
+        }
+        NowLine::RunStop(stop) if stop.unresponsive => Some(UNRESPONSIVE_DETAIL.to_owned()),
+        NowLine::Background(work) => work.description.as_ref().map(ToString::to_string),
+        NowLine::Goal(goal) => Some(goal.objective.to_string()),
+        _ => None,
+    };
+    // When the text is cut, its details button shows all of it.
+    let details = notice_overflows(&title, detail.as_deref(), &texts, lane_width, window)
+        .then(|| notice_details(title.clone(), detail, t));
     super::chat::lane(
         0.,
         h_flex()
@@ -519,6 +617,7 @@ pub(super) fn now_row(line: &NowLine, this: &WeakEntity<Workspace>, t: &Tokens, 
                     .child(div().flex_none().max_w_full().truncate().child(title))
                     .children(description.map(|d| div().min_w_0().truncate().text_color(muted.opacity(0.6)).child(d))),
             )
+            .children(details)
             .when(!actions.is_empty(), |row| row.child(h_flex().flex_none().ml(px(6.)).gap(px(10.)).children(actions))),
     )
     .into_any_element()

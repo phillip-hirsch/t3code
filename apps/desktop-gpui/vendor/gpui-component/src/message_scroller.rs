@@ -168,6 +168,18 @@ impl MessageScrollerState {
         true
     }
 
+    /// Scroll so `offset` (as [`Self::logical_scroll_top`] reports it) is at the
+    /// top of the viewport, if its row exists.
+    pub fn scroll_to_offset(&mut self, offset: ListOffset, cx: &mut Context<Self>) -> bool {
+        if offset.item_ix >= self.list_state.item_count() {
+            return false;
+        }
+
+        self.list_state.scroll_to(offset);
+        cx.notify();
+        true
+    }
+
     /// Resume tail following and scroll to the latest row.
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Tail);

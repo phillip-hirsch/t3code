@@ -397,6 +397,8 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &options, &mut view.cache),
             None => Vec::new(),
         };
+        // The side chat answers its approvals under its own timeline.
+        rows.retain(|row| !matches!(row, Row::Approval { .. }));
         for row in &mut rows {
             match row {
                 Row::User { revert, .. } => *revert = None,
@@ -416,10 +418,11 @@ impl Workspace {
                 scroller.splice(range, count, cx);
             }
         });
+        self.sync_details(cx);
         cx.notify();
     }
 
-    fn side_chat_projection(&self) -> Option<&ThreadProjection> {
+    pub(super) fn side_chat_projection(&self) -> Option<&ThreadProjection> {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
     }
 

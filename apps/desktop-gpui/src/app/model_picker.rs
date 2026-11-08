@@ -72,13 +72,13 @@ impl ProviderLock {
         let locked = projection.thread.provider_instance_id.as_ref().or(selection.map(|s| &s.instance_id));
         let group = locked
             .and_then(|id| providers.iter().find(|p| &p.instance_id == id))
-            .and_then(|p| p.continuation.as_ref()?["groupKey"].as_str().map(str::to_owned));
+            .and_then(|p| Some(p.continuation.as_ref()?.group_key.clone()));
         let exact_instance = locked.filter(|_| driver == "antigravity" && group.is_none()).cloned();
         Some(Self { driver, group, exact_instance })
     }
 
     fn allows(&self, provider: &Provider) -> bool {
-        let group = provider.continuation.as_ref().and_then(|c| c["groupKey"].as_str());
+        let group = provider.continuation.as_ref().map(|c| c.group_key.as_str());
         provider.driver == self.driver
             && self.group.as_deref().is_none_or(|key| group == Some(key))
             && self.exact_instance.as_ref().is_none_or(|id| *id == provider.instance_id)
@@ -303,6 +303,8 @@ impl Workspace {
         self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
         self.refresh_menu_items(cx);
+        // A pick on another harness shows its pending handoff at the timeline's end.
+        self.refresh_rows(cx);
         cx.notify();
     }
 

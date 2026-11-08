@@ -817,7 +817,10 @@ fn parse_paragraph(
             // so a CRLF document still carries its carriage return here. Take
             // the CR with the newline: dropping only the newline would strand
             // the CR in the middle of the reflowed line.
-            text = val.value.replace("\r\n", " ").replace(['\n', '\r'], " ");
+            // With line breaks on (`remark-breaks`), a soft break renders as a
+            // newline instead.
+            let line_end = if cx.markdown_extensions.has_line_breaks() { "\n" } else { " " };
+            text = val.value.replace("\r\n", line_end).replace(['\n', '\r'], line_end);
             paragraph.push(mapped_inline(source, text.clone(), node, cx))
         }
         Node::Emphasis(val) => {
@@ -2220,6 +2223,24 @@ mod tests {
                 "source: {source:?}"
             );
         }
+    }
+
+    /// With line breaks on, a soft break keeps its line, and structure that
+    /// spans lines (a heading under prose, a table) still parses.
+    #[test]
+    fn test_line_breaks_keep_soft_breaks_and_structure() {
+        let mut cx = NodeContext {
+            markdown_extensions: Arc::new(MarkdownExtensions::default().line_breaks()),
+            ..NodeContext::default()
+        };
+        let document = parse("one\r\ntwo\n# Title\n\n| a |\n| - |\n| b |", &mut cx).unwrap();
+
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(paragraph.text(), "one\ntwo");
+        assert!(matches!(&document.blocks[1], BlockNode::Heading { .. }));
+        assert!(matches!(&document.blocks[2], BlockNode::Table(_)));
     }
 
     /// The two breaks stay distinguishable in one paragraph: the soft one

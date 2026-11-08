@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui_kit::{Context, Image, ImageFormat, ImageSource, SharedString, SharedUri};
-use serde_json::json;
+use markdown::mdast::Node;
+use serde_json::{Value, json};
 
 use super::Workspace;
 
@@ -28,6 +29,11 @@ static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
 pub(super) struct ImageCache(Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>);
 
 impl ImageCache {
+    /// The loaded image for `destination`, if it has loaded.
+    pub(super) fn get(&self, destination: &str) -> Option<Arc<Image>> {
+        self.0.lock().ok()?.get(destination).cloned().flatten()
+    }
+
     /// `TextView`'s `image_source`: the loaded image, else a blank one.
     pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
         let cache = self.0.clone();
@@ -43,40 +49,94 @@ pub(super) enum Source {
     Direct(String),
     Data(ImageFormat, Vec<u8>),
     WorkspaceFile(String),
+    /// An `assets.createUrl` resource, such as a tool's output image.
+    Asset(Value),
     Blocked,
 }
 
-/// The destinations of the `![alt](dest)` images in `markdown`, outside code fences.
+/// Whether `markdown` can hold an image at all, so most messages skip parsing for one.
+fn may_hold_images(markdown: &str) -> bool {
+    markdown.contains("![") || markdown.to_ascii_lowercase().contains("<img")
+}
+
+/// The destinations of the images the parsed `markdown` shows, in order and once each: inline
+/// `![alt](dest)`, reference `![alt][id]` (by its definition) and raw HTML `<img src>`.
 pub(super) fn image_destinations(markdown: &str) -> Vec<String> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    let Ok(root) = markdown::to_mdast(markdown, &options) else { return Vec::new() };
+    let mut definitions = HashMap::new();
+    collect_definitions(&root, &mut definitions);
     let mut found = Vec::new();
-    let mut fenced = false;
-    for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
+    collect_images(&root, &definitions, &mut found);
+    found
+}
+
+fn collect_definitions<'a>(node: &'a Node, definitions: &mut HashMap<&'a str, &'a str>) {
+    if let Node::Definition(definition) = node {
+        // The first definition of a label wins, as CommonMark resolves it.
+        definitions.entry(definition.identifier.as_str()).or_insert(definition.url.as_str());
+    }
+    for child in node.children().into_iter().flatten() {
+        collect_definitions(child, definitions);
+    }
+}
+
+fn collect_images(node: &Node, definitions: &HashMap<&str, &str>, found: &mut Vec<String>) {
+    let mut push = |dest: &str| {
+        if !dest.is_empty() && !found.iter().any(|d| d == dest) {
+            found.push(dest.to_owned());
         }
-        if fenced {
-            continue;
-        }
-        let mut rest = line;
-        while let Some(start) = rest.find("![") {
-            rest = &rest[start + 2..];
-            let Some(close) = rest.find("](") else { break };
-            let after = &rest[close + 2..];
-            let Some(end) = after.find(')') else { break };
-            let inner = after[..end].trim();
-            let dest = match inner.strip_prefix('<') {
-                Some(angled) => angled.split('>').next().unwrap_or_default(),
-                None => inner.split_whitespace().next().unwrap_or_default(),
-            };
-            if !dest.is_empty() && !found.iter().any(|d| d == dest) {
-                found.push(dest.to_owned());
+    };
+    match node {
+        Node::Image(image) => push(&image.url),
+        Node::ImageReference(image) => {
+            if let Some(url) = definitions.get(image.identifier.as_str()) {
+                push(url);
             }
-            rest = &after[end + 1..];
+        }
+        Node::Html(html) => html_image_sources(&html.value).iter().for_each(|src| push(src)),
+        _ => {}
+    }
+    for child in node.children().into_iter().flatten() {
+        collect_images(child, definitions, found);
+    }
+}
+
+/// The `src` of each `<img>` tag in a raw HTML fragment.
+fn html_image_sources(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut sources = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find("<img").map(|i| from + i + 4) {
+        let end = lower[start..].find('>').map_or(lower.len(), |i| start + i);
+        from = end;
+        if !lower[start..].starts_with(|c: char| c.is_ascii_whitespace() || c == '/') {
+            continue;
+        }
+        let tag = &lower[start..end];
+        let Some(attr) = tag.match_indices("src").map(|(i, _)| i).find(|&i| {
+            i > 0 && tag.as_bytes()[i - 1].is_ascii_whitespace() && tag[i + 3..].trim_start().starts_with('=')
+        }) else {
+            continue;
+        };
+        let value_at = start + attr + 3;
+        let value = html[value_at..end].trim_start().trim_start_matches('=').trim_start();
+        let src = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or_default(),
+            _ => value.split_ascii_whitespace().next().unwrap_or_default(),
+        };
+        if !src.is_empty() {
+            sources.push(decode_entities(src));
         }
     }
-    found
+    sources
+}
+
+/// The HTML parser decodes these in an attribute, so the cache key must too.
+fn decode_entities(value: &str) -> String {
+    value.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 fn is_windows_absolute(path: &str) -> bool {
@@ -152,13 +212,42 @@ fn base64(text: &str) -> Option<Vec<u8>> {
 impl Workspace {
     /// Starts loading the images `markdown` shows that the cache has not seen yet.
     pub(super) fn load_markdown_images(&mut self, key: &SharedString, markdown: &str, cx: &mut Context<Self>) {
-        if !markdown.contains("![") {
+        if !may_hold_images(markdown) {
             return;
         }
+        self.load_images(key, image_destinations(markdown), cx);
+    }
+
+    /// Starts loading the image at each destination the cache has not seen yet, for the row
+    /// that shows `key` to remeasure once it lands.
+    pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
         let root = self.git_cwd();
+        let sources = destinations
+            .into_iter()
+            .map(|destination| {
+                let source = classify(&destination, root.as_deref());
+                (destination, source)
+            })
+            .collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    /// Starts loading each asset image (`ChatMarkdownAssetImage`), cached under its destination.
+    pub(super) fn load_asset_images(
+        &mut self,
+        key: &SharedString,
+        assets: Vec<(String, Value)>,
+        cx: &mut Context<Self>,
+    ) {
+        let sources =
+            assets.into_iter().map(|(destination, resource)| (destination, Source::Asset(resource))).collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
-        for destination in image_destinations(markdown) {
+        for (destination, source) in sources {
             {
                 let Ok(mut cache) = cache.0.lock() else { return };
                 if cache.contains_key(&destination) {
@@ -166,8 +255,14 @@ impl Workspace {
                 }
                 cache.insert(destination.clone(), None);
             }
-            let source = classify(&destination, root.as_deref());
-            let (client, base, thread_id) = (self.client(), self.http_base().map(str::to_owned), thread_id.clone());
+            let resource = match &source {
+                Source::WorkspaceFile(path) => {
+                    thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
+                }
+                Source::Asset(resource) => Some(resource.clone()),
+                _ => None,
+            };
+            let (client, base) = (self.client(), self.http_base().map(str::to_owned));
             let (key, cache) = (key.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
                 let fetched: Option<(Option<String>, Vec<u8>)> = match source {
@@ -179,16 +274,15 @@ impl Workspace {
                         return;
                     }
                     Source::Direct(url) => fetch(url).await,
-                    Source::WorkspaceFile(path) => match (client, base, thread_id) {
-                        (Some(client), Some(base), Some(thread_id)) => {
-                            let resource = json!({"_tag": "media-file", "threadId": thread_id, "path": path});
+                    Source::WorkspaceFile(_) | Source::Asset(_) => match (client, base, resource) {
+                        (Some(client), Some(base), Some(resource)) => {
                             match client.request("assets.createUrl", json!({"resource": resource})).await {
                                 Ok(signed) => match signed["relativeUrl"].as_str() {
                                     Some(relative) => fetch(format!("{base}{relative}")).await,
                                     None => None,
                                 },
                                 Err(error) => {
-                                    log::debug!("assets.createUrl for a markdown image: {error}");
+                                    log::debug!("assets.createUrl for a chat image: {error}");
                                     None
                                 }
                             }
@@ -342,6 +436,9 @@ mod tests {
     fn images_outside_code_are_found_once() {
         let markdown = "![a](shot.png) and ![b](<my shot.png> \"t\")\n```\n![c](x.png)\n```\n![a](shot.png)";
         assert_eq!(image_destinations(markdown), vec!["shot.png", "my shot.png"]);
+        let markdown =
+            "![ref][Logo] then <img alt=\"x\" src='html.png?a=1&amp;b=2'>\n\n`![no](code.png)`\n\n[logo]: ref.png";
+        assert_eq!(image_destinations(markdown), vec!["ref.png", "html.png?a=1&b=2"]);
     }
 
     #[test]

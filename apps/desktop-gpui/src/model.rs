@@ -111,6 +111,12 @@ pub struct OptionChoice {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Continuation {
+    pub group_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Provider {
     pub instance_id: String,
     #[serde(default)]
@@ -152,6 +158,9 @@ pub struct Provider {
     pub native_sessions: Option<NativeSessions>,
     #[serde(default)]
     pub configurable_providers: bool,
+    /// Instances sharing a `groupKey` continue one conversation, so switching needs no handoff.
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
     #[serde(default)]
     pub supports_conversation_rollback: Option<bool>,
     #[serde(default, deserialize_with = "lossy")]
@@ -163,9 +172,6 @@ pub struct Provider {
     /// Empty means every runtime mode.
     #[serde(default)]
     pub supported_runtime_modes: Vec<String>,
-    /// `continuation`: instances sharing a `groupKey` can continue each other's threads.
-    #[serde(default)]
-    pub continuation: Option<Value>,
     /// `false` hides the composer's Plan toggle.
     #[serde(default)]
     pub show_interaction_mode_toggle: Option<bool>,
@@ -1366,6 +1372,12 @@ pub struct Run {
     /// Starts a new provider conversation; earlier runs stay visible but never reach the provider.
     #[serde(default)]
     pub fresh_context: bool,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub context_handoff_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1568,6 +1580,38 @@ pub struct ThreadProjection {
     pub provider_sessions: Vec<ProviderSession>,
     #[serde(default, deserialize_with = "lossy")]
     pub plans: Vec<PlanArtifact>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub subagents: Vec<Subagent>,
+}
+
+/// `OrchestrationV2Subagent`, as far as Thread details reads it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
+    /// `provider_native` or `app_owned`.
+    pub origin: String,
+    pub driver: String,
+    #[serde(default)]
+    pub native_task_ref: Option<NativeTaskRef>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTaskRef {
+    #[serde(default)]
+    pub native_id: Option<String>,
+    pub strength: String,
 }
 
 impl ThreadProjection {
@@ -1887,6 +1931,7 @@ impl ThreadProjection {
             "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
             "plan.updated" => upsert(&mut self.plans, PlanArtifact::deserialize(payload)?, |p| &p.id),
+            "subagent.updated" => upsert(&mut self.subagents, Subagent::deserialize(payload)?, |a| &a.id),
             "provider-session.attached" | "provider-session.updated" => {
                 upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
             }

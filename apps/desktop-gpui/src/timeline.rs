@@ -13,6 +13,7 @@ use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::model::{self, Run, ThreadProjection, TurnItem, is_active_run_status};
+pub use crate::queue::Attribution;
 use crate::work_log::{self, Activity, Entry, Status, Tone, WorkIcon};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,11 +29,9 @@ pub enum Row {
         created_at: SharedString,
         /// The checkpoint "Edit from here" rewinds to.
         revert: Option<Checkpoint>,
-        /// "Sent by T3 Code" above the bubble; not the user's own words, so it never groups.
-        sent_by_t3code: bool,
-        /// Another agent sent it (`attribution === "agent"`): it folds to one line, and names the
-        /// thread it came from when it has one.
-        from_agent: Option<FromAgent>,
+        /// Who sent it when not the user (`resolveUserMessagePresentation`); such a message is
+        /// not the user's own words, so it never groups.
+        attribution: Option<Attribution>,
     },
     Assistant {
         id: SharedString,
@@ -101,6 +100,13 @@ pub enum Row {
     Subagent(Rc<SubagentCard>),
     /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
     Embed(Rc<Embed>),
+    /// A thread the turn created, summarized under its last reply (`resourceSummary`).
+    CreatedThread {
+        id: SharedString,
+        run_id: SharedString,
+        title: Option<SharedString>,
+        thread_id: Option<SharedString>,
+    },
     /// "Superseded attempt": the work a steer cut off, folded.
     AttemptFold {
         key: SharedString,
@@ -108,6 +114,18 @@ pub enum Row {
     },
     /// A secret or link an agent asked for, while it waits on the user (`SecretRequestCard`, `LinkRequestCard`).
     Request(Rc<RequestCard>),
+    /// A same-harness model or effort change before the message it took effect with (`ModelSwitchRow`).
+    ModelSwitch {
+        id: SharedString,
+        switch: Rc<(model::ModelSelection, model::ModelSelection)>,
+    },
+    /// A provider handoff, or the one the composer's pick would start (`HandoffRow`).
+    Handoff(Rc<HandoffRow>),
+    /// A pending approval where the agent asked for it, with its answers (`TimelinePendingApprovalRow`).
+    Approval {
+        id: SharedString,
+        request_id: SharedString,
+    },
     /// A queued follow-up, after the timeline (`QueuedRunsControl`).
     Queued {
         message: Rc<crate::queue::QueuedMessage>,
@@ -125,6 +143,15 @@ pub enum Row {
         total: usize,
         expanded: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffRow {
+    pub id: SharedString,
+    pub endpoints: crate::handoff::Endpoints,
+    pub failed: bool,
+    /// Not sent yet: the composer's pick runs on another harness than the thread's last run.
+    pub pending: bool,
 }
 
 /// An `html_render` page or an MCP app's attachment (`htmlRenderFromToolItem`, `mcpAppFromToolItem`).
@@ -332,11 +359,41 @@ pub struct SubagentCard {
     pub started_at: Option<SharedString>,
     pub completed_at: Option<SharedString>,
     pub child_thread_id: Option<SharedString>,
+    /// The thread in a linked environment that runs the task, when it runs there.
+    pub remote: Option<RemoteChild>,
     pub driver: SharedString,
     pub status: SharedString,
     /// Subagents one provider turn started together group into one row.
     pub run_id: Option<SharedString>,
     pub provider_turn_id: Option<SharedString>,
+}
+
+/// `OrchestrationV2RemoteTaskChild`: where a task runs in a linked environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteChild {
+    pub environment_id: SharedString,
+    pub thread_id: SharedString,
+    /// The environment's name, shown as "on <label>".
+    pub label: SharedString,
+}
+
+/// The thread a subagent card opens.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubagentTarget<'a> {
+    Local(&'a SharedString),
+    Remote(&'a RemoteChild),
+}
+
+impl SubagentCard {
+    /// `SubagentTimelineLink`'s `open`: the child thread here, else the remote one when this
+    /// client is connected to its environment.
+    pub fn target(&self, connected: impl Fn(&str) -> bool) -> Option<SubagentTarget<'_>> {
+        match (&self.child_thread_id, &self.remote) {
+            (Some(child), _) => Some(SubagentTarget::Local(child)),
+            (None, Some(remote)) if connected(&remote.environment_id) => Some(SubagentTarget::Remote(remote)),
+            _ => None,
+        }
+    }
 }
 
 /// `subagentGroupSummary` + `summarizeSubagentStatuses`: "2 working · 1 done", and whether
@@ -476,6 +533,14 @@ fn subagent_card(item: &TurnItem) -> SubagentCard {
         started_at: text("startedAt").map(|s| s.to_owned().into()),
         completed_at: text("completedAt").map(|s| s.to_owned().into()),
         child_thread_id: text("childThreadId").map(|s| s.to_owned().into()),
+        remote: item.raw.get("remoteChild").and_then(|remote| {
+            let text = |key: &str| remote.get(key).and_then(Value::as_str).map(|v| SharedString::from(v.to_owned()));
+            Some(RemoteChild {
+                environment_id: text("environmentId")?,
+                thread_id: text("threadId")?,
+                label: text("label").unwrap_or_default(),
+            })
+        }),
         driver: text("driver").unwrap_or_default().to_owned().into(),
         status: item.status.clone().into(),
         run_id: item.run_id.clone().map(Into::into),
@@ -582,7 +647,7 @@ impl Row {
     }
 
     fn is_own_user_message(&self) -> bool {
-        matches!(self, Row::User { sent_by_t3code: false, from_agent: None, .. })
+        matches!(self, Row::User { attribution: None, .. })
     }
 }
 
@@ -628,12 +693,6 @@ fn compacting_label(reason: Option<&str>) -> &'static str {
     }
 }
 
-/// The thread an agent-sent message came from (`senderThreadId`), if it names one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FromAgent {
-    pub sender_thread: Option<SharedString>,
-}
-
 enum Kind {
     /// `revertible`: a turn start or queued turn, which "Edit from here" can rewind.
     User {
@@ -642,10 +701,11 @@ enum Kind {
         revertible: bool,
         /// A bare `/compact` turn, which its compaction row stands in for.
         compaction: Option<Option<&'static str>>,
-        sent_by_t3code: bool,
-        from_agent: Option<FromAgent>,
+        attribution: Option<Attribution>,
         /// `/clear` or an automation started a new provider session with this message.
         fresh_context: bool,
+        /// `modelSwitch`: the model or effort change that took effect with it.
+        model_switch: Option<Rc<(model::ModelSelection, model::ModelSelection)>>,
     },
     Assistant {
         text: SharedString,
@@ -661,6 +721,8 @@ enum Kind {
     },
     Embed(Rc<Embed>),
     Request(Rc<RequestCard>),
+    /// A `handoff` item, whose endpoints read the thread's runs.
+    Handoff(Rc<TurnItem>),
 }
 
 struct TimelineEntry {
@@ -801,15 +863,24 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 _ => None,
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
+            let (shown, attribution) = crate::queue::user_message_presentation(item);
             Kind::User {
-                text: text("text"),
+                text: shown.into(),
                 steer,
                 revertible,
-                sent_by_t3code: crate::queue::sent_by_t3code(item),
-                from_agent: crate::queue::sent_by_agent(item)
-                    .then(|| FromAgent { sender_thread: item.str("senderThreadId").map(SharedString::from) }),
+                attribution,
                 compaction: compaction_command(item),
                 fresh_context: item.bool("freshContext"),
+                model_switch: item
+                    .raw
+                    .get("modelSwitch")
+                    .and_then(|switch| Some((switch.get("from")?, switch.get("to")?)))
+                    .and_then(|(from, to)| {
+                        Some(Rc::new((
+                            serde_json::from_value(from.clone()).ok()?,
+                            serde_json::from_value(to.clone()).ok()?,
+                        )))
+                    }),
             }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
@@ -820,18 +891,15 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
         "link_request" if item.str("linkStatus") == Some("pending") && !inherited => {
             Kind::Request(Rc::new(request_card(item)))
         }
-        "fork"
-        | "handoff"
-        | "run_interrupt_request"
-        | "run_interrupt_result"
-        | "secret_request"
-        | "link_request"
-        | "subagent" => Kind::Event {
-            label: event_label(item, inherited).into(),
-            item_type: item.item_type.clone().into(),
-            subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
-            system: system_divider(item).map(Rc::new),
-        },
+        "handoff" => Kind::Handoff(item.clone()),
+        "fork" | "run_interrupt_request" | "run_interrupt_result" | "secret_request" | "link_request" | "subagent" => {
+            Kind::Event {
+                label: event_label(item, inherited).into(),
+                item_type: item.item_type.clone().into(),
+                subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
+                system: system_divider(item).map(Rc::new),
+            }
+        }
         _ => match embed(item) {
             Some(embed) => Kind::Embed(Rc::new(embed)),
             None => Kind::Work(Rc::new(work_log::entry_from_item(item))),
@@ -865,7 +933,6 @@ fn event_label(item: &TurnItem, inherited: bool) -> String {
     let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
     match item.item_type.as_str() {
         "fork" => "Forked thread".into(),
-        "handoff" => "Switched provider".into(),
         // `secretRequestDisplay` for an answered request.
         "secret_request" => {
             let outcome = match item.str("secretStatus") {
@@ -1858,8 +1925,9 @@ pub fn rows(
                         || e.question_answered
                         || is_pending(e)
                 };
-                // A pending approval is drawn once, with its buttons, by the composer.
-                if is_pending(work) {
+                // A pending approval shows where the agent asked, with its buttons.
+                if let Some(request_id) = work.approval_request_id.as_ref().filter(|_| is_pending(work)) {
+                    rows.push(Row::Approval { id: entry.id.clone(), request_id: request_id.clone() });
                     index += 1;
                     continue;
                 }
@@ -1939,6 +2007,12 @@ pub fn rows(
             Kind::Event { system: Some(divider), .. } => rows.push(Row::System(divider.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Request(card) => rows.push(Row::Request(card.clone())),
+            Kind::Handoff(item) => rows.push(Row::Handoff(Rc::new(HandoffRow {
+                id: entry.id.clone(),
+                endpoints: crate::handoff::resolve_endpoints(item, &projection.runs),
+                failed: entry.status == "failed",
+                pending: false,
+            }))),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
             Kind::User { compaction: Some(_), .. } if entry.run_id.is_some() => {
                 let run = entry.run_id.as_ref().expect("a run");
@@ -1953,7 +2027,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, sent_by_t3code, from_agent, fresh_context, .. } => {
+            Kind::User { text, steer, attribution, fresh_context, model_switch, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -1962,6 +2036,12 @@ pub fn rows(
                         icon: DividerIcon::Eraser,
                         action: None,
                     })));
+                }
+                if let Some(switch) = model_switch {
+                    rows.push(Row::ModelSwitch {
+                        id: format!("model-switch:{}", entry.id).into(),
+                        switch: switch.clone(),
+                    });
                 }
                 rows.push(Row::User {
                     id: entry.id.clone(),
@@ -1972,8 +2052,7 @@ pub fn rows(
                     continues_steer: false,
                     created_at: entry.created_at.clone(),
                     revert: reverts.get(&entry.id).cloned(),
-                    sent_by_t3code: *sent_by_t3code,
-                    from_agent: from_agent.clone(),
+                    attribution: attribution.clone(),
                 });
             }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
@@ -2013,7 +2092,7 @@ pub fn rows(
         }
     }
 
-    let mut rows = attach_trailing_meta(rows);
+    let mut rows = attach_trailing_meta(attach_created_thread_summaries(rows, &entries));
     let flags: Vec<(bool, bool, bool)> = rows
         .iter()
         .map(|row| (row.is_work(), row.is_own_user_message(), matches!(row, Row::User { steer: Some(_), .. })))
@@ -2023,16 +2102,8 @@ pub fn rows(
         let previous = index.checked_sub(1).and_then(|i| flags.get(i)).copied().unwrap_or_default();
         match row {
             Row::Work(work) => work.continues = next.0,
-            Row::User {
-                steer,
-                grouped_with_previous,
-                grouped_with_next,
-                continues_steer,
-                sent_by_t3code,
-                from_agent,
-                ..
-            } => {
-                let own = !*sent_by_t3code && from_agent.is_none();
+            Row::User { steer, grouped_with_previous, grouped_with_next, continues_steer, attribution, .. } => {
+                let own = attribution.is_none();
                 *grouped_with_previous = own && previous.1;
                 *grouped_with_next = own && next.1;
                 *continues_steer = previous.2 && steer.is_some();
@@ -2119,6 +2190,44 @@ fn attach_changed_files(
 
 /// `attachTrailingToolGroupsToAssistant`: when tool groups of the same run follow a finished
 /// reply, its actions move under the last of them.
+/// `attachCreatedThreadSummaries`: each thread a turn created gets a card under the turn's last reply.
+fn attach_created_thread_summaries(rows: Vec<Row>, entries: &[Rc<TimelineEntry>]) -> Vec<Row> {
+    let created: Vec<Row> = entries
+        .iter()
+        .filter_map(|entry| {
+            let work = entry.work().filter(|work| work.item_type == "thread_created")?;
+            let raw = &work.item.0.raw;
+            let text = |key: &str| raw.get(key).and_then(Value::as_str).map(|v| SharedString::from(v.to_owned()));
+            Some(Row::CreatedThread {
+                id: format!("summary:{}", entry.id).into(),
+                run_id: entry.run_id.clone()?,
+                title: text("title"),
+                thread_id: text("targetThreadId"),
+            })
+        })
+        .collect();
+    if created.is_empty() {
+        return rows;
+    }
+    let mut out = Vec::with_capacity(rows.len() + created.len());
+    for row in rows {
+        let run = match &row {
+            Row::Assistant { terminal: true, run_id: Some(run), .. } => Some(run.clone()),
+            _ => None,
+        };
+        out.push(row);
+        if let Some(run) = run {
+            out.extend(
+                created
+                    .iter()
+                    .filter(|card| matches!(card, Row::CreatedThread { run_id, .. } if *run_id == run))
+                    .cloned(),
+            );
+        }
+    }
+    out
+}
+
 fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
     let failed_or_tool = |e: &Entry| e.is_tool_like() || (e.item_type == "error" && e.status == Some(Status::Failed));
     let mut meta_after: HashMap<usize, usize> = HashMap::new();
@@ -2127,6 +2236,11 @@ fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
         let mut last = None;
         let mut trailing = false;
         for (candidate_index, candidate) in rows.iter().enumerate().skip(index + 1) {
+            if matches!(candidate, Row::CreatedThread { run_id, .. } if run_id == run) {
+                trailing = true;
+                last = Some(candidate_index);
+                continue;
+            }
             let Row::Work(work) = candidate else {
                 if matches!(candidate, Row::User { .. } | Row::Assistant { .. }) {
                     break;
@@ -2240,8 +2354,7 @@ mod tests {
             continues_steer: false,
             created_at: SharedString::default(),
             revert: None,
-            sent_by_t3code: false,
-            from_agent: None,
+            attribution: None,
         }
     }
 
@@ -2288,6 +2401,7 @@ mod tests {
                 Row::SubagentGroup { cards, .. } => format!("subagents {}", cards.len()),
                 Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
                 Row::Embed(embed) => format!("embed {}", embed.title),
+                Row::CreatedThread { title, .. } => format!("created {}", title.as_deref().unwrap_or_default()),
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
@@ -2296,6 +2410,9 @@ mod tests {
                 Row::WorktreeSetup { snapshot, .. } => format!("setup {}", snapshot.phase),
                 Row::System(divider) => format!("system {}", divider.label),
                 Row::Request(card) => format!("request {}", card.item_id),
+                Row::ModelSwitch { switch, .. } => format!("model-switch {} {}", switch.0.model, switch.1.model),
+                Row::Handoff(handoff) => format!("handoff {}", handoff.endpoints.to.instance_id),
+                Row::Approval { request_id, .. } => format!("approval {request_id}"),
             })
             .collect()
     }
@@ -2348,6 +2465,21 @@ mod tests {
         let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
         assert!(described[reply + 1].starts_with("work"), "{described:?}");
         assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
+    }
+
+    #[test]
+    fn created_threads_summarize_under_the_turns_last_reply() {
+        let mut items = turn("r1");
+        let created = json!({"title": "Fix CI", "targetThreadId": "t2"});
+        items.insert(2, item("r1-new", "thread_created", "r1", "2026-11-04T10:00:01.500Z", created));
+        let p = projection(items, json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        // The card counts as trailing work, so the reply's actions follow it.
+        assert_eq!(described, ["user go", "fold Worked for 1m 5s", "assistant done", "created Fix CI", "meta"]);
+        let open = HashSet::from([fold_key("r1")]);
+        let described = describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default()));
+        assert_eq!(described.iter().filter(|row| row.starts_with("created")).count(), 1, "{described:?}");
+        assert_eq!(described.last().map(String::as_str), Some("meta"), "{described:?}");
     }
 
     #[test]
@@ -2708,6 +2840,24 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
         let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(described, ["system New session", "user go", "assistant looking"]);
+
+        // A model switch sits right above its message; a handoff is its own divider.
+        let mut items = turn("r1")[..2].to_vec();
+        items[0]["modelSwitch"] =
+            json!({"from": {"instanceId": "codex", "model": "a"}, "to": {"instanceId": "codex", "model": "b"}});
+        items.insert(
+            0,
+            item(
+                "h",
+                "handoff",
+                "r1",
+                "2026-11-04T09:59:00.000Z",
+                json!({"fromProviderInstanceIds": ["claude"], "toProviderInstanceId": "codex"}),
+            ),
+        );
+        let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        assert_eq!(described, ["handoff codex", "model-switch a b", "user go", "assistant looking"]);
     }
 
     #[test]
@@ -2888,6 +3038,14 @@ mod tests {
         let generic = card(json!({"status": "failed", "result": "Child task ended with status failed"}));
         assert_eq!((generic.detail, generic.failed), (None, true));
         assert_eq!([5_000, 185_000, 3_725_000].map(agent_elapsed), ["5s", "3m 05s", "1h 02m"]);
+        assert!(matches!(done.target(|_| false), Some(SubagentTarget::Local(child)) if child == "child"));
+        let remote = card(
+            json!({"childThreadId": null, "remoteChild": {"environmentId": "mac", "threadId": "t9", "label": "MacBook"}}),
+        );
+        let linked = remote.remote.clone().expect("a remote child");
+        assert_eq!((&*linked.environment_id, &*linked.thread_id, &*linked.label), ("mac", "t9", "MacBook"));
+        assert_eq!(remote.target(|env| env == "mac"), Some(SubagentTarget::Remote(&linked)));
+        assert_eq!(remote.target(|_| false), None);
     }
 
     #[test]
@@ -2919,8 +3077,11 @@ mod tests {
         items.insert(0, item("u0", "user_message", "r2", "2026-11-04T10:00:00.500Z", json!({"text": "z"})));
         let p = projection(items, json!([]));
         let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
-        assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
-        assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
+        assert!(matches!(rows[0], Row::User { grouped_with_next: false, attribution: None, .. }));
+        assert!(matches!(
+            rows[1],
+            Row::User { grouped_with_previous: false, attribution: Some(Attribution::T3Code), .. }
+        ));
 
         // Another agent's message (a subagent's task) folds and names the thread that sent it.
         let task = json!({"text": "e", "inputIntent": "turn_start", "createdBy": "agent", "senderThreadId": "parent"});
@@ -2930,15 +3091,52 @@ mod tests {
         ];
         let p = projection(items, json!([]));
         let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
-        let Row::User { from_agent: Some(from), grouped_with_next: false, .. } = &rows[0] else {
+        let Row::User { attribution: Some(Attribution::Agent { sender_thread }), grouped_with_next: false, .. } =
+            &rows[0]
+        else {
             panic!("an agent's message folds: {:?}", describe(&rows))
         };
-        assert_eq!(from.sender_thread.as_deref(), Some("parent"));
-        assert!(matches!(rows[1], Row::User { from_agent: None, grouped_with_previous: false, .. }));
+        assert_eq!(sender_thread.as_deref(), Some("parent"));
+        assert!(matches!(rows[1], Row::User { attribution: None, grouped_with_previous: false, .. }));
+
+        // An automation names its task; a legacy one loses its trigger line. A guest's message
+        // shows the guest's own words and name. Neither groups with the user's own.
+        let automation = json!({"text": "run it", "createdBy": "agent", "scheduledTaskId": "task-1"});
+        let legacy = json!({"text": "[Triggered by schedule task: Nightly [v2]]\n\nrun it",
+            "messageId": "scheduled-task-message:task-2:3:manual"});
+        let guest = json!({"text": "Guest Ann says: hi", "context": {"version": 1, "records": [],
+            "guest": {"guestMessageId": "g", "name": "Ann", "text": "hi"}}});
+        let items = vec![
+            item("u7", "user_message", "r4", "2026-11-04T10:00:00.000Z", automation),
+            item("u8", "user_message", "r4", "2026-11-04T10:00:01.000Z", legacy),
+            item("u9", "user_message", "r4", "2026-11-04T10:00:02.000Z", guest),
+            item("u10", "user_message", "r4", "2026-11-04T10:00:03.000Z", json!({"text": "mine"})),
+        ];
+        let p = projection(items, json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|row| match row {
+                Row::User { text, attribution, grouped_with_previous, .. } => {
+                    (text.to_string(), attribution.clone(), *grouped_with_previous)
+                }
+                _ => panic!("only messages: {:?}", describe(&rows)),
+            })
+            .collect();
+        let automation = |task: &str| Some(Attribution::Automation { scheduled_task_id: Some(task.into()) });
+        assert_eq!(
+            shown,
+            [
+                ("run it".into(), automation("task-1"), false),
+                ("run it".into(), automation("task-2"), false),
+                ("hi".into(), Some(Attribution::Guest { name: "Ann".into() }), false),
+                ("mine".into(), None, false),
+            ]
+        );
     }
 
     #[test]
-    fn a_pending_approval_is_left_to_the_composer() {
+    fn a_pending_approval_shows_where_it_was_asked() {
         let items = vec![
             item(
                 "u",
@@ -2966,7 +3164,7 @@ mod tests {
         let pending = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         p.runtime_requests = vec![request("resolved")];
         let resolved = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
-        assert_eq!(pending, ["user go", "working"]);
+        assert_eq!(pending, ["user go", "working", "approval q"]);
         assert_eq!(resolved, ["user go", "working", "live rm -rf build"]);
     }
 }

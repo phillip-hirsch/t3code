@@ -594,6 +594,35 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// `openFileInPreview` for a chat file link: a path on the thread's host, in a new tab of
+    /// the integrated browser.
+    pub(in crate::app) fn open_host_file_in_browser(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
+        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let inside = crate::app::markdown_ui::workspace_relative(path, self.git_cwd().as_deref()).is_some();
+        let resource =
+            json!({"_tag": if inside { "workspace-file" } else { "media-file" }, "threadId": thread_id, "path": path});
+        cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
+            Ok((url, _)) => {
+                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));
+            }
+            Err(error) => {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(
+                        Notification::error(logic::error_message(&error)).title("Unable to open file in browser"),
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
 }
 
 #[cfg(test)]
