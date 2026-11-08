@@ -780,7 +780,7 @@ pub(super) fn render_row(
         }
         Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
-        Row::Now(line) => super::thread_now::now_row(line, this, &t, cx),
+        Row::Now(line) => super::thread_now::now_row(line, this, lane_width, &t, window, cx),
         Row::Workflow { row, expanded } => {
             lane(16., super::workflow::workflow_row(row, *expanded, this, lane_width, &t, cx)).into_any_element()
         }
