@@ -1,12 +1,14 @@
 //! Opening a diff's file from its header (`openDiffFilePrimaryAction`): the path opens in the
 //! panel's Files surface; the rest of the header folds the file, as the chevron does.
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
-use gpui_kit::component::h_flex;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
+    AnyElement, App, ClipboardItem, ElementId, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
 };
 
 use super::super::Workspace;
@@ -14,6 +16,11 @@ use super::super::git::{self, DiffColorScheme};
 use super::super::markdown_ui::workspace_relative;
 use super::diff_load::FileStat;
 use crate::theme::Tokens;
+
+/// The header the copy button shows on hover of.
+const HEADER_GROUP: &str = "diff-file-header";
+/// `ANCHORED_COPY_TOAST_TIMEOUT_MS`: how long the button shows it copied.
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn is_windows_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
@@ -189,12 +196,14 @@ pub(super) fn header(
     };
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
+    let copy = copy_path_button(&path, &view, tokens, cx);
     let (open_path, fold_path, fold_view) = (path.clone(), path, view.clone());
     // `[data-title]:hover`: the code foreground mixed 16% toward primary.
     let hover = tokens.foreground.blend(tokens.primary.opacity(0.16));
     let muted = tokens.muted_foreground;
     h_flex()
         .id("diff-file-header-content")
+        .group(HEADER_GROUP)
         .w_full()
         .min_w_0()
         .gap_2()
@@ -216,10 +225,48 @@ pub(super) fn header(
                 })
                 .child(name),
         )
+        // `DiffFileHeaderSuffix`, after the filename: copy path, then the file's load status.
+        .child(copy)
+        .children(suffix)
         .child(div().flex_1())
         .children(counts)
         .when_some(status, |el, status| el.child(div().text_xs().text_color(muted).child(status)))
-        .children(suffix)
+        .into_any_element()
+}
+
+/// `DiffFilePathCopyButton` (`icon-micro`, `ghost-muted`): shown on the header's hover, it
+/// copies the path and shows a check and "Copied" for a moment.
+fn copy_path_button(path: &SharedString, view: &Entity<Workspace>, tokens: &Tokens, cx: &App) -> AnyElement {
+    let id: SharedString = format!("diff-copy-path:{path}").into();
+    let copied = view.read(cx).copy_feedback.is(&id);
+    let (accent, foreground) = (tokens.accent, tokens.foreground);
+    let glyph = if copied {
+        Icon::new(IconName::Check).text_color(tokens.success_foreground)
+    } else {
+        Icon::new(IconName::Copy)
+    };
+    let label = if copied { "Copied" } else { "Copy path" };
+    let (view, path) = (view.clone(), path.clone());
+    div()
+        .id(ElementId::Name(id.clone()))
+        .size(px(20.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .text_color(tokens.muted_foreground)
+        .hover(move |style| style.bg(accent).text_color(foreground))
+        .when(!copied, |el| el.invisible().group_hover(HEADER_GROUP, gpui_kit::Styled::visible))
+        .child(glyph.size(px(12.)))
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .on_click(move |_, _, cx| {
+            // Inside the file header, whose click folds the file.
+            cx.stop_propagation();
+            cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
+            view.update(cx, |this, cx| this.copied(id.clone(), COPIED_FOR, cx));
+        })
         .into_any_element()
 }
 
