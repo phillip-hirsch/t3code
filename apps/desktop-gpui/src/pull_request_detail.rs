@@ -547,7 +547,8 @@ pub struct StackPlan {
     pub selected_open: bool,
 }
 
-pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
+/// `stale`: the stack is kept from before a lookup that failed or is still running.
+pub fn stack_plan(stack: &Stack, number: u64, stale: bool) -> StackPlan {
     let position = stack.layers.iter().position(|l| l.number == number).map_or(0, |i| i + 1);
     let unmerged: Vec<&StackLayer> = stack.layers.iter().filter(|l| l.state != State::Merged).collect();
     let merge: Vec<&StackLayer> = stack.layers[..position].iter().filter(|l| l.state != State::Merged).collect();
@@ -555,12 +556,14 @@ pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
     let merge_blocked = merge.iter().any(|l| l.state != State::Open || l.is_draft);
     StackPlan {
         position,
-        merge_disabled: !selected_open
+        merge_disabled: stale
+            || !selected_open
             || merge.is_empty()
             || merge.iter().any(|l| l.head_sha.is_none())
             || merge_blocked,
         merge: merge.iter().map(|l| l.number).collect(),
-        rebase_disabled: unmerged.is_empty()
+        rebase_disabled: stale
+            || unmerged.is_empty()
             || unmerged.iter().any(|l| l.head_sha.is_none())
             || unmerged.iter().any(|l| l.state != State::Open),
         rebase: unmerged.iter().map(|l| l.number).collect(),
@@ -593,7 +596,42 @@ pub enum Primary {
     Closed,
 }
 
-pub fn primary_control(detail: &Detail, checks_state: Option<&str>) -> Option<Primary> {
+/// Who merges the shown layer of a native stack (`allowsSinglePullRequestMerge`, `stackOwnsMerge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackMerge {
+    /// The host's stack merges it, so the single-merge controls step aside.
+    pub owns: bool,
+    /// Membership is known and the pull request is in no stack: it may merge on its own.
+    pub single: bool,
+    /// The last stack lookup failed.
+    pub failed: bool,
+}
+
+impl Default for StackMerge {
+    fn default() -> Self {
+        Self { owns: false, single: true, failed: false }
+    }
+}
+
+impl StackMerge {
+    /// `has_stack`, `fresh` (the last lookup answered and none is in flight) and `failed` describe
+    /// the stack lookup; a host without stack actions always merges single pull requests.
+    pub fn of(detail: &Detail, has_stack: bool, fresh: bool, failed: bool) -> Self {
+        let supports = detail.capabilities.stacks == Some(true) && detail.capabilities.stack_actions == Some(true);
+        Self { owns: supports && has_stack, single: !supports || (!has_stack && fresh && !failed), failed }
+    }
+
+    /// `mergeBlockedReason`.
+    pub fn blocked_reason(self) -> Option<&'static str> {
+        (!self.single).then_some(if self.failed {
+            "Couldn't check stack membership"
+        } else {
+            "Checking stack membership…"
+        })
+    }
+}
+
+pub fn primary_control(detail: &Detail, checks_state: Option<&str>, stack: StackMerge) -> Option<Primary> {
     let has_method = !allowed_merge_methods(detail).is_empty();
     match detail.state {
         State::Merged => return Some(Primary::Merged),
@@ -614,11 +652,12 @@ pub fn primary_control(detail: &Detail, checks_state: Option<&str>) -> Option<Pr
     }
     if detail.auto_merge_enabled == Some(false)
         && checks_state.is_some_and(|s| s != "passing")
+        && !stack.owns
         && can(detail, "enable-auto-merge")
     {
         return Some(Primary::EnableAutoMerge);
     }
-    can(detail, "merge").then_some(Primary::Merge)
+    (!stack.owns && can(detail, "merge")).then_some(Primary::Merge)
 }
 
 /// The overflow menu's state actions (`showsDraftToggle`, `showsMergeNow`, ...).
@@ -635,7 +674,7 @@ pub struct MenuActions {
     pub delete_branch: bool,
 }
 
-pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
+pub fn menu_actions(detail: &Detail, primary: Option<Primary>, stack: StackMerge) -> MenuActions {
     let open = detail.state == State::Open;
     let conflicting = open && detail.mergeability == "conflicting";
     let methods = allowed_merge_methods(detail).len();
@@ -645,9 +684,12 @@ pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
         draft_toggle: open
             && can(detail, if detail.is_draft { "ready" } else { "draft" })
             && !(detail.is_draft && primary == Some(Primary::Ready)),
-        merge_now: mergeable && matches!(primary, Some(Primary::EnableAutoMerge | Primary::AutoMergeArmed)),
-        disable_auto_merge: armed && can(detail, "disable-auto-merge"),
-        auto_merge: open
+        merge_now: stack.single
+            && mergeable
+            && matches!(primary, Some(Primary::EnableAutoMerge | Primary::AutoMergeArmed)),
+        disable_auto_merge: stack.single && armed && can(detail, "disable-auto-merge"),
+        auto_merge: stack.single
+            && open
             && !armed
             && primary != Some(Primary::EnableAutoMerge)
             && !detail.is_draft
@@ -1970,38 +2012,87 @@ mod tests {
     #[test]
     fn the_primary_control_follows_where_the_pull_request_stands() {
         let pending = Some("pending");
-        assert_eq!(primary_control(&detail(json!({"state": "merged"})), None), Some(Primary::Merged));
-        assert_eq!(primary_control(&detail(json!({"state": "closed"})), None), Some(Primary::Closed));
-        assert_eq!(primary_control(&detail(json!({"mergeability": "conflicting"})), None), Some(Primary::Resolve));
-        assert_eq!(primary_control(&detail(json!({"isDraft": true})), None), Some(Primary::Ready));
-        assert_eq!(primary_control(&detail(json!({"autoMergeEnabled": true})), None), Some(Primary::AutoMergeArmed));
         assert_eq!(
-            primary_control(&detail(json!({"autoMergeEnabled": false})), pending),
+            primary_control(&detail(json!({"state": "merged"})), None, StackMerge::default()),
+            Some(Primary::Merged)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"state": "closed"})), None, StackMerge::default()),
+            Some(Primary::Closed)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"mergeability": "conflicting"})), None, StackMerge::default()),
+            Some(Primary::Resolve)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"isDraft": true})), None, StackMerge::default()),
+            Some(Primary::Ready)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"autoMergeEnabled": true})), None, StackMerge::default()),
+            Some(Primary::AutoMergeArmed)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"autoMergeEnabled": false})), pending, StackMerge::default()),
             Some(Primary::EnableAutoMerge)
         );
-        assert_eq!(primary_control(&detail(json!({})), pending), Some(Primary::Merge), "unreported auto-merge merges");
+        assert_eq!(
+            primary_control(&detail(json!({})), pending, StackMerge::default()),
+            Some(Primary::Merge),
+            "unreported auto-merge merges"
+        );
         let viewer_cannot = detail(json!({"viewerPermissions": {"actions": []}}));
-        assert_eq!(primary_control(&viewer_cannot, None), None);
+        assert_eq!(primary_control(&viewer_cannot, None, StackMerge::default()), None);
         let no_method = detail(json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}}));
-        assert_eq!(primary_control(&no_method, None), None);
+        assert_eq!(primary_control(&no_method, None, StackMerge::default()), None);
     }
 
     #[test]
     fn the_menu_offers_what_the_state_allows() {
         let open = detail(json!({}));
-        let actions = menu_actions(&open, primary_control(&open, None));
+        let actions = menu_actions(&open, primary_control(&open, None, StackMerge::default()), StackMerge::default());
         assert!(actions.draft_toggle && actions.auto_merge && actions.merge_methods && actions.close);
         assert!(!actions.merge_now && !actions.reopen && !actions.revert && !actions.delete_branch);
         let armed = detail(json!({"autoMergeEnabled": true}));
-        let actions = menu_actions(&armed, primary_control(&armed, None));
+        let actions = menu_actions(&armed, primary_control(&armed, None, StackMerge::default()), StackMerge::default());
         assert!(actions.merge_now && actions.disable_auto_merge && !actions.auto_merge);
         let draft = detail(json!({"isDraft": true}));
-        assert!(!menu_actions(&draft, primary_control(&draft, None)).draft_toggle, "the header already offers ready");
+        assert!(
+            !menu_actions(&draft, primary_control(&draft, None, StackMerge::default()), StackMerge::default())
+                .draft_toggle,
+            "the header already offers ready"
+        );
         let closed = detail(json!({"state": "closed"}));
-        let actions = menu_actions(&closed, primary_control(&closed, None));
+        let actions =
+            menu_actions(&closed, primary_control(&closed, None, StackMerge::default()), StackMerge::default());
         assert!(actions.reopen && actions.delete_branch && !actions.close);
         let merged = detail(json!({"state": "merged"}));
-        assert!(menu_actions(&merged, None).revert);
+        assert!(menu_actions(&merged, None, StackMerge::default()).revert);
+    }
+
+    #[test]
+    fn a_native_stack_owns_merging_and_unresolved_membership_blocks_a_single_merge() {
+        let caps = json!({
+            "diff": true, "stacks": true, "stackActions": true, "mergeMethods": ["merge", "squash"],
+            "actions": ["merge", "enable-auto-merge", "disable-auto-merge"],
+        });
+        let stacked = detail(json!({"autoMergeEnabled": true, "capabilities": caps}));
+        let open = detail(json!({"capabilities": caps}));
+        let owner = StackMerge::of(&open, true, true, false);
+        assert!(owner.owns && !owner.single);
+        assert_eq!(primary_control(&open, None, owner), None, "the stack menu merges it");
+        let checking = StackMerge::of(&open, false, false, false);
+        assert_eq!(primary_control(&open, None, checking), Some(Primary::Merge));
+        assert_eq!(checking.blocked_reason(), Some("Checking stack membership…"));
+        assert_eq!(StackMerge::of(&open, false, false, true).blocked_reason(), Some("Couldn't check stack membership"));
+        let actions = menu_actions(&stacked, primary_control(&stacked, None, checking), checking);
+        assert!(!actions.merge_now && !actions.disable_auto_merge && !actions.auto_merge);
+        let alone = StackMerge::of(&open, false, true, false);
+        assert_eq!(alone, StackMerge::default());
+        let actions = menu_actions(&stacked, primary_control(&stacked, None, alone), alone);
+        assert!(actions.merge_now && actions.disable_auto_merge);
+        let unsupported = detail(json!({}));
+        assert_eq!(StackMerge::of(&unsupported, false, false, true).blocked_reason(), None);
     }
 
     #[test]
@@ -2053,11 +2144,12 @@ mod tests {
             ],
         }))
         .unwrap();
-        let plan = stack_plan(&stack, 3);
+        let plan = stack_plan(&stack, 3, false);
         assert_eq!((plan.position, plan.merge.as_slice(), plan.merge_disabled), (3, &[2, 3][..], false));
+        assert!(stack_plan(&stack, 3, true).merge_disabled, "a stale stack cannot merge");
         assert_eq!(plan.rebase, [2, 3, 4]);
         assert!(plan.rebase_disabled, "a layer without a known head cannot be rebased safely");
-        assert!(stack_plan(&stack, 4).merge_disabled, "a draft layer blocks the merge");
+        assert!(stack_plan(&stack, 4, false).merge_disabled, "a draft layer blocks the merge");
         assert_eq!(
             stack_heads(&stack, &[2, 3]),
             json!([{"number": 2, "headSha": "b1"}, {"number": 3, "headSha": "c1"}])

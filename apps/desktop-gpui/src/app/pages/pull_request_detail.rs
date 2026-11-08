@@ -118,6 +118,8 @@ pub(in crate::app) struct Panel {
     code: Option<code::CodeTab>,
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
+    /// The last stack lookup answered and no other is in flight (`nativeStackQuery.isFresh`).
+    stack_fresh: bool,
     stack_failed: bool,
     linked: Option<Vec<header::LinkedThread>>,
     checks_all: bool,
@@ -180,6 +182,7 @@ impl Panel {
             code: None,
             write: write::WriteState::default(),
             stack: None,
+            stack_fresh: false,
             stack_failed: false,
             linked: None,
             checks_all: false,
@@ -986,7 +989,8 @@ impl Workspace {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let term = logic::terminology(&detail.provider).0;
         let (checks_state, checks_stale) = panel.checks_state(detail);
-        let primary = logic::primary_control(detail, checks_state);
+        let stack = logic::StackMerge::of(detail, panel.stack.is_some(), panel.stack_fresh, panel.stack_failed);
+        let primary = logic::primary_control(detail, checks_state, stack);
         let method = self.pr_merge_method(panel, detail);
         let (_, state_color, state_label) = state_glyph(detail.state, detail.is_draft, t);
         let hairline = Hsla { a: t.border.a * 0.6, ..t.border };
@@ -1041,9 +1045,9 @@ impl Workspace {
             .gap(px(4.))
             .children(self.render_pr_thread_count(t, cx))
             .children(self.render_pr_stack(detail, method, t, cx))
-            .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
+            .children(self.render_pr_primary(detail, primary, stack, method, state_label, state_color, t, cx))
             .child(self.render_pr_checkout(detail, t, cx))
-            .child(self.render_pr_menu(detail, primary, method, guides, thread, &view, t))
+            .child(self.render_pr_menu(detail, primary, stack, method, guides, thread, &view, t))
             .child(collapse_button(t, cx));
 
         let author = actor_label(detail.author.as_ref(), t);
@@ -1221,10 +1225,12 @@ impl Workspace {
     }
 
     /// `PullRequestPrimaryAction`.
+    #[allow(clippy::too_many_arguments)]
     fn render_pr_primary(
         &self,
         detail: &Detail,
         primary: Option<Primary>,
+        stack: logic::StackMerge,
         method: &'static str,
         state_label: &'static str,
         state_color: Hsla,
@@ -1277,10 +1283,15 @@ impl Workspace {
                     idle
                 };
                 let icon = if armed == Some(action) { Lucide::Check } else { Lucide::GitMerge };
+                // Still pressable-looking while membership resolves, like the web's aria-disabled.
+                let blocked = stack.blocked_reason();
                 out.push(
                     button(if primary == Primary::Merge { "pr-merge" } else { "pr-enable-auto-merge" }, icon, label)
+                        .when_some(blocked, |el, reason| el.tooltip(reason))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.press_pr_action(action, Some(method), window, cx);
+                            if blocked.is_none() {
+                                this.press_pr_action(action, Some(method), window, cx);
+                            }
                         }))
                         .into_any_element(),
                 );
@@ -1320,6 +1331,7 @@ impl Workspace {
         &self,
         detail: &Rc<Detail>,
         primary: Option<Primary>,
+        stack: logic::StackMerge,
         method: &'static str,
         guides: bool,
         thread: Option<&PanelThread>,
@@ -1328,7 +1340,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let (term, short) = logic::terminology(&detail.provider);
-        let actions = logic::menu_actions(detail, primary);
+        let actions = logic::menu_actions(detail, primary, stack);
         let allowed = logic::allowed_merge_methods(detail);
         let busy = panel.pending.is_some();
         let deleting = panel.pending == Some("delete-branch");

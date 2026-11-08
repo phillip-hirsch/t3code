@@ -90,6 +90,9 @@ impl Workspace {
         let key = key.to_owned();
         let mut reference = panel.reference.to_json();
         if detail.capabilities.stacks == Some(true) {
+            if let Some(panel) = self.pr_panel(&key) {
+                panel.stack_fresh = false;
+            }
             let (client, key) = (client.clone(), key.clone());
             let mut input = reference.clone();
             if input.get("host").is_none()
@@ -104,6 +107,7 @@ impl Workspace {
                     match result.map(serde_json::from_value::<Option<Stack>>) {
                         Ok(Ok(stack)) => {
                             panel.stack = stack.map(Rc::new);
+                            panel.stack_fresh = true;
                             panel.stack_failed = false;
                         }
                         Ok(Err(error)) => {
@@ -485,7 +489,8 @@ impl Workspace {
             }
             return Vec::new();
         };
-        let plan = logic::stack_plan(&stack, detail.number);
+        // A stack kept from before a failed or running lookup may have moved (`stale`).
+        let plan = logic::stack_plan(&stack, detail.number, !panel.stack_fresh || panel.stack_failed);
         let actions = detail.capabilities.stack_actions == Some(true);
         let can_merge = actions && logic::can(detail, "merge") && !logic::allowed_merge_methods(detail).is_empty();
         let can_rebase = actions && detail.viewer_permissions.stack_rebase == Some(true);
@@ -595,7 +600,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        let plan = logic::stack_plan(&stack, detail.number);
+        let plan = logic::stack_plan(&stack, detail.number, false);
         let merge = action == "merge";
         let layers = if merge { plan.merge } else { plan.rebase };
         let term = logic::terminology(&detail.provider).0;
@@ -674,7 +679,7 @@ impl Workspace {
     ) {
         let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        if panel.pending.is_some() {
+        if panel.pending.is_some() || !panel.stack_fresh || panel.stack_failed {
             return;
         }
         let merge = action == "merge";
