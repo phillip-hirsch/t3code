@@ -70,6 +70,7 @@ mod preview;
 mod prompt_stash;
 mod queue;
 mod quit;
+mod recovery;
 mod request_cards;
 mod right_panel;
 mod send;
@@ -1088,6 +1089,9 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.client_settings.read_failed {
+            return self.render_settings_recovery(window, cx);
+        }
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
@@ -1258,5 +1262,6 @@ impl Render for Workspace {
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))
+            .into_any_element()
     }
 }
