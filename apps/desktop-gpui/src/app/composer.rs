@@ -202,6 +202,8 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        // `set_value` clears the undo history that could bring a deleted chip back.
+        self.release_retained_attachments(cx);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
         self.sync_trigger(cx);

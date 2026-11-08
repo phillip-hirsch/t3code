@@ -183,6 +183,33 @@ fn find_attachment<'a>(
         .find(|(_, attachment)| attachment.local_id == local_id)
 }
 
+/// Moves attachments whose chip left the text (it was in `previous`, not in `live`) into
+/// `retained`, and retained ones whose chip is back into `attachments`; `None` when nothing
+/// moved, else the restored attachments that need their upload taken again.
+fn reconcile_chips(
+    attachments: &mut Vec<Attachment>,
+    retained: &mut Vec<Attachment>,
+    previous: &[String],
+    live: &[String],
+) -> Option<Vec<String>> {
+    let (dropped, kept): (Vec<_>, Vec<_>) = mem::take(attachments).into_iter().partition(|a| {
+        let id = a.chip_id();
+        previous.contains(&id) && !live.contains(&id)
+    });
+    let (restored, still): (Vec<_>, Vec<_>) =
+        mem::take(retained).into_iter().partition(|a| live.contains(&a.chip_id()));
+    *attachments = kept;
+    *retained = still;
+    if dropped.is_empty() && restored.is_empty() {
+        return None;
+    }
+    retained.extend(dropped);
+    let reupload = restored.iter().filter(|a| !matches!(a.upload, Upload::Ready(_))).map(|a| a.local_id.clone());
+    let reupload = reupload.collect();
+    attachments.extend(restored);
+    Some(reupload)
+}
+
 /// A dropped file's bytes, or its size when it is over the limit and was not read.
 #[derive(Debug, PartialEq)]
 enum Read {
@@ -728,24 +755,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Drops attachments whose chip the user deleted from the text.
+    /// Sets aside attachments whose chip the user deleted from the text, and brings back
+    /// those whose chip an undo restored (`reconcileAttachmentContextReferences`).
     pub(super) fn sync_attachment_chips(&mut self, previous_chips: &[String], cx: &mut Context<Self>) {
         let state = self.composer.read(cx);
         let live: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let dropped: Vec<String> = self
-            .attachments
-            .iter()
-            .filter(|a| {
-                let id = a.chip_id();
-                previous_chips.contains(&id) && !live.contains(&id)
-            })
-            .map(|a| a.local_id.clone())
-            .collect();
-        if dropped.is_empty() {
+        let Some(restored) =
+            reconcile_chips(&mut self.attachments, &mut self.retained_attachments, previous_chips, &live)
+        else {
             return;
+        };
+        // An upload that finished while set aside was dropped; take it again.
+        for local_id in restored {
+            self.upload(local_id, cx);
         }
-        self.attachments.retain(|a| !dropped.contains(&a.local_id));
         cx.notify();
+    }
+
+    /// The editor's undo history ended, so deleted chips can no longer come back.
+    pub(super) fn release_retained_attachments(&mut self, cx: &mut Context<Self>) {
+        for attachment in mem::take(&mut self.retained_attachments) {
+            self.release_upload(&attachment, cx);
+        }
     }
 
     /// The send payload's `attachments` and `context`, or why it cannot send yet.
@@ -1027,6 +1058,27 @@ mod tests {
         );
         let terminal = composer_text::context_link("terminal", "terminal_t1", "Shell");
         assert!(environment_context_records(&format!("see {terminal}")).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_chip_keeps_its_attachment_until_undo_brings_it_back() {
+        let file = |id: &str, upload: Upload| Attachment {
+            upload,
+            ..Attachment::restored_as(id.into(), "file", "a.txt".into(), "text/plain".into(), vec![1])
+        };
+        let mut attachments = vec![file("a", Upload::Ready("up-a".into())), file("b", Upload::Uploading)];
+        let mut retained = Vec::new();
+        let ids = |list: &[Attachment]| list.iter().map(|a| a.local_id.clone()).collect::<Vec<_>>();
+
+        let both = [attachments[0].chip_id(), attachments[1].chip_id()];
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &both, &both), None);
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &both, &[]), Some(vec![]));
+        assert_eq!((ids(&attachments), ids(&retained)), (vec![], vec!["a".to_owned(), "b".to_owned()]));
+
+        let restored = reconcile_chips(&mut attachments, &mut retained, &[], &both);
+        assert_eq!(restored, Some(vec!["b".to_owned()]), "only the unfinished upload is taken again");
+        assert_eq!((ids(&attachments), ids(&retained)), (vec!["a".to_owned(), "b".to_owned()], vec![]));
+        assert_eq!(attachments[0].upload, Upload::Ready("up-a".into()));
     }
 
     #[test]

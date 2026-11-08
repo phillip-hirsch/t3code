@@ -225,6 +225,8 @@ pub struct Workspace {
     dragging_files: bool,
     /// Targets whose dropped or picked files are still being read, one entry per read.
     reading_attachments: Vec<Target>,
+    /// Attachments whose chip was deleted, kept until the editor's undo history ends.
+    retained_attachments: Vec<attachments::Attachment>,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
     sidebar_view: Entity<sidebar::SidebarView>,
@@ -427,6 +429,7 @@ impl Workspace {
             environment_remote: false,
             dragging_files: false,
             reading_attachments: Vec::new(),
+            retained_attachments: Vec::new(),
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
             visit: visits::VisitTracker::default(),
