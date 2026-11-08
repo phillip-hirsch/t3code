@@ -33,10 +33,14 @@ pub(in crate::app) struct UsageState {
     days: u32,
     /// Usage provider kinds the reader turned off.
     hidden: Vec<String>,
-    /// The environment filter: this window reads one environment, so it is on or off.
-    environment_selected: bool,
+    /// The environments the reader picked; `None` is all of them, new ones included.
+    selected: Option<Vec<SharedString>>,
     window: UsageWindow,
-    /// The answer on screen and the window it answers; a new window keeps it until it lands.
+    /// Each environment's last answer and the window they answer; a new window keeps them until it lands.
+    answers: Option<(Vec<logic::EnvironmentUsage>, UsageWindow)>,
+    /// Environments whose last read failed, with why.
+    failures: Vec<(SharedString, String)>,
+    /// The selected answers combined, as shown.
     summary: Option<(Rc<Summary>, UsageWindow)>,
     merged: Rc<Merged>,
     /// Answers left out of the totals for their contract version.
@@ -44,7 +48,6 @@ pub(in crate::app) struct UsageState {
     /// When the last answer landed, and each environment's prices and aliases the read went out with.
     answered_at: Option<i64>,
     scan_settings: Vec<(SharedString, Value)>,
-    error: Option<SharedString>,
     loading: bool,
     refreshing: bool,
     generation: u64,
@@ -193,14 +196,15 @@ impl Default for UsageState {
             metric: "limits",
             days: 30,
             hidden: Vec::new(),
-            environment_selected: true,
+            selected: None,
             window: local_window(30),
+            answers: None,
+            failures: Vec::new(),
             summary: None,
             merged: Rc::default(),
             mismatches: Vec::new(),
             answered_at: None,
             scan_settings: Vec::new(),
-            error: None,
             loading: false,
             refreshing: false,
             generation: 0,
@@ -219,6 +223,33 @@ impl Default for UsageState {
 impl UsageState {
     fn tokens(&self) -> bool {
         self.metric == "tokens"
+    }
+
+    fn is_selected(&self, environment_id: &str) -> bool {
+        self.selected.as_ref().is_none_or(|ids| ids.iter().any(|id| id == environment_id))
+    }
+
+    /// The selected environments' answers as one summary, or `None` while none answered.
+    fn recombine(&mut self) {
+        let (summary, mismatches) = self
+            .answers
+            .as_ref()
+            .and_then(|(answers, window)| {
+                let picked = answers.iter().filter(|a| self.is_selected(&a.environment_id)).cloned().collect();
+                let (summary, mismatches) = logic::combine(picked)?;
+                Some((Some((Rc::new(summary), window.clone())), mismatches))
+            })
+            .unwrap_or_default();
+        (self.summary, self.mismatches) = (summary, mismatches);
+        self.merged = Rc::new(match &self.summary {
+            Some((summary, _)) => logic::merge(summary, &self.hidden),
+            None => Merged::default(),
+        });
+    }
+
+    /// Why nothing shows: the first selected environment's failure.
+    fn error(&self) -> Option<&str> {
+        self.failures.iter().find(|(id, _)| self.is_selected(id)).map(|(_, message)| message.as_str())
     }
 
     fn hidden_drivers(&self) -> Vec<&'static str> {
@@ -273,7 +304,7 @@ impl Workspace {
 
     /// A connected environment's prices or model aliases differ from what the last read went out with.
     fn usage_scan_settings_changed(&self) -> bool {
-        let environments = self.limit_environments();
+        let environments = self.usage_environments();
         environments.len() != self.usage.scan_settings.len()
             || environments
                 .iter()
@@ -324,15 +355,18 @@ impl Workspace {
     fn set_hidden_usage_providers(&mut self, hidden: Vec<String>, cx: &mut Context<Self>) {
         self.usage.hidden = hidden;
         self.save_usage_preferences();
-        self.remerge_usage();
+        self.usage.recombine();
         cx.notify();
     }
 
-    fn remerge_usage(&mut self) {
-        self.usage.merged = Rc::new(match &self.usage.summary {
-            Some((summary, _)) => logic::merge(summary, &self.usage.hidden),
-            None => Merged::default(),
-        });
+    fn select_usage_environments(&mut self, selected: Option<Vec<SharedString>>, cx: &mut Context<Self>) {
+        self.usage.selected = selected;
+        self.usage.hover = None;
+        self.usage.recombine();
+        if self.usage.metric == "limits" {
+            self.refresh_limits(true, cx);
+        }
+        cx.notify();
     }
 
     /// The environments the page reads: every connected one, with its `usageModelFilter`.
@@ -347,6 +381,13 @@ impl Workspace {
 
     /// The selected environments' provider and limit-source reads, with their labels.
     fn limit_environments(&self) -> Vec<(SharedString, SharedString, &crate::model::ServerInfo)> {
+        let mut environments = self.usage_environments();
+        environments.retain(|(id, ..)| self.usage.is_selected(id));
+        environments
+    }
+
+    /// Every connected environment, with its label.
+    fn usage_environments(&self) -> Vec<(SharedString, SharedString, &crate::model::ServerInfo)> {
         self.sessions()
             .iter()
             .filter(|s| s.is_connected())
@@ -373,18 +414,21 @@ impl Workspace {
             return;
         }
         let scan: Vec<(SharedString, Value)> =
-            self.limit_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
+            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
+        // A refresh re-prices the selected environments; every one is read so a pick shows at once.
+        let rated: Vec<crate::rpc::RpcClient> = machines
+            .iter()
+            .filter(|(id, ..)| refresh_rates && self.usage.is_selected(id))
+            .map(|(_, client, _)| client.clone())
+            .collect();
         let usage = &mut self.usage;
         usage.scan_settings = scan;
         usage.generation += 1;
         let generation = usage.generation;
         usage.loading = true;
         cx.spawn(async move |this, cx| {
-            if refresh_rates {
-                let refreshes =
-                    machines.iter().map(|(_, client, _)| client.request("server.refreshUsageRates", json!({})));
-                futures::future::join_all(refreshes).await;
-            }
+            let refreshes = rated.iter().map(|client| client.request("server.refreshUsageRates", json!({})));
+            futures::future::join_all(refreshes).await;
             let mut machines = machines;
             for attempt in 0..2 {
                 let reads = machines.iter().map(|(id, client, input)| {
@@ -400,33 +444,24 @@ impl Workspace {
                     }
                     // A machine that fails to answer leaves the others' usage showing.
                     let mut answers = Vec::new();
-                    let mut failure = None;
+                    usage.failures.clear();
                     for (environment_id, result) in results {
-                        match result.map(serde_json::from_value::<Summary>) {
-                            Ok(Ok(summary)) => answers.push(logic::EnvironmentUsage { environment_id, summary }),
-                            Ok(Err(error)) => {
-                                failure.get_or_insert_with(|| format!("Unreadable usage summary: {error}"));
+                        let failure = match result.map(serde_json::from_value::<Summary>) {
+                            Ok(Ok(summary)) => {
+                                answers.push(logic::EnvironmentUsage { environment_id, summary });
+                                continue;
                             }
-                            Err(error) => {
-                                failure.get_or_insert_with(|| usage_error(&error));
-                            }
-                        }
+                            Ok(Err(error)) => format!("Unreadable usage summary: {error}"),
+                            Err(error) => usage_error(&error),
+                        };
+                        usage.failures.push((environment_id.into(), failure));
                     }
                     again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
-                    let answered = !answers.is_empty();
-                    if answered {
+                    if !answers.is_empty() {
                         usage.answered_at = Some(now_ms());
+                        usage.answers = Some((answers, window.clone()));
                     }
-                    match (logic::combine(answers), failure) {
-                        (Some((summary, mismatches)), _) => {
-                            usage.error = None;
-                            usage.mismatches = mismatches;
-                            usage.summary = Some((Rc::new(summary), window.clone()));
-                            this.remerge_usage();
-                        }
-                        (None, Some(failure)) if !answered => usage.error = Some(failure.into()),
-                        (None, _) => {}
-                    }
+                    usage.recombine();
                     this.usage.loading = again;
                     if !again {
                         this.usage.refreshing = false;
@@ -448,7 +483,8 @@ impl Workspace {
     /// Re-probes provider limits (`refreshUsageLimits`): automatic refreshes wait five minutes
     /// between probes.
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
-        let machines = self.usage_machines();
+        let mut machines = self.usage_machines();
+        machines.retain(|(id, ..)| self.usage.is_selected(id));
         if machines.is_empty() {
             return;
         }
@@ -609,41 +645,66 @@ impl Workspace {
         let limits = usage.metric == "limits";
         let view = cx.entity();
         let separator = || div().flex_none().text_color(t.muted_foreground).child("/");
-        let labels: Vec<SharedString> = self.limit_environments().into_iter().map(|(_, label, _)| label).collect();
-        let environment: SharedString =
-            if labels.is_empty() { "This environment".into() } else { labels.join(", ").into() };
-        let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
-        let has_issue = !limits && (usage.error.is_some() || !usage.mismatches.is_empty());
-        let mismatch_lines: Vec<String> = self
-            .usage
+        let environments = self.usage_environments();
+        let selected: Vec<(SharedString, SharedString)> = environments
+            .iter()
+            .filter(|(id, ..)| usage.is_selected(id))
+            .map(|(id, label, _)| (id.clone(), label.clone()))
+            .collect();
+        let failures: Vec<String> = usage
+            .failures
+            .iter()
+            .filter_map(|(id, message)| {
+                let (_, label) = selected.iter().find(|(selected, _)| selected == id)?;
+                Some(format!("{label}: {message}"))
+            })
+            .collect();
+        let mismatch_lines: Vec<String> = usage
             .mismatches
             .iter()
             .map(|mismatch| {
-                let label = self
-                    .limit_environments()
-                    .into_iter()
+                let label = environments
+                    .iter()
                     .find(|(id, ..)| id.as_ref() == mismatch.environment_id)
                     .map_or_else(|| mismatch.environment_id.clone(), |(_, label, _)| label.to_string());
                 mismatch.message(&label)
             })
             .collect();
-        let env_label =
-            if usage.environment_selected { "All environments".to_owned() } else { "0 environments".into() };
-        let env_status: SharedString = if usage.error.is_some() {
-            "Unavailable".into()
-        } else if !usage.mismatches.is_empty() {
-            "Update required".into()
-        } else if usage.loading && summary.is_none() {
-            "Scanning…".into()
-        } else if usage.loading {
-            "Refreshing…".into()
-        } else {
-            "Ready".into()
+        let has_issue = !limits && (!failures.is_empty() || !mismatch_lines.is_empty());
+        let env_label: SharedString = match (&usage.selected, selected.as_slice()) {
+            (None, _) => "All environments".into(),
+            (Some(_), [(_, label)]) => label.clone(),
+            (Some(_), selected) => format!("{} environments", selected.len()).into(),
         };
-        let selected = usage.environment_selected;
+        // `UsageEnvironmentFilter`'s per-environment status.
+        let rows: Vec<(SharedString, SharedString, bool, SharedString, bool)> = environments
+            .iter()
+            .map(|(id, label, _)| {
+                let failed = usage.failures.iter().any(|(failed, _)| failed == id);
+                let answer = usage
+                    .answers
+                    .as_ref()
+                    .and_then(|(answers, _)| answers.iter().find(|answer| answer.environment_id == id.as_ref()));
+                let status = if failed {
+                    "Unavailable"
+                } else if answer.is_some_and(|answer| !answer.summary.compatible()) {
+                    "Update required"
+                } else if usage.loading && answer.is_none() {
+                    "Scanning…"
+                } else if usage.loading {
+                    "Refreshing…"
+                } else {
+                    "Ready"
+                };
+                (id.clone(), label.clone(), usage.is_selected(id), status.into(), failed)
+            })
+            .collect();
+        let all_ids: Vec<SharedString> = environments.iter().map(|(id, ..)| id.clone()).collect();
+        let selected_ids: Vec<SharedString> = selected.iter().map(|(id, _)| id.clone()).collect();
+        let all_selected = usage.selected.is_none();
         let env_filter = inline_menu_button("usage-environment", t)
             .text_color(t.foreground)
-            .child(env_label)
+            .child(div().min_w_0().truncate().child(env_label))
             .child(if has_issue {
                 Icon::new(Lucide::CircleAlert).with_size(px(14.)).text_color(t.warning_foreground)
             } else {
@@ -651,48 +712,50 @@ impl Workspace {
             })
             .dropdown_menu({
                 let view = view.clone();
-                let muted = t.muted_foreground;
-                let error = usage.error.clone();
-                move |menu, window, _| {
-                    let env = environment.clone();
-                    let status = env_status.clone();
-                    let error_line = error.clone();
-                    menu.item(PopupMenuItem::new("All environments").checked(selected).on_click(window.listener_for(
-                        &view,
-                        |this, _, _, cx| {
-                            this.usage.environment_selected = !this.usage.environment_selected;
-                            cx.notify();
-                        },
-                    )))
-                    .separator()
-                    .item(
-                        PopupMenuItem::element(move |_, _| {
+                let (muted, destructive) = (t.muted_foreground, t.error_foreground);
+                move |mut menu, window, _| {
+                    menu = menu
+                        .item(PopupMenuItem::new("All environments").checked(all_selected).on_click(
+                            window.listener_for(&view, move |this, _, _, cx| {
+                                this.select_usage_environments(if all_selected { Some(Vec::new()) } else { None }, cx);
+                            }),
+                        ))
+                        .separator();
+                    for (id, label, checked, status, failed) in rows.iter().cloned() {
+                        let (all_ids, selected_ids) = (all_ids.clone(), selected_ids.clone());
+                        let item = PopupMenuItem::element(move |_, _| {
                             h_flex()
                                 .min_w(px(200.))
                                 .gap(px(12.))
-                                .child(div().flex_1().min_w_0().truncate().child(env.clone()))
+                                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
                                 .when(!limits, |el| {
-                                    el.child(div().flex_none().text_xs().text_color(muted).child(status.clone()))
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(if failed { destructive } else { muted })
+                                            .child(status.clone()),
+                                    )
                                 })
                         })
-                        .checked(selected)
-                        .on_click(window.listener_for(&view, |this, _, _, cx| {
-                            this.usage.environment_selected = !this.usage.environment_selected;
-                            cx.notify();
-                        })),
-                    )
-                    // `UsageEnvironmentStatus`: why environments are missing from the totals.
-                    .when(!limits && (error_line.is_some() || !mismatch_lines.is_empty()), |menu| {
-                        let lines =
-                            error_line.iter().map(SharedString::to_string).chain(mismatch_lines.iter().cloned());
-                        lines.fold(menu.separator(), gpui_kit::component::menu::PopupMenu::label)
-                    })
-                    .separator()
-                    .item(
-                        PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
-                            window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
-                        ),
-                    )
+                        .checked(checked)
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                            let next = toggle_environment(&selected_ids, &id, &all_ids);
+                            this.select_usage_environments(next, cx);
+                        }));
+                        menu = menu.item(item);
+                    }
+                    if rows.is_empty() {
+                        menu = menu.label("No environments connected.");
+                    }
+                    // `UsageCoverageNotice`: why selected environments are missing from the totals.
+                    if !limits && (!failures.is_empty() || !mismatch_lines.is_empty()) {
+                        let lines = failures.iter().chain(&mismatch_lines).cloned();
+                        menu = lines.fold(menu.separator(), gpui_kit::component::menu::PopupMenu::label);
+                    }
+                    menu.separator().item(PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
+                        window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
+                    ))
                 }
             });
 
@@ -763,7 +826,7 @@ impl Workspace {
             cx,
             super::super::Workspace::select_usage_metric,
         );
-        let disabled = usage.refreshing || (!limits && !usage.environment_selected);
+        let disabled = usage.refreshing || (!limits && selected.is_empty());
         h_flex()
             .min_h(px(48.))
             .flex_none()
@@ -803,26 +866,29 @@ impl Workspace {
     fn render_usage_body(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
-        if !usage.environment_selected {
+        if self.limit_environments().is_empty() {
             let what = if limits { "limits" } else { "usage" };
-            return muted_line(format!("Select an environment to see {what}."), t).into_any_element();
+            let ask = if self.usage_environments().is_empty() { "Connect" } else { "Select" };
+            return muted_line(format!("{ask} an environment to see {what}."), t).into_any_element();
         }
         if limits {
             return self.render_limits(t, cx);
         }
         // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
-        if usage.summary.is_some() && !usage.loading && self.usage_scan_settings_changed() {
+        // So does a pick of environments the last read missed.
+        let unread = usage.summary.is_none() && usage.answers.is_some() && usage.error().is_none();
+        if !usage.loading && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
             let view = cx.entity();
             cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
         }
         let usage = &self.usage;
-        match (&usage.summary, &usage.error) {
+        match (&usage.summary, usage.error()) {
             (None, Some(error)) => v_flex()
                 .py(px(48.))
                 .items_center()
                 .text_sm()
                 .text_color(t.muted_foreground)
-                .child(error.clone())
+                .child(error.to_owned())
                 .into_any_element(),
             (None, None) => usage_skeleton(t).into_any_element(),
             (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, cx),
@@ -1534,6 +1600,15 @@ fn limit_inputs<'a>(
         .collect()
 }
 
+/// `UsageEnvironmentFilter`'s pick: the selection with `id` toggled, `None` once every environment is in it.
+fn toggle_environment(selected: &[SharedString], id: &SharedString, all: &[SharedString]) -> Option<Vec<SharedString>> {
+    let mut next: Vec<SharedString> = selected.iter().filter(|picked| *picked != id).cloned().collect();
+    if next.len() == selected.len() {
+        next.push(id.clone());
+    }
+    (next.len() != all.len()).then_some(next)
+}
+
 fn usage_error(error: &crate::rpc::RpcError) -> String {
     match error {
         crate::rpc::RpcError::Failure(value) => {
@@ -2090,5 +2165,42 @@ mod tests {
         ] {
             assert_eq!(read_preferences(&bad), ("limits", 30, Vec::new()), "{bad}");
         }
+    }
+
+    fn summary(cost: f64, host: &str) -> Summary {
+        serde_json::from_value(json!({
+            "contractVersion": 6, "readAt": "2026-11-01T00:00:00Z",
+            "buckets": [{
+                "day": "2026-11-01", "provider": "codex", "model": "m", "sourcePath": "/codex",
+                "totals": {"uncachedInputTokens": 1, "cachedInputTokens": 0, "cacheCreationTokens": 0, "outputTokens": 1, "reasoningTokens": 0},
+                "costUsd": cost, "cacheSavingsUsd": 0, "costSource": "modelPriced", "records": 1, "unpricedRecords": 0, "sessions": 1,
+            }],
+            "sources": [{"fingerprint": {"provider": "codex", "resolvedHomePath": "/codex", "hostId": host}, "status": "ok"}],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn environments_are_picked_one_at_a_time_and_totals_follow() {
+        let ids: Vec<SharedString> = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(toggle_environment(&ids, &ids[1], &ids), Some(vec!["a".into(), "c".into()]));
+        assert_eq!(toggle_environment(&ids[..2], &ids[2], &ids), None, "every one picked is all, new ones included");
+        assert_eq!(toggle_environment(&ids[..1], &ids[0], &ids), Some(Vec::new()));
+
+        let answers = vec![
+            logic::EnvironmentUsage { environment_id: "a".into(), summary: summary(1., "box-a") },
+            logic::EnvironmentUsage { environment_id: "b".into(), summary: summary(2., "box-b") },
+        ];
+        let mut usage = UsageState { answers: Some((answers, local_window(30))), ..UsageState::default() };
+        usage.recombine();
+        assert_eq!(usage.merged.cost_usd, 3.);
+        usage.selected = Some(vec!["b".into()]);
+        usage.recombine();
+        assert_eq!(usage.merged.cost_usd, 2., "only the picked environment counts");
+        usage.failures = vec![("a".into(), "down".into())];
+        assert_eq!(usage.error(), None, "an unpicked environment's failure is not shown");
+        usage.selected = Some(Vec::new());
+        usage.recombine();
+        assert!(usage.summary.is_none());
     }
 }

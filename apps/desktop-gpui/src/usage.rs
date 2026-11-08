@@ -307,6 +307,7 @@ pub struct Merged {
 /// `mergeUsage` for one environment, without `hidden` providers: each scanned source counts its
 /// buckets and distinct sessions once (bucket session counts double-count sessions spanning days).
 /// One machine's answer to `server.getUsageSummary`.
+#[derive(Clone)]
 pub struct EnvironmentUsage {
     pub environment_id: String,
     pub summary: Summary,
