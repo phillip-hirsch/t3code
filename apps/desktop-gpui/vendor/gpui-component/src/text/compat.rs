@@ -128,6 +128,11 @@ impl TextView {
         self.inner = self.inner.blockquote_style(style);
         self
     }
+    /// Sets whether links draw their underline; off, a link shows by its color alone.
+    pub fn link_underline(mut self, underline: bool) -> Self {
+        self.inner = self.inner.link_underline(underline);
+        self
+    }
     /// Sets whether a copied selection carries Markdown source or plain text.
     pub fn selection_format(mut self, value: SelectionFormat) -> Self {
         self.inner = self.inner.selection_format(value);

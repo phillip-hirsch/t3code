@@ -15,6 +15,8 @@ pub struct TextViewStyle {
     foreground: Hsla,
     muted_foreground: Hsla,
     link: Hsla,
+    /// Whether links draw their hairline underline.
+    link_underline: bool,
     selection: Hsla,
     code_background: Hsla,
     border: Hsla,
@@ -44,6 +46,7 @@ impl PartialEq for TextViewStyle {
             && self.foreground == other.foreground
             && self.muted_foreground == other.muted_foreground
             && self.link == other.link
+            && self.link_underline == other.link_underline
             && self.selection == other.selection
             && self.code_background == other.code_background
             && self.border == other.border
@@ -87,6 +90,7 @@ impl TextViewStyle {
             foreground: colors.foreground,
             muted_foreground: colors.muted_foreground,
             link: colors.primary,
+            link_underline: true,
             selection: colors.selection,
             code_background: colors.accent,
             border: colors.border,
@@ -123,6 +127,12 @@ impl TextViewStyle {
     /// Sets the link text color.
     pub fn with_link(mut self, color: Hsla) -> Self {
         self.link = color;
+        self
+    }
+
+    /// Sets whether links draw their underline; off, a link shows by its color alone.
+    pub fn with_link_underline(mut self, underline: bool) -> Self {
+        self.link_underline = underline;
         self
     }
 
@@ -273,6 +283,11 @@ impl TextViewStyle {
     /// The link text color.
     pub fn link(&self) -> Hsla {
         self.link
+    }
+
+    /// Whether links draw their underline.
+    pub fn link_underline(&self) -> bool {
+        self.link_underline
     }
 
     /// The background painted behind selected text.

@@ -1819,6 +1819,8 @@ fn markdown_view(
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
+        // `.chat-markdown a`: links show by color, with no underline.
+        .link_underline(false)
         .selectable(true)
         .stream_fade(streaming)
         // The user's typed newlines break lines (`lineBreaks`, remark-breaks).
