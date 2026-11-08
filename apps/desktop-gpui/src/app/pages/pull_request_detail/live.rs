@@ -432,8 +432,8 @@ impl Workspace {
 
     /// `usePullRequestChecksRefresh`: an open pull request's checks are read through
     /// `pullRequests.checks` every 45 seconds while any run, else every minute, while it is on
-    /// screen and the app is in front. A server without the read, or a host that answers none,
-    /// ends the poll.
+    /// screen, connected and the app is in front. A server without the read, or a host that
+    /// answers none, ends the poll.
     pub(super) fn follow_pr_checks(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(panel) = self.pr_panel_ref(key) else { return };
         if panel._checks_poll.is_some()
@@ -457,10 +457,12 @@ impl Workspace {
                         let panel = this.pr_panel_ref(&key)?;
                         let detail = panel.detail.as_ref()?;
                         let idle = detail.state == list_logic::State::Open && !panel.detail_loading;
-                        let client = this.pull_request_client_of(&key)?;
+                        // A disconnected environment skips its turn; the poll resumes on reconnect.
+                        let client = this.pull_request_client_of(&key);
                         Some(
-                            (shown && idle && cx.active_window().is_some())
-                                .then(|| (client, panel.reference.to_json())),
+                            client
+                                .filter(|_| shown && idle && cx.active_window().is_some())
+                                .map(|client| (client, panel.reference.to_json())),
                         )
                     });
                     let Ok(Some(read)) = read else { break };
