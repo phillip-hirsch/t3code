@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
-use crate::model::{Run, ThreadProjection, ThreadShell, ThreadState};
+use crate::model::{ModelSelection, Run, ThreadProjection, ThreadShell, ThreadState};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row};
 
@@ -50,6 +50,9 @@ pub(super) struct SideChats {
     deleting: bool,
     /// Unsent composer text of side chats not on screen, by thread id.
     drafts: HashMap<String, String>,
+    /// The parent composer's model pick for a side chat that started without a question; its
+    /// first message runs on it (`setModelSelection` on the side chat's draft).
+    models: HashMap<String, ModelSelection>,
 }
 
 impl SideChats {
@@ -226,14 +229,18 @@ impl Workspace {
             "title": "Side chat",
         });
         let text = prompt.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
+        // `readSettings().modelSelection`: the parent composer's model and reasoning go along.
+        let model = self.model_override.clone();
+        let asked = text.is_some();
         cx.spawn_in(window, async move |this, cx| {
             let forked = client.request("orchestration.dispatchCommand", fork).await;
             let sent = match (&forked, text) {
                 (Err(_), _) | (_, None) => None,
                 // Sent before the tab shows: closing a tab whose side chat never ran deletes it.
-                (Ok(_), Some(text)) => Some(
-                    client.request("orchestration.dispatchCommand", turn_command(&target, &text, false, "steer")).await,
-                ),
+                (Ok(_), Some(text)) => {
+                    let command = turn_command(&target, &text, false, "steer", model.as_ref());
+                    Some(client.request("orchestration.dispatchCommand", command).await)
+                }
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.side_chat.starting = false;
@@ -257,6 +264,9 @@ impl Workspace {
                     // thread's panel, so a side chat that never ran goes.
                     None if this.target.as_ref() != Some(&origin) => delete_unused(cx),
                     None => {
+                        if let Some(model) = model.filter(|_| !asked) {
+                            this.side_chat.models.insert(target.clone(), model);
+                        }
                         this.open_surface(Surface::SideChat(target), window, cx);
                         on_started(this, window, cx);
                     }
@@ -312,6 +322,7 @@ impl Workspace {
 
     /// `releaseSurfaceResources` for a side chat: the server keeps one that ran or got a message.
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.side_chat.models.remove(thread_id);
         if self.shell_thread(thread_id).is_some() {
             self.dispatch(delete_command(thread_id, true), cx);
         }
@@ -426,7 +437,8 @@ impl Workspace {
         } else {
             self.client_settings.values.get("followUpBehavior").as_str().unwrap_or("steer")
         };
-        let command = turn_command(&view.thread_id, &text, running, follow_up);
+        let model = self.side_chat.models.get(&view.thread_id);
+        let command = turn_command(&view.thread_id, &text, running, follow_up, model);
         let (Some(client), composer) = (self.client(), view.composer.clone()) else { return };
         let thread_id = view.thread_id.clone();
         if let Some(view) = self.side_chat.view.as_mut() {
@@ -436,6 +448,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if result.is_ok() {
+                    this.side_chat.models.remove(&thread_id);
+                }
                 let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == thread_id) else { return };
                 view.sending = false;
                 if let Err(error) = result {
@@ -759,7 +774,7 @@ fn quiet(text: &'static str, t: &Tokens) -> AnyElement {
 }
 
 /// `startThreadTurn` as a side chat sends it: `message.dispatch` with the follow-up delivery.
-fn turn_command(thread_id: &str, text: &str, running: bool, follow_up: &str) -> Value {
+fn turn_command(thread_id: &str, text: &str, running: bool, follow_up: &str, model: Option<&ModelSelection>) -> Value {
     let queue = running && follow_up == "queue";
     let mut command = json!({
         "type": "message.dispatch",
@@ -774,6 +789,9 @@ fn turn_command(thread_id: &str, text: &str, running: bool, follow_up: &str) -> 
     });
     if !queue {
         command["deliveryIntent"] = (if running { "steer" } else { "auto" }).into();
+    }
+    if let Some(model) = model {
+        command["modelSelection"] = model.to_json();
     }
     command
 }
@@ -872,14 +890,21 @@ mod tests {
 
     #[test]
     fn turns_steer_or_queue_behind_a_running_reply() {
-        let idle = turn_command("t", "hi", false, "queue");
+        let idle = turn_command("t", "hi", false, "queue", None);
         assert_eq!(
             (idle["dispatchMode"]["type"].as_str(), idle["deliveryIntent"].as_str()),
             (Some("start_immediately"), Some("auto"))
         );
-        let queued = turn_command("t", "hi", true, "queue");
+        let queued = turn_command("t", "hi", true, "queue", None);
         assert_eq!(queued["dispatchMode"]["type"], "queue_after_active");
         assert!(queued.get("deliveryIntent").is_none());
-        assert_eq!(turn_command("t", "hi", true, "steer")["deliveryIntent"], "steer");
+        assert_eq!(turn_command("t", "hi", true, "steer", None)["deliveryIntent"], "steer");
+        assert!(idle.get("modelSelection").is_none(), "without a pick the side chat keeps its model");
+        let model = ModelSelection {
+            instance_id: "codex".into(),
+            model: "gpt".into(),
+            options: Some(vec![json!({"id": "reasoningEffort", "value": "high"})]),
+        };
+        assert_eq!(turn_command("t", "hi", false, "steer", Some(&model))["modelSelection"], model.to_json());
     }
 }
