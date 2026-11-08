@@ -684,7 +684,7 @@ impl Workspace {
     }
 
     /// The condensed header row: author and time, branches, and the diff size (`condensedRowRef`).
-    pub(super) fn render_pr_condensed_row(&self, detail: &Detail, t: &Tokens) -> AnyElement {
+    pub(super) fn render_pr_condensed_row(&self, detail: &Detail, stat: Option<AnyElement>, t: &Tokens) -> AnyElement {
         let now = now_ms();
         let updated = parse_ms(&detail.updated_at).map(|at| relative_time(now - at)).unwrap_or_default();
         h_flex()
@@ -720,7 +720,7 @@ impl Workspace {
                         detail.changed_files,
                         if detail.changed_files == 1 { "file" } else { "files" }
                     ))
-                    .children(diff_stat(detail.additions, detail.deletions, 11., t)),
+                    .children(stat),
             )
             .into_any_element()
     }

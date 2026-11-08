@@ -37,6 +37,7 @@ use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
 mod avatars;
+pub(super) mod breakdown;
 mod code;
 mod completions;
 mod guide;
@@ -1046,6 +1047,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let breakdown = self.pr_breakdown_stat("pr-breakdown", detail, 12., t, cx);
+        let condensed_breakdown = self.pr_breakdown_stat("pr-breakdown-condensed", detail, 11., t, cx);
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let term = logic::terminology(&detail.provider).0;
         let (checks_state, checks_stale) = panel.checks_state(detail);
@@ -1074,7 +1077,7 @@ impl Workspace {
         let open_label = list_logic::open_on_host_label(&detail.provider);
         let number = number_link(&detail.url, detail.number, state_color, open_label);
         let condensed = panel.condensed;
-        let condensed_row = self.render_pr_condensed_row(detail, t);
+        let condensed_row = self.render_pr_condensed_row(detail, condensed_breakdown, t);
         let back = thread.filter(|thread| thread.back).map(|_| back_button(t, cx));
         let crumbs = h_flex()
             .flex_1()
@@ -1195,7 +1198,7 @@ impl Workspace {
                                 if detail.changed_files == 1 { "file" } else { "files" }
                             )),
                     )
-                    .children(diff_stat(detail.additions, detail.deletions, 12., t)),
+                    .children(breakdown),
             );
 
         let title = match self.render_pr_title_input(t, cx) {
@@ -2576,6 +2579,29 @@ fn actor_label(actor: Option<&Actor>, t: &Tokens) -> impl IntoElement {
         .child(avatar(actor, 16., t))
         .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(login))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+}
+
+impl Workspace {
+    /// The shown pull request's diff stat, its split read before the hover (`eager`).
+    fn pr_breakdown_stat(
+        &mut self,
+        id: &'static str,
+        detail: &Detail,
+        size: f32,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let stat = diff_stat(detail.additions, detail.deletions, size, t)?;
+        let reference = self.pull_requests.panel.as_ref()?.reference.to_json();
+        let subject = breakdown::Subject {
+            project_id: detail.project_id.clone(),
+            reference,
+            additions: detail.additions,
+            deletions: detail.deletions,
+        };
+        self.read_pr_breakdown(&subject, cx);
+        Some(breakdown::breakdown_stat(id, stat, subject, &cx.entity()))
+    }
 }
 
 fn diff_stat(additions: u64, deletions: u64, size: f32, t: &Tokens) -> Option<impl IntoElement> {

@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::sidebar::now_ms;
+use super::pull_request_detail::breakdown;
 use crate::pull_request_detail::Reference;
 use crate::pull_requests::AssignableProject;
 use crate::pull_requests::{
@@ -118,6 +119,8 @@ pub(in crate::app) struct PullRequestsState {
     refreshing: bool,
     error: Option<SharedString>,
     stats: Stats,
+    /// Each pull request's diff split, read on its stat's first hover.
+    pub(super) breakdowns: std::collections::HashMap<String, super::pull_request_detail::breakdown::Breakdown>,
     rows: Rc<[Row]>,
     list_state: ListState,
     _debounce: Option<Task<()>>,
@@ -195,6 +198,7 @@ impl PullRequestsState {
             refreshing: false,
             error: None,
             stats: Stats::new(),
+            breakdowns: std::collections::HashMap::new(),
             rows: Rc::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(480.)),
             _debounce: None,
@@ -1706,13 +1710,20 @@ fn pull_request_row(
     }
     let stat = stat.filter(|(a, d)| a + d > 0).map(|(additions, deletions)| {
         let addition: Hsla = if t.dark { rgb(0x00d492).into() } else { rgb(0x007a55).into() };
-        h_flex()
+        let stat = h_flex()
             .flex_none()
             .gap(px(4.))
             .font_family(t.fonts.mono)
             .text_size(px(11.))
             .child(div().text_color(addition).child(format!("+{additions}")))
-            .child(div().text_color(t.error).child(format!("-{deletions}")))
+            .child(div().text_color(t.error).child(format!("-{deletions}")));
+        let subject = breakdown::Subject {
+            project_id: entry.project_id.clone(),
+            reference: entry.reference(),
+            additions,
+            deletions,
+        };
+        breakdown::breakdown_stat(id("breakdown"), stat, subject, view)
     });
     let title_line = h_flex()
         .min_w_0()

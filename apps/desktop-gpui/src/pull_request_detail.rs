@@ -40,6 +40,40 @@ pub struct Label {
     pub color: Option<String>,
 }
 
+/// `PullRequestChangeBreakdown`: a change's lines split by what its files are.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ChangeBreakdown {
+    pub code: LineCount,
+    pub tests: LineCount,
+    pub mocks: LineCount,
+    pub generated: LineCount,
+    /// Servers from before the docs split send none; their docs lines sit in `code`.
+    #[serde(default)]
+    pub docs: LineCount,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LineCount {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+impl ChangeBreakdown {
+    /// `ChangeBreakdownGrid`'s rows: each kind that has lines, in the web's order.
+    pub fn rows(&self) -> Vec<(&'static str, LineCount)> {
+        [
+            ("Code", self.code),
+            ("Tests", self.tests),
+            ("Mocks", self.mocks),
+            ("Generated", self.generated),
+            ("Docs", self.docs),
+        ]
+        .into_iter()
+        .filter(|(_, count)| count.additions + count.deletions > 0)
+        .collect()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Check {
     pub name: String,
@@ -2397,6 +2431,21 @@ mod tests {
         assert!(asked_then_fixed.starts_with("Why?\n\nPR #7") && asked_then_fixed.ends_with("Fix this\n\na.rs L1"));
         assert_eq!(append_handoff(&fix, &ask), fix, "a fix keeps out answer-only instructions");
         assert_eq!(append_handoff(&ask, &ask), ask);
+    }
+
+    #[test]
+    fn a_change_breakdown_lists_the_kinds_with_lines() {
+        let split: Option<ChangeBreakdown> = serde_json::from_value(json!({
+            "code": {"additions": 10, "deletions": 2},
+            "tests": {"additions": 0, "deletions": 0},
+            "mocks": {"additions": 0, "deletions": 1},
+            "generated": {"additions": 0, "deletions": 0},
+        }))
+        .unwrap();
+        let rows: Vec<(&str, u64, u64)> =
+            split.unwrap().rows().into_iter().map(|(label, c)| (label, c.additions, c.deletions)).collect();
+        assert_eq!(rows, [("Code", 10, 2), ("Mocks", 0, 1)], "an older server sends no docs");
+        assert_eq!(serde_json::from_value::<Option<ChangeBreakdown>>(Value::Null).unwrap(), None);
     }
 
     #[test]
