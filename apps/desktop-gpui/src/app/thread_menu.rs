@@ -6,10 +6,12 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::component::menu::PopupMenu;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::{
-    AnyElement, Bounds, Context, DismissEvent, Entity, Focusable as _, IntoElement, ParentElement as _, Pixels,
-    Subscription, Task, Window, anchored, deferred, point, px,
+    AnyElement, App, Bounds, Context, DismissEvent, Entity, FocusHandle, Focusable as _, IntoElement,
+    ParentElement as _, Pixels, Point, Subscription, Task, Window, anchored, deferred, point, px,
 };
 
 use super::sidebar::{MenuOrigin, Renaming};
@@ -18,13 +20,27 @@ use super::{Target, Workspace};
 /// Electron delays the menu through the double-click interval, so a double click renames instead.
 const TITLE_MENU_DELAY: Duration = Duration::from_millis(500);
 
-#[derive(Default)]
 pub(super) struct TitleState {
-    menu: Option<(Entity<PopupMenu>, Subscription)>,
+    /// The open menu, and the pointer it opened at (a right-click); else it hangs under the title.
+    menu: Option<(Entity<PopupMenu>, Option<Point<Pixels>>, Subscription)>,
     pending: Option<Task<()>>,
     pub rename: Option<Renaming>,
     /// The title's bounds from the last paint; the menu opens under its left edge.
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The breadcrumb's buttons (project, parent thread, title), tab stops like the web's.
+    pub crumbs: [FocusHandle; 3],
+}
+
+impl TitleState {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            menu: None,
+            pending: None,
+            rename: None,
+            bounds: Rc::default(),
+            crumbs: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+        }
+    }
 }
 
 /// `hostedThreadLink`: every character outside `[A-Za-z0-9_-]` percent-encoded.
@@ -61,40 +77,92 @@ impl Workspace {
             return;
         }
         if now {
-            self.open_thread_menu(window, cx);
+            self.open_thread_menu(None, window, cx);
             return;
         }
         self.title.pending = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(TITLE_MENU_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.title.pending = None;
-                this.open_thread_menu(window, cx);
+                this.open_thread_menu(None, window, cx);
             });
         }));
     }
 
-    fn open_thread_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `handleHeaderContextMenu`: a right-click on the breadcrumb opens the thread's menu at the
+    /// pointer, or "Project settings" for a draft in a project; nothing while renaming.
+    pub(super) fn context_click_header(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title.rename.is_some() {
+            return;
+        }
+        match &self.target {
+            Some(Target::Thread { .. }) => {
+                self.title.pending = None;
+                self.open_thread_menu(Some(position), window, cx);
+            }
+            Some(Target::Draft { .. }) if self.target_project().is_some() => {
+                self.title.pending = None;
+                let view = cx.weak_entity();
+                let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+                    let view = view.clone();
+                    menu.min_w(px(200.)).item(
+                        PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
+                            move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| this.open_settings("projects", cx));
+                            },
+                        ),
+                    )
+                });
+                self.show_title_menu(menu, Some(position), window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn open_thread_menu(&mut self, at: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(model) = self.title_thread_id().and_then(|id| self.thread_menu(&id, MenuOrigin::Title, cx)) else {
             return;
         };
         let view = cx.weak_entity();
         let menu =
             PopupMenu::build(window, cx, move |menu, window, cx| model.build(&view, menu.min_w(px(220.)), window, cx));
+        self.show_title_menu(menu, at, window, cx);
+    }
+
+    /// Focuses `menu` until it dismisses, then hands focus back (to the title, after a keyboard open).
+    fn show_title_menu(
+        &mut self,
+        menu: Entity<PopupMenu>,
+        at: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = window.focused(cx);
         menu.focus_handle(cx).focus(window, cx);
-        let subscription = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+        let subscription = cx.subscribe_in(&menu, window, move |this, menu, _: &DismissEvent, window, cx| {
             this.title.menu = None;
+            // An item that moved focus (Rename's input) keeps it.
+            if let Some(previous) = previous.as_ref().filter(|_| menu.focus_handle(cx).contains_focused(window, cx)) {
+                previous.focus(window, cx);
+            }
             cx.notify();
         });
-        self.title.menu = Some((menu, subscription));
+        self.title.menu = Some((menu, at, subscription));
         cx.notify();
     }
 
-    /// The open title menu, under the title's left edge.
+    /// The open title menu: at the pointer for a right-click, else under the title's left edge.
     pub(super) fn render_title_menu(&self) -> Option<AnyElement> {
-        let (menu, _) = self.title.menu.as_ref()?;
+        let (menu, at, _) = self.title.menu.as_ref()?;
         let bounds = self.title.bounds.get();
-        let corner = point(bounds.left(), bounds.bottom() + px(4.));
-        Some(deferred(anchored().position(corner).child(menu.clone())).with_priority(2).into_any_element())
+        let corner = at.unwrap_or_else(|| point(bounds.left(), bounds.bottom() + px(4.)));
+        let menu = anchored().position(corner).snap_to_window_with_margin(px(8.)).child(menu.clone());
+        Some(deferred(menu).with_priority(2).into_any_element())
     }
 }
 

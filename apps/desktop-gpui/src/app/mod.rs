@@ -430,7 +430,7 @@ impl Workspace {
             automations: Default::default(),
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
-            title: thread_menu::TitleState::default(),
+            title: thread_menu::TitleState::new(cx),
             host: Default::default(),
             _connection_task: Self::connect(window, cx),
             landed: false,
