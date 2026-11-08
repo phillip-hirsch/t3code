@@ -76,6 +76,13 @@ edges (`collisionPadding`). The patch:
 - Tests: the focus test above and `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`
   check the placement.
 
+**Text can drop macOS font smoothing.** The web's Font smoothing setting (on by default) sets
+`-webkit-font-smoothing: antialiased`, thin grayscale text. 0.3.11 always applies macOS's
+color-dependent stroke dilation when the user allows smoothing. The patch, in
+`src/text_system.rs`: `TextSystem::set_thin_font_smoothing`, which makes
+`glyph_dilation_for_color` return 0. Dilation is part of the glyph cache key, so the next frame
+paints with the change. No test: only the macOS text system dilates.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
