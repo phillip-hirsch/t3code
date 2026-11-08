@@ -43,14 +43,38 @@ pub(super) struct MessageMatch {
     pub(super) snippet: String,
     pub(super) message_id: Option<String>,
     pub(super) at: Option<String>,
+    /// 1 for whole words, 0.8 for a word start, less inside words; older servers omit it.
+    quality: Option<f32>,
+    /// How many of the thread's newest messages match; older servers omit it.
+    hits: Option<u32>,
 }
 
-/// Server message search for a query, debounced (`useThreadSearch`).
+impl MessageMatch {
+    fn from_json(value: &Value) -> Option<Self> {
+        #[expect(clippy::cast_possible_truncation, reason = "a match quality near 1")]
+        let quality = value["quality"].as_f64().map(|q| q as f32);
+        Some(Self {
+            thread_id: value["threadId"].as_str()?.to_owned(),
+            user: value["source"] == "user",
+            snippet: value["snippet"].as_str()?.to_owned(),
+            message_id: value["messageId"].as_str().map(str::to_owned),
+            at: value["messageCreatedAt"].as_str().map(str::to_owned),
+            quality,
+            hits: value["hits"].as_u64().and_then(|hits| u32::try_from(hits).ok()),
+        })
+    }
+}
+
+/// Server message search for a query over every connected environment, debounced
+/// (`useThreadSearch`). Each environment's matches join as it answers.
 #[derive(Default)]
 pub(super) struct MessageSearch {
     pub(super) query: String,
     pub(super) matches: Vec<MessageMatch>,
+    /// Some environment has not answered yet.
     pub(super) pending: bool,
+    /// Counts answers, so views can cache what they derive from `matches`.
+    generation: u64,
     _task: Option<Task<()>>,
 }
 
@@ -186,7 +210,75 @@ pub(super) struct Palette {
     dark: bool,
     /// The root view's Threads group, ranked once per query and shell change.
     threads: Option<ThreadRanking>,
+    /// "In messages", in the order last shown.
+    message_order: MessageOrder,
     _subscription: Subscription,
+}
+
+/// The message rows' ranking for a query, answers and shell, and the order shown so far.
+#[derive(Default)]
+struct MessageOrder {
+    key: (String, u64, u64),
+    order: Option<ShownOrder>,
+}
+
+/// `ShownOrder`: message result keys in the order the palette last showed them for `query`.
+#[derive(Debug, PartialEq)]
+struct ShownOrder {
+    query: String,
+    keys: Vec<String>,
+    /// How many of `keys` are on screen; only those hold their places.
+    shown: usize,
+}
+
+/// Rows past the limit a slower environment's best matches may take.
+const LATE_ROOM: usize = 3;
+
+/// `nextShownOrder`: shown rows keep their places when a slower environment answers, so the
+/// pointer and the arrows stay on the same row; its best matches may take a few rows more.
+fn next_shown_order(previous: Option<ShownOrder>, query: &str, ranked: Vec<String>, limit: usize) -> ShownOrder {
+    let Some(previous) = previous.filter(|p| p.query == query) else {
+        let shown = limit.min(ranked.len());
+        return ShownOrder { query: query.to_owned(), keys: ranked, shown };
+    };
+    let kept: Vec<String> =
+        previous.keys[..previous.shown].iter().filter(|key| ranked.contains(key)).cloned().collect();
+    let rest: Vec<String> = ranked.into_iter().filter(|key| !kept.contains(key)).collect();
+    let arrived = rest.iter().filter(|key| !previous.keys.contains(key)).count();
+    let shown = (kept.len() + rest.len()).min(limit + LATE_ROOM).min(limit.max(kept.len() + arrived.min(LATE_ROOM)));
+    ShownOrder { query: previous.query, keys: [kept, rest].concat(), shown }
+}
+
+/// `MESSAGE_PREFIX`: a match quality at or above it is a word match.
+const MESSAGE_PREFIX: f32 = 0.8;
+
+/// `rankMessageMatches`: word matches first; among them a pick for the query, then the closer
+/// match, then many hits on a used thread, then the newer message.
+fn rank_messages<'a>(
+    entries: Vec<(&'a MessageMatch, search::ThreadUse)>,
+    tokens: &[Vec<char>],
+    now: i64,
+) -> Vec<&'a MessageMatch> {
+    #[expect(clippy::cast_precision_loss, reason = "a hit count")]
+    let weight = |hits: u32| 1. + (1. + hits as f32).log2();
+    let mut ranked: Vec<(&MessageMatch, f32, f64, f32)> = entries
+        .into_iter()
+        .map(|(found, used)| {
+            // Older servers send no quality; their matches count as words.
+            let quality = found.quality.unwrap_or(1.);
+            let picked_at = used.picked_at(tokens, now).unwrap_or(0.);
+            (found, quality, picked_at, weight(found.hits.unwrap_or(1)) * used.boost(now))
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        (b.1 >= MESSAGE_PREFIX)
+            .cmp(&(a.1 >= MESSAGE_PREFIX))
+            .then(b.2.total_cmp(&a.2))
+            .then(b.1.total_cmp(&a.1))
+            .then(b.3.total_cmp(&a.3))
+            .then_with(|| b.0.at.cmp(&a.0.at))
+    });
+    ranked.into_iter().map(|(found, ..)| found).collect()
 }
 
 /// Ranking every thread is the palette's one cost that grows with the data, so it runs
@@ -289,6 +381,7 @@ impl Workspace {
             placeholder: "",
             dark: crate::theme::tokens(cx).dark,
             threads: None,
+            message_order: MessageOrder::default(),
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -455,34 +548,34 @@ impl Workspace {
             return;
         }
         search._task = Some(cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
             cx.background_executor().timer(MESSAGE_DEBOUNCE).await;
-            let requests =
-                clients.iter().map(|client| client.request("orchestration.searchThreads", json!({"query": query})));
-            // An environment that fails to answer leaves the others' matches showing.
-            let answers = futures::future::join_all(requests).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(search) = slot(this).filter(|s| s.query == query) else { return };
-                search.pending = false;
-                search.matches = answers
-                    .into_iter()
-                    .filter_map(|answer| {
-                        answer.inspect_err(|error| log::warn!("orchestration.searchThreads: {error}")).ok()
+            let mut answers: futures::stream::FuturesUnordered<_> = clients
+                .iter()
+                .map(|client| client.request("orchestration.searchThreads", json!({"query": query})))
+                .collect();
+            // Each environment's matches show as it answers; one that fails leaves the others'.
+            while let Some(answer) = answers.next().await {
+                let settled = answers.is_empty();
+                let matches: Vec<MessageMatch> = answer
+                    .inspect_err(|error| log::warn!("orchestration.searchThreads: {error}"))
+                    .ok()
+                    .and_then(|value| {
+                        value["matches"].as_array().map(|m| m.iter().filter_map(MessageMatch::from_json).collect())
                     })
-                    .filter_map(|value| value["matches"].as_array().cloned())
-                    .flatten()
-                    .filter_map(|m| {
-                        Some(MessageMatch {
-                            thread_id: m["threadId"].as_str()?.to_owned(),
-                            user: m["source"] == "user",
-                            snippet: m["snippet"].as_str()?.to_owned(),
-                            message_id: m["messageId"].as_str().map(str::to_owned),
-                            at: m["messageCreatedAt"].as_str().map(str::to_owned),
-                        })
-                    })
-                    .collect();
-                this.notify_sidebar(cx);
-                cx.notify();
-            });
+                    .unwrap_or_default();
+                let updated = this.update(cx, |this, cx| {
+                    let Some(search) = slot(this).filter(|s| s.query == query) else { return };
+                    search.pending = !settled;
+                    search.matches.extend(matches);
+                    search.generation += 1;
+                    this.notify_sidebar(cx);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
         }));
     }
 
@@ -918,18 +1011,11 @@ impl Workspace {
             .collect();
         groups.sort_by_key(|(best, order, _)| (std::cmp::Reverse(*best), *order));
         let mut groups: Vec<Group> = groups.into_iter().map(|(_, _, g)| g).collect();
-        let listed: Vec<String> = groups
+        let shown = palette.message_order.order.as_ref().filter(|_| messages);
+        let shown = shown.map_or(&[][..], |order| &order.keys[..order.shown]);
+        let message_rows: Vec<Row> = shown
             .iter()
-            .flat_map(|g| g.rows.iter())
-            .filter_map(|r| match &r.run {
-                Run::Thread(id) => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        let matches = if messages { palette.messages.matches.as_slice() } else { &[] };
-        let message_rows: Vec<Row> = matches
-            .iter()
-            .filter(|m| !listed.contains(&m.thread_id))
+            .filter_map(|thread_id| palette.messages.matches.iter().find(|m| &m.thread_id == thread_id))
             .filter_map(|m| {
                 let thread = self.palette_threads().find(|t| t.id == m.thread_id)?;
                 let mut row = self.thread_row(thread, now);
@@ -944,12 +1030,61 @@ impl Workspace {
                 row.time = m.at.as_deref().and_then(crate::timestamp::parse_ms).map(|at| ago(now - at));
                 Some(row)
             })
-            .take(MESSAGE_LIMIT)
             .collect();
         if !message_rows.is_empty() {
             groups.push(Group { label: "In messages", rows: message_rows });
         }
         groups
+    }
+
+    /// What the palette derives from its query and the shell, before it builds rows.
+    fn prepare_palette(&mut self, query: &str) {
+        self.rank_palette_threads(query);
+        self.order_palette_messages();
+    }
+
+    /// Ranks the message hits of threads no title match lists (`withoutTitleMatches`), keeping
+    /// the rows already shown in their places.
+    fn order_palette_messages(&mut self) {
+        let Some(palette) = &self.palette else { return };
+        let search = &palette.messages;
+        let key = (search.query.clone(), search.generation, self.shell.revision);
+        if palette.message_order.key == key {
+            return;
+        }
+        let tokens = search::fold_query(&search.query);
+        let now = super::sidebar::now_ms();
+        let entries = search
+            .matches
+            .iter()
+            .filter_map(|found| {
+                let thread = self.palette_threads().find(|t| t.id == found.thread_id)?;
+                let titled = self.match_thread_fields(thread, &tokens, false).is_some();
+                (!titled).then(|| (found, self.thread_use(thread)))
+            })
+            .collect();
+        let ranked = rank_messages(entries, &tokens, now).into_iter().map(|m| m.thread_id.clone()).collect();
+        let Some(palette) = &mut self.palette else { return };
+        let order = next_shown_order(palette.message_order.order.take(), &key.0, ranked, MESSAGE_LIMIT);
+        palette.message_order = MessageOrder { key, order: Some(order) };
+    }
+
+    /// `scoreThreadSearch` over the thread's title, pull requests, branch and project.
+    fn match_thread_fields(
+        &self,
+        thread: &crate::model::ThreadShell,
+        tokens: &[Vec<char>],
+        typos: bool,
+    ) -> Option<search::Match> {
+        let pull_requests = crate::thread_pull_requests::search_entries(thread);
+        let subject = search::ThreadSubject {
+            id: &thread.id,
+            title: &thread.title,
+            branch: thread.branch.as_deref(),
+            project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
+            pull_requests: &pull_requests,
+        };
+        search::match_thread(tokens, &subject, typos)
     }
 
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
@@ -993,15 +1128,7 @@ impl Workspace {
         let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
-                let pull_requests = crate::thread_pull_requests::search_entries(thread);
-                let subject = search::ThreadSubject {
-                    id: &thread.id,
-                    title: &thread.title,
-                    branch: thread.branch.as_deref(),
-                    project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
-                    pull_requests: &pull_requests,
-                };
-                let found = search::match_thread(tokens, &subject, typos)?;
+                let found = self.match_thread_fields(thread, tokens, typos)?;
                 let rank = if current == Some(thread.id.as_str()) {
                     -1.
                 } else {
@@ -1218,7 +1345,7 @@ impl Workspace {
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).value().to_string()) else { return };
-        self.rank_palette_threads(&query);
+        self.prepare_palette(&query);
         let Some(palette) = &self.palette else { return };
         let view = palette.view;
         let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
@@ -1297,7 +1424,7 @@ impl Workspace {
 
     pub(super) fn render_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let query = self.palette.as_ref()?.input.read(cx).value().to_string();
-        self.rank_palette_threads(&query);
+        self.prepare_palette(&query);
         let palette = self.palette.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let view = palette.view;
@@ -1774,6 +1901,66 @@ mod tests {
             base.extend(fields);
         }
         serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    fn shown_message_rows_hold_their_places_and_leave_room_for_a_slower_environment() {
+        let keys = |prefix: &str, n: usize| (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>();
+        let fast = keys("a", 12);
+        let first = next_shown_order(None, "rust", fast.clone(), 10);
+        assert_eq!(first.keys[..first.shown], fast[..10]);
+        let slow = keys("b", 4);
+        let second = next_shown_order(Some(first), "rust", [slow.clone(), fast.clone()].concat(), 10);
+        assert_eq!(second.keys[..second.shown], [&fast[..10], &slow[..3]].concat(), "its best few come next");
+        let again = next_shown_order(
+            Some(ShownOrder { query: second.query.clone(), keys: second.keys.clone(), shown: second.shown }),
+            "rust",
+            [slow.clone(), fast.clone()].concat(),
+            10,
+        );
+        assert_eq!(again, second, "nothing new moves nothing");
+        let third = next_shown_order(Some(second), "rust", [vec!["c0".to_owned()], slow, fast].concat(), 10);
+        assert_eq!(third.shown, 13, "a third environment gets no more room past the limit");
+        assert_eq!(next_shown_order(Some(third), "rusty", vec!["b0".into()], 10).keys, ["b0"]);
+    }
+
+    #[test]
+    #[expect(clippy::cast_precision_loss, reason = "test epoch ms")]
+    fn message_hits_rank_by_word_match_then_pick_then_quality_hits_and_use() {
+        const DAY: i64 = 86_400_000;
+        let now = 100 * DAY;
+        let hit = |thread_id: &str, quality: f32, hits: u32| MessageMatch {
+            thread_id: thread_id.into(),
+            user: true,
+            snippet: String::new(),
+            message_id: None,
+            at: None,
+            quality: Some(quality),
+            hits: Some(hits),
+        };
+        let used = |active: i64| search::ThreadUse { activity_at: Some(now - active), opens: None };
+        let picked = search::ThreadUse {
+            activity_at: Some(now - 30 * DAY),
+            opens: Some(crate::model::ThreadOpens {
+                opened_at: (now - DAY) as f64,
+                score: 1.,
+                picks: vec![crate::model::ThreadPick { query: "needle".into(), at: (now - DAY) as f64 }],
+            }),
+        };
+        let hits = [hit("a-word", 1., 1), hit("b-prefix", 0.8, 1), hit("b-recent", 1., 1), hit("b-picked", 0.8, 1)];
+        let entries =
+            vec![(&hits[0], used(30 * DAY)), (&hits[1], used(30 * DAY)), (&hits[2], used(0)), (&hits[3], picked)];
+        let ranked = |entries| -> Vec<String> {
+            rank_messages(entries, &search::fold_query("needle"), now)
+                .into_iter()
+                .map(|m| m.thread_id.clone())
+                .collect()
+        };
+        assert_eq!(ranked(entries), ["b-picked", "b-recent", "a-word", "b-prefix"]);
+        let (mention, about) = (hit("mention", 1., 1), hit("about", 1., 21));
+        assert_eq!(ranked(vec![(&mention, used(3 * DAY)), (&about, used(48 * DAY))]), ["about", "mention"]);
+        let inside = hit("inside", 0.3, 40);
+        assert_eq!(ranked(vec![(&inside, used(0)), (&about, used(48 * DAY))]), ["about", "inside"]);
     }
 
     #[test]
