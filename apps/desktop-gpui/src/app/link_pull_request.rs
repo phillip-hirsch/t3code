@@ -286,25 +286,25 @@ mod tests {
         LinkProject::of(&identity).unwrap()
     }
 
-    fn link(host: &str, repository: &str, number: u64, url: &str) -> Option<Result<ResolvedLink, String>> {
-        Some(Ok(ResolvedLink { host: host.into(), repository: repository.into(), number, url: url.into() }))
+    fn link(host: &str, repository: &str, number: u64, url: &str) -> ResolvedLink {
+        ResolvedLink { host: host.into(), repository: repository.into(), number, url: url.into() }
     }
 
     #[test]
     fn links_a_url_a_checkout_command_or_a_number_for_the_project() {
         let github = project("github.com/acme/app");
         let url = "https://github.com/acme/app/pull/7";
-        assert_eq!(resolve(&format!("  {url}  "), None), link("github.com", "acme/app", 7, url));
-        assert_eq!(resolve(&format!("gh pr checkout {url}"), None), link("github.com", "acme/app", 7, url));
+        assert_eq!(resolve(&format!("  {url}  "), None), Some(Ok(link("github.com", "acme/app", 7, url))));
+        assert_eq!(resolve(&format!("gh pr checkout {url}"), None), Some(Ok(link("github.com", "acme/app", 7, url))));
         assert_eq!(
             resolve("#42", Some(&github)),
-            link("github.com", "acme/app", 42, "https://github.com/acme/app/pull/42")
+            Some(Ok(link("github.com", "acme/app", 42, "https://github.com/acme/app/pull/42")))
         );
         assert_eq!(resolve("gh pr checkout 3", Some(&github)), resolve("3", Some(&github)));
         let gitlab = project("gitlab.com/group/sub/app");
         assert_eq!(
             resolve("12", Some(&gitlab)),
-            link("gitlab.com", "group/sub/app", 12, "https://gitlab.com/group/sub/app/-/merge_requests/12")
+            Some(Ok(link("gitlab.com", "group/sub/app", 12, "https://gitlab.com/group/sub/app/-/merge_requests/12")))
         );
     }
 

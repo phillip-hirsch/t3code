@@ -4,8 +4,8 @@
 //! with the native dialog, then `projects.mutate`).
 //!
 //! Go to file and Search project contents open the child searches in `files/`.
-//! Actions this client has no surface for yet (guest sharing, PR linking, new project, clone, WSL folders,
-//! the theme editor, workspace focus) are left out.
+//! Actions this client has no surface for yet (guest sharing, new project, clone, WSL folders) are left
+//! out, and the theme list has no environment-published themes.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
