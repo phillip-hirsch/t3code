@@ -285,8 +285,7 @@ impl Workspace {
             return false;
         };
         self.remember_script(&project_id, script_id);
-        let stop_on_settle = script.stop_on_settle == Some(true);
-        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: script.command, stop_on_settle }), cx);
+        window.dispatch_action(Box::new(super::RunInTerminal::script(cwd, &script)), cx);
         true
     }
 

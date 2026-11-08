@@ -1555,7 +1555,7 @@ fn code_block_header(
                     if let Some(cwd) = this.upgrade().and_then(|w| w.read(cx).git_cwd()) {
                         let command = command.clone();
                         window.dispatch_action(
-                            Box::new(super::RunInTerminal { cwd, command, stop_on_settle: false }),
+                            Box::new(super::RunInTerminal { cwd, command, stop_on_settle: false, preview_url: None }),
                             cx,
                         );
                     }

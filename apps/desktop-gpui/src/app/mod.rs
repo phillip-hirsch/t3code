@@ -103,6 +103,17 @@ pub struct RunInTerminal {
     pub command: String,
     /// The script's `stopOnSettle`.
     pub stop_on_settle: bool,
+    /// The script's `previewUrl` when it has `autoOpenPreview`, opened once the command is written.
+    pub preview_url: Option<String>,
+}
+
+impl RunInTerminal {
+    /// A project script run in `cwd`.
+    fn script(cwd: String, script: &crate::model::ProjectScript) -> Self {
+        let preview_url =
+            script.preview_url.clone().filter(|url| script.auto_open_preview == Some(true) && !url.trim().is_empty());
+        Self { cwd, command: script.command.clone(), stop_on_settle: script.stop_on_settle == Some(true), preview_url }
+    }
 }
 pub use terminal::key_bindings as terminal_key_bindings;
 pub use titlebar::TRAFFIC_LIGHTS;

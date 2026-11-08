@@ -665,8 +665,7 @@ impl Workspace {
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.git_cwd().filter(|_| self.can_run_scripts()) else { return };
         self.remember_script(&run.project_id, &run.id);
-        let (command, stop_on_settle) = (run.command.to_string(), run.stop_on_settle);
-        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command, stop_on_settle }), cx);
+        window.dispatch_action(Box::new(super::RunInTerminal::script(cwd, &run.script)), cx);
     }
 
     /// `hasTerminalWriteAccess`: scripts run only with `terminal:operate` on the thread's environment.
@@ -1940,18 +1939,13 @@ fn script_item_row(
 struct ScriptRun {
     project_id: String,
     id: String,
-    command: SharedString,
-    stop_on_settle: bool,
+    /// The whole script, so its run keeps `stopOnSettle` and its preview settings.
+    script: std::rc::Rc<ProjectScript>,
 }
 
 impl ScriptRun {
     fn new(project_id: &str, script: &ProjectScript) -> Self {
-        Self {
-            project_id: project_id.to_owned(),
-            id: script.id.clone(),
-            command: script.command.clone().into(),
-            stop_on_settle: script.stop_on_settle == Some(true),
-        }
+        Self { project_id: project_id.to_owned(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
     }
 }
 
@@ -2013,6 +2007,18 @@ mod tests {
         assert_eq!(primary(&scripts, Some("deleted")).as_deref(), Some("dev"));
         assert_eq!(primary(&scripts[..2], None).as_deref(), Some("setup"));
         assert_eq!(primary(&scripts[1..2], None), None, "a settle-only script is never primary");
+
+        // The run keeps the script's settle flag and the preview it opens automatically.
+        let mut dev = script("dev", false, false);
+        dev.stop_on_settle = Some(true);
+        dev.preview_url = Some("http://localhost:5173".into());
+        let run = |script: &ProjectScript| super::super::RunInTerminal::script("/repo".into(), script);
+        assert!(run(&dev).stop_on_settle);
+        assert_eq!(run(&dev).preview_url, None, "no autoOpenPreview, no preview");
+        dev.auto_open_preview = Some(true);
+        assert_eq!(run(&dev).preview_url.as_deref(), Some("http://localhost:5173"));
+        dev.preview_url = Some("  ".into());
+        assert_eq!(run(&dev).preview_url, None);
     }
 
     #[test]
