@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use super::{Settings, contract};
+use crate::model::T3ProjectFile;
 
 /// The scope picked in the scope sentence (`SettingsScopeSearch`, minus `checkout`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +46,8 @@ pub struct Project {
     pub id: String,
     pub environment_id: String,
     pub name: String,
+    /// The checkout's root, where its `t3.json` is read.
+    pub workspace_root: String,
     /// The project's legacy `defaultModelSelection`, used until settings fold it.
     pub legacy_model_selection: Option<Value>,
     /// The project's legacy `defaultThreadEnvMode`, used until settings fold it.
@@ -182,8 +185,7 @@ fn connected<'s, 'env>(
 pub enum Source {
     Environment,
     Project,
-    /// The repository's `t3.json`. This client does not read project files yet, so no
-    /// value resolves here; the web shows the same before the file loads.
+    /// The repository's `t3.json`.
     ProjectFile,
 }
 
@@ -204,33 +206,57 @@ impl Target {
 }
 
 /// `resolveScopedSettingsTargets`: one per connected environment, or per connected checkout at
-/// project scope. The first is the representative a row shows.
-pub fn targets(scope: &Scope, environments: &[Environment]) -> Vec<Target> {
+/// project scope. The first is the representative a row shows. `file` gives a checkout's
+/// `t3.json` once it has loaded; until then a checkout has no file tier.
+pub fn targets<'f>(
+    scope: &Scope,
+    environments: &[Environment],
+    file: impl Fn(&Project) -> Option<&'f T3ProjectFile>,
+) -> Vec<Target> {
     match &scope.kind {
         ScopeKind::Unavailable { .. } => Vec::new(),
         ScopeKind::Project { members } => members
             .iter()
             .filter_map(|project| {
                 let environment = environments.iter().find(|e| e.id == project.environment_id)?;
-                Some(resolve_project_settings(environment.id, environment.settings?, Some(project)))
+                Some(resolve_project_settings(environment.id, environment.settings?, Some(project), file(project)))
             })
             .collect(),
         ScopeKind::All | ScopeKind::Environment => connected(scope, environments)
-            .map(|(environment, settings)| resolve_project_settings(environment.id, settings, None))
+            .map(|(environment, settings)| resolve_project_settings(environment.id, settings, None, None))
             .collect(),
     }
 }
 
-/// `resolveProjectSettings` without the `t3.json` tier: a project's overrides over the
-/// environment's settings. Overrides naming a provider instance the project disables are
-/// skipped, like the web; the web's text generation fallback for that case is not ported.
-pub fn resolve_project_settings(environment_id: &str, settings: &Settings, project: Option<&Project>) -> Target {
+/// `resolveProjectSettings`: a project's overrides over the environment's settings, then for
+/// file-backed keys still unset, the checkout's `t3.json` (a missing or invalid file gives the
+/// built-in value). Overrides naming a provider instance the project disables are skipped, like
+/// the web; the web's text generation fallback for that case is not ported.
+pub fn resolve_project_settings(
+    environment_id: &str,
+    settings: &Settings,
+    project: Option<&Project>,
+    file: Option<&T3ProjectFile>,
+) -> Target {
     let overrides = project_overrides(settings, project);
     let mut effective = settings.clone();
     let mut sources = HashMap::new();
     for (key, value) in overrides {
         sources.insert(key.clone(), Source::Project);
         effective.set(key, value);
+    }
+    if let Some(file) = file {
+        for (key, built_in) in &contract().file_backed_built_ins {
+            if !effective.get(key).is_null() {
+                continue;
+            }
+            let (value, source) = match file.setting(key) {
+                Some(value) => (value.clone(), Source::ProjectFile),
+                None => (built_in.clone(), Source::Environment),
+            };
+            sources.insert(key.clone(), source);
+            effective.set(key.clone(), value);
+        }
     }
     Target {
         environment_id: environment_id.to_owned(),
@@ -812,6 +838,7 @@ mod tests {
             id: id.into(),
             environment_id: "env-1".into(),
             name: "Repo".into(),
+            workspace_root: format!("/{id}"),
             legacy_model_selection: None,
             legacy_thread_env_mode: None,
         }
@@ -900,24 +927,56 @@ mod tests {
             "defaultThreadEnvMode": "local",
             "projectSettingsOverrides": {"p1": {"defaultThreadEnvMode": "worktree"}},
         }));
-        let target = resolve_project_settings("env-1", &s, Some(&project("p1")));
+        let target = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
         assert_eq!(target.settings.get("defaultThreadEnvMode"), "worktree");
         assert_eq!(target.source("defaultThreadEnvMode"), Source::Project);
         assert_eq!(target.source("defaultRuntimeMode"), Source::Environment);
-        let other = resolve_project_settings("env-1", &s, Some(&project("p2")));
+        let other = resolve_project_settings("env-1", &s, Some(&project("p2")), None);
         assert_eq!(other.settings.get("defaultThreadEnvMode"), "local");
         assert_eq!(resolve_project_setting(&s, Some(&project("p1")), "defaultThreadEnvMode"), "worktree");
         assert_eq!(resolve_project_setting(&s, None, "defaultThreadEnvMode"), "local");
     }
 
     #[test]
+    fn a_checkouts_t3_json_backs_settings_neither_the_project_nor_environment_sets() {
+        let file = T3ProjectFile::parse(r#"{"defaultThreadEnvMode": "worktree"}"#);
+        let unset = settings(json!({}));
+        let target = resolve_project_settings("env-1", &unset, Some(&project("p1")), Some(&file));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "worktree");
+        assert_eq!(target.source("defaultThreadEnvMode"), Source::ProjectFile);
+        assert_eq!(target.settings.get("worktreeSubmodules"), "recursive", "unset in the file: built in");
+        assert_eq!(target.source("worktreeSubmodules"), Source::Environment);
+
+        let set = settings(json!({"defaultThreadEnvMode": "local"}));
+        let target = resolve_project_settings("env-1", &set, Some(&project("p1")), Some(&file));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "local", "the environment outranks the file");
+        assert_eq!(target.source("defaultThreadEnvMode"), Source::Environment);
+
+        let invalid = T3ProjectFile::parse(r#"{"defaultThreadEnvMode": "cloud"}"#);
+        assert_eq!(invalid, T3ProjectFile::Invalid);
+        let target = resolve_project_settings("env-1", &unset, Some(&project("p1")), Some(&invalid));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "local", "an invalid file gives the built-in value");
+
+        let unloaded = resolve_project_settings("env-1", &unset, Some(&project("p1")), None);
+        assert!(unloaded.settings.get("defaultThreadEnvMode").is_null(), "no tier before the file loads");
+
+        let scope = Scope {
+            kind: ScopeKind::Project { members: vec![project("p1")] },
+            label: String::new(),
+            environment_ids: vec!["env-1".into()],
+        };
+        let t = targets(&scope, &[env(&unset)], |member| (member.workspace_root == "/p1").then_some(&file));
+        assert_eq!(row_source(&t, &["defaultThreadEnvMode"]), RowSource::ProjectFile);
+    }
+
+    #[test]
     fn legacy_project_fields_apply_until_folded() {
         let legacy = Project { legacy_thread_env_mode: Some("worktree".into()), ..project("p1") };
         let unfolded =
-            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": false})), Some(&legacy));
+            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": false})), Some(&legacy), None);
         assert_eq!(unfolded.source("defaultThreadEnvMode"), Source::Project);
         let folded =
-            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": true})), Some(&legacy));
+            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": true})), Some(&legacy), None);
         assert_eq!(folded.source("defaultThreadEnvMode"), Source::Environment);
     }
 
@@ -928,7 +987,7 @@ mod tests {
             "providerInstances": {"codex_2": {"enabled": false}},
             "projectSettingsOverrides": {"p1": {"defaultModelSelection": {"instanceId": "codex_2", "model": "m"}}},
         }));
-        let target = resolve_project_settings("env-1", &s, Some(&project("p1")));
+        let target = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
         assert_eq!(target.source("defaultModelSelection"), Source::Environment);
     }
 
@@ -980,7 +1039,7 @@ mod tests {
 
     #[test]
     fn mixed_and_source_compare_every_target() {
-        let a = resolve_project_settings("env-1", &settings(json!({"defaultRuntimeMode": "a"})), None);
+        let a = resolve_project_settings("env-1", &settings(json!({"defaultRuntimeMode": "a"})), None, None);
         let mut b = a.clone();
         b.settings.set("defaultRuntimeMode", "b".into());
         b.sources.insert("defaultRuntimeMode".into(), Source::Project);
@@ -999,12 +1058,12 @@ mod tests {
         let projects = [group(&["p1"]), group(&["p2"])];
         let state = |search: ScopeSearch, keys: &[&str]| {
             let scope = resolve(&search, &projects, &[e]);
-            row_inheritance(&scope, &targets(&scope, &[e]), &e, keys).0
+            row_inheritance(&scope, &targets(&scope, &[e], |_| None), &e, keys).0
         };
         assert_eq!(state(search(Some("p1"), None), &["defaultRuntimeMode"]), InheritanceState::Overridden);
         let (inherited, summary) = {
             let scope = resolve(&search(Some("p2"), None), &projects, &[e]);
-            row_inheritance(&scope, &targets(&scope, &[e]), &e, &["defaultRuntimeMode"])
+            row_inheritance(&scope, &targets(&scope, &[e], |_| None), &e, &["defaultRuntimeMode"])
         };
         assert_eq!((inherited, summary.as_str()), (InheritanceState::Inherited, "Inherited from Studio"));
         assert_eq!(state(search(None, None), &["defaultRuntimeMode"]), InheritanceState::Default);
@@ -1013,7 +1072,7 @@ mod tests {
         );
         let e = env(&customized);
         let scope = resolve(&search(None, None), &projects, &[e]);
-        let t = targets(&scope, &[e]);
+        let t = targets(&scope, &[e], |_| None);
         assert_eq!(row_inheritance(&scope, &t, &e, &["enableDeviceSupport"]).0, InheritanceState::Environment);
     }
 
@@ -1023,7 +1082,7 @@ mod tests {
             "defaultThreadEnvMode": "worktree",
             "projectSettingsOverrides": {"p1": {"defaultThreadEnvMode": "local"}},
         }));
-        let overridden = resolve_project_settings("env-1", &s, Some(&project("p1")));
+        let overridden = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
         let layers = inheritance_layers(&overridden, &s, "defaultThreadEnvMode");
         let summary: Vec<_> = layers.iter().map(|l| (l.label.as_str(), l.value.as_str(), l.effective)).collect();
         assert_eq!(
@@ -1035,7 +1094,7 @@ mod tests {
                 ("Default", "Current checkout", false),
             ]
         );
-        let environment = resolve_project_settings("env-1", &Settings::server_defaults(), None);
+        let environment = resolve_project_settings("env-1", &Settings::server_defaults(), None, None);
         let layers = inheritance_layers(&environment, &Settings::server_defaults(), "defaultRuntimeMode");
         assert_eq!(
             layers.iter().map(|l| (l.label.as_str(), l.effective)).collect::<Vec<_>>(),
@@ -1108,7 +1167,7 @@ mod tests {
         let e = env(&s);
         let groups = [group(&["a", "b"])];
         let scope = resolve(&search(Some("a"), None), &groups, &[e]);
-        let t = targets(&scope, &[e]);
+        let t = targets(&scope, &[e], |_| None);
         assert_eq!(t.iter().map(|t| t.project_id.as_deref()).collect::<Vec<_>>(), [Some("a"), Some("b")]);
         assert_eq!(row_inheritance(&scope, &t, &e, &["defaultRuntimeMode"]).0, InheritanceState::Mixed);
         let plan = plan_patch(&scope, &[e], json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
@@ -1139,7 +1198,7 @@ mod tests {
 
         let all = resolve(&search(None, None), &groups, &environments);
         assert_eq!(ids(&plan_patch(&all, &environments, patch)), ["env-1", "env-2"]);
-        let t = targets(&all, &environments);
+        let t = targets(&all, &environments, |_| None);
         assert_eq!(t[0].environment_id, "env-1", "the primary represents the selection");
         assert!(are_mixed(&t, &["defaultRuntimeMode"]));
 

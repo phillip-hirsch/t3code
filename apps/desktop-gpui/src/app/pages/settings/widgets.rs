@@ -613,6 +613,7 @@ fn scope_groups(groups: &[ProjectGroup]) -> Vec<scope::Group> {
                     id: m.project.id.clone(),
                     environment_id: m.project.environment_id.to_string(),
                     name: project_name(&m.project).to_string(),
+                    workspace_root: m.project.workspace_root.clone(),
                     legacy_model_selection: m
                         .project
                         .default_model_selection
@@ -664,12 +665,23 @@ impl Workspace {
         };
         let environments = view.environments();
         let (search, scope) = self.resolve_settings_scope(&scope_groups, &environments);
-        let targets = scope::targets(&scope, &environments);
+        let targets = scope::targets(&scope, &environments, |project| {
+            let key = (SharedString::from(project.environment_id.clone()), project.workspace_root.clone());
+            self.t3_project_files.get(&key).filter(|file| !matches!(file, crate::model::T3ProjectFile::Loading))
+        });
         drop(environments);
         view.search = search;
         view.scope = scope;
         view.targets = targets;
         view
+    }
+
+    /// Starts reading the selected checkouts' `t3.json` for the file tier (`useMemberProjectFiles`).
+    pub(super) fn load_scope_project_files(&mut self, view: &SettingsView, cx: &mut Context<Self>) {
+        let ScopeKind::Project { members } = &view.scope.kind else { return };
+        for member in members {
+            self.t3_project_file(&member.environment_id.clone().into(), &member.workspace_root, cx);
+        }
     }
 
     /// The environment a scoped page reads and acts on (`useSettingsScope().environment`),
