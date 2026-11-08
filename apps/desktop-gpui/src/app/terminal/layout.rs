@@ -119,7 +119,6 @@ impl DrawerLayout {
         if !self.height.is_finite() || self.height <= 0. {
             self.height = DEFAULT_HEIGHT;
         }
-        self.open &= !self.terminal_ids.is_empty();
         self
     }
 
@@ -404,6 +403,10 @@ mod tests {
         assert_eq!(ids(&messy), [["term-1"], ["term-3"]]);
         assert_eq!((messy.active_id.as_str(), messy.active_group_id.as_str()), ("term-1", "g"));
         assert_eq!(messy.height, DEFAULT_HEIGHT);
+
+        // A drawer opened without the grant stays open on its empty state.
+        let empty: DrawerLayout = serde_json::from_value(serde_json::json!({"terminalOpen": true})).unwrap();
+        assert!(empty.restored().open);
     }
 
     fn ids(layout: &DrawerLayout) -> Vec<Vec<&str>> {
