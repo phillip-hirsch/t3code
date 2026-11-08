@@ -17,7 +17,7 @@ use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as
 use gpui_kit::component::diff::{
     Diff, DiffChangeIndicator, DiffEvent, DiffFile, DiffHunkSeparator, DiffMode, DiffState,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, MenuMetrics, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
@@ -1845,7 +1845,17 @@ impl Workspace {
                     .dropdown_menu(move |menu: PopupMenu, window, cx| {
                         // `MenuItem`'s `sm:min-h-7 sm:text-sm`.
                         let rem = window.rem_size();
-                        let menu = menu.min_w(px(200.)).item_text(None, rem * 0.875, rem * 1.75);
+                        let menu = menu.min_w(px(200.)).metrics(MenuMetrics {
+                            font_family: None,
+                            text_size: rem * 0.875,
+                            row_height: rem * 1.75,
+                            // `MenuPopup`'s `p-1`, `MenuItem`'s `px-2` and `MenuSeparator`'s `my-1 h-px`.
+                            padding_y: px(4.),
+                            item_padding_x: px(8.),
+                            separator_height: px(9.),
+                            background: None,
+                            separator: None,
+                        });
                         // An available Browser lists the profiles to open it in (`MenuSub`).
                         let menu = if browser {
                             let (view, profiles) = (view.clone(), profiles.clone());
