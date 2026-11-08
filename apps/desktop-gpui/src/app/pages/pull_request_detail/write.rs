@@ -172,6 +172,36 @@ pub(super) fn can_submit_review(verdict: &str, summary: &str, comments: usize, s
     }
 }
 
+/// `offered`: the verdicts this host takes and this viewer may give, in `VERDICTS` order.
+fn offered_verdicts(detail: &Detail) -> Vec<(&'static str, &'static str)> {
+    VERDICTS
+        .iter()
+        .copied()
+        .filter(|(v, _)| detail.capabilities.review.verdicts.iter().any(|c| c == v))
+        .filter(|(v, _)| detail.viewer_permissions.verdicts.iter().any(|c| c == v))
+        .collect()
+}
+
+/// `selectedVerdict`: the one picked while it is still offered, else the first offered.
+fn selected_verdict(
+    offered: &[(&'static str, &'static str)],
+    picked: Option<&'static str>,
+) -> Option<(&'static str, &'static str)> {
+    offered.iter().copied().find(|(v, _)| Some(*v) == picked).or_else(|| offered.first().copied())
+}
+
+/// Mod+Enter in the review summary: the selected verdict, when it can be submitted.
+fn summary_shortcut_verdict(
+    offered: &[(&'static str, &'static str)],
+    picked: Option<&'static str>,
+    summary: &str,
+    comments: usize,
+    summary_required: bool,
+) -> Option<&'static str> {
+    let (verdict, _) = selected_verdict(offered, picked)?;
+    can_submit_review(verdict, summary, comments, summary_required).then_some(verdict)
+}
+
 /// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
 fn summary_required(provider: &str) -> bool {
     provider == "forgejo"
@@ -328,7 +358,8 @@ impl Workspace {
         }
         if self.pr_review().is_some_and(|r| r.summary.is_none()) {
             let input = cx.new(|cx| TextareaState::new(window, cx).rows(3));
-            let sub = watch(&input, None, window, cx);
+            let sub =
+                watch(&input, Some(|this, window, cx| this.submit_pr_review_from_summary(window, cx)), window, cx);
             if let Some(review) = self.pr_review() {
                 review.summary = Some(input);
             }
@@ -345,13 +376,7 @@ impl Workspace {
         let verdict = panel.write.verdict;
         let pending = self.pr_pending_comments().len();
         let Some(summary) = self.pr_review().and_then(|r| r.summary.clone()) else { return };
-        let offered: Vec<&str> = VERDICTS
-            .iter()
-            .map(|v| v.0)
-            .filter(|v| detail.capabilities.review.verdicts.iter().any(|c| c == v))
-            .filter(|v| detail.viewer_permissions.verdicts.iter().any(|c| c == v))
-            .collect();
-        let selected = offered.iter().copied().find(|v| Some(*v) == verdict).or_else(|| offered.first().copied());
+        let selected = selected_verdict(&offered_verdicts(&detail), verdict).map(|(v, _)| v);
         let required = summary_required(&detail.provider);
         let placeholder = match selected {
             None => "Summarize your review (optional)",
@@ -398,6 +423,21 @@ impl Workspace {
             },
         );
         cx.notify();
+    }
+
+    /// Mod+Enter in the summary submits the selected verdict (`isCommentSubmitShortcut`).
+    fn submit_pr_review_from_summary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let picked = panel.write.verdict;
+        let comments = self.pr_pending_comments().len();
+        let summary = self.pr_review().and_then(|r| r.summary.clone()).map(|s| text_of(&s, cx)).unwrap_or_default();
+        let required = summary_required(&detail.provider);
+        if let Some(verdict) =
+            summary_shortcut_verdict(&offered_verdicts(&detail), picked, &summary, comments, required)
+        {
+            self.submit_pr_review(verdict, window, cx);
+        }
     }
 
     /// `PullRequestReviewForm.submit`.
@@ -464,12 +504,7 @@ impl Workspace {
     ) -> Option<AnyElement> {
         let term = logic::terminology(&detail.provider).0;
         let can_comment = detail.capabilities.comment && detail.viewer_permissions.comment;
-        let verdicts: Vec<(&'static str, &'static str)> = VERDICTS
-            .iter()
-            .copied()
-            .filter(|(v, _)| detail.capabilities.review.verdicts.iter().any(|c| c == v))
-            .filter(|(v, _)| detail.viewer_permissions.verdicts.iter().any(|c| c == v))
-            .collect();
+        let verdicts = offered_verdicts(detail);
         if !can_comment && verdicts.is_empty() {
             return None;
         }
@@ -701,11 +736,7 @@ impl Workspace {
             return div().into_any_element();
         };
         let required = summary_required(&detail.provider);
-        let selected = verdicts
-            .iter()
-            .copied()
-            .find(|(v, _)| Some(*v) == panel.write.verdict)
-            .or_else(|| verdicts.first().copied());
+        let selected = selected_verdict(verdicts, panel.write.verdict);
         let text = text_of(&summary, cx);
         let busy = panel.write.submitting.is_some();
         let view = cx.entity();
@@ -1867,6 +1898,20 @@ mod tests {
         assert!(can_submit_review("comment", "", 2, false));
         assert!(can_submit_review("request-changes", "", 1, false));
         assert!(!can_submit_review("request-changes", "", 1, true), "Forgejo wants a summary to request changes");
+    }
+
+    #[test]
+    fn the_summary_shortcut_submits_the_selected_verdict_when_it_can() {
+        let offered = [("comment", "Comment"), ("approve", "Approve"), ("request-changes", "Request changes")];
+        assert_eq!(summary_shortcut_verdict(&offered, Some("approve"), "", 0, false), Some("approve"));
+        assert_eq!(summary_shortcut_verdict(&offered, None, "", 0, false), None, "a bare comment needs a summary");
+        assert_eq!(summary_shortcut_verdict(&offered, None, "looks good", 0, false), Some("comment"));
+        assert_eq!(
+            summary_shortcut_verdict(&offered[..1], Some("approve"), "ok", 0, false),
+            Some("comment"),
+            "a verdict no longer offered falls back to the first"
+        );
+        assert_eq!(summary_shortcut_verdict(&[], None, "ok", 0, false), None);
     }
 
     #[test]
