@@ -17,13 +17,15 @@ use gpui_kit::{
     AnyElement, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
 use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
 use super::super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, settings_section, switch};
 use crate::app::Workspace;
-use crate::model::{ModelSelection, ServerInfo};
+use crate::model::{ModelSelection, Provider, ServerInfo};
+use crate::settings::{Settings, scope};
 use crate::theme::tokens;
 
 #[path = "snooze.rs"]
@@ -51,20 +53,93 @@ fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
     (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
 }
 
+/// One target as its default model resolves: its environment's providers, its settings and
+/// the project it is for.
+#[derive(Clone, Copy)]
+struct ModelTarget<'a> {
+    info: &'a ServerInfo,
+    settings: &'a Settings,
+    project_id: Option<&'a str>,
+}
+
+/// `resolveProjectDefaultProviderModelSelection`: the automatic default with the project's
+/// provider overrides; the first driver's instances, defaults first, win before any other.
+fn project_automatic_model<'a>(target: ModelTarget<'a>) -> Option<ModelSelection> {
+    let providers = &target.info.providers;
+    let mut drivers: Vec<&str> = Vec::new();
+    for provider in providers {
+        if !drivers.contains(&provider.driver.as_str()) {
+            drivers.push(&provider.driver);
+        }
+    }
+    let mut entries: Vec<&Provider> = providers.iter().collect();
+    entries.sort_by_key(|p| (drivers.iter().position(|d| *d == p.driver), p.instance_id != p.driver));
+    let selectable = |p: &Provider| {
+        p.availability.as_deref() != Some("unavailable")
+            && scope::provider_instance_enabled(target.settings, target.project_id, &p.instance_id)
+    };
+    let pick = |group: &[&'a Provider]| {
+        group
+            .iter()
+            .find(|p| selectable(p) && p.status == "ready")
+            .or_else(|| group.iter().find(|p| selectable(p) && p.status != "error"))
+            .copied()
+    };
+    let first: Vec<&Provider> =
+        entries.iter().copied().filter(|p| Some(p.driver.as_str()) == drivers.first().copied()).collect();
+    let provider = pick(&first).or_else(|| pick(&entries))?;
+    Some(ModelSelection {
+        instance_id: provider.instance_id.clone(),
+        model: provider.default_model()?.to_owned(),
+        options: None,
+    })
+}
+
+/// `resolveEffectiveDefaultModelSelection`: the picked model while the target's model
+/// preferences (else this device's) still show it, else the instance's first shown default.
+fn effective_model(target: ModelTarget, client: &Settings, selection: ModelSelection) -> ModelSelection {
+    let Some(provider) = target.info.provider(&selection.instance_id) else { return selection };
+    let preferences = Some(target.settings.get("providerModelPreferences"))
+        .filter(|p| !p.is_null())
+        .unwrap_or_else(|| client.get("providerModelPreferences"));
+    let hidden = &preferences[selection.instance_id.as_str()]["hiddenModels"];
+    let is_hidden = |slug: &str| hidden.as_array().is_some_and(|h| h.iter().any(|h| h.as_str() == Some(slug)));
+    let shown: Vec<_> = provider.models.iter().filter(|m| m.is_custom || !is_hidden(&m.slug)).collect();
+    if shown.iter().any(|m| m.slug == selection.model) {
+        return selection;
+    }
+    match shown.iter().find(|m| m.is_default == Some(true)).or(shown.first()) {
+        Some(model) => ModelSelection { model: model.slug.clone(), ..selection },
+        None => selection,
+    }
+}
+
 /// The model a target's new threads start with: its stored default while that provider is
-/// selectable, else the environment's automatic pick.
-fn effective_default_model(stored: &Value, info: &ServerInfo) -> Option<ModelSelection> {
-    let stored: Option<ModelSelection> = serde::Deserialize::deserialize(stored).ok();
-    stored
-        .filter(|s| info.provider(&s.instance_id).is_some_and(crate::model::Provider::is_selectable))
-        .or_else(|| info.automatic_model())
+/// selectable, else the automatic pick for its project, as its preferences show it.
+fn effective_default_model(stored: &Value, target: ModelTarget, client: &Settings) -> Option<ModelSelection> {
+    let selection = match ModelSelection::deserialize(stored).ok() {
+        Some(stored) if target.info.provider(&stored.instance_id).is_some_and(Provider::is_selectable) => Some(stored),
+        Some(_) => target.info.automatic_model(),
+        None => project_automatic_model(target),
+    };
+    selection.map(|selection| effective_model(target, client, selection))
+}
+
+/// A selected target on its connected environment.
+fn model_target<'a>(workspace: &'a Workspace, target: &'a scope::Target) -> Option<ModelTarget<'a>> {
+    let info = workspace.env_info(&target.environment_id)?;
+    Some(ModelTarget { info, settings: &target.settings, project_id: target.project_id.as_deref() })
 }
 
 /// `defaultModelSelectionsAreMixed`: the targets differ in their stored default or in the model
-/// it resolves to on their own environment.
-fn default_models_mixed<'a>(targets: impl IntoIterator<Item = (&'a Value, Option<&'a ServerInfo>)>) -> bool {
-    let mut resolved =
-        targets.into_iter().map(|(stored, info)| (stored, info.and_then(|info| effective_default_model(stored, info))));
+/// it resolves to on their own environment and project.
+fn default_models_mixed<'a>(
+    client: &Settings,
+    targets: impl IntoIterator<Item = (&'a Value, Option<ModelTarget<'a>>)>,
+) -> bool {
+    let mut resolved = targets
+        .into_iter()
+        .map(|(stored, target)| (stored, target.and_then(|target| effective_default_model(stored, target, client))));
     let Some(first) = resolved.next() else { return false };
     resolved.any(|other| other != first)
 }
@@ -82,7 +157,7 @@ fn offers_model(
         Some(provider.driver.as_str()) == driver
             && provider.availability.as_deref() != Some("unavailable")
             && crate::settings::scope::provider_instance_enabled(settings, project_id, &pick.instance_id)
-            && provider.models.iter().any(|m| m.slug == pick.model)
+            && provider.models.iter().any(|m| m.slug == pick.model && !m.is_unavailable)
     })
 }
 
@@ -217,10 +292,11 @@ impl Workspace {
     ) -> AnyElement {
         let t = *tokens(cx);
         let project_scope = view.scope.is_project();
+        let client = &self.client_settings.values;
+        let model_target = |target| model_target(self, target);
         let mixed = default_models_mixed(
-            view.targets
-                .iter()
-                .map(|target| (target.settings.get("defaultModelSelection"), self.env_info(&target.environment_id))),
+            client,
+            view.targets.iter().map(|target| (target.settings.get("defaultModelSelection"), model_target(target))),
         );
         let automatic =
             !view.targets.is_empty() && view.targets.iter().all(|t| t.settings.get("defaultModelSelection").is_null());
@@ -229,7 +305,10 @@ impl Workspace {
                 this.save_scoped_model(key, pick, window, cx);
             }
         };
-        let selection = effective_default_model(view.value("defaultModelSelection"), self.settings_info());
+        let info = self.settings_info();
+        let fallback = ModelTarget { info, settings: &info.settings, project_id: None };
+        let target = view.targets.first().and_then(model_target).unwrap_or(fallback);
+        let selection = effective_default_model(view.value("defaultModelSelection"), target, client);
         let denial = selection.as_ref().filter(|_| !mixed).and_then(|s| self.scoped_model_denial(view, s));
         let model: AnyElement = match &selection {
             Some(selection) => h_flex()
@@ -863,19 +942,50 @@ mod tests {
     fn automatic_defaults_differ_when_they_resolve_differently() {
         let codex = info(json!([{"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
             "models": [{"slug": "gpt", "isDefault": true}]}]));
-        let claude = info(json!([{"instanceId": "claude", "driver": "claudeAgent", "enabled": true, "status": "ready",
+        let claude =
+            info(json!([{"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "status": "ready",
             "models": [{"slug": "opus", "isDefault": true}]}]));
         let automatic = Value::Null;
-        assert!(default_models_mixed([(&automatic, Some(&codex)), (&automatic, Some(&claude))]));
-        assert!(!default_models_mixed([(&automatic, Some(&codex)), (&automatic, Some(&codex))]));
+        let device = Settings::layered(&Default::default(), &json!({}));
+        let on = |info, project_id| Some(ModelTarget { info, settings: &device, project_id });
+        let mixed = |targets: [(&Value, Option<ModelTarget>); 2]| default_models_mixed(&device, targets);
+        assert!(mixed([(&automatic, on(&codex, None)), (&automatic, on(&claude, None))]));
+        assert!(!mixed([(&automatic, on(&codex, None)), (&automatic, on(&codex, None))]));
         let pinned = json!({"instanceId": "codex", "model": "gpt"});
-        assert!(default_models_mixed([(&pinned, Some(&codex)), (&automatic, Some(&codex))]), "stored values differ");
+        assert!(mixed([(&pinned, on(&codex, None)), (&automatic, on(&codex, None))]), "stored values differ");
+
+        // Both providers on one environment; one project turns Codex off.
+        let both = info(json!([
+            {"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
+                "models": [{"slug": "gpt", "isDefault": true}, {"slug": "mini"}]},
+            {"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "status": "ready",
+                "models": [{"slug": "opus", "isDefault": true}]}
+        ]));
+        let overrides = Settings::layered(
+            &Default::default(),
+            &json!({"projectSettingsOverrides": {"claude-only": {"providerInstances": {"codex": {"enabled": false}}}}}),
+        );
+        let project = |id| Some(ModelTarget { info: &both, settings: &overrides, project_id: Some(id) });
+        assert!(mixed([(&automatic, project("claude-only")), (&automatic, project("other"))]), "a project override");
+        assert!(!mixed([(&automatic, project("claude-only")), (&automatic, on(&claude, None))]));
+
+        let hiding = Settings::layered(
+            &Default::default(),
+            &json!({"providerModelPreferences": {"codex": {"hiddenModels": ["gpt"], "modelOrder": []}}}),
+        );
+        let hidden = Some(ModelTarget { info: &both, settings: &hiding, project_id: None });
+        assert!(mixed([(&automatic, hidden), (&automatic, on(&both, None))]), "a hidden default resolves elsewhere");
+        assert!(
+            !default_models_mixed(&hiding, [(&automatic, hidden), (&automatic, on(&both, None))]),
+            "this device's preferences stand in for a target without its own"
+        );
     }
 
     #[test]
     fn a_target_must_offer_the_picked_model() {
         let env = info(json!([
-            {"instanceId": "codex", "driver": "codex", "enabled": true, "models": [{"slug": "gpt"}]},
+            {"instanceId": "codex", "driver": "codex", "enabled": true,
+                "models": [{"slug": "gpt"}, {"slug": "retired", "isUnavailable": true}]},
             {"instanceId": "grok", "driver": "grok", "enabled": true, "availability": "unavailable", "models": [{"slug": "g"}]}
         ]));
         let settings = crate::settings::Settings::layered(
@@ -895,6 +1005,7 @@ mod tests {
             "disabled for the project"
         );
         assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("codex", "other")), "no such model");
+        assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("codex", "retired")), "listed unavailable");
         assert!(!offers_model(&env, &settings, None, Some("claudeAgent"), &pick("codex", "gpt")), "another driver");
         assert!(!offers_model(&env, &settings, None, Some("grok"), &pick("grok", "g")), "unavailable");
         assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("missing", "gpt")));

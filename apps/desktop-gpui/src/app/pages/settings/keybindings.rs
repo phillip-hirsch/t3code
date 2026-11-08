@@ -775,8 +775,14 @@ impl KeybindingsPanel {
         false
     }
 
+    /// `canWriteSettings`: connected targets that all grant `settings:write`; the editor is
+    /// `inert` without it.
+    fn editable(&self) -> bool {
+        self.connected && !self.targets.is_empty() && self.can_write
+    }
+
     fn start_recording(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.connected {
+        if self.editable() {
             self.recording = Some(id.to_owned());
             cx.notify();
         }
@@ -789,6 +795,9 @@ impl KeybindingsPanel {
     }
 
     fn toggle_when(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editable() {
+            return;
+        }
         if self.when_open.as_deref() == Some(id) {
             self.close_when(cx);
             return;
@@ -851,6 +860,9 @@ impl KeybindingsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.editable() {
+            return;
+        }
         let Some(draft) = self.draft_mut(id) else { return };
         draft.when = next(draft.when.as_ref());
         draft.when_valid = true;
@@ -1075,7 +1087,17 @@ impl KeybindingsPanel {
                 .collect();
             body.push(settings_section(SharedString::from(title), title, rendered, &t));
         }
-        children.push(v_flex().gap(px(32.)).children(body).into_any_element());
+        // `inert`: a cover takes the rows' clicks, and the handlers check `editable` too.
+        children.push(
+            v_flex()
+                .relative()
+                .gap(px(32.))
+                .children(body)
+                .when(!self.editable(), |el| {
+                    el.child(div().id("keybindings-inert").absolute().inset_0().block_mouse_except_scroll())
+                })
+                .into_any_element(),
+        );
         v_flex()
             .id("settings-keybindings")
             .gap(px(32.))
@@ -1112,7 +1134,7 @@ impl KeybindingsPanel {
                     .font_weight(FontWeight::MEDIUM)
                     .icon(Icon::new(IconName::Plus).size(px(16.)))
                     .label("Add keybinding")
-                    .disabled(self.adding.is_some() || !self.connected)
+                    .disabled(self.adding.is_some() || !self.editable())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.adding = Some(NewDraft {
                             command: None,

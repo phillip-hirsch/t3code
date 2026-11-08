@@ -376,11 +376,14 @@ pub(in crate::app) fn redacted_email(
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(SharedString::from(format!("redacted-{id}")))
+        .relative()
         .cursor_pointer()
         .font_family(t.fonts.mono)
         .text_size(px(10.))
-        .text_color(if revealed { t.muted_foreground } else { t.muted_foreground.opacity(0.6) })
-        .hover(|el| el.text_color(t.foreground))
+        .when(revealed, |el| el.text_color(t.muted_foreground).hover(|el| el.text_color(t.foreground)))
+        .when(!revealed, |el| {
+            el.text_color(gpui_kit::transparent_black()).child(super::instances::blur_smear(t.muted_foreground))
+        })
         .child(if revealed { email.to_owned() } else { redacted_placeholder(email) })
         .tooltip(move |window, cx| {
             gpui_kit::component::tooltip::Tooltip::new(if revealed {

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use futures::channel::oneshot;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogEntrance, DialogFooter};
-use gpui_kit::component::{WindowExt as _, v_flex};
+use gpui_kit::component::{FocusableExt as _, WindowExt as _, v_flex};
 use gpui_kit::{
     AnyElement, App, FontWeight, IntoElement as _, ParentElement as _, SharedString, Styled as _, Window, div, px,
     relative, white,
@@ -81,13 +81,17 @@ pub(in crate::app) fn ask_confirmation(ask: Ask, window: &mut Window, cx: &mut A
     let focus = cancel_focus.clone();
     window.open_dialog(cx, move |dialog, window, cx| {
         let t = theme::tokens(cx);
+        // `focus-visible:ring`: the focus Cancel opens with stays unmarked until a key moves it.
+        let ring = window.last_input_was_keyboard();
         let ok = send.clone();
-        let action = Button::new("confirm-dialog-ok").label(confirm_label.clone()).track_focus(&ok_focus).on_click(
-            move |_, window, cx| {
+        let action = Button::new("confirm-dialog-ok")
+            .label(confirm_label.clone())
+            .track_focus(&ok_focus)
+            .focus_ring(ring)
+            .on_click(move |_, window, cx| {
                 ok(true);
                 window.close_dialog(cx);
-            },
-        );
+            });
         let action = if destructive { action.danger() } else { action.primary() };
         let enter = send.clone();
         let (enter_ok, enter_cancel) = (ok_focus.clone(), cancel_focus.clone());
@@ -133,6 +137,7 @@ pub(in crate::app) fn ask_confirmation(ask: Ask, window: &mut Window, cx: &mut A
                             .label("Cancel")
                             .outline()
                             .track_focus(&cancel_focus)
+                            .focus_ring(ring)
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(action),
