@@ -430,7 +430,7 @@ impl Tokens {
             row_hover: c.sidebar_row_hover,
             row_active: c.sidebar_row_active,
             sheet_row_hover: c.sidebar_row_hover,
-            sheet_row_selected: c.sidebar_row_active,
+            sheet_row_selected: c.sidebar_row_selected,
             icon: c.icon_muted,
         };
         self
@@ -764,6 +764,7 @@ mod tests {
         assert_eq!(hex_of(tokens.background), hex_of(colors.canvas));
         assert_eq!(hex_of(tokens.primary), hex_of(colors.message_action));
         assert_eq!(hex_of(tokens.sidebar.row_active), hex_of(colors.sidebar_row_active));
+        assert_eq!(hex_of(tokens.sidebar.sheet_row_selected), hex_of(colors.sidebar_row_selected));
         assert_eq!(
             hex_of(Tokens::for_choice(&Default::default(), false).background),
             hex_of(Tokens::light().background)
