@@ -72,6 +72,9 @@ pub(super) struct SidebarState {
     rows_surface: super::sidebar_sheet::RowsSurface,
     /// A menu opened by a click rather than a right-click (the snooze menu).
     menu: Option<OpenMenu>,
+    /// The row whose right-click menu is open. Electron's menu is native and leaves the page's
+    /// hover on the row, so its Snooze and Settle controls stay up until the menu closes.
+    context_menu: Option<String>,
     /// By environment, workspace root, then favicon path, so a lookup needs no key built.
     favicons: HashMap<SharedString, HashMap<String, HashMap<Option<String>, Favicon>>>,
     renaming: Option<actions::Renaming>,
@@ -196,6 +199,7 @@ impl SidebarState {
             _hover_card_delay: None,
             rows_surface: super::sidebar_sheet::RowsSurface::Docked,
             menu: None,
+            context_menu: None,
             favicons: HashMap::new(),
             renaming: None,
             clicked: None,
@@ -875,6 +879,20 @@ impl Workspace {
         let thread_id = thread_id.to_owned();
         move |menu, window, cx| {
             let Some(workspace) = view.upgrade() else { return menu };
+            workspace.update(cx, |this, cx| {
+                this.sidebar.context_menu = Some(thread_id.clone());
+                cx.notify();
+            });
+            let (closed_view, closed_id) = (view.clone(), thread_id.clone());
+            cx.subscribe_self(move |_, _: &gpui_kit::DismissEvent, cx| {
+                let _ = closed_view.update(cx, |this, cx| {
+                    if this.sidebar.context_menu.as_ref() == Some(&closed_id) {
+                        this.sidebar.context_menu = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
             if let Some(bulk) = workspace.read(cx).bulk_menu(&thread_id) {
                 return bulk.build(&view, menu, window, cx);
             }
@@ -1919,7 +1937,8 @@ impl Workspace {
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
                 .into_any_element(),
         };
-        let menu_open = self.sidebar.menu.as_ref().is_some_and(|m| m.owner.as_deref() == Some(thread.id.as_str()));
+        let menu_open = self.sidebar.menu.as_ref().is_some_and(|m| m.owner.as_deref() == Some(thread.id.as_str()))
+            || self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
         let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
         let thread_id = thread.id.clone();
         let snooze = facts.can_snooze(now).then(|| {
@@ -2298,6 +2317,7 @@ impl Workspace {
         let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
         // Beside a Woke label the action takes its own place (`isWoke && ...:static`).
         let beside = woke_status && hovered;
+        let menu_open = self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
         let settle = h_flex()
             .id(SharedString::from(format!("folder-settle-{}", thread.id)))
             .when(!beside, |el| el.absolute().top_0().bottom_0().right_0().invisible())
@@ -2305,6 +2325,7 @@ impl Workspace {
             .px(px(8.))
             .rounded(px(6.))
             .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
+            .when(menu_open, gpui_kit::Styled::visible)
             .text_color(tokens.muted_foreground)
             .hover(|s| s.text_color(sb.foreground))
             .tooltip(tooltip("Settle thread"))
@@ -2320,7 +2341,12 @@ impl Workspace {
             .min_w(px(32.))
             .flex_none()
             .justify_end()
-            .child(div().when(!woke_status, |el| el.group_hover(ROW_GROUP, gpui_kit::Styled::invisible)).child(label))
+            .child(
+                div()
+                    .when(!woke_status, |el| el.group_hover(ROW_GROUP, gpui_kit::Styled::invisible))
+                    .when(!woke_status && menu_open, gpui_kit::Styled::invisible)
+                    .child(label),
+            )
             .child(settle);
         let title_color = if recede {
             sb.foreground.opacity(0.75)
@@ -2449,6 +2475,7 @@ impl Workspace {
         };
         let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
         let beside = woke && hovered;
+        let menu_open = self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
         let action = action.map(|(action_shelf, name, size, label)| {
             let thread_id = thread.id.clone();
             h_flex()
@@ -2458,6 +2485,7 @@ impl Workspace {
                 .px(px(6.))
                 .rounded(px(6.))
                 .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
+                .when(menu_open, gpui_kit::Styled::visible)
                 .text_color(tokens.muted_foreground)
                 .hover(|s| s.text_color(sb.foreground))
                 .tooltip(tooltip(label))
@@ -2528,6 +2556,7 @@ impl Workspace {
                         div()
                             .when(action.is_some() && !woke, |el| {
                                 el.group_hover(ROW_GROUP, gpui_kit::Styled::invisible)
+                                    .when(menu_open, gpui_kit::Styled::invisible)
                             })
                             .child(label),
                     )
