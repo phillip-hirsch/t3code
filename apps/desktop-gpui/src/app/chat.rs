@@ -7,12 +7,13 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use gpui_kit::component::button::Button;
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
@@ -291,7 +292,7 @@ fn scroll_to_end_button(
     button: gpui_kit::component::button::Button,
     t: &Tokens,
 ) -> gpui_kit::component::button::Button {
-    use gpui_kit::component::{IconName as ComponentIcon, Sizable as _};
+    use gpui_kit::component::IconName as ComponentIcon;
     button
         .xsmall()
         .icon(Icon::new(ComponentIcon::ChevronDown).size(px(14.)))
@@ -748,6 +749,9 @@ pub(super) fn render_row(
             lane(0., subagent_group(key, cards, *expanded, this, &t)).into_any_element()
         }
         Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
+        Row::CreatedThread { id, title, thread_id, .. } => {
+            lane(8., created_thread_card(id, title.as_ref(), thread_id.as_ref(), this, &t)).into_any_element()
+        }
         Row::AttemptFold { key, expanded } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
             let button = h_flex()
@@ -1180,6 +1184,59 @@ fn subagent_group(
 }
 
 /// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.
+/// `V2LifecycleRow`'s `resourceSummary` card: a thread the turn created, with Open chat.
+fn created_thread_card(
+    id: &SharedString,
+    title: Option<&SharedString>,
+    thread_id: Option<&SharedString>,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let open = thread_id.cloned().map(|thread_id| {
+        let this = this.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            let thread_id = thread_id.to_string();
+            let _ = this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
+        }
+    });
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap(px(12.))
+        .p(px(12.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(alpha(t.border, 0.6))
+        .child(
+            div()
+                .size(px(36.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(alpha(t.muted, 0.6))
+                .child(Icon::new(IconName::MessageSquare).size(px(16.)).text_color(t.muted_foreground)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title.cloned().unwrap_or_else(|| "Created thread".into())),
+        )
+        .child(
+            Button::new(ElementId::Name(format!("open-created:{id}").into()))
+                .outline()
+                .xsmall()
+                .label("Open chat")
+                .when_some(open, |button, open| button.on_click(open)),
+        )
+        .into_any_element()
+}
+
 fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let open = {
         let (this, embed) = (this.clone(), embed.clone());

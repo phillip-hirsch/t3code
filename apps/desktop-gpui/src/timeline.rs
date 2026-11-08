@@ -100,6 +100,13 @@ pub enum Row {
     Subagent(Rc<SubagentCard>),
     /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
     Embed(Rc<Embed>),
+    /// A thread the turn created, summarized under its last reply (`resourceSummary`).
+    CreatedThread {
+        id: SharedString,
+        run_id: SharedString,
+        title: Option<SharedString>,
+        thread_id: Option<SharedString>,
+    },
     /// "Superseded attempt": the work a steer cut off, folded.
     AttemptFold {
         key: SharedString,
@@ -2049,7 +2056,7 @@ pub fn rows(
         }
     }
 
-    let mut rows = attach_trailing_meta(rows);
+    let mut rows = attach_trailing_meta(attach_created_thread_summaries(rows, &entries));
     let flags: Vec<(bool, bool, bool)> = rows
         .iter()
         .map(|row| (row.is_work(), row.is_own_user_message(), matches!(row, Row::User { steer: Some(_), .. })))
@@ -2147,6 +2154,44 @@ fn attach_changed_files(
 
 /// `attachTrailingToolGroupsToAssistant`: when tool groups of the same run follow a finished
 /// reply, its actions move under the last of them.
+/// `attachCreatedThreadSummaries`: each thread a turn created gets a card under the turn's last reply.
+fn attach_created_thread_summaries(rows: Vec<Row>, entries: &[Rc<TimelineEntry>]) -> Vec<Row> {
+    let created: Vec<Row> = entries
+        .iter()
+        .filter_map(|entry| {
+            let work = entry.work().filter(|work| work.item_type == "thread_created")?;
+            let raw = &work.item.0.raw;
+            let text = |key: &str| raw.get(key).and_then(Value::as_str).map(|v| SharedString::from(v.to_owned()));
+            Some(Row::CreatedThread {
+                id: format!("summary:{}", entry.id).into(),
+                run_id: entry.run_id.clone()?,
+                title: text("title"),
+                thread_id: text("targetThreadId"),
+            })
+        })
+        .collect();
+    if created.is_empty() {
+        return rows;
+    }
+    let mut out = Vec::with_capacity(rows.len() + created.len());
+    for row in rows {
+        let run = match &row {
+            Row::Assistant { terminal: true, run_id: Some(run), .. } => Some(run.clone()),
+            _ => None,
+        };
+        out.push(row);
+        if let Some(run) = run {
+            out.extend(
+                created
+                    .iter()
+                    .filter(|card| matches!(card, Row::CreatedThread { run_id, .. } if *run_id == run))
+                    .cloned(),
+            );
+        }
+    }
+    out
+}
+
 fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
     let failed_or_tool = |e: &Entry| e.is_tool_like() || (e.item_type == "error" && e.status == Some(Status::Failed));
     let mut meta_after: HashMap<usize, usize> = HashMap::new();
@@ -2155,6 +2200,11 @@ fn attach_trailing_meta(rows: Vec<Row>) -> Vec<Row> {
         let mut last = None;
         let mut trailing = false;
         for (candidate_index, candidate) in rows.iter().enumerate().skip(index + 1) {
+            if matches!(candidate, Row::CreatedThread { run_id, .. } if run_id == run) {
+                trailing = true;
+                last = Some(candidate_index);
+                continue;
+            }
             let Row::Work(work) = candidate else {
                 if matches!(candidate, Row::User { .. } | Row::Assistant { .. }) {
                     break;
@@ -2315,6 +2365,7 @@ mod tests {
                 Row::SubagentGroup { cards, .. } => format!("subagents {}", cards.len()),
                 Row::AttemptFold { expanded, .. } => format!("attempt-fold {expanded}"),
                 Row::Embed(embed) => format!("embed {}", embed.title),
+                Row::CreatedThread { title, .. } => format!("created {}", title.as_deref().unwrap_or_default()),
                 Row::Queued { message, .. } => format!("queued {}", message.text),
                 Row::QueueToggle { total, .. } => format!("queue-toggle {total}"),
                 Row::Now(_) => "now".into(),
@@ -2378,6 +2429,21 @@ mod tests {
         let reply = described.iter().position(|row| row == "assistant done").expect("the reply");
         assert!(described[reply + 1].starts_with("work"), "{described:?}");
         assert_eq!(described.get(reply + 2).map(String::as_str), Some("meta"), "{described:?}");
+    }
+
+    #[test]
+    fn created_threads_summarize_under_the_turns_last_reply() {
+        let mut items = turn("r1");
+        let created = json!({"title": "Fix CI", "targetThreadId": "t2"});
+        items.insert(2, item("r1-new", "thread_created", "r1", "2026-11-04T10:00:01.500Z", created));
+        let p = projection(items, json!([{"id": "r1", "status": "completed", "ordinal": 1}]));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        // The card counts as trailing work, so the reply's actions follow it.
+        assert_eq!(described, ["user go", "fold Worked for 1m 5s", "assistant done", "created Fix CI", "meta"]);
+        let open = HashSet::from([fold_key("r1")]);
+        let described = describe(&rows(&p, &open, &RowOptions::default(), &mut EntryCache::default()));
+        assert_eq!(described.iter().filter(|row| row.starts_with("created")).count(), 1, "{described:?}");
+        assert_eq!(described.last().map(String::as_str), Some("meta"), "{described:?}");
     }
 
     #[test]
