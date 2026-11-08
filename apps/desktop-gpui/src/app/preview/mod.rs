@@ -1393,10 +1393,23 @@ fn host_of(url: &str) -> String {
     url::Url::parse(url).ok().and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_else(|| url.to_owned())
 }
 
-/// Electron's `reloadIgnoringCache`, as close as wry gets: a plain reload, which revalidates the page.
+/// Electron's `reloadIgnoringCache`. wry has no cache-bypassing reload, so the page refetches its
+/// document and static resources past the HTTP cache, then reloads onto the fresh copies. The
+/// refetch is bounded: a stalled server must not stop the reload. Fetches and XHRs are not replayed.
+const HARD_RELOAD_SCRIPT: &str = "(()=>{const abort=new AbortController();\
+const timer=setTimeout(()=>abort.abort(),5000);\
+const kinds=new Set(['script','link','css','img','image','video','audio','track']);\
+const urls=new Set([location.href.split('#')[0]]);\
+for(const e of performance.getEntriesByType('resource')){if(kinds.has(e.initiatorType))urls.add(e.name);}\
+const refetch=(u)=>{try{if(!/^https?:/.test(u))return null;const same=new URL(u).origin===location.origin;\
+return fetch(u,{cache:'reload',mode:same?'same-origin':'no-cors',credentials:'include',signal:abort.signal})\
+.then((r)=>r.blob());}catch{return null;}};\
+Promise.allSettled([...urls].map(refetch)).finally(()=>{clearTimeout(timer);location.reload();});})()";
+
 fn hard_reload(view: &wry::WebView) {
-    if let Err(error) = view.reload() {
-        log::warn!("could not reload the page: {error}");
+    if let Err(error) = view.evaluate_script(HARD_RELOAD_SCRIPT) {
+        log::warn!("could not hard reload the page: {error}");
+        let _ = view.reload();
     }
 }
 
