@@ -7,6 +7,7 @@
 //! Actions this client has no surface for yet (guest sharing, PR linking, new project, clone, WSL folders,
 //! the theme editor, workspace focus) are left out.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -157,6 +158,8 @@ struct Row {
     run: Run,
     /// Keywords that match besides the title (`searchTerms`).
     terms: &'static [&'static str],
+    /// Search terms from the data: member names, paths and environments.
+    data_terms: Vec<SharedString>,
     /// Ranking, while a query is typed.
     quality: f32,
 }
@@ -175,6 +178,7 @@ impl Row {
             pin: None,
             run,
             terms: &[],
+            data_terms: Vec::new(),
             quality: 0.,
         }
     }
@@ -212,6 +216,10 @@ pub(super) struct Palette {
     threads: Option<ThreadRanking>,
     /// "In messages", in the order last shown.
     message_order: MessageOrder,
+    /// Project and "New thread in..." rows by group key, in the order the palette opened with:
+    /// a pin from a row must not move rows under the pointer or the jump numbers.
+    project_order: RefCell<Option<Vec<String>>>,
+    new_thread_order: RefCell<Option<Vec<String>>>,
     _subscription: Subscription,
 }
 
@@ -247,6 +255,24 @@ fn next_shown_order(previous: Option<ShownOrder>, query: &str, ranked: Vec<Strin
     let arrived = rest.iter().filter(|key| !previous.keys.contains(key)).count();
     let shown = (kept.len() + rest.len()).min(limit + LATE_ROOM).min(limit.max(kept.len() + arrived.min(LATE_ROOM)));
     ShownOrder { query: previous.query, keys: [kept, rest].concat(), shown }
+}
+
+/// `useOrderWhileOpen`: `items` sorted into the held order by key, rows it has not seen after,
+/// in their own order; those then hold their places too.
+fn hold_order<T>(order: &RefCell<Option<Vec<String>>>, items: Vec<(String, T)>) -> Vec<(String, T)> {
+    let mut order = order.borrow_mut();
+    let held = order.get_or_insert_with(Vec::new);
+    let rank = |key: &str| held.iter().position(|k| k == key);
+    let mut ranked: Vec<(usize, (String, T))> =
+        items.into_iter().enumerate().map(|(at, item)| (rank(&item.0).unwrap_or(held.len() + at), item)).collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    let items: Vec<(String, T)> = ranked.into_iter().map(|(_, item)| item).collect();
+    for (key, _) in &items {
+        if !held.contains(key) {
+            held.push(key.clone());
+        }
+    }
+    items
 }
 
 /// `MESSAGE_PREFIX`: a match quality at or above it is a word match.
@@ -382,6 +408,8 @@ impl Workspace {
             dark: crate::theme::tokens(cx).dark,
             threads: None,
             message_order: MessageOrder::default(),
+            project_order: RefCell::default(),
+            new_thread_order: RefCell::default(),
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -611,36 +639,89 @@ impl Workspace {
                 preferred: current.as_ref().is_some_and(|id| g.project_ids.contains(id)),
             })
             .collect();
-        let mut rows: Vec<Row> = pickable
+        let mut rows: Vec<(String, Row)> = pickable
             .iter()
             .filter(|g| !g.members[0].is_scratch)
-            .enumerate()
-            .map(|(i, g)| {
+            .map(|g| {
                 let p = g.representative();
-                let mut row = Row::new(
-                    format!("new-in-{}", p.id),
-                    RowIcon::Project(p.id.clone()),
-                    g.display_name.clone(),
-                    Run::NewThread(p.id.clone()),
+                let mut row = self.project_row(format!("new-in-{}", p.id), g, Run::NewThread(p.id.clone()));
+                // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
+                row.data_terms.extend(
+                    g.members
+                        .iter()
+                        .flat_map(|m| [m.project.title.clone().into(), m.project.workspace_root.clone().into()]),
                 );
-                row.description = Some(Description::Text(format!("Local · {}", p.workspace_root).into()));
-                row.shortcut = (i < 9).then(|| self.shortcut(&format!("thread.jump.{}", i + 1))).flatten();
-                row.pin = Some((g.project_ids.clone(), g.pinned));
-                row
+                row.data_terms.push(self.location_label(&p.environment_id));
+                (g.key.clone(), row)
             })
             .collect();
         if let Some(environment) = self.scratch_environment() {
             let mut row = Row::new(
-                "new-thread-no-project",
+                NO_PROJECT_KEY,
                 RowIcon::Lucide(IconName::MessageSquareDashed),
                 "No project",
                 Run::ScratchThread(environment),
             );
             row.terms = &["no project", "without project", "none"];
             row.shortcut = self.shortcut("chat.newWithoutProject");
-            rows.insert(no_project_index(&entries), row);
+            rows.insert(no_project_index(&entries), (NO_PROJECT_KEY.to_owned(), row));
         }
-        rows
+        let Some(palette) = &self.palette else { return Vec::new() };
+        let rows = hold_order(&palette.new_thread_order, rows);
+        // Jump shortcuts follow the rows as shown, so a pin cannot move a number to another row.
+        let mut jump = 0;
+        rows.into_iter()
+            .map(|(key, mut row)| {
+                if key != NO_PROJECT_KEY {
+                    jump += 1;
+                    row.shortcut = (jump <= 9).then(|| self.shortcut(&format!("thread.jump.{jump}"))).flatten();
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// `buildProjectActionItems`: a project group's row, matched by its names and path.
+    fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, run: Run) -> Row {
+        let p = group.representative();
+        let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
+        let location = self.location_label(&p.environment_id);
+        row.description = Some(Description::Text(format!("{location} · {}", p.workspace_root).into()));
+        row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
+        row.pin = Some((group.project_ids.clone(), group.pinned));
+        row
+    }
+
+    /// Projects as root search results (`buildProjectSearchItems`): a grouped project matches on
+    /// every member's name, path and machine, and lists the machines it lives on.
+    fn project_search_rows(&self) -> Vec<Row> {
+        let groups = self.project_groups();
+        let current = self.current_project().map(|p| p.id.clone());
+        let rows = crate::project_groups::picker(&groups, current.as_deref())
+            .into_iter()
+            .map(|g| {
+                let p = g.representative();
+                let mut row = self.project_row(format!("project-{}", p.id), g, Run::Project(p.id.clone()));
+                let mut labels: Vec<SharedString> = Vec::new();
+                for member in &g.members {
+                    let label = self.location_label(&member.project.environment_id);
+                    row.data_terms.extend([
+                        member.project.title.clone().into(),
+                        member.project.workspace_root.clone().into(),
+                        label.clone(),
+                    ]);
+                    if !labels.contains(&label) {
+                        labels.push(label);
+                    }
+                }
+                if g.members.len() > 1 {
+                    row.description = Some(Description::Text(labels.join(" · ").into()));
+                }
+                (g.key.clone(), row)
+            })
+            .collect();
+        let Some(palette) = &self.palette else { return Vec::new() };
+        hold_order(&palette.project_order, rows).into_iter().map(|(_, row)| row).collect()
     }
 
     /// The live shortcut label of `command` (`shortcutCommand`), as tooltips show it.
@@ -926,8 +1007,6 @@ impl Workspace {
                 Group { label: "Recent Threads", rows: recent },
             ];
         }
-        let current = self.current_project().map(|p| p.id.clone());
-        let projects = self.pickable_projects(current.as_deref());
         let stem: Vec<char> = "new thread in".chars().collect();
         let names_stem = stem.starts_with(&tokens.join(&' ')[..]);
         let suggestions: Vec<Row> = if names_stem {
@@ -942,19 +1021,7 @@ impl Workspace {
                 })
                 .collect()
         };
-        let project_rows: Vec<Row> = projects
-            .iter()
-            .map(|p| {
-                let mut row = Row::new(
-                    format!("project-{}", p.id),
-                    RowIcon::Project(p.id.clone()),
-                    self.group_name(p),
-                    Run::Project(p.id.clone()),
-                );
-                row.description = Some(Description::Text(format!("Local · {}", p.workspace_root).into()));
-                row
-            })
-            .collect();
+        let project_rows = self.project_search_rows();
         let settings: Vec<Row> = super::pages::settings_sections()
             .map(|(group, id, label)| {
                 let mut row =
@@ -1843,6 +1910,7 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
             // The title names the item; its terms are keywords, the best one counts.
             let found = std::iter::once(title.as_str())
                 .chain(row.terms.iter().copied())
+                .chain(row.data_terms.iter().map(SharedString::as_ref))
                 .filter_map(|text| search::match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos))
                 .max_by(|a, b| a.quality.total_cmp(&b.quality))?;
             row.quality = found.quality;
@@ -1859,6 +1927,9 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
     });
     scored
 }
+
+/// The "No project" row's key, which holds its place among the projects.
+const NO_PROJECT_KEY: &str = "new-thread-no-project";
 
 /// A pickable project group, as `newThreadNoProjectIndex` sees it.
 struct NoProjectEntry {
@@ -1915,6 +1986,26 @@ mod tests {
             base.extend(fields);
         }
         serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    fn project_rows_hold_their_opening_order_while_new_ones_join_at_the_end() {
+        let order = RefCell::default();
+        let keys = |items: Vec<(String, ())>| items.into_iter().map(|(key, ())| key).collect::<Vec<_>>();
+        let items = |keys: &[&str]| keys.iter().map(|key| ((*key).to_owned(), ())).collect::<Vec<_>>();
+        assert_eq!(keys(hold_order(&order, items(&["a", "b", "c"]))), ["a", "b", "c"]);
+        assert_eq!(keys(hold_order(&order, items(&["c", "a", "b"]))), ["a", "b", "c"], "a pin moves nothing");
+        assert_eq!(keys(hold_order(&order, items(&["d", "c", "a"]))), ["a", "c", "d"], "a new row joins at the end");
+        assert_eq!(keys(hold_order(&order, items(&["e", "d", "b", "a"]))), ["a", "b", "d", "e"]);
+    }
+
+    #[test]
+    fn project_rows_match_member_paths_and_machines() {
+        let mut row = Row::new("p", RowIcon::Lucide(IconName::Folder), "t3code", Run::Open(View::Browse));
+        row.data_terms = vec!["H:\\Developer\\t3code".into(), "Studio Mac".into()];
+        let finds = |query: &str| !score_rows(vec![row.clone()], &search::fold_query(query), false).is_empty();
+        assert!(finds("developer") && finds("studio"));
+        assert!(!finds("sidebar"));
     }
 
     #[test]

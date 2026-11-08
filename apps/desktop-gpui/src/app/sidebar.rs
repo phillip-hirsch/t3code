@@ -712,16 +712,6 @@ impl Workspace {
         cache.groups.clone()
     }
 
-    /// The projects the palette offers: one per open group, pinned first, then the group of
-    /// `preferred` (`buildSidebarProjectPickerEntries`).
-    pub(super) fn pickable_projects(&self, preferred: Option<&str>) -> Vec<&ProjectShell> {
-        let groups = self.project_groups();
-        project_groups::picker(&groups, preferred)
-            .into_iter()
-            .filter_map(|g| self.shell.projects.iter().find(|p| p.id == g.representative().id))
-            .collect()
-    }
-
     /// The project ids the filter keeps, or `None` for all projects.
     fn scoped_project_ids(&self) -> Option<HashSet<String>> {
         let groups = self.project_groups();
