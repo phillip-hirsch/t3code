@@ -558,7 +558,7 @@ impl Workspace {
     }
 
     /// The panel's width in this window.
-    pub(super) fn pr_panel_width(&self, window: &Window) -> f32 {
+    pub(in crate::app) fn pr_panel_width(&self, window: &Window) -> f32 {
         let viewport = f32::from(window.viewport_size().width);
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         clamp_panel_width(self.pull_requests.panel_width.unwrap_or(viewport / 2.), viewport - sidebar)

@@ -806,7 +806,11 @@ impl Workspace {
             .h_full()
             .min_h_0()
             .child(self.render_header(window, cx))
-            .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
+            .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(
+                self.pull_request_column_width(window) >= LIST_TOOLBAR_ONE_ROW,
+                &tokens,
+                cx,
+            )))
             .child(div().flex_1().min_h_0().child(body));
         if !self.pull_request_panel_shown() {
             return column.into_any_element();
@@ -840,13 +844,21 @@ impl Workspace {
         }
     }
 
-    fn render_pull_request_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The list column's width: the main column less a panel beside it (`@container/pr-list`).
+    fn pull_request_column_width(&self, window: &Window) -> f32 {
+        let viewport = f32::from(window.viewport_size().width);
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
+        let panel = if self.pull_request_panel_shown() { self.pr_panel_width(window) } else { 0. };
+        viewport - sidebar - panel
+    }
+
+    /// `wide`: the search shares the row with the controls; narrower, it takes a row of its own.
+    fn render_pull_request_toolbar(&self, wide: bool, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.pull_requests;
         let view = cx.entity();
         let search = h_flex()
             .id("pr-search")
-            .flex_1()
-            .min_w(px(96.))
+            .map(|el| if wide { el.flex_1().min_w(px(96.)) } else { el.w_full() })
             .h(px(32.))
             .px(px(10.))
             .gap(px(8.))
@@ -1384,6 +1396,9 @@ impl Workspace {
 }
 
 /// The centered `max-w-6xl` column every part of the page sits in.
+/// `@lg/pr-list` (32rem): from this column width the search shares the toolbar's first row.
+const LIST_TOOLBAR_ONE_ROW: f32 = 512.;
+
 fn page_frame() -> gpui_kit::Div {
     div().w_full().max_w(px(PAGE_MAX_WIDTH)).mx_auto().px(px(PAGE_GUTTER))
 }
