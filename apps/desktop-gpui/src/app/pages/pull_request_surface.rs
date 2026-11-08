@@ -170,10 +170,28 @@ impl Workspace {
 }
 
 impl Workspace {
-    /// `LinkPullRequestDialog`: links a change request to the open thread by URL or number.
+    /// Pull requests link to threads where the environment reports capabilities
+    /// (`threadPullRequestLinkMode`).
+    pub(in crate::app) fn pull_request_linking(&self, thread_id: &str) -> bool {
+        let environment = self.thread_environment(thread_id);
+        environment.and_then(|e| self.env_info(&e)).is_some_and(|info| !info.capabilities.is_null())
+    }
+
     fn open_link_pull_request_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(shell) = self.open_thread_shell() else { return };
-        let thread_id = shell.id.clone();
+        if let Some(thread_id) = self.open_thread_shell().map(|shell| shell.id.clone()) {
+            self.open_link_pull_request(thread_id, window, cx);
+        }
+    }
+
+    /// `LinkPullRequestDialog`: links a change request to `thread_id` by URL or number. The panel
+    /// and the command palette open this one dialog.
+    pub(in crate::app) fn open_link_pull_request(
+        &mut self,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
         let identity =
             self.shell.projects.iter().find(|p| p.id == shell.project_id).and_then(|p| p.repository_identity.clone());
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Pull request URL or #42"));
