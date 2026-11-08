@@ -708,17 +708,10 @@ impl Workspace {
 
     pub(in crate::app) fn render_usage_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let viewport = window.viewport_size();
-        let padding = if viewport.width >= px(1024.) {
-            40.
-        } else if viewport.width >= px(640.) {
-            24.
-        } else {
-            0.
-        };
+        let viewport = f32::from(window.viewport_size().width);
+        let padding = modal_padding(viewport);
         // `@4xl/usage-header` (56rem) on the header's content box, inside the border and `ps-5 pe-2`.
-        let panel = (f32::from(viewport.width) - 2. * padding).min(1280.);
-        let compact = panel - 2. - 28. < 896.;
+        let compact = modal_panel_width(viewport) - 2. - 28. < 896.;
         // `AppRouteModal` focuses its surface, not its first control, and keeps Tab inside it.
         let focus = window.use_keyed_state("usage-modal-focus", cx, |_, cx| cx.focus_handle()).read(cx).clone();
         if std::mem::take(&mut self.usage.focus_on_open) {
@@ -763,7 +756,7 @@ impl Workspace {
                                     .w_full()
                                     .max_w(px(1024.))
                                     .mx_auto()
-                                    .px(px(24.))
+                                    .px(px(page_gutter(viewport)))
                                     .pt(px(24.))
                                     .pb(px(48.))
                                     .gap(px(24.))
@@ -1015,8 +1008,9 @@ impl Workspace {
             let ask = if self.usage_environments().is_empty() { "Connect" } else { "Select" };
             return muted_line(format!("{ask} an environment to see {what}."), t).into_any_element();
         }
+        let viewport = f32::from(win.viewport_size().width);
         if limits {
-            return self.render_limits(t, cx);
+            return self.render_limits(t, viewport, cx);
         }
         // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
         // So does a pick of environments the last read missed.
@@ -1034,7 +1028,7 @@ impl Workspace {
                 .text_color(t.muted_foreground)
                 .child(error.to_owned())
                 .into_any_element(),
-            (None, None) => usage_skeleton(t).into_any_element(),
+            (None, None) => usage_skeleton(t, viewport).into_any_element(),
             (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, win, cx),
         }
     }
@@ -1055,7 +1049,7 @@ impl Workspace {
         pools
     }
 
-    fn render_limits(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_limits(&mut self, t: &Tokens, viewport: f32, cx: &mut Context<Self>) -> AnyElement {
         let pools = self.limit_pools();
         let usage = &self.usage;
         let hidden = usage.hidden_drivers();
@@ -1085,7 +1079,13 @@ impl Workspace {
         if self.usage.card.open.as_ref().is_some_and(|open| !keys.contains(open)) {
             self.usage.card.close();
         }
+        // A card's heading stacks above its bar below `md`; the bar's own `@2xl/pool` (42rem) container
+        // query, inside the card's border, `p-4` and heading column, picks the wide segments.
+        let stack = viewport < MD;
+        let pool_width = page_content_width(viewport) - 2. - 32. - if stack { 0. } else { 176. + 24. };
         let segments = Segments {
+            stack,
+            wide: pool_width >= 672.,
             now,
             hour12: self.hour12(),
             redeemed: &self.usage.redeemed,
@@ -1279,16 +1279,14 @@ impl Workspace {
 
         let chart_title =
             format!("{} {}", if hourly { "Hourly" } else { "Daily" }, if tokens { "processed tokens" } else { "cost" });
-        overview = overview.child(
-            h_flex().items_start().gap(px(24.)).child(summary_column.w(px(288.)).flex_none()).child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(12.))
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(chart_title))
-                    .child(self.render_usage_chart(&merged, window, &providers, t, cx)),
-            ),
-        );
+        let viewport = f32::from(win.viewport_size().width);
+        let (lg, md) = (viewport >= LG, viewport >= MD);
+        let chart = v_flex()
+            .min_w_0()
+            .gap(px(12.))
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(chart_title))
+            .child(self.render_usage_chart(&merged, window, &providers, t, cx));
+        overview = overview.child(summary_and_chart(lg, summary_column, chart));
 
         let metric = |label: &str, value: String| {
             v_flex()
@@ -1297,21 +1295,15 @@ impl Workspace {
                 .child(div().text_xs().text_color(t.muted_foreground).child(label.to_owned()))
                 .child(dim(div()).text_base().font_weight(FontWeight::MEDIUM).child(value))
         };
-        overview = overview.child(
-            v_flex().gap(px(8.)).mt(px(18.)).child(section_title("Totals")).child(
-                h_flex().py(px(4.)).children(
-                    [
-                        metric("Processed tokens", logic::format_tokens(merged.total_tokens as f64)),
-                        metric("Cached input", logic::format_tokens(merged.cached_input_tokens as f64)),
-                        metric("Uncached input", logic::format_tokens(merged.uncached_input_tokens as f64)),
-                        metric("Output", logic::format_tokens(merged.output_tokens as f64)),
-                        metric("Cache savings", logic::format_usd(merged.cache_savings_usd)),
-                    ]
-                    .into_iter()
-                    .map(|m| m.flex_1().pr(px(24.))),
-                ),
-            ),
-        );
+        overview = overview.child(v_flex().gap(px(8.)).mt(px(18.)).child(section_title("Totals")).child(
+            totals_grid(md).children([
+                metric("Processed tokens", logic::format_tokens(merged.total_tokens as f64)),
+                metric("Cached input", logic::format_tokens(merged.cached_input_tokens as f64)),
+                metric("Uncached input", logic::format_tokens(merged.uncached_input_tokens as f64)),
+                metric("Output", logic::format_tokens(merged.output_tokens as f64)),
+                metric("Cache savings", logic::format_usd(merged.cache_savings_usd)),
+            ]),
+        ));
 
         if merged.total_tokens > 0 {
             let ink = |share: f32| mix(t.foreground, t.background, share);
@@ -1360,10 +1352,7 @@ impl Workspace {
                 bars
             };
             overview = overview.child(
-                h_flex()
-                    .mt(px(18.))
-                    .gap(px(48.))
-                    .children(bars.into_iter().map(|bar| div().flex_1().min_w_0().child(bar))),
+                share_bars_grid(lg).mt(px(18.)).children(bars.into_iter().map(|bar| div().min_w_0().child(bar))),
             );
         }
 
@@ -1797,6 +1786,55 @@ fn usage_error(error: &crate::rpc::RpcError) -> String {
     }
 }
 
+/// Tailwind's `md` and `lg` viewport breakpoints.
+const MD: f32 = 768.;
+const LG: f32 = 1024.;
+
+/// `AppRouteModal`'s `sm:p-6 lg:p-10` around its panel.
+fn modal_padding(viewport: f32) -> f32 {
+    if viewport >= LG {
+        40.
+    } else if viewport >= 640. {
+        24.
+    } else {
+        0.
+    }
+}
+
+/// The panel's `sm:max-w-[80rem]` border box.
+fn modal_panel_width(viewport: f32) -> f32 {
+    (viewport - 2. * modal_padding(viewport)).min(1280.)
+}
+
+/// `WorkspacePageContainer`'s `px-5 sm:px-6`.
+fn page_gutter(viewport: f32) -> f32 {
+    if viewport >= 640. { 24. } else { 20. }
+}
+
+/// The width inside `WorkspacePageContainer width="wide"` (`max-w-5xl`), within the panel's border.
+fn page_content_width(viewport: f32) -> f32 {
+    (modal_panel_width(viewport) - 2.).min(1024.) - 2. * page_gutter(viewport)
+}
+
+/// `grid gap-6 lg:grid-cols-[minmax(0,18rem)_minmax(0,1fr)]`: the summary beside the chart, above it below `lg`.
+fn summary_and_chart(lg: bool, summary: gpui_kit::Div, chart: gpui_kit::Div) -> gpui_kit::Div {
+    if lg {
+        h_flex().items_start().gap(px(24.)).child(summary.w(px(288.)).flex_none()).child(chart.flex_1())
+    } else {
+        v_flex().gap(px(24.)).child(summary).child(chart)
+    }
+}
+
+/// `grid grid-cols-2 gap-x-6 gap-y-4 py-1 md:grid-cols-5`.
+fn totals_grid(md: bool) -> gpui_kit::Div {
+    div().grid().grid_cols(if md { 5 } else { 2 }).gap_x(px(24.)).gap_y(px(16.)).py(px(4.))
+}
+
+/// `grid gap-x-12 gap-y-8 lg:grid-cols-2`.
+fn share_bars_grid(lg: bool) -> gpui_kit::Div {
+    div().grid().grid_cols(if lg { 2 } else { 1 }).gap_x(px(48.)).gap_y(px(32.))
+}
+
 fn section_title(title: &str) -> impl IntoElement {
     div().text_sm().font_weight(FontWeight::MEDIUM).child(title.to_owned())
 }
@@ -2060,8 +2098,10 @@ fn share_bar(
         .into_any_element()
 }
 
-/// What every limit segment reads: the clock, redeem progress, the shared card and focus handles.
+/// What every limit segment reads: the layout, the clock, redeem progress, the shared card and focus handles.
 struct Segments<'a> {
+    stack: bool,
+    wide: bool,
     now: i64,
     hour12: bool,
     redeemed: &'a [Redeem],
@@ -2119,10 +2159,23 @@ fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Se
     let cursor = (pool.driver == "cursor").then(|| logic::CURSOR_WINDOWS.iter().find(|w| w.0 == window.id)).flatten();
     let label = cursor.map_or(window.label.clone(), |w| w.1.to_owned());
     let several = window.columns.len() > 1;
-    let bars = window.columns.iter().map(|member| {
+    let bars = window.columns.iter().enumerate().map(|(position, member)| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, color, segments, cx)
+        pool_segment(pool, window, member, position + 1, color, segments, cx)
     });
+    let bar = h_flex().min_w_0().gap(px(4.)).children(bars);
+    // Below `@2xl/pool` the segments show numbers, and a legend row per account carries their details.
+    let bar = if segments.wide {
+        bar
+    } else {
+        v_flex().min_w_0().gap(px(4.)).child(bar).children(window.columns.iter().enumerate().filter_map(
+            |(position, member)| {
+                member.as_ref().map(|member| legend_row(pool, window, member, position + 1, color, segments))
+            },
+        ))
+    };
+    // Below `md` the heading sits above the bar.
+    let row = if segments.stack { v_flex().gap(px(12.)) } else { h_flex().gap(px(24.)) };
     v_flex()
         .gap(px(12.))
         .rounded(px(8.))
@@ -2130,37 +2183,32 @@ fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Se
         .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
         .p(px(16.))
         .child(
-            h_flex()
-                .gap(px(24.))
-                .child(
-                    v_flex()
-                        .w(px(176.))
-                        .flex_none()
-                        .gap(px(4.))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
-                        .child(
-                            h_flex()
-                                .items_baseline()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .text_3xl()
-                                        .line_height(px(36.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(format!("{}%", window.remaining_percent)),
-                                )
-                                .child(div().text_sm().text_color(t.muted_foreground).child("left"))
-                                .children(
-                                    window
-                                        .pace
-                                        .map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
-                                ),
-                        )
-                        .when_some(window.next_refill.filter(|_| several), |el, refill| {
-                            el.child(div().text_xs().font_weight(FontWeight::MEDIUM).child(format!("↻ +{refill}%")))
-                        }),
-                )
-                .child(h_flex().flex_1().min_w_0().gap(px(4.)).children(bars)),
+            row.child(
+                v_flex()
+                    .when(!segments.stack, |el| el.w(px(176.)).flex_none())
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_3xl()
+                                    .line_height(px(36.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{}%", window.remaining_percent)),
+                            )
+                            .child(div().text_sm().text_color(t.muted_foreground).child("left"))
+                            .children(
+                                window.pace.map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                            ),
+                    )
+                    .when_some(window.next_refill.filter(|_| several), |el, refill| {
+                        el.child(div().text_xs().font_weight(FontWeight::MEDIUM).child(format!("↻ +{refill}%")))
+                    }),
+            )
+            .child(if segments.stack { bar } else { bar.flex_1() }),
         )
         .children(cursor.map(|w| div().text_xs().text_color(t.muted_foreground).child(w.2)))
         .into_any_element()
@@ -2223,6 +2271,7 @@ fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
     member: &logic::Member,
+    index: usize,
     color: Hsla,
     segments: &Segments<'_>,
     cx: &App,
@@ -2232,17 +2281,11 @@ fn pool_segment(
     let key = segment_key(pool, window, account);
     let several = window.columns.len() > 1;
     let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0);
-    let color = crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into());
+    let color = account_color(account, color);
     let remaining = logic::remaining_percent(&member.window);
     let time_left = logic::pace_remaining_percent(&member.window, now);
     let resets_in = logic::format_resets_in(&member.window, now);
-    let name: AnyElement = match (&account.display_name, &account.email) {
-        (Some(name), _) => {
-            div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(name.clone()).into_any_element()
-        }
-        (None, Some(email)) => account_chip(email).into_any_element(),
-        (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
-    };
+    let name = account_name(account);
     let open = segments.card.open.as_deref() == Some(key.as_str());
     let fill = Hsla { a: color.a * 0.35, ..color };
     let ring = t.ring;
@@ -2251,7 +2294,7 @@ fn pool_segment(
         .id(ElementId::Name(format!("pool-{key}").into()))
         .relative()
         .w_full()
-        .h(px(32.))
+        .h(px(if segments.wide { 32. } else { 20. }))
         .rounded(px(6.))
         .bg(t.muted)
         .overflow_hidden()
@@ -2273,44 +2316,61 @@ fn pool_segment(
                 .rounded_full()
                 .bg(t.foreground)
         }))
-        .child(
-            h_flex()
-                .relative()
-                .size_full()
-                .px(px(8.))
-                .gap(px(6.))
-                .text_xs()
-                .when(several, |el| {
-                    el.child(name)
-                        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("{remaining}%")))
-                })
-                .when(resets_in.is_some() || credits.is_some(), |el| {
-                    el.child(
-                        h_flex()
-                            .ml_auto()
-                            .flex_none()
-                            .gap(px(6.))
-                            .rounded(px(4.))
-                            .bg(Hsla { a: 0.85, ..t.background })
-                            .px(px(6.))
-                            .py(px(2.))
-                            .text_size(gpui_kit::rems(0.6875))
-                            .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
-                            .when_some(credits.as_ref(), |el, credits| {
-                                el.when(resets_in.is_some(), |el| {
-                                    el.child(div().text_color(t.muted_foreground).child("·"))
-                                })
-                                .child(
-                                    h_flex()
-                                        .gap(px(2.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
-                                        .child(credits.available_count.to_string()),
-                                )
-                            }),
-                    )
-                }),
-        )
+        .when(!segments.wide, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(gpui_kit::rems(0.625))
+                    .line_height(relative(1.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Hsla { a: 0.8, ..t.foreground })
+                    .child(index.to_string()),
+            )
+        })
+        .when(segments.wide, |el| {
+            el.child(
+                h_flex()
+                    .relative()
+                    .size_full()
+                    .px(px(8.))
+                    .gap(px(6.))
+                    .text_xs()
+                    .when(several, |el| {
+                        el.child(name)
+                            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("{remaining}%")))
+                    })
+                    .when(resets_in.is_some() || credits.is_some(), |el| {
+                        el.child(
+                            h_flex()
+                                .ml_auto()
+                                .flex_none()
+                                .gap(px(6.))
+                                .rounded(px(4.))
+                                .bg(Hsla { a: 0.85, ..t.background })
+                                .px(px(6.))
+                                .py(px(2.))
+                                .text_size(gpui_kit::rems(0.6875))
+                                .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
+                                .when_some(credits.as_ref(), |el, credits| {
+                                    el.when(resets_in.is_some(), |el| {
+                                        el.child(div().text_color(t.muted_foreground).child("·"))
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap(px(2.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
+                                            .child(credits.available_count.to_string()),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+        })
         .on_hover({
             let (view, key) = (view.clone(), key.clone());
             move |hovering: &bool, _, cx| {
@@ -2360,6 +2420,99 @@ fn pool_segment(
             });
         });
     popup.content(card).into_any_element()
+}
+
+/// An account's accent color, or its driver's.
+fn account_color(account: &logic::Account, color: Hsla) -> Hsla {
+    crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into())
+}
+
+/// `AccountName`: the display name, the email's chip, or the driver.
+fn account_name(account: &logic::Account) -> AnyElement {
+    match (&account.display_name, &account.email) {
+        (Some(name), _) => {
+            div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(name.clone()).into_any_element()
+        }
+        (None, Some(email)) => account_chip(email).into_any_element(),
+        (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
+    }
+}
+
+/// `LegendRow`: a narrow pool's numbered account line, which opens the segment's card.
+fn legend_row(
+    pool: &Pool,
+    window: &PoolWindow,
+    member: &logic::Member,
+    index: usize,
+    color: Hsla,
+    segments: &Segments<'_>,
+) -> AnyElement {
+    let (t, now) = (segments.t, segments.now);
+    let account = &pool.accounts[member.account];
+    let key = segment_key(pool, window, account);
+    let color = account_color(account, color);
+    let resets_in = logic::format_resets_in(&member.window, now);
+    let credits = account.limits.reset_credits.as_ref().map_or(0, |c| c.available_count);
+    let view = segments.view.clone();
+    Button::new(ElementId::Name(format!("pool-legend-{key}").into()))
+        .ghost()
+        .small()
+        .w_full()
+        .h(px(28.))
+        .px(px(7.))
+        .rounded(px(6.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(t.foreground)
+        .child(
+            div()
+                .size(px(16.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(Hsla { a: color.a * 0.35, ..color })
+                .text_size(gpui_kit::rems(0.625))
+                .line_height(relative(1.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(Hsla { a: 0.8, ..t.foreground })
+                .child(index.to_string()),
+        )
+        .child(account_name(account))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("{}%", logic::remaining_percent(&member.window))),
+        )
+        .child(
+            h_flex()
+                .ml_auto()
+                .flex_none()
+                .gap(px(6.))
+                .text_size(gpui_kit::rems(0.6875))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(t.muted_foreground)
+                .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
+                .when(credits > 0, |el| {
+                    el.when(resets_in.is_some(), |el| el.child("·")).child(
+                        h_flex()
+                            .gap(px(2.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.foreground)
+                            .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
+                            .child(credits.to_string()),
+                    )
+                }),
+        )
+        .on_click(move |_, _, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.usage.card.press(&key);
+                cx.notify();
+            });
+        })
+        .into_any_element()
 }
 
 /// `SegmentPopover`: the account, its plan and where it is signed in, the window, and its reset credits.
@@ -2478,43 +2631,34 @@ fn segment_card(pool: &Pool, window: &PoolWindow, member: &logic::Member, segmen
         }))
 }
 
-fn usage_skeleton(t: &Tokens) -> impl IntoElement {
+fn usage_skeleton(t: &Tokens, viewport: f32) -> impl IntoElement {
     let bar = |w: f32, h: f32| div().w(px(w)).h(px(h)).rounded(px(6.)).bg(t.muted);
+    let fill = |h: f32| div().h(px(h)).rounded(px(6.)).bg(t.muted);
+    let summary = v_flex()
+        .gap(px(20.))
+        .child(v_flex().gap(px(4.)).child(bar(144., 40.)).child(bar(128., 16.)))
+        .children(logic::PROVIDERS.iter().map(|_| {
+            v_flex()
+                .gap(px(4.))
+                .child(h_flex().justify_between().child(bar(104., 14.)).child(bar(56., 14.)))
+                .child(bar(144., 16.))
+        }));
+    let chart = v_flex().gap(px(12.)).child(bar(96., 20.)).child(fill(224.).ml(px(64.)));
     v_flex()
         .gap(px(24.))
-        .child(
-            h_flex()
-                .items_start()
-                .gap(px(24.))
-                .child(
-                    v_flex()
-                        .w(px(288.))
-                        .gap(px(20.))
-                        .child(v_flex().gap(px(4.)).child(bar(144., 40.)).child(bar(128., 16.)))
-                        .children(logic::PROVIDERS.iter().map(|_| {
-                            v_flex()
-                                .gap(px(4.))
-                                .child(h_flex().justify_between().child(bar(104., 14.)).child(bar(56., 14.)))
-                                .child(bar(144., 16.))
-                        })),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap(px(12.))
-                        .child(bar(96., 20.))
-                        .child(div().ml(px(64.)).h(px(224.)).rounded(px(6.)).bg(t.muted)),
-                ),
-        )
-        .child(v_flex().gap(px(8.)).child(section_title("Totals")).child(h_flex().children(
+        .child(summary_and_chart(viewport >= LG, summary, chart))
+        .child(v_flex().gap(px(8.)).child(section_title("Totals")).child(totals_grid(viewport >= MD).children(
             ["Processed tokens", "Cached input", "Uncached input", "Output", "Cache savings"].map(|label| {
                 v_flex()
-                    .flex_1()
                     .gap(px(2.))
                     .child(div().text_xs().text_color(t.muted_foreground).child(label))
                     .child(bar(64., 24.))
             }),
         )))
+        .child(
+            share_bars_grid(viewport >= LG)
+                .child(v_flex().gap(px(10.)).child(bar(112., 20.)).child(fill(8.)).child(bar(288., 16.))),
+        )
         .child(
             v_flex()
                 .gap(px(12.))
