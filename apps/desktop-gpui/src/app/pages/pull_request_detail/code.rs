@@ -1298,6 +1298,10 @@ impl Workspace {
         let loading_more = code.loading_more.as_deref() == Some(thread.id.as_str());
         let id = thread.id.clone();
         let success = t.success_foreground;
+        let chat = comments
+            .iter()
+            .any(|c| logic::visible_body(&c.body).is_some())
+            .then(|| logic::ChatSubject::Thread(ReviewThread { comments: comments.clone(), ..thread.clone() }));
         let header = h_flex()
             .gap(px(8.))
             .text_xs()
@@ -1327,8 +1331,14 @@ impl Workspace {
                     })),
             )
             .when(thread.is_outdated, |el| el.child("outdated"))
-            .children(self.render_pr_fix_thread(thread, t, cx))
-            .children(self.render_pr_thread_actions(thread, t, cx));
+            .child(
+                h_flex()
+                    .ml_auto()
+                    .gap(px(8.))
+                    .children(self.render_pr_fix(logic::Finding::Thread(thread.clone()), t, cx))
+                    .children(self.render_pr_add_to_chat(&thread.id, chat, false, t, cx))
+                    .children(self.render_pr_thread_actions(thread, t, cx)),
+            );
         let mut body = Vec::new();
         let mut reply_box = None;
         if expanded {

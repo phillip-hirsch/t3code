@@ -77,11 +77,17 @@ pub(super) fn environment_items(
 }
 
 /// `pullRequestHandoffLabels`: beside a thread's composer the fixes land in that thread.
-pub(super) fn fix_labels(in_this_thread: bool) -> (&'static str, &'static str) {
+pub(super) struct FixLabels {
+    pub(super) finding: &'static str,
+    pub(super) check: &'static str,
+    pub(super) findings: &'static str,
+}
+
+pub(super) fn fix_labels(in_this_thread: bool) -> FixLabels {
     if in_this_thread {
-        ("Fix", "Fix findings in this thread")
+        FixLabels { finding: "Fix", check: "Fix in this thread", findings: "Fix findings in this thread" }
     } else {
-        ("Fix in a thread", "Fix findings in a thread")
+        FixLabels { finding: "Fix in a thread", check: "Fix", findings: "Fix findings in a thread" }
     }
 }
 
@@ -330,21 +336,24 @@ impl Workspace {
         self.start_pr_handoff("findings".into(), Some(prompt), CheckoutMode::Worktree, window, cx);
     }
 
-    pub(super) fn fix_pr_thread(
-        &mut self,
-        thread: &crate::pull_request_detail::ReviewThread,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// `startFixFinding`: one finding's fix, beside the composer or in a checkout.
+    pub(super) fn fix_pr_finding(&mut self, finding: &logic::Finding, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        let prompt = logic::fix_thread_handoff(&logic::HandoffSubject::of(&detail), thread);
-        self.start_pr_handoff(
-            format!("finding:thread:{}", thread.id),
-            Some(prompt),
-            CheckoutMode::Worktree,
-            window,
-            cx,
-        );
+        let prompt = logic::fix_finding_handoff(&logic::HandoffSubject::of(&detail), finding);
+        self.start_pr_handoff(finding.key(), Some(prompt), CheckoutMode::Worktree, window, cx);
+    }
+
+    /// `addCommentToChat`: a remark, with its pull request, into the composer beside the panel.
+    pub(super) fn add_pr_to_chat(&mut self, chat: &logic::ChatSubject, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pr_attaches_to_composer() {
+            return;
+        }
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let threads = panel.activity.as_ref().map_or(&[][..], |a| a.review_threads.as_slice());
+        let Some(text) = logic::chat_handoff(&logic::HandoffSubject::of(&detail), chat, threads) else { return };
+        self.write_pr_task(&text, window, cx);
+        window.push_notification(Notification::success("").title("Added to the composer"), cx);
     }
 
     pub(super) fn resolve_pr_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {

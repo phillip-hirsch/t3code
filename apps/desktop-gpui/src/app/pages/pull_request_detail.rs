@@ -1413,7 +1413,7 @@ impl Workspace {
         let handoff = panel.handoff.clone();
         let attaches = self.pr_attaches_to_composer();
         let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
-        let fix_findings = handoff::fix_labels(attaches).1;
+        let fix_findings = handoff::fix_labels(attaches).findings;
         let pickable = self.pr_pickable_environments(detail);
         let acting = self.pr_acting_project(detail);
         let detail = detail.clone();
@@ -1894,7 +1894,7 @@ impl Workspace {
                     .into_any_element(),
             )
         });
-        let checks = checks_open.then(|| render_checks(&detail.checks, stale, t, cx));
+        let checks = checks_open.then(|| self.render_pr_checks(&detail.checks, stale, t, cx));
         let comment_total = activity.as_ref().map_or(0, |a| a.comment_total());
         let comments_body = comments_open.then(|| self.render_pr_comments(detail, activity.as_ref(), t, window, cx));
         let comments_actions = self.render_pr_comment_actions(activity.as_ref(), t, cx);
@@ -2111,6 +2111,7 @@ impl Workspace {
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
         let opened_body =
             if open { body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", root.id), b, cx)) } else { None };
+        let chat = self.render_pr_add_to_chat(&root.id, logic::chat_subject(root, thread), false, t, cx);
         let toggle_key = key;
         v_flex()
             .rounded(px(8.))
@@ -2149,7 +2150,8 @@ impl Workspace {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_pr_disclosure(toggle_key.clone(), cx);
                                     })),
-                            ),
+                            )
+                            .children(chat),
                     )
                     .children(comment_location(root, thread, t))
                     .children(
@@ -2193,6 +2195,10 @@ impl Workspace {
         let edit = (can_edit && editor.is_none())
             .then(|| self.pr_edit_button(comment.id.clone(), edit_kind, comment.body.clone(), t, cx));
         let reactions = self.render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx);
+        let fix = logic::summary_finding(comment, thread, reply).and_then(|finding| self.render_pr_fix(finding, t, cx));
+        // A reply goes with its conversation, from the card that heads it.
+        let chat = if reply { None } else { logic::chat_subject(comment, thread) };
+        let chat = self.render_pr_add_to_chat(&comment.id, chat, false, t, cx);
         let outcome = logic::review_outcome(comment.review_state.as_deref());
         let state = match (outcome, comment.review_state.as_deref()) {
             (Some(outcome), _) => Some(outcome_badge(outcome, t)),
@@ -2214,8 +2220,17 @@ impl Workspace {
                     .bg(Hsla { a: t.muted.a * 0.25, ..t.muted })
                     .px(px(12.))
                     .py(px(10.))
-                    .child(comment_identity(comment, t))
-                    .children(state)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(comment_identity(comment, t))
+                            .children(state),
+                    )
+                    .children(fix)
+                    .children(chat)
                     .children(reactions.map(|r| div().ml_auto().child(r))),
             )
             .when(!reply, |el| {
@@ -2766,7 +2781,27 @@ fn section(
     v_flex().w_full().child(heading).when(open, |el| el.px(px(16.)).pb(px(16.)))
 }
 
-fn render_checks(checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Workspace>) -> AnyElement {
+impl Workspace {
+    fn render_pr_checks(&self, checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let fixes: Vec<Option<Button>> = checks
+            .iter()
+            .map(|check| {
+                matches!(check.status.as_str(), "failure" | "cancelled")
+                    .then(|| self.render_pr_fix(logic::Finding::Check(check.clone()), t, cx))
+                    .flatten()
+            })
+            .collect();
+        render_checks(checks, fixes, stale, t, cx)
+    }
+}
+
+fn render_checks(
+    checks: &[Check],
+    fixes: Vec<Option<Button>>,
+    stale: bool,
+    t: &Tokens,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     if stale {
         return h_flex()
             .gap(px(8.))
@@ -2784,24 +2819,34 @@ fn render_checks(checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Wor
         return muted_line("No checks reported.", t).into_any_element();
     }
     v_flex()
-        .children(checks.iter().enumerate().map(|(index, check)| {
+        .children(checks.iter().zip(fixes).enumerate().map(|(index, (check, fix))| {
             let (icon, color) = check_status_icon(&check.status, t);
             let url = check.url.clone();
             h_flex()
-                .id(ElementId::Name(format!("pr-check-{index}-{}", check.name).into()))
-                .items_start()
+                .items_center()
                 .gap(px(8.))
-                .px(px(8.))
-                .py(px(8.))
+                .pr(px(4.))
                 .rounded(px(6.))
-                .text_xs()
-                .line_height(px(20.))
-                .when(url.is_some(), gpui_kit::Styled::cursor_pointer)
                 .hover(|s| s.bg(Hsla { a: t.accent.a * 0.6, ..t.accent }))
-                .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.)).text_color(color)))
-                .child(div().flex_1().min_w_0().text_color(t.foreground).child(check.name.clone()))
-                .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
-                .when_some(url, |el, url| el.on_click(move |_, _, cx| cx.open_url(&url)))
+                .child(
+                    h_flex()
+                        .id(ElementId::Name(format!("pr-check-{index}-{}", check.name).into()))
+                        .flex_1()
+                        .min_w_0()
+                        .items_start()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .text_xs()
+                        .line_height(px(20.))
+                        .when(url.is_some(), gpui_kit::Styled::cursor_pointer)
+                        .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.)).text_color(color)))
+                        .child(div().flex_1().min_w_0().text_color(t.foreground).child(check.name.clone()))
+                        .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
+                        .when_some(url, |el, url| el.on_click(move |_, _, cx| cx.open_url(&url))),
+                )
+                .children(fix)
         }))
         .into_any_element()
 }
@@ -3034,13 +3079,26 @@ fn timeline_body(event: &Event, view: &Entity<Workspace>, t: &Tokens, cx: &mut A
 fn conversation_card(
     event: &Event,
     show_path: bool,
+    reply: bool,
     view: &Entity<Workspace>,
     now: i64,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    let body = timeline_body(event, view, t, cx);
+    let (edit, body) = view.update(cx, |this, cx| {
+        let editor = this.render_pr_timeline_editor(event, t, cx);
+        match editor {
+            Ok(editor) => (None, editor.map(|e| div().pt(px(12.)).child(e).into_any_element())),
+            Err(edit) => (edit, None),
+        }
+    });
+    let body = match body {
+        Some(editor) => Some(editor),
+        None => timeline_body(event, view, t, cx),
+    };
+    let (chat, reactions) = view.update(cx, |this, cx| this.render_pr_timeline_actions(event, reply, t, cx));
     v_flex()
+        .group(write::EDIT_GROUP)
         .py(px(8.))
         .child(
             h_flex()
@@ -3085,10 +3143,53 @@ fn conversation_card(
                             .text_color(t.muted_foreground),
                         ),
                 )
+                .children(edit)
+                .children(chat)
+                .children(reactions)
                 .children(open_on_host_button(format!("pr-open-{}", event.id), event.url.clone(), t)),
         )
         .children(body.map(|body| div().px(px(8.)).pb(px(8.)).child(body)))
         .into_any_element()
+}
+
+impl Workspace {
+    /// An editable card's editor while it is open (`Ok`), else its edit button (`Err`).
+    fn render_pr_timeline_editor(
+        &mut self,
+        event: &Event,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<AnyElement>, Option<AnyElement>> {
+        let Some(comment) = event.comment.as_deref() else { return Err(None) };
+        let detail = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref());
+        let can_edit = detail
+            .is_some_and(|d| logic::can_edit_comment(d, &comment.kind, comment.author.as_ref(), comment.can_edit));
+        if !can_edit {
+            return Err(None);
+        }
+        if self.pr_editing(&comment.id) {
+            return Ok(self.render_pr_editor(t, cx));
+        }
+        let kind: &'static str = if comment.kind == "review-comment" { "review-comment" } else { "issue-comment" };
+        Err(Some(self.pr_edit_button(comment.id.clone(), kind, comment.body.clone(), t, cx)))
+    }
+
+    /// A Timeline card's Add to chat and reactions.
+    fn render_pr_timeline_actions(
+        &mut self,
+        event: &Event,
+        reply: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> (Option<AnyElement>, Option<AnyElement>) {
+        let Some(comment) = event.comment.as_deref() else { return (None, None) };
+        let chat = (event.body.is_some() && !reply).then(|| logic::ChatSubject::Comment(comment.clone()));
+        let chat = self.render_pr_add_to_chat(&format!("timeline:{}", comment.id), chat, true, t, cx);
+        let reactions = self
+            .render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx)
+            .map(|bar| div().ml_auto().child(bar).into_any_element());
+        (chat, reactions)
+    }
 }
 
 fn conversation_group(
@@ -3111,8 +3212,11 @@ fn conversation_group(
     }
     let count = events.len();
     let authors = actors.len();
-    let cards: Vec<AnyElement> =
-        if open { events.iter().map(|e| conversation_card(e, true, view, now, t, cx)).collect() } else { Vec::new() };
+    let cards: Vec<AnyElement> = if open {
+        events.iter().map(|e| conversation_card(e, true, false, view, now, t, cx)).collect()
+    } else {
+        Vec::new()
+    };
     div()
         .relative()
         .mb(px(20.))
@@ -3171,7 +3275,7 @@ fn thread_event(
             .relative()
             .mb(px(20.))
             .pl(px(48.))
-            .child(conversation_card(event, true, view, now, t, cx))
+            .child(conversation_card(event, true, false, view, now, t, cx))
             .into_any_element();
     };
     let dismissed = logic::review_outcome(event.review_state.as_deref()) == Some("dismissed");
@@ -3185,10 +3289,10 @@ fn thread_event(
     let success = t.success_foreground;
     let mut body = Vec::new();
     if expanded {
-        body.push(conversation_card(event, false, view, now, t, cx));
+        body.push(conversation_card(event, false, false, view, now, t, cx));
         if !thread.replies.is_empty() {
             let cards: Vec<AnyElement> =
-                thread.replies.iter().map(|r| conversation_card(r, false, view, now, t, cx)).collect();
+                thread.replies.iter().map(|r| conversation_card(r, false, true, view, now, t, cx)).collect();
             body.push(
                 v_flex()
                     .ml(px(8.))
@@ -3356,6 +3460,7 @@ fn verdict_event(
     let color = if stale { Hsla { a: 0.7, ..t.muted_foreground } } else { outcome_color(outcome, t) };
     let tip: SharedString = format!("{} earlier changes", logic::outcome_label(outcome)).into();
     let body = timeline_body(event, view, t, cx);
+    let (chat, reactions) = view.update(cx, |this, cx| this.render_pr_timeline_actions(event, false, t, cx));
     div()
         .relative()
         .mb(px(20.))
@@ -3407,6 +3512,8 @@ fn verdict_event(
                             .text_color(t.muted_foreground),
                         ),
                 )
+                .children(chat)
+                .children(reactions)
                 .children(open_on_host_button(format!("pr-open-{}", event.id), event.url.clone(), t)),
         )
         .children(body)

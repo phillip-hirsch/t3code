@@ -46,6 +46,8 @@ pub struct Check {
     pub status: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1233,6 +1235,8 @@ pub struct Event {
     pub path: Option<String>,
     pub review_state: Option<String>,
     pub thread: Option<TimelineThread>,
+    /// The comment the event shows, for its edits, reactions and Add to chat.
+    pub comment: Option<Box<Comment>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1271,6 +1275,7 @@ fn lifecycle(id: &str, at: &str, kind: EventKind, title: String, actor: Option<A
         path: None,
         review_state: None,
         thread: None,
+        comment: None,
     }
 }
 
@@ -1289,6 +1294,7 @@ fn comment_event(comment: &Comment) -> Event {
         path: comment.path.clone(),
         review_state: comment.review_state.clone(),
         thread: None,
+        comment: Some(Box::new(comment.clone())),
     }
 }
 
@@ -1616,14 +1622,114 @@ pub fn selection_handoff(subject: &HandoffSubject, path: &str, lines: &str, requ
     with_context(bounded(request), &[subject.context(&[]), format!("{path} {lines}")])
 }
 
-/// `buildFixFindingHandoff` for one review thread.
-pub fn fix_thread_handoff(subject: &HandoffSubject, thread: &ReviewThread) -> String {
-    let mut lines = vec![
-        "Fix the review finding attached to this message. It is attached on the line it was written against."
-            .to_owned(),
-    ];
+/// One thing to fix on its own (`PullRequestFinding`).
+#[derive(Clone, Debug)]
+pub enum Finding {
+    Thread(ReviewThread),
+    Comment(Comment),
+    Check(Check),
+}
+
+impl Finding {
+    /// `pullRequestFindingKey`.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Thread(thread) => format!("finding:thread:{}", thread.id),
+            Self::Comment(comment) => format!("finding:comment:{}", comment.id),
+            Self::Check(check) => format!("finding:check:{}:{}", check.name, check.url.as_deref().unwrap_or_default()),
+        }
+    }
+}
+
+/// The Summary card's finding: a remark that isn't a reply or an approval, as its conversation
+/// when it heads one.
+pub fn summary_finding(comment: &Comment, thread: Option<&ReviewThread>, reply: bool) -> Option<Finding> {
+    if reply
+        || !matches!(comment.kind.as_str(), "review" | "review-comment")
+        || review_outcome(comment.review_state.as_deref()) == Some("approved")
+    {
+        return None;
+    }
+    match thread {
+        Some(thread) => Some(Finding::Thread(thread.clone())),
+        None => visible_body(&comment.body).map(|_| Finding::Comment(comment.clone())),
+    }
+}
+
+/// `buildFixFindingHandoff`.
+pub fn fix_finding_handoff(subject: &HandoffSubject, finding: &Finding) -> String {
+    let lead = match finding {
+        Finding::Thread(_) => {
+            "Fix the review finding attached to this message. It is attached on the line it was written against."
+        }
+        Finding::Comment(_) => {
+            "Fix the review remark quoted below. It names no line, so find what it refers to before changing anything."
+        }
+        Finding::Check(_) => {
+            "Fix the failing check quoted below. Reproduce it locally first. The name is all the host reported, and the run may fail for a reason the code cannot show."
+        }
+    };
+    let mut lines = vec![lead.to_owned()];
     lines.extend(subject.preamble());
-    with_context(lines.join("\n"), &[subject.context(&[]), thread_context(thread)])
+    match finding {
+        Finding::Thread(thread) => {
+            return with_context(lines.join("\n"), &[subject.context(&[]), thread_context(thread)]);
+        }
+        Finding::Comment(comment) => {
+            let body = visible_body(&comment.body).unwrap_or_default();
+            let author = bounded_field(comment.author.as_ref().map_or("ghost", |a| a.login.as_str()));
+            let place = comment.path.as_deref().map_or(String::new(), |p| format!(" on `{}`", bounded_field(p)));
+            lines.push(format!("> {author}{place}: {}", bounded_field(&body)));
+        }
+        Finding::Check(check) => {
+            let quoted = match &check.description {
+                Some(description) => format!("{}: {description}", check.name),
+                None => check.name.clone(),
+            };
+            lines.push(format!("> {}", bounded_field(&quoted)));
+        }
+    }
+    with_context(lines.join("\n"), &[subject.context(&[])])
+}
+
+/// What Add to chat hands over (`PullRequestChatSubject`).
+#[derive(Clone, Debug)]
+pub enum ChatSubject {
+    Thread(ReviewThread),
+    Comment(Comment),
+}
+
+/// `chatSubject`: a remark on a line goes as its whole conversation; `None` with no words to
+/// talk about.
+pub fn chat_subject(comment: &Comment, thread: Option<&ReviewThread>) -> Option<ChatSubject> {
+    match thread {
+        Some(thread) => {
+            thread.comments.iter().any(|c| visible_body(&c.body).is_some()).then(|| ChatSubject::Thread(thread.clone()))
+        }
+        None => visible_body(&comment.body).map(|_| ChatSubject::Comment(comment.clone())),
+    }
+}
+
+/// `addCommentToChat`: the pull request's context and the remark (`buildPullRequestCommentContext`),
+/// a comment that belongs to a conversation going as all of it.
+pub fn chat_handoff(subject: &HandoffSubject, chat: &ChatSubject, threads: &[ReviewThread]) -> Option<String> {
+    let conversation = |thread: &ReviewThread| {
+        thread.comments.iter().any(|c| readable_body(&c.body).is_some()).then(|| thread_context(thread))
+    };
+    let context = match chat {
+        ChatSubject::Thread(thread) => conversation(thread)?,
+        ChatSubject::Comment(comment) => match threads.iter().find(|t| t.comments.iter().any(|c| c.id == comment.id)) {
+            Some(thread) => conversation(thread)?,
+            None => {
+                let body = readable_body(&comment.body)?;
+                let author = comment.author.as_ref().map_or("ghost", |a| a.login.as_str());
+                // The chip's `filePath rangeLabel`: the file a remark names, or who wrote one that names none.
+                let place = comment.path.clone().unwrap_or_else(|| format!("@{author}"));
+                format!("{place} comment\n{}", bounded(&format!("{author}: {body}")))
+            }
+        },
+    };
+    Some(with_context(String::new(), &[subject.context(&[]), context]))
 }
 
 /// `buildFixFindingsHandoff`: unresolved threads, remarks with no line, and failing checks.
@@ -2160,7 +2266,7 @@ mod tests {
 
     #[test]
     fn a_checks_read_refreshes_the_detail_unless_it_is_older() {
-        let check = |status: &str| Check { name: "ci".into(), status: status.into(), url: None };
+        let check = |status: &str| Check { name: "ci".into(), status: status.into(), url: None, description: None };
         assert_eq!(checks_refresh_interval(&[]).as_secs(), 45);
         assert_eq!(checks_refresh_interval(&[check("success"), check("pending")]).as_secs(), 45);
         assert_eq!(checks_refresh_interval(&[check("success"), check("failure")]).as_secs(), 60);
@@ -2245,7 +2351,7 @@ mod tests {
     fn checks_group_by_what_they_need() {
         let checks: Vec<Check> = ["failure", "pending", "success", "action-required", "skipped"]
             .iter()
-            .map(|status| Check { name: (*status).into(), status: (*status).into(), url: None })
+            .map(|status| Check { name: (*status).into(), status: (*status).into(), url: None, description: None })
             .collect();
         let (attention, running, completed) = group_checks(&checks);
         let names = |list: Vec<&Check>| list.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
@@ -2294,6 +2400,48 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_card_fixes_its_remark_or_check_and_adds_its_conversation_to_chat() {
+        let activity: Activity = serde_json::from_value(json!({
+            "comments": [
+                {"id": "r", "kind": "review", "author": {"login": "ana"}, "body": "Rename  this", "createdAt": "2026-10-01T00:00:00Z", "path": "a.rs"},
+                {"id": "ok", "kind": "review", "body": "LGTM", "reviewState": "APPROVED", "createdAt": "2026-10-01T00:00:00Z"},
+                {"id": "c", "kind": "issue-comment", "author": {"login": "cy"}, "body": "Why?", "createdAt": "2026-10-01T00:00:00Z"},
+                {"id": "t1", "kind": "review-comment", "author": {"login": "bo"}, "body": "Off by one", "createdAt": "2026-10-01T00:00:00Z"},
+            ],
+            "commentCount": 4, "commentsTruncated": false, "commits": [],
+            "reviewThreads": [
+                {"id": "th", "path": "b.rs", "line": 4, "isResolved": false, "comments": [{"id": "t1", "author": {"login": "bo"}, "body": "Off by one", "createdAt": "2026-10-01T00:00:00Z"}]},
+            ],
+        }))
+        .unwrap();
+        let [remark, approval, plain, threaded] = &activity.comments[..] else { panic!("four comments") };
+        let thread = &activity.review_threads[0];
+        let d = detail(json!({}));
+        let subject = HandoffSubject::of(&d);
+        assert!(summary_finding(approval, None, false).is_none(), "an approval is not a finding");
+        assert!(summary_finding(plain, None, false).is_none(), "a plain comment is not a finding");
+        assert!(summary_finding(threaded, Some(thread), true).is_none(), "a reply goes with its conversation");
+        assert_eq!(
+            summary_finding(threaded, Some(thread), false).map(|f| f.key()).as_deref(),
+            Some("finding:thread:th")
+        );
+        let fix = fix_finding_handoff(&subject, &summary_finding(remark, None, false).unwrap());
+        assert!(fix.starts_with("Fix the review remark quoted below."), "{fix}");
+        assert!(fix.contains("\n> ana on `a.rs`: Rename this\n\nPR #7 · Add\n"), "{fix}");
+        let check =
+            Check { name: "ci".into(), status: "failure".into(), url: None, description: Some("exit 1".into()) };
+        let fix = fix_finding_handoff(&subject, &Finding::Check(check.clone()));
+        assert!(fix.starts_with("Fix the failing check quoted below.") && fix.contains("\n> ci: exit 1\n\n"), "{fix}");
+        assert_eq!(Finding::Check(check).key(), "finding:check:ci:");
+
+        let chat = chat_handoff(&subject, &ChatSubject::Comment(threaded.clone()), &activity.review_threads).unwrap();
+        assert!(chat.starts_with("PR #7 · Add\n") && chat.ends_with("\n\nb.rs L4\nbo: Off by one"), "{chat}");
+        let chat = chat_handoff(&subject, &chat_subject(plain, None).unwrap(), &activity.review_threads).unwrap();
+        assert!(chat.ends_with("\n\n@cy comment\ncy: Why?"), "{chat}");
+        assert_eq!(append_handoff(&chat, &chat), chat, "adding it again adds nothing");
+    }
+
+    #[test]
     fn fixing_findings_lists_unresolved_threads_remarks_and_failing_checks() {
         let activity: Activity = serde_json::from_value(json!({
             "comments": [
@@ -2307,7 +2455,7 @@ mod tests {
             ],
         }))
         .unwrap();
-        let checks = [Check { name: "ci / test".into(), status: "failure".into(), url: None }];
+        let checks = [Check { name: "ci / test".into(), status: "failure".into(), url: None, description: None }];
         let d = detail(json!({}));
         let prompt = fix_findings_handoff(&HandoffSubject::of(&d), &activity, &checks);
         assert!(
@@ -2318,7 +2466,7 @@ mod tests {
         assert!(prompt.ends_with("b.rs L4 (before)\nbo: Off by one"), "a resolved thread is left out: {prompt}");
         assert!(prompt.contains("\n\nPR #7 · Add\nThe pull request is #7"), "the pull request rides along: {prompt}");
         let thread = &activity.review_threads[0];
-        let fix = fix_thread_handoff(&HandoffSubject::of(&d), thread);
+        let fix = fix_finding_handoff(&HandoffSubject::of(&d), &Finding::Thread(thread.clone()));
         assert!(
             fix.contains(
                 "against.\nWork in the prepared checkout and keep the change focused.\nThe quoted review text"
@@ -2356,7 +2504,12 @@ mod tests {
         let checks = |statuses: &[(&str, Option<&str>)]| -> Vec<Check> {
             statuses
                 .iter()
-                .map(|(status, url)| Check { name: "ci".into(), status: (*status).into(), url: url.map(Into::into) })
+                .map(|(status, url)| Check {
+                    name: "ci".into(),
+                    status: (*status).into(),
+                    url: url.map(Into::into),
+                    description: None,
+                })
                 .collect()
         };
         assert_eq!(checks_state(&[]), None);

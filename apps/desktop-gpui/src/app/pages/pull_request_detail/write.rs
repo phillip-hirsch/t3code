@@ -1013,32 +1013,47 @@ impl Workspace {
         })
     }
 
-    /// "Fix in a thread" on a review conversation (`onFixFinding`), "Fix" beside a thread's composer.
-    pub(super) fn render_pr_fix_thread(
-        &self,
-        thread: &crate::pull_request_detail::ReviewThread,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    /// A finding's Fix (`onFixFinding`): the remark's label, or a failing check's.
+    pub(super) fn render_pr_fix(&self, finding: logic::Finding, t: &Tokens, cx: &mut Context<Self>) -> Option<Button> {
         let panel = self.pull_requests.panel.as_ref()?;
         let detail = panel.detail.as_ref()?;
         let attaches = self.pr_attaches_to_composer();
         if !attaches {
             self.shell.projects.iter().find(|p| p.id == detail.project_id)?;
         }
-        let label = super::handoff::fix_labels(attaches).0;
-        let key = format!("finding:thread:{}", thread.id);
+        let labels = super::handoff::fix_labels(attaches);
+        let label = if matches!(finding, logic::Finding::Check(_)) { labels.check } else { labels.finding };
+        let key = finding.key();
         let preparing = panel.handoff.as_deref() == Some(key.as_str());
-        let thread = thread.clone();
         Some(
-            ghost_button(ElementId::Name(format!("pr-thread-fix:{}", thread.id).into()), t)
-                .ml_auto()
+            ghost_button(ElementId::Name(format!("pr-fix:{key}").into()), t)
+                .flex_none()
                 .disabled(panel.write.thread_pending || panel.handoff.is_some())
                 .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
                 .child(if preparing { "Preparing..." } else { label })
-                .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_thread(&thread, window, cx)))
-                .into_any_element(),
+                .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_finding(&finding, window, cx))),
         )
+    }
+
+    /// `AddToChatButton`: only beside a thread's composer; `icon` is the Timeline's bare one.
+    pub(super) fn render_pr_add_to_chat(
+        &self,
+        id: &str,
+        chat: Option<logic::ChatSubject>,
+        icon: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let chat = chat.filter(|_| self.pr_attaches_to_composer())?;
+        let button = ghost_button(ElementId::Name(format!("pr-chat:{id}").into()), t)
+            .flex_none()
+            .child(Icon::new(Lucide::MessageSquarePlus).with_size(px(12.)))
+            .on_click(cx.listener(move |this, _, window, cx| this.add_pr_to_chat(&chat, window, cx)));
+        Some(if icon {
+            button.size(px(24.)).p_0().text_color(t.muted_foreground).tooltip("Add to chat").into_any_element()
+        } else {
+            button.child("Add to chat").into_any_element()
+        })
     }
 
     fn set_pr_thread_resolved(
@@ -1200,9 +1215,11 @@ impl Workspace {
                 let input = cx.new(|cx| TextareaState::new(window, cx).rows(6).default_value(body.clone()));
                 input.update(cx, |input, cx| input.focus(window, cx));
                 let sub = watch(&input, Some(crate::app::Workspace::save_pr_edit), window, cx);
-                if let Some(write) = this.pr_write() {
-                    write.editing = Some(Editing { subject: subject.clone(), kind, input, preview: false });
-                    write._watch.extend(sub);
+                if let Some(panel) = this.pull_requests.panel.as_mut() {
+                    panel.write.editing = Some(Editing { subject: subject.clone(), kind, input, preview: false });
+                    panel.write._watch.extend(sub);
+                    // A Timeline card grows into its editor.
+                    panel.timeline.remeasure();
                 }
                 cx.notify();
             }));
@@ -1316,8 +1333,9 @@ impl Workspace {
                         .gap(px(8.))
                         .child(ghost_button("pr-editor-cancel", t).disabled(saving).child("Cancel").on_click(
                             cx.listener(|this, _, _, cx| {
-                                if let Some(write) = this.pr_write() {
-                                    write.editing = None;
+                                if let Some(panel) = this.pull_requests.panel.as_mut() {
+                                    panel.write.editing = None;
+                                    panel.timeline.remeasure();
                                 }
                                 cx.notify();
                             }),
