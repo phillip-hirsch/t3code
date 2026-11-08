@@ -130,7 +130,7 @@ impl RenderOnce for Segmented {
                         }
                     })
                     .when(self.disabled, |el| el.opacity(0.64))
-                    .when(!self.disabled, |el| el.cursor_pointer())
+                    .when(!self.disabled, gpui_kit::Styled::cursor_pointer)
                     .child(segment.label)
                     .on_click(move |_, window, cx| press(window, cx))
             }))
