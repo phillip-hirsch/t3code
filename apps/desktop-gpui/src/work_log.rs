@@ -1329,6 +1329,13 @@ impl Entry {
         self.t3.as_ref().map(|t3| t3.tool.icon)
     }
 
+    /// The thread a `t3_thread_read` call read (`threadReadTargetId`).
+    pub fn thread_read_target(&self) -> Option<&str> {
+        let reads = self.item_type == "dynamic_tool" && self.t3.as_ref().is_some_and(|t3| t3.tool.summary == "thread-read");
+        let id = self.item.0.raw.pointer("/input/threadId").and_then(Value::as_str).map(str::trim);
+        id.filter(|id| reads && !id.is_empty())
+    }
+
     /// The per-entry icon (`workEntryIconName`).
     pub fn icon(&self) -> WorkIcon {
         if self.item_type == "notification" {
@@ -1676,6 +1683,11 @@ pub fn summary_kind(entries: &[&Entry]) -> SummaryKind {
 // ---------------------------------------------------------------------------
 // Row labels
 
+/// `threadReadLabelPrefix`: "Read a T3 thread" becomes "Read thread", for the title to follow.
+pub fn thread_read_prefix(label: &str) -> Option<String> {
+    label.strip_suffix(" a T3 thread").map(|head| format!("{head} thread"))
+}
+
 /// Single-line labels collapse whitespace like CSS `white-space: nowrap`.
 pub fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1984,6 +1996,24 @@ mod tests {
         assert_eq!(only_files.question.unwrap().preview.as_deref(), Some("a.txt, b.txt"));
         let pending = entry(json!({"type": "user_input_request", "status": "waiting", "questions": []}));
         assert_eq!(pending.question, None);
+    }
+
+    #[test]
+    fn thread_reads_name_the_thread_they_read() {
+        let read = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_read",
+            "input": {"threadId": " t-1 "}}));
+        assert_eq!(read.thread_read_target(), Some("t-1"));
+        let label = display_label(&read);
+        assert_eq!(label, "Read a T3 thread");
+        assert_eq!(thread_read_prefix(&label).as_deref(), Some("Read thread"));
+        assert_eq!(thread_read_prefix("Reading a T3 thread").as_deref(), Some("Reading thread"));
+        assert_eq!(thread_read_prefix("Listed T3 threads"), None);
+        let list = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_list",
+            "input": {"threadId": "t-1"}}));
+        assert_eq!(list.thread_read_target(), None);
+        let blank = entry(json!({"type": "dynamic_tool", "toolName": "mcp__t3-code__t3_thread_read",
+            "input": {"threadId": "  "}}));
+        assert_eq!(blank.thread_read_target(), None);
     }
 
     #[test]

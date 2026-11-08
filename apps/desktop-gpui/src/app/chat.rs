@@ -2130,7 +2130,13 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                 .child(
                     row.id(ElementId::Name(work.id.clone()))
                         .cursor_pointer()
-                        .child(work_line(entry.icon(), color, label.clone(), muted, None))
+                        .child(work_line(
+                            entry.icon(),
+                            color,
+                            entry_label(entry, label.clone(), (*expanded, false), this, t, cx),
+                            muted,
+                            None,
+                        ))
                         .on_click(toggle(this, group.clone())),
                 )
                 .into_any_element()
@@ -2266,8 +2272,18 @@ fn entry_details(
 }
 
 /// A row's label: an answered request names its questions, then what was answered, which
-/// reads muted once the answers show below.
-fn entry_label(entry: &Entry, label: SharedString, expanded: bool, t: &Tokens) -> AnyElement {
+/// reads muted once the answers show below; a thread read names the thread, linked to it.
+fn entry_label(
+    entry: &Entry,
+    label: SharedString,
+    (expanded, linked): (bool, bool),
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    if let Some(read) = thread_read_label(entry, &label, linked, this, t, cx) {
+        return read;
+    }
     let Some(question) = &entry.question else { return label.into_any_element() };
     let heading = if question.heading.is_empty() { label } else { question.heading.clone() };
     let Some(preview) = &question.preview else { return heading.into_any_element() };
@@ -2283,6 +2299,52 @@ fn entry_label(entry: &Entry, label: SharedString, expanded: bool, t: &Tokens) -
                 .child(preview.clone()),
         )
         .into_any_element()
+}
+
+/// `ThreadReadLabel`: `Read thread “Title”` for a thread of this environment that is still listed.
+fn thread_read_label(
+    entry: &Entry,
+    label: &str,
+    linked: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> Option<AnyElement> {
+    let thread_id = entry.thread_read_target()?;
+    let prefix = work_log::thread_read_prefix(label)?;
+    let workspace = this.upgrade()?;
+    let workspace = workspace.read(cx);
+    let environment = workspace.active_environment()?;
+    let thread = workspace.shell.threads.iter().find(|t| t.id == thread_id && t.environment_id == *environment)?;
+    let title = thread.title.trim();
+    if title.is_empty() || thread.archived_at.is_some() || thread.deleted_at.is_some() {
+        return None;
+    }
+    let title = div().min_w_0().truncate().child(SharedString::from(title.to_owned()));
+    let title = if linked {
+        let (this, env, id) = (this.clone(), thread.environment_id.clone(), thread.id.clone());
+        title
+            .id(ElementId::Name(format!("read-thread:{}", entry.id).into()))
+            .text_color(t.foreground)
+            .cursor_pointer()
+            .hover(gpui_kit::Styled::underline)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                let (env, id) = (env.clone(), id.clone());
+                let _ = this.update(cx, |w, cx| w.select_thread_in(env, id, window, cx));
+            })
+            .into_any_element()
+    } else {
+        title.into_any_element()
+    };
+    Some(
+        h_flex()
+            .min_w_0()
+            .child(div().flex_none().child(format!("{prefix} “")))
+            .child(title)
+            .child(div().flex_none().child("”"))
+            .into_any_element(),
+    )
 }
 
 /// `QuestionAnswerHistory`: each question, its answer, and the files sent with it.
@@ -2361,7 +2423,7 @@ fn single_entry(
     } else {
         label.clone()
     };
-    let label_text = entry_label(entry, label_text, expanded, t);
+    let label_text = entry_label(entry, label_text, (expanded, true), this, t, cx);
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     let expandable = expandable(entry, label);
@@ -2385,7 +2447,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
     let expandable = expandable(entry, label);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
-    let shown = entry_label(entry, shown, expanded, t);
+    let shown = entry_label(entry, shown, (expanded, true), this, t, cx);
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
