@@ -295,7 +295,7 @@ impl Workspace {
 
     /// Runs one write RPC for the shown pull request; success reads it again, failure toasts
     /// `failure`. `done` gets that pull request's key, which stays right if another tab shows meanwhile.
-    fn run_pr_write(
+    pub(super) fn run_pr_write(
         &mut self,
         method: &'static str,
         input: Value,

@@ -40,6 +40,105 @@ pub struct Label {
     pub color: Option<String>,
 }
 
+/// `DescriptionDraft`: a description written from this client, shown in place of the host's copy
+/// until the first host reading after its saves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DescriptionDraft {
+    key: String,
+    observed_at: Option<f64>,
+    /// `None` once the last save failed: until a host reading, nobody knows which saves landed.
+    pub body: Option<String>,
+    /// Saves still running. The host applies them in order, so the last one is `body`.
+    saves: usize,
+}
+
+impl DescriptionDraft {
+    /// `descriptionDraftInForce`.
+    pub fn in_force(draft: Option<Self>, key: &str, observed_at: Option<f64>) -> Option<Self> {
+        let mut draft = draft.filter(|d| d.key == key)?;
+        if draft.saves > 0 {
+            draft.observed_at = observed_at;
+            return Some(draft);
+        }
+        (observed_at.is_some() && draft.observed_at == observed_at).then_some(draft)
+    }
+
+    /// `startDescriptionSave`.
+    pub fn start(draft: Option<Self>, key: &str, observed_at: Option<f64>, body: String) -> Self {
+        let saves = draft.filter(|d| d.key == key).map_or(0, |d| d.saves);
+        Self { key: key.to_owned(), observed_at, body: Some(body), saves: saves + 1 }
+    }
+
+    /// `settleDescriptionSave`: each save writes the whole body, so a failure only loses `body`
+    /// when no later save is running.
+    pub fn settle(draft: Option<Self>, key: &str, saved: bool) -> Option<Self> {
+        let mut draft = draft?;
+        if draft.key != key || draft.saves == 0 {
+            return Some(draft);
+        }
+        draft.saves -= 1;
+        if !saved && draft.saves == 0 {
+            draft.body = None;
+        }
+        Some(draft)
+    }
+}
+
+/// Where `markdown`'s task-list items start, in order.
+fn task_item_starts(markdown: &str) -> Vec<usize> {
+    fn walk(node: &markdown::mdast::Node, out: &mut Vec<usize>) {
+        if let markdown::mdast::Node::ListItem(item) = node
+            && item.checked.is_some()
+            && let Some(position) = &item.position
+        {
+            out.push(position.start.offset);
+        }
+        for child in node.children().map(Vec::as_slice).unwrap_or_default() {
+            walk(child, out);
+        }
+    }
+    // The view's own options (`MarkdownExtensions::parse_options`), so the starts match its spans.
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    let mut out = Vec::new();
+    if let Ok(root) = markdown::to_mdast(markdown, &options) {
+        walk(&root, &mut out);
+    }
+    out
+}
+
+/// `taskListMarkerOffset`: the `[ ]` on a task item's first line, after its bullet.
+fn task_marker_offset(markdown: &str, item_start: usize) -> Option<usize> {
+    let line = markdown.get(item_start..)?.split('\n').next()?;
+    let rest = line.trim_start();
+    let rest = match rest.strip_prefix(['-', '+', '*']) {
+        Some(rest) => rest,
+        None => {
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            rest.get(digits..).filter(|_| digits > 0)?.strip_prefix(['.', ')'])?
+        }
+    };
+    let marker = rest.trim_start();
+    if marker.len() == rest.len() {
+        return None;
+    }
+    let bytes = marker.as_bytes();
+    (bytes.len() >= 3 && bytes[0] == b'[' && matches!(bytes[1], b' ' | b'x' | b'X') && bytes[2] == b']')
+        .then(|| item_start + line.len() - marker.len())
+}
+
+/// A task ticked in the shown description: `body` with that task's marker set. `shown` is the
+/// text the view parsed (`body` with comments stripped and media links resolved), so the task is
+/// found by its place among the tasks rather than by offset.
+pub fn toggle_task(body: &str, shown: &str, item_start: usize, checked: bool) -> Option<String> {
+    let index = task_item_starts(shown).iter().position(|&start| start == item_start)?;
+    let marker = task_marker_offset(body, *task_item_starts(body).get(index)?)?;
+    let mut next = body.to_owned();
+    next.replace_range(marker + 1..marker + 2, if checked { "x" } else { " " });
+    Some(next)
+}
+
 /// `PullRequestChangeBreakdown`: a change's lines split by what its files are.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ChangeBreakdown {
@@ -2431,6 +2530,33 @@ mod tests {
         assert!(asked_then_fixed.starts_with("Why?\n\nPR #7") && asked_then_fixed.ends_with("Fix this\n\na.rs L1"));
         assert_eq!(append_handoff(&fix, &ask), fix, "a fix keeps out answer-only instructions");
         assert_eq!(append_handoff(&ask, &ask), ask);
+    }
+
+    #[test]
+    fn ticking_a_shown_task_sets_its_marker_in_the_description() {
+        let body = "<!-- - [ ] hidden -->\nIntro ![a](img.png)\n\n- [ ] one\n  1. [x] two\n* not a task\n";
+        let shown = "\nIntro ![a](https://host/img.png)\n\n- [ ] one\n  1. [x] two\n* not a task\n";
+        let second = shown.find("1. [x]").unwrap();
+        assert_eq!(
+            toggle_task(body, shown, second, false).as_deref(),
+            Some("<!-- - [ ] hidden -->\nIntro ![a](img.png)\n\n- [ ] one\n  1. [ ] two\n* not a task\n"),
+        );
+        let first = shown.find("- [ ]").unwrap();
+        assert!(toggle_task(body, shown, first, true).unwrap().contains("- [x] one"));
+        assert_eq!(toggle_task(body, shown, shown.find("* not").unwrap(), true), None);
+    }
+
+    #[test]
+    fn a_description_draft_holds_until_the_host_reads_it_after_its_saves() {
+        let draft = DescriptionDraft::start(None, "pr", Some(1.), "a".into());
+        let draft = DescriptionDraft::start(Some(draft), "pr", Some(1.), "b".into());
+        let draft = DescriptionDraft::settle(Some(draft), "pr", false);
+        assert_eq!(draft.as_ref().and_then(|d| d.body.as_deref()), Some("b"), "a later save is still running");
+        let draft = DescriptionDraft::in_force(draft, "pr", Some(2.));
+        assert!(draft.is_some(), "kept while a save runs");
+        let draft = DescriptionDraft::settle(draft, "pr", true);
+        assert!(DescriptionDraft::in_force(draft.clone(), "pr", Some(2.)).is_some(), "same reading");
+        assert!(DescriptionDraft::in_force(draft, "pr", Some(3.)).is_none(), "the host's next reading wins");
     }
 
     #[test]

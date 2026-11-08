@@ -107,6 +107,8 @@ pub(in crate::app) struct Panel {
     copied: Option<&'static str>,
     _copied: Option<Task<()>>,
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
+    /// The description as last written from here (`DescriptionDraft`).
+    description_draft: Option<logic::DescriptionDraft>,
     summary_scroll: ScrollHandle,
     timeline: ListState,
     timeline_rows: Rc<[TimelineRow]>,
@@ -177,6 +179,7 @@ impl Panel {
             copied: None,
             _copied: None,
             markdown: HashMap::new(),
+            description_draft: None,
             summary_scroll: ScrollHandle::new(),
             timeline: ListState::new(0, ListAlignment::Top, px(600.)),
             timeline_rows: Rc::default(),
@@ -858,26 +861,30 @@ impl Workspace {
     }
 
     /// One markdown body, parsed once and kept while the panel shows this pull request.
+    /// What a markdown body's view parses: HTML comments out, media links resolved on the host.
+    fn pr_markdown_source(&self, text: &str) -> String {
+        let panel = self.pull_requests.panel.as_ref();
+        let url =
+            panel.and_then(|p| p.detail.as_ref().map(|d| d.url.as_str()).or(p.seed.as_ref().map(|e| e.url.as_str())));
+        let stripped = logic::strip_html_comments(text);
+        match url.and_then(logic::url_origin) {
+            Some(origin) => logic::resolve_media_urls(&stripped, origin),
+            None => stripped,
+        }
+    }
+
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
+        let shown = self.pr_markdown_source(text);
         let panel = self.pull_requests.panel.as_mut()?;
-        let url = panel.detail.as_ref().map(|d| d.url.as_str()).or(panel.seed.as_ref().map(|e| e.url.as_str()));
-        let origin = url.and_then(logic::url_origin);
-        let source = |text: &str| {
-            let stripped = logic::strip_html_comments(text);
-            match origin {
-                Some(origin) => logic::resolve_media_urls(&stripped, origin),
-                None => stripped,
-            }
-        };
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
             if held != text {
-                let source = source(text);
+                let source = shown;
                 view.update(cx, |view, cx| view.set_text(&source, cx));
                 text.clone_into(held);
             }
             return Some(view.clone());
         }
-        let source = source(text);
+        let source = shown;
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {
@@ -887,6 +894,47 @@ impl Workspace {
         });
         panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
+    }
+
+    /// The description shown: this client's draft while it is in force, else the host's.
+    fn pr_description(&mut self, detail: &Detail) -> String {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return detail.body.clone() };
+        panel.description_draft =
+            logic::DescriptionDraft::in_force(panel.description_draft.take(), &detail.url, detail.observed_at);
+        panel.description_draft.as_ref().and_then(|d| d.body.clone()).unwrap_or_else(|| detail.body.clone())
+    }
+
+    /// A ticked task saves the description with its marker set (`toggleTask`).
+    fn toggle_pr_task(&mut self, item_start: usize, checked: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let body = self.pr_description(&detail);
+        let shown = self.pr_markdown_source(&body);
+        let Some(next) = logic::toggle_task(&body, &shown, item_start, checked).filter(|next| *next != body) else {
+            return;
+        };
+        let Some(mut payload) = self.pull_requests.panel.as_ref().map(|p| p.reference.to_json()) else { return };
+        payload["body"] = json!(next);
+        if let Some(panel) = self.pull_requests.panel.as_mut() {
+            let draft = panel.description_draft.take();
+            panel.description_draft =
+                Some(logic::DescriptionDraft::start(draft, &detail.url, detail.observed_at, next));
+        }
+        let url = detail.url.clone();
+        self.run_pr_write(
+            "pullRequests.update",
+            payload,
+            "Could not save the description".into(),
+            None,
+            window,
+            cx,
+            move |this, key, saved, _, _| {
+                if let Some(panel) = this.pr_panel(key) {
+                    panel.description_draft =
+                        logic::DescriptionDraft::settle(panel.description_draft.take(), &url, saved);
+                }
+            },
+        );
+        cx.notify();
     }
 
     /// The merge method the header and menu use (`resolvePullRequestMergeMethod`).
@@ -1872,15 +1920,24 @@ impl Workspace {
             meta_row(Lucide::Tag, "Labels", value, t)
         });
 
+        let body = self.pr_description(detail);
         let description = description_open.then(|| {
             if self.pr_editing("description") {
                 return self.render_pr_editor(t, cx);
             }
-            let text = if detail.body.trim().is_empty() { "_No description provided._" } else { detail.body.as_str() };
-            let markdown =
-                self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()));
-            let edit = logic::can_edit_change_request(detail)
-                .then(|| self.pr_edit_button("description".into(), "description", detail.body.clone(), t, cx));
+            let text = if body.trim().is_empty() { "_No description provided._" } else { body.as_str() };
+            let editable = logic::can_edit_change_request(detail);
+            let view = cx.entity();
+            let markdown = self.pr_markdown("description", text, cx).map(|state| {
+                let markdown = pr_markdown_view(&state, t, view.clone());
+                if !editable {
+                    return markdown;
+                }
+                markdown.on_task_toggle(move |item_start, checked, window, cx| {
+                    view.update(cx, |this, cx| this.toggle_pr_task(item_start, checked, window, cx));
+                })
+            });
+            let edit = editable.then(|| self.pr_edit_button("description".into(), "description", body.clone(), t, cx));
             let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
             Some(
                 v_flex()
