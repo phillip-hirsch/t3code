@@ -775,11 +775,9 @@ impl Workspace {
         row
     }
 
-    /// Threads the palette lists: visible, unarchived, not subagents or side chats.
+    /// Threads the palette lists.
     fn palette_threads(&self) -> impl Iterator<Item = &crate::model::ThreadShell> {
-        self.shell.threads.iter().filter(|t| {
-            t.is_listed() && t.archived_at.is_none() && t.deleted_at.is_none() && t.lineage.parent_thread_id.is_none()
-        })
+        self.shell.threads.iter().filter(|t| listed_in_palette(t))
     }
 
     fn palette_groups(&self, query: &str) -> Vec<Group> {
@@ -1652,6 +1650,11 @@ impl Workspace {
     }
 }
 
+/// `buildThreadActionItems`: unarchived and not a subagent or side chat; a fork is listed.
+fn listed_in_palette(thread: &crate::model::ThreadShell) -> bool {
+    thread.is_listed() && thread.archived_at.is_none() && thread.deleted_at.is_none()
+}
+
 /// When a thread was last used: its latest user-authored message.
 fn used_at(thread: &crate::model::ThreadShell) -> i64 {
     thread
@@ -1757,6 +1760,23 @@ fn marked_row(highlight: Option<usize>, browsing: bool, rows: usize) -> Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn thread(fields: Value) -> crate::model::ThreadShell {
+        let mut value = json!({"id": "t1", "projectId": "p1", "title": "Fix it", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z"});
+        if let (Some(base), Value::Object(fields)) = (value.as_object_mut(), fields) {
+            base.extend(fields);
+        }
+        serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    fn forks_are_listed_but_subagents_side_chats_and_archived_threads_are_not() {
+        let lineage = |lineage: Value| thread(json!({"lineage": lineage}));
+        assert!(listed_in_palette(&lineage(json!({"parentThreadId": "t0", "relationshipToParent": "fork"}))));
+        assert!(!listed_in_palette(&lineage(json!({"parentThreadId": "t0", "relationshipToParent": "subagent"}))));
+        assert!(!listed_in_palette(&lineage(json!({"parentThreadId": "t0", "sideChat": true}))));
+        assert!(!listed_in_palette(&thread(json!({"archivedAt": "2026-01-02T00:00:00Z"}))));
+    }
 
     #[test]
     fn the_first_row_stays_highlighted_for_the_pin_until_another_is() {
