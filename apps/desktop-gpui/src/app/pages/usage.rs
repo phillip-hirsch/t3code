@@ -935,6 +935,22 @@ impl Workspace {
                         }),
                 ),
         );
+        let chatgpt_sharing = !usage.hidden.iter().any(|h| h == "codex")
+            && self
+                .limit_environments()
+                .iter()
+                .any(|(_, _, info)| info.providers.iter().any(|p| super::settings::uses_chatgpt_sharing(&p.auth)));
+        if chatgpt_sharing {
+            summary_column = summary_column.child(
+                h_flex()
+                    .justify_between()
+                    .gap(px(8.))
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child("ChatGPT shared usage")
+                    .child(super::settings::chatgpt_usage_button("usage-chatgpt-sharing", t).xsmall()),
+            );
+        }
         for kind in logic::rank_providers(&providers, &merged.providers, tokens) {
             let totals = merged.providers.iter().find(|p| p.provider == kind).cloned().unwrap_or_default();
             let share = if tokens { totals.token_share } else { totals.cost_share };
