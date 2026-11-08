@@ -19,7 +19,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, ParentElement as _, PathPromptOptions, SharedString,
+    IntoElement, KeyDownEvent, Keystroke, ParentElement as _, PathPromptOptions, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
@@ -241,6 +241,9 @@ pub(super) struct Palette {
     stack: Vec<(View, String)>,
     /// The highlighted row; `None` paints none, but Enter runs the first.
     highlight: Option<usize>,
+    /// The arrows moved the highlight: the next render scrolls it into view (`block: "nearest"`).
+    reveal: bool,
+    scroll: ScrollHandle,
     browse: Browse,
     messages: MessageSearch,
     placeholder: &'static str,
@@ -468,6 +471,8 @@ impl Workspace {
             view: View::Root,
             stack: Vec::new(),
             highlight: Some(0),
+            reveal: false,
+            scroll: ScrollHandle::new(),
             browse: Browse::default(),
             messages: MessageSearch::default(),
             placeholder: "",
@@ -1871,6 +1876,7 @@ impl Workspace {
                 };
                 if let Some(palette) = &mut self.palette {
                     palette.highlight = Some(next);
+                    palette.reveal = true;
                 }
                 cx.notify();
             }
@@ -1901,6 +1907,7 @@ impl Workspace {
     pub(super) fn render_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let query = self.palette.as_ref()?.input.read(cx).value().to_string();
         self.prepare_palette(&query);
+        let reveal = std::mem::take(&mut self.palette.as_mut()?.reveal);
         let palette = self.palette.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let view = palette.view;
@@ -1968,14 +1975,15 @@ impl Workspace {
                 .children(accessory),
         );
         let mut index = 0usize;
-        let mut list = v_flex().p(px(8.));
+        // The list's direct children, so the scroll handle can reveal the highlighted row by position.
+        let mut list: Vec<AnyElement> = Vec::new();
         let total_rows: usize = groups.iter().map(|g| g.rows.len()).sum();
         for (gi, group) in groups.iter().enumerate() {
             if group.rows.is_empty() {
                 continue;
             }
             if !group.label.is_empty() {
-                list = list.child(
+                list.push(
                     div()
                         .px(px(8.))
                         .py(px(6.))
@@ -1984,17 +1992,21 @@ impl Workspace {
                         .line_height(px(16.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(muted)
-                        .child(group.label),
+                        .child(group.label)
+                        .into_any_element(),
                 );
             }
             for row in &group.rows {
                 if row.disabled {
-                    list = list.child(self.render_disabled_palette_row(row, &tokens));
+                    list.push(self.render_disabled_palette_row(row, &tokens));
                     continue;
                 }
                 let highlighted = highlight == Some(index);
+                if highlighted && reveal {
+                    palette.scroll.scroll_to_item(list.len());
+                }
                 let mark = RowMark { highlighted, marked: marked == Some(index) };
-                list = list.child(self.render_palette_row(row, index, mark, &tokens, cx));
+                list.push(self.render_palette_row(row, index, mark, &tokens, cx));
                 index += 1;
             }
         }
@@ -2120,14 +2132,23 @@ impl Workspace {
                         )
                         .child(
                             // `max-h-[min(28rem,70vh)]` on the list alone.
-                            div()
-                                .id("palette-list")
+                            v_flex()
+                                .relative()
                                 .flex_1()
                                 .min_h_0()
                                 .max_h((height * 0.7).min(px(448.)))
-                                .overflow_y_scrollbar()
-                                .child(list)
-                                .children(empty),
+                                .child(
+                                    v_flex()
+                                        .id("palette-list")
+                                        .track_scroll(&palette.scroll)
+                                        .flex_1()
+                                        .min_h_0()
+                                        .p(px(8.))
+                                        .overflow_y_scroll()
+                                        .children(list)
+                                        .children(empty),
+                                )
+                                .vertical_scrollbar(&palette.scroll),
                         )
                         .child(footer)
                         .focus_trap("palette-trap", &trap),
