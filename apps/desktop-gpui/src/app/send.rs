@@ -2,15 +2,78 @@
 //! `packages/client-runtime/src/operations/commands.ts`): `message.dispatch`
 //! for a thread, `orchestration.launchThread` for a draft.
 
-use gpui_kit::{Context, Keystroke, Window};
+use std::rc::Rc;
+
+use gpui_kit::{Context, Keystroke, SharedString, Window};
 use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::composer::ComposerDraft;
 use super::composer_plan;
 use super::{Target, Workspace, draft_title, new_id};
-use crate::model::ModelSelection;
+use crate::model::{ModelSelection, ThreadProjection};
 use crate::new_thread::{self, DraftWorkspace};
+use crate::queue::QueuedMessage;
+use crate::timeline::Row;
+
+/// A message sent to a thread that its projection doesn't show yet (`optimisticUserMessages`).
+pub(super) struct PendingSend {
+    thread_id: String,
+    message_id: String,
+    text: SharedString,
+    created_at: SharedString,
+    queued: bool,
+}
+
+impl PendingSend {
+    /// The projection shows it, as a message or as a queued run.
+    fn landed(&self, projection: &ThreadProjection) -> bool {
+        let id = Some(self.message_id.as_str());
+        projection.runs.iter().any(|run| run.user_message_id.as_deref() == id)
+            || projection.turn_items.iter().any(|item| item.item_type == "user_message" && item.str("messageId") == id)
+    }
+
+    fn row(&self) -> Row {
+        if self.queued {
+            let message = QueuedMessage {
+                run_id: SharedString::default(),
+                message_id: self.message_id.clone().into(),
+                text: self.text.clone(),
+                preview: crate::queue::preview_text(&self.text).into(),
+                editable: false,
+                created_at: Some(self.created_at.clone()),
+                sent_by_t3code: false,
+                fresh_context: false,
+            };
+            return Row::Queued { message: Rc::new(message), last: true };
+        }
+        Row::User {
+            id: format!("optimistic:{}", self.message_id).into(),
+            text: self.text.clone(),
+            steer: None,
+            grouped_with_previous: false,
+            grouped_with_next: false,
+            continues_steer: false,
+            created_at: self.created_at.clone(),
+            revert: None,
+            sent_by_t3code: false,
+            from_agent: None,
+        }
+    }
+}
+
+/// Drops the sends `projection` (of `thread_id`) now shows, and returns the rows of the rest:
+/// messages for after the timeline, queued ones for after the queue.
+pub(super) fn pending_rows(
+    pending: &mut Vec<PendingSend>,
+    thread_id: &str,
+    projection: &ThreadProjection,
+) -> (Vec<Row>, Vec<Row>) {
+    pending.retain(|send| send.thread_id != thread_id || !send.landed(projection));
+    let shown = pending.iter().filter(|send| send.thread_id == thread_id);
+    let (queued, sent): (Vec<_>, Vec<_>) = shown.partition(|send| send.queued);
+    (sent.into_iter().map(PendingSend::row).collect(), queued.into_iter().map(PendingSend::row).collect())
+}
 
 /// What a send shortcut asks for (`composer-logic.ts`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +246,7 @@ impl Workspace {
         // Thread settings the message runs with, applied right before it.
         let mut settings_commands = Vec::new();
         let mut sent_mode = None;
+        let mut pending_send = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
             Target::Thread { id: thread_id, .. } => {
                 // A plan follow-up refines in plan mode, or implements in build mode (`resolvePlanFollowUpSubmission`).
@@ -213,6 +277,14 @@ impl Workspace {
                     fresh_context: fresh_arm.is_some(),
                 }
                 .command();
+                // Feedback answers an approval rather than posting a message.
+                pending_send = (!text_is_feedback).then(|| PendingSend {
+                    thread_id: thread_id.clone(),
+                    message_id: command["messageId"].as_str().unwrap_or_default().to_owned(),
+                    text: command["text"].as_str().unwrap_or_default().to_owned().into(),
+                    created_at: crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default().into(),
+                    queued: running && command.get("deliveryIntent").is_none(),
+                });
                 ("orchestration.dispatchCommand", command, None, None)
             }
             Target::Draft { project_id, .. } => {
@@ -264,6 +336,8 @@ impl Workspace {
         let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
         let project_id = self.target_project().map(|p| p.id.clone());
         let sent_attachments = std::mem::take(&mut self.attachments);
+        let pending_id = pending_send.as_ref().map(|send| send.message_id.clone());
+        self.pending_sends.extend(pending_send);
         self.sending = true;
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
@@ -341,6 +415,7 @@ impl Workspace {
                         }
                     }
                     Err(error) => {
+                        this.pending_sends.retain(|send| Some(&send.message_id) != pending_id.as_ref());
                         this.error = Some(error.into());
                         if !text.is_empty() {
                             this.give_back_prompt(&origin, text, window, cx);
@@ -352,10 +427,12 @@ impl Workspace {
                         }
                     }
                 }
+                this.refresh_rows(cx);
                 cx.notify();
             });
         })
         .detach();
+        self.refresh_rows(cx);
         cx.notify();
     }
 
@@ -489,6 +566,36 @@ mod tests {
         assert!(queued.get("freshContext").is_none());
         let fresh = ThreadMessage { fresh_context: true, ..message(None, None) };
         assert_eq!(fresh.command()["freshContext"], true);
+    }
+
+    #[test]
+    fn a_sent_message_shows_until_its_thread_does() {
+        let projection = |items: Value, runs: Value| {
+            let projection = json!({"thread": {"id": "t", "title": "t"}, "runs": runs, "turnItems": items});
+            let mut state = crate::model::ThreadState::default();
+            state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})).unwrap();
+            state.projection.unwrap()
+        };
+        let send = |thread: &str, id: &str, queued: bool| PendingSend {
+            thread_id: thread.into(),
+            message_id: id.into(),
+            text: "hi".into(),
+            created_at: "now".into(),
+            queued,
+        };
+        let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false)];
+        let empty = projection(json!([]), json!([]));
+        let (sent, queued) = pending_rows(&mut pending, "t", &empty);
+        assert!(matches!(sent.as_slice(), [Row::User { id, .. }] if id.as_ref() == "optimistic:m1"));
+        assert!(matches!(queued.as_slice(), [Row::Queued { message, .. }] if message.message_id.as_ref() == "m2"));
+
+        let landed = projection(
+            json!([{"id": "i1", "type": "user_message", "threadId": "t", "messageId": "m1", "ordinal": 1}]),
+            json!([{"id": "r2", "status": "queued", "ordinal": 2, "userMessageId": "m2"}]),
+        );
+        let (sent, queued) = pending_rows(&mut pending, "t", &landed);
+        assert!(sent.is_empty() && queued.is_empty(), "both landed");
+        assert_eq!(pending[0].message_id, "m3", "another thread's send waits for that thread");
     }
 
     #[test]

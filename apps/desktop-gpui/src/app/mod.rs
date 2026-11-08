@@ -227,6 +227,8 @@ pub struct Workspace {
     reading_attachments: Vec<Target>,
     /// Attachments whose chip was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
+    /// Sent messages their thread doesn't show yet.
+    pending_sends: Vec<send::PendingSend>,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
     sidebar_view: Entity<sidebar::SidebarView>,
@@ -430,6 +432,7 @@ impl Workspace {
             dragging_files: false,
             reading_attachments: Vec::new(),
             retained_attachments: Vec::new(),
+            pending_sends: Vec::new(),
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
             visit: visits::VisitTracker::default(),
@@ -819,11 +822,24 @@ impl Workspace {
             }
             None => Vec::new(),
         };
+        let (sent, queued) = match self.thread.as_ref().and_then(|t| Some((&t.id, t.state.projection.as_ref()?))) {
+            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, id, projection),
+            None => Default::default(),
+        };
+        new_rows.extend(sent);
         self.apply_workflow_opening(&mut new_rows, cx);
         self.sync_worktree_setup(cx);
         self.insert_worktree_setup(&mut new_rows);
         new_rows.extend(self.now_rows(cx));
-        new_rows.extend(self.queue_rows());
+        let mut queue = self.queue_rows();
+        if !queued.is_empty() {
+            let at = queue.iter().position(|row| matches!(row, Row::QueueToggle { .. })).unwrap_or(queue.len());
+            if let Some(Row::Queued { last, .. }) = at.checked_sub(1).and_then(|i| queue.get_mut(i)) {
+                *last = false;
+            }
+            queue.splice(at..at, queued);
+        }
+        new_rows.extend(queue);
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
         self.sync_subagent_tick(cx);

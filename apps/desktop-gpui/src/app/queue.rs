@@ -356,7 +356,9 @@ pub(super) fn queued_row(
     let editing = ui.edit.as_ref().is_some_and(|edit| edit.run_id == message.run_id);
     let busy = ui.busy.is_some();
     let blocked = workspace.edit_blocked_reason();
-    let id = &message.run_id;
+    // Sent but not queued on the server yet: no run to act on.
+    let pending = message.run_id.is_empty();
+    let id = if pending { &message.message_id } else { &message.run_id };
     let muted = t.muted_foreground;
     let bubble = div()
         .min_w_0()
@@ -383,7 +385,7 @@ pub(super) fn queued_row(
             .group_hover(format!("queued:{id}"), |s| s.opacity(1.))
             .children(time),
     );
-    if ui.state.can_send(message) && !editing {
+    if !pending && ui.state.can_send(message) && !editing {
         // The first message's Send now names `thread.steerQueuedMessage`.
         let first = ui.state.queued.first().is_some_and(|q| &q.run_id == id);
         let tooltip: SharedString = match workspace.shortcut_label("thread.steerQueuedMessage").filter(|_| first) {
@@ -408,7 +410,7 @@ pub(super) fn queued_row(
                 let _ = this.update(cx, |w, cx| w.cancel_queue_edit(window, cx));
             }),
         );
-    } else {
+    } else if !pending {
         let edit_disabled = !message.editable || busy || blocked.is_some();
         // The last message's edit names `thread.editQueuedMessage`, labelled as from the composer.
         let edit_tooltip: SharedString = match blocked {
