@@ -7,6 +7,7 @@ mod custom_snooze;
 mod drafts;
 mod filter;
 mod provider_update;
+mod scope_store;
 mod search_results;
 mod selection;
 
@@ -24,9 +25,9 @@ use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DismissEvent, DragMoveEvent, EmptyView,
     Entity, FocusHandle, Focusable as _, Font, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun, WeakEntity, Window, anchored,
-    deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
+    IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun,
+    WeakEntity, Window, anchored, deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
 };
 use serde_json::json;
 
@@ -78,6 +79,11 @@ pub(super) struct SidebarState {
     undo: Option<actions::UndoNotice>,
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
+    /// The thread route last seen, and the one whose row still waits to scroll into view
+    /// (`SidebarRouteReveal`).
+    route_seen: Option<String>,
+    reveal: Option<String>,
+    scroll: ScrollHandle,
     groups: RefCell<GroupsCache>,
     search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
@@ -190,7 +196,10 @@ impl SidebarState {
             renaming: None,
             clicked: None,
             undo: None,
-            scope: Vec::new(),
+            scope: scope_store::load(),
+            route_seen: None,
+            reveal: None,
+            scroll: ScrollHandle::new(),
             groups: RefCell::default(),
             search_ranking: RefCell::default(),
             collapsed_folders: HashSet::new(),
@@ -232,6 +241,16 @@ struct GroupsKey {
 struct GroupsCache {
     key: Option<GroupsKey>,
     groups: Rc<[ProjectGroup]>,
+}
+
+/// `resolveSidebarRouteReveal`'s `widensScope`: the filter hides a listed thread.
+fn reveal_widens_scope(thread: &ThreadShell, groups: &[ProjectGroup], scope: &[String]) -> bool {
+    let scoped = scoped_groups(groups, scope);
+    !scoped.is_empty()
+        && thread.is_listed()
+        && thread.archived_at.is_none()
+        && thread.deleted_at.is_none()
+        && !scoped.iter().any(|g| g.project_ids.contains(&thread.project_id))
 }
 
 /// The filter's groups that still exist and are open, in sidebar order; empty is all projects.
@@ -1239,10 +1258,32 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// A new thread route that the filter hides widens it to every project, like the web's
+    /// route reveal, so history, links and the palette never open a thread with no row.
+    fn reveal_route(&mut self, groups: &[ProjectGroup], searching: bool) {
+        let Some(route) = self.route_thread().map(str::to_owned) else { return };
+        if self.sidebar.route_seen.as_ref() != Some(&route) {
+            self.sidebar.route_seen = Some(route.clone());
+            self.sidebar.reveal = Some(route);
+        }
+        // Search results replace the thread list; the reveal waits for it to return.
+        let Some(pending) = self.sidebar.reveal.as_deref().filter(|_| !searching) else { return };
+        let Some(thread) = self.shell.threads.iter().find(|t| t.id == pending) else { return };
+        if reveal_widens_scope(thread, groups, &self.sidebar.scope) {
+            self.sidebar.selection.clear();
+            self.sidebar.scope.clear();
+            scope_store::save(&[]);
+            self.sidebar.settled_visible = SETTLED_INITIAL;
+        }
+    }
+
     /// Sets the project filter; the settled tail starts over at its first page.
     pub(super) fn set_scope(&mut self, scope: Vec<String>, cx: &mut Context<Self>) {
         // A selection made under one scope can hold threads the next one hides.
         self.sidebar.selection.clear();
+        if self.sidebar.scope != scope {
+            scope_store::save(&scope);
+        }
         self.sidebar.scope = scope;
         self.sidebar.settled_visible = SETTLED_INITIAL;
         self.notify_sidebar(cx);
@@ -1307,9 +1348,17 @@ impl Workspace {
         let boring = self.boring_sidebar();
         let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
         let groups = self.project_groups();
+        self.reveal_route(&groups, !query.is_empty());
         let draft_rows = self.draft_rows();
         let items =
             self.sidebar.items(&self.shell, &groups, self.target.as_ref(), draft_rows, working_shelf, boring, now);
+        let revealed = (self.sidebar.reveal.as_deref())
+            .filter(|_| query.is_empty())
+            .and_then(|id| items.iter().position(|item| item.thread_id().as_deref() == Some(id)));
+        if let Some(index) = revealed {
+            self.sidebar.reveal = None;
+            self.sidebar.scroll.scroll_to_item(index);
+        }
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();
@@ -1330,11 +1379,12 @@ impl Workspace {
         });
 
         // Under a fixed header the web drops the list group's top padding.
-        let mut list = v_flex().min_h_full().px(px(8.)).pb(px(8.)).gap(px(1.));
+        // The rows are the scroll container's own children, so a route reveal can scroll to one.
+        let mut list: Vec<AnyElement> = Vec::new();
         if !query.is_empty() {
-            list = list.child(self.render_search_results(&query, now, &tokens, cx));
+            list.push(self.render_search_results(&query, now, &tokens, cx));
         } else if !has_rows && self.sidebar.settled_count_is_zero(&items) {
-            list = list.child(self.render_empty_state(&tokens, cx));
+            list.push(self.render_empty_state(&tokens, cx));
         } else {
             for (index, item) in items.into_iter().enumerate() {
                 // Only a focused list draws the cursor ring, so only it needs the row keys.
@@ -1377,7 +1427,7 @@ impl Workspace {
                     }
                     Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
                 };
-                list = list.child(if ring { focus_ring(element, &tokens) } else { element });
+                list.push(if ring { focus_ring(element, &tokens) } else { element });
             }
         }
         self.sidebar.inbox_order = inbox_order;
@@ -1458,16 +1508,20 @@ impl Workspace {
             .child(self.render_chrome_row(&tokens, window, cx))
             .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(
-                div()
+                v_flex()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
+                    .px(px(8.))
+                    .pb(px(8.))
+                    .gap(px(1.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.sidebar.scroll)
                     .track_focus(&self.sidebar.list_focus)
                     .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                         this.list_key(event, window, cx);
                     }))
-                    .child(list),
+                    .children(list),
             )
             .children(
                 self.render_provider_pill(&tokens, cx)
@@ -2698,6 +2752,37 @@ mod tests {
         // In fullscreen the traffic lights hide, and so do Windows' and Linux's (on the right).
         assert_eq!(sf(52.), px(MIN_WIDTH));
         assert_eq!(min_width(brand_probe_width(px(52.), px(10.18), px(36.), size)), px(MIN_WIDTH));
+    }
+
+    #[test]
+    fn a_route_the_filter_hides_widens_it_unless_the_thread_has_no_row() {
+        let group = |key: &str, archived: bool| ProjectGroup {
+            key: key.into(),
+            display_name: key.into(),
+            members: Vec::new(),
+            project_ids: vec![key.into()],
+            pinned: false,
+            archived,
+        };
+        let thread = |project: &str, extra: serde_json::Value| -> ThreadShell {
+            let mut value = json!({
+                "id": "t", "projectId": project, "title": "t", "status": "idle",
+                "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z",
+                "lineage": {"rootThreadId": "t"},
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let groups = [group("a", false), group("b", false), group("gone", true)];
+        let scope = ["a".to_owned()];
+        assert!(reveal_widens_scope(&thread("b", json!({})), &groups, &scope));
+        assert!(!reveal_widens_scope(&thread("a", json!({})), &groups, &scope), "already shown");
+        assert!(!reveal_widens_scope(&thread("b", json!({})), &groups, &[]), "no filter");
+        assert!(!reveal_widens_scope(&thread("b", json!({})), &groups, &["gone".into()]), "an archived scope is all");
+        let archived = thread("b", json!({"archivedAt": "2026-11-02T00:00:00.000Z"}));
+        assert!(!reveal_widens_scope(&archived, &groups, &scope));
+        let sub = thread("b", json!({"lineage": {"rootThreadId": "p", "relationshipToParent": "subagent"}}));
+        assert!(!reveal_widens_scope(&sub, &groups, &scope), "listed under its parent");
     }
 
     #[test]
