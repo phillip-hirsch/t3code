@@ -1829,24 +1829,92 @@ pub fn needs_host_refresh(action: &str) -> bool {
     matches!(action, "update-branch" | "approve-workflows")
 }
 
-/// A change request link's host, repository and number (`parseChangeRequestUrl`), for the
-/// hosts whose links name the repository in the path: GitHub's `/pull/` and GitLab's `/-/merge_requests/`.
-pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/')?;
-    let path = path.split(['?', '#']).next()?;
-    let (repository, tail) = path.split_once("/-/merge_requests/").or_else(|| {
-        let mut parts = path.splitn(3, '/');
-        let (owner, name, tail) = (parts.next()?, parts.next()?, parts.next()?);
-        let tail = tail.strip_prefix("pull/")?;
-        Some((&path[..owner.len() + 1 + name.len()], tail))
-    })?;
-    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    let after = &tail[digits.len()..];
-    if repository.split('/').count() < 2 || !(after.is_empty() || after.starts_with('/')) {
+/// A change request link (`ParsedChangeRequestUrl`), as the first host that claims it reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeRequestLink {
+    /// The host kind that claimed it: "github", "gitlab", "forgejo", ...
+    pub provider: &'static str,
+    /// `authority ?? host`: Forgejo and Azure DevOps keep a non-default port.
+    pub host: String,
+    /// Lowercase, as every host's parser gives it.
+    pub repository: String,
+    pub number: u64,
+    /// The repository's browser URL, without query or hash.
+    pub repository_url: String,
+}
+
+/// `[^/]+` for each segment of a repository path.
+fn repository_path(segments: &[&str]) -> Option<String> {
+    segments.iter().all(|s| !s.is_empty()).then(|| segments.join("/"))
+}
+
+/// The repository path and number when `segments` end in `{repository}/{route...}/{number}`,
+/// trying the longest repository first like the hosts' greedy routes.
+fn route_match(segments: &[&str], route: &[&[&str]], repository: impl Fn(&[&str]) -> bool) -> Option<(String, u64)> {
+    (1..segments.len()).rev().find_map(|split| {
+        let (repo, rest) = segments.split_at(split);
+        let tail = &rest[..route.len().min(rest.len())];
+        if tail.len() != route.len() || !tail.iter().zip(route).all(|(seg, options)| options.contains(seg)) {
+            return None;
+        }
+        let number = rest.get(route.len())?;
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) || !repository(repo) {
+            return None;
+        }
+        let number: u64 = number.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
+        Some((repository_path(repo)?, number))
+    })
+}
+
+/// `sourceControlClients.parseChangeRequestUrl`: GitCafe and Azure DevOps claim a link first, then
+/// GitHub (`/pull/`), GitLab (`/-/merge_requests/`), Forgejo (`/pulls/`) and Bitbucket (`/pull-requests/`).
+pub fn parse_change_request(url: &str) -> Option<ChangeRequestLink> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    Some((host.to_lowercase(), repository.to_owned(), digits.parse().ok().filter(|n| *n > 0)?))
+    let hostname = parsed.host_str()?.to_lowercase();
+    let authority = match parsed.port() {
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname.clone(),
+    };
+    let path = parsed.path().strip_prefix('/')?;
+    let segments: Vec<&str> = path.split('/').collect();
+    let two = |repo: &[&str]| repo.len() == 2;
+    let many = |repo: &[&str]| repo.len() >= 2;
+    let azure = |repo: &[&str]| repo.len() >= 2 && repo[repo.len() - 2] == "_git";
+    let bitbucket = hostname == "bitbucket.org" || hostname.split('.').any(|label| label == "bitbucket");
+    let gitcafe = matches!(hostname.as_str(), "git.cafe" | "staging.git.cafe");
+    let (provider, host, (repository, number)) = None
+        .or_else(|| {
+            gitcafe
+                .then(|| route_match(&segments, &[&["pull", "pulls"]], two))
+                .flatten()
+                .map(|m| ("gitcafe", &hostname, m))
+        })
+        .or_else(|| route_match(&segments, &[&["pullrequest"]], azure).map(|m| ("azure-devops", &authority, m)))
+        .or_else(|| route_match(&segments, &[&["pull"]], two).map(|m| ("github", &hostname, m)))
+        .or_else(|| route_match(&segments, &[&["-"], &["merge_requests"]], many).map(|m| ("gitlab", &hostname, m)))
+        .or_else(|| route_match(&segments, &[&["pulls"]], many).map(|m| ("forgejo", &authority, m)))
+        .or_else(|| {
+            bitbucket
+                .then(|| route_match(&segments, &[&["pull-requests"]], two))
+                .flatten()
+                .map(|m| ("bitbucket", &hostname, m))
+        })?;
+    let origin = parsed.origin().ascii_serialization();
+    Some(ChangeRequestLink {
+        provider,
+        host: host.clone(),
+        repository_url: format!("{origin}/{repository}"),
+        repository: repository.to_lowercase(),
+        number,
+    })
+}
+
+/// A change request link's host, repository and number (`parseChangeRequestUrl`).
+pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
+    parse_change_request(url).map(|link| (link.host, link.repository, link.number))
 }
 
 /// The project whose repository holds the change request: its repository key is `host/repository`.
@@ -2252,7 +2320,7 @@ mod tests {
         let parse = parse_change_request_url;
         assert_eq!(
             parse("https://github.com/Acme/App/pull/12/files"),
-            Some(("github.com".into(), "Acme/App".into(), 12))
+            Some(("github.com".into(), "acme/app".into(), 12))
         );
         assert_eq!(
             parse("https://GitHub.com/acme/app/pull/12#top"),
@@ -2262,9 +2330,37 @@ mod tests {
             parse("https://gitlab.com/group/sub/proj/-/merge_requests/5"),
             Some(("gitlab.com".into(), "group/sub/proj".into(), 5))
         );
+        assert_eq!(
+            parse("https://codeberg.org/forge/app/pulls/3"),
+            Some(("codeberg.org".into(), "forge/app".into(), 3))
+        );
+        assert_eq!(
+            parse("http://forge.local:3000/team/app/pulls/4/files"),
+            Some(("forge.local:3000".into(), "team/app".into(), 4)),
+            "Forgejo keeps the port"
+        );
+        assert_eq!(
+            parse("https://bitbucket.org/team/app/pull-requests/8"),
+            Some(("bitbucket.org".into(), "team/app".into(), 8))
+        );
+        assert_eq!(parse("https://example.com/team/app/pull-requests/8"), None, "only Bitbucket's hosts");
+        assert_eq!(
+            parse("https://dev.azure.com/org/Proj/_git/Repo/pullrequest/21"),
+            Some(("dev.azure.com".into(), "org/proj/_git/repo".into(), 21))
+        );
+        assert_eq!(
+            parse("https://git.cafe/acme/app/pulls/6"),
+            Some(("git.cafe".into(), "acme/app".into(), 6)),
+            "GitCafe claims /pulls/ on its own hosts"
+        );
+        assert_eq!(
+            parse_change_request("https://github.com/Acme/App/pull/12?x=1").map(|l| l.repository_url),
+            Some("https://github.com/Acme/App".into())
+        );
         assert_eq!(parse("https://github.com/acme/app/issues/12"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/12x"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/0"), None);
+        assert_eq!(parse("ftp://github.com/acme/app/pull/1"), None);
         let projects = [("p1", Some("github.com/acme/web")), ("p2", Some("github.com/acme/app")), ("p3", None)];
         assert_eq!(project_for_link(projects, "github.com", "Acme/App"), Some("p2"));
         assert_eq!(project_for_link(projects, "gitlab.com", "acme/app"), None);

@@ -268,9 +268,9 @@ fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedStrin
     window.push_notification(Notification::success("").title(title), cx);
 }
 
-/// The repository's page: the pull request URL without its `/pull/N` tail.
+/// The repository's page (`parseChangeRequestUrl(url).link.repositoryUrl`).
 fn repository_url(url: &str) -> Option<String> {
-    ["/pull/", "/-/merge_requests/"].iter().find_map(|tail| url.find(tail).map(|at| url[..at].to_owned()))
+    logic::parse_change_request(url).map(|link| link.repository_url)
 }
 
 impl Workspace {
