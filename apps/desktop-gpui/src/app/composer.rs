@@ -975,8 +975,7 @@ impl Workspace {
             .when(self.can_attach(), |el| {
                 el.child(
                     div().mr(px(8.)).child(
-                        div()
-                            .id("attach")
+                        action_control(div().id("attach"), &self.composer_action_focus[ATTACH], t)
                             .size(px(28.))
                             .flex_none()
                             .flex()
@@ -1038,7 +1037,7 @@ impl Workspace {
             .and_then(|t| t.state.projection.as_ref())
             .is_some_and(super::super::model::ThreadProjection::is_running);
         let stop = || {
-            round_button("stop", t.error.opacity(0.9), t.error, t)
+            action_control(round_button("stop", t.error.opacity(0.9), t.error, t), &self.composer_action_focus[STOP], t)
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
@@ -1065,6 +1064,8 @@ impl Workspace {
                 (false, true) => "Submit answer",
             };
             let enabled = ready && can_respond && !responding;
+            let submit = div().id("submit-answer");
+            let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
                 .gap(px(8.))
                 .when(running, |el| el.child(stop()))
@@ -1079,8 +1080,7 @@ impl Workspace {
                     )
                 })
                 .child(
-                    div()
-                        .id("submit-answer")
+                    submit
                         .h(px(28.))
                         .px(px(16.))
                         .flex()
@@ -1118,7 +1118,9 @@ impl Workspace {
             } else {
                 Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
             };
-            return round_button("resume", t.primary, t.primary, t)
+            let resume = round_button("resume", t.primary, t.primary, t);
+            let resume = if enabled { action_control(resume, &self.composer_action_focus[PRIMARY], t) } else { resume };
+            return resume
                 .child(content)
                 .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
                 .when(enabled, |el| {
@@ -1181,31 +1183,25 @@ impl Workspace {
             }
             _ => None,
         };
-        round_button("send", fill, t.primary, t)
-            .when_some(stage, |el, art| {
-                el.relative()
-                    .when(!can_send, |el| el.opacity(0.64))
-                    .child(super::sidebar::stage_button_art(art, t.dark))
-            })
-            .child(div().relative().child(content))
-            .when(!can_send, |el| el.shadow(Vec::new()))
-            .when(can_send, |el| {
-                el.cursor_pointer().when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover))).on_click(
-                    cx.listener(|this, event: &ClickEvent, window, cx| {
-                        let modifiers = event.modifiers();
-                        let intent = if modifiers.control || modifiers.platform {
-                            Intent::Alternate
-                        } else {
-                            Intent::Foreground
-                        };
-                        this.submit_with(intent, window, cx);
-                    }),
-                )
-            })
-            .when_some(tooltip, |el, tooltip| {
-                el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            })
-            .into_any_element()
+        let send = round_button("send", fill, t.primary, t);
+        let send = if can_send { action_control(send, &self.composer_action_focus[PRIMARY], t) } else { send };
+        send.when_some(stage, |el, art| {
+            el.relative().when(!can_send, |el| el.opacity(0.64)).child(super::sidebar::stage_button_art(art, t.dark))
+        })
+        .child(div().relative().child(content))
+        .when(!can_send, |el| el.shadow(Vec::new()))
+        .when(can_send, |el| {
+            el.cursor_pointer().when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover))).on_click(cx.listener(
+                |this, event: &ClickEvent, window, cx| {
+                    let modifiers = event.modifiers();
+                    let intent =
+                        if modifiers.control || modifiers.platform { Intent::Alternate } else { Intent::Foreground };
+                    this.submit_with(intent, window, cx);
+                },
+            ))
+        })
+        .when_some(tooltip, |el, tooltip| el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)))
+        .into_any_element()
     }
 
     fn render_approval(
@@ -1812,6 +1808,24 @@ pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
     let button =
         Button::new(id).ghost().small().h(px(28.)).px(px(8.)).border_1().border_color(gpui_kit::transparent_black());
     t.breakpoint.control_text(button).font_weight(FontWeight::MEDIUM).text_color(t.foreground.opacity(0.8))
+}
+
+const ATTACH: usize = 0;
+const STOP: usize = 1;
+pub(super) const PRIMARY: usize = 2;
+
+/// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
+/// click leaves the composer focused past (`preventPointerFocus`).
+pub(super) fn action_control(
+    control: gpui_kit::Stateful<gpui_kit::Div>,
+    focus: &gpui_kit::FocusHandle,
+    t: &Tokens,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = t.ring;
+    control
+        .track_focus(focus)
+        .focus_visible(move |s| s.border_2().border_color(ring))
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| window.prevent_default())
 }
 
 /// The send/stop circle (`h-9 w-9 sm:h-8 sm:w-8`) with its tinted shadow and inset highlight.

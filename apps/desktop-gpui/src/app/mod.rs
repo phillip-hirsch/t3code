@@ -192,6 +192,8 @@ pub struct Workspace {
     /// Requests that arrived mid-typing, kept out of sight for now.
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
+    /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
+    composer_action_focus: [gpui_kit::FocusHandle; 3],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
@@ -405,6 +407,7 @@ impl Workspace {
             question: None,
             typing_guard: Default::default(),
             _typing_idle: None,
+            composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_drafts: HashMap::new(),
             composer_selections: HashMap::new(),
             responding: None,
