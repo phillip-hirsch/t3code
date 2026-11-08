@@ -312,7 +312,10 @@ impl Workspace {
         self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
-                && (self.plan_toggle_key(keystroke, window, cx) || self.menu_key(keystroke, window, cx)))
+                && (self.code_key(keystroke, window, cx)
+                    || self.list_outdent_key(keystroke, window, cx)
+                    || self.plan_toggle_key(keystroke, window, cx)
+                    || self.menu_key(keystroke, window, cx)))
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -331,7 +334,86 @@ impl Workspace {
         }
         self.question_option_key(keystroke, window, cx)
             || (context.composer_focus
-                && (self.history_key(keystroke, window, cx) || self.send_key(keystroke, context, window, cx)))
+                && (self.history_key(keystroke, window, cx)
+                    || self.send_key(keystroke, context, window, cx)
+                    || self.composer_list_key(keystroke, window, cx)))
+    }
+
+    /// The rich editor's code-block keys, ahead of menus and sending (`ComposerPromptEditorTiptap`):
+    /// Enter writes a line of code or leaves the block, Tab and Shift+Tab indent.
+    fn code_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if m.control || m.platform || self.question.is_some() {
+            return false;
+        }
+        if !self.client_settings.values.bool("composerRichTextEnabled") {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let (text, selection) = (state.value(), state.selected_range());
+        let edit = match keystroke.key.as_str() {
+            "enter" => crate::composer_edit::code_enter(&text, selection),
+            "tab" => crate::composer_edit::code_tab(&text, selection, m.shift),
+            _ => None,
+        };
+        edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
+    }
+
+    /// Shift+Tab lifts a nested list item before it switches Build and Plan (`composerCommandKey.ts`).
+    fn list_outdent_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if keystroke.key != "tab" || !m.shift || m.control || m.alt || m.platform {
+            return false;
+        }
+        self.list_edit(crate::composer_edit::list_outdent, window, cx)
+    }
+
+    /// Enter that doesn't send continues a list; Tab nests its item (`applyListEdit`).
+    fn composer_list_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if m.control || m.platform {
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "enter" => self.list_edit(crate::composer_edit::list_enter, window, cx),
+            "tab" if !m.shift && !m.alt => self.list_edit(crate::composer_edit::list_indent, window, cx),
+            _ => false,
+        }
+    }
+
+    fn list_edit(
+        &mut self,
+        edit: fn(&str, usize, &[std::ops::Range<usize>]) -> Option<crate::composer_edit::Edit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.question.is_some() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        if !selection.is_empty() {
+            return false;
+        }
+        let tokens: Vec<_> = state.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
+        let edit = edit(&state.value(), selection.start, &tokens);
+        edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
+    }
+
+    fn apply_composer_edit(
+        &mut self,
+        edit: crate::composer_edit::Edit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.composer.update(cx, |state, cx| {
+            if !edit.is_noop() {
+                state.set_selected_range(edit.range, cx);
+                state.replace(edit.text, window, cx);
+            }
+            state.set_selected_range(edit.select, cx);
+        });
+        true
     }
 
     /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
