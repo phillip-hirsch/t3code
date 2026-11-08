@@ -330,6 +330,11 @@ impl Images {
         .detach();
         None
     }
+
+    /// Drops `resource`'s image, so the next `get` fetches it again.
+    pub(in crate::app) fn forget(&mut self, resource: &Value) {
+        self.slots.remove(&resource.to_string());
+    }
 }
 
 /// The `project-favicon` resource for a project (`projectFaviconUrlAtom`).

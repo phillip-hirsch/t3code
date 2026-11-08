@@ -246,6 +246,13 @@ impl Workspace {
         state.mutation = Some(mutation);
         if state.kind == logic::FileKind::Image {
             state.load = Load::Image;
+            // `workspace-revision`: a mutation fetches the image again.
+            if changed {
+                let resource = self.image_resource(key);
+                if let Some(images) = self.files.images.get(&key.checkout.env) {
+                    images.update(cx, |images, _| images.forget(&resource));
+                }
+            }
         } else if state.kind.is_asset() {
             state.load = Load::Asset;
         } else if fresh || (changed && !dirty) {
@@ -1018,17 +1025,21 @@ impl Workspace {
 
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.
     fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
-        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
-        let resource = match &self.target {
-            Some(Target::Thread { id: thread_id, .. }) => {
-                json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
-            }
-            _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
-        };
+        let resource = self.image_resource(key);
         let env = &key.checkout.env;
         let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
         let images = self.files.images.entry(env.clone()).or_insert_with(|| cx.new(|_| Default::default())).clone();
         images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
+    }
+
+    fn image_resource(&self, key: &FileKey) -> Value {
+        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
+        match &self.target {
+            Some(Target::Thread { id: thread_id, .. }) => {
+                json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
+            }
+            _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
+        }
     }
 
     /// The editor the details card's Open in launches.
