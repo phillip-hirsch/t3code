@@ -34,7 +34,9 @@ impl Workspace {
             context.editable_focus = false;
         }
         let keymap = self.keymap.clone();
-        let command = keymap::resolve(&keymap, keystroke, &context);
+        // `scriptKeybindings`: the open thread's environment binds its project scripts.
+        let scripts = self.server_info().keybindings.clone();
+        let command = keymap::resolve_chat(&keymap, &scripts, keystroke, &context);
         if let Some(command) = command {
             log::trace!("shortcut resolves to {command}");
         }
