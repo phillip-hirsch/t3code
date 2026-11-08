@@ -52,8 +52,8 @@ pub(super) struct FilesState {
     trees: HashMap<Checkout, tree::TreeState>,
     /// Each opened file's preview.
     previews: HashMap<FileKey, preview::PreviewState>,
-    /// A line to scroll each opened file to, with the request it came from (`revealLine`).
-    reveals: HashMap<FileKey, (u32, u64)>,
+    /// Each opened file's last open request, with the line it asked for (`revealLine`).
+    reveals: HashMap<FileKey, (Option<u32>, u64)>,
     reveal_requests: u64,
     /// `t3code.fileExplorerOpen`: the explorer beside a previewed file.
     explorer_hidden: bool,

@@ -86,6 +86,8 @@ pub(super) struct PreviewState {
     applied_wrap: Option<bool>,
     mutation: Option<(Option<String>, Option<String>)>,
     revealed: Option<u64>,
+    /// The open request the rendered view was picked over (`handledReveal`).
+    rendered_reveal: Option<u64>,
     _read: Option<Task<()>>,
     _full: Option<Task<()>>,
     _save: Option<Task<()>>,
@@ -109,6 +111,7 @@ impl PreviewState {
             applied_wrap: None,
             mutation: None,
             revealed: None,
+            rendered_reveal: None,
             _read: None,
             _full: None,
             _save: None,
@@ -174,14 +177,28 @@ impl Rendered {
     }
 }
 
+/// `revealHandled`: a line reveal shows the source until the rendered view is picked over it.
+fn reveal_handled(reveal: Option<(Option<u32>, u64)>, rendered_reveal: Option<u64>) -> bool {
+    match reveal {
+        Some((Some(_), request)) => rendered_reveal == Some(request),
+        _ => true,
+    }
+}
+
 impl super::FilesState {
-    pub(super) fn shows_rendered(&self, mode: Rendered) -> bool {
-        match mode {
+    /// The rendered view `key` shows in `mode`: the preference, unless a line reveal holds the source.
+    pub(super) fn shows_rendered(&self, key: &FileKey, mode: Rendered) -> bool {
+        let preferred = match mode {
             Rendered::Markdown => self.render_markdown,
             Rendered::Html => !self.html_source,
             Rendered::Table => !self.table_source,
             Rendered::Mermaid => !self.mermaid_source,
-        }
+        };
+        preferred
+            && reveal_handled(
+                self.reveals.get(key).copied(),
+                self.previews.get(key).and_then(|state| state.rendered_reveal),
+            )
     }
 
     pub(super) fn set_rendered(&mut self, mode: Rendered, rendered: bool) {
@@ -208,10 +225,10 @@ impl Workspace {
             return;
         }
         let path = logic::normalize_open_path(path);
-        if let (Some(line), Some(target)) = (line, self.project_target()) {
+        if let Some(target) = self.project_target() {
             self.files.reveal_requests += 1;
             let key = FileKey { checkout: target.checkout, path: path.clone() };
-            self.files.reveals.insert(key, (line.max(1), self.files.reveal_requests));
+            self.files.reveals.insert(key, (line.map(|line| line.max(1)), self.files.reveal_requests));
         }
         self.open_file_surface(path, window, cx);
     }
@@ -249,7 +266,15 @@ impl Workspace {
             state.applied_wrap = Some(wrap);
             editor.update(cx, |editor, cx| editor.set_soft_wrap(wrap, window, cx));
         }
-        if let Some((line, request)) = reveal.filter(|(_, request)| state.revealed != Some(*request)) {
+        // The full file shows in place of the first megabyte once it loads, so the line waits for it.
+        let shown = match &state.full {
+            None => Some(editor),
+            Some(FullFile::Ready { editor, .. }) => Some(editor.clone()),
+            Some(FullFile::Loading | FullFile::Failed) => None,
+        };
+        if let (Some(editor), Some((Some(line), request))) = (shown, reveal)
+            && state.revealed != Some(request)
+        {
             state.revealed = Some(request);
             editor.update(cx, |editor, cx| editor.set_cursor_position(Position::new(line - 1, 0), window, cx));
             // The caret moves without taking focus: the composer keeps it, as when the web's palette closes.
@@ -400,6 +425,8 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(state) = this.files.previews.get_mut(&request_key) else { return };
+                // A new viewer takes the open request's line again, like the web's remounted one.
+                state.revealed = None;
                 state.full = Some(match text {
                     Ok((text, cells)) => {
                         let editor = cx.new(|cx| EditorState::new(window, cx).language("text").default_value(text));
@@ -708,7 +735,7 @@ impl Workspace {
         let text = state.is_some_and(|s| matches!(s.load, Load::Text { .. }));
         let kind = state.map_or(logic::FileKind::Text, |s| s.kind);
         let mode = (!folder).then(|| Rendered::of(&path)).flatten();
-        let rendered = mode.is_some_and(|mode| self.files.shows_rendered(mode));
+        let rendered = mode.is_some_and(|mode| self.files.shows_rendered(key, mode));
         let shows_raw_text = text && !rendered && kind != logic::FileKind::Pdf;
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
@@ -738,9 +765,14 @@ impl Workspace {
                     (false, Rendered::Table) => IconName::Table2,
                     (false, _) => IconName::Eye,
                 };
+                let key = key.clone();
                 el.child(action("file-rendered", icon, mode.toggle_label(rendered).into(), rendered).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.files.set_rendered(mode, !rendered);
+                        let request = this.files.reveals.get(&key).map(|(_, request)| *request);
+                        if let Some(state) = this.files.previews.get_mut(&key) {
+                            state.rendered_reveal = if rendered { None } else { request };
+                        }
                         cx.notify();
                     }),
                 ))
@@ -785,9 +817,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let render_markdown = self.files.render_markdown;
-        let delimiter = logic::table_delimiter(&key.path).filter(|_| self.files.shows_rendered(Rendered::Table));
-        let render_mermaid = self.files.shows_rendered(Rendered::Mermaid);
+        let render_markdown = self.files.shows_rendered(key, Rendered::Markdown);
+        let delimiter = logic::table_delimiter(&key.path).filter(|_| self.files.shows_rendered(key, Rendered::Table));
+        let render_mermaid = self.files.shows_rendered(key, Rendered::Mermaid);
         let kind = self.files.previews.get(key).map_or(logic::FileKind::Text, |s| s.kind);
         match self.files.previews.get(key).map(|s| &s.load) {
             Some(Load::Asset) => {
@@ -799,7 +831,9 @@ impl Workspace {
                 };
             }
             Some(Load::Binary) => return self.render_asset_file(key, kind, width, window, cx),
-            Some(Load::Text { .. }) if kind == logic::FileKind::Html && self.files.shows_rendered(Rendered::Html) => {
+            Some(Load::Text { .. })
+                if kind == logic::FileKind::Html && self.files.shows_rendered(key, Rendered::Html) =>
+            {
                 return self.render_document(key, kind, window, cx);
             }
             _ => {}
@@ -1025,4 +1059,18 @@ async fn fetch_asset(
                 .context("Text previews support files up to 256 MB.")
         })
         .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_handled;
+
+    #[test]
+    fn a_line_reveal_holds_the_source_until_the_rendered_view_is_picked() {
+        assert!(reveal_handled(None, None));
+        assert!(reveal_handled(Some((None, 3)), None), "an open without a line keeps the rendered view");
+        assert!(!reveal_handled(Some((Some(12), 3)), None));
+        assert!(reveal_handled(Some((Some(12), 3)), Some(3)), "picking the rendered view handles the reveal");
+        assert!(!reveal_handled(Some((Some(12), 4)), Some(3)), "a newer line request shows the source again");
+    }
 }
