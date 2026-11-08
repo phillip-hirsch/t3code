@@ -104,6 +104,31 @@ pub fn panel_target(
     linked.or(branch).map(from_linked)
 }
 
+/// What `thread.copyReference` copies (`ThreadReferenceCopyTarget`'s kind and value).
+#[derive(Debug, PartialEq)]
+pub enum ReferenceCopy<'a> {
+    /// "Copy PR link": this URL.
+    PullRequest(&'a str),
+    /// "Copy thread": a link that opens the thread.
+    Thread,
+}
+
+/// `resolveThreadReferenceCopyTarget`: the pull request open in the panel (`None` without one,
+/// `Some(None)` while its URL loads, when there is nothing to copy yet), else the thread's current
+/// pull request, else its linked or branch one, else the thread.
+pub fn reference_copy<'a>(
+    open_panel: Option<Option<&'a str>>,
+    links: &'a [PullRequestLink],
+    linked: Option<&'a LinkedPullRequest>,
+    branch: Option<&'a LinkedPullRequest>,
+) -> Option<ReferenceCopy<'a>> {
+    let url = match open_panel {
+        Some(url) => Some(url?),
+        None => current(links).map(|link| link.url.as_str()).or(linked.or(branch).map(|l| l.url.as_str())),
+    };
+    Some(url.map_or(ReferenceCopy::Thread, ReferenceCopy::PullRequest))
+}
+
 /// `ThreadSearchPullRequest`: what thread search matches a pull request by.
 pub struct SearchPullRequest {
     pub number: u64,
@@ -184,5 +209,31 @@ mod tests {
         let branch = LinkedPullRequest { number: 9, ..linked };
         assert_eq!(panel_target("p", &[], None, Some(&branch)).unwrap().number, 9);
         assert!(panel_target("p", &[], None, None).is_none());
+    }
+
+    #[test]
+    fn copy_reference_prefers_the_open_panel_then_the_current_pull_request_then_the_thread() {
+        let links = vec![link(2, "agent", "open", "2026-01-01T00:00:00Z")];
+        let branch = LinkedPullRequest {
+            project_id: "p".into(),
+            repository: "o/r".into(),
+            number: 9,
+            url: "https://github.com/o/r/pull/9".into(),
+        };
+        let panel = Some(Some("https://github.com/o/r/pull/5"));
+        assert_eq!(
+            reference_copy(panel, &links, None, Some(&branch)),
+            Some(ReferenceCopy::PullRequest("https://github.com/o/r/pull/5"))
+        );
+        assert_eq!(reference_copy(Some(None), &links, None, None), None, "the panel's URL is loading");
+        assert_eq!(
+            reference_copy(None, &links, None, Some(&branch)),
+            Some(ReferenceCopy::PullRequest("https://github.com/o/r/pull/2"))
+        );
+        assert_eq!(
+            reference_copy(None, &[], None, Some(&branch)),
+            Some(ReferenceCopy::PullRequest("https://github.com/o/r/pull/9"))
+        );
+        assert_eq!(reference_copy(None, &[], None, None), Some(ReferenceCopy::Thread));
     }
 }

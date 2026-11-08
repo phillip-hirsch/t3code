@@ -232,7 +232,8 @@ impl Panel {
             .unwrap_or("github")
     }
 
-    fn url(&self) -> Option<&str> {
+    /// The pull request's URL: its detail's, else the list row's it opened from.
+    pub(super) fn url(&self) -> Option<&str> {
         self.detail.as_ref().map(|d| d.url.as_str()).or(self.seed.as_ref().map(|s| s.url.as_str()))
     }
 

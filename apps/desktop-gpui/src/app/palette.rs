@@ -863,12 +863,21 @@ impl Workspace {
                 rows.push(row);
             }
         }
-        if let Some(thread) = thread {
-            let mut row = lucide("copy-thread-reference", IconName::Link, "Copy thread", Run::CopyThread);
-            row.description = Some(Description::Text(thread.title.clone().into()));
-            row.terms = &["copy", "thread", "thread id", "reference"];
+        if let Some(target) = self.reference_copy_target() {
+            use super::palette_actions::CopyTarget;
+            let (title, description, terms): (_, _, &'static [&'static str]) = match target {
+                CopyTarget::PullRequest(url) => ("Copy PR link", url, &["copy", "pull request", "link", "reference"]),
+                CopyTarget::Thread { title, .. } => {
+                    ("Copy thread", title, &["copy", "thread", "thread id", "reference"])
+                }
+            };
+            let mut row = lucide("copy-thread-reference", IconName::Link, title, Run::CopyThread);
+            row.description = Some(Description::Text(description.into()));
+            row.terms = terms;
             row.shortcut = self.shortcut("thread.copyReference");
             rows.push(row);
+        }
+        if let Some(thread) = thread {
             if self.pull_request_linking(&thread.id) {
                 let link = Run::LinkPullRequest(thread.id.clone());
                 let mut row = lucide("link-pull-request", IconName::Link2, "Link pull request to thread", link);
