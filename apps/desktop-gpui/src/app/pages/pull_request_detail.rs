@@ -42,6 +42,7 @@ mod completions;
 mod guide;
 mod handoff;
 mod header;
+pub(super) use header::checks_body;
 mod live;
 pub(in crate::app) mod write;
 

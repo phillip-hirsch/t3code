@@ -15,6 +15,59 @@ pub(super) struct LinkedThread {
     title: String,
 }
 
+/// `ChecksBody`: checks needing attention and running ones first; completed ones fold behind
+/// "Show all" while any of those show.
+pub(in crate::app::pages) fn checks_body(
+    checks: &[Check],
+    show_all: bool,
+    on_toggle: impl Fn(&mut App) + 'static,
+    t: &Tokens,
+) -> AnyElement {
+    if checks.is_empty() {
+        return div().text_xs().text_color(t.muted_foreground).child("No checks reported").into_any_element();
+    }
+    let (attention, running, completed) = logic::group_checks(checks);
+    let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
+    let rows = attention
+        .iter()
+        .chain(running.iter())
+        .copied()
+        .chain(completed.iter().copied().filter(|_| show_all || !collapsible))
+        .enumerate()
+        .map(|(index, check)| {
+            let (icon, color) = check_status_icon(&check.status, t);
+            let url = check.url.clone();
+            h_flex()
+                .gap(px(8.))
+                .text_xs()
+                .child(Icon::new(icon).with_size(px(14.)).text_color(color))
+                .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
+                .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
+                .children(url.map(|url| {
+                    div()
+                        .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                        .flex_none()
+                        .cursor_pointer()
+                        .text_color(t.primary)
+                        .hover(gpui_kit::Styled::underline)
+                        .child("Details")
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                }))
+        });
+    v_flex()
+        .child(v_flex().id("pr-checks-list").max_h(px(256.)).overflow_y_scroll().gap(px(4.)).children(rows))
+        .when(collapsible, |el| {
+            el.child(
+                div().mt(px(4.)).child(
+                    ghost_button("pr-checks-show-all", t)
+                        .child(if show_all { "Show less" } else { "Show all" })
+                        .on_click(move |_, _, cx| on_toggle(cx)),
+                ),
+            )
+        })
+        .into_any_element()
+}
+
 /// The pull request's key as threads record it: the link's host and lowercase repository.
 fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
     let (host, repository, number) = logic::parse_change_request_url(&detail.url)?;
@@ -177,44 +230,7 @@ impl Workspace {
             .p(px(12.))
             .content(move |_, _, cx| {
                 let t = *theme::tokens(cx);
-                let (attention, running, completed) = logic::group_checks(&checks);
-                let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
-                let visible: Vec<&Check> = attention
-                    .iter()
-                    .chain(running.iter())
-                    .copied()
-                    .chain(completed.iter().copied().filter(|_| show_all || !collapsible))
-                    .collect();
-                let rows: Vec<AnyElement> = visible
-                    .iter()
-                    .enumerate()
-                    .map(|(index, check)| {
-                        let (icon, color) = check_status_icon(&check.status, &t);
-                        let url = check.url.clone();
-                        h_flex()
-                            .gap(px(8.))
-                            .text_xs()
-                            .child(Icon::new(icon).with_size(px(14.)).text_color(color))
-                            .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(t.muted_foreground)
-                                    .child(logic::check_status_label(check)),
-                            )
-                            .children(url.map(|url| {
-                                div()
-                                    .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
-                                    .flex_none()
-                                    .cursor_pointer()
-                                    .text_color(t.primary)
-                                    .hover(gpui_kit::Styled::underline)
-                                    .child("Details")
-                                    .on_click(move |_, _, cx| cx.open_url(&url))
-                            }))
-                            .into_any_element()
-                    })
-                    .collect();
+                let view = view.clone();
                 v_flex()
                     .child(div().mb(px(8.)).text_sm().font_weight(FontWeight::MEDIUM).child(label))
                     .children(
@@ -228,35 +244,21 @@ impl Workspace {
                                     .text_color(t.muted_foreground)
                                     .child("Check details are out of date. Refresh the pull request to update them."),
                             )
-                        } else if checks.is_empty() {
-                            el.child(div().text_xs().text_color(t.muted_foreground).child("No checks reported"))
                         } else {
-                            el.child(
-                                v_flex()
-                                    .id("pr-checks-list")
-                                    .max_h(px(256.))
-                                    .overflow_y_scroll()
-                                    .gap(px(4.))
-                                    .children(rows),
-                            )
+                            el.child(checks_body(
+                                &checks,
+                                show_all,
+                                move |cx| {
+                                    view.update(cx, |this, cx| {
+                                        if let Some(panel) = this.pull_requests.panel.as_mut() {
+                                            panel.checks_all = !panel.checks_all;
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                                &t,
+                            ))
                         }
-                    })
-                    .when(collapsible && !stale, |el| {
-                        let view = view.clone();
-                        el.child(
-                            div().mt(px(4.)).child(
-                                ghost_button("pr-checks-show-all", &t)
-                                    .child(if show_all { "Show less" } else { "Show all" })
-                                    .on_click(move |_, _, cx| {
-                                        view.update(cx, |this, cx| {
-                                            if let Some(panel) = this.pull_requests.panel.as_mut() {
-                                                panel.checks_all = !panel.checks_all;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                        )
                     })
             })
             .into_any_element()

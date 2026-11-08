@@ -4,6 +4,7 @@
 //! and Refresh asks the host again through `pullRequests.invalidate`.
 
 mod facets;
+mod row_popovers;
 use facets::FacetKind;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -145,6 +146,8 @@ pub(in crate::app) struct PullRequestsState {
     /// Each listed row's focus, kept across rebuilds, and the listener that prefetches a row
     /// focus rests on (attached at the next render, which has the window).
     row_focus: std::collections::HashMap<String, (FocusHandle, Option<Subscription>)>,
+    /// A row's open checks or stack popover and what it read.
+    row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
 }
 
 impl PullRequestsState {
@@ -198,6 +201,7 @@ impl PullRequestsState {
             prefetch: None,
             facet_search: None,
             row_focus: std::collections::HashMap::new(),
+            row_popover: None,
         }
     }
 
@@ -1516,8 +1520,8 @@ pub(super) fn tone(t: &Tokens, light: u32, dark: u32, dark_alpha: f32) -> Hsla {
     if t.dark { Hsla { a: dark_alpha, ..rgb(dark).into() } } else { rgb(light).into() }
 }
 
-fn state_glyph(entry: &Entry, t: &Tokens) -> (Lucide, Hsla, &'static str) {
-    match (entry.state, entry.is_draft) {
+fn state_glyph(state: logic::State, is_draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
+    match (state, is_draft) {
         (logic::State::Merged, _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
         (logic::State::Closed, _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
         (_, true) => (Lucide::GitPullRequestDraft, tone(t, 0x71717b, 0x9f9fa9, 0.8), "Draft"),
@@ -1638,11 +1642,11 @@ fn pull_request_row(
     view: &Entity<Workspace>,
     t: &Tokens,
     window: &mut Window,
-    _: &mut App,
+    cx: &mut App,
 ) -> AnyElement {
     let key = entry.key();
     let id = |part: &str| format!("pr-{key}-{part}");
-    let (state_icon, state_color, state_label) = state_glyph(entry, t);
+    let (state_icon, state_color, state_label) = state_glyph(entry.state, entry.is_draft, t);
     let conflict = entry.state == logic::State::Open && !entry.is_draft && entry.mergeability == "conflicting";
     let conflict_label = format!("Conflicts with {}", entry.base_branch);
     let url = entry.url.clone();
@@ -1666,8 +1670,9 @@ fn pull_request_row(
             }
         });
     let mut signals = h_flex().flex_none().gap(px(4.));
+    let workspace = view.read(cx);
     if let Some((icon, color, label)) = entry.checks_state.as_deref().and_then(|s| checks_glyph(s, t)) {
-        signals = signals.child(glyph(id("checks"), icon, 14., color, label));
+        signals = signals.child(row_popovers::checks_popover(entry, icon, color, label, workspace, view));
     }
     if let Some((icon, color, label)) = entry.review_decision.as_deref().and_then(|d| review_glyph(d, t)) {
         signals = signals.child(glyph(id("review"), icon, 14., color, label));
@@ -1675,7 +1680,6 @@ fn pull_request_row(
     let stat = stat.filter(|(a, d)| a + d > 0).map(|(additions, deletions)| {
         let addition: Hsla = if t.dark { rgb(0x00d492).into() } else { rgb(0x007a55).into() };
         h_flex()
-            .ml_auto()
             .flex_none()
             .gap(px(4.))
             .font_family(t.fonts.mono)
@@ -1689,7 +1693,16 @@ fn pull_request_row(
         .child(number)
         .child(div().min_w_0().truncate().text_sm().text_color(t.foreground).child(entry.title.clone()))
         .child(signals)
-        .children(stat);
+        .child(
+            h_flex()
+                .ml_auto()
+                .flex_none()
+                .gap(px(6.))
+                .children(
+                    entry.stack.as_ref().map(|stack| row_popovers::stack_popover(entry, stack, workspace, view, t)),
+                )
+                .children(stat),
+        );
 
     let login = entry.author.as_ref().map_or("ghost", |a| a.login.as_str());
     let author_tooltip: SharedString = match entry.author.as_ref().and_then(|a| a.name.as_deref()) {

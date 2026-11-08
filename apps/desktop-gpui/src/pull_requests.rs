@@ -57,10 +57,20 @@ impl State {
     }
 }
 
+/// `PullRequestStackMembership`: the row's place in a native stack.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct StackMembership {
+    pub number: u64,
+    pub position: u64,
+    pub size: u64,
+}
+
 /// `PullRequestListEntry`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
+    #[serde(default)]
+    pub stack: Option<StackMembership>,
     /// The environment that answered for the row (`EnvironmentPullRequestEntry`).
     #[serde(skip)]
     pub environment_id: String,
@@ -1102,6 +1112,13 @@ mod tests {
 
     fn numbers(group: &Group) -> Vec<u64> {
         group.entries.iter().map(|e| e.number).collect()
+    }
+
+    #[test]
+    fn a_row_keeps_its_stack_membership() {
+        let row = entry(1, json!({"stack": {"number": 7, "position": 2, "size": 3, "base": "main"}}));
+        assert_eq!(row.stack, Some(StackMembership { number: 7, position: 2, size: 3 }));
+        assert_eq!(entry(2, json!({"stack": null})).stack, None);
     }
 
     #[test]
