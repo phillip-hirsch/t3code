@@ -3735,25 +3735,30 @@ impl BlockNode {
                 // The marker hangs in an indent column, right-aligned against
                 // the text like an outside list marker, and steps back in
                 // color so the item text leads.
-                this.child(
-                    div()
-                        .flex_none()
-                        .min_w(indent)
-                        .pr(indent * 0.3)
-                        .text_right()
-                        .text_color(style.muted_foreground())
-                        .refine_style(style.list_style())
-                        .child(
-                            list_item_prefix(
-                                ix,
-                                options.list_start,
-                                options.ordered,
-                                options.depth,
-                            )
+                let marker = div()
+                    .flex_none()
+                    .min_w(indent)
+                    .pr(indent * 0.3)
+                    .text_right()
+                    .text_color(style.muted_foreground())
+                    .refine_style(style.list_style());
+                // A top-level bullet is a filled disc the size of a browser's
+                // `list-style-type: disc`; the font's "•" draws it smaller.
+                this.child(if !options.ordered && options.depth == 0 {
+                    let color = style.list_style().text.color.unwrap_or(style.muted_foreground());
+                    marker
+                        .h(line_height)
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .child(div().size(rems(0.3)).rounded_full().bg(color))
+                } else {
+                    marker.child(
+                        list_item_prefix(ix, options.list_start, options.ordered, options.depth)
                             .trim_end()
                             .to_string(),
-                        ),
-                )
+                    )
+                })
             })
             .when_some(checked, |this, checked| {
                 // Todo list checkbox

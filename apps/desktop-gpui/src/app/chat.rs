@@ -2367,6 +2367,8 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             .id(ElementId::Name(work.id.clone()))
             .max_h(px(288.))
             .overflow_y_scroll()
+            // `scrollbar-gutter-stable`: the 6px scrollbar's lane stays reserved.
+            .pr(px(6.))
             .rounded(px(6.))
             .children(entries.iter().map(|detail| detail_entry(detail, this, t, cx)).collect::<Vec<_>>())
             .into_any_element(),
