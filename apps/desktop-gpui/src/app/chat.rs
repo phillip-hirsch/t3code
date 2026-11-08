@@ -1612,12 +1612,23 @@ fn markdown_view(
                     .upgrade()
                     .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
                 if let Some(target) = target {
+                    let position = event.position();
+                    // A relative link may name a file by its basename alone (`findWorkspaceFileMatch`).
+                    let authored = url.split(['?', '#']).next().unwrap_or_default().replace("%20", " ");
                     let _ = link_this.update(cx, |workspace, cx| {
-                        if right {
-                            workspace.open_file_menu(target, event.position(), window, cx);
-                        } else {
-                            workspace.open_file_link(&target, window, cx);
-                        }
+                        workspace.with_workspace_match(
+                            &authored,
+                            target,
+                            window,
+                            cx,
+                            move |workspace, target, window, cx| {
+                                if right {
+                                    workspace.open_file_menu(target, position, window, cx);
+                                } else {
+                                    workspace.open_file_link(&target, window, cx);
+                                }
+                            },
+                        );
                     });
                     return;
                 }

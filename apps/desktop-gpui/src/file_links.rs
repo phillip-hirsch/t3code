@@ -105,7 +105,8 @@ fn split_suffix(path: &str) -> Option<(&str, u32, Option<u32>)> {
     }
 }
 
-fn without_position(path: &str) -> &str {
+/// The path without its `:line` or `:line:column` (`splitFilePathPosition`).
+pub(crate) fn without_position(path: &str) -> &str {
     split_suffix(path).map_or(path, |(path, ..)| path)
 }
 

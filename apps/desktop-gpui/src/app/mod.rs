@@ -86,6 +86,7 @@ mod thread_now;
 mod titlebar;
 mod visits;
 mod workflow;
+mod workspace_lookup;
 mod worktree_setup;
 
 gpui_kit::actions!(
@@ -279,6 +280,8 @@ pub struct Workspace {
     find: Option<find::ThreadFind>,
     /// Go to file, Search project contents, and the Files and file panel surfaces.
     files: files::FilesState,
+    /// The workspace search for the file a chat reference names, while it runs.
+    file_lookup: Option<gpui_kit::Task<()>>,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
@@ -453,6 +456,7 @@ impl Workspace {
             draft_picker: draft_picker::DraftPicker::new(cx),
             find: None,
             files: files::FilesState::default(),
+            file_lookup: None,
             focus: cx.focus_handle(),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),

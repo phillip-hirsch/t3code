@@ -679,7 +679,9 @@ impl MarkdownPlugin for FileChips {
                 let _ = menu.update(cx, |w, cx| {
                     let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
                     if let Some(target) = target {
-                        w.open_file_menu(target, position, window, cx);
+                        w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
+                            w.open_file_menu(target, position, window, cx);
+                        });
                     }
                 });
             });
@@ -699,15 +701,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.git_cwd();
-        let Some(target) = file_links::resolve_target(path, cwd.as_deref()) else { return };
-        let relative = workspace_relative(without_position(&target), cwd.as_deref());
-        match relative {
-            Some(relative) if !editor && matches!(self.target, Some(super::Target::Thread { .. })) => {
-                self.open_file(&relative, line, window, cx);
+        let Some(target) = file_links::resolve_target(path, self.git_cwd().as_deref()) else { return };
+        self.with_workspace_match(path, target, window, cx, move |this, target, window, cx| {
+            let relative = workspace_relative(without_position(&target), this.git_cwd().as_deref());
+            match relative {
+                Some(relative) if !editor && matches!(this.target, Some(super::Target::Thread { .. })) => {
+                    this.open_file(&relative, line, window, cx);
+                }
+                _ => this.open_file_link(&target, window, cx),
             }
-            _ => self.open_file_link(&target, window, cx),
-        }
+        });
     }
 }
 
