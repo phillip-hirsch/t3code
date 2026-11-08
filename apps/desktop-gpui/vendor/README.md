@@ -182,6 +182,18 @@ chips inside it. Files:
 - `src/text/node.rs`: `InlineNode::covered`, `Paragraph::to_markdown`, `selected_markdown`; one
   test, `selected_object_copies_the_label_it_keeps_as_prose_once`.
 
+**Soft breaks can render as line breaks.** A user message keeps its typed newlines, as the web's
+`lineBreaks` (`remark-breaks`) does after parsing. 0.9.0 always reflows a soft break to a space,
+and breaking lines before parsing changed headings and tables. The patch adds
+`MarkdownExtensions::line_breaks()` (and `TextView::markdown_line_breaks`), a parser setting: a
+soft break inside a text node becomes a newline. Files:
+
+- `src/text/markdown_ext.rs`: the `line_breaks` flag, its builder, and its place in the parser
+  configuration.
+- `src/text/text_view.rs`: `markdown_line_breaks`.
+- `src/text/format/markdown.rs`: the `Node::Text` arm of `parse_paragraph`; one test,
+  `test_line_breaks_keep_soft_breaks_and_structure`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -237,3 +249,6 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
 `rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
+
+**Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
+passing through to gpui-base's (see its "Soft breaks can render as line breaks").

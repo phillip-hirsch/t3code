@@ -258,6 +258,7 @@ impl PartialEq for MarkdownNode {
 pub struct MarkdownExtensions {
     enable_mdx: bool,
     enable_frontmatter: bool,
+    line_breaks: bool,
     block_parsers: Vec<Arc<MarkdownBlockParserFn>>,
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
@@ -285,6 +286,18 @@ impl MarkdownExtensions {
         self.enable_frontmatter = true;
         self.bump_revision();
         self
+    }
+
+    /// Render soft line breaks as hard ones, as `remark-breaks` does, instead
+    /// of reflowing them to spaces.
+    pub fn line_breaks(mut self) -> Self {
+        self.line_breaks = true;
+        self.bump_revision();
+        self
+    }
+
+    pub(crate) fn has_line_breaks(&self) -> bool {
+        self.line_breaks
     }
 
     /// Enable MDX JSX/expression constructs.
@@ -364,6 +377,7 @@ impl MarkdownExtensions {
         self.parser_revision == other.parser_revision
             && self.enable_mdx == other.enable_mdx
             && self.enable_frontmatter == other.enable_frontmatter
+            && self.line_breaks == other.line_breaks
             && self.block_parsers.len() == other.block_parsers.len()
             && self.block_renderers.len() == other.block_renderers.len()
             && self.inline_parsers.len() == other.inline_parsers.len()

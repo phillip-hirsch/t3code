@@ -204,6 +204,11 @@ impl TextView {
         self.inner = self.inner.markdown_mdx();
         self
     }
+    /// Renders soft line breaks as hard ones (`remark-breaks`).
+    pub fn markdown_line_breaks(mut self) -> Self {
+        self.inner = self.inner.markdown_line_breaks();
+        self
+    }
 
     /// Parses custom block nodes out of the Markdown AST.
     pub fn markdown_block_parser<F>(mut self, parser: F) -> Self

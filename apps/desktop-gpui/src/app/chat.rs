@@ -116,13 +116,12 @@ impl Workspace {
         &mut self,
         key: SharedString,
         text: &SharedString,
-        breaks: bool,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
         if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
             return state.view.clone();
         }
-        let source = self.with_skill_links(&if breaks { hard_breaks(text) } else { text.to_string() });
+        let source = self.with_skill_links(text);
         self.load_markdown_images(&key, &source, cx);
         if let Some(state) = self.markdown.0.get_mut(&key) {
             state.text = text.clone();
@@ -268,13 +267,12 @@ fn markdown_with(
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    let user = kind == MarkdownKind::User;
     let key_for_view = key.clone();
     match this.update(cx, |workspace, cx| {
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
         let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
         let chips = (workspace.git_cwd(), workspace.entry_kinds.clone());
-        (workspace.markdown_state(key, text, user, cx), wrap, workspace.markdown_images.clone(), math, chips)
+        (workspace.markdown_state(key, text, cx), wrap, workspace.markdown_images.clone(), math, chips)
     }) {
         Ok((state, wrap, images, math, chips)) => {
             markdown_view(&state, kind, key_for_view, wrap, width, this, chips, t)
@@ -284,27 +282,6 @@ fn markdown_with(
         }
         Err(_) => div().into_any_element(),
     }
-}
-
-/// remark-breaks: single newlines outside code fences become hard breaks.
-fn hard_breaks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 16);
-    let mut fenced = false;
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
-        if fence {
-            fenced = !fenced;
-        }
-        out.push_str(line);
-        if let Some(next) = lines.peek() {
-            if !fenced && !fence && !line.trim().is_empty() && !next.trim().is_empty() {
-                out.push('\\');
-            }
-            out.push('\n');
-        }
-    }
-    out
 }
 
 fn scroll_to_end_button(
@@ -1437,6 +1414,8 @@ fn markdown_view(
         .inline_code_style(inline_code)
         .selectable(true)
         .stream_fade(streaming)
+        // The user's typed newlines break lines (`lineBreaks`, remark-breaks).
+        .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
             code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
         })
@@ -2215,12 +2194,5 @@ mod tests {
         assert_eq!(thread_link("t3-thread://v2/env/abc/").as_deref(), Some("abc"));
         assert_eq!(thread_link("https://example.com"), None);
         assert_eq!(thread_link("t3-thread://v3/x"), None);
-    }
-
-    #[test]
-    fn typed_newlines_break_lines_except_in_code_and_between_paragraphs() {
-        assert_eq!(hard_breaks("one\ntwo"), "one\\\ntwo");
-        assert_eq!(hard_breaks("one\n\ntwo"), "one\n\ntwo");
-        assert_eq!(hard_breaks("```\na\nb\n```\nafter"), "```\na\nb\n```\nafter");
     }
 }
