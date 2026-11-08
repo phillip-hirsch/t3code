@@ -56,7 +56,10 @@ pub(in crate::app) struct UsageState {
     refreshing: bool,
     generation: u64,
     limits_now: i64,
-    limits_refreshed_at: Option<i64>,
+    /// Per environment, as the web's `refreshUsageLimits`: probes still out, and when an
+    /// automatic probe may run again.
+    limits_pending: Vec<SharedString>,
+    limits_after: HashMap<SharedString, i64>,
     by_time: bool,
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
@@ -304,7 +307,8 @@ impl Default for UsageState {
             refreshing: false,
             generation: 0,
             limits_now: now_ms(),
-            limits_refreshed_at: None,
+            limits_pending: Vec::new(),
+            limits_after: HashMap::new(),
             by_time: false,
             hover: None,
             scroll: ScrollHandle::new(),
@@ -344,6 +348,23 @@ impl UsageState {
             Some((summary, _)) => logic::merge(summary, &self.hidden),
             None => Merged::default(),
         });
+    }
+
+    /// Whether to probe this environment's limits now: never while a probe is out, and an
+    /// automatic one only past its own cooldown.
+    fn limits_due(&self, environment_id: &SharedString, automatic: bool, now: i64) -> bool {
+        !self.limits_pending.contains(environment_id)
+            && (!automatic || self.limits_after.get(environment_id).is_none_or(|after| now >= *after))
+    }
+
+    /// A probe of this environment's limits settled.
+    fn limits_probed(&mut self, environment_id: &SharedString, now: i64) {
+        self.limits_pending.retain(|id| id != environment_id);
+        self.limits_after.insert(environment_id.clone(), now + LIMITS_AUTO_REFRESH_MS);
+        self.limits_now = now;
+        if !self.limits_pending.iter().any(|id| self.is_selected(id)) {
+            self.refreshing = false;
+        }
     }
 
     /// Why nothing shows: the first selected environment's failure.
@@ -583,40 +604,34 @@ impl Workspace {
     /// Re-probes provider limits (`refreshUsageLimits`): automatic refreshes wait five minutes
     /// between probes.
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
-        let mut machines = self.usage_machines();
-        machines.retain(|(id, ..)| self.usage.is_selected(id));
-        if machines.is_empty() {
-            return;
-        }
         let now = now_ms();
-        if automatic && self.usage.limits_refreshed_at.is_some_and(|at| now - at < LIMITS_AUTO_REFRESH_MS) {
-            return;
-        }
-        self.usage.limits_refreshed_at = Some(now);
+        let usage = &self.usage;
+        let mut machines = self.usage_machines();
+        machines.retain(|(id, ..)| usage.is_selected(id) && usage.limits_due(id, automatic, now));
+        let usage = &mut self.usage;
         if !automatic {
-            self.usage.refreshing = true;
+            // A probe already out counts as this refresh, as the web awaits it.
+            usage.refreshing = !machines.is_empty() || usage.limits_pending.iter().any(|id| usage.is_selected(id));
         }
-        cx.spawn(async move |this, cx| {
-            let probes = machines.iter().map(|(id, client, _)| async move {
-                (id, client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await)
-            });
-            let results = futures::future::join_all(probes).await;
-            let _ = this.update(cx, |this, cx| {
-                // Each answer lands on the environment that gave it, if it is still here.
-                for (id, result) in results {
-                    let (Ok(payload), Some(info)) = (result, this.env_info_mut(id)) else { continue };
-                    let event = json!({"type": "providerStatuses", "payload": payload});
-                    if let Err(error) = info.apply(&event) {
-                        log::warn!("refreshed providers did not decode: {error}");
+        for (id, client, _) in machines {
+            usage.limits_pending.push(id.clone());
+            cx.spawn(async move |this, cx| {
+                let result =
+                    client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await;
+                let _ = this.update(cx, |this, cx| {
+                    // The answer lands on the environment that gave it, if it is still here.
+                    if let (Ok(payload), Some(info)) = (result, this.env_info_mut(&id)) {
+                        let event = json!({"type": "providerStatuses", "payload": payload});
+                        if let Err(error) = info.apply(&event) {
+                            log::warn!("refreshed providers did not decode: {error}");
+                        }
                     }
-                }
-                this.usage.limits_now = now_ms();
-                this.usage.limits_refreshed_at = Some(now_ms());
-                this.usage.refreshing = false;
-                cx.notify();
-            });
-        })
-        .detach();
+                    this.usage.limits_probed(&id, now_ms());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -2764,5 +2779,17 @@ mod tests {
         usage.selected = Some(Vec::new());
         usage.recombine();
         assert!(usage.summary.is_none());
+    }
+
+    #[test]
+    fn limits_cool_down_per_environment() {
+        let (a, b): (SharedString, SharedString) = ("a".into(), "b".into());
+        let mut usage = UsageState { limits_pending: vec![a.clone()], ..UsageState::default() };
+        assert!(!usage.limits_due(&a, false, 0), "a probe still out is not repeated");
+        usage.limits_probed(&a, 0);
+        assert!(!usage.limits_due(&a, true, 1));
+        assert!(usage.limits_due(&b, true, 1), "probing a leaves b due");
+        assert!(usage.limits_due(&a, false, 1), "the refresh button always probes");
+        assert!(usage.limits_due(&a, true, LIMITS_AUTO_REFRESH_MS));
     }
 }
