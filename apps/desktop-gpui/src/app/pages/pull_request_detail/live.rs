@@ -2,7 +2,7 @@
 //! a width the user drags, the header condensing once its fold scrolls away, and reads that
 //! follow the host (`useLiveRefresh` and `pullRequests.subscribeRefreshes`).
 
-use gpui_kit::{DragMoveEvent, Empty, MouseButton, ScrollEvent, deferred};
+use gpui_kit::{DismissEvent, DragMoveEvent, Empty, Focusable as _, MouseButton, Pixels, Point, ScrollEvent, deferred};
 
 use super::*;
 use crate::rpc::StreamEvent;
@@ -19,6 +19,34 @@ const CONDENSE_AT: f32 = 140.;
 
 /// Drag payload for the panel's left-edge resize handle.
 struct PanelResize;
+
+/// Drag payload for a tab moved along the strip (`SortableTabList`).
+struct TabDrag(Reference);
+
+/// The tab menu's bulk closes (`closeOtherSurfaces`, `closeSurfacesToRight`, `closeAllSurfaces`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTabs {
+    Others,
+    ToTheRight,
+    All,
+}
+
+/// The tabs `which` closes, counted from the tab at `index`.
+fn tabs_to_close<T: Clone>(tabs: &[T], index: usize, which: CloseTabs) -> Vec<T> {
+    match which {
+        CloseTabs::Others => tabs.iter().enumerate().filter(|(i, _)| *i != index).map(|(_, t)| t.clone()).collect(),
+        CloseTabs::ToTheRight => tabs.iter().skip(index + 1).cloned().collect(),
+        CloseTabs::All => tabs.to_vec(),
+    }
+}
+
+/// `moveSurface`: the tab at `from` lands at `to`, the others keeping their order.
+fn move_tab<T>(tabs: &mut Vec<T>, from: usize, to: usize) {
+    if from < tabs.len() && to < tabs.len() && from != to {
+        let tab = tabs.remove(from);
+        tabs.insert(to, tab);
+    }
+}
 
 /// Whether the page shows its panel (`rightPanelState.isOpen`) and lets it take the list's room
 /// (`rightPanelMaximized`). Hiding the panel keeps every tab, as the web's store keeps its surfaces.
@@ -145,6 +173,84 @@ impl Workspace {
         if self.pull_requests.panel.is_none() {
             self.pull_requests.layout = PanelLayout::default();
         }
+        cx.notify();
+    }
+
+    /// Closes several tabs at once; when the shown one goes, `keep` shows instead.
+    fn close_pr_tabs(&mut self, close: &[Reference], keep: Option<Reference>, cx: &mut Context<Self>) {
+        self.pull_requests.tabs.retain(|tab| !close.contains(tab));
+        for reference in close {
+            self.pull_requests.parked.remove(&reference.key());
+        }
+        if self.pull_requests.panel.as_ref().is_some_and(|p| close.contains(&p.reference)) {
+            self.pull_requests.panel = None;
+            if let Some(keep) = keep.filter(|keep| self.pull_requests.tabs.contains(keep)) {
+                self.show_pr_tab(keep, None, cx);
+            }
+        }
+        if self.pull_requests.panel.is_none() {
+            self.pull_requests.layout = PanelLayout::default();
+        }
+        cx.notify();
+    }
+
+    /// The tab menu's Close others, Close to the right and Close all.
+    fn close_pr_tabs_from(&mut self, reference: &Reference, which: CloseTabs, cx: &mut Context<Self>) {
+        let Some(index) = self.pull_requests.tabs.iter().position(|r| r == reference) else { return };
+        let close = tabs_to_close(&self.pull_requests.tabs, index, which);
+        let keep = (which != CloseTabs::All).then(|| reference.clone());
+        self.close_pr_tabs(&close, keep, cx);
+    }
+
+    /// A tab dropped on another takes its place.
+    fn move_pr_tab(&mut self, dragged: &Reference, onto: &Reference, cx: &mut Context<Self>) {
+        let tabs = &mut self.pull_requests.tabs;
+        let (Some(from), Some(to)) = (tabs.iter().position(|r| r == dragged), tabs.iter().position(|r| r == onto))
+        else {
+            return;
+        };
+        move_tab(tabs, from, to);
+        cx.notify();
+    }
+
+    /// The right-click menu on a tab (`handleTabContextMenu`).
+    fn open_pr_tab_menu(
+        &mut self,
+        reference: Reference,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.pull_requests.tabs.iter().position(|r| *r == reference) else { return };
+        let count = self.pull_requests.tabs.len();
+        let view = cx.entity();
+        let menu = PopupMenu::build(window, cx, move |menu, window, _| {
+            let item = |label: &'static str, disabled: bool, which: Option<CloseTabs>| {
+                let reference = reference.clone();
+                PopupMenuItem::new(label).disabled(disabled).on_click(window.listener_for(
+                    &view,
+                    move |this: &mut Workspace, _, _, cx| match which {
+                        Some(which) => this.close_pr_tabs_from(&reference, which, cx),
+                        None => this.close_pr_tab(&reference, cx),
+                    },
+                ))
+            };
+            menu.min_w(px(180.))
+                .item(item("Close", false, None))
+                .item(item("Close others", count <= 1, Some(CloseTabs::Others)))
+                .item(item("Close to the right", index + 1 >= count, Some(CloseTabs::ToTheRight)))
+                .item(item("Close all", false, Some(CloseTabs::All)))
+        });
+        let previous = window.focused(cx);
+        menu.focus_handle(cx).focus(window, cx);
+        let dismiss = cx.subscribe_in(&menu, window, move |this, _, _: &DismissEvent, window, cx| {
+            this.pull_requests.tab_menu = None;
+            if let Some(previous) = &previous {
+                previous.focus(window, cx);
+            }
+            cx.notify();
+        });
+        self.pull_requests.tab_menu = Some((menu, position, dismiss));
         cx.notify();
     }
 
@@ -411,6 +517,12 @@ impl Workspace {
             .child(self.render_pr_tab_strip(&t, cx))
             .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(None, window, cx)))
             .when(!maximized, |el| el.child(deferred(handle).with_priority(1)))
+            .children(self.pull_requests.tab_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
             .into_any_element()
     }
 
@@ -440,6 +552,7 @@ impl Workspace {
                 };
                 let group: SharedString = format!("pr-tab:{key}").into();
                 let (close, middle, activate) = (reference.clone(), reference.clone(), reference.clone());
+                let (menu, dragged, onto) = (reference.clone(), reference.clone(), reference.clone());
                 let (accent, foreground, muted) = (t.accent, t.foreground, t.muted);
                 h_flex()
                     .id(ElementId::Name(group.clone()))
@@ -495,6 +608,16 @@ impl Workspace {
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| this.close_pr_tab(&middle, cx)),
                     )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_pr_tab_menu(menu.clone(), event.position, window, cx);
+                        }),
+                    )
+                    .on_drag(TabDrag(dragged), |_, _, _, cx| cx.new(|_| Empty))
+                    .drag_over::<TabDrag>(move |style, _, _, _| style.bg(Hsla { a: accent.a * 0.6, ..accent }))
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_pr_tab(&drag.0, &onto, cx)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let seed = this.pull_requests.entry_for(&activate);
                         this.open_pull_request_panel(activate.clone(), seed, cx);
@@ -562,6 +685,26 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tab_menu_closes_the_tabs_it_names() {
+        let tabs = ["a", "b", "c", "d"];
+        assert_eq!(tabs_to_close(&tabs, 1, CloseTabs::Others), ["a", "c", "d"]);
+        assert_eq!(tabs_to_close(&tabs, 1, CloseTabs::ToTheRight), ["c", "d"]);
+        assert!(tabs_to_close(&tabs, 3, CloseTabs::ToTheRight).is_empty());
+        assert_eq!(tabs_to_close(&tabs, 0, CloseTabs::All), tabs);
+    }
+
+    #[test]
+    fn a_dragged_tab_takes_the_place_it_lands_on() {
+        let mut tabs = vec!["a", "b", "c", "d"];
+        move_tab(&mut tabs, 0, 2);
+        assert_eq!(tabs, ["b", "c", "a", "d"]);
+        move_tab(&mut tabs, 3, 0);
+        assert_eq!(tabs, ["d", "b", "c", "a"]);
+        move_tab(&mut tabs, 1, 9);
+        assert_eq!(tabs, ["d", "b", "c", "a"], "a place past the end changes nothing");
+    }
 
     #[test]
     fn hiding_the_panel_keeps_it_to_show_again_and_ends_maximizing() {

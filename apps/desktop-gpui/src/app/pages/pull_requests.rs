@@ -153,6 +153,9 @@ pub(in crate::app) struct PullRequestsState {
     row_focus_unheard: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
+    /// The right-click menu on one of the panel's tabs, where it opened.
+    pub(super) tab_menu:
+        Option<(Entity<gpui_kit::component::menu::PopupMenu>, gpui_kit::Point<gpui_kit::Pixels>, Subscription)>,
 }
 
 impl PullRequestsState {
@@ -210,6 +213,7 @@ impl PullRequestsState {
             row_focus: std::collections::HashMap::new(),
             row_focus_unheard: false,
             row_popover: None,
+            tab_menu: None,
         }
     }
 
