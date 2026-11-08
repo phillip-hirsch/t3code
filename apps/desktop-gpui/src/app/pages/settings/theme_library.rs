@@ -1,6 +1,8 @@
 //! The Appearance page's color scheme tiles and theme cards (`ThemeLibrary` in `ThemeSettings.tsx`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Button as Pressable, Checkbox};
@@ -12,8 +14,8 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, BoxShadow, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, hsla,
-    linear_color_stop, linear_gradient, px, relative,
+    ParentElement as _, RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, hsla,
+    img, px, relative,
 };
 
 use super::widgets::subheading;
@@ -133,7 +135,8 @@ pub(in crate::app) fn toast(window: &mut Window, cx: &mut App, title: String, de
 impl Workspace {
     /// "Color scheme" tiles over the theme cards. Cards only mark their picked appearances, as
     /// on the web; the standard "T3 Code" card stands for no theme.
-    pub(super) fn render_theme_library(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_theme_library(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        drop_retired_orbs(window);
         let t = *theme::tokens(cx);
         let choice = self.client_settings.theme_choice();
         let owners = [choice.owner(false), choice.owner(true)];
@@ -828,20 +831,123 @@ fn circle_button(id: SharedString, colors: &Preview, dark: bool, picked: bool, t
         })
 }
 
+/// One mode's `THEME_PREVIEW_RENDER_SPECS`: where the accent and the action color glow from, and
+/// how they fade.
+struct OrbSpec {
+    accent: [f32; 2],
+    accent_middle: f32,
+    accent_middle_opacity: f32,
+    accent_end: f32,
+    action: [f32; 2],
+    action_opacity: f32,
+    action_end: f32,
+}
+
+const LIGHT_ORB: OrbSpec = OrbSpec {
+    accent: [0.72, 0.22],
+    accent_middle: 0.28,
+    accent_middle_opacity: 0.72,
+    accent_end: 0.58,
+    action: [0.18, 0.82],
+    action_opacity: 0.45,
+    action_end: 0.55,
+};
+
+const DARK_ORB: OrbSpec =
+    OrbSpec { accent: [0.28, 0.78], accent_middle_opacity: 0.62, action: [0.82, 0.18], ..LIGHT_ORB };
+
+/// The orb bitmap's side; it scales down to every circle size.
+const ORB_PIXELS: u32 = 128;
+
+/// The cached orbs; a full cache retires them all for [`drop_retired_orbs`].
+const ORB_CACHE: usize = 64;
+
+type OrbKey = ([u32; 3], bool);
+
+#[derive(Default)]
+struct Orbs {
+    cache: HashMap<OrbKey, Arc<RenderImage>>,
+    retired: Vec<Arc<RenderImage>>,
+}
+
+thread_local! {
+    static ORBS: RefCell<Orbs> = RefCell::default();
+}
+
+/// Frees the atlas space of orbs the cache let go, such as a theme being edited.
+pub(super) fn drop_retired_orbs(window: &mut Window) {
+    for image in ORBS.with_borrow_mut(|orbs| std::mem::take(&mut orbs.retired)) {
+        let _ = window.drop_image(image);
+    }
+}
+
+/// The CSS `radial-gradient(circle at ...)` stops as an opacity at `t` of the farthest-corner radius.
+fn fade(t: f32, stops: &[(f32, f32)]) -> f32 {
+    let mut previous = stops[0];
+    for &(at, opacity) in stops {
+        if t <= at {
+            let span = at - previous.0;
+            return if span <= 0. { opacity } else { previous.1 + (opacity - previous.1) * (t - previous.0) / span };
+        }
+        previous = (at, opacity);
+    }
+    previous.1
+}
+
+/// `getThemePreviewStyle` painted at [`ORB_PIXELS`]: the base with the action glow, then the
+/// accent glow over it, scaled by 1.1 around the middle. BGRA, as GPUI textures are.
+fn orb_bitmap(base: Hsla, accent: Hsla, action: Hsla, spec: &OrbSpec) -> image::RgbaImage {
+    let reach = |[x, y]: [f32; 2]| x.max(1. - x).hypot(y.max(1. - y));
+    let (accent_reach, action_reach) = (reach(spec.accent), reach(spec.action));
+    let accent_stops = [(0., 1.), (spec.accent_middle, spec.accent_middle_opacity), (spec.accent_end, 0.)];
+    let action_stops = [(0., spec.action_opacity), (spec.action_end, 0.)];
+    let [base, accent, action] = [base, accent, action].map(|c| {
+        let c = c.to_rgb();
+        [c.r, c.g, c.b]
+    });
+    #[expect(clippy::cast_precision_loss, reason = "a bitmap side of 128")]
+    let side = ORB_PIXELS as f32;
+    image::RgbaImage::from_fn(ORB_PIXELS, ORB_PIXELS, |x, y| {
+        #[expect(clippy::cast_precision_loss, reason = "a bitmap side of 128")]
+        let at = |v: u32| 0.5 + ((v as f32 + 0.5) / side - 0.5) / 1.1;
+        let (x, y) = (at(x), at(y));
+        let distance = |[cx, cy]: [f32; 2]| (x - cx).hypot(y - cy);
+        let action_alpha = fade(distance(spec.action) / action_reach, &action_stops);
+        let accent_alpha = fade(distance(spec.accent) / accent_reach, &accent_stops);
+        let pixel = [0, 1, 2].map(|i| {
+            let under = base[i] + (action[i] - base[i]) * action_alpha;
+            let value = under + (accent[i] - under) * accent_alpha;
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a channel clamped to 0..=255")]
+            let byte = (value.clamp(0., 1.) * 255.).round() as u8;
+            byte
+        });
+        image::Rgba([pixel[2], pixel[1], pixel[0], 255])
+    })
+}
+
+fn orb_image(base: Hsla, colors: &Preview, dark: bool) -> Arc<RenderImage> {
+    let pack = |c: Hsla| u32::from(gpui_kit::Rgba::from(c));
+    let key = ([pack(base), pack(colors.accent), pack(colors.message_action)], dark);
+    ORBS.with_borrow_mut(|Orbs { cache, retired }| {
+        if let Some(image) = cache.get(&key) {
+            return image.clone();
+        }
+        if cache.len() >= ORB_CACHE {
+            retired.extend(cache.drain().map(|(_, image)| image));
+        }
+        let spec = if dark { &DARK_ORB } else { &LIGHT_ORB };
+        let bitmap = orb_bitmap(base, colors.accent, colors.message_action, spec);
+        let image = Arc::new(RenderImage::new([image::Frame::new(bitmap)]));
+        cache.insert(key, image.clone());
+        image
+    })
+}
+
 /// `ThemePreviewCircle`: the canvas lifted toward white or black, with the accent and the
-/// action color fading in from opposite edges (GPUI has no radial gradients).
+/// action color glowing from opposite sides.
 fn preview_circle(colors: &Preview, dark: bool, t: &Tokens) -> Div {
     let target: Hsla = if dark { gpui_kit::rgb(0x09090b).into() } else { hsla(0., 0., 1., 1.) };
     let base = theme::mix_oklab(colors.canvas, target, 0.2);
-    // `THEME_PREVIEW_RENDER_SPECS`: the accent sits top right in light mode, bottom left in dark.
-    let (accent_angle, action_angle) = if dark { (225., 45.) } else { (45., 225.) };
-    let layer = |angle: f32, color: Hsla, start: f32| {
-        div().absolute().inset_0().rounded_full().bg(linear_gradient(
-            angle,
-            linear_color_stop(color.opacity(0.), start),
-            linear_color_stop(color, 1.),
-        ))
-    };
     let edge: Hsla = if dark { hsla(0., 0., 1., 0.14) } else { hsla(0., 0., 0., 0.1) };
     div()
         .relative()
@@ -851,8 +957,7 @@ fn preview_circle(colors: &Preview, dark: bool, t: &Tokens) -> Div {
         .border_2()
         .border_color(t.background)
         .bg(base)
-        .child(layer(accent_angle, colors.accent.opacity(0.85), 0.35))
-        .child(layer(action_angle, colors.message_action.opacity(0.45), 0.5))
+        .child(img(orb_image(base, colors, dark)).absolute().inset_0().size_full().rounded_full())
         .child(div().absolute().inset_0().rounded_full().border_1().border_color(edge))
 }
 

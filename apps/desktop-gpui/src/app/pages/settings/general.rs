@@ -183,7 +183,7 @@ impl Workspace {
         ];
         let fold = self.advanced_fold("appearance", advanced, cx);
         let interface = settings_section("appearance-interface", "Interface", interface.into_iter().chain([fold]), &t);
-        let sections = [self.render_theme_library(cx), interface, self.render_typography(view, window, cx)];
+        let sections = [self.render_theme_library(window, cx), interface, self.render_typography(view, window, cx)];
         self.settings_page("appearance", view, sections, cx)
     }
 
