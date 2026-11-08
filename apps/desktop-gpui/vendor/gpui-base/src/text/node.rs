@@ -20,7 +20,7 @@ use crate::{
     scrollable_mask::horizontal_scroll_area,
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
-        MarkdownNode, TableActionsFn,
+        MarkdownNode, TableActionsFn, TaskToggleFn,
         document::{NodeRenderOptions, PrevBlock, flow_position},
         inline::{
             Inline, InlineHighlight, InlineState, code_insets, combine_highlights, fade_highlights,
@@ -2709,6 +2709,7 @@ pub(crate) struct NodeContext {
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) task_toggle_handler: Option<Arc<TaskToggleFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
     pub(crate) stream_fade: Option<Arc<StreamFadeFrame>>,
@@ -3713,11 +3714,13 @@ impl BlockNode {
 }
 
 impl BlockNode {
+    #[allow(clippy::too_many_arguments)]
     fn render_list_item_row(
         content: AnyElement,
         ix: usize,
         options: NodeRenderOptions,
         checked: Option<bool>,
+        toggle: Option<(Arc<TaskToggleFn>, usize)>,
         style: &TextViewStyle,
         line_height: Pixels,
         indent: Pixels,
@@ -3791,7 +3794,19 @@ impl BlockNode {
                                         .size(rems(0.75)),
                                     )
                                 }),
-                        ),
+                        )
+                        // t3code: a pressable checkbox (`TextView::on_task_toggle`).
+                        .map(|this| match toggle {
+                            Some((toggle, start)) => this
+                                .id(("task-list-item", start))
+                                .cursor_pointer()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(move |_, window, cx| toggle(start, !checked, window, cx))
+                                .into_any_element(),
+                            None => this.into_any_element(),
+                        }),
                 )
             })
             .child(
@@ -3823,8 +3838,12 @@ impl BlockNode {
                 children,
                 spread,
                 checked,
-                ..
+                span,
             } => {
+                let toggle = node_cx
+                    .task_toggle_handler
+                    .clone()
+                    .zip(span.as_ref().map(|span| span.start));
                 let body = body_font_size(node_cx, window);
                 let indent = body * 1.4;
                 // The paragraph gap a nested list keeps from its neighbours, and
@@ -3902,6 +3921,7 @@ impl BlockNode {
                                         ix,
                                         options,
                                         *checked,
+                                        toggle.clone(),
                                         &node_cx.style,
                                         window.line_height(),
                                         indent,
@@ -3945,6 +3965,7 @@ impl BlockNode {
                                             ix,
                                             options,
                                             *checked,
+                                            toggle.clone(),
                                             &node_cx.style,
                                             window.line_height(),
                                             indent,

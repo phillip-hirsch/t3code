@@ -182,6 +182,16 @@ chips inside it. Files:
 - `src/text/node.rs`: `InlineNode::covered`, `Paragraph::to_markdown`, `selected_markdown`; one
   test, `selected_object_copies_the_label_it_keeps_as_prose_once`.
 
+**Task-list checkboxes can be pressed.** A pull request's description ticks its tasks for people
+who may edit it (the web's `onTaskListChange`); 0.9.0 draws the checkboxes inert. The patch adds
+`TextView::on_task_toggle`, which makes each checkbox pressable and hands the list item's source
+offset and the state asked for to the handler. Files:
+
+- `src/text/text_view.rs`: `TaskToggleFn`, the builder, and passing it to the state.
+- `src/text/state.rs`: the handler, into `NodeContext` each frame.
+- `src/text/node.rs`: `NodeContext::task_toggle_handler`; `render_list_item` passes the item's
+  span start to `render_list_item_row`, whose checkbox takes the click.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -232,6 +242,9 @@ an input the same at every width. Files:
 **A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
 its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
 `Size`'s text size only when the caller set none.
+
+**Text views pass task toggles through.** `src/text/compat.rs`: `TextView::on_task_toggle` forwards
+to gpui-base's (see its "Task-list checkboxes can be pressed").
 
 **The tooltip looks like the web's.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
