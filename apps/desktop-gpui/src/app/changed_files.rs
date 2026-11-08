@@ -37,14 +37,28 @@ fn stat_label(additions: u64, deletions: u64, size: f32, tokens: &Tokens, scheme
 /// `Button variant="ghost-muted"`: muted until hovered, the accent fill on hover.
 fn ghost_muted(id: impl Into<ElementId>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     let (accent, foreground) = (tokens.accent, tokens.foreground);
-    h_flex()
-        .id(id)
-        .flex_none()
-        .justify_center()
-        .rounded(px(6.))
-        .text_color(tokens.muted_foreground)
-        .cursor_pointer()
-        .hover(move |s| s.bg(accent).text_color(foreground))
+    keyboard_button(
+        h_flex()
+            .id(id)
+            .flex_none()
+            .justify_center()
+            .rounded(px(6.))
+            .text_color(tokens.muted_foreground)
+            .cursor_pointer()
+            .hover(move |s| s.bg(accent).text_color(foreground)),
+        tokens,
+    )
+}
+
+/// A `<button>`: a tab stop that Enter and Space click, with `focus-visible:ring-2 ring-inset`.
+/// The ring's 2px come out of the control's padding.
+fn keyboard_button(element: gpui_kit::Stateful<gpui_kit::Div>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = tokens.ring;
+    element
+        .tab_index(0)
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |s| s.border_color(ring))
 }
 
 pub(super) fn card(
@@ -133,7 +147,7 @@ pub(super) fn card(
             h_flex().flex_none().gap(px(4.)).children(toggle_all).child(
                 ghost_muted(ElementId::Name(format!("changed-files-open-diff-{run}").into()), tokens)
                     .h(px(24.))
-                    .px(px(7.))
+                    .px(px(5.))
                     .gap(px(4.))
                     .items_center()
                     .text_xs()
@@ -162,7 +176,7 @@ pub(super) fn card(
                 div().px(px(12.)).pb(px(8.)).child(
                     ghost_muted(ElementId::Name(format!("changed-files-more-{run}").into()), tokens)
                         .h(px(24.))
-                        .px(px(7.))
+                        .px(px(5.))
                         .items_center()
                         .text_xs()
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -194,16 +208,19 @@ fn tree_row(
     let indent = 8. + depth as f32 * 14.;
     let accent = tokens.accent.opacity(0.6);
     let row = |id: ElementId| {
-        h_flex()
-            .id(id)
-            .h(px(28.))
-            .w_full()
-            .gap(px(8.))
-            .pl(px(indent))
-            .pr(px(8.))
-            .rounded(px(6.))
-            .cursor_pointer()
-            .hover(move |s| s.bg(accent))
+        keyboard_button(
+            h_flex()
+                .id(id)
+                .h(px(28.))
+                .w_full()
+                .gap(px(8.))
+                .pl(px(indent - 2.))
+                .pr(px(6.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(accent)),
+            tokens,
+        )
     };
     let muted = |alpha: f32| -> Hsla { tokens.muted_foreground.opacity(alpha) };
     match node {
