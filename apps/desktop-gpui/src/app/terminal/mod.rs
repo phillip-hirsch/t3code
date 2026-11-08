@@ -620,7 +620,7 @@ impl Workspace {
         match event {
             // `handleSessionExited`: only a client that may operate the terminal cleans it up.
             SessionEvent::Exited if self.terminal_operable(thread_id) => {
-                self.close_terminal(thread_id, terminal_id, cx)
+                self.close_terminal(thread_id, terminal_id, cx);
             }
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
