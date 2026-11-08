@@ -311,7 +311,8 @@ fn scroll_to_end_button(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-        .bg(Hsla { a: 0.8, ..t.background })
+        // `surface-glass` blurs what it covers; with no backdrop blur, an opaque fill stands in.
+        .bg(t.background)
         .text_color(t.foreground)
 }
 
