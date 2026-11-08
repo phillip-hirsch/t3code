@@ -302,10 +302,8 @@ impl Workspace {
             }
             "enter" => {
                 let Some(index) = picker.highlight.filter(|i| *i < len) else { return false };
-                let pick = match index.checked_sub(usize::from(automatic)) {
-                    None => None,
-                    Some(row) => Some(value(&shown[row], self.diff_base_ref())),
-                };
+                let pick =
+                    index.checked_sub(usize::from(automatic)).map(|row| value(&shown[row], self.diff_base_ref()));
                 self.select_base_ref(pick, cx);
             }
             _ => return false,

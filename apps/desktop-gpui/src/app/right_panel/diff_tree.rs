@@ -39,7 +39,7 @@ fn pane_width(chosen: Option<f32>, row: f32) -> (f32, f32) {
     (chosen.unwrap_or(initial).clamp(TREE_MIN, max), max)
 }
 
-/// The resize handle's keys: ArrowLeft widens, ArrowRight narrows, Home and End jump.
+/// The resize handle's keys: `ArrowLeft` widens, `ArrowRight` narrows, Home and End jump.
 fn resized_width(width: f32, max: f32, key: &str) -> Option<f32> {
     let next = match key {
         "left" => width + RESIZE_STEP,

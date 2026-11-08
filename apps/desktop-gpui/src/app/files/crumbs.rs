@@ -1,6 +1,6 @@
 //! `FolderContentsMenu` (`FileBreadcrumbs.tsx`): the chevron after a folder crumb lists that
 //! folder. Files open; a folder lists its own entries in the same menu, which "Back" (or
-//! ArrowLeft) climbs again, never above the crumb's folder.
+//! `ArrowLeft`) climbs again, never above the crumb's folder.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -110,7 +110,7 @@ impl FolderMenu {
         move |_, window, cx| menu.navigate(folder.clone(), window, cx)
     }
 
-    /// ArrowLeft in the menu: lists the folder above, as "Back" does.
+    /// `ArrowLeft` in the menu: lists the folder above, as "Back" does.
     fn climb(&self, window: &mut Window, cx: &mut App) {
         let Some(parent) = back_target(&self.crumb, &self.directory(cx)) else { return };
         let menu = self.view.read(cx).files.crumb_menu.as_ref().and_then(|open| open.menu.clone());
