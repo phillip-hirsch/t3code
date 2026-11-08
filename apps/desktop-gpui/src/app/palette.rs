@@ -990,22 +990,15 @@ impl Workspace {
         let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
-                let title = Field::new(&thread.title);
-                let branch = thread
-                    .branch
-                    .as_deref()
-                    .map(|b| b.trim_start_matches("t3code/").trim_start_matches("t3/"))
-                    .unwrap_or_default();
-                let branch = Field::new(branch);
-                let project = Field::new(
-                    self.shell.projects.iter().find(|p| p.id == thread.project_id).map_or("", |p| p.title.as_str()),
-                );
-                let mut title_field = Weighted::new(&title, 1.);
-                title_field.mid_word = true;
-                let mut project_field = Weighted::new(&project, 0.25);
-                project_field.context = true;
-                let found =
-                    search::match_fields(tokens, &[title_field, Weighted::new(&branch, 0.6), project_field], typos)?;
+                let pull_requests = crate::thread_pull_requests::search_entries(thread);
+                let subject = search::ThreadSubject {
+                    id: &thread.id,
+                    title: &thread.title,
+                    branch: thread.branch.as_deref(),
+                    project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
+                    pull_requests: &pull_requests,
+                };
+                let found = search::match_thread(tokens, &subject, typos)?;
                 let age = now - used_at(thread);
                 let rank =
                     if current == Some(thread.id.as_str()) { -1. } else { found.quality * search::usage_boost(age) };

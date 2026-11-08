@@ -304,6 +304,120 @@ pub fn has_long_token(query: &str) -> bool {
     })
 }
 
+/// `searchableBranch`: the app's worktree prefix ("t3/", "t3code/" before it) matches nearly
+/// every thread, so it is dropped, but only before more text.
+pub fn searchable_branch(branch: &str) -> &str {
+    ["t3/", "t3code/"]
+        .iter()
+        .find_map(|prefix| branch.strip_prefix(prefix).filter(|rest| rest.starts_with(|c: char| !c.is_whitespace())))
+        .unwrap_or(branch)
+}
+
+/// `threadFieldQuery`: pull request prefixes ("pr 12", "pull request #12", "#12") and the
+/// worktree prefix come off, so a query matches the stored fields.
+fn thread_field_query(query: &str) -> &str {
+    let mut query = ["pr", "pull request", "pull"]
+        .iter()
+        .find_map(|prefix| {
+            let rest = query.strip_prefix(prefix)?.trim_start();
+            rest.strip_prefix('#').unwrap_or(rest).starts_with(|c: char| c.is_ascii_digit()).then_some(rest)
+        })
+        .unwrap_or(query);
+    if let Some(rest) = query.strip_prefix('#') {
+        query = rest.trim_start();
+    }
+    searchable_branch(query)
+}
+
+/// `REFERENCE_PREFIX_MIN`: IDs and links have many word starts, so a short query would hit them all.
+const REFERENCE_PREFIX_MIN: usize = 8;
+
+/// `matchReference`: a long prefix of the thread ID or a pull request reference, or any long
+/// part of one that holds a digit. A number is never cut short (".../pull/2288" is not 22889).
+fn matches_reference<'a>(query: &str, mut references: impl Iterator<Item = &'a str>) -> bool {
+    if query.chars().count() < REFERENCE_PREFIX_MIN {
+        return false;
+    }
+    let not_cut = |text: &str, end: usize| !text[end..].starts_with(char::is_numeric);
+    let anywhere = query.chars().any(char::is_numeric);
+    references.any(|reference| {
+        let folded = reference.to_lowercase();
+        if !anywhere {
+            return folded.starts_with(query);
+        }
+        folded.find(query).is_some_and(|at| not_cut(&folded, at + query.len()))
+            || (query.starts_with(folded.as_str()) && not_cut(query, folded.len()))
+    })
+}
+
+/// What thread search matches a thread by (`ThreadSearchSubject`).
+pub struct ThreadSubject<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub branch: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub pull_requests: &'a [crate::thread_pull_requests::SearchPullRequest],
+}
+
+/// `scoreThreadSearch` without picks: titles and pull request numbers count fully, pull request
+/// titles and branches less, the project least. `ranges` are the title's.
+pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> Option<Match> {
+    let query: String = tokens.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>().join(" ");
+    let field_tokens = fold_query(thread_field_query(&query));
+    let title = Field::new(thread.title);
+    let numbers: Vec<Field> = thread.pull_requests.iter().map(|pr| Field::new(&format!("#{}", pr.number))).collect();
+    let titles: Vec<Option<Field>> =
+        thread.pull_requests.iter().map(|pr| pr.title.as_deref().map(Field::new)).collect();
+    let branch = thread.branch.map(|b| Field::new(searchable_branch(b)));
+    let project = thread.project.map(Field::new);
+    let mut fields = vec![Weighted { mid_word: true, ..Weighted::new(&title, 1.) }];
+    for (number, title) in numbers.iter().zip(&titles) {
+        fields.push(Weighted::new(number, 1.));
+        fields.extend(title.as_ref().map(|title| Weighted::new(title, 0.5)));
+    }
+    fields.extend(branch.as_ref().map(|branch| Weighted::new(branch, 0.6)));
+    fields.extend(project.as_ref().map(|project| Weighted { context: true, ..Weighted::new(project, 0.25) }));
+    if let Some(found) = match_fields(&field_tokens, &fields, typos) {
+        // A multi-word match the title shows none of must sit in one field to explain it.
+        let explained = !found.ranges.is_empty() || field_tokens.len() < 2 || has_hint(&field_tokens, thread, typos);
+        return explained.then_some(found);
+    }
+    let references = thread.pull_requests.iter().flat_map(|pr| pr.references.iter().map(String::as_str));
+    matches_reference(&query, std::iter::once(thread.id).chain(references)).then(|| Match {
+        quality: 0.6,
+        strong: true,
+        ranges: Vec::new(),
+    })
+}
+
+/// `matchHint` found a field: the first that holds the whole query, else, past the words the
+/// project holds, the first that holds the rest.
+fn has_hint(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> bool {
+    let holds = |text: &str, tokens: &[Vec<char>]| {
+        match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos).is_some()
+    };
+    let candidates: Vec<String> = thread
+        .pull_requests
+        .iter()
+        .map(|pr| match &pr.title {
+            Some(title) => format!("#{} {title}", pr.number),
+            None => format!("#{}", pr.number),
+        })
+        .chain(thread.branch.map(|b| searchable_branch(b).to_owned()))
+        .chain(thread.project.map(str::to_owned))
+        .collect();
+    let hint_for = |tokens: &[Vec<char>]| candidates.iter().any(|text| !text.is_empty() && holds(text, tokens));
+    if hint_for(tokens) {
+        return true;
+    }
+    let rest: Vec<Vec<char>> = tokens
+        .iter()
+        .filter(|token| !thread.project.is_some_and(|project| holds(project, std::slice::from_ref(token))))
+        .cloned()
+        .collect();
+    !rest.is_empty() && rest.len() != tokens.len() && hint_for(&rest)
+}
+
 /// `findSearchTokenRanges`: char ranges of `text` holding a long query token;
 /// a token under four chars must start a word.
 pub fn token_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
@@ -397,6 +511,33 @@ mod tests {
     fn every_token_must_match_except_filler() {
         assert!(quality("fix the sidebar", "Fix sidebar").is_some());
         assert_eq!(quality("fix composer", "Fix sidebar"), None);
+    }
+
+    #[test]
+    fn threads_match_by_pull_request_number_title_and_reference() {
+        let pull_requests = [crate::thread_pull_requests::SearchPullRequest {
+            number: 22889,
+            title: Some("Speed up the diff worker".into()),
+            references: ["pingdotgg/t3code#22889".into(), "https://github.com/pingdotgg/t3code/pull/22889".into()],
+        }];
+        let thread = ThreadSubject {
+            id: "c0ffee12-3456",
+            title: "Sidebar polish",
+            branch: Some("t3/fix-flaky-ci"),
+            project: Some("t3code"),
+            pull_requests: &pull_requests,
+        };
+        let finds = |query: &str| match_thread(&fold_query(query), &thread, false).is_some();
+        for query in ["22889", "#22889", "pr 22889", "PR#22889", "pull request #22889", "diff worker", "t3/fix-flaky"] {
+            assert!(finds(query), "{query}");
+        }
+        assert!(finds("https://github.com/pingdotgg/t3code/pull/22889/files"), "a link that goes on");
+        assert!(finds("pingdotgg/t3code#22889") && finds("c0ffee12"), "a reference or the thread ID");
+        assert!(!finds("github.com/pingdotgg/t3code/pull/2288"), "a number is never cut short");
+        assert!(!finds("c0ffee"), "a short ID prefix matches nothing");
+        assert!(finds("t3code diff worker"), "the project's words, then a field holding the rest");
+        assert!(!finds("speed flaky"), "words spread over unrelated fields are a coincidence");
+        assert_eq!(searchable_branch("t3/"), "t3/", "the prefix stays until more text follows");
     }
 
     #[test]

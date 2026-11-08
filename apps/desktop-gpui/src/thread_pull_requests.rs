@@ -104,6 +104,41 @@ pub fn panel_target(
     linked.or(branch).map(from_linked)
 }
 
+/// `ThreadSearchPullRequest`: what thread search matches a pull request by.
+pub struct SearchPullRequest {
+    pub number: u64,
+    pub title: Option<String>,
+    /// `owner/repo#N` and the link.
+    pub references: [String; 2],
+}
+
+/// `SEARCHED_PULL_REQUEST_TITLES`: a triage thread linked to dozens would match almost any word.
+const SEARCHED_TITLES: usize = 3;
+
+/// `threadSearchPullRequests`: every pull request by number and link, the newest few by title.
+pub fn search_entries(thread: &crate::model::ThreadShell) -> Vec<SearchPullRequest> {
+    let (links, linked, branch) =
+        (&thread.pull_requests, thread.linked_pull_request.as_ref(), thread.branch_pull_request.as_ref());
+    let entry = |repository: &str, number: u64, url: &str, title: Option<String>| SearchPullRequest {
+        number,
+        title,
+        references: [format!("{repository}#{number}"), url.to_owned()],
+    };
+    let mut entries: Vec<SearchPullRequest> =
+        branch.map(|b| entry(&b.repository, b.number, &b.url, None)).into_iter().collect();
+    if links.is_empty() {
+        entries.extend(linked.map(|l| entry(&l.repository, l.number, &l.url, None)));
+        return entries;
+    }
+    let mut newest_first: Vec<&PullRequestLink> = visible(links).collect();
+    newest_first.sort_by_key(|link| std::cmp::Reverse(link.updated_ms()));
+    entries.extend(newest_first.into_iter().enumerate().map(|(index, link)| {
+        let title = link.snapshot.as_ref().filter(|_| index < SEARCHED_TITLES).map(|s| s.title.clone());
+        entry(&link.repository, link.number, &link.url, title)
+    }));
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
