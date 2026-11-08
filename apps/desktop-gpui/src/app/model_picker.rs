@@ -636,12 +636,16 @@ impl Workspace {
                         .child(Input::new(&search).appearance(false).small().h(px(26.)).text_sm())
                 })),
         );
+        // Inside the docked picker's fixed height, so a ChatGPT plan never resizes it.
+        let sharing = self.render_chatgpt_sharing(current, t);
+        let (list_footer, footer) = if docked.is_some() { (sharing, None) } else { (None, sharing) };
         let column = v_flex()
             .w(px(if searching { LIST + RAIL } else { LIST }))
             .h_full()
             .when(!searching, |el| el.border_l_1().border_color(rule))
             .child(search_row)
-            .child(list);
+            .child(list)
+            .children(list_footer);
         v_flex()
             .id("model-picker-body")
             .w(px(RAIL + LIST + if docked.is_some() { EFFORT } else { 0. }))
@@ -657,8 +661,39 @@ impl Workspace {
                         docked.map(|descriptors| self.render_effort_column(current, model_name, descriptors, t, cx)),
                     ),
             )
+            .children(footer)
             .children(docked.map(|descriptors| self.render_picker_footer(current, descriptors, t, cx)))
             .into_any_element()
+    }
+
+    /// `ChatGptSharingControl`: why a managed ChatGPT connection has no Fast or Ultrafast.
+    fn render_chatgpt_sharing(&self, current: Option<&ModelSelection>, t: &Tokens) -> Option<AnyElement> {
+        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id))?;
+        if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
+            return None;
+        }
+        const NOTICE: &str = "Fast and Ultrafast are unavailable with this ChatGPT connection. Use an existing Codex CLI login for speed options your account supports.";
+        let plan = h_flex()
+            .id("chatgpt-sharing")
+            .gap(px(8.))
+            .text_xs()
+            .text_color(t.muted_foreground)
+            .child(svg().path("icons/app/openai.svg").size(px(14.)).flex_none().text_color(t.muted_foreground))
+            .child("Using ChatGPT plan")
+            .tooltip(|window, cx| Tooltip::new(NOTICE).build(window, cx));
+        Some(
+            h_flex()
+                .flex_none()
+                .justify_between()
+                .gap(px(16.))
+                .px(px(12.))
+                .py(px(8.))
+                .border_t_1()
+                .border_color(t.border)
+                .child(plan)
+                .child(super::pages::settings::chatgpt_usage_button("chatgpt-sharing-usage", t).xsmall())
+                .into_any_element(),
+        )
     }
 
     fn render_rail(&self, tab: &Tab, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
