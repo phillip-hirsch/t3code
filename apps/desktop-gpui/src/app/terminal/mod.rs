@@ -13,6 +13,8 @@ mod session;
 pub(in crate::app) use self::grid::TerminalTheme;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
@@ -55,6 +57,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 const MIN_DRAWER_HEIGHT: f32 = 180.;
 /// `MAX_HIDDEN_MOUNTED_TERMINAL_THREADS`: hidden threads whose open drawers keep their sessions.
 const MAX_HIDDEN_THREADS: usize = 10;
+/// Drawer drags change the height every frame; the file is written once they settle.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_DRAWER_HEIGHT_RATIO: f32 = 0.75;
 
 /// A `TerminalSummary` from `subscribeTerminalMetadata`.
@@ -90,7 +94,12 @@ struct Pane {
 
 #[derive(Default)]
 pub(super) struct Terminals {
+    /// By thread; changed through [`Terminals::drawer`] and [`Terminals::drawer_mut`].
     drawers: HashMap<String, DrawerLayout>,
+    drawers_changed: bool,
+    /// The drawers as last saved (`t3code:terminal-state:v1`).
+    persisted: Value,
+    _persist: Option<Task<()>>,
     /// Sessions of the shown group, by terminal id.
     panes: HashMap<String, Pane>,
     /// Hidden threads' open drawer sessions, kept so switching back finds them as they were;
@@ -149,7 +158,67 @@ fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &
     })
 }
 
+/// Where the drawers are kept between launches.
+fn drawers_path() -> Option<PathBuf> {
+    Some(crate::settings::userdata_dir()?.join("terminal-state.json"))
+}
+
+/// The stored drawers, normalized; a missing or unreadable file restores none.
+fn read_drawers(path: &Path) -> HashMap<String, DrawerLayout> {
+    let stored: HashMap<String, DrawerLayout> =
+        std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    stored.into_iter().map(|(thread_id, drawer)| (thread_id, drawer.restored())).collect()
+}
+
+/// The drawers that differ from the default, by thread id.
+fn stored_drawers(drawers: &HashMap<String, DrawerLayout>) -> Value {
+    let mut stored: Vec<(&String, &DrawerLayout)> =
+        drawers.iter().filter_map(|(thread_id, drawer)| Some((thread_id, drawer.stored()?))).collect();
+    stored.sort_by_key(|(thread_id, _)| *thread_id);
+    stored
+        .into_iter()
+        .map(|(thread_id, drawer)| (thread_id.clone(), json!(drawer)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 impl Terminals {
+    /// The drawers the last session left.
+    pub(super) fn restored() -> Self {
+        let drawers = drawers_path().map(|path| read_drawers(&path)).unwrap_or_default();
+        Self { persisted: stored_drawers(&drawers), drawers, ..Self::default() }
+    }
+
+    fn drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
+        self.drawers_changed = true;
+        self.drawers.entry(thread_id).or_default()
+    }
+
+    fn drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
+        self.drawers_changed = true;
+        self.drawers.get_mut(thread_id)
+    }
+
+    /// Saves the drawers once they settle, if they changed since the last save.
+    fn persist(&mut self, cx: &App) {
+        if !std::mem::take(&mut self.drawers_changed) {
+            return;
+        }
+        let stored = stored_drawers(&self.drawers);
+        if stored == self.persisted {
+            return;
+        }
+        self.persisted = stored.clone();
+        let Some(path) = drawers_path() else { return };
+        let executor = cx.background_executor().clone();
+        self._persist = Some(cx.background_spawn(async move {
+            executor.timer(PERSIST_DEBOUNCE).await;
+            if let Err(error) = crate::settings::write_atomically(&path, &stored) {
+                log::warn!("could not save {}: {error}", path.display());
+            }
+        }));
+    }
+
     /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
     pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
         self.draft_threads.remove(project_id)
@@ -352,12 +421,13 @@ impl Workspace {
                 .collect();
             drawer.reconcile(&ids);
         }
+        self.terminals.drawers_changed = true;
     }
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.terminal_thread(true) else { return };
-        let drawer = self.terminals.drawers.entry(thread_id.clone()).or_default();
+        let drawer = self.terminals.drawer(thread_id.clone());
         if drawer.open {
             drawer.open = false;
             self.focus_composer(window, cx);
@@ -365,12 +435,12 @@ impl Workspace {
             // A setup or agent-started shell already runs: show it instead of starting another.
             match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
-                    self.terminals.drawers.entry(thread_id).or_default().ensure(&id);
+                    self.terminals.drawer(thread_id).ensure(&id);
                     self.terminals.focus_pending = Some(id);
                 }
                 // Without the grant the drawer opens on its empty state.
                 None if !self.terminal_operable(&thread_id) => {
-                    self.terminals.drawers.entry(thread_id).or_default().open = true;
+                    self.terminals.drawer(thread_id).open = true;
                 }
                 None => self.launch_terminal(thread_id, Place::New, cx),
             }
@@ -383,7 +453,7 @@ impl Workspace {
 
     fn open_drawer_for_action(&mut self) -> Option<String> {
         let thread_id = self.terminal_thread(true)?;
-        self.terminals.drawers.entry(thread_id.clone()).or_default().open = true;
+        self.terminals.drawer(thread_id.clone()).open = true;
         Some(thread_id)
     }
 
@@ -417,7 +487,7 @@ impl Workspace {
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
         let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminals.drawers.entry(thread_id.clone()).or_default();
+        let drawer = self.terminals.drawer(thread_id.clone());
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         match reuse.filter(|_| !run.stop_on_settle) {
@@ -443,7 +513,7 @@ impl Workspace {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
-        if !self.terminals.drawers.entry(thread_id.clone()).or_default().place(&terminal_id, place) {
+        if !self.terminals.drawer(thread_id.clone()).place(&terminal_id, place) {
             return;
         }
         self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx);
@@ -492,7 +562,7 @@ impl Workspace {
 
     fn activate_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
-        if let Some(drawer) = self.terminals.drawers.get_mut(&thread_id) {
+        if let Some(drawer) = self.terminals.drawer_mut(&thread_id) {
             drawer.set_active(terminal_id);
             self.terminals.focus_pending = Some(terminal_id.to_owned());
             cx.notify();
@@ -537,7 +607,7 @@ impl Workspace {
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
         self.close_panel_terminal(thread_id, terminal_id);
-        if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
+        if let Some(drawer) = self.terminals.drawer_mut(thread_id) {
             drawer.close(terminal_id);
             if drawer.open {
                 self.terminals.focus_pending = Some(drawer.active_id.clone());
@@ -598,6 +668,7 @@ impl Workspace {
                 .collect(),
             _ => Vec::new(),
         };
+        self.terminals.persist(cx);
         self.park_terminal_panes(thread_id.as_deref().filter(|_| self.page.is_none()), cx);
         let thread_id = thread_id.unwrap_or_default();
         self.terminals.panes.retain(|id, pane| shown.contains(id) && pane.session.read(cx).thread_id == thread_id);
@@ -669,7 +740,7 @@ impl Workspace {
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                if let Some(drawer) = self.terminals.drawers.get_mut(thread_id)
+                if let Some(drawer) = self.terminals.drawer_mut(thread_id)
                     && drawer.active_id != terminal_id
                 {
                     drawer.set_active(terminal_id);
@@ -839,7 +910,7 @@ impl Workspace {
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DrawerResize>, _, cx| {
                     let Some(thread_id) = this.shown_terminal_thread().map(str::to_owned) else { return };
                     let height = f32::from(event.bounds.bottom() - event.event.position.y).round();
-                    if let Some(drawer) = this.terminals.drawers.get_mut(&thread_id) {
+                    if let Some(drawer) = this.terminals.drawer_mut(&thread_id) {
                         drawer.height = height.clamp(MIN_DRAWER_HEIGHT, max);
                         cx.notify();
                     }
@@ -1237,7 +1308,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.select_thread(thread_id.clone(), window, cx);
-        self.terminals.drawers.entry(thread_id).or_default().ensure(&terminal_id);
+        self.terminals.drawer(thread_id).ensure(&terminal_id);
         self.terminals.focus_pending = Some(terminal_id);
         cx.notify();
     }
@@ -1271,6 +1342,25 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn drawers_survive_a_relaunch_and_default_ones_are_not_stored() {
+        let mut drawers = HashMap::new();
+        drawers.insert("closed".to_owned(), DrawerLayout::default());
+        let mut open = DrawerLayout::default();
+        open.place("term-1", Place::New);
+        drawers.insert("thread".to_owned(), open.clone());
+        let stored = stored_drawers(&drawers);
+        assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), ["thread"]);
+
+        let dir = std::env::temp_dir().join(format!("t3-gpui-terminal-state-{}", std::process::id()));
+        let path = dir.join("terminal-state.json");
+        assert!(read_drawers(&path).is_empty());
+        crate::settings::write_atomically(&path, &stored).unwrap();
+        assert_eq!(read_drawers(&path), HashMap::from([("thread".to_owned(), open)]));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

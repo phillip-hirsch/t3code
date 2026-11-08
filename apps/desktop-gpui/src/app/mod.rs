@@ -464,7 +464,7 @@ impl Workspace {
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),
-            terminals: terminal::Terminals::default(),
+            terminals: terminal::Terminals::restored(),
             side_chat: Default::default(),
             alerts: Default::default(),
             snap_shot: Default::default(),
