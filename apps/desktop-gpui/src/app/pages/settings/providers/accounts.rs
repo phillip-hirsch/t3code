@@ -399,6 +399,10 @@ impl Workspace {
         let driver = instance["driver"].as_str().unwrap_or(&provider.driver);
         let codex_managed = driver == "codex" && codex_setup_managed(&instance["config"]);
         let can_authenticate = provider.setup.as_ref().map(|setup| setup.can_authenticate);
+        // A view-only session sees the managed Codex setup but no sign-in or API-key rows.
+        if !codex_managed && self.providers_read_only() {
+            return None;
+        }
         if !codex_managed && can_authenticate != Some(true) && !(provider.driver == "acpRegistry" && provider.installed)
         {
             if driver == "cursor" && can_authenticate == Some(false) {
@@ -1416,7 +1420,7 @@ impl AccountSection {
             text(reconnect_email.unwrap_or_else(|| "Use your ChatGPT subscription.".into()))
         };
 
-        let read_only = false;
+        let read_only = self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only());
         let pending = self.pending;
         let can_start = if view.installed {
             setup.as_ref().is_some_and(|s| s.can_authenticate)

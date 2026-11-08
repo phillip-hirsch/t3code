@@ -32,6 +32,8 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::connections::SessionLoad;
+use super::connections::logic::PROVIDERS_MANAGE;
 use super::system::background;
 use super::widgets::{SettingRow, select_trigger};
 use crate::app::Workspace;
@@ -43,6 +45,25 @@ use crate::theme::{self, Tokens};
 pub(super) fn driver_secret_fields(kind: &str) -> Option<(&'static str, Vec<(&'static str, &'static str)>)> {
     let driver = drivers::driver(kind)?;
     Some((driver.label, driver.fields.iter().filter(|f| f.secret).map(|f| (f.key, f.label)).collect()))
+}
+
+/// What this session may do with the environment's providers (`classifyProviderEnvironmentAccess`
+/// over `resolveRemoteOperateAccess`): a failed session check reads as view-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProviderAccess {
+    Checking,
+    ReadOnly,
+    Editable,
+}
+
+impl ProviderAccess {
+    fn of(load: Option<&SessionLoad>) -> Self {
+        match load {
+            None | Some(SessionLoad::Pending) => Self::Checking,
+            Some(load) if load.grants(PROVIDERS_MANAGE) => Self::Editable,
+            Some(_) => Self::ReadOnly,
+        }
+    }
 }
 
 /// What the page keeps between frames, like the panel's React state.
@@ -106,6 +127,23 @@ impl Workspace {
             let note = div().px_4().text_sm().text_color(t.muted_foreground).child(message);
             return self.settings_page("providers", &view, [note.into_any_element()], cx);
         }
+        let read_only = match self.provider_access() {
+            ProviderAccess::Checking => {
+                let note = v_flex()
+                    .px_4()
+                    .gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Loading provider settings"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.muted_foreground)
+                            .child("Checking what this session is allowed to change."),
+                    );
+                return self.settings_page("providers", &view, [note.into_any_element()], cx);
+            }
+            ProviderAccess::ReadOnly => true,
+            ProviderAccess::Editable => false,
+        };
         let page =
             window.use_keyed_state(self.settings_state_key("settings-providers"), cx, |_, _| ProvidersPage::default());
         let override_projects =
@@ -131,6 +169,14 @@ impl Workspace {
         let editor =
             selected.as_ref().map(|row| self.render_instance_editor(&page, row, &override_projects, window, cx));
 
+        // `canAddProvider`: nothing to add when read-only or when the policy allows no driver.
+        let can_add = !read_only
+            && self
+                .settings_info()
+                .managed_policy
+                .pointer("/limits/providers/allowedDrivers")
+                .and_then(Value::as_array)
+                .is_none_or(|allowed| !allowed.is_empty());
         let add_row = div()
             .id("providers-add-row")
             .flex()
@@ -193,7 +239,7 @@ impl Workspace {
                     })
                     .border_color(t.border.opacity(0.6))
                     .bg(t.muted.opacity(0.1))
-                    .child(divided(list.into_iter().chain([add_row.into_any_element()]), &t)),
+                    .child(divided(list.into_iter().chain(can_add.then(|| add_row.into_any_element())), &t)),
             )
             .child(
                 div()
@@ -219,18 +265,31 @@ impl Workspace {
                     .px_4()
                     .justify_between()
                     .gap_4()
-                    .child(
-                        h_flex().gap_1().child(section_title("Providers", &t)).child(
+                    .child(h_flex().gap_1().child(section_title("Providers", &t)).when(can_add, |el| {
+                        el.child(
                             ghost_icon_button("providers-add", gpui_kit::assets::IconName::Plus, &t)
                                 .tooltip("Add provider")
                                 .on_click(cx.listener({
                                     let page = page.clone();
                                     move |this, _, window, cx| this.open_add_provider_dialog(page.clone(), window, cx)
                                 })),
-                        ),
-                    )
-                    .child(self.render_providers_header_actions(&page, &t, cx)),
+                        )
+                    }))
+                    .child(self.render_providers_header_actions(&page, read_only, &t, cx)),
             )
+            .when(read_only, |el| {
+                let label = view.label_of(self.settings_environment().as_deref().unwrap_or_default()).to_owned();
+                let description = format!("This session can view {label}'s providers but can't change their settings.");
+                el.child(
+                    div()
+                        .overflow_hidden()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(t.border.opacity(0.6))
+                        .bg(t.card.opacity(0.4))
+                        .child(settings_row("Limited permissions", Some(&description), None, false, &t)),
+                )
+            })
             .child(card);
         let content = [
             providers.into_any_element(),
@@ -244,6 +303,7 @@ impl Workspace {
     fn render_providers_header_actions(
         &self,
         page: &Entity<ProvidersPage>,
+        read_only: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -261,7 +321,7 @@ impl Workspace {
         h_flex()
             .gap_2()
             .mr(px(-8.))
-            .when(!candidates.is_empty() || updating_all, |el| {
+            .when(!read_only && (!candidates.is_empty() || updating_all), |el| {
                 el.child(
                     ghost_text_button("providers-update-all", if updating_all { "Updating…" } else { "Update all" }, t)
                         .disabled(updating_all)
@@ -398,6 +458,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.providers_read_only() {
+            return;
+        }
         let settings = &self.settings_info().settings;
         let previous = instances::instance_config(settings, instance_id);
         let disabling = !instances::resolve_enabled(&next) && previous.as_ref().is_none_or(instances::resolve_enabled);
@@ -457,7 +520,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !page.update(cx, |page, _| page.updating.insert(instance_id.to_owned())) {
+        if self.providers_read_only() || !page.update(cx, |page, _| page.updating.insert(instance_id.to_owned())) {
             return;
         }
         let mut payload = json!({"provider": driver, "instanceId": instance_id});
@@ -497,7 +560,7 @@ impl Workspace {
     fn update_all_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
         let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
         let Some(client) = self.settings_client() else { return };
-        if candidates.is_empty() || page.read(cx).updating_all {
+        if candidates.is_empty() || page.read(cx).updating_all || self.providers_read_only() {
             return;
         }
         page.update(cx, |page, cx| {
@@ -531,6 +594,18 @@ impl Workspace {
     }
 
     /// A request whose failure becomes an error notification titled `failure`.
+    /// What this session may do with the Settings environment's providers.
+    pub(super) fn provider_access(&self) -> ProviderAccess {
+        let environment = self.settings_environment();
+        let load = environment.and_then(|id| self.settings_ui.grants.get(id.as_ref())).map(|(_, load)| load);
+        ProviderAccess::of(load)
+    }
+
+    /// Provider mutations wait for `providers:manage` (`readOnly` across the panel).
+    pub(super) fn providers_read_only(&self) -> bool {
+        self.provider_access() != ProviderAccess::Editable
+    }
+
     fn providers_request(
         &mut self,
         method: &'static str,
@@ -887,4 +962,21 @@ fn text_input(state: &Entity<InputState>, width: Option<f32>) -> Input {
 
 fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(6.)).flex_none().rounded_full().bg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::pages::settings::connections::logic::Session;
+
+    #[test]
+    fn provider_access_needs_a_providers_manage_grant() {
+        let ready =
+            |scopes: Value| SessionLoad::Ready(Session::from_json(&json!({"authenticated": true, "scopes": scopes})));
+        assert_eq!(ProviderAccess::of(None), ProviderAccess::Checking);
+        assert_eq!(ProviderAccess::of(Some(&SessionLoad::Pending)), ProviderAccess::Checking);
+        assert_eq!(ProviderAccess::of(Some(&SessionLoad::Failed)), ProviderAccess::ReadOnly);
+        assert_eq!(ProviderAccess::of(Some(&ready(json!(["orchestration:read"])))), ProviderAccess::ReadOnly);
+        assert_eq!(ProviderAccess::of(Some(&ready(json!(["providers:manage"])))), ProviderAccess::Editable);
+    }
 }

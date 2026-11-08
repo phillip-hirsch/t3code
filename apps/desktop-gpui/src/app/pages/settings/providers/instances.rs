@@ -771,7 +771,8 @@ impl Workspace {
                 && p.pointer("/versionAdvisory/canInstallVersion") == Some(&json!(true))
         });
         let can_update = live.as_ref().is_some_and(is_settings_update_candidate);
-        let action = if advisory.target_version.is_some() { can_install } else { can_update };
+        let action =
+            !self.providers_read_only() && if advisory.target_version.is_some() { can_install } else { can_update };
         let icon = if facts.compatibility_warning {
             gpui_kit::assets::IconName::TriangleAlert
         } else {
@@ -1023,6 +1024,7 @@ impl Workspace {
                     })
                     .child(
                         switch(SharedString::from(format!("provider-enabled-{}", row.id)), facts.enabled)
+                            .disabled(self.providers_read_only())
                             .accessibility_label(format!("Enable {}", facts.name))
                             .on_change(cx.listener({
                                 let projects = override_projects.to_vec();
@@ -1250,7 +1252,8 @@ impl Workspace {
             .into_any_element(),
         );
 
-        sections.extend(self.render_acp_session_management(&row.id, false, window, cx));
+        let read_only = self.providers_read_only();
+        sections.extend(self.render_acp_session_management(&row.id, read_only, window, cx));
 
         if driver.is_some() {
             let models = self.render_models_section(page, row, live.as_ref(), &instance, window, cx);
@@ -1444,10 +1447,12 @@ impl Workspace {
                 this.persist_provider_instance(&instance_id, next, window, cx);
             },
         );
-        let input = text_input(&input, (!self.settings_ui.provider_rows_stacked).then_some(224.));
+        let read_only = self.providers_read_only();
+        let input = text_input(&input, (!self.settings_ui.provider_rows_stacked).then_some(224.)).disabled(read_only);
         h_flex()
             .gap_2()
             .justify_end()
+            .when(read_only, |el| el.opacity(0.5))
             .when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::w_full)
             .child(picker)
             .child(input.when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::flex_1))
@@ -1466,6 +1471,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let read_only = self.providers_read_only();
         let variable = environment(instance).into_iter().find(|v| v["name"] == field.name);
         let redacted = variable.as_ref().is_some_and(|v| v["valueRedacted"] == true);
         let value = variable.as_ref().filter(|_| !redacted).and_then(|v| v["value"].as_str()).unwrap_or_default();
@@ -1503,8 +1509,8 @@ impl Workspace {
         let control = h_flex()
             .map(|el| if stacked { el.w_full() } else { el.w(px(224.)) })
             .gap_2()
-            .child(text_input(&input, None).flex_1().disabled(managed.is_some()))
-            .when(variable.is_some() && managed.is_none(), |el| {
+            .child(text_input(&input, None).flex_1().disabled(read_only || managed.is_some()))
+            .when(variable.is_some() && managed.is_none() && !read_only, |el| {
                 el.child(
                     ghost_icon_button(
                         SharedString::from(format!("env-field-clear-{}", field.name)),
@@ -1528,7 +1534,7 @@ impl Workspace {
                 .child(control)
                 .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
                 .into_any_element(),
-            None => control.into_any_element(),
+            None => control.when(read_only, |el| el.opacity(0.5)).into_any_element(),
         };
         settings_row(field.label, field.description, Some(control), stacked, t).into_any_element()
     }
@@ -1599,6 +1605,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let editor = self.render_environment_variables(page, row, instance, locks, t, window, cx);
+        if self.providers_read_only() {
+            return vec![div().opacity(0.5).child(editor).into_any_element()];
+        }
         match locks.filter(|locks| locks.whole) {
             // `ManagedNotice`.
             Some(locks) => vec![
@@ -1635,7 +1644,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let inert = locks.is_some_and(|locks| locks.whole);
+        let inert = self.providers_read_only() || locks.is_some_and(|locks| locks.whole);
         let dedicated: Vec<&str> =
             drivers::driver(&row.driver).map_or(vec![], |d| d.environment_fields.iter().map(|f| f.name).collect());
         let generic: Vec<Value> = environment(instance)
