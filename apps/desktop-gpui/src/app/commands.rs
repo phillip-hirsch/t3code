@@ -64,6 +64,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let chat = self.page.is_none() && self.settings.is_none();
+        let pull_requests_page = self.page == Some(pages::Page::PullRequests) && self.settings.is_none();
         let palette_open = self.palette.is_some();
         if let Some(index) = keymap::jump_index(command, "modelPicker") {
             return self.model_picker_jump(index, window, cx);
@@ -100,6 +101,10 @@ impl Workspace {
                 if chat && !palette_open =>
             {
                 self.preview_command(command, window, cx);
+            }
+            "rightPanel.toggle" if pull_requests_page => return self.toggle_pull_request_panel(cx),
+            "rightPanel.toggleMaximized" if pull_requests_page => {
+                return self.toggle_pull_request_panel_maximized(cx);
             }
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
             "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),

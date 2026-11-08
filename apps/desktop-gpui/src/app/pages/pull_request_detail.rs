@@ -44,6 +44,7 @@ mod handoff;
 mod header;
 pub(super) use header::checks_body;
 mod live;
+pub(in crate::app) use live::PanelLayout;
 pub(in crate::app) mod write;
 
 const CONVERSATION_PAGE: usize = 10;
@@ -295,6 +296,10 @@ impl Workspace {
         seed: Option<Rc<Entry>>,
         cx: &mut Context<Self>,
     ) {
+        // Picking a pull request on the page shows the panel again (`openPullRequest`).
+        if self.page == Some(super::Page::PullRequests) && self.pull_requests.layout.reveal() {
+            cx.notify();
+        }
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
             return;
         }
@@ -321,14 +326,6 @@ impl Workspace {
         if guides {
             self.read_pr_guide(cx);
         }
-        cx.notify();
-    }
-
-    /// "Collapse pull request panel": every tab closes with it.
-    pub(super) fn close_pull_request_panel(&mut self, cx: &mut Context<Self>) {
-        self.pull_requests.panel = None;
-        self.pull_requests.tabs.clear();
-        self.pull_requests.parked.clear();
         cx.notify();
     }
 
@@ -972,8 +969,7 @@ impl Workspace {
                             .font_weight(FontWeight::MEDIUM)
                             .child(panel.reference.repository.clone()),
                     )
-                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("#{number}")))
-                    .child(collapse_button(t, cx)),
+                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("#{number}"))),
             )
             .children(title.map(|title| {
                 div()
@@ -1106,8 +1102,7 @@ impl Workspace {
             .children(self.render_pr_stack(detail, method, t, cx))
             .children(self.render_pr_primary(detail, primary, stack, method, state_label, state_color, t, cx))
             .child(self.render_pr_checkout(detail, t, cx))
-            .child(self.render_pr_menu(detail, primary, stack, method, guides, thread, &view, t))
-            .child(collapse_button(t, cx));
+            .child(self.render_pr_menu(detail, primary, stack, method, guides, thread, &view, t));
 
         let author = actor_label(detail.author.as_ref(), t);
         let checkout = logic::checkout_command(&detail.provider, detail.number).map(|command| {
@@ -2440,18 +2435,6 @@ fn back_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
         .on_click(cx.listener(|this, _, window, cx| {
             this.open_surface(super::super::right_panel::Surface::PullRequests, window, cx);
         }))
-}
-
-fn collapse_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
-    Button::new("pr-collapse")
-        .ghost()
-        .xsmall()
-        .size(px(24.))
-        .p_0()
-        .rounded(px(6.))
-        .tooltip("Collapse pull request panel")
-        .child(Icon::new(Lucide::PanelRight).with_size(px(14.)).text_color(t.muted_foreground))
-        .on_click(cx.listener(|this, _, _, cx| this.close_pull_request_panel(cx)))
 }
 
 /// `Button size="xs" variant="outline"`.

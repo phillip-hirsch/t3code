@@ -20,12 +20,86 @@ const CONDENSE_AT: f32 = 140.;
 /// Drag payload for the panel's left-edge resize handle.
 struct PanelResize;
 
+/// Whether the page shows its panel (`rightPanelState.isOpen`) and lets it take the list's room
+/// (`rightPanelMaximized`). Hiding the panel keeps every tab, as the web's store keeps its surfaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::app) struct PanelLayout {
+    hidden: bool,
+    maximized: bool,
+}
+
+impl PanelLayout {
+    fn shown(self, has_panel: bool) -> bool {
+        has_panel && !self.hidden
+    }
+
+    /// Only a shown panel counts as maximized.
+    fn maximized(self, has_panel: bool) -> bool {
+        self.shown(has_panel) && self.maximized
+    }
+
+    /// `toggleRightPanel`; refused while no pull request is open to show.
+    fn toggle(&mut self, has_panel: bool) -> bool {
+        if self.shown(has_panel) {
+            *self = Self { hidden: true, maximized: false };
+        } else if has_panel {
+            self.hidden = false;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// `toggleRightPanelMaximized`; refused while the panel is hidden.
+    fn toggle_maximized(&mut self, has_panel: bool) -> bool {
+        if !self.shown(has_panel) {
+            return false;
+        }
+        self.maximized = !self.maximized;
+        true
+    }
+
+    /// Opening a pull request shows the panel; returns whether it was hidden.
+    pub(super) fn reveal(&mut self) -> bool {
+        std::mem::take(&mut self.hidden)
+    }
+}
+
 /// `clamp(width)` between the panel's minimum and what leaves the list its own.
 pub(super) fn clamp_panel_width(width: f32, available: f32) -> f32 {
     width.min(available - LIST_MIN_WIDTH).max(MIN_WIDTH)
 }
 
 impl Workspace {
+    /// The page shows the panel beside (or over) the list.
+    pub(in crate::app) fn pull_request_panel_shown(&self) -> bool {
+        self.pull_requests.layout.shown(self.pull_requests.panel.is_some())
+    }
+
+    /// A pull request is open on the page, shown or hidden (`selectedPullRequestSurface`).
+    pub(in crate::app) fn pull_request_panel_open(&self) -> bool {
+        self.pull_requests.panel.is_some()
+    }
+
+    pub(in crate::app) fn pull_request_panel_maximized(&self) -> bool {
+        self.pull_requests.layout.maximized(self.pull_requests.panel.is_some())
+    }
+
+    /// The page's "Toggle right panel" (`rightPanel.toggle`): hides the panel with its tabs kept,
+    /// or shows it again. Returns whether there was a panel to toggle.
+    pub(in crate::app) fn toggle_pull_request_panel(&mut self, cx: &mut Context<Self>) -> bool {
+        let toggled = self.pull_requests.layout.toggle(self.pull_requests.panel.is_some());
+        cx.notify();
+        toggled
+    }
+
+    /// The page's maximize toggle (`rightPanel.toggleMaximized`).
+    pub(in crate::app) fn toggle_pull_request_panel_maximized(&mut self, cx: &mut Context<Self>) -> bool {
+        let toggled = self.pull_requests.layout.toggle_maximized(self.pull_requests.panel.is_some());
+        cx.notify();
+        toggled
+    }
+
     /// Opens a pull request as a tab, or shows its tab; the shown one's state is parked, not lost.
     pub(super) fn show_pr_tab(
         &mut self,
@@ -66,6 +140,10 @@ impl Workspace {
             if let Some(next) = next {
                 self.show_pr_tab(next, None, cx);
             }
+        }
+        // The last tab closed closes the panel; the next one opens unmaximized.
+        if self.pull_requests.panel.is_none() {
+            self.pull_requests.layout = PanelLayout::default();
         }
         cx.notify();
     }
@@ -288,6 +366,7 @@ impl Workspace {
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         let available = viewport - sidebar;
         let width = clamp_panel_width(self.pull_requests.panel_width.unwrap_or(viewport / 2.), available);
+        let maximized = self.pull_request_panel_maximized();
         let handle = div()
             .id("pr-panel-resize")
             .group("pr-panel-resize")
@@ -318,8 +397,7 @@ impl Workspace {
         v_flex()
             .id("pr-panel")
             .relative()
-            .flex_none()
-            .w(px(width))
+            .map(|el| if maximized { el.flex_1().min_w_0() } else { el.flex_none().w(px(width)) })
             .h_full()
             .min_h_0()
             .border_l_1()
@@ -332,7 +410,7 @@ impl Workspace {
             }))
             .child(self.render_pr_tab_strip(&t, cx))
             .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(None, window, cx)))
-            .child(deferred(handle).with_priority(1))
+            .when(!maximized, |el| el.child(deferred(handle).with_priority(1)))
             .into_any_element()
     }
 
@@ -484,6 +562,23 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hiding_the_panel_keeps_it_to_show_again_and_ends_maximizing() {
+        let mut layout = PanelLayout::default();
+        assert!(!layout.toggle(false), "nothing to show before a pull request opens");
+        assert!(layout.toggle_maximized(true));
+        assert!(layout.maximized(true));
+        assert!(layout.toggle(true));
+        assert!(!layout.shown(true), "hidden, with its pull requests still open");
+        assert!(!layout.toggle_maximized(true), "a hidden panel does not maximize");
+        assert!(layout.toggle(true));
+        assert!(layout.shown(true));
+        assert!(!layout.maximized(true), "shown again at its own width");
+        layout.toggle(true);
+        assert!(layout.reveal(), "opening a pull request shows the panel");
+        assert!(layout.shown(true));
+    }
 
     #[test]
     fn the_panel_keeps_its_minimum_and_leaves_the_list_its_own() {

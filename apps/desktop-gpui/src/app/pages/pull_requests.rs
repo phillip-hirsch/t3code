@@ -133,6 +133,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
     /// The panel's dragged width; `None` is half the window.
     pub(super) panel_width: Option<f32>,
+    /// Whether the panel shows beside the list, or over it; hiding keeps every tab.
+    pub(super) layout: super::pull_request_detail::PanelLayout,
     /// `pullRequests.subscribeRefreshes` per connected environment, with the socket it runs on.
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
@@ -198,6 +200,7 @@ impl PullRequestsState {
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
             panel_width: None,
+            layout: super::pull_request_detail::PanelLayout::default(),
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
             write_grants: std::collections::HashMap::new(),
@@ -795,10 +798,17 @@ impl Workspace {
             .min_h_0()
             .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
             .child(div().flex_1().min_h_0().child(body));
-        if self.pull_requests.panel.is_none() {
+        if !self.pull_request_panel_shown() {
             return column.into_any_element();
         }
-        h_flex().size_full().min_h_0().child(column).child(self.render_pr_panel_column(window, cx)).into_any_element()
+        // Maximized, the panel takes the row and the list keeps its state out of sight.
+        let maximized = self.pull_request_panel_maximized();
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .child(column.when(maximized, |el| el.flex_none().w_0().overflow_hidden()))
+            .child(self.render_pr_panel_column(window, cx))
+            .into_any_element()
     }
 
     /// `onFocus={() => onIntent(entry)}`: a row focus rests on prefetches like one the pointer rests on.
@@ -1207,7 +1217,8 @@ impl Workspace {
         let view = cx.entity();
         let t = *t;
         let now = now_ms();
-        let selected = self.pull_requests.panel.as_ref().map(|p| p.reference().clone());
+        let selected = self.pull_request_panel_shown().then(|| self.pull_requests.panel.as_ref()).flatten();
+        let selected = selected.map(|p| p.reference().clone());
         // Rows name their host once several answer, and their server once several are connected.
         let show_provider = self.pull_requests.list.as_ref().is_some_and(|l| l.providers.len() > 1);
         let servers = self.pull_request_servers();
