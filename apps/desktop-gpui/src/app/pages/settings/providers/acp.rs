@@ -23,6 +23,7 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::super::connections::logic::{ORCHESTRATION_OPERATE, ORCHESTRATION_READ, PROVIDERS_MANAGE};
 use super::super::scoped_client;
 use super::add::{is_configured_acp_agent, settings_row};
 use super::drivers::DRIVERS;
@@ -551,6 +552,8 @@ pub(super) struct AcpSessions {
     instance_id: String,
     read_only: bool,
     project_id: Option<String>,
+    /// Bumped when the project changes, so late results for the old one are dropped.
+    generation: u64,
     sessions: Vec<NativeSession>,
     next_cursor: Option<String>,
     loading: bool,
@@ -577,6 +580,7 @@ impl AcpSessions {
             instance_id,
             read_only,
             project_id: None,
+            generation: 0,
             sessions: Vec::new(),
             next_cursor: None,
             loading: false,
@@ -600,12 +604,52 @@ impl AcpSessions {
     }
 
     fn select_project(&mut self, project_id: String, cx: &mut Context<Self>) {
-        self.project_id = Some(project_id);
+        self.retire_project(Some(project_id));
+        cx.notify();
+    }
+
+    /// Moves to `project_id`: the old project's lists, drafts and busy flags go, and its
+    /// pending results and confirmations no longer apply.
+    fn retire_project(&mut self, project_id: Option<String>) {
+        if self.project_id == project_id {
+            return;
+        }
+        self.project_id = project_id;
+        self.generation += 1;
         self.sessions.clear();
         self.next_cursor = None;
+        self.loading = false;
+        self.importing = None;
+        self.deleting = None;
         self.providers.clear();
+        self.loading_providers = false;
+        self.saving_provider = None;
         self.drafts.clear();
-        cx.notify();
+    }
+
+    /// Whether this connection's session grants `scope` on the instance's environment.
+    fn grants(&self, scope: &str, cx: &App) -> bool {
+        let (Some(workspace), Some(environment)) = (self.workspace.upgrade(), self.scope.as_ref()) else {
+            return false;
+        };
+        workspace.read(cx).environment_grants(environment, scope)
+    }
+
+    /// [`Self::call`] for the current project: `done` doesn't run once the project changes.
+    fn call_for_project(
+        &mut self,
+        method: &'static str,
+        input: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<Value, RpcError>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let generation = self.generation;
+        self.call(method, input, window, cx, move |this, result, window, cx| {
+            if this.generation == generation {
+                done(this, result, window, cx);
+            }
+        });
     }
 
     /// Sends `method`, then hands the result to `done` on this entity.
@@ -635,7 +679,7 @@ impl AcpSessions {
             input["cursor"] = cursor.clone().into();
         }
         let append = cursor.is_some();
-        self.call("server.listAcpRegistrySessions", input, window, cx, move |this, result, window, cx| {
+        self.call_for_project("server.listAcpRegistrySessions", input, window, cx, move |this, result, window, cx| {
             this.loading = false;
             let page = result.and_then(|value| {
                 let sessions = Vec::<NativeSession>::deserialize(&value["sessions"])
@@ -656,6 +700,9 @@ impl AcpSessions {
     }
 
     fn import_session(&mut self, session: NativeSession, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.grants(ORCHESTRATION_OPERATE, cx) {
+            return;
+        }
         let Some(project_id) = self.project_id.clone().filter(|_| self.importing.is_none()) else { return };
         self.importing = Some(session.session_id.clone());
         let input = json!({
@@ -665,7 +712,7 @@ impl AcpSessions {
             "title": session.title,
             "updatedAt": session.updated_at,
         });
-        self.call("server.importAcpRegistrySession", input, window, cx, move |this, result, window, cx| {
+        self.call_for_project("server.importAcpRegistrySession", input, window, cx, move |this, result, window, cx| {
             this.importing = None;
             match result {
                 Ok(value) => {
@@ -695,17 +742,24 @@ impl AcpSessions {
             "Permanently delete native ACP session \"{}\"?",
             session.title.as_deref().unwrap_or(&session.session_id)
         );
-        let view = cx.entity();
+        let (view, generation) = (cx.entity(), self.generation);
         confirm_destructive(window, cx, &message, move |window, cx| {
-            view.update(cx, |this, cx| this.delete_session(session, window, cx));
+            view.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.delete_session(session, window, cx);
+                }
+            });
         });
     }
 
     fn delete_session(&mut self, session: NativeSession, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.grants(ORCHESTRATION_OPERATE, cx) {
+            return;
+        }
         let Some(project_id) = self.project_id.clone().filter(|_| self.deleting.is_none()) else { return };
         self.deleting = Some(session.session_id.clone());
         let input = json!({"instanceId": self.instance_id, "projectId": project_id, "sessionId": session.session_id});
-        self.call("server.deleteAcpRegistrySession", input, window, cx, move |this, result, window, cx| {
+        self.call_for_project("server.deleteAcpRegistrySession", input, window, cx, move |this, result, window, cx| {
             this.deleting = None;
             match result {
                 Ok(_) => {
@@ -722,7 +776,7 @@ impl AcpSessions {
         let Some(project_id) = self.project_id.clone().filter(|_| !self.loading_providers) else { return };
         self.loading_providers = true;
         let input = json!({"instanceId": self.instance_id, "projectId": project_id});
-        self.call("server.listAcpRegistryProviders", input, window, cx, move |this, result, window, cx| {
+        self.call_for_project("server.listAcpRegistryProviders", input, window, cx, move |this, result, window, cx| {
             this.loading_providers = false;
             let providers = result.and_then(|value| {
                 Vec::<AgentProvider>::deserialize(&value["providers"]).map_err(|e| RpcError::Defect(e.to_string()))
@@ -745,7 +799,7 @@ impl AcpSessions {
 
     fn save_provider(&mut self, provider_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = self.project_id.clone() else { return };
-        if self.saving_provider.is_some() || self.loading_providers {
+        if self.saving_provider.is_some() || self.loading_providers || !self.grants(PROVIDERS_MANAGE, cx) {
             return;
         }
         let Some(draft) = self.drafts.get(&provider_id) else { return };
@@ -771,7 +825,7 @@ impl AcpSessions {
             input["headers"] = Value::Object(headers);
         }
         self.saving_provider = Some(provider_id.clone());
-        self.call("server.setAcpRegistryProvider", input, window, cx, move |this, result, window, cx| {
+        self.call_for_project("server.setAcpRegistryProvider", input, window, cx, move |this, result, window, cx| {
             this.saving_provider = None;
             match result {
                 Ok(_) => {
@@ -787,34 +841,44 @@ impl AcpSessions {
         if self.project_id.is_none() || self.saving_provider.is_some() || self.loading_providers {
             return;
         }
-        let view = cx.entity();
+        let (view, generation) = (cx.entity(), self.generation);
         let message = format!("Disable ACP provider \"{provider_id}\"?");
         confirm_destructive(window, cx, &message, move |window, cx| {
-            view.update(cx, |this, cx| this.disable_provider(provider_id, window, cx));
+            view.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.disable_provider(provider_id, window, cx);
+                }
+            });
         });
     }
 
     fn disable_provider(&mut self, provider_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = self.project_id.clone() else { return };
-        if self.saving_provider.is_some() {
+        if self.saving_provider.is_some() || !self.grants(PROVIDERS_MANAGE, cx) {
             return;
         }
         self.saving_provider = Some(provider_id.clone());
         let input = json!({"instanceId": self.instance_id, "projectId": project_id, "providerId": provider_id});
-        self.call("server.disableAcpRegistryProvider", input, window, cx, move |this, result, window, cx| {
-            this.saving_provider = None;
-            match result {
-                Ok(_) => {
-                    window.push_notification(Notification::success("ACP provider disabled"), cx);
-                    this.load_providers(Some(provider_id), window, cx);
+        self.call_for_project(
+            "server.disableAcpRegistryProvider",
+            input,
+            window,
+            cx,
+            move |this, result, window, cx| {
+                this.saving_provider = None;
+                match result {
+                    Ok(_) => {
+                        window.push_notification(Notification::success("ACP provider disabled"), cx);
+                        this.load_providers(Some(provider_id), window, cx);
+                    }
+                    Err(error) => report_failure(window, cx, "Could not disable ACP provider", &error),
                 }
-                Err(error) => report_failure(window, cx, "Could not disable ACP provider", &error),
-            }
-        });
+            },
+        );
     }
 
     fn logout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.logging_out {
+        if self.logging_out || !self.grants(PROVIDERS_MANAGE, cx) {
             return;
         }
         self.logging_out = true;
@@ -876,6 +940,18 @@ fn confirm_destructive(
         .detach();
 }
 
+/// What this connection may do with the instance's sessions (`orchestration:read` / `:operate`).
+#[derive(Clone, Copy)]
+struct Access {
+    read: bool,
+    operate: bool,
+}
+
+/// The project the section works in: the picked one while it is still listed, else the first.
+fn resolve_project(projects: &[(String, String)], selected: Option<&str>) -> Option<String> {
+    projects.iter().find(|(id, _)| Some(id.as_str()) == selected).or(projects.first()).map(|(id, _)| id.clone())
+}
+
 impl AcpSessions {
     fn project_picker(
         &self,
@@ -917,7 +993,14 @@ impl AcpSessions {
             .into_any_element()
     }
 
-    fn render_sessions(&self, can_import: bool, can_delete: bool, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sessions(
+        &self,
+        can_import: bool,
+        can_delete: bool,
+        access: Access,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         v_flex()
             .px(px(16.))
             .pb(px(4.))
@@ -969,7 +1052,9 @@ impl AcpSessions {
                                             } else {
                                                 "Import"
                                             })
-                                            .disabled(!can_import || imported || self.importing.is_some())
+                                            .disabled(
+                                                !access.operate || !can_import || imported || self.importing.is_some(),
+                                            )
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.import_session(import_target.clone(), window, cx);
                                             })),
@@ -984,7 +1069,7 @@ impl AcpSessions {
                                                 } else {
                                                     "Delete"
                                                 })
-                                                .disabled(imported || self.deleting.is_some())
+                                                .disabled(!access.operate || imported || self.deleting.is_some())
                                                 .on_click(cx.listener(move |this, _, window, cx| {
                                                     this.confirm_delete_session(delete_target.clone(), window, cx);
                                                 })),
@@ -1001,7 +1086,7 @@ impl AcpSessions {
                             .ghost()
                             .xsmall()
                             .label(if self.loading { "Loading" } else { "Load more" })
-                            .disabled(self.loading)
+                            .disabled(!access.read || self.loading)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.load_sessions(Some(cursor.clone()), window, cx);
                             })),
@@ -1144,7 +1229,9 @@ impl AcpSessions {
         if !can_list && !can_logout && !can_configure {
             return None;
         }
-        let pending = self.pending();
+        let access =
+            Access { read: self.grants(ORCHESTRATION_READ, cx), operate: self.grants(ORCHESTRATION_OPERATE, cx) };
+        let pending = !access.read || self.pending();
         let controls = h_flex()
             .flex_wrap()
             .gap(px(8.))
@@ -1170,7 +1257,7 @@ impl AcpSessions {
                         } else {
                             "Refresh"
                         })
-                        .disabled(self.loading || self.project_id.is_none())
+                        .disabled(!access.read || self.loading || self.project_id.is_none())
                         .on_click(cx.listener(|this, _, window, cx| this.load_sessions(None, window, cx))),
                 )
             });
@@ -1187,7 +1274,7 @@ impl AcpSessions {
                 Some(controls.into_any_element()),
                 &t,
             ))
-            .when(show_sessions, |col| col.child(self.render_sessions(can_import, can_delete, &t, cx)));
+            .when(show_sessions, |col| col.child(self.render_sessions(can_import, can_delete, access, &t, cx)));
         if can_configure {
             let header = h_flex()
                 .flex_wrap()
@@ -1212,7 +1299,12 @@ impl AcpSessions {
                         } else {
                             "Refresh"
                         })
-                        .disabled(self.loading_providers || self.saving_provider.is_some() || self.project_id.is_none())
+                        .disabled(
+                            !access.read
+                                || self.loading_providers
+                                || self.saving_provider.is_some()
+                                || self.project_id.is_none(),
+                        )
                         .on_click(cx.listener(|this, _, window, cx| this.load_providers(None, window, cx))),
                 );
             let providers = self.providers.clone();
@@ -1266,9 +1358,7 @@ impl Render for AcpSessions {
                 .collect();
             (provider, projects)
         };
-        if self.project_id.is_none() {
-            self.project_id = projects.first().map(|(id, _)| id.clone());
-        }
+        self.retire_project(resolve_project(&projects, self.project_id.as_deref()));
         let read_only = self.read_only;
         provider
             .filter(|p| p.driver == super::add::ACP_REGISTRY)
@@ -1337,6 +1427,34 @@ mod tests {
         assert!(is_first_class_agent("codex-acp"));
         assert!(is_first_class_agent("opencode-v2"));
         assert!(!is_first_class_agent("gemini"));
+    }
+
+    #[test]
+    fn a_project_that_leaves_the_list_gives_way_to_the_first_one() {
+        let projects = [("a".to_owned(), "A".to_owned()), ("b".to_owned(), "B".to_owned())];
+        assert_eq!(resolve_project(&projects, Some("b")).as_deref(), Some("b"));
+        assert_eq!(resolve_project(&projects, Some("gone")).as_deref(), Some("a"));
+        assert_eq!(resolve_project(&projects, None).as_deref(), Some("a"));
+        assert_eq!(resolve_project(&[], Some("b")), None);
+    }
+
+    #[test]
+    fn moving_to_another_project_drops_the_old_ones_work() {
+        let mut sessions = AcpSessions::new(WeakEntity::new_invalid(), None, "acp".into(), false);
+        sessions.retire_project(Some("a".into()));
+        let first = sessions.generation;
+        sessions.loading = true;
+        sessions.importing = Some("s".into());
+        sessions.deleting = Some("s".into());
+        sessions.loading_providers = true;
+        sessions.saving_provider = Some("p".into());
+        sessions.next_cursor = Some("c".into());
+        sessions.retire_project(Some("a".into()));
+        assert_eq!(sessions.generation, first, "the same project keeps its work");
+        sessions.retire_project(Some("b".into()));
+        assert_ne!(sessions.generation, first);
+        assert!(!sessions.pending() && sessions.next_cursor.is_none());
+        assert_eq!(sessions.project_id.as_deref(), Some("b"));
     }
 
     #[test]

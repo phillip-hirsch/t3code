@@ -1068,7 +1068,7 @@ impl AccountSection {
     /// `removeProviderAuthMethod.permissionAtom`: removal needs `providers:manage` on this environment.
     fn can_remove_auth_method(&self, cx: &App) -> bool {
         let (Some(workspace), Some(scope)) = (self.workspace.upgrade(), self.scope.as_ref()) else { return false };
-        workspace.read(cx).settings_ui.grants.get(scope.as_ref()).is_some_and(|(_, load)| load.grants(PROVIDERS_MANAGE))
+        workspace.read(cx).environment_grants(scope, PROVIDERS_MANAGE)
     }
 
     /// Forgets an incomplete ChatGPT connection; the picker stays open on the updated list.

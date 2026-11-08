@@ -601,6 +601,11 @@ impl Workspace {
         ProviderAccess::of(load)
     }
 
+    /// Whether this connection's session on `environment` grants `scope` (`readEnvironmentScope`).
+    pub(super) fn environment_grants(&self, environment: &str, scope: &str) -> bool {
+        self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.grants(scope))
+    }
+
     /// Provider mutations wait for `providers:manage` (`readOnly` across the panel).
     pub(super) fn providers_read_only(&self) -> bool {
         self.provider_access() != ProviderAccess::Editable
