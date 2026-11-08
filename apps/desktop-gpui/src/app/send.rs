@@ -219,6 +219,7 @@ impl Workspace {
         if (text.is_empty() && !self.has_attachments() && follow_up.is_none())
             || self.sending
             || self.target_rewinding()
+            || self.runtime_mode_ceiling().is_some()
         {
             return;
         }

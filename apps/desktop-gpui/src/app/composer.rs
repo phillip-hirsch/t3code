@@ -349,6 +349,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // The permissions popover nests in the model picker's footer, so it takes the keys first.
+        if self.permissions_key(keystroke, window, cx) {
+            return true;
+        }
         if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
@@ -1200,7 +1204,12 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
+        let disabled_reason: Option<SharedString> = if self.attachments_busy() {
+            Some("Attachment(s) still uploading".into())
+        } else {
+            // An answer to an open question still goes through.
+            self.runtime_mode_ceiling().filter(|_| self.question.is_none()).map(|(denial, _)| denial.into())
+        };
         let can_send = sendable
             && self.target.is_some()
             && self.client().is_some()
@@ -1232,7 +1241,7 @@ impl Workspace {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
         };
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
-            (Some(reason), _) => Some(reason.into()),
+            (Some(reason), _) => Some(reason),
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
             (None, true) if !can_steer => Some("Queue message".into()),
             (None, true) => {
@@ -1459,6 +1468,7 @@ impl Workspace {
             .chain(self.render_extension_status_banner(t))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
+            .chain(self.render_runtime_mode_ceiling_banner(t, cx))
             .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
             .chain(self.render_child_approvals(t, cx))
             .collect();
