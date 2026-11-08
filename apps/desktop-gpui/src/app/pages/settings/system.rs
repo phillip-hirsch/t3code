@@ -86,8 +86,9 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let connected = self.settings_client().is_some();
-        let background = self.render_background_row(cx);
-        let storage = self.render_storage_sections(window, cx);
+        let background = self.render_background_row(view, cx);
+        // `StorageCleanupSections` renders nothing for a project or checkout.
+        let storage = if view.scope.is_project() { Vec::new() } else { self.render_storage_sections(window, cx) };
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let updates = [
             row(
@@ -307,9 +308,12 @@ impl Workspace {
         &self.settings_info().settings
     }
 
-    /// `BackgroundActivitySettingsRow`; this client is one environment, so Advanced is always offered.
-    fn render_background_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// `BackgroundActivitySettingsRow`. Advanced edits one environment's intervals, so it waits
+    /// for a scope of one; a selection whose environments differ reads "Mixed".
+    fn render_background_row(&mut self, view: &SettingsView, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
+        let one_environment = view.scope.environment_ids.len() == 1 && view.environment().is_some();
+        let mixed = view.mixed(&["backgroundActivity"]);
         let settings = self.settings_json();
         let resolved = background::resolve_server(settings);
         let option = background::profile_option(settings);
@@ -342,7 +346,7 @@ impl Workspace {
                 .build(window, cx)
             });
         let title = h_flex().gap_1p5().child("Background activity").child(info);
-        let label = option.map_or("Advanced", Profile::label);
+        let label = if mixed { "Mixed" } else { option.map_or("Advanced", Profile::label) };
         let picker_view = view.clone();
         let picker = Button::new("background-activity-profile")
             .outline()
@@ -352,17 +356,24 @@ impl Workspace {
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                 for profile in Profile::ALL {
-                    menu = menu.item(PopupMenuItem::new(profile.label()).checked(option == Some(profile)).on_click(
+                    let checked = !mixed && option == Some(profile);
+                    menu = menu.item(PopupMenuItem::new(profile.label()).checked(checked).on_click(
                         window.listener_for(&picker_view, move |this, _, window, cx| {
                             this.update_settings(background::profile_patch(profile), window, cx);
                         }),
                     ));
                 }
-                menu.item(PopupMenuItem::new("Advanced").checked(option.is_none()).on_click(
-                    window.listener_for(&picker_view, |this, _, window, cx| this.open_background_dialog(window, cx)),
-                ))
+                let advanced = if one_environment { "Advanced" } else { "Advanced (one environment)" };
+                menu.item(
+                    PopupMenuItem::new(advanced)
+                        .checked(!mixed && option.is_none())
+                        .disabled(!one_environment)
+                        .on_click(window.listener_for(&picker_view, |this, _, window, cx| {
+                            this.open_background_dialog(window, cx);
+                        })),
+                )
             });
-        let configure = option.is_none().then(|| {
+        let configure = (option.is_none() && one_environment).then(|| {
             Button::new("background-activity-configure")
                 .outline()
                 .small()
@@ -380,7 +391,7 @@ impl Workspace {
 
     /// `BackgroundActivityAdvancedDialog`.
     fn open_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_client().is_none() {
+        if self.settings_client().is_none() || self.settings_view().scope.environment_ids.len() != 1 {
             return;
         }
         let (view, scope) = (cx.entity(), self.settings_environment());
