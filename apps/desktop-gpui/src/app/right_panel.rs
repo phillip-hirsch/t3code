@@ -240,6 +240,14 @@ impl PanelState {
     }
 }
 
+impl DiffKey {
+    /// The same files asked for again: only the reads' revisions differ.
+    fn same_selection(&self, other: &Self) -> bool {
+        (&self.target, &self.cwd, &self.scope, &self.base_ref, self.ignore_whitespace)
+            == (&other.target, &other.cwd, &other.scope, &other.base_ref, other.ignore_whitespace)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct DiffKey {
     target: Target,
@@ -311,9 +319,17 @@ impl FilePatches {
         client: RpcClient,
         request: diff_load::PatchRequest,
         files: Vec<diff_load::FileStat>,
+        previous: Option<&Self>,
     ) -> Self {
         let stats = files.iter().map(|file| (file.path.clone().into(), file.clone())).collect();
         let index = files.iter().enumerate().map(|(index, file)| (file.path.clone().into(), index)).collect();
+        // A refresh of the same selection keeps the patches it read, each read again behind them.
+        let rows = previous.map_or_else(
+            || vec![None; files.len()],
+            |previous| diff_load::carried_rows(&previous.files, &previous.rows, &files),
+        );
+        let mut demand = diff_load::PatchDemand::new(files.len());
+        demand.request(rows.iter().enumerate().filter_map(|(index, row)| row.as_ref().map(|_| index)));
         Self {
             selection,
             client,
@@ -321,8 +337,8 @@ impl FilePatches {
             stats: std::rc::Rc::new(stats),
             index,
             placeholders: files.iter().map(diff_load::placeholder).collect(),
-            rows: vec![None; files.len()],
-            demand: diff_load::PatchDemand::new(files.len()),
+            rows,
+            demand,
             files,
             _reads: Vec::new(),
         }
@@ -1097,8 +1113,13 @@ impl Workspace {
             self.reveal_pending_file(cx);
             return;
         }
-        self.right_panel.loaded = Some(key);
         let selection = (target.clone(), scope.clone());
+        // A refresh of the shown selection keeps it readable until the new read lands.
+        let retain = self.right_panel.loaded.as_ref().is_some_and(|loaded| loaded.same_selection(&key))
+            && self.right_panel.shown.as_ref() == Some(&selection)
+            && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
+        let install = if retain { Install::Update } else { Install::Replace };
+        self.right_panel.loaded = Some(key);
         let (Some(client), Target::Thread { id: thread_id, .. }) = (self.client(), target) else { return };
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
@@ -1162,8 +1183,10 @@ impl Workspace {
             DiffScope::Commit(sha) => Some(sha.clone()),
             _ => None,
         };
-        self.right_panel.load = DiffLoad::Loading;
-        (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        if !retain {
+            self.right_panel.load = DiffLoad::Loading;
+            (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        }
         let diff = self.right_panel.diff.clone();
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
             let (method, input) = request;
@@ -1188,6 +1211,7 @@ impl Workspace {
                 ignore_whitespace,
             });
             let _ = this.update(cx, |this, cx| {
+                let previous = this.right_panel.patches.take().filter(|_| retain);
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
@@ -1207,16 +1231,21 @@ impl Workspace {
                         });
                         let pending = match patch_request.filter(|_| !parsed.deferred.is_empty()) {
                             Some(request) => {
-                                let patches =
-                                    FilePatches::new(selection.clone(), client.clone(), request, parsed.deferred);
+                                let patches = FilePatches::new(
+                                    selection.clone(),
+                                    client.clone(),
+                                    request,
+                                    parsed.deferred,
+                                    previous.as_ref(),
+                                );
                                 let outstanding = patches.demand.outstanding();
                                 this.right_panel.patches = Some(patches);
-                                this.show_file_patches(Install::Replace, cx);
+                                this.show_file_patches(install, cx);
                                 this.start_patch_reads(cx);
                                 outstanding
                             }
                             None => {
-                                this.show_diff_files(&selection, parsed.files, Install::Replace, cx);
+                                this.show_diff_files(&selection, parsed.files, install, cx);
                                 0
                             }
                         };

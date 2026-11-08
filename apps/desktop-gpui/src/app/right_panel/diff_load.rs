@@ -203,6 +203,20 @@ pub(super) fn settle_file(file: &FileStat, reply: Option<&Value>, source_kind: &
     }
 }
 
+/// The settled rows a refresh keeps: each file listed again with the same counts keeps the
+/// patch it showed until its new read settles.
+pub(super) fn carried_rows<R: Clone>(previous: &[FileStat], rows: &[Option<R>], files: &[FileStat]) -> Vec<Option<R>> {
+    let by_path: std::collections::HashMap<&str, usize> =
+        previous.iter().enumerate().map(|(index, file)| (file.path.as_str(), index)).collect();
+    files
+        .iter()
+        .map(|file| {
+            let index = *by_path.get(file.path.as_str())?;
+            if previous[index] == *file { rows.get(index).cloned().flatten() } else { None }
+        })
+        .collect()
+}
+
 /// A header-only row that names the file, for a patch that did not load or is still on its way.
 pub(super) fn placeholder(file: &FileStat) -> Vec<DiffFile> {
     let previous = file.previous_path.as_deref().unwrap_or(&file.path);
@@ -266,6 +280,16 @@ mod tests {
         assert_eq!(demand.start(), [4, 8, 9]);
         demand.load_next(12);
         assert!(!demand.is_requested(12));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_patches_of_files_listed_again_unchanged() {
+        let file =
+            |path: &str, additions: usize| FileStat { path: path.into(), previous_path: None, additions, deletions: 0 };
+        let previous = [file("a", 1), file("b", 2), file("c", 3)];
+        let rows = [Some("a"), Some("b"), None];
+        let files = [file("0", 1), file("a", 1), file("b", 5), file("c", 3)];
+        assert_eq!(carried_rows(&previous, &rows, &files), [None, Some("a"), None, None]);
     }
 
     #[test]
