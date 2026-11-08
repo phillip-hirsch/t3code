@@ -276,6 +276,7 @@ impl Workspace {
     /// `script.<id>.run`: runs the open project's script with that id in the thread's terminal.
     fn run_script_shortcut(&mut self, script_id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(project) = self.target_project() else { return false };
+        let project_id = project.id.clone();
         let scripts = super::pages::settings::code::projects::scripts::resolve_project_scripts(
             &self.server_info().settings,
             project,
@@ -283,6 +284,7 @@ impl Workspace {
         let (Some(script), Some(cwd)) = (scripts.into_iter().find(|s| s.id == script_id), self.git_cwd()) else {
             return false;
         };
+        self.remember_script(&project_id, script_id);
         let stop_on_settle = script.stop_on_settle == Some(true);
         window.dispatch_action(Box::new(super::RunInTerminal { cwd, command: script.command, stop_on_settle }), cx);
         true

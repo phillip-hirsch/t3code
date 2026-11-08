@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
-use crate::model::{DelegatedFrom, ThreadShell, TokenUsage, UsageLimits};
+use crate::model::{DelegatedFrom, ProjectScript, ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
@@ -522,8 +522,8 @@ impl Workspace {
         .detach();
     }
 
-    /// `ProjectScriptsControl` in panel mode: run the first script, pick or add one from the menu,
-    /// or "Add project script" while the project has none.
+    /// `ProjectScriptsControl` in panel mode: run the primary script, pick, import or add one from
+    /// the menu; "Actions" when no script can be primary; "Add project script" with none at all.
     fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         use super::pages::settings::code::projects::scripts::{
             ScriptInput, importable_scripts, resolve_project_scripts, script_icon,
@@ -548,64 +548,7 @@ impl Workspace {
             },
             None => Vec::new(),
         };
-        let scripts: Vec<(SharedString, ScriptRun)> = saved
-            .into_iter()
-            .map(|script| {
-                let stop_on_settle = script.stop_on_settle == Some(true);
-                (script.name.into(), ScriptRun { command: script.command.into(), stop_on_settle })
-            })
-            .collect();
-        let Some((name, run)) = scripts.first().cloned() else {
-            if !importable.is_empty() {
-                // `ProjectScriptsControl` with only `t3.json` actions: "Actions" opens the import menu.
-                let view = cx.entity();
-                let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-                    menu = menu.label("From t3.json");
-                    for input in &importable {
-                        let (pid, input) = (project_id.clone(), input.clone());
-                        let name = SharedString::from(input.name.clone());
-                        menu = menu.item(
-                            PopupMenuItem::element(move |_, cx| {
-                                h_flex().w_full().gap_2().child(name.clone()).child(
-                                    icon("icons/download.svg")
-                                        .with_size(px(14.))
-                                        .ml_auto()
-                                        .text_color(theme::tokens(cx).muted_foreground),
-                                )
-                            })
-                            .icon(gpui_kit::component::Icon::new(script_icon(&input.icon)))
-                            .on_click(window.listener_for(
-                                &view,
-                                move |this, _, window, cx| {
-                                    this.import_project_script(&pid, &input, window, cx);
-                                },
-                            )),
-                        );
-                    }
-                    let pid = project_id.clone();
-                    menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
-                        window.listener_for(&view, move |this, _, window, cx| {
-                            this.open_project_script_editor(&pid, None, window, cx);
-                        }),
-                    ))
-                };
-                return Some(
-                    select_row("details-project-actions", tokens, colors, cx)
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(10.))
-                                .child(icon("icons/wrench.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                                .child(div().flex_1().min_w_0().truncate().text_left().child("Actions")),
-                        )
-                        .child(select_chevron(tokens))
-                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                            build(menu.min_w(px(264.)), window, cx)
-                        })
-                        .into_any_element(),
-                );
-            }
+        if saved.is_empty() && importable.is_empty() {
             return Some(
                 action_row("details-add-script", colors, cx)
                     .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
@@ -616,7 +559,14 @@ impl Workspace {
                     }))
                     .into_any_element(),
             );
-        };
+        }
+        let primary = primary_script(&saved, self.last_invoked_script(&project_id))
+            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)));
+        let scripts: Vec<(SharedString, ScriptRun)> = saved
+            .iter()
+            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)))
+            .collect();
+        // `scriptItems`: the scripts, then the `t3.json` ones to import, then "Add project script".
         let view = cx.entity();
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
             for (name, run) in &scripts {
@@ -625,12 +575,54 @@ impl Workspace {
                     window.listener_for(&view, move |this, _, window, cx| this.run_project_script(&run, window, cx)),
                 ));
             }
-            let project_id = project_id.clone();
-            menu.separator().item(PopupMenuItem::new("Add action").icon(icon("icons/plus.svg")).on_click(
+            if !importable.is_empty() {
+                if !scripts.is_empty() {
+                    menu = menu.separator();
+                }
+                menu = menu.label("From t3.json");
+            }
+            for input in &importable {
+                let (pid, input) = (project_id.clone(), input.clone());
+                let name = SharedString::from(input.name.clone());
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        h_flex().w_full().gap_2().child(name.clone()).child(
+                            icon("icons/download.svg")
+                                .with_size(px(14.))
+                                .ml_auto()
+                                .text_color(theme::tokens(cx).muted_foreground),
+                        )
+                    })
+                    .icon(gpui_kit::component::Icon::new(script_icon(&input.icon)))
+                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                        this.import_project_script(&pid, &input, window, cx);
+                    })),
+                );
+            }
+            let pid = project_id.clone();
+            menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.open_project_script_editor(&project_id, None, window, cx);
+                    this.open_project_script_editor(&pid, None, window, cx);
                 }),
             ))
+        };
+        let Some((name, run)) = primary else {
+            return Some(
+                select_row("details-project-actions", tokens, colors, cx)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(10.))
+                            .child(icon("icons/wrench.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                            .child(div().flex_1().min_w_0().truncate().text_left().child("Actions")),
+                    )
+                    .child(select_chevron(tokens))
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                        build(menu.min_w(px(264.)), window, cx)
+                    })
+                    .into_any_element(),
+            );
         };
         let tooltip: SharedString = format!("Run {name}").into();
         Some(
@@ -656,8 +648,26 @@ impl Workspace {
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.git_cwd() else { return };
+        self.remember_script(&run.project_id, &run.id);
         let (command, stop_on_settle) = (run.command.to_string(), run.stop_on_settle);
         window.dispatch_action(Box::new(super::RunInTerminal { cwd, command, stop_on_settle }), cx);
+    }
+
+    /// `lastInvokedScriptByProjectId[projectId]`: the script last run in the project on this device.
+    fn last_invoked_script(&self, project_id: &str) -> Option<&str> {
+        self.client_settings.values.get(LAST_INVOKED_SCRIPT_KEY)[project_id].as_str()
+    }
+
+    /// Remembers `script_id` as the project's last run script, which the card then offers first.
+    pub(super) fn remember_script(&mut self, project_id: &str, script_id: &str) {
+        if self.last_invoked_script(project_id) == Some(script_id) {
+            return;
+        }
+        let mut by_project =
+            self.client_settings.values.get(LAST_INVOKED_SCRIPT_KEY).as_object().cloned().unwrap_or_default();
+        by_project.insert(project_id.to_owned(), script_id.into());
+        let patch = serde_json::Map::from_iter([(LAST_INVOKED_SCRIPT_KEY.to_owned(), Value::Object(by_project))]);
+        self.client_settings.apply(&patch);
     }
 
     fn version_control_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
@@ -1802,8 +1812,34 @@ pub(super) fn format_context_tokens(value: u64) -> String {
 /// A project script's run from the details card.
 #[derive(Clone)]
 struct ScriptRun {
+    project_id: String,
+    id: String,
     command: SharedString,
     stop_on_settle: bool,
+}
+
+impl ScriptRun {
+    fn new(project_id: &str, script: &ProjectScript) -> Self {
+        Self {
+            project_id: project_id.to_owned(),
+            id: script.id.clone(),
+            command: script.command.clone().into(),
+            stop_on_settle: script.stop_on_settle == Some(true),
+        }
+    }
+}
+
+/// `t3code:last-invoked-script-by-project`, kept with this device's client settings.
+const LAST_INVOKED_SCRIPT_KEY: &str = "lastInvokedScriptByProject";
+
+/// The card's run button: the script last run in the project, else `primaryProjectScript` (a
+/// regular script, then a setup one; a settle-only script is never primary).
+fn primary_script<'a>(scripts: &'a [ProjectScript], last_invoked: Option<&str>) -> Option<&'a ProjectScript> {
+    let settles = |script: &ProjectScript| script.run_on_settle == Some(true);
+    last_invoked
+        .and_then(|id| scripts.iter().find(|script| script.id == id))
+        .or_else(|| scripts.iter().find(|script| !script.run_on_worktree_create && !settles(script)))
+        .or_else(|| scripts.iter().find(|script| !settles(script)))
 }
 
 #[cfg(test)]
@@ -1827,6 +1863,30 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(format_context_tokens(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn the_primary_script_is_the_last_run_else_a_regular_then_a_setup_one() {
+        let script = |id: &str, setup: bool, settle: bool| ProjectScript {
+            id: id.into(),
+            name: id.into(),
+            command: id.into(),
+            icon: "play".into(),
+            run_on_worktree_create: setup,
+            run_on_settle: settle.then_some(true),
+            stop_on_settle: None,
+            run_async: None,
+            preview_url: None,
+            auto_open_preview: None,
+        };
+        let primary =
+            |scripts: &[ProjectScript], last: Option<&str>| primary_script(scripts, last).map(|s| s.id.clone());
+        let scripts = [script("setup", true, false), script("settle", false, true), script("dev", false, false)];
+        assert_eq!(primary(&scripts, None).as_deref(), Some("dev"));
+        assert_eq!(primary(&scripts, Some("settle")).as_deref(), Some("settle"), "the last run wins");
+        assert_eq!(primary(&scripts, Some("deleted")).as_deref(), Some("dev"));
+        assert_eq!(primary(&scripts[..2], None).as_deref(), Some("setup"));
+        assert_eq!(primary(&scripts[1..2], None), None, "a settle-only script is never primary");
     }
 
     #[test]
