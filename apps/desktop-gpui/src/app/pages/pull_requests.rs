@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
@@ -1016,6 +1016,22 @@ impl Workspace {
                     "Add a project, and the pull requests from its repository appear here.".into(),
                     t,
                 ))
+                .child(
+                    Button::new("pr-add-project")
+                        .primary()
+                        .small()
+                        .h(px(28.))
+                        .px(px(9.))
+                        .gap(px(6.))
+                        .rounded(px(8.))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(Icon::new(Lucide::Plus).with_size(px(14.)))
+                        .child("Add project")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_palette(super::super::palette::View::AddProject, window, cx);
+                        })),
+                )
                 .into_any_element();
         }
         let quoted = || {
