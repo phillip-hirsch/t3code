@@ -14,12 +14,9 @@ pub(super) use usage::UsageState;
 
 use super::{Target, Workspace};
 
-/// Every Settings section as (group heading, route id, label), for search.
-pub(super) fn settings_sections() -> impl Iterator<Item = (Option<&'static str>, &'static str, &'static str)> {
-    settings::SETTINGS
-        .iter()
-        .flat_map(|(group, items)| items.iter().map(move |(id, label)| (*group, *id, *label)))
-        .filter(|(_, id, _)| settings::section_enabled(id))
+/// Every setting this client offers, with its section's label, for the palette's search.
+pub(super) fn palette_settings() -> impl Iterator<Item = (&'static crate::settings::SearchItem, &'static str)> {
+    settings::searchable_settings()
 }
 
 /// A page that replaces the chat in the main column (`/_chat/pull-requests`, `/_chat/usage`).

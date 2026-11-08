@@ -1,4 +1,4 @@
-//! Sidebar search: title and branch matches first, then message hits from
+//! Sidebar search: title, pull request and branch matches first, then message hits from
 //! `orchestration.searchThreads` (`Sidebar.tsx` search, `SidebarSearchResultRow`).
 
 use std::cell::OnceCell;
@@ -15,8 +15,9 @@ use crate::app::Workspace;
 use crate::app::palette::MessageSearch;
 use crate::inbox;
 use crate::model::ThreadShell;
-use crate::search::{self, Field, Weighted};
+use crate::search::{self, ThreadSubject};
 use crate::theme::Tokens;
+use crate::thread_pull_requests::SearchPullRequest;
 
 /// The title and branch matches for a query, as indexes into `shell.threads`, ranked once
 /// per query, shell change, scope and minute instead of on every render, key and hover.
@@ -96,28 +97,29 @@ impl Workspace {
             return ranking.threads.clone();
         }
         let tokens = search::fold_query(query);
-        let candidates: Vec<(usize, &ThreadShell)> =
-            self.shell.threads.iter().enumerate().filter(|(_, t)| visible(t)).collect();
+        let candidates: Vec<(usize, &ThreadShell, Vec<SearchPullRequest>)> = self
+            .shell
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| visible(t))
+            .map(|(at, t)| (at, t, crate::thread_pull_requests::search_entries(t)))
+            .collect();
         let score = |typos: bool| {
             let mut found: Vec<(usize, f32, bool)> = candidates
                 .iter()
-                .filter_map(|&(at, thread)| {
-                    let title = Field::new(&thread.title);
-                    let branch = thread.branch.as_deref().unwrap_or_default();
-                    let branch = Field::new(branch.trim_start_matches("t3code/").trim_start_matches("t3/"));
-                    let mut title_field = Weighted::new(&title, 1.);
-                    title_field.mid_word = true;
-                    let found = search::match_fields(&tokens, &[title_field, Weighted::new(&branch, 0.6)], typos)?;
-                    let used = crate::timestamp::parse_ms(
-                        thread
-                            .latest_user_authored_message_at
-                            .as_ref()
-                            .and_then(Option::as_deref)
-                            .or(thread.latest_user_message_at.as_deref())
-                            .unwrap_or(&thread.updated_at),
-                    )
-                    .unwrap_or(0);
-                    Some((at, found.quality * search::usage_boost(now - used), found.strong))
+                .filter_map(|(at, thread, pull_requests)| {
+                    let subject = ThreadSubject {
+                        id: &thread.id,
+                        title: &thread.title,
+                        branch: thread.branch.as_deref(),
+                        project: None,
+                        environment: None,
+                        pull_requests,
+                    };
+                    let found = search::match_thread(&tokens, &subject, typos)?;
+                    let used = search::ThreadUse::of(thread, self.local_opened_at(&thread.id));
+                    Some((*at, found.quality * used.boost(now), found.strong))
                 })
                 .collect();
             found.sort_by(|a, b| {
@@ -177,9 +179,22 @@ impl Workspace {
         self.sidebar.search_highlight = None;
     }
 
+    /// A row listed for a message match opens find on it, as the palette does.
     fn open_search_result(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.sidebar.search.read(cx).value().trim().to_owned();
+        let message_row = self
+            .search_results(&self.search_query(cx), now_ms())
+            .iter()
+            .any(|r| r.thread.id == thread_id && r.snippet.is_some());
+        let find = message_row
+            .then(|| self.sidebar.messages.matches.iter().find(|m| m.thread_id == thread_id))
+            .flatten()
+            .map(|m| (crate::app::find::query_for_message(&m.snippet, &query), m.message_id.clone()));
         self.clear_search(window, cx);
         self.select_thread(thread_id, window, cx);
+        if let Some((query, message_id)) = find {
+            self.open_thread_find_on(&query, message_id, window, cx);
+        }
     }
 
     pub(super) fn render_search_results(
@@ -213,9 +228,9 @@ impl Workspace {
                 let muted_icon = settled && !active;
                 let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
                 let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-                let time =
-                    crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
-                        .map(|at| inbox::format_relative(now - at));
+                let time = inbox::Facts { thread, child_request: None }
+                    .activity_timestamp()
+                    .map(|at| inbox::format_relative(now - at));
                 let title_color = if active {
                     sb.foreground
                 } else if settled {

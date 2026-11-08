@@ -168,10 +168,17 @@ impl Workspace {
 
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
-        if empty != self.composer_empty {
+        let triage = !empty && super::palette_actions::is_triage_prompt(&self.composer.read(cx).value());
+        if empty != self.composer_empty || triage != self.composer_triage {
             self.composer_empty = empty;
+            self.composer_triage = triage;
             cx.notify();
         }
+    }
+
+    /// `composerDraftHasUserContent`: the open composer holds text or attachments.
+    pub(super) fn composer_has_user_content(&self, cx: &gpui_kit::App) -> bool {
+        !self.composer.read(cx).value().trim().is_empty() || self.has_attachments()
     }
 
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.

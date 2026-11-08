@@ -39,6 +39,36 @@ impl Workspace {
         self.open_thread_shell().is_some_and(|shell| links::visible(&shell.pull_requests).next().is_some())
     }
 
+    /// `useOpenPanelPullRequestUrl`: `None` when no pull request is open in the panel (on the
+    /// Pull requests page, its detail panel), else its URL once known.
+    pub(in crate::app) fn open_panel_pull_request_url(&self) -> Option<Option<String>> {
+        let panel_url = |reference: Option<&Reference>| {
+            let panel = self.pull_requests.panel.as_ref().filter(|p| reference.is_none_or(|r| p.reference() == r));
+            panel.and_then(|p| p.url()).map(str::to_owned)
+        };
+        if self.page == Some(super::Page::PullRequests) {
+            return self.pull_requests.panel.is_some().then(|| panel_url(None));
+        }
+        let Some(Surface::PullRequest(reference)) = self.active_surface() else { return None };
+        // Before the detail loads, a link the thread holds names the same pull request.
+        let shell = self.open_thread_shell();
+        let linked = shell.and_then(|shell| {
+            let same = |repository: &str, number: u64| {
+                repository.eq_ignore_ascii_case(&reference.repository) && number == reference.number
+            };
+            links::visible(&shell.pull_requests).find(|l| same(&l.repository, l.number)).map(|l| l.url.clone()).or_else(
+                || {
+                    [shell.linked_pull_request.as_ref(), shell.branch_pull_request.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .find(|l| same(&l.repository, l.number))
+                        .map(|l| l.url.clone())
+                },
+            )
+        });
+        Some(panel_url(Some(reference)).or(linked))
+    }
+
     /// The visible linked pull requests as sorted `[host, repository, number]` keys
     /// (`proactivePullRequestsKey`).
     pub(in crate::app) fn thread_pull_request_keys(&self) -> Vec<String> {

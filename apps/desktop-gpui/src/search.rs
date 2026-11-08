@@ -288,12 +288,82 @@ pub fn class(quality: f32) -> u8 {
     }
 }
 
-/// `threadUsageBoost` without open history: recency of the last user message.
-#[expect(clippy::cast_possible_truncation, reason = "a boost clamped to 1..=2.5")]
-pub fn usage_boost(age_ms: i64) -> f32 {
-    const HALF_LIFE: f64 = 14. * 86_400_000.;
-    let recency = 2f64.powf(-(age_ms.max(0) as f64) / HALF_LIFE);
-    (1. + recency).min(2.5) as f32
+const DAY_MS: f64 = 86_400_000.;
+/// `SEARCH_RECENCY_HALF_LIFE_MS`: activity recency and open counts halve every two weeks.
+const HALF_LIFE_MS: f64 = 14. * DAY_MS;
+/// `PICK_WINDOW_MS`: a pick counts for three weeks from when it was made.
+const PICK_WINDOW_MS: f64 = 21. * DAY_MS;
+
+fn decay(age_ms: f64) -> f64 {
+    2f64.powf(-age_ms.max(0.) / HALF_LIFE_MS)
+}
+
+/// How a thread was used, as `threadSearchSubject` reads it: the user's latest activity and the
+/// thread's opens, this client's own latest open merged in.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadUse {
+    /// Epoch ms.
+    pub activity_at: Option<i64>,
+    pub opens: Option<crate::model::ThreadOpens>,
+}
+
+impl ThreadUse {
+    /// What the user wrote, not agent wakes; a thread the user never wrote in counts from its
+    /// creation, and an older server's missing field falls back to the latest user message.
+    pub fn of(thread: &crate::model::ThreadShell, local_opened_at: Option<i64>) -> Self {
+        let parse = crate::timestamp::parse_ms;
+        let activity_at = match &thread.latest_user_authored_message_at {
+            Some(authored) => parse(authored.as_deref().unwrap_or(&thread.created_at)),
+            None => thread.latest_user_message_at.as_deref().and_then(parse).or_else(|| parse(&thread.updated_at)),
+        };
+        #[expect(clippy::cast_precision_loss, reason = "epoch ms are far below 2^52")]
+        let local = local_opened_at.map(|at| at as f64).filter(|at| *at > 0.);
+        let server = thread.opens.as_ref();
+        let opens = match local {
+            Some(at) if at > server.map_or(0., |o| o.opened_at) => Some(crate::model::ThreadOpens {
+                opened_at: at,
+                ..server.cloned().unwrap_or(crate::model::ThreadOpens { score: 1., ..Default::default() })
+            }),
+            _ => server.cloned(),
+        };
+        Self { activity_at, opens }
+    }
+
+    /// `threadUsageBoost`: 1 for a stale, never-opened thread, about 2 for one active today, and
+    /// up to 2.5 for one opened often.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "a boost clamped to 1..=2.5")]
+    pub fn boost(&self, now: i64) -> f32 {
+        let now = now as f64;
+        let recency = self.activity_at.map_or(0., |at| decay(now - at as f64));
+        let opens = self.opens.as_ref().map_or(0., |o| o.score * decay(now - o.opened_at));
+        (1. + recency + 0.5 * (1. + opens).log2()).min(2.5) as f32
+    }
+
+    /// `threadRecentUse`: the later of the user's last message and last open.
+    #[expect(clippy::cast_possible_truncation, reason = "epoch ms")]
+    pub fn recent(&self) -> i64 {
+        self.activity_at.unwrap_or(0).max(self.opens.as_ref().map_or(0, |o| o.opened_at as i64))
+    }
+
+    /// `activePick`: when the thread was last picked for this query (exactly, else as a prefix
+    /// of three letters or more), while that pick lasts.
+    #[expect(clippy::cast_precision_loss, reason = "epoch ms")]
+    pub fn picked_at(&self, tokens: &[Vec<char>], now: i64) -> Option<f64> {
+        let query = picked_query(tokens);
+        let prefix = query.chars().count() >= 3;
+        let live = self.opens.iter().flat_map(|o| &o.picks).filter(|pick| now as f64 - pick.at <= PICK_WINDOW_MS);
+        let latest = |picks: &mut dyn Iterator<Item = &crate::model::ThreadPick>| {
+            picks.map(|pick| pick.at).max_by(f64::total_cmp)
+        };
+        latest(&mut live.clone().filter(|pick| pick.query == query))
+            .or_else(|| latest(&mut live.filter(|pick| prefix && pick.query.starts_with(&query))))
+    }
+}
+
+/// `pickedQuery`: the folded query cut to the 32 chars the server stores.
+fn picked_query(tokens: &[Vec<char>]) -> String {
+    let folded: String = tokens.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>().join(" ");
+    folded.chars().take(32).collect::<String>().trim().to_owned()
 }
 
 /// `messageSearchTokens(..).long` is non-empty: the server message search runs.
@@ -302,6 +372,131 @@ pub fn has_long_token(query: &str) -> bool {
         let len = token.chars().count();
         len >= 3 || (len == 2 && token.chars().any(|c| is_cjk(c) || ('\u{ac00}'..='\u{d7af}').contains(&c)))
     })
+}
+
+/// `searchableBranch`: the app's worktree prefix ("t3/", "t3code/" before it) matches nearly
+/// every thread, so it is dropped, but only before more text.
+pub fn searchable_branch(branch: &str) -> &str {
+    ["t3/", "t3code/"]
+        .iter()
+        .find_map(|prefix| branch.strip_prefix(prefix).filter(|rest| rest.starts_with(|c: char| !c.is_whitespace())))
+        .unwrap_or(branch)
+}
+
+/// `threadFieldQuery`: pull request prefixes ("pr 12", "pull request #12", "#12") and the
+/// worktree prefix come off, so a query matches the stored fields.
+fn thread_field_query(query: &str) -> &str {
+    let mut query = ["pr", "pull request", "pull"]
+        .iter()
+        .find_map(|prefix| {
+            let rest = query.strip_prefix(prefix)?.trim_start();
+            rest.strip_prefix('#').unwrap_or(rest).starts_with(|c: char| c.is_ascii_digit()).then_some(rest)
+        })
+        .unwrap_or(query);
+    if let Some(rest) = query.strip_prefix('#') {
+        query = rest.trim_start();
+    }
+    searchable_branch(query)
+}
+
+/// `REFERENCE_PREFIX_MIN`: IDs and links have many word starts, so a short query would hit them all.
+const REFERENCE_PREFIX_MIN: usize = 8;
+
+/// `matchReference`: a long prefix of the thread ID or a pull request reference, or any long
+/// part of one that holds a digit. A number is never cut short (".../pull/2288" is not 22889).
+fn matches_reference<'a>(query: &str, mut references: impl Iterator<Item = &'a str>) -> bool {
+    if query.chars().count() < REFERENCE_PREFIX_MIN {
+        return false;
+    }
+    let not_cut = |text: &str, end: usize| !text[end..].starts_with(char::is_numeric);
+    let anywhere = query.chars().any(char::is_numeric);
+    references.any(|reference| {
+        let folded = reference.to_lowercase();
+        if !anywhere {
+            return folded.starts_with(query);
+        }
+        folded.find(query).is_some_and(|at| not_cut(&folded, at + query.len()))
+            || (query.starts_with(folded.as_str()) && not_cut(query, folded.len()))
+    })
+}
+
+/// What thread search matches a thread by (`ThreadSearchSubject`).
+pub struct ThreadSubject<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub branch: Option<&'a str>,
+    pub project: Option<&'a str>,
+    /// Only with two or more environments; it tells same-named threads apart.
+    pub environment: Option<&'a str>,
+    pub pull_requests: &'a [crate::thread_pull_requests::SearchPullRequest],
+}
+
+/// `scoreThreadSearch` without picks: titles and pull request numbers count fully, pull request
+/// titles and branches less, project and environment names least. `ranges` are the title's.
+pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> Option<Match> {
+    let query: String = tokens.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>().join(" ");
+    let field_tokens = fold_query(thread_field_query(&query));
+    let title = Field::new(thread.title);
+    let numbers: Vec<Field> = thread.pull_requests.iter().map(|pr| Field::new(&format!("#{}", pr.number))).collect();
+    let titles: Vec<Option<Field>> =
+        thread.pull_requests.iter().map(|pr| pr.title.as_deref().map(Field::new)).collect();
+    let branch = thread.branch.map(|b| Field::new(searchable_branch(b)));
+    let project = thread.project.map(Field::new);
+    let environment = thread.environment.map(Field::new);
+    let mut fields = vec![Weighted { mid_word: true, ..Weighted::new(&title, 1.) }];
+    for (number, title) in numbers.iter().zip(&titles) {
+        fields.push(Weighted::new(number, 1.));
+        fields.extend(title.as_ref().map(|title| Weighted::new(title, 0.5)));
+    }
+    fields.extend(branch.as_ref().map(|branch| Weighted::new(branch, 0.6)));
+    for context in [&project, &environment].into_iter().flatten() {
+        fields.push(Weighted { context: true, ..Weighted::new(context, 0.25) });
+    }
+    if let Some(found) = match_fields(&field_tokens, &fields, typos) {
+        // A multi-word match the title shows none of must sit in one field to explain it.
+        let explained = !found.ranges.is_empty() || field_tokens.len() < 2 || has_hint(&field_tokens, thread, typos);
+        return explained.then_some(found);
+    }
+    let references = thread.pull_requests.iter().flat_map(|pr| pr.references.iter().map(String::as_str));
+    matches_reference(&query, std::iter::once(thread.id).chain(references)).then(|| Match {
+        quality: 0.6,
+        strong: true,
+        ranges: Vec::new(),
+    })
+}
+
+/// `matchHint` found a field: the first that holds the whole query, else, past the words the
+/// project or environment holds, the first that holds the rest.
+fn has_hint(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -> bool {
+    let holds = |text: &str, tokens: &[Vec<char>]| {
+        match_fields(tokens, &[Weighted::new(&Field::new(text), 1.)], typos).is_some()
+    };
+    let candidates: Vec<String> = thread
+        .pull_requests
+        .iter()
+        .map(|pr| match &pr.title {
+            Some(title) => format!("#{} {title}", pr.number),
+            None => format!("#{}", pr.number),
+        })
+        .chain(thread.branch.map(|b| searchable_branch(b).to_owned()))
+        .chain(thread.project.map(str::to_owned))
+        .chain(thread.environment.map(str::to_owned))
+        .collect();
+    let hint_for = |tokens: &[Vec<char>]| candidates.iter().any(|text| !text.is_empty() && holds(text, tokens));
+    if hint_for(tokens) {
+        return true;
+    }
+    let rest: Vec<Vec<char>> = tokens
+        .iter()
+        .filter(|token| {
+            ![thread.project, thread.environment]
+                .into_iter()
+                .flatten()
+                .any(|context| holds(context, std::slice::from_ref(token)))
+        })
+        .cloned()
+        .collect();
+    !rest.is_empty() && rest.len() != tokens.len() && hint_for(&rest)
 }
 
 /// `findSearchTokenRanges`: char ranges of `text` holding a long query token;
@@ -353,6 +548,44 @@ pub fn split_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<(String, bool)> 
 mod tests {
     use super::*;
 
+    const DAY: i64 = 86_400_000;
+
+    fn shell(fields: serde_json::Value) -> crate::model::ThreadShell {
+        let mut value = serde_json::json!({"id": "t", "projectId": "p", "title": "T", "status": "idle",
+            "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-02T00:00:00Z"});
+        if let (Some(base), serde_json::Value::Object(fields)) = (value.as_object_mut(), fields) {
+            base.extend(fields);
+        }
+        serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    #[expect(clippy::cast_precision_loss, reason = "test epoch ms")]
+    fn a_thread_is_used_when_written_in_or_opened_here_or_anywhere() {
+        let written = shell(serde_json::json!({"latestUserAuthoredMessageAt": "1970-01-03T00:00:00Z"}));
+        assert_eq!(ThreadUse::of(&written, None).recent(), 2 * DAY);
+        assert_eq!(ThreadUse::of(&shell(serde_json::json!({"latestUserAuthoredMessageAt": null})), None).recent(), 0);
+        let opened = serde_json::json!({"latestUserAuthoredMessageAt": "1970-01-03T00:00:00Z",
+            "opens": {"openedAt": (5 * DAY) as f64, "score": 3, "picks": [{"query": "sidebar", "at": (4 * DAY) as f64}]}});
+        let opened = shell(opened);
+        assert_eq!(ThreadUse::of(&opened, None).recent(), 5 * DAY, "an open later than the last message");
+        let here = ThreadUse::of(&opened, Some(9 * DAY));
+        assert_eq!(
+            (here.recent(), here.opens.as_ref().map(|o| o.score)),
+            (9 * DAY, Some(3.)),
+            "a local open keeps the stats"
+        );
+        assert_eq!(ThreadUse::of(&written, Some(9 * DAY)).opens.map(|o| o.score), Some(1.));
+        assert!(ThreadUse::of(&opened, None).boost(5 * DAY) > ThreadUse::of(&written, None).boost(5 * DAY));
+        let unreadable = shell(serde_json::json!({"opens": {"openedAt": "soon"}}));
+        assert!(unreadable.opens.is_none(), "an unreadable value is no opens, not a lost thread");
+        let used = ThreadUse::of(&opened, None);
+        assert_eq!(used.picked_at(&fold_query("Sidebar"), 5 * DAY), Some((4 * DAY) as f64));
+        assert_eq!(used.picked_at(&fold_query("sid"), 5 * DAY), Some((4 * DAY) as f64), "a prefix of three letters");
+        assert_eq!(used.picked_at(&fold_query("si"), 5 * DAY), None);
+        assert_eq!(used.picked_at(&fold_query("sidebar"), 30 * DAY), None, "picks last three weeks");
+    }
+
     fn quality(query: &str, title: &str) -> Option<f32> {
         let field = Field::new(title);
         let tokens = fold_query(query);
@@ -397,6 +630,35 @@ mod tests {
     fn every_token_must_match_except_filler() {
         assert!(quality("fix the sidebar", "Fix sidebar").is_some());
         assert_eq!(quality("fix composer", "Fix sidebar"), None);
+    }
+
+    #[test]
+    fn threads_match_by_pull_request_number_title_and_reference() {
+        let pull_requests = [crate::thread_pull_requests::SearchPullRequest {
+            number: 22889,
+            title: Some("Speed up the diff worker".into()),
+            references: ["pingdotgg/t3code#22889".into(), "https://github.com/pingdotgg/t3code/pull/22889".into()],
+        }];
+        let thread = ThreadSubject {
+            id: "c0ffee12-3456",
+            title: "Sidebar polish",
+            branch: Some("t3/fix-flaky-ci"),
+            project: Some("t3code"),
+            environment: Some("Studio Mac"),
+            pull_requests: &pull_requests,
+        };
+        let finds = |query: &str| match_thread(&fold_query(query), &thread, false).is_some();
+        for query in ["22889", "#22889", "pr 22889", "PR#22889", "pull request #22889", "diff worker", "t3/fix-flaky"] {
+            assert!(finds(query), "{query}");
+        }
+        assert!(finds("https://github.com/pingdotgg/t3code/pull/22889/files"), "a link that goes on");
+        assert!(finds("pingdotgg/t3code#22889") && finds("c0ffee12"), "a reference or the thread ID");
+        assert!(!finds("github.com/pingdotgg/t3code/pull/2288"), "a number is never cut short");
+        assert!(!finds("c0ffee"), "a short ID prefix matches nothing");
+        assert!(finds("t3code diff worker"), "the project's words, then a field holding the rest");
+        assert!(finds("studio sidebar") && finds("studio mac diff worker"), "the environment's name, as context");
+        assert!(!finds("speed flaky"), "words spread over unrelated fields are a coincidence");
+        assert_eq!(searchable_branch("t3/"), "t3/", "the prefix stays until more text follows");
     }
 
     #[test]

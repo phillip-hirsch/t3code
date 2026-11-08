@@ -3,6 +3,7 @@
 //! draft moves to the same project's checkout on another machine, by hand or by load balancing.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::notification::Notification;
@@ -11,8 +12,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
+    AnyElement, App, Context, ElementId, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use serde_json::json;
 
@@ -47,23 +48,102 @@ enum Sampling {
     Failed,
 }
 
-#[derive(Default)]
+/// The last sample of the machines (`useLoadBalancedEnvironment`): it speaks for one draft and
+/// one set of candidates only, so another draft, or a change in who can run it, samples again.
+#[derive(Debug, PartialEq)]
+struct Sample {
+    target: Target,
+    candidates: Vec<SharedString>,
+    state: Sampling,
+}
+
+/// Where sampling stands for `target`'s draft with these `candidates`.
+fn sampling_for(sample: Option<&Sample>, target: &Target, candidates: &[SharedString]) -> Sampling {
+    sample.filter(|s| s.target == *target && s.candidates == candidates).map_or(Sampling::Idle, |s| s.state)
+}
+
 pub(super) struct HostUi {
     open: bool,
-    /// By project group key, as the web keeps one draft per logical project.
-    selections: HashMap<String, Selection>,
-    sampling: Sampling,
+    /// By draft, as the web keeps them on each draft session: they follow it from machine to
+    /// machine, and a new draft starts without them.
+    selections: HashMap<Target, Selection>,
+    sample: Option<Sample>,
     _sample: Option<Task<()>>,
+    /// The open menu takes the keys, as a select's list does.
+    menu_focus: FocusHandle,
+    highlight: Option<usize>,
+    typeahead: Typeahead,
+}
+
+impl HostUi {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            open: false,
+            selections: HashMap::new(),
+            sample: None,
+            _sample: None,
+            menu_focus: cx.focus_handle(),
+            highlight: None,
+            typeahead: Typeahead::default(),
+        }
+    }
+}
+
+/// The draft moved from `from` to `to`, and its routing goes with it.
+fn carry(selections: &mut HashMap<Target, Selection>, from: &Target, to: &Target) {
+    if let Some(selection) = selections.remove(from) {
+        selections.insert(to.clone(), selection);
+    }
+}
+
+/// A row of the open menu.
+#[derive(Clone)]
+enum HostItem {
+    Auto(SharedString),
+    Environment(EnvironmentOption),
+}
+
+impl HostItem {
+    fn label(&self) -> &str {
+        match self {
+            Self::Auto(label) => label,
+            Self::Environment(option) => &option.label,
+        }
+    }
+}
+
+/// Typing a row's first letters highlights it (floating-ui's `useTypeahead`, which Base UI's
+/// Select uses): letters typed within `RESET` add up; a repeated letter cycles its rows.
+#[derive(Default)]
+struct Typeahead {
+    typed: String,
+    at: Option<Instant>,
+    /// The highlight when this run of letters began; the search starts after it.
+    from: Option<usize>,
+}
+
+impl Typeahead {
+    const RESET: Duration = Duration::from_millis(750);
+
+    fn type_char(&mut self, c: char, labels: &[&str], highlight: Option<usize>, now: Instant) -> Option<usize> {
+        if self.at.is_none_or(|at| now.duration_since(at) > Self::RESET) {
+            self.typed.clear();
+        }
+        if self.typed.is_empty() {
+            self.from = highlight;
+        }
+        self.at = Some(now);
+        self.typed.extend(c.to_lowercase());
+        let first = self.typed.chars().next()?;
+        let cycling = self.typed.chars().all(|ch| ch == first);
+        // A repeated letter moves on from the current row; more letters refine from the start of the run.
+        let (needle, from) = if cycling { (first.to_string(), highlight) } else { (self.typed.clone(), self.from) };
+        let start = from.map_or(0, |i| i + 1);
+        (0..labels.len()).map(|k| (start + k) % labels.len()).find(|&i| labels[i].to_lowercase().starts_with(&needle))
+    }
 }
 
 impl Workspace {
-    /// The open draft's or thread's project group key.
-    fn target_group_key(&self) -> Option<String> {
-        let project = self.target_project()?;
-        let groups = self.project_groups();
-        groups.iter().find(|g| g.contains(&project.id)).map(|g| g.key.clone())
-    }
-
     fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
         let info = self.session(environment_id).map(|s| &s.server_info);
         EnvironmentOption {
@@ -131,7 +211,19 @@ impl Workspace {
     }
 
     fn selection(&self) -> Option<&Selection> {
-        self.host.selections.get(&self.target_group_key()?)
+        self.host.selections.get(self.target.as_ref()?)
+    }
+
+    /// A draft opened afresh on `target` starts on load balancing again.
+    pub(super) fn forget_draft_routing(&mut self, target: &Target) {
+        self.host.selections.remove(target);
+    }
+
+    fn sampling(&self, options: &[EnvironmentOption]) -> Sampling {
+        let Some(target) = &self.target else { return Sampling::Idle };
+        let candidates: Vec<SharedString> =
+            self.load_balancing_candidates(options).into_iter().map(|(id, _, _)| id).collect();
+        sampling_for(self.host.sample.as_ref(), target, &candidates)
     }
 
     /// `automaticEnvironment`: the draft's machine is load balancing's choice.
@@ -154,7 +246,7 @@ impl Workspace {
             return None;
         }
         let picked = matches!(self.selection(), Some(Selection::Auto { picked: Some(_) }));
-        Some(match self.host.sampling {
+        Some(match self.sampling(options) {
             Sampling::Pending if !picked => "Checking machines…",
             Sampling::Failed if !picked => "Auto balance unavailable",
             _ => "Auto balance",
@@ -164,11 +256,11 @@ impl Workspace {
     /// Moves the draft to `option`'s checkout, opening its "No project" folder first if needed
     /// (`onEnvironmentChange`). A pick by hand turns load balancing off for this draft.
     fn change_environment(&mut self, option: EnvironmentOption, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.target_group_key() else { return };
+        let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
         self.host.open = false;
-        self.host.selections.insert(key, Selection::Manual);
+        self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
-        self.host.sampling = Sampling::Idle;
+        self.host.sample = None;
         let Some(project_id) = option.project_id else {
             self.open_scratch_then_retarget(option.environment_id, window, cx);
             return;
@@ -178,10 +270,10 @@ impl Workspace {
 
     /// The draft keeps its text and moves to another checkout of its project.
     pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
-        if !matches!(self.target, Some(Target::Draft { .. })) {
-            return;
-        }
-        self.target = Some(Target::Draft { env, project_id });
+        let Some(from @ Target::Draft { .. }) = self.target.clone() else { return };
+        let to = Target::Draft { env, project_id };
+        carry(&mut self.host.selections, &from, &to);
+        self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
         self.model_override = None;
@@ -249,12 +341,12 @@ impl Workspace {
             window.push_notification(Notification::warning(message).title("Keep attachments on this machine"), cx);
             return;
         }
-        let Some(key) = self.target_group_key() else { return };
-        self.host.selections.insert(key, Selection::Auto { picked: None });
+        let Some(target) = self.target.clone() else { return };
+        self.host.selections.insert(target, Selection::Auto { picked: None });
         self.draft_workspace.choice.branch = None;
         self.draft_workspace.choice.existing_worktree = None;
         self.host._sample = None;
-        self.host.sampling = Sampling::Idle;
+        self.host.sample = None;
         self.sync_load_balancing(cx);
         cx.notify();
     }
@@ -262,9 +354,8 @@ impl Workspace {
     /// Samples the candidate machines once an automatic draft has no machine yet, then moves
     /// the draft to the pick (`useLoadBalancedEnvironment` and its effect). Cheap when idle.
     pub(super) fn sync_load_balancing(&mut self, cx: &mut Context<Self>) {
+        let Some(origin @ Target::Draft { .. }) = self.target.clone() else { return };
         if !self.client_settings.values.bool("loadBalancingEnabled")
-            || !matches!(self.target, Some(Target::Draft { .. }))
-            || self.host.sampling != Sampling::Idle
             || matches!(self.selection(), Some(Selection::Auto { picked: Some(_) }))
         {
             return;
@@ -273,10 +364,12 @@ impl Workspace {
         if !self.automatic_environment(&options) {
             return;
         }
-        let Some(key) = self.target_group_key() else { return };
         let candidates = self.load_balancing_candidates(&options);
-        self.host.sampling = Sampling::Pending;
-        let origin = self.target.clone();
+        let ids: Vec<SharedString> = candidates.iter().map(|(id, _, _)| id.clone()).collect();
+        if sampling_for(self.host.sample.as_ref(), &origin, &ids) != Sampling::Idle {
+            return;
+        }
+        self.host.sample = Some(Sample { target: origin.clone(), candidates: ids, state: Sampling::Pending });
         self.host._sample = Some(cx.spawn(async move |this, cx| {
             let requests = candidates.iter().map(|(id, client, weight)| async move {
                 let resources = client.request("server.getHostResources", json!({})).await.ok();
@@ -293,12 +386,16 @@ impl Workspace {
                 let picked = load_balancing::choose(&sampled, super::sidebar::now_ms()).map(SharedString::from);
                 let target = picked.as_ref().and_then(|id| options.iter().find(|o| o.environment_id == *id));
                 match target.and_then(|o| Some((o.environment_id.clone(), o.project_id.clone()?))) {
-                    Some((env, project_id)) if this.target == origin => {
-                        this.host.sampling = Sampling::Idle;
-                        this.host.selections.insert(key, Selection::Auto { picked: Some(env.clone()) });
+                    Some((env, project_id)) if this.target.as_ref() == Some(&origin) => {
+                        this.host.sample = None;
+                        this.host.selections.insert(origin, Selection::Auto { picked: Some(env.clone()) });
                         this.retarget_draft(env, project_id, cx);
                     }
-                    _ => this.host.sampling = Sampling::Failed,
+                    _ => {
+                        if let Some(sample) = this.host.sample.as_mut().filter(|s| s.target == origin) {
+                            sample.state = Sampling::Failed;
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -344,9 +441,74 @@ impl Workspace {
         if !self.can_change_environment(&self.logical_project_environments()) {
             return false;
         }
-        self.host.open = true;
-        cx.notify();
+        self.set_host_open(true, cx);
         true
+    }
+
+    /// Opens the menu on its selected row, as a select opens on its value, or closes it.
+    fn set_host_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.host.open = open;
+        self.host.typeahead = Typeahead::default();
+        self.host.highlight = open.then(|| self.host_items().iter().position(|(_, checked)| *checked).unwrap_or(0));
+        cx.notify();
+    }
+
+    /// The menu's rows and which one is checked: Auto balance where it can be chosen, then the
+    /// machines.
+    fn host_items(&self) -> Vec<(HostItem, bool)> {
+        let options = self.logical_project_environments();
+        let auto = self.auto_environment_label(&options);
+        let active = self.active_environment();
+        let balancing = self.client_settings.values.bool("loadBalancingEnabled") && !self.draft_is_scratch();
+        let auto_row = balancing.then(|| (HostItem::Auto(auto.unwrap_or("Auto balance").into()), auto.is_some()));
+        let machines = options.into_iter().map(|option| {
+            let checked = auto.is_none() && Some(&option.environment_id) == active;
+            (HostItem::Environment(option), checked)
+        });
+        auto_row.into_iter().chain(machines).collect()
+    }
+
+    fn pick_host_item(&mut self, item: HostItem, window: &mut Window, cx: &mut Context<Self>) {
+        match item {
+            HostItem::Auto(_) => self.choose_auto_environment(window, cx),
+            HostItem::Environment(option) => self.change_environment(option, window, cx),
+        }
+    }
+
+    /// `SelectPopup`'s keys: the arrows, Home and End move the highlight, Enter or Space picks
+    /// it, and letters jump to a row. Escape belongs to the popover, which closes.
+    fn host_menu_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.modified() {
+            return;
+        }
+        let items = self.host_items();
+        let Some(last) = items.len().checked_sub(1) else { return };
+        let highlight = self.host.highlight;
+        let next = match keystroke.key.as_str() {
+            "down" => Some(highlight.map_or(0, |i| if i >= last { 0 } else { i + 1 })),
+            "up" => Some(highlight.map_or(last, |i| if i == 0 { last } else { i - 1 })),
+            "home" => Some(0),
+            "end" => Some(last),
+            "enter" | "space" => {
+                if let Some((item, _)) = highlight.and_then(|i| items.get(i)).cloned() {
+                    self.pick_host_item(item, window, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            _ => {
+                let Some(c) = keystroke.key_char.as_deref().and_then(|s| s.chars().next()).filter(|c| !c.is_control())
+                else {
+                    return;
+                };
+                let labels: Vec<&str> = items.iter().map(|(item, _)| item.label()).collect();
+                self.host.typeahead.type_char(c, &labels, highlight, Instant::now()).or(highlight)
+            }
+        };
+        self.host.highlight = next;
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// `composer.cycleHost`: the draft moves to the project's next machine.
@@ -415,73 +577,117 @@ impl Workspace {
             .anchor(gpui_kit::Anchor::BottomLeft)
             .open(self.host.open)
             .on_open_change(move |open, _, cx| {
-                view.update(cx, |this, cx| {
-                    this.host.open = *open;
-                    cx.notify();
-                });
+                view.update(cx, |this, cx| this.set_host_open(*open, cx));
             })
+            .track_focus(&self.host.menu_focus)
             .trigger(trigger)
             .p(px(4.))
             .rounded(px(8.));
         if self.host.open {
-            let balancing = self.client_settings.values.bool("loadBalancingEnabled") && !self.draft_is_scratch();
-            popover = popover.child(self.render_host_menu(&options, active, auto, balancing, t, cx));
+            popover = popover.child(self.render_host_menu(t, cx));
         }
         Some(div().id("host-picker-wrap").min_w_0().child(popover).into_any_element())
     }
 
-    fn render_host_menu(
-        &self,
-        options: &[EnvironmentOption],
-        active: Option<&SharedString>,
-        auto: Option<&'static str>,
-        balancing: bool,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let row = |id: ElementId, icon: Lucide, label: SharedString, checked: bool| {
-            h_flex()
-                .id(id)
-                .h(px(28.))
-                .px(px(8.))
-                .gap(px(6.))
-                .rounded(px(4.))
-                .text_xs()
-                .cursor_pointer()
-                .hover(|s| s.bg(t.accent))
-                .child(Icon::new(icon).with_size(px(12.)))
-                .child(div().flex_1().truncate().child(label))
-                .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(12.))))
-        };
+    fn render_host_menu(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let mut menu = v_flex()
+            .id("host-menu")
+            .track_focus(&self.host.menu_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.host_menu_key(event, window, cx)))
             .min_w(px(180.))
             .child(div().px(px(8.)).py(px(4.)).text_xs().text_color(t.muted_foreground).child("Run on"));
-        if balancing {
-            let label = SharedString::from(auto.unwrap_or("Auto balance"));
+        for (index, (item, checked)) in self.host_items().into_iter().enumerate() {
+            let (id, icon): (ElementId, Lucide) = match &item {
+                HostItem::Auto(_) => ("host-auto".into(), Lucide::Scale),
+                HostItem::Environment(option) => {
+                    (ElementId::Name(format!("host-{}", option.environment_id).into()), machine_icon(&option.machine))
+                }
+            };
+            let label = SharedString::from(item.label().to_owned());
+            // The pointer highlights the row it moves over, so one row paints at a time.
             menu = menu.child(
-                row("host-auto".into(), Lucide::Scale, label, auto.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| this.choose_auto_environment(window, cx))),
+                h_flex()
+                    .id(id)
+                    .h(px(28.))
+                    .px(px(8.))
+                    .gap(px(6.))
+                    .rounded(px(4.))
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(self.host.highlight == Some(index), |el| el.bg(t.accent))
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if this.host.highlight != Some(index) {
+                            this.host.highlight = Some(index);
+                            cx.notify();
+                        }
+                    }))
+                    .child(Icon::new(icon).with_size(px(12.)))
+                    .child(div().flex_1().truncate().child(label))
+                    .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(12.))))
+                    .on_click(cx.listener(move |this, _, window, cx| this.pick_host_item(item.clone(), window, cx))),
             );
-        }
-        for option in options {
-            let checked = auto.is_none() && Some(&option.environment_id) == active;
-            let id = ElementId::Name(format!("host-{}", option.environment_id).into());
-            let picked = option.clone();
-            menu =
-                menu.child(row(id, machine_icon(&option.machine), option.label.clone(), checked).on_click(
-                    cx.listener(move |this, _, window, cx| this.change_environment(picked.clone(), window, cx)),
-                ));
         }
         menu.into_any_element()
     }
 }
 
 /// `EnvironmentMachineIcon`.
-fn machine_icon(machine: &str) -> Lucide {
+pub(super) fn machine_icon(machine: &str) -> Lucide {
     match machine {
         "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
         "laptop" => Lucide::Laptop,
         "cloud" => Lucide::Cloud,
         _ => Lucide::Server,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(env: &str, project: &str) -> Target {
+        Target::Draft { env: env.to_owned().into(), project_id: project.to_owned() }
+    }
+
+    #[test]
+    fn a_failed_sample_holds_only_for_its_draft_and_candidates() {
+        let (a, b) = (draft("local", "web"), draft("local", "api"));
+        let candidates: Vec<SharedString> = vec!["local".into(), "remote".into()];
+        let failed = Sample { target: a.clone(), candidates: candidates.clone(), state: Sampling::Failed };
+        assert_eq!(sampling_for(Some(&failed), &a, &candidates), Sampling::Failed);
+        assert_eq!(sampling_for(Some(&failed), &b, &candidates), Sampling::Idle, "another draft samples");
+        assert_eq!(sampling_for(Some(&failed), &a, &candidates[..1]), Sampling::Idle, "the candidates changed");
+        assert_eq!(sampling_for(None, &a, &candidates), Sampling::Idle);
+    }
+
+    #[test]
+    fn routing_follows_its_draft_and_stays_off_other_drafts() {
+        let mut selections = HashMap::new();
+        let (here, there) = (draft("local", "web"), draft("remote", "web-copy"));
+        selections.insert(here.clone(), Selection::Manual);
+        carry(&mut selections, &here, &there);
+        assert_eq!(selections.get(&there), Some(&Selection::Manual));
+        assert_eq!(selections.get(&here), None, "a new draft back on the first machine starts fresh");
+        carry(&mut selections, &draft("local", "api"), &here);
+        assert_eq!(selections.get(&here), None, "a draft without a choice carries none");
+    }
+
+    #[test]
+    fn typing_jumps_to_the_row_its_letters_start() {
+        let labels = ["Auto balance", "Laptop", "Lab server", "Mac Studio"];
+        let now = Instant::now();
+        let mut typeahead = Typeahead::default();
+        assert_eq!(typeahead.type_char('L', &labels, Some(0), now), Some(1));
+        assert_eq!(typeahead.type_char('a', &labels, Some(1), now), Some(1), "\"la\" still names Laptop");
+        assert_eq!(typeahead.type_char('b', &labels, Some(1), now), Some(2), "\"lab\" refines to Lab server");
+        let later = now + Typeahead::RESET + Duration::from_millis(1);
+        assert_eq!(typeahead.type_char('m', &labels, Some(2), later), Some(3), "a pause starts over");
+        assert_eq!(typeahead.type_char('x', &labels, Some(3), later), None, "no row starts \"mx\"");
+
+        // A repeated letter cycles the rows it starts, wrapping past the end.
+        let mut typeahead = Typeahead::default();
+        assert_eq!(typeahead.type_char('l', &labels, Some(0), now), Some(1));
+        assert_eq!(typeahead.type_char('l', &labels, Some(1), now), Some(2));
+        assert_eq!(typeahead.type_char('l', &labels, Some(2), now), Some(1));
     }
 }

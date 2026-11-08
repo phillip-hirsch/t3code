@@ -1,6 +1,6 @@
 //! What the palette's thread and project actions run (`CommandPalette.tsx`): a thread without
 //! a project (`useScratchProject`), triage (`useStartTriage`), prompt links (`copyPromptLink.ts`),
-//! copying the thread (`threadReference.ts`), and restarting the agent session.
+//! copying the thread or its pull request's link (`threadReference.ts`), and restarting the agent session.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -9,6 +9,22 @@ use serde_json::json;
 
 use super::{Target, Workspace, new_id};
 use crate::model::RepositoryIdentity;
+use crate::thread_pull_requests::ReferenceCopy;
+
+/// `TRIAGE_CLI_COMMAND`: triage from a terminal on the machine.
+pub(super) const TRIAGE_CLI: &str = "npx t3 triage";
+
+/// `isTriagePrompt`: a draft is a triage draft while its message still links the playbook file
+/// (`TRIAGE_PROMPT_FILE_NAME`).
+pub(super) fn is_triage_prompt(prompt: &str) -> bool {
+    prompt.contains("[triage-playbook.md](")
+}
+
+/// What `thread.copyReference` copies.
+pub(super) enum CopyTarget {
+    PullRequest(String),
+    Thread { thread_id: String, title: String },
+}
 
 /// `promptLinkRepositoryOf`: a GitHub repository's `owner/name`.
 pub(super) fn github_repository(identity: &RepositoryIdentity) -> Option<(String, String)> {
@@ -54,7 +70,7 @@ fn toast_error(title: &str, message: impl Into<gpui_kit::SharedString>, window: 
 
 impl Workspace {
     /// `startScratchThread`: `projects.ensureScratch` on `environment`, then a draft there,
-    /// holding `prompt` if given.
+    /// holding `prompt` if given and the draft has no user content.
     pub(super) fn start_scratch_thread(
         &mut self,
         environment: SharedString,
@@ -76,8 +92,9 @@ impl Workspace {
                 let Some(project_id) = project_id else { return };
                 // A scratch project made just now may not be listed yet.
                 this.start_draft_in(environment, project_id, window, cx);
-                if let Some(prompt) = &prompt {
-                    this.set_composer_text(prompt.clone(), window, cx);
+                // Never over what the user wrote: the draft may already hold some.
+                if let Some(prompt) = prompt.filter(|_| !this.composer_has_user_content(cx)) {
+                    this.set_composer_text(prompt, window, cx);
                 }
             });
         })
@@ -87,8 +104,7 @@ impl Workspace {
     /// `useStartTriage`: the server prepares a triage session, then a No project draft opens
     /// with its playbook linked.
     pub(super) fn start_triage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        const CLI: &str = "npx t3 triage";
-        let fail = |message: &str| format!("{message} Run {CLI} in a terminal on that machine instead.");
+        let fail = |message: &str| format!("{message} Run {TRIAGE_CLI} in a terminal on that machine instead.");
         if self.server_info().scratch_workspace_root.is_none() {
             toast_error(
                 "Could not start triage",
@@ -149,14 +165,48 @@ impl Workspace {
         window.push_notification(Notification::success("").title("Prompt link copied"), cx);
     }
 
-    /// `thread.copyReference`: a link that opens the thread from anywhere (`threadChipCopyTarget`).
+    /// What `thread.copyReference` copies (`resolveThreadReferenceCopyTarget`): the pull request
+    /// open in the panel or the thread's current one, else the open thread; `None` while the
+    /// panel's pull request URL loads, or with no thread.
+    pub(super) fn reference_copy_target(&self) -> Option<CopyTarget> {
+        let open_panel = self.open_panel_pull_request_url();
+        if self.page == Some(super::pages::Page::PullRequests) {
+            return open_panel.flatten().map(CopyTarget::PullRequest);
+        }
+        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        let shell = self.shell.threads.iter().find(|t| &t.id == id);
+        let empty = Vec::new();
+        let copy = crate::thread_pull_requests::reference_copy(
+            open_panel.as_ref().map(Option::as_deref),
+            shell.map_or(&empty, |t| &t.pull_requests),
+            shell.and_then(|t| t.linked_pull_request.as_ref()),
+            shell.and_then(|t| t.branch_pull_request.as_ref()),
+        )?;
+        Some(match copy {
+            ReferenceCopy::PullRequest(url) => CopyTarget::PullRequest(url.to_owned()),
+            ReferenceCopy::Thread => {
+                CopyTarget::Thread { thread_id: id.clone(), title: shell.map(|t| t.title.clone()).unwrap_or_default() }
+            }
+        })
+    }
+
+    /// `thread.copyReference`: the pull request's link, or a link that opens the thread from
+    /// anywhere (`threadChipCopyTarget`).
     pub(super) fn copy_thread_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = &self.target else { return };
-        let Some(environment_id) = self.server_info().environment_id.as_deref() else { return };
-        let title = self.shell.threads.iter().find(|t| &t.id == thread_id).map(|t| t.title.clone()).unwrap_or_default();
-        let link = super::thread_menu::hosted_thread_link(environment_id, thread_id);
-        cx.write_to_clipboard(ClipboardItem::new_string(link));
-        window.push_notification(Notification::success(title).title("Thread copied"), cx);
+        let note = match self.reference_copy_target() {
+            Some(CopyTarget::PullRequest(url)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                Notification::success(url).title("PR link copied")
+            }
+            Some(CopyTarget::Thread { thread_id, title }) => {
+                let Some(environment_id) = self.server_info().environment_id.as_deref() else { return };
+                let link = super::thread_menu::hosted_thread_link(environment_id, &thread_id);
+                cx.write_to_clipboard(ClipboardItem::new_string(link));
+                Notification::success(title).title("Thread copied")
+            }
+            None => return,
+        };
+        window.push_notification(note, cx);
     }
 
     /// "Restart agent session": detaches the thread's provider sessions, so the next message
@@ -212,6 +262,13 @@ mod tests {
 
     fn identity(key: &str) -> RepositoryIdentity {
         serde_json::from_value(json!({"canonicalKey": key})).unwrap()
+    }
+
+    #[test]
+    fn a_draft_is_triage_while_it_links_the_playbook() {
+        assert!(is_triage_prompt("Read [triage-playbook.md](/tmp/t3/triage-playbook.md) first."));
+        assert!(!is_triage_prompt("Read triage-playbook.md first."), "a bare name is not the link");
+        assert!(!is_triage_prompt(""));
     }
 
     #[test]

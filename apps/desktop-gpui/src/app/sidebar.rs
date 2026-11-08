@@ -7,8 +7,10 @@ mod custom_snooze;
 mod drafts;
 mod filter;
 mod provider_update;
+mod scope_store;
 mod search_results;
 mod selection;
+mod update_plan;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -24,9 +26,9 @@ use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DismissEvent, DragMoveEvent, EmptyView,
     Entity, FocusHandle, Focusable as _, Font, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun, WeakEntity, Window, anchored,
-    deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
+    IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun,
+    WeakEntity, Window, anchored, deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
 };
 use serde_json::json;
 
@@ -78,6 +80,11 @@ pub(super) struct SidebarState {
     undo: Option<actions::UndoNotice>,
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
+    /// The thread route last seen, and the one whose row still waits to scroll into view
+    /// (`SidebarRouteReveal`).
+    route_seen: Option<String>,
+    reveal: Option<String>,
+    scroll: ScrollHandle,
     groups: RefCell<GroupsCache>,
     search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
@@ -190,7 +197,10 @@ impl SidebarState {
             renaming: None,
             clicked: None,
             undo: None,
-            scope: Vec::new(),
+            scope: scope_store::load(),
+            route_seen: None,
+            reveal: None,
+            scroll: ScrollHandle::new(),
             groups: RefCell::default(),
             search_ranking: RefCell::default(),
             collapsed_folders: HashSet::new(),
@@ -232,6 +242,16 @@ struct GroupsKey {
 struct GroupsCache {
     key: Option<GroupsKey>,
     groups: Rc<[ProjectGroup]>,
+}
+
+/// `resolveSidebarRouteReveal`'s `widensScope`: the filter hides a listed thread.
+fn reveal_widens_scope(thread: &ThreadShell, groups: &[ProjectGroup], scope: &[String]) -> bool {
+    let scoped = scoped_groups(groups, scope);
+    !scoped.is_empty()
+        && thread.is_listed()
+        && thread.archived_at.is_none()
+        && thread.deleted_at.is_none()
+        && !scoped.iter().any(|g| g.project_ids.contains(&thread.project_id))
 }
 
 /// The filter's groups that still exist and are open, in sidebar order; empty is all projects.
@@ -495,6 +515,11 @@ fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
 }
 
+/// A `<button>`: Tab reaches it, Enter or Space clicks it, and keyboard focus shows the ring.
+pub(super) fn keyboard_button(el: gpui_kit::Stateful<gpui_kit::Div>, ring: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    el.focusable().tab_stop(true).focus_visible(move |s| s.border_2().border_color(ring))
+}
+
 fn tooltip(label: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
     move |window, cx| Tooltip::new(label).build(window, cx)
 }
@@ -685,16 +710,6 @@ impl Workspace {
             *cache = GroupsCache { key: Some(key), groups: Rc::from(groups) };
         }
         cache.groups.clone()
-    }
-
-    /// The projects the palette offers: one per open group, pinned first, then the group of
-    /// `preferred` (`buildSidebarProjectPickerEntries`).
-    pub(super) fn pickable_projects(&self, preferred: Option<&str>) -> Vec<&ProjectShell> {
-        let groups = self.project_groups();
-        project_groups::picker(&groups, preferred)
-            .into_iter()
-            .filter_map(|g| self.shell.projects.iter().find(|p| p.id == g.representative().id))
-            .collect()
     }
 
     /// The project ids the filter keeps, or `None` for all projects.
@@ -1239,10 +1254,40 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// `/projects/$projectKey`: Settings › Projects with the group holding `project_id` picked,
+    /// on every environment (`getSidebarProjectSettingsKey`, resolved as Settings groups them).
+    pub(in crate::app) fn open_project_settings(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let project = self.settings_project_groups().into_iter().find(|g| g.contains(project_id)).map(|g| g.key);
+        self.settings_ui.scope = crate::settings::scope::ScopeSearch { project, machine: None };
+        self.open_settings("projects", cx);
+    }
+
+    /// A new thread route that the filter hides widens it to every project, like the web's
+    /// route reveal, so history, links and the palette never open a thread with no row.
+    fn reveal_route(&mut self, groups: &[ProjectGroup], searching: bool) {
+        let Some(route) = self.route_thread().map(str::to_owned) else { return };
+        if self.sidebar.route_seen.as_ref() != Some(&route) {
+            self.sidebar.route_seen = Some(route.clone());
+            self.sidebar.reveal = Some(route);
+        }
+        // Search results replace the thread list; the reveal waits for it to return.
+        let Some(pending) = self.sidebar.reveal.as_deref().filter(|_| !searching) else { return };
+        let Some(thread) = self.shell.threads.iter().find(|t| t.id == pending) else { return };
+        if reveal_widens_scope(thread, groups, &self.sidebar.scope) {
+            self.sidebar.selection.clear();
+            self.sidebar.scope.clear();
+            scope_store::save(&[]);
+            self.sidebar.settled_visible = SETTLED_INITIAL;
+        }
+    }
+
     /// Sets the project filter; the settled tail starts over at its first page.
     pub(super) fn set_scope(&mut self, scope: Vec<String>, cx: &mut Context<Self>) {
         // A selection made under one scope can hold threads the next one hides.
         self.sidebar.selection.clear();
+        if self.sidebar.scope != scope {
+            scope_store::save(&scope);
+        }
         self.sidebar.scope = scope;
         self.sidebar.settled_visible = SETTLED_INITIAL;
         self.notify_sidebar(cx);
@@ -1307,9 +1352,17 @@ impl Workspace {
         let boring = self.boring_sidebar();
         let multiline = self.client_settings.values.bool("boringSidebarMultilineRows");
         let groups = self.project_groups();
+        self.reveal_route(&groups, !query.is_empty());
         let draft_rows = self.draft_rows();
         let items =
             self.sidebar.items(&self.shell, &groups, self.target.as_ref(), draft_rows, working_shelf, boring, now);
+        let revealed = (self.sidebar.reveal.as_deref())
+            .filter(|_| query.is_empty())
+            .and_then(|id| items.iter().position(|item| item.thread_id().as_deref() == Some(id)));
+        if let Some(index) = revealed {
+            self.sidebar.reveal = None;
+            self.sidebar.scroll.scroll_to_item(index);
+        }
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
         let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
         let route = self.route_thread();
@@ -1330,11 +1383,12 @@ impl Workspace {
         });
 
         // Under a fixed header the web drops the list group's top padding.
-        let mut list = v_flex().min_h_full().px(px(8.)).pb(px(8.)).gap(px(1.));
+        // The rows are the scroll container's own children, so a route reveal can scroll to one.
+        let mut list: Vec<AnyElement> = Vec::new();
         if !query.is_empty() {
-            list = list.child(self.render_search_results(&query, now, &tokens, cx));
+            list.push(self.render_search_results(&query, now, &tokens, cx));
         } else if !has_rows && self.sidebar.settled_count_is_zero(&items) {
-            list = list.child(self.render_empty_state(&tokens, cx));
+            list.push(self.render_empty_state(&tokens, cx));
         } else {
             for (index, item) in items.into_iter().enumerate() {
                 // Only a focused list draws the cursor ring, so only it needs the row keys.
@@ -1377,7 +1431,7 @@ impl Workspace {
                     }
                     Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
                 };
-                list = list.child(if ring { focus_ring(element, &tokens) } else { element });
+                list.push(if ring { focus_ring(element, &tokens) } else { element });
             }
         }
         self.sidebar.inbox_order = inbox_order;
@@ -1458,16 +1512,20 @@ impl Workspace {
             .child(self.render_chrome_row(&tokens, window, cx))
             .child(self.render_search_row(!query.is_empty(), window, &tokens, cx))
             .child(
-                div()
+                v_flex()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
+                    .px(px(8.))
+                    .pb(px(8.))
+                    .gap(px(1.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.sidebar.scroll)
                     .track_focus(&self.sidebar.list_focus)
                     .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                         this.list_key(event, window, cx);
                     }))
-                    .child(list),
+                    .children(list),
             )
             .children(
                 self.render_provider_pill(&tokens, cx)
@@ -1489,6 +1547,7 @@ impl Workspace {
         } else {
             (sb.foreground, sb.muted_foreground, sb.muted_foreground, sb.row_hover)
         };
+        let ring = tokens.ring;
         let arrow = |id: &'static str, name: IconName, label: &'static str, enabled: bool| {
             div()
                 .id(id)
@@ -1498,6 +1557,7 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .when(!enabled, |el| el.opacity(0.64))
+                .map(|el| if enabled { keyboard_button(el, ring) } else { el })
                 .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(arrow_hover)))
                 // Inside the drag region a button must occlude, or Windows takes the press as a drag.
                 .occlude()
@@ -1583,8 +1643,7 @@ impl Workspace {
                     )
                     .when(searching, |el| {
                         el.child(
-                            div()
-                                .id("sidebar-search-clear")
+                            keyboard_button(div().id("sidebar-search-clear"), tokens.ring)
                                 .size(px(20.))
                                 .flex()
                                 .flex_none()
@@ -1612,8 +1671,7 @@ impl Workspace {
         // Settings covers these buttons; a tooltip left from the click would sit over it.
         let covered = self.settings.is_some();
         let button = |id: &'static str, name: IconName, label: &'static str| {
-            div()
-                .id(id)
+            keyboard_button(div().id(id), tokens.ring)
                 .size(px(32.))
                 .flex()
                 .items_center()
@@ -1645,8 +1703,7 @@ impl Workspace {
             // On a utility page the three shortcuts become one "Back" (`SidebarChrome.tsx`).
             .map(|el| match self.page {
                 Some(_) => el.child(
-                    text_sm(h_flex())
-                        .id("sidebar-back-to-chat")
+                    keyboard_button(text_sm(h_flex()).id("sidebar-back-to-chat"), tokens.ring)
                         .flex_1()
                         .h(px(32.))
                         .px(px(8.))
@@ -1687,19 +1744,13 @@ impl Workspace {
     }
 
     /// The footer's update control (`SidebarUpdatePill.tsx`): "update everything" while a
-    /// provider can be updated in one click (`isProviderUpdateCandidate`), else the desktop
+    /// provider on a connected machine can be updated in one click (`useProviderUpdates`), else the desktop
     /// app's "Check for updates", which this build always shows as unavailable since it has
     /// no update feed (`getDesktopUpdateIdleTooltip`).
     fn render_update_button(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let candidates: Vec<(String, String)> = self
-            .server_info()
-            .providers
-            .iter()
-            .filter(|p| inbox::is_provider_update_candidate(p))
-            .map(|p| (p.driver.clone(), p.instance_id.clone()))
-            .collect();
+        let plan = self.provider_update_plan();
         let sb = tokens.sidebar;
-        if candidates.is_empty() {
+        if plan.is_empty() {
             let detail: SharedString = self.about_update_description().into();
             return div()
                 .id("sidebar-check-updates")
@@ -1725,14 +1776,9 @@ impl Workspace {
                 .child(icon(IconName::RefreshCw, 16., sb.icon))
                 .into_any_element();
         }
-        let label: SharedString = match candidates.len() {
-            1 => "Update 1 provider".into(),
-            n => format!("Update {n} providers").into(),
-        };
         let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
-        let tip = label.clone();
-        div()
-            .id("sidebar-update")
+        let tip = Self::provider_update_summary(&plan);
+        keyboard_button(div().id("sidebar-update"), tokens.ring)
             .ml_auto()
             .size(px(32.))
             .flex_none()
@@ -1745,45 +1791,13 @@ impl Workspace {
             .hover(|s| s.bg(sb.row_hover))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.update_providers(label.clone(), candidates.clone(), window, cx);
+                this.confirm_provider_updates(plan.clone(), window, cx);
             }))
             .child(icon(IconName::CircleArrowUp, 16., sb.foreground))
             .into_any_element()
     }
 
     /// Confirms (`UpdateEverythingDialog`), then `server.updateProvider` for each candidate.
-    fn update_providers(
-        &mut self,
-        summary: SharedString,
-        candidates: Vec<(String, String)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.client() else { return };
-        let answer = window.prompt(
-            gpui_kit::PromptLevel::Info,
-            &format!("{summary}?"),
-            Some("Each provider updates to its latest version."),
-            &["Update", "Cancel"],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            for (driver, instance_id) in candidates {
-                let input = json!({"provider": driver, "instanceId": instance_id});
-                if let Err(error) = client.request("server.updateProvider", input).await {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(format!("Provider update failed: {error}").into());
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
     fn render_shelf_header(
         &self,
         shelf: Shelf,
@@ -1796,8 +1810,7 @@ impl Workspace {
         let color = tokens.sidebar.muted_foreground;
         let chevron = icon(IconName::ChevronDown, 12., color)
             .when(!expanded, |i| i.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2)));
-        text_xs(h_flex())
-            .id(shelf.label())
+        keyboard_button(text_xs(h_flex()).id(shelf.label()), tokens.ring)
             .when(first, gpui_kit::Styled::mt_auto)
             .mx(px(2.))
             .h(px(32.))
@@ -1818,8 +1831,7 @@ impl Workspace {
 
     fn render_show_more(&self, count: usize, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let sb = tokens.sidebar;
-        text_sm(h_flex())
-            .id("sidebar-settled-more")
+        keyboard_button(text_sm(h_flex()).id("sidebar-settled-more"), tokens.ring)
             .h(px(36.))
             .flex_none()
             .px(px(10.))
@@ -2206,6 +2218,7 @@ impl Workspace {
             let (new_in, pin) = (workspace.clone(), workspace.clone());
             let settings = workspace.clone();
             let (project_id, root, member_ids) = (project_id.clone(), root.clone(), member_ids.clone());
+            let settings_project = project_id.clone();
             menu.item(PopupMenuItem::new("New thread").on_click(move |_, window, cx| {
                 let _ = new_in.update(cx, |this, cx| this.start_draft(project_id.clone(), window, cx));
             }))
@@ -2221,7 +2234,7 @@ impl Workspace {
             )
             .item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
                 move |_, _, cx| {
-                    let _ = settings.update(cx, |this, cx| this.open_settings("projects", cx));
+                    let _ = settings.update(cx, |this, cx| this.open_project_settings(&settings_project, cx));
                 },
             ))
         }
@@ -2698,6 +2711,38 @@ mod tests {
         // In fullscreen the traffic lights hide, and so do Windows' and Linux's (on the right).
         assert_eq!(sf(52.), px(MIN_WIDTH));
         assert_eq!(min_width(brand_probe_width(px(52.), px(10.18), px(36.), size)), px(MIN_WIDTH));
+    }
+
+    #[test]
+    fn a_route_the_filter_hides_widens_it_unless_the_thread_has_no_row() {
+        let group = |key: &str, archived: bool| ProjectGroup {
+            key: key.into(),
+            display_name: key.into(),
+            members: Vec::new(),
+            project_ids: vec![key.into()],
+            project_refs: vec![("env".into(), key.into())],
+            pinned: false,
+            archived,
+        };
+        let thread = |project: &str, extra: serde_json::Value| -> ThreadShell {
+            let mut value = json!({
+                "id": "t", "projectId": project, "title": "t", "status": "idle",
+                "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z",
+                "lineage": {"rootThreadId": "t"},
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let groups = [group("a", false), group("b", false), group("gone", true)];
+        let scope = ["a".to_owned()];
+        assert!(reveal_widens_scope(&thread("b", json!({})), &groups, &scope));
+        assert!(!reveal_widens_scope(&thread("a", json!({})), &groups, &scope), "already shown");
+        assert!(!reveal_widens_scope(&thread("b", json!({})), &groups, &[]), "no filter");
+        assert!(!reveal_widens_scope(&thread("b", json!({})), &groups, &["gone".into()]), "an archived scope is all");
+        let archived = thread("b", json!({"archivedAt": "2026-11-02T00:00:00.000Z"}));
+        assert!(!reveal_widens_scope(&archived, &groups, &scope));
+        let sub = thread("b", json!({"lineage": {"rootThreadId": "p", "relationshipToParent": "subagent"}}));
+        assert!(!reveal_widens_scope(&sub, &groups, &scope), "listed under its parent");
     }
 
     #[test]

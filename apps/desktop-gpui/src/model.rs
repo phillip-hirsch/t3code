@@ -887,6 +887,30 @@ pub struct ThreadShell {
     pub pull_requests: Vec<crate::thread_pull_requests::PullRequestLink>,
     #[serde(default)]
     pub branch_pull_request: Option<crate::thread_pull_requests::LinkedPullRequest>,
+    /// Open stats only rank search results, so an unreadable value reads as none (`LenientThreadOpens`).
+    #[serde(default, deserialize_with = "lenient")]
+    pub opens: Option<ThreadOpens>,
+}
+
+/// `OrchestrationV2ThreadOpens`: when the thread was last opened (epoch ms), a decaying open
+/// count, and the latest palette queries that picked it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpens {
+    pub opened_at: f64,
+    pub score: f64,
+    #[serde(default)]
+    pub picks: Vec<ThreadPick>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ThreadPick {
+    pub query: String,
+    pub at: f64,
+}
+
+fn lenient<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<Option<T>, D::Error> {
+    Ok(T::deserialize(Value::deserialize(deserializer)?).ok())
 }
 
 impl ThreadShell {

@@ -6,14 +6,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 
 use super::*;
+use crate::app::palette::LinkedThread;
 use crate::pull_request_detail::Stack;
-
-/// A thread that links this pull request (`pullRequests.linkedThreads`).
-#[derive(Clone, Debug)]
-pub(super) struct LinkedThread {
-    id: String,
-    title: String,
-}
 
 /// The pull request's key as threads record it: the link's host and lowercase repository.
 fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
@@ -78,11 +72,11 @@ impl Workspace {
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .filter(|t| t["archivedAt"].is_null())
                             .filter_map(|t| {
                                 Some(LinkedThread {
                                     id: t["id"].as_str()?.to_owned(),
                                     title: t["title"].as_str().unwrap_or_default().to_owned(),
+                                    archived: !t["archivedAt"].is_null(),
                                 })
                             })
                             .collect(),
@@ -262,32 +256,29 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Linked threads: a count that lists them; picking one opens it.
+    /// Linked threads: a count that opens the palette on the pull request's link, listing them,
+    /// archived ones too (`PullRequestThreadLinks` `display="count"`).
     pub(super) fn render_pr_thread_count(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let linked = self.pull_requests.panel.as_ref()?.linked.clone()?;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let linked = panel.linked.clone()?;
         if linked.is_empty() {
             return None;
         }
-        let view = cx.entity();
-        let tip = format!("Linked from {} {}", linked.len(), if linked.len() == 1 { "thread" } else { "threads" });
+        let url = panel.detail.as_ref()?.url.clone();
+        let environment = self.project_environment(&panel.reference.project_id)?;
+        let tip = format!(
+            "Linked from {} {}. Search in the command palette.",
+            linked.len(),
+            if linked.len() == 1 { "thread" } else { "threads" }
+        );
         Some(
             ghost_button("pr-linked-threads", t)
                 .tooltip(tip)
                 .child(Icon::new(Lucide::MessageSquare).with_size(px(14.)))
                 .child(linked.len().to_string())
-                .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu: PopupMenu, window, _| {
-                    menu = menu.label("Linked threads");
-                    for thread in &linked {
-                        let id = thread.id.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new(thread.title.clone()).icon(Lucide::MessageSquare).on_click(
-                                window.listener_for(&view, move |this, _, window, cx| {
-                                    this.select_thread(id.clone(), window, cx);
-                                }),
-                            ));
-                    }
-                    menu
-                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_palette_search(url.clone(), environment.clone(), linked.clone(), window, cx);
+                }))
                 .into_any_element(),
         )
     }

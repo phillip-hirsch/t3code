@@ -83,6 +83,18 @@ pub(super) fn check_session<T: 'static>(
     })
 }
 
+/// `useFilesystemReadAccess`: whether this client's session may read host files on `endpoint`.
+/// `apply` gets `None` while the check fails, and it is retried.
+pub(in crate::app) fn check_filesystem_read<T: 'static>(
+    endpoint: Endpoint,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, Option<bool>, &mut Context<T>) + 'static,
+) -> Task<()> {
+    check_session(endpoint, cx, move |this, load, cx| {
+        apply(this, load.session().map(|session| session.grants(logic::FILESYSTEM_READ)), cx);
+    })
+}
+
 impl Workspace {
     pub(super) fn render_settings_connections(
         &mut self,

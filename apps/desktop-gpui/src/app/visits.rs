@@ -3,6 +3,7 @@
 //! one visit with `opened`, then each shell update advances the read
 //! watermark, throttled while a run streams.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui_kit::{Context, Task};
@@ -18,6 +19,9 @@ const THROTTLE_MS: i64 = 10_000;
 pub(super) struct VisitTracker {
     thread_id: Option<String>,
     state: VisitState,
+    /// When this client last opened each thread, sent or not, so recent threads follow
+    /// switches the server merges or never hears (`localThreadOpens`).
+    local_opens: HashMap<String, i64>,
     _timer: Option<Task<()>>,
 }
 
@@ -97,12 +101,20 @@ fn decide_now(state: &mut VisitState, shell: &ThreadShell, woke_at: Option<&str>
 impl Workspace {
     /// Starts tracking `thread_id` as the thread on screen.
     pub(super) fn open_visit(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let mut local_opens = std::mem::take(&mut self.visit.local_opens);
+        local_opens.insert(thread_id.to_owned(), super::sidebar::now_ms());
         self.visit = VisitTracker {
             thread_id: Some(thread_id.to_owned()),
             state: VisitState { open_pending: true, ..VisitState::default() },
+            local_opens,
             _timer: None,
         };
         self.track_visit(cx);
+    }
+
+    /// When this client last opened `thread_id`.
+    pub(super) fn local_opened_at(&self, thread_id: &str) -> Option<i64> {
+        self.visit.local_opens.get(thread_id).copied()
     }
 
     /// Runs after every shell update, and when a throttled visit comes due.

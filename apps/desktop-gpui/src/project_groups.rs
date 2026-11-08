@@ -134,7 +134,7 @@ pub fn normalize_path(path: &str) -> String {
 }
 
 /// `isWindowsDrivePath`: `C:` followed by a separator or nothing.
-fn is_drive_path(path: &str) -> bool {
+pub fn is_drive_path(path: &str) -> bool {
     match path.as_bytes() {
         [drive, b':', rest @ ..] => drive.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/' | b'\\')),
         _ => false,
@@ -143,7 +143,7 @@ fn is_drive_path(path: &str) -> bool {
 
 /// `trimTrailingPathSeparators`: roots (`/`, `\`, `C:\`) stay, a bare drive gains its
 /// separator, and a POSIX path only sheds forward slashes.
-fn trim_trailing_separators(path: &str) -> String {
+pub fn trim_trailing_separators(path: &str) -> String {
     let is_root = |p: &str| matches!(p, "/" | "\\") || (p.len() == 3 && is_drive_path(p));
     if path.is_empty() || is_root(path) {
         return path.to_owned();
@@ -255,6 +255,9 @@ pub struct ProjectGroup {
     /// Every project record in the group (`memberProjectRefs`), including entries that share
     /// a folder with a member.
     pub project_ids: Vec<String>,
+    /// The same records by environment and id (`scopedProjectKey`): ids can repeat across
+    /// environments, as on a copied one.
+    pub project_refs: Vec<(SharedString, String)>,
     /// Clients write every member together; any pinned member pins the group.
     pub pinned: bool,
     pub archived: bool,
@@ -269,12 +272,26 @@ impl ProjectGroup {
         self.project_ids.iter().any(|id| id == project_id)
     }
 
+    /// Whether `project`, on its environment, is one of the group's records.
+    pub fn contains_project(&self, project: &ProjectShell) -> bool {
+        self.project_refs.iter().any(|(env, id)| *env == project.environment_id && *id == project.id)
+    }
+
     /// `buildSidebarProjectPickerEntries`' `targetProject`: the checkout on the current
     /// project's environment, else the representative.
     pub fn target(&self, environment_id: Option<&str>) -> &ProjectShell {
         environment_id
             .and_then(|env| self.members.iter().find(|m| m.project.environment_id == env))
             .map_or_else(|| self.representative(), |m| &m.project)
+    }
+
+    /// `targetProject` for the contextual project: that checkout when it is a member, else
+    /// [`Self::target`] on its environment.
+    pub fn target_for(&self, preferred: Option<&ProjectShell>) -> &ProjectShell {
+        let exact = preferred.and_then(|p| {
+            self.members.iter().find(|m| m.project.id == p.id && m.project.environment_id == p.environment_id)
+        });
+        exact.map_or_else(|| self.target(preferred.map(|p| p.environment_id.as_ref())), |m| &m.project)
     }
 
     /// `ProjectEnvironmentBadge`: for a group with checkouts off `primary`, its tooltip ("On …",
@@ -362,11 +379,13 @@ pub fn build_groups(
         let mode = settings.mode_for(&physical_key);
         let key = logical_key(identity_source, mode, &physical_key, group_scratch && is_scratch);
         let project_ids = entries.iter().map(|p| p.id.clone());
+        let project_refs = entries.iter().map(|p| (p.environment_id.clone(), p.id.clone()));
         let member = Member { project: winner.clone(), physical_key, is_scratch };
         match index_by_key.get(&key) {
             Some(&index) => {
                 groups[index].members.push(member);
                 groups[index].project_ids.extend(project_ids);
+                groups[index].project_refs.extend(project_refs);
             }
             None => {
                 index_by_key.insert(key.clone(), groups.len());
@@ -375,6 +394,7 @@ pub fn build_groups(
                     display_name: String::new(),
                     members: vec![member],
                     project_ids: project_ids.collect(),
+                    project_refs: project_refs.collect(),
                     pinned: false,
                     archived: false,
                 });
@@ -453,9 +473,9 @@ pub fn pickable(groups: &[ProjectGroup]) -> Vec<&ProjectGroup> {
 
 /// `buildSidebarProjectPickerEntries`: the pickable groups, with the group holding `preferred`
 /// (the current project) leading the unpinned ones; pinned groups stay first.
-pub fn picker<'g>(groups: &'g [ProjectGroup], preferred: Option<&str>) -> Vec<&'g ProjectGroup> {
+pub fn picker<'g>(groups: &'g [ProjectGroup], preferred: Option<&ProjectShell>) -> Vec<&'g ProjectGroup> {
     let mut entries = pickable(groups);
-    let Some(at) = preferred.and_then(|id| entries.iter().position(|g| g.contains(id))) else { return entries };
+    let Some(at) = preferred.and_then(|p| entries.iter().position(|g| g.contains_project(p))) else { return entries };
     if !entries[at].pinned {
         let group = entries.remove(at);
         let pinned = entries.iter().filter(|g| g.pinned).count();
@@ -525,6 +545,14 @@ mod tests {
         assert_eq!(groups[0].target(Some("remote")).id, "b");
         assert_eq!(groups[0].target(Some("elsewhere")).id, "a");
         assert_eq!(groups[0].target(None).id, "a");
+        // The palette keeps the open checkout, else one on its machine.
+        let (a, b) = (&groups[0].members[0].project, &groups[0].members[1].project);
+        assert_eq!(groups[0].target_for(Some(b)).id, "b");
+        assert_eq!(groups[0].target_for(Some(a)).id, "a");
+        let mut elsewhere = project("c", "/other", repo("x", "/other"));
+        elsewhere.environment_id = "remote".into();
+        assert_eq!(groups[0].target_for(Some(&elsewhere)).id, "b");
+        assert_eq!(groups[0].target_for(None).id, "a");
     }
 
     #[test]
@@ -732,9 +760,15 @@ mod tests {
         let picked: Vec<&str> = pickable(&groups).iter().map(|g| g.key.as_str()).collect();
         assert_eq!(picked, ["env:/p", "env:/a", "env:/b"]);
         // The picker moves the current project to the front of the unpinned ones.
-        let keys = |preferred| picker(&groups, preferred).iter().map(|g| g.key.clone()).collect::<Vec<_>>();
-        assert_eq!(keys(Some("b")), ["env:/p", "env:/b", "env:/a"]);
-        assert_eq!(keys(Some("p")), ["env:/p", "env:/a", "env:/b"]);
+        let keys = |preferred: Option<&ProjectShell>| {
+            picker(&groups, preferred).iter().map(|g| g.key.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(Some(&projects[3])), ["env:/p", "env:/b", "env:/a"]);
+        assert_eq!(keys(Some(&projects[2])), ["env:/p", "env:/a", "env:/b"]);
         assert_eq!(keys(None), ["env:/p", "env:/a", "env:/b"]);
+        // `b` on another machine is another project, not the one in this group.
+        let mut elsewhere = projects[3].clone();
+        elsewhere.environment_id = "copy".into();
+        assert_eq!(keys(Some(&elsewhere)), ["env:/p", "env:/a", "env:/b"]);
     }
 }

@@ -81,6 +81,44 @@ pub(in crate::app) fn failure_message(title: Option<&str>, error: &str) -> Strin
     }
 }
 
+/// Where the window goes once the open thread is parked: the next inbox thread, else a
+/// draft in its project.
+pub(super) struct Leave {
+    thread_id: String,
+    next: Option<String>,
+    project_id: Option<String>,
+}
+
+/// `getFallbackThreadIdAfterDelete`: the newest thread still in the inbox of the deleted
+/// thread's project, by the sidebar's thread sort order.
+fn fallback_after_delete<'a>(
+    threads: &'a [crate::model::ThreadShell],
+    deleted: &str,
+    sort_order: &str,
+    now: i64,
+) -> Option<&'a str> {
+    let project = &threads.iter().find(|t| t.id == deleted)?.project_id;
+    let requests = inbox::child_requests(threads);
+    let parse = crate::timestamp::parse_ms;
+    let sorted_at = |t: &crate::model::ThreadShell| match sort_order {
+        "created_at" => parse(&t.created_at).or_else(|| parse(&t.updated_at)),
+        _ => t.latest_user_message_at.as_deref().and_then(parse).or_else(|| parse(&t.updated_at)),
+    };
+    threads
+        .iter()
+        .filter(|t| {
+            &t.project_id == project
+                && t.id != deleted
+                && t.is_listed()
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+                && t.settled_override.as_deref() != Some("settled")
+                && !Facts::new(t, &requests).is_snoozed(now)
+        })
+        .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
+        .map(|t| t.id.as_str())
+}
+
 /// What undo restores for one thread.
 pub(super) struct UndoEntry {
     thread_id: String,
@@ -159,6 +197,33 @@ impl Workspace {
         })
         .detach();
         true
+    }
+
+    /// [`Self::thread_command`], running `accepted` only once the server takes the command:
+    /// the web awaits the mutation before it registers an undo or moves on.
+    pub(in crate::app) fn thread_command_then(
+        &mut self,
+        kind: &str,
+        thread_id: &str,
+        fields: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        accepted: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let title = failure_title(kind, &fields);
+        let command = Self::thread_command_value(kind, thread_id, fields);
+        let Some(client) = self.thread_client(thread_id) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("orchestration.dispatchCommand", command).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(_) => accepted(this, window, cx),
+                Err(error) => {
+                    this.error = Some(failure_message(title, &error.to_string()).into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// `{type, commandId, threadId, ..fields}`.
@@ -320,35 +385,32 @@ impl Workspace {
         .detach();
     }
 
-    /// After settling, snoozing or archiving the open thread, the web moves on
-    /// to the next inbox thread in sidebar order (wrapping), else a new draft
-    /// in its project.
-    fn leave_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_threads(thread_id, &[], window, cx);
-    }
-
-    /// `leave_thread`, also passing over `parked`: threads parked with it (`coParkingKeys`).
-    pub(super) fn leave_threads(
-        &mut self,
-        thread_id: &str,
-        parked: &[String],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// `planForwardNavigation`: after settling or snoozing the open thread, the web moves on
+    /// to the next inbox thread in sidebar order (wrapping), passing over `parked` (threads
+    /// parked with it, `coParkingKeys`), else a new draft in its project. It is planned
+    /// before the command, as the thread leaves the inbox order once the server takes it.
+    pub(super) fn plan_leave(&self, thread_id: &str, parked: &[String]) -> Option<Leave> {
         if self.open_thread_id() != Some(thread_id) {
-            return;
+            return None;
         }
         let order = &self.sidebar.inbox_order;
         let next = order.iter().position(|id| id == thread_id).and_then(|at| {
             order[at + 1..].iter().chain(&order[..at]).find(|id| *id != thread_id && !parked.contains(id)).cloned()
         });
-        match next {
-            Some(next) => self.select_thread(next, window, cx),
-            None => {
-                if let Some(project_id) = self.thread(thread_id).map(|t| t.project_id.clone()) {
-                    self.start_draft(project_id, window, cx);
-                }
-            }
+        Some(Leave {
+            thread_id: thread_id.to_owned(),
+            next,
+            project_id: self.thread(thread_id).map(|t| t.project_id.clone()),
+        })
+    }
+
+    /// Runs the plan if the thread it leaves is still open.
+    pub(super) fn leave(&mut self, plan: Option<Leave>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = plan.filter(|plan| self.open_thread_id() == Some(plan.thread_id.as_str())) else { return };
+        match (plan.next, plan.project_id) {
+            (Some(next), _) => self.select_thread(next, window, cx),
+            (None, Some(project_id)) => self.start_draft(project_id, window, cx),
+            (None, None) => {}
         }
     }
 
@@ -361,13 +423,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let entry = self.undo_entry(thread_id);
-        if !self.thread_command("thread.settle", thread_id, json!({}), cx) {
-            return;
-        }
-        self.push_undo(UndoAction::Settled, entry, cx);
-        if advance {
-            self.leave_thread(thread_id, window, cx);
-        }
+        let plan = advance.then(|| self.plan_leave(thread_id, &[])).flatten();
+        self.thread_command_then("thread.settle", thread_id, json!({}), window, cx, move |this, window, cx| {
+            this.push_undo(UndoAction::Settled, entry, cx);
+            this.leave(plan, window, cx);
+        });
     }
 
     pub(in crate::app) fn unsettle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -390,13 +450,11 @@ impl Workspace {
         }
         let entry = self.undo_entry(thread_id);
         let wake = json!({"snoozedUntil": crate::timestamp::iso(wake_ms).unwrap_or_default()});
-        if !self.thread_command("thread.snooze", thread_id, wake, cx) {
-            return;
-        }
-        self.push_undo(UndoAction::Snoozed, entry, cx);
-        if advance {
-            self.leave_thread(thread_id, window, cx);
-        }
+        let plan = advance.then(|| self.plan_leave(thread_id, &[])).flatten();
+        self.thread_command_then("thread.snooze", thread_id, wake, window, cx, move |this, window, cx| {
+            this.push_undo(UndoAction::Snoozed, entry, cx);
+            this.leave(plan, window, cx);
+        });
     }
 
     pub(super) fn wake_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -428,11 +486,11 @@ impl Workspace {
             detail: Some("This will move the thread out of your pinned section."),
             destructive: false,
         };
-        self.confirm_then(question, window, cx, move |this, _, cx| {
+        self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
-            if this.thread_command("thread.unpin", &thread_id, json!({}), cx) {
+            this.thread_command_then("thread.unpin", &thread_id, json!({}), window, cx, move |this, _, cx| {
                 this.push_undo(UndoAction::Unpinned, entry, cx);
-            }
+            });
         });
     }
 
@@ -449,12 +507,12 @@ impl Workspace {
             detail: Some("This will move the threads out of your pinned section."),
             destructive: false,
         };
-        self.confirm_then(question, window, cx, move |this, _, cx| {
+        self.confirm_then(question, window, cx, move |this, window, cx| {
             for id in &ids {
                 let entry = this.undo_entry(id);
-                if this.thread_command("thread.unpin", id, json!({}), cx) {
+                this.thread_command_then("thread.unpin", id, json!({}), window, cx, move |this, _, cx| {
                     this.push_undo(UndoAction::Unpinned, entry, cx);
-                }
+                });
             }
         });
     }
@@ -473,13 +531,15 @@ impl Workspace {
         };
         self.confirm_then(question, window, cx, move |this, window, cx| {
             let entry = this.undo_entry(&thread_id);
-            if !this.thread_command("thread.archive", &thread_id, json!({}), cx) {
-                return;
-            }
-            this.push_undo(UndoAction::Archived, entry, cx);
-            if this.open_thread_id() == Some(&*thread_id) {
-                this.start_draft(project_id, window, cx);
-            }
+            let was_open = this.open_thread_id() == Some(&*thread_id);
+            let id = thread_id.clone();
+            this.thread_command_then("thread.archive", &thread_id, json!({}), window, cx, move |this, window, cx| {
+                this.push_undo(UndoAction::Archived, entry, cx);
+                // Only when the user is still on the thread they archived.
+                if was_open && this.open_thread_id() == Some(&*id) {
+                    this.start_draft(project_id, window, cx);
+                }
+            });
         });
     }
 
@@ -493,11 +553,33 @@ impl Workspace {
             detail: Some("This permanently clears conversation history for this thread."),
             destructive: true,
         };
-        self.confirm_then(question, window, cx, move |this, _, cx| {
-            if this.thread_client(&thread_id).is_some() {
-                this.expire_undo(&thread_id);
-                this.thread_command("thread.delete", &thread_id, json!({}), cx);
+        self.confirm_then(question, window, cx, move |this, window, cx| {
+            if this.thread_client(&thread_id).is_none() {
+                return;
             }
+            this.expire_undo(&thread_id);
+            let was_open = this.open_thread_id() == Some(&*thread_id);
+            let sort_order =
+                this.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
+            let fallback =
+                fallback_after_delete(&this.shell.threads, &thread_id, &sort_order, now_ms()).map(str::to_owned);
+            let id = thread_id.clone();
+            this.thread_command_then("thread.delete", &thread_id, json!({}), window, cx, move |this, window, cx| {
+                // The deletion event may already have closed it; another thread opened since stays.
+                if !was_open || !(this.target.is_none() || this.open_thread_id() == Some(&*id)) {
+                    return;
+                }
+                match fallback.filter(|next| this.thread(next).is_some()) {
+                    Some(next) => this.select_thread(next, window, cx),
+                    // The index route lands on a draft in the most recently active project.
+                    None => {
+                        let landing = inbox::most_recent_project(&this.shell.projects, &this.shell.threads);
+                        if let Some(project_id) = landing.map(|p| p.id.clone()) {
+                            this.start_draft(project_id, window, cx);
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -702,8 +784,7 @@ impl Workspace {
                 .text_color(tokens.sidebar.muted_foreground)
                 .child(label)
                 .child(
-                    div()
-                        .id("sidebar-undo")
+                    super::keyboard_button(div().id("sidebar-undo"), tokens.ring)
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(tokens.foreground)
                         .cursor_pointer()
@@ -930,7 +1011,11 @@ impl ThreadMenu {
             }
             menu.item(PopupMenuItem::new("Thread ID").on_click(copy(id.clone())))
         });
-        menu = menu.item(act!(item("Project settings"), |this, _w, cx, _id| this.open_settings("projects", cx)));
+        menu = menu.item(act!(item("Project settings"), |this, _w, cx, id| {
+            if let Some(project_id) = this.shell.threads.iter().find(|t| t.id == id).map(|t| t.project_id.clone()) {
+                this.open_project_settings(&project_id, cx);
+            }
+        }));
         menu = menu.separator();
         menu = menu.item(
             act!(item("Archive thread"), |this, window, cx, id| this.archive_thread(&id, window, cx))
@@ -939,5 +1024,57 @@ impl ThreadMenu {
         let delete =
             if cfg!(target_os = "macos") { item("Delete").icon(Icon::new(Lucide::Trash)) } else { item("Delete") };
         menu.item(act!(delete, |this, window, cx, id| this.delete_thread(&id, window, cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::fallback_after_delete;
+    use crate::model::ThreadShell;
+
+    fn thread(id: &str, project: &str, extra: serde_json::Value) -> ThreadShell {
+        let mut value = json!({
+            "id": id, "projectId": project, "title": id, "status": "idle",
+            "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z",
+            "lineage": {"rootThreadId": id},
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn deleting_falls_back_to_the_newest_open_thread_in_its_project() {
+        let now = crate::timestamp::parse_ms("2026-11-04T00:00:00.000Z").unwrap();
+        let threads = [
+            thread("gone", "p", json!({})),
+            thread("old", "p", json!({"latestUserMessageAt": "2026-11-02T00:00:00.000Z"})),
+            thread(
+                "new",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T00:00:00.000Z", "createdAt": "2026-10-01T00:00:00.000Z"}),
+            ),
+            thread(
+                "settled",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "settledOverride": "settled"}),
+            ),
+            thread(
+                "snoozed",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "snoozedUntil": "2026-11-05T00:00:00.000Z"}),
+            ),
+            thread(
+                "archived",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "archivedAt": "2026-11-03T00:00:00.000Z"}),
+            ),
+            thread("elsewhere", "q", json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z"})),
+        ];
+        assert_eq!(fallback_after_delete(&threads, "gone", "updated_at", now), Some("new"));
+        assert_eq!(fallback_after_delete(&threads, "gone", "created_at", now), Some("old"));
+        assert_eq!(fallback_after_delete(&threads, "elsewhere", "updated_at", now), None);
+        assert_eq!(fallback_after_delete(&threads, "missing", "updated_at", now), None);
     }
 }

@@ -54,6 +54,7 @@ mod inspector;
 mod keep_alive;
 mod keymap;
 mod layout;
+mod link_pull_request;
 pub mod main_window;
 mod markdown_images;
 mod markdown_ui;
@@ -182,6 +183,8 @@ pub struct Workspace {
     runtime_mode_override: Option<String>,
     /// Tracked so typing only re-renders when the send button's state flips.
     composer_empty: bool,
+    /// The composer links the triage playbook (`isTriagePrompt`), which the draft hero follows.
+    composer_triage: bool,
     /// The floating composer's height last frame: the transcript reserves it at its end, and the
     /// "Scroll to end" pill sits above it (`composerTimelineInset`).
     composer_height: f32,
@@ -394,6 +397,7 @@ impl Workspace {
             sticky_model: None,
             runtime_mode_override: None,
             composer_empty: true,
+            composer_triage: false,
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
@@ -431,7 +435,7 @@ impl Workspace {
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::default(),
-            host: Default::default(),
+            host: host_picker::HostUi::new(cx),
             _connection_task: Self::connect(window, cx),
             landed: false,
             page: None,
@@ -879,6 +883,9 @@ impl Workspace {
         self.stash_composer(cx);
         let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
+        if opened && !self.composer_drafts.contains_key(&target) {
+            self.forget_draft_routing(&target);
+        }
         let carried = self.carried_model();
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {

@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::actions::UndoAction;
 use super::now_ms;
-use crate::app::{Target, Workspace};
+use crate::app::Workspace;
 use crate::inbox::{self, Facts};
 
 /// The selected rows and the anchor a Shift-click ranges from.
@@ -231,15 +231,13 @@ impl Workspace {
         }
         for id in ids {
             let entry = self.undo_entry(id);
-            self.thread_command("thread.settle", id, json!({}), cx);
-            self.push_undo(UndoAction::Settled, entry, cx);
+            let plan = self.plan_leave(id, ids);
+            self.thread_command_then("thread.settle", id, json!({}), window, cx, move |this, window, cx| {
+                this.push_undo(UndoAction::Settled, entry, cx);
+                this.leave(plan, window, cx);
+            });
         }
         self.clear_selection(cx);
-        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
-            && ids.contains(&open)
-        {
-            self.leave_threads(&open, ids, window, cx);
-        }
     }
 
     /// Snoozes each thread until `wake_ms`, moving on past all of them from the open one.
@@ -254,26 +252,41 @@ impl Workspace {
         }
         self.clear_selection(cx);
         let until = crate::timestamp::iso(wake_ms).unwrap_or_default();
-        let mut commands = Vec::new();
-        for id in ids {
-            let entry = self.undo_entry(id);
-            commands.push(Self::thread_command_value("thread.snooze", id, json!({"snoozedUntil": until})));
-            self.push_undo(UndoAction::Snoozed, entry, cx);
-        }
-        self.dispatch_batch(
-            commands,
-            false,
-            |failed, succeeded| match succeeded {
-                0 => "Failed to snooze threads".into(),
-                _ => format!("Failed to snooze {failed} thread{}", plural(failed)),
-            },
-            cx,
-        );
-        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
-            && ids.contains(&open)
-        {
-            self.leave_threads(&open, ids, window, cx);
-        }
+        let steps: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                let command = Self::thread_command_value("thread.snooze", id, json!({"snoozedUntil": until}));
+                Some((self.thread_client(id)?, command, self.undo_entry(id), self.plan_leave(id, ids)))
+            })
+            .collect();
+        // Each undo and the move past the open thread wait for the server to take its snooze.
+        cx.spawn_in(window, async move |this, cx| {
+            let (mut accepted, mut failed, mut first_error) = (Vec::new(), 0, None);
+            for (client, command, entry, plan) in steps {
+                match client.request("orchestration.dispatchCommand", command).await {
+                    Ok(_) => accepted.push((entry, plan)),
+                    Err(error) => {
+                        failed += 1;
+                        first_error.get_or_insert(error.to_string());
+                    }
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                let title = match accepted.len() {
+                    0 => "Failed to snooze threads".to_owned(),
+                    _ => format!("Failed to snooze {failed} thread{}", plural(failed)),
+                };
+                for (entry, plan) in accepted {
+                    this.push_undo(UndoAction::Snoozed, entry, cx);
+                    this.leave(plan, window, cx);
+                }
+                if let Some(error) = first_error {
+                    this.error = Some(super::actions::failure_message(Some(&title), &error).into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Deletes the threads, asked first unless `confirmThreadDelete` is off.
@@ -283,11 +296,41 @@ impl Workspace {
         }
         let ids = ids.to_vec();
         let count = ids.len();
+        // `deleteSelectedThreadEntries`: a failure leaves the rest deleting and its row selected.
         let run = move |this: &mut Self, cx: &mut Context<Self>| {
-            let commands = ids.iter().map(|id| Self::thread_command_value("thread.delete", id, json!({}))).collect();
-            this.dispatch_batch(commands, true, |_, _| "Failed to delete threads".into(), cx);
-            this.sidebar.selection.remove(&ids);
-            this.notify_sidebar(cx);
+            let steps: Vec<_> = ids
+                .iter()
+                .filter_map(|id| {
+                    let command = Self::thread_command_value("thread.delete", id, json!({}));
+                    Some((id.clone(), this.thread_client(id)?, command))
+                })
+                .collect();
+            cx.spawn(async move |this, cx| {
+                let (mut deleted, mut first_error) = (HashSet::new(), None);
+                for (id, client, command) in steps {
+                    match client.request("orchestration.dispatchCommand", command).await {
+                        Ok(_) => {
+                            deleted.insert(id);
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error.to_string());
+                        }
+                    }
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(error) = first_error {
+                        let message = super::actions::failure_message(Some("Failed to delete threads"), &error);
+                        this.error = Some(message.into());
+                        cx.notify();
+                    }
+                    let gone = deselect_after_delete(&ids, &deleted, |id| {
+                        this.shell.threads.iter().any(|t| t.id == id && t.deleted_at.is_none())
+                    });
+                    this.sidebar.selection.remove(&gone);
+                    this.notify_sidebar(cx);
+                });
+            })
+            .detach();
         };
         if self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(false) {
             run(self, cx);
@@ -301,11 +344,16 @@ This permanently clears conversation history for these threads.",
         let answer = super::super::confirm::confirm(&message, true, window, cx);
         cx.spawn(async move |this, cx| {
             if answer.await == Ok(true) {
-                let _ = this.update(cx, |this, cx| run(this, cx));
+                let _ = this.update(cx, run);
             }
         })
         .detach();
     }
+}
+
+/// `getThreadKeysToDeselectAfterDelete`: the deleted threads and any already gone.
+fn deselect_after_delete(selected: &[String], deleted: &HashSet<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    selected.iter().filter(|id| deleted.contains(*id) || !exists(id)).cloned().collect()
 }
 
 #[cfg(test)]
@@ -363,5 +411,12 @@ mod tests {
         assert_eq!(selection.anchor, None);
         assert!(selection.clear());
         assert!(!selection.clear());
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_its_row_selected() {
+        let deleted = HashSet::from(["a".to_owned()]);
+        let gone = deselect_after_delete(&ordered()[..3], &deleted, |id| id != "c");
+        assert_eq!(gone, ["a", "c"], "b failed and still exists, so it stays selected");
     }
 }
