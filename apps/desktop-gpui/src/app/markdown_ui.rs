@@ -794,6 +794,18 @@ impl MarkdownPlugin for ThreadChips {
     }
 }
 
+/// Where a chat link to a thread opens: the thread's environment and id, as [`ThreadChips`]
+/// resolves it, so a reference-style link keeps the environment it names (`MarkdownThreadLink`).
+pub(super) fn thread_link_destination(
+    url: &str,
+    message_environment: Option<&str>,
+    threads: &[crate::model::ThreadShell],
+) -> Option<(SharedString, String)> {
+    let link = crate::thread_links::parse(url)?;
+    let thread = resolve_thread_link(&link, message_environment, threads)?;
+    Some((thread.environment_id.clone(), thread.id.clone()))
+}
+
 /// The thread a link names: in its own environment (or the message's), as written then
 /// percent-decoded; a v1 link the message's environment lacks takes a unique match elsewhere.
 fn resolve_thread_link<'a>(
@@ -1038,5 +1050,26 @@ mod tests {
         let headers = vec!["Step".to_owned(), "Result".to_owned()];
         let rows = vec![vec!["Read".to_owned(), "1, 2".to_owned()], vec!["Say \"hi\"".to_owned(), "a\n  b".to_owned()]];
         assert_eq!(table_csv(&headers, &rows), "Step,Result\nRead,\"1, 2\"\n\"Say \"\"hi\"\"\",a b");
+    }
+
+    fn thread(environment: &str, id: &str) -> crate::model::ThreadShell {
+        let mut thread: crate::model::ThreadShell = serde_json::from_value(json!({
+            "id": id, "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        thread.environment_id = environment.to_owned().into();
+        thread
+    }
+
+    #[test]
+    fn thread_links_open_in_the_environment_they_name() {
+        let threads = [thread("here", "abc"), thread("there", "abc"), thread("there", "only")];
+        let open = |url: &str| thread_link_destination(url, Some("here"), &threads).map(|(e, id)| (e.to_string(), id));
+        assert_eq!(open("t3-thread://v2/there/abc"), Some(("there".into(), "abc".into())));
+        assert_eq!(open("https://app.t3.codes/threads/there/abc"), Some(("there".into(), "abc".into())));
+        assert_eq!(open("t3-thread://v1/abc"), Some(("here".into(), "abc".into())), "v1 takes the message's");
+        assert_eq!(open("t3-thread://v1/only"), Some(("there".into(), "only".into())), "or a unique match");
+        assert_eq!(open("t3-thread://v2/here/only"), None, "a scoped link never jumps machines");
+        assert_eq!(open("https://example.com"), None);
     }
 }

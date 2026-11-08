@@ -1607,7 +1607,7 @@ fn markdown_view(
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
             // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).
-            if thread_link(url).is_none() {
+            if crate::thread_links::parse(url).is_none() {
                 let target = link_this
                     .upgrade()
                     .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
@@ -1638,24 +1638,25 @@ fn markdown_view(
                     link_this.update(cx, |workspace, cx| workspace.open_link_menu(url, event.position(), window, cx));
                 return;
             }
-            let _ = link_this.update(cx, |workspace, cx| match thread_link(url) {
-                Some(thread_id) => workspace.select_thread(thread_id, window, cx),
+            let _ = link_this.update(cx, |workspace, cx| match crate::thread_links::parse(url) {
+                // A thread no longer here opens nothing, as its chip shows.
+                Some(_) => {
+                    let message_environment = workspace.active_environment().map(|e| e.to_string());
+                    let destination = super::markdown_ui::thread_link_destination(
+                        url,
+                        message_environment.as_deref(),
+                        &workspace.shell.threads,
+                    );
+                    if let Some((env, thread_id)) = destination {
+                        workspace.select_thread_in(env, thread_id, window, cx);
+                    }
+                }
                 // A project's pull request opens in its panel (`pullRequestLinksOpenInApp`); Ctrl-click and
                 // every other link follow `browserLinkTarget`.
                 None if !event.modifiers().secondary(cx) && workspace.open_change_request_link(url, cx) => {}
                 None => workspace.open_link(url, event, window, cx),
             });
         })
-}
-
-/// `parseThreadLink`: `t3-thread://v1/{thread}` or `t3-thread://v2/{environment}/{thread}`.
-fn thread_link(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("t3-thread://")?;
-    let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
-    match parts.as_slice() {
-        ["v1", thread] | ["v2", _, thread] if !thread.is_empty() => Some((*thread).to_owned()),
-        _ => None,
-    }
 }
 
 /// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
@@ -2370,13 +2371,5 @@ mod tests {
         assert_eq!(runnable_command("sh", "rm -rf \u{202e}/ tmp\n"), None);
         // A newline or tab inside the block is a control character too, as on the web.
         assert_eq!(runnable_command("sh", "a\nb\n"), None);
-    }
-
-    #[test]
-    fn thread_links_open_their_thread() {
-        assert_eq!(thread_link("t3-thread://v1/abc").as_deref(), Some("abc"));
-        assert_eq!(thread_link("t3-thread://v2/env/abc/").as_deref(), Some("abc"));
-        assert_eq!(thread_link("https://example.com"), None);
-        assert_eq!(thread_link("t3-thread://v3/x"), None);
     }
 }
