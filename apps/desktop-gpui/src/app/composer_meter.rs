@@ -72,7 +72,7 @@ impl Workspace {
             return reserve.then(|| div().size(px(28.)).flex_none().into_any_element());
         };
         let (usage, live) = projection.context_window()?;
-        let usage = usage.clone();
+        let usage = usage.into_owned();
         let percentage = used_percentage(&usage);
         #[expect(clippy::cast_possible_truncation, reason = "a percentage clamped to 0..=100")]
         let shown = percentage.unwrap_or(0.).clamp(0., 100.) as f32;

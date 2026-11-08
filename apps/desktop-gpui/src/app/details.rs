@@ -1264,7 +1264,7 @@ impl Workspace {
         let usage = self.open_projection()?.context_usage()?;
         Some(Section {
             height: METER_ROW_HEIGHT,
-            element: meter_grid(vec![context_meter(usage, tokens)], colors),
+            element: meter_grid(vec![context_meter(&usage, tokens)], colors),
             min_density: Density::Essential,
         })
     }

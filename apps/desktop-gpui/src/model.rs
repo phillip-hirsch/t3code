@@ -4,6 +4,7 @@
 //! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
 //! values never fail a whole frame; only fields the UI reads are typed.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1088,6 +1089,9 @@ pub struct AppThread {
     /// `"v1_import"` for a thread brought over from the old event store.
     #[serde(default)]
     pub history_origin: Option<String>,
+    /// Where it was forked from: `{type: "run", threadId, runId}` for a fork at a run.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
     /// Why the last `checkpoint.rollback` failed, keyed by its command id.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
@@ -1404,6 +1408,9 @@ pub struct VisibleRow {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadProjection {
     pub thread: AppThread,
+    /// `contextTransfers`: context carried between threads, such as a fork's source usage.
+    #[serde(default, deserialize_with = "lossy")]
+    pub context_transfers: Vec<Value>,
     #[serde(default, deserialize_with = "lossy")]
     pub runs: Vec<Run>,
     #[serde(default, deserialize_with = "lossy")]
@@ -1471,16 +1478,16 @@ impl ThreadProjection {
         self.runs.iter().any(|run| run.status == "queued" && run.queue_held)
     }
 
-    /// The newest turn report, else the active provider thread's snapshot, as
-    /// `latestProviderTurnTokenUsage` + `deriveLatestContextWindowSnapshot`
-    /// in `packages/client-runtime/src/state/contextWindow.ts`.
-    pub fn context_usage(&self) -> Option<&TokenUsage> {
+    /// The newest turn report, else a native fork's source usage, else the active provider
+    /// thread's snapshot, else the last compaction's counts, as `latestProviderTurnTokenUsage` +
+    /// `deriveLatestContextWindowSnapshot` in `packages/client-runtime/src/state/contextWindow.ts`.
+    pub fn context_usage(&self) -> Option<Cow<'_, TokenUsage>> {
         self.context_window().map(|(usage, _)| usage)
     }
 
     /// `context_usage` and whether it is a live turn report, which always compacts
     /// automatically and carries no totals.
-    pub fn context_window(&self) -> Option<(&TokenUsage, bool)> {
+    pub fn context_window(&self) -> Option<(Cow<'_, TokenUsage>, bool)> {
         let mut latest: Option<&TokenUsage> = None;
         for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
             // Ties go to the later entry, since live upserts append.
@@ -1489,11 +1496,51 @@ impl ThreadProjection {
             }
         }
         if let Some(usage) = latest {
-            return Some((usage, true));
+            return Some((Cow::Borrowed(usage), true));
         }
-        let active = self.thread.active_provider_thread_id.as_ref()?;
-        let usage = self.provider_threads.iter().find(|thread| &thread.id == active)?.context_usage.as_ref()?;
-        Some((usage, false))
+        let active = self.thread.active_provider_thread_id.as_ref();
+        let snapshot = active
+            .and_then(|active| self.provider_threads.iter().find(|thread| &thread.id == active))
+            .and_then(|thread| thread.context_usage.as_ref());
+        match snapshot {
+            Some(usage) => Some((Cow::Borrowed(usage), false)),
+            None => match self.fork_source_usage() {
+                Some(usage) => Some((Cow::Owned(usage), true)),
+                None => self.compaction_usage().map(|usage| (Cow::Owned(usage), false)),
+            },
+        }
+    }
+
+    /// A fork's first context: the usage its source run had, until its own provider reports.
+    fn fork_source_usage(&self) -> Option<TokenUsage> {
+        let forked = self.thread.forked_from.as_ref().filter(|forked| forked["type"] == "run")?;
+        let instance = self.thread.model_selection.as_ref()?.instance_id.as_str();
+        let (source, run) = (forked["threadId"].as_str()?, forked["runId"].as_str()?);
+        let transfer = self.context_transfers.iter().find(|transfer| {
+            transfer["type"] == "fork"
+                && transfer["targetThreadId"] == self.thread.id.as_str()
+                && transfer["sourceThreadId"] == source
+                && transfer["sourcePoint"]["runId"] == run
+                && transfer["sourceProviderInstanceId"] == instance
+                && (transfer["status"] == "pending" || transfer["resolution"]["strategy"] == "native_fork")
+        })?;
+        serde_json::from_value(transfer["sourceTokenUsage"].clone()).ok()
+    }
+
+    /// The newest compaction's after count, with its before count as the total processed.
+    fn compaction_usage(&self) -> Option<TokenUsage> {
+        self.visible_turn_items.iter().rev().filter(|row| row.item.item_type == "compaction").find_map(|row| {
+            let item = &row.item.raw;
+            Some(TokenUsage {
+                used_tokens: item["afterTokenCount"].as_u64()?,
+                max_tokens: None,
+                auto_compact_threshold: None,
+                updated_at: item["startedAt"].as_str().or_else(|| item["updatedAt"].as_str()).map(str::to_owned),
+                total_processed_tokens: item["beforeTokenCount"].as_u64(),
+                compacts_automatically: Some(true),
+                cost: None,
+            })
+        })
     }
 
     /// `deriveProviderExtensionStatuses`: only the selected provider's current session can supply them.
@@ -2156,6 +2203,40 @@ mod tests {
         assert!(compacting(&[prompt.clone(), compaction("running")]), "an automatic compaction mid-turn");
         assert!(!compacting(&[compact, compaction("completed"), prompt.clone()]));
         assert!(!compacting(&[prompt]));
+    }
+
+    #[test]
+    fn the_context_window_falls_back_to_a_fork_source_then_the_last_compaction() {
+        let item = |id: &str, after: Value| {
+            json!({"visibility": "visible", "sourceThreadId": "t", "sourceItemId": id,
+                "item": {"id": id, "type": "compaction", "threadId": "t", "startedAt": "2026-01-01T00:00:00Z",
+                    "beforeTokenCount": 9000, "afterTokenCount": after}})
+        };
+        let projection = |extra: Value| -> ThreadProjection {
+            let mut value = json!({
+                "thread": {"id": "t", "title": "t", "modelSelection": {"instanceId": "codex", "model": "m"},
+                    "forkedFrom": {"type": "run", "threadId": "src", "runId": "r1"}},
+                "visibleTurnItems": [item("c1", json!(1200)), item("c2", Value::Null)],
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let compacted = projection(json!({}));
+        let (usage, live) = compacted.context_window().unwrap();
+        assert_eq!((usage.used_tokens, usage.total_processed_tokens, live), (1200, Some(9000), false));
+        assert_eq!(usage.compacts_automatically, Some(true), "a compaction without counts is skipped");
+        let transfer = |status: &str, strategy: &str| {
+            json!({"contextTransfers": [{"type": "fork", "targetThreadId": "t", "sourceThreadId": "src",
+                "sourcePoint": {"runId": "r1"}, "sourceProviderInstanceId": "codex", "status": status,
+                "resolution": {"strategy": strategy}, "sourceTokenUsage": {"usedTokens": 500, "maxTokens": 1000}}]})
+        };
+        let forked = projection(transfer("pending", ""));
+        let (usage, live) = forked.context_window().unwrap();
+        assert_eq!((usage.used_tokens, usage.max_tokens, live), (500, Some(1000), true));
+        let resolved = projection(transfer("resolved", "native_fork"));
+        assert_eq!(resolved.context_usage().unwrap().used_tokens, 500);
+        let replayed = projection(transfer("resolved", "replay"));
+        assert_eq!(replayed.context_usage().unwrap().used_tokens, 1200, "only a native fork carries usage");
     }
 
     #[test]
