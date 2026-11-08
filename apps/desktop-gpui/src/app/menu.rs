@@ -1,14 +1,23 @@
 //! The macOS menu bar, as Electron's `DesktopApplicationMenu` builds it for darwin: the app
-//! menu (About, Check for Updates, Settings, Services, Hide, Quit), File › Close Window, Edit,
-//! View › Toggle Full Screen, Window and Help. Windows and Linux hide Electron's menu bar,
-//! so they get none, but keep its Settings (Ctrl+,) and Toggle Full Screen (F11) accelerators.
+//! menu (About, Check for Updates, Settings, Services, Hide, Quit), File › Close Window, Edit
+//! (with Paste as Text, Delete and Speech), View (Reload, Force Reload, Toggle Developer Tools,
+//! Toggle Full Screen), Window and Help. Windows and Linux hide Electron's menu bar, so they get
+//! none, but keep its accelerators: Settings (Ctrl+,), Paste as Text (Ctrl+Shift+V), Reload
+//! (Ctrl+R, Ctrl+Shift+R) and Toggle Full Screen (F11).
+//!
+//! The app has no web contents to reload: Reload and Force Reload start the backend connection
+//! over, which reads every stream again. Toggle Developer Tools is GPUI's inspector, which only
+//! debug builds carry.
 //!
 //! Inside a window, ⌘Q goes through the workspace's hold-to-quit gate (`confirmQuit`), so Quit's
 //! key binding only matches outside every window's `Root` context. It still becomes the menu's
 //! ⌘Q, which quits directly when no window has focus, like Electron's `role: "quit"`.
 
 use gpui_kit::component::input;
-use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, PromptLevel, SystemMenuType};
+use gpui_kit::{
+    App, Context, Div, Focusable as _, Global, InteractiveElement as _, KeyBinding, Menu, MenuItem, OsAction,
+    PromptLevel, SystemMenuType, Window,
+};
 
 use super::Workspace;
 
@@ -23,6 +32,11 @@ gpui_kit::actions!(
         ShowAllApps,
         QuitApp,
         CloseWindow,
+        PasteAsText,
+        StartSpeaking,
+        StopSpeaking,
+        Reload,
+        ForceReload,
         ToggleFullScreen,
         Minimize,
         Zoom,
@@ -42,9 +56,19 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
             KeyBinding::new("cmd-m", Minimize, None),
             KeyBinding::new("cmd-q", QuitApp, Some("!Root")),
+            KeyBinding::new("cmd-shift-v", PasteAsText, Some("Input")),
+            KeyBinding::new("cmd-r", Reload, None),
+            KeyBinding::new("cmd-shift-r", ForceReload, None),
         ]);
     } else {
-        cx.bind_keys([KeyBinding::new("ctrl-,", OpenSettings, None), KeyBinding::new("f11", ToggleFullScreen, None)]);
+        // The terminal keeps Ctrl+R and Ctrl+Shift+R, as xterm takes them before Electron's menu.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+            KeyBinding::new("ctrl-shift-v", PasteAsText, Some("Input")),
+            KeyBinding::new("ctrl-r", Reload, Some("!Terminal")),
+            KeyBinding::new("ctrl-shift-r", ForceReload, Some("!Terminal")),
+            KeyBinding::new("f11", ToggleFullScreen, None),
+        ]);
     }
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOtherApps, cx| cx.hide_other_apps());
@@ -56,6 +80,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(|_: &OpenSettings, cx| with_workspace(cx, |workspace, _, cx| workspace.open_settings("general", cx)));
+    cx.on_action(|_: &Reload, cx| with_workspace(cx, Workspace::reconnect));
+    cx.on_action(|_: &ForceReload, cx| with_workspace(cx, Workspace::reconnect));
+    cx.on_action(|_: &StopSpeaking, cx| stop_speaking(cx));
     cx.on_action(|_: &About, _| show_about_panel());
     cx.on_action(|_: &CheckForUpdates, cx| {
         with_workspace(cx, |workspace, window, cx| {
@@ -107,13 +134,33 @@ fn menus() -> Vec<Menu> {
                 MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
                 MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
                 MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
+                MenuItem::action("Paste as Text", PasteAsText),
+                MenuItem::action("Delete", input::Delete),
+                MenuItem::separator(),
                 MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "Speech".into(),
+                    items: vec![
+                        MenuItem::action("Start Speaking", StartSpeaking),
+                        MenuItem::action("Stop Speaking", StopSpeaking),
+                    ],
+                    disabled: false,
+                }),
             ],
             disabled: false,
         },
         Menu {
             name: "View".into(),
-            items: vec![MenuItem::action("Toggle Full Screen", ToggleFullScreen)],
+            items: vec![
+                MenuItem::action("Reload", Reload),
+                MenuItem::action("Force Reload", ForceReload),
+                // ⌥⌘I, bound by gpui-component.
+                #[cfg(debug_assertions)]
+                MenuItem::action("Toggle Developer Tools", gpui_kit::component::ToggleInspector),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+            ],
             disabled: false,
         },
         Menu {
@@ -132,6 +179,89 @@ fn menus() -> Vec<Menu> {
             disabled: false,
         },
     ]
+}
+
+impl Workspace {
+    /// The Edit menu's actions that act on the focused field.
+    pub(super) fn on_menu_actions(&self, root: Div, cx: &mut Context<Self>) -> Div {
+        root.on_action(cx.listener(|this, _: &PasteAsText, window, cx| this.paste_as_text(window, cx))).on_action(
+            cx.listener(|this, _: &StartSpeaking, window, cx| {
+                if let Some(text) = this.composer_text_to_speak(window, cx) {
+                    start_speaking(text, cx);
+                }
+            }),
+        )
+    }
+
+    /// Paste as Text: the clipboard's text goes into the composer as typed, never folded into an
+    /// attachment and never attaching what the clipboard also holds (`consumePasteAsTextShortcut`).
+    /// Other fields only paste text anyway.
+    fn paste_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composer.read(cx).focus_handle(cx).is_focused(window) {
+            window.dispatch_action(Box::new(input::Paste), cx);
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()).filter(|text| !text.is_empty()) else {
+            return;
+        };
+        self.composer.update(cx, |state, cx| state.insert(text, window, cx));
+    }
+
+    /// What Start Speaking reads in the focused composer: its selection, else all of it, as
+    /// AppKit's text views do.
+    fn composer_text_to_speak(&self, window: &Window, cx: &App) -> Option<String> {
+        let state = self.composer.read(cx);
+        if !state.focus_handle(cx).is_focused(window) {
+            return None;
+        }
+        let value = state.value();
+        let selected = state.selected_range();
+        let text = value.get(selected).filter(|text| !text.is_empty()).unwrap_or(&value);
+        (!text.trim().is_empty()).then(|| text.to_owned())
+    }
+}
+
+/// The speech Start Speaking began, which Stop Speaking (or the next start) ends.
+#[derive(Default)]
+struct Speech(Option<std::process::Child>);
+
+impl Global for Speech {}
+
+/// AppKit's `startSpeaking:`, through macOS's `say`, which reads the text from its input.
+fn start_speaking(text: String, cx: &mut App) {
+    stop_speaking(cx);
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let spawned = std::process::Command::new("/usr/bin/say")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            log::warn!("could not start speaking: {error}");
+            return;
+        }
+    };
+    // Dropping the input closes it, so `say` reads all of it and speaks.
+    if let Some(mut input) = child.stdin.take()
+        && let Err(error) = std::io::Write::write_all(&mut input, text.as_bytes())
+    {
+        log::warn!("could not hand the text to speech: {error}");
+    }
+    cx.set_global(Speech(Some(child)));
+}
+
+fn stop_speaking(cx: &mut App) {
+    let Some(mut child) = cx.try_global::<Speech>().is_some().then(|| cx.global_mut::<Speech>().0.take()).flatten()
+    else {
+        return;
+    };
+    // Already finished is fine; the wait reaps it either way.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Acts on the focused window. GPUI runs app-level action handlers while it holds that window

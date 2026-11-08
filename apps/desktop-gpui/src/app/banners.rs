@@ -551,7 +551,7 @@ impl Workspace {
 
     /// Starts the connection over, and the backend too when it is down, without waiting out
     /// its restart backoff.
-    fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.global::<crate::environments::PrimaryBackend>().restart();
         self.connection = Connection::Starting;
         self._connection_task = Self::connect(window, cx);

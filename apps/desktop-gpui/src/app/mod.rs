@@ -1131,6 +1131,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_steer_queued))
             .on_action(cx.listener(Self::on_edit_queued))
             .map(|el| self.on_terminal_actions(el, cx))
+            .map(|el| self.on_menu_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();
