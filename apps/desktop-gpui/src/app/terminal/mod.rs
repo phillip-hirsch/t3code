@@ -235,6 +235,11 @@ impl Terminals {
         self.draft_threads.remove(project_id)
     }
 
+    /// The project whose unsent draft launches with `thread_id`.
+    fn draft_project(&self, thread_id: &str) -> Option<&str> {
+        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(project_id, _)| project_id.as_str())
+    }
+
     fn summaries(&self, thread_id: &str) -> &[Summary] {
         self.summaries.as_ref().and_then(|all| all.get(thread_id)).map_or(&[], Vec::as_slice)
     }
@@ -571,7 +576,11 @@ impl Workspace {
         };
         self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
-        let origin = self.thread_target(&thread_id).or_else(|| self.target.clone());
+        let origin = match self.terminals.draft_project(&thread_id) {
+            Some(project_id) => self.draft_target(project_id),
+            None => self.thread_target(&thread_id),
+        }
+        .or_else(|| self.target.clone());
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
             if let (Ok(()), Some(data)) = (&result, then_write) {
@@ -1463,6 +1472,16 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn a_drafts_future_thread_maps_back_to_its_project_until_sent() {
+        let mut terminals = Terminals::default();
+        terminals.draft_threads.insert("project".into(), "future".into());
+        assert_eq!(terminals.draft_project("future"), Some("project"));
+        assert_eq!(terminals.draft_project("other"), None);
+        terminals.take_draft_thread("project");
+        assert_eq!(terminals.draft_project("future"), None, "a sent draft's thread is listed");
     }
 
     #[test]
