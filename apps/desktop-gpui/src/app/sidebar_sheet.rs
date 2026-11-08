@@ -1,6 +1,9 @@
 //! Below the web's `md` breakpoint the sidebar leaves the row and opens as a sheet over the
 //! window (`ui/sidebar.tsx`: `isMobile`, `openMobile`). The sheet keeps its own open state, so
-//! the docked sidebar's state survives a trip through a narrow window.
+//! the docked sidebar's state survives a trip through a narrow window. The docked state also
+//! survives a relaunch, as the web keeps it in `localStorage` (`chat_thread_sidebar_open`).
+
+use std::path::{Path, PathBuf};
 
 use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::{
@@ -37,6 +40,11 @@ impl Default for SidebarOpen {
 }
 
 impl SidebarOpen {
+    /// The docked state the last session left, else open (`readStoredSidebarOpen ?? defaultOpen`).
+    pub(super) fn restored(stored: Option<bool>) -> Self {
+        Self { docked: stored.unwrap_or(true), ..Self::default() }
+    }
+
     /// Follows the window width; true when the sidebar switched between docked and sheet.
     pub(super) fn fit(&mut self, viewport_width: Pixels) -> bool {
         let narrow = f32::from(viewport_width) < SHEET_BELOW;
@@ -67,12 +75,15 @@ impl SidebarOpen {
         }
     }
 
-    /// `toggleSidebar`: the sheet in a narrow window, the docked sidebar otherwise.
-    pub(super) fn toggle(&mut self) {
+    /// `toggleSidebar`: the sheet in a narrow window, the docked sidebar otherwise. Returns the
+    /// docked state to store when that is what changed; the sheet's state is never stored.
+    pub(super) fn toggle(&mut self) -> Option<bool> {
         if self.narrow {
             self.sheet = !self.sheet;
+            None
         } else {
             self.docked = !self.docked;
+            Some(self.docked)
         }
     }
 
@@ -81,6 +92,22 @@ impl SidebarOpen {
         if self.narrow {
             self.sheet = false;
         }
+    }
+}
+
+/// Where the docked state is kept between launches.
+pub(super) fn docked_path() -> Option<PathBuf> {
+    Some(crate::settings::userdata_dir()?.join("chat-thread-sidebar-open.json"))
+}
+
+/// A missing or unreadable file leaves the default.
+pub(super) fn read_docked(path: &Path) -> Option<bool> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+pub(super) fn write_docked(path: &Path, docked: bool) {
+    if let Err(error) = crate::settings::write_atomically(path, &docked.into()) {
+        log::warn!("could not save {}: {error}", path.display());
     }
 }
 
@@ -163,7 +190,9 @@ impl Workspace {
     }
 
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_open.toggle();
+        if let (Some(docked), Some(path)) = (self.sidebar_open.toggle(), docked_path()) {
+            write_docked(&path, docked);
+        }
         self.notify_sidebar(cx);
         cx.notify();
     }
@@ -249,6 +278,25 @@ mod tests {
         assert!(open.sheet());
         open.fit(px(1000.));
         assert!(!open.docked(), "the docked sidebar stays closed");
+    }
+
+    #[test]
+    fn only_the_docked_state_is_stored_and_restored() {
+        let mut open = at(1000.);
+        assert_eq!(open.toggle(), Some(false));
+        open.fit(px(700.));
+        assert_eq!(open.toggle(), None, "the sheet's state is not stored");
+
+        let dir = std::env::temp_dir().join(format!("t3-gpui-sidebar-open-{}", std::process::id()));
+        let path = dir.join("chat-thread-sidebar-open.json");
+        assert_eq!(read_docked(&path), None);
+        write_docked(&path, false);
+        let mut restored = SidebarOpen::restored(read_docked(&path));
+        restored.fit(px(1000.));
+        assert!(!restored.docked() && !restored.shown());
+        assert!(SidebarOpen::restored(None).docked());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

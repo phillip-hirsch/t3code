@@ -421,7 +421,9 @@ impl Workspace {
                 let workspace = cx.weak_entity();
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
-            sidebar_open: sidebar_sheet::SidebarOpen::default(),
+            sidebar_open: sidebar_sheet::SidebarOpen::restored(
+                sidebar_sheet::docked_path().and_then(|path| sidebar_sheet::read_docked(&path)),
+            ),
             sheet_focus: sidebar_sheet::SheetFocus::default(),
             sheet_trap: cx.focus_handle(),
             details_open: true,
