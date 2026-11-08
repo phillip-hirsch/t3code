@@ -1112,22 +1112,32 @@ impl Workspace {
         let now = now_ms();
         let view = cx.entity();
 
-        let repo_url = repository_url(&detail.url);
-        let repository = div()
-            .id("pr-crumb-repository")
-            .min_w_0()
-            .truncate()
-            .font_weight(FontWeight::MEDIUM)
-            .child(detail.repository.clone())
-            .when_some(repo_url, |el, url| {
+        let repository = match repository_url(&detail.url) {
+            Some(url) => {
                 let tip: SharedString = format!("Open {} repository", detail.repository).into();
-                el.cursor_pointer()
+                gpui_kit::base::Button::new("pr-crumb-repository")
+                    .block()
+                    .min_w_0()
+                    .truncate()
+                    .line_height(gpui_kit::rems(1.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
                     .hover(|s| s.text_color(t.foreground))
+                    .focus_visible(outline_ring(t))
+                    .child(detail.repository.clone())
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                     .on_click(move |_, _, cx| cx.open_url(&url))
-            });
+                    .into_any_element()
+            }
+            None => div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(detail.repository.clone())
+                .into_any_element(),
+        };
         let open_label = list_logic::open_on_host_label(&detail.provider);
-        let number = number_link(&detail.url, detail.number, state_color, open_label);
+        let number = number_link(&detail.url, detail.number, state_color, open_label, term, t);
         let condensed = panel.condensed;
         let condensed_row = self.render_pr_condensed_row(detail, condensed_breakdown, t);
         let back = thread.filter(|thread| thread.back).map(|_| back_button(t, cx));
@@ -1166,7 +1176,8 @@ impl Workspace {
 
         let author = actor_label(detail.author.as_ref(), t);
         let checkout = logic::checkout_command(&detail.provider, detail.number).map(|command| {
-            copyable_code("pr-copy-checkout", command, panel.copied == Some("checkout"), "Copy checkout command", t)
+            let copied = panel.copied == Some("checkout");
+            copyable_code("pr-copy-checkout", command, copied, "Copy checkout command", "Checkout command copied", t)
                 .ml_auto()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let command = this
@@ -1218,6 +1229,7 @@ impl Workspace {
                             head,
                             panel.copied == Some("branch"),
                             &format!("Copy {term} branch"),
+                            "Branch name copied",
                             t,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2552,15 +2564,24 @@ fn ghost_button(id: impl Into<ElementId>, t: &Tokens) -> Button {
         .text_color(t.muted_foreground)
 }
 
-fn number_link(url: &str, number: u64, color: Hsla, open_label: &'static str) -> impl IntoElement {
+fn number_link(
+    url: &str,
+    number: u64,
+    color: Hsla,
+    open_label: &'static str,
+    term: &str,
+    t: &Tokens,
+) -> impl IntoElement {
     let (open, copy, menu_open) = (url.to_owned(), url.to_owned(), url.to_owned());
-    h_flex()
-        .id("pr-crumb-number")
+    gpui_kit::base::Button::new("pr-crumb-number")
         .flex_none()
         .gap(px(2.))
+        .line_height(gpui_kit::rems(1.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .cursor_pointer()
+        .focus_visible(outline_ring(t))
+        .accessibility_label(format!("Open {term} #{number} on host"))
         .child(format!("#{number}"))
         .child(Icon::new(Lucide::ExternalLink).with_size(px(10.)).text_color(color))
         .tooltip(move |window, cx| Tooltip::new(open_label).build(window, cx))
@@ -2576,25 +2597,39 @@ fn number_link(url: &str, number: u64, color: Hsla, open_label: &'static str) ->
         })
 }
 
+/// The app's default `:focus-visible` outline (`outline-ring/50`), 2px drawn inside the control.
+fn outline_ring(t: &Tokens) -> impl Fn(gpui_kit::StyleRefinement) -> gpui_kit::StyleRefinement + Copy {
+    inset_ring(Hsla { a: t.ring.a * 0.5, ..t.ring })
+}
+
+/// `focus-visible:ring-2 focus-visible:ring-inset` in `color`.
+fn inset_ring(color: Hsla) -> impl Fn(gpui_kit::StyleRefinement) -> gpui_kit::StyleRefinement + Copy {
+    move |s| s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), color).spread_radius(px(2.)).inset()])
+}
+
 /// `PullRequestCopyableCode`: shows "Copied" in place for a moment after a click.
 fn copyable_code(
     id: &'static str,
     value: String,
     copied: bool,
     label: &str,
+    copied_label: &str,
     t: &Tokens,
-) -> gpui_kit::Stateful<gpui_kit::Div> {
+) -> gpui_kit::base::Button {
     let tip: SharedString = format!("{}: {value}", if copied { "Copied" } else { label }).into();
-    div()
-        .id(id)
+    gpui_kit::base::Button::new(id)
+        .block()
         .min_w_0()
         .max_w_full()
         .px(px(4.))
         .py(px(2.))
         .rounded(px(4.))
+        .line_height(gpui_kit::rems(1.))
         .font_family(FONT_MONO)
         .cursor_pointer()
         .hover(|s| s.bg(Hsla { a: t.accent.a * 0.45, ..t.accent }).text_color(t.foreground))
+        .focus_visible(inset_ring(t.ring))
+        .accessibility_label(if copied { copied_label.to_owned() } else { label.to_owned() })
         .child(div().truncate().child(if copied { "Copied".to_owned() } else { value }))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
 }
