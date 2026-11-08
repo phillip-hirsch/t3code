@@ -146,6 +146,7 @@ pub(in crate::app) struct PullRequestsState {
     /// Each listed row's focus, kept across rebuilds, and the listener that prefetches a row
     /// focus rests on (attached at the next render, which has the window).
     row_focus: std::collections::HashMap<String, (FocusHandle, Option<Subscription>)>,
+    row_focus_unheard: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
 }
@@ -201,6 +202,7 @@ impl PullRequestsState {
             prefetch: None,
             facet_search: None,
             row_focus: std::collections::HashMap::new(),
+            row_focus_unheard: false,
             row_popover: None,
         }
     }
@@ -731,6 +733,7 @@ impl Workspace {
                         None => {
                             let focus = cx.focus_handle().tab_stop(true);
                             state.row_focus.insert(entry.key(), (focus.clone(), None));
+                            state.row_focus_unheard = true;
                             focus
                         }
                     };
@@ -797,6 +800,9 @@ impl Workspace {
 
     /// `onFocus={() => onIntent(entry)}`: a row focus rests on prefetches like one the pointer rests on.
     fn listen_to_pull_request_row_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.pull_requests.row_focus_unheard) {
+            return;
+        }
         for (key, (focus, listener)) in &mut self.pull_requests.row_focus {
             if listener.is_some() {
                 continue;
