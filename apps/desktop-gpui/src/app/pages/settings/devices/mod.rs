@@ -2,10 +2,11 @@
 //! `apps/web/src/components/settings/IntegrationsSettings.tsx`, with `DeviceToolVersions` and
 //! `DeviceHostUpdates` from `apps/web/src/components/device/`). Device sources are in `sources.rs`.
 //!
-//! The web runs each device change on every selected environment; GPUI has one. Scoped in the web:
-//! "Agents can use devices" (`enableAgentDeviceAccess`) has a project override, written as a plain
-//! setting there; "Use devices" (`enableDeviceSupport`) is environment-only. Without a scope here,
-//! both go through `device.configure` like the web's environment scope.
+//! The web runs each device change on every selected environment; GPUI has one. "Agents can use
+//! devices" (`enableAgentDeviceAccess`) has a project override, written as a plain scoped setting
+//! under a project scope; "Use devices" (`enableDeviceSupport`) and the device sources are
+//! environment-only, so a project scope can't change them. Otherwise both switches go through
+//! `device.configure`.
 
 mod sources;
 
@@ -28,6 +29,7 @@ use crate::app::pages::settings::widgets::{RowFrame, settings_section};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcClient;
 use crate::rpc::RpcError;
+use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
 impl Workspace {
@@ -58,19 +60,28 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sections = [self.render_device_integration(cx), self.render_device_sources(window, cx)];
+        let project_scope = matches!(view.scope.kind, ScopeKind::Project { .. });
+        let sections = [
+            self.render_device_integration(view, project_scope, cx),
+            self.render_device_sources(project_scope, window, cx),
+        ];
         self.settings_page("devices", view, sections, cx)
     }
 
     /// `DeviceIntegrationControls`: the hub and agent access switches, and the local host's progress.
-    fn render_device_integration(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_device_integration(
+        &self,
+        view: &SettingsView,
+        project_scope: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let empty = DeviceState::default();
         let state = self.settings_device_state().unwrap_or(&empty);
         let connected = self.settings_client().is_some();
         let loaded = connected && self.settings_device_state().is_some();
-        let setting = |key: &str| self.settings_info().settings.bool(key);
-        let (enabled, agent_enabled) = (setting("enableDeviceSupport"), setting("enableAgentDeviceAccess"));
+        let enabled = self.settings_info().settings.bool("enableDeviceSupport");
+        let agent_enabled = view.value("enableAgentDeviceAccess").as_bool() == Some(true);
         let busy = state.readiness().busy;
         let pending = self.devices.pending;
 
@@ -88,7 +99,7 @@ impl Workspace {
                     Switch::new("device-hub-switch")
                         .checked(enabled)
                         .accessibility_label("Device hub")
-                        .disabled(!loaded || busy || pending.is_some())
+                        .disabled(project_scope || !loaded || busy || pending.is_some())
                         .on_click(cx.listener(|this, checked: &bool, window, cx| {
                             let mut input = json!({ "enabled": *checked });
                             if *checked {
@@ -115,8 +126,12 @@ impl Workspace {
                     Switch::new("agent-device-access-switch")
                         .checked(agent_enabled)
                         .accessibility_label("Agent device access")
-                        .disabled(!loaded || !enabled || busy || pending.is_some())
-                        .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                        .disabled(!connected || (!project_scope && (!loaded || !enabled || busy)) || pending.is_some())
+                        .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                            if project_scope {
+                                this.update_settings(json!({ "enableAgentDeviceAccess": *checked }), window, cx);
+                                return;
+                            }
                             this.configure_devices(
                                 Pending::Agent,
                                 json!({ "agentAccessEnabled": *checked }),
