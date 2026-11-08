@@ -641,7 +641,11 @@ where
                                 .occlude()
                                 .map(|this| match self.state.menu_width {
                                     Length::Auto => this.w(bounds.size.width),
-                                    Length::Definite(w) => this.w(w),
+                                    // `min-w-(--anchor-width) max-w-(--available-width)`.
+                                    Length::Definite(w) => this
+                                        .w(w)
+                                        .max_w(window.viewport_size().width - px(16.))
+                                        .min_w(bounds.size.width),
                                 })
                                 .popover_style(cx)
                                 .child(

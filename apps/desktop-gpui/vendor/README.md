@@ -263,5 +263,10 @@ answer the pointer only. `src/tooltip.rs` adds `managed_tooltip_focusable` (and
 shows the tooltip at once on a keyboard focus, hides it on blur, and hides it on Escape;
 `Button`, `Checkbox` and `Radio` pass their focus handles.
 
+**A select's popup is at least its trigger's width.** The web's select and combobox popups set
+their own width with `min-w-(--anchor-width) max-w-(--available-width)`; 0.9.0's `Select` with a
+`menu_width` used that width alone, so a wide trigger had a narrower popup. In `src/select.rs` a
+set width is at least the trigger's and at most the window's less the 8px margins.
+
 **Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
