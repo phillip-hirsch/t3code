@@ -16,7 +16,6 @@ use serde_json::json;
 use super::{icon, project_icon, tooltip};
 use crate::app::palette::View;
 use crate::app::{Workspace, new_id};
-use crate::inbox;
 use crate::project_groups::{self, ProjectGroup};
 use crate::theme::Tokens;
 
@@ -42,13 +41,8 @@ impl Workspace {
         rows
     }
 
-    /// Open project groups in view: the scoped ones, else all of them.
-    fn groups_in_view(&self) -> usize {
-        let groups = self.project_groups();
-        match super::scoped_groups(&groups, &self.sidebar.scope).len() {
-            0 => project_groups::pickable(&groups).len(),
-            scoped => scoped,
-        }
+    fn new_thread_opens_picker(&self) -> bool {
+        opens_new_thread_picker(&self.project_groups())
     }
 
     fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -145,17 +139,11 @@ impl Workspace {
     }
 
     /// `chat.new` and the New thread button: a draft in the current project when
-    /// `in_project` (Shift, `chat.newLocal`) or only one project is in view,
-    /// else "New thread in…" in the palette.
+    /// `in_project` (Shift, `chat.newLocal`) or there is one open project (whatever the
+    /// filter shows), else "New thread in…" in the palette.
     pub(in crate::app) fn new_thread(&mut self, in_project: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if in_project || self.groups_in_view() <= 1 {
-            let groups = self.project_groups();
-            let scoped =
-                super::scoped_groups(&groups, &self.sidebar.scope).first().map(|g| g.representative().id.clone());
-            let project = self.new_thread_project().or(scoped).or_else(|| {
-                inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
-            });
-            if let Some(project_id) = project {
+        if in_project || !self.new_thread_opens_picker() {
+            if let Some(project_id) = self.new_thread_project() {
                 self.start_draft(project_id, window, cx);
                 return;
             }
@@ -184,7 +172,7 @@ impl Workspace {
                 .hover(|s| s.bg(sb.row_hover))
         };
         let has_projects = !self.shell.projects.is_empty();
-        let show_hint = self.groups_in_view() > 1;
+        let show_hint = self.new_thread_opens_picker();
         let new_thread_label = self.with_shortcut("New thread", "chat.new");
         let in_project_hint = format!(
             "New thread in current project: Shift+click{}",
@@ -481,5 +469,31 @@ impl Workspace {
                 .child(deferred(anchored().snap_to_window_with_margin(px(8.)).child(popup)).with_priority(3))
                 .into_any_element(),
         )
+    }
+}
+
+/// `!shouldCreateNewThreadInCurrentProject(false, ..)`: the open groups decide, not the filter.
+fn opens_new_thread_picker(groups: &[ProjectGroup]) -> bool {
+    !groups.is_empty() && project_groups::pickable(groups).len() != 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_thread_asks_for_a_project_unless_one_is_open() {
+        let group = |key: &str, archived: bool| ProjectGroup {
+            key: key.into(),
+            display_name: key.into(),
+            members: Vec::new(),
+            project_ids: vec![key.into()],
+            pinned: false,
+            archived,
+        };
+        assert!(!opens_new_thread_picker(&[]), "no projects: the draft path decides");
+        assert!(!opens_new_thread_picker(&[group("a", false), group("b", true)]));
+        assert!(opens_new_thread_picker(&[group("a", false), group("b", false)]));
+        assert!(opens_new_thread_picker(&[group("a", true)]), "every project archived");
     }
 }
