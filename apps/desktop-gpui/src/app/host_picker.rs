@@ -631,6 +631,16 @@ impl Workspace {
     }
 }
 
+/// `EnvironmentMachineIcon`.
+pub(super) fn machine_icon(machine: &str) -> Lucide {
+    match machine {
+        "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
+        "laptop" => Lucide::Laptop,
+        "cloud" => Lucide::Cloud,
+        _ => Lucide::Server,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,15 +689,5 @@ mod tests {
         assert_eq!(typeahead.type_char('l', &labels, Some(0), now), Some(1));
         assert_eq!(typeahead.type_char('l', &labels, Some(1), now), Some(2));
         assert_eq!(typeahead.type_char('l', &labels, Some(2), now), Some(1));
-    }
-}
-
-/// `EnvironmentMachineIcon`.
-pub(super) fn machine_icon(machine: &str) -> Lucide {
-    match machine {
-        "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
-        "laptop" => Lucide::Laptop,
-        "cloud" => Lucide::Cloud,
-        _ => Lucide::Server,
     }
 }
