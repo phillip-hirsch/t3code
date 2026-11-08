@@ -61,6 +61,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let chat = self.page.is_none() && self.settings.is_none();
+        // Any chat route not under a modal page, such as Pull requests (`installChatRouteCommands`).
+        let chat_route = self.settings.is_none() && !self.page.is_some_and(pages::Page::is_modal);
         let palette_open = self.palette.is_some();
         if let Some(index) = keymap::jump_index(command, "modelPicker") {
             return self.model_picker_jump(index, window, cx);
@@ -84,9 +86,9 @@ impl Workspace {
                 self.open_page(pages::Page::Usage, cx);
             }
             "commandPalette.toggle" => self.open_palette(palette::View::Root, window, cx),
-            "chat.new" if chat && !palette_open => self.new_thread(false, window, cx),
-            "chat.newLocal" if chat && !palette_open => self.new_thread(true, window, cx),
-            "chat.newWithoutProject" if chat && !palette_open => {
+            "chat.new" if chat_route && !palette_open => self.new_thread(false, window, cx),
+            "chat.newLocal" if chat_route && !palette_open => self.new_thread(true, window, cx),
+            "chat.newWithoutProject" if chat_route && !palette_open => {
                 let Some(environment) = self.scratch_environment() else { return false };
                 if !held {
                     self.start_scratch_thread(environment, None, window, cx);
