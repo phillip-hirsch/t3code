@@ -846,9 +846,102 @@ pub fn profile_report(settings: &crate::settings::Settings) -> Value {
     })
 }
 
+/// `resolveDiscoveredServerUrl`: a loopback server another machine discovered, at that
+/// machine's address. `environment_base` is the hosting environment's `httpBaseUrl`, `None` for
+/// this machine's own server, which reaches loopback directly.
+pub fn resolve_discovered_server_url(raw: &str, environment_base: Option<&str>) -> String {
+    let Ok(normalized) = normalize_url(raw) else { return raw.to_owned() };
+    let Ok(mut parsed) = url::Url::parse(&normalized) else { return raw.to_owned() };
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]"));
+    let Some(base) = environment_base.filter(|_| loopback) else { return normalized };
+    let Some(host) = url::Url::parse(base).ok().and_then(|base| base.host_str().map(normalize_hostname)) else {
+        return raw.to_owned();
+    };
+    // `resolveEnvironmentPortTarget` reaches only private-network servers directly.
+    if !is_private_network_host(&host) {
+        return raw.to_owned();
+    }
+    let port = parsed.port_or_known_default();
+    // localhost lets the browser reach loopback servers bound to either IPv4 or IPv6.
+    let host = if is_local_loopback_host(&host) {
+        "localhost".to_owned()
+    } else if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    if parsed.set_host(Some(&host)).is_err() || parsed.set_port(port).is_err() {
+        return raw.to_owned();
+    }
+    parsed.into()
+}
+
+/// `normalizeHostname`.
+fn normalize_hostname(host: &str) -> String {
+    host.to_ascii_lowercase().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_owned()
+}
+
+/// `isLocalLoopbackHost`.
+fn is_local_loopback_host(host: &str) -> bool {
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `isPrivateNetworkHost`, for a normalized host.
+fn is_private_network_host(host: &str) -> bool {
+    use std::net::IpAddr;
+    let private_v4 = |[a, b, ..]: [u8; 4]| {
+        matches!(a, 0 | 10 | 127)
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254)
+            || (a == 198 && (18..=19).contains(&b))
+    };
+    if host == "::"
+        || is_local_loopback_host(host)
+        || [".localhost", ".local", ".home.arpa", ".ts.net"].iter().any(|suffix| host.ends_with(suffix))
+        || host == "home.arpa"
+        || (!host.contains('.') && !host.contains(':'))
+    {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => private_v4(ip.octets()),
+        Ok(IpAddr::V6(ip)) => ip.to_ipv4_mapped().map_or_else(
+            || {
+                let first = ip.segments()[0];
+                first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+            },
+            |ip| private_v4(ip.octets()),
+        ),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_servers_open_at_the_machine_that_hosts_them() {
+        let resolve = resolve_discovered_server_url;
+        // This machine reaches its own loopback servers.
+        assert_eq!(resolve("localhost:5173/app?x=1", None), "http://localhost:5173/app?x=1");
+        assert_eq!(resolve("http://127.0.0.1:3000", Some("http://192.168.1.20:3773")), "http://192.168.1.20:3000/");
+        assert_eq!(
+            resolve("http://[::1]:8080/a#b", Some("http://box.tail1234.ts.net:3773")),
+            "http://box.tail1234.ts.net:8080/a#b"
+        );
+        assert_eq!(
+            resolve("http://localhost:4000", Some("http://[fd7a:115c:a1e0::1]:3773")),
+            "http://[fd7a:115c:a1e0::1]:4000/"
+        );
+        assert_eq!(resolve("http://localhost:4000", Some("http://127.0.0.1:3773")), "http://localhost:4000/");
+        // A public address needs a preview gateway, so the raw URL opens.
+        assert_eq!(resolve("http://localhost:4000", Some("https://t3.example.com")), "http://localhost:4000");
+        // A server already bound to a reachable address opens as it is.
+        assert_eq!(resolve("http://192.168.1.20:4000", Some("http://10.0.0.2:3773")), "http://192.168.1.20:4000/");
+    }
 
     fn session(tab: &str, updated_at: &str) -> Value {
         json!({
