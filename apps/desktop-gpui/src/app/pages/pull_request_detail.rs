@@ -110,7 +110,7 @@ pub(in crate::app) struct Panel {
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
     stack_failed: bool,
-    linked: Option<Vec<header::LinkedThread>>,
+    linked: Option<Vec<crate::app::palette::LinkedThread>>,
     checks_all: bool,
     maintainer_saving: bool,
     /// A maintainer-edits choice saved and not yet read back.

@@ -96,6 +96,8 @@ enum Run {
     NewThread(String),
     Open(View),
     Thread(String),
+    /// A thread on this environment, which the shell may not list (an archived linked thread).
+    ThreadIn(SharedString, String),
     Project(String),
     Settings(&'static str),
     /// Settings › Projects with this project's group picked.
@@ -216,11 +218,48 @@ pub(super) struct Palette {
     threads: Option<ThreadRanking>,
     /// "In messages", in the order last shown.
     message_order: MessageOrder,
+    /// The threads a pull request's count opened the palette with, listed while its query stays.
+    linked: Option<LinkedSearch>,
     /// Project and "New thread in..." rows by group key, in the order the palette opened with:
     /// a pin from a row must not move rows under the pointer or the jump numbers.
     project_order: RefCell<Option<Vec<String>>>,
     new_thread_order: RefCell<Option<Vec<String>>>,
     _subscription: Subscription,
+}
+
+/// A thread that links a pull request (`PullRequestLinkedThreadsResult`'s threads).
+#[derive(Clone, Debug)]
+pub(super) struct LinkedThread {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) archived: bool,
+}
+
+/// `CommandPaletteOpenIntent` "search" with `linkedThreads`: the query that opened the palette
+/// and the threads to list for it in place of thread search.
+struct LinkedSearch {
+    query: String,
+    environment: SharedString,
+    threads: Vec<LinkedThread>,
+}
+
+impl LinkedSearch {
+    /// `buildLinkedThreadActionItems`.
+    fn rows(&self) -> Vec<Row> {
+        self.threads
+            .iter()
+            .map(|thread| {
+                let title = if thread.title.is_empty() { "Untitled thread" } else { thread.title.as_str() };
+                let run = Run::ThreadIn(self.environment.clone(), thread.id.clone());
+                let mut row =
+                    Row::new(format!("thread-{}", thread.id), RowIcon::Lucide(IconName::MessageSquare), title, run);
+                let description = if thread.archived { "Archived thread" } else { "Linked thread" };
+                row.description = Some(Description::Text(description.into()));
+                row.data_terms = vec![self.query.clone().into(), thread.title.clone().into()];
+                row
+            })
+            .collect()
+    }
 }
 
 /// The message rows' ranking for a query, answers and shell, and the order shown so far.
@@ -408,6 +447,7 @@ impl Workspace {
             dark: crate::theme::tokens(cx).dark,
             threads: None,
             message_order: MessageOrder::default(),
+            linked: None,
             project_order: RefCell::default(),
             new_thread_order: RefCell::default(),
             _subscription: subscription,
@@ -422,6 +462,24 @@ impl Workspace {
             self.push_palette_view(view, window, cx);
         }
         cx.notify();
+    }
+
+    /// `openCommandPalette({ query, linkedThreads })`: a fresh palette searching `query`, which
+    /// lists `linked`'s threads while the query stays as it opened.
+    pub(super) fn open_palette_search(
+        &mut self,
+        query: String,
+        environment: SharedString,
+        linked: Vec<LinkedThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette = None;
+        self.open_palette(View::Root, window, cx);
+        if let Some(palette) = &mut self.palette {
+            palette.linked = Some(LinkedSearch { query: query.clone(), environment, threads: linked });
+        }
+        self.set_palette_query(&query, window, cx);
     }
 
     /// Puts back the query the palette had before a child search opened.
@@ -1034,11 +1092,13 @@ impl Workspace {
             })
             .collect();
         let action_rows = self.action_rows();
+        let linked = palette.linked.as_ref().filter(|linked| linked.query == query).map(LinkedSearch::rows);
         let rank = |typos: bool| {
             let actions = score_rows(action_rows.clone(), &tokens, typos);
             let suggestions = score_rows(suggestions.clone(), &tokens, typos);
-            let threads = match (typos, &ranking.typos) {
-                (true, Some(ranked)) => ranked.rows.clone(),
+            let threads = match (typos, &ranking.typos, &linked) {
+                (_, _, Some(rows)) => score_rows(rows.clone(), &tokens, typos),
+                (true, Some(ranked), None) => ranked.rows.clone(),
                 _ => ranking.strict.rows.clone(),
             };
             let projects = score_rows(project_rows.clone(), &tokens, typos);
@@ -1052,7 +1112,9 @@ impl Workspace {
             ]
         };
         let mut ranked = rank(false);
-        if !ranking.strict.strong && !ranked.iter().any(|(_, rows)| rows.iter().any(|(_, strong)| *strong)) {
+        // Linked threads stand in for thread search, so its strong match does not count.
+        let strong_thread = ranking.strict.strong && linked.is_none();
+        if !strong_thread && !ranked.iter().any(|(_, rows)| rows.iter().any(|(_, strong)| *strong)) {
             ranked = rank(true);
         }
         let threads_matched = !ranked[2].1.is_empty();
@@ -1078,7 +1140,7 @@ impl Workspace {
             .collect();
         groups.sort_by_key(|(best, order, _)| (std::cmp::Reverse(*best), *order));
         let mut groups: Vec<Group> = groups.into_iter().map(|(_, _, g)| g).collect();
-        let shown = palette.message_order.order.as_ref().filter(|_| messages);
+        let shown = palette.message_order.order.as_ref().filter(|_| messages && linked.is_none());
         let shown = shown.map_or(&[][..], |order| &order.keys[..order.shown]);
         let message_rows: Vec<Row> = shown
             .iter()
@@ -1298,6 +1360,7 @@ impl Workspace {
         match run {
             Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
+            Run::ThreadIn(environment, thread_id) => self.select_thread_in(environment, thread_id, window, cx),
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
@@ -1997,6 +2060,30 @@ mod tests {
         assert_eq!(keys(hold_order(&order, items(&["c", "a", "b"]))), ["a", "b", "c"], "a pin moves nothing");
         assert_eq!(keys(hold_order(&order, items(&["d", "c", "a"]))), ["a", "c", "d"], "a new row joins at the end");
         assert_eq!(keys(hold_order(&order, items(&["e", "d", "b", "a"]))), ["a", "b", "d", "e"]);
+    }
+
+    #[test]
+    fn a_pull_request_link_lists_its_linked_threads_archived_ones_too() {
+        let query = "https://github.com/pingdotgg/t3code/pull/22889";
+        let thread = |id: &str, title: &str, archived| LinkedThread { id: id.into(), title: title.into(), archived };
+        let linked = LinkedSearch {
+            query: query.into(),
+            environment: "env".into(),
+            threads: vec![thread("t1", "Speed up diffs", false), thread("t2", "", true)],
+        };
+        let rows = score_rows(linked.rows(), &search::fold_query(query), false);
+        let shown: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|(row, _)| {
+                let description = match &row.description {
+                    Some(Description::Text(text)) => Some(text.as_ref()),
+                    _ => None,
+                };
+                (row.title.as_ref(), description)
+            })
+            .collect();
+        assert_eq!(shown, [("Speed up diffs", Some("Linked thread")), ("Untitled thread", Some("Archived thread"))]);
+        assert!(matches!(&rows[1].0.run, Run::ThreadIn(env, id) if env == "env" && id == "t2"));
     }
 
     #[test]
