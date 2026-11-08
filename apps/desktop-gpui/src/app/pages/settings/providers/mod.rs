@@ -509,33 +509,42 @@ impl Workspace {
         );
     }
 
-    /// "Update all": every one-click update candidate, then one summary notification.
+    /// "Update all": every one-click update candidate, then one summary notification
+    /// (`getProviderUpdateRunToastView`) read from each run's returned `updateState`.
     fn update_all_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
         let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
-        let Some(client) = self.settings_client() else { return };
+        let (Some(client), Some(environment)) = (self.settings_client(), self.settings_environment()) else { return };
         if candidates.is_empty() || page.read(cx).updating_all {
             return;
         }
+        let machine = self.settings_info().environment_label.clone().unwrap_or_else(|| environment.to_string());
         page.update(cx, |page, cx| {
             page.updating_all = true;
             cx.notify();
         });
         let page = page.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let mut failures = Vec::new();
+            let mut runs = Vec::new();
             for (driver, instance_id) in candidates {
                 let payload = json!({"provider": driver, "instanceId": instance_id});
-                if let Err(error) = client.request("server.updateProvider", payload).await {
-                    failures
-                        .push(format!("{}: {error}", drivers::driver(&driver).map_or(driver.as_str(), |d| d.label)));
-                }
+                let result = client.request("server.updateProvider", payload).await.map_err(|e| e.to_string());
+                runs.push((driver, instance_id, result));
             }
-            let _ = this.update_in(cx, |_, window, cx| {
-                if !failures.is_empty() {
-                    window.push_notification(
-                        Notification::error(failures.join("\n")).title("Some providers could not update"),
-                        cx,
-                    );
+            let _ = this.update_in(cx, |this, window, cx| {
+                let mut failures = Vec::new();
+                for (driver, instance_id, result) in &runs {
+                    failures.push(instances::update_run_failure(&machine, driver, instance_id, result));
+                    if let Ok(reply) = result {
+                        this.apply_environment_event(
+                            &environment,
+                            &json!({"type": "providerStatuses", "payload": reply}),
+                        );
+                    }
+                }
+                if let Some((updated, title, description)) = instances::update_runs_toast(&failures) {
+                    let toast =
+                        if updated { Notification::success(description) } else { Notification::error(description) };
+                    window.push_notification(toast.title(title), cx);
                 }
                 page.update(cx, |page, cx| {
                     page.updating_all = false;

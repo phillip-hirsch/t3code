@@ -403,6 +403,57 @@ pub(super) fn one_click_update_candidates(providers: &[Value]) -> Vec<(String, S
         .collect()
 }
 
+/// `getProviderUpdateRunOutcome`: `None` when the instance's `updateState` came back
+/// `succeeded`, else the "<machine> · <provider>: <why>" line.
+pub(super) fn update_run_failure(
+    machine: &str,
+    driver: &str,
+    instance_id: &str,
+    result: &Result<Value, String>,
+) -> Option<String> {
+    let name = super::drivers::driver(driver).map_or(driver, |d| d.label);
+    let label = format!("{machine} \u{b7} {name}");
+    let reply = match result {
+        Ok(reply) => reply,
+        Err(error) => return Some(format!("{label}: {error}")),
+    };
+    let state = reply["providers"]
+        .as_array()
+        .and_then(|providers| providers.iter().find(|p| p["instanceId"] == instance_id))
+        .map(|provider| &provider["updateState"]);
+    if state.is_some_and(|state| state["status"] == "succeeded") {
+        return None;
+    }
+    let message = state.and_then(|state| state["message"].as_str()).unwrap_or("Provider update did not finish.");
+    Some(format!("{label}: {message}"))
+}
+
+/// `getProviderUpdateRunToastView`: whether every run updated, the title, the description.
+pub(super) fn update_runs_toast(failures: &[Option<String>]) -> Option<(bool, String, String)> {
+    let settled = failures.len();
+    if settled == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = failures.iter().flatten().map(String::as_str).collect();
+    if lines.is_empty() {
+        let title = if settled == 1 { "Provider updated".to_owned() } else { format!("{settled} providers updated") };
+        let description = if settled == 1 {
+            "New sessions will use the updated provider."
+        } else {
+            "New sessions will use the updated providers."
+        };
+        return Some((true, title, description.to_owned()));
+    }
+    let title = if lines.len() < settled {
+        format!("{} of {settled} provider updates failed", lines.len())
+    } else if settled == 1 {
+        "Provider update failed".to_owned()
+    } else {
+        "Provider updates failed".to_owned()
+    };
+    Some((false, title, lines.join("\n")))
+}
+
 /// "Checked 5m ago" from the newest `checkedAt` (`ProviderLastChecked`).
 pub(super) fn last_checked_label(providers: &[Value], now_ms: i64) -> Option<String> {
     let latest = providers.iter().filter_map(|p| p["checkedAt"].as_str()).max()?;
@@ -1861,6 +1912,44 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_all_reports_each_run_by_its_returned_state() {
+        let reply = |status: &str, message: Option<&str>| {
+            Ok(json!({"providers": [
+                {"instanceId": "other", "updateState": {"status": "succeeded"}},
+                {"instanceId": "codex", "updateState": {"status": status, "message": message}},
+            ]}))
+        };
+        assert_eq!(update_run_failure("Laptop", "codex", "codex", &reply("succeeded", None)), None);
+        assert_eq!(
+            update_run_failure("Laptop", "codex", "codex", &reply("failed", Some("npm exited with 1"))).as_deref(),
+            Some("Laptop \u{b7} Codex: npm exited with 1"),
+            "a reply that didn't succeed is a failure"
+        );
+        assert_eq!(
+            update_run_failure("Laptop", "codex", "codex", &Ok(json!({"providers": []}))).as_deref(),
+            Some("Laptop \u{b7} Codex: Provider update did not finish.")
+        );
+        assert_eq!(
+            update_run_failure("Laptop", "codex", "codex", &Err("socket closed".into())).as_deref(),
+            Some("Laptop \u{b7} Codex: socket closed")
+        );
+
+        let toast = |failures: &[Option<&str>]| {
+            update_runs_toast(&failures.iter().map(|f| f.map(str::to_owned)).collect::<Vec<_>>())
+        };
+        let owned = |ok: bool, title: &str, description: &str| Some((ok, title.to_owned(), description.to_owned()));
+        assert_eq!(toast(&[]), None);
+        assert_eq!(toast(&[None]), owned(true, "Provider updated", "New sessions will use the updated provider."));
+        assert_eq!(
+            toast(&[None, None]),
+            owned(true, "2 providers updated", "New sessions will use the updated providers.")
+        );
+        assert_eq!(toast(&[Some("a")]), owned(false, "Provider update failed", "a"));
+        assert_eq!(toast(&[Some("a"), Some("b")]), owned(false, "Provider updates failed", "a\nb"));
+        assert_eq!(toast(&[None, Some("b"), None]), owned(false, "1 of 3 provider updates failed", "b"));
+    }
 
     #[test]
     fn rows_follow_the_web_order() {
