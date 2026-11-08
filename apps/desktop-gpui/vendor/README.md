@@ -221,13 +221,14 @@ menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
 
-**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 4px taller
-with 16px text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
+**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 0.25rem taller
+with 1rem text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
 an input the same at every width. Files:
 
-- `src/input/input.rs`: `Input::render` adds the 4px and `text_base` below 640px, before the
+- `src/input/input.rs`: `Input::render` adds the 0.25rem and `text_base` below 640px, before the
   caller's style refinement, so a call site's own height or text size still wins.
-- `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
+- `src/sizing.rs`: `Size::input_height_rems`, the height `input_h` sets, in rems so it scales with the
+  interface font size.
 
 **A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
 its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
@@ -237,3 +238,13 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
 `rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
+
+**A selected radio shows a dot.** The web's `Radio` marks the selection with a centered dot
+(`size-2 sm:size-1.5`) in a `size-4.5 sm:size-4` circle; 0.9.0 draws the checkbox's checkmark at one
+size. `src/radio.rs` draws the dot and grows the default size below 640px.
+
+**Dialogs take the web's default geometry.** The web's `DialogPopup` centers in the window,
+`max-w-lg` (512px) wide with `rounded-2xl` corners; 0.9.0 sat dialogs a tenth of the viewport down,
+448px wide with `radius_lg`. `src/dialog/dialog.rs` makes centered and 512px the defaults (an
+explicit `margin_top` still places one from the top) and rounds the surface 16px;
+`src/dialog/footer.rs` rounds the footer 15px to sit inside the border.

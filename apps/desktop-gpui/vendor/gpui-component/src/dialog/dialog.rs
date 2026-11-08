@@ -219,8 +219,9 @@ impl Default for DialogProps {
     fn default() -> Self {
         Self {
             margin_top: None,
-            centered: false,
-            width: px(448.),
+            // t3code: the web's `DialogPopup` sits in the middle of the window, `max-w-lg` wide.
+            centered: true,
+            width: px(512.),
             max_width: None,
             overlay: true,
             keyboard: true,
@@ -484,20 +485,22 @@ impl Dialog {
         self
     }
 
-    /// Set the top offset of the dialog, defaults to None, will use the 1/10 of the viewport height.
+    /// Sets the top offset of the dialog in place of centering it; without one an uncentered
+    /// dialog sits a tenth of the viewport down.
     pub fn margin_top(mut self, margin_top: impl Into<Pixels>) -> Self {
         self.props.margin_top = Some(margin_top.into());
+        self.props.centered = false;
         self
     }
 
     /// Centers the dialog vertically in the window, whatever its height, in
-    /// place of the [`Self::margin_top`] offset.
+    /// place of the [`Self::margin_top`] offset. This is the default.
     pub fn centered(mut self) -> Self {
         self.props.centered = true;
         self
     }
 
-    /// Sets the width of the dialog, defaults to 448px.
+    /// Sets the width of the dialog, defaults to 512px.
     ///
     /// The dialog is never wider than the viewport minus a margin on each side.
     ///
@@ -507,7 +510,7 @@ impl Dialog {
         self
     }
 
-    /// Sets the width of the dialog, defaults to 448px.
+    /// Sets the width of the dialog, defaults to 512px.
     ///
     /// The dialog is never wider than the viewport minus a margin on each side.
     pub fn width(mut self, width: impl Into<Pixels>) -> Self {
@@ -779,7 +782,8 @@ impl RenderOnce for Dialog {
                                         .bg(cx.theme().tokens.background)
                                         .border_1()
                                         .border_color(cx.theme().border)
-                                        .rounded(cx.theme().radius_lg)
+                                        // t3code: the web's `rounded-2xl`.
+                                        .rounded(px(16.))
                                         .min_h_24()
                                         .pt(paddings.top)
                                         .pb(paddings.bottom)
@@ -1011,16 +1015,16 @@ pub(crate) mod tests {
     }
 
     /// The clamp must not touch a dialog that already fits: the default width
-    /// and the tenth-of-the-viewport top offset are the documented contract.
+    /// and the centered placement are the documented contract.
     #[gpui::test]
-    fn a_dialog_that_fits_keeps_its_default_width_and_top_offset(cx: &mut TestAppContext) {
+    fn a_dialog_that_fits_keeps_its_default_width_and_centers(cx: &mut TestAppContext) {
         let cx = window(cx, size(px(1000.), px(800.)));
         open(cx, |dialog, _, _| dialog.title("Fits").child("body"));
 
         let bounds = surface(cx, 0);
-        assert_eq!(bounds.size.width, px(448.));
-        assert_eq!(bounds.origin.x, px(276.));
-        assert_eq!(bounds.origin.y, px(80.));
+        assert_eq!(bounds.size.width, px(512.));
+        assert_eq!(bounds.origin.x, px(244.));
+        assert_eq!(bounds.center().y, px(400.));
     }
 
     /// A dialog wider and taller than the window must shrink to the viewport

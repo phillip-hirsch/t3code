@@ -1,10 +1,10 @@
 use gpui::{
     AnyElement, App, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, relative,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, px, relative,
 };
 
 use crate::{
-    ActiveTheme as _, StyledExt as _,
+    StyledExt as _,
     button::Button,
     dialog::{Confirm, DialogDispatchAnchor},
     h_flex,
@@ -47,12 +47,13 @@ impl Styled for DialogFooter {
 }
 
 impl RenderOnce for DialogFooter {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         h_flex()
             .gap_2()
             .justify_end()
             .line_height(relative(1.25))
-            .rounded_b(cx.theme().radius_lg)
+            // t3code: `rounded-b-[calc(var(--radius-2xl)-1px)]` inside the dialog's border.
+            .rounded_b(px(15.))
             .refine_style(&self.style)
             .children(self.children)
     }
