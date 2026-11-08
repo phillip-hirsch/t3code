@@ -1103,7 +1103,7 @@ impl Render for Workspace {
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
-        let mini_player = self.render_preview_mini_player(cx);
+        let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);

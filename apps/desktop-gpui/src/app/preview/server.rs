@@ -155,16 +155,16 @@ impl ServerStream {
 #[derive(Default)]
 pub(super) struct ServerStreams {
     streams: HashMap<String, ServerStream>,
-    /// The agent tab the panel drew this frame.
-    pub(super) drawn: Option<String>,
+    /// The agent tabs the panel and the mini player drew this frame.
+    pub(super) drawn: Vec<String>,
 }
 
 impl Workspace {
     /// Keeps the stream of the agent tab on screen and closes the others.
     pub(super) fn retain_server_streams(&mut self, cx: &mut App) {
-        let drawn = self.preview.server.drawn.take();
+        let drawn = std::mem::take(&mut self.preview.server.drawn);
         self.preview.server.streams.retain(|tab, stream| {
-            let keep = drawn.as_ref() == Some(tab);
+            let keep = drawn.contains(tab);
             if !keep {
                 for image in stream.stale.drain(..).chain(stream.frame.take()) {
                     cx.drop_image(image, None);
@@ -308,18 +308,21 @@ impl Workspace {
         self.preview.server.streams.get(tab_id).is_some_and(|stream| stream.send(input))
     }
 
-    /// The agent tab's page: the control bar over its latest frame.
+    /// The agent tab's page: its latest frame with the control bar above it, or below it
+    /// (`controlPosition="bottom"`) in the mini player.
+    #[expect(clippy::too_many_arguments, reason = "a render helper's layout options")]
     pub(super) fn render_server_page(
         &mut self,
         thread_id: &str,
         tab_id: &str,
         follow_size: bool,
+        bar_below: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_server_stream(thread_id, tab_id, window, cx);
-        self.preview.server.drawn = Some(tab_id.to_owned());
+        self.preview.server.drawn.push(tab_id.to_owned());
         let Some(stream) = self.preview.server.streams.get_mut(tab_id) else {
             return div().flex_1().into_any_element();
         };
@@ -351,7 +354,7 @@ impl Workspace {
             .gap_2()
             .px_2()
             .py_1()
-            .border_b_1()
+            .map(|bar| if bar_below { bar.border_t_1() } else { bar.border_b_1() })
             .border_color(tokens.border)
             .bg(tokens.background)
             .child(div().text_xs().text_color(tokens.muted_foreground).child(control_label(control.as_ref())))
@@ -437,7 +440,9 @@ impl Workspace {
                 }
             }));
         let overlay = self.render_server_overlay(tab_id, tokens, cx);
-        v_flex().flex_1().min_h_0().relative().child(bar).child(body.children(overlay)).into_any_element()
+        let body = body.children(overlay);
+        let page = v_flex().flex_1().min_h_0().relative();
+        if bar_below { page.child(body).child(bar) } else { page.child(bar).child(body) }.into_any_element()
     }
 
     /// The page's dialog, or the stop that ended the stream.

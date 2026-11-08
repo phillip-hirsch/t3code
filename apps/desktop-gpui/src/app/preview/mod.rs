@@ -971,7 +971,7 @@ impl Workspace {
         }
         if let Some(session) = session.as_ref().filter(|s| s.server_hosted()) {
             let follow_size = session.viewport.size().is_none();
-            return self.render_server_page(thread_id, tab_id, follow_size, &tokens, window, cx);
+            return self.render_server_page(thread_id, tab_id, follow_size, false, &tokens, window, cx);
         }
         let fixed = session.as_ref().and_then(|s| s.viewport.size()).map(|size| preview::fit_viewport(size, available));
         self.preview.panel_view = Some((tab_id.to_owned(), fixed.map_or(1., |(_, scale)| scale)));
@@ -1348,7 +1348,11 @@ impl Workspace {
 
     /// `ThreadPreviewMiniPlayer`: the floated tab over the chat's bottom-right corner, unless the
     /// panel shows that same tab (`shouldRenderPreviewMiniPlayer`).
-    pub(super) fn render_preview_mini_player(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_preview_mini_player(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let thread_id = self.preview_thread_id()?.to_owned();
         let tab_id = self.preview.floating.get(&thread_id)?.clone();
         if self.page.is_some() || self.active_surface() == Some(&Surface::Browser(tab_id.clone())) {
@@ -1358,7 +1362,13 @@ impl Workspace {
         let session = self.preview.threads.get(&thread_id)?.get(&tab_id)?.clone();
         let body = (MINI_SIZE, MINI_SIZE - MINI_HEADER);
         let fixed = session.viewport.size().map(|size| preview::fit_viewport(size, body));
-        self.preview.mini_view = Some((tab_id.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        // An agent's tab streams here as in the panel, with its control bar below the page.
+        let streamed = session
+            .server_hosted()
+            .then(|| self.render_server_page(&thread_id, &tab_id, false, true, &tokens, window, cx));
+        if streamed.is_none() {
+            self.preview.mini_view = Some((tab_id.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        }
         let view = self.preview.tabs.get(&tab_id).map(|tab| tab.view.clone());
         let title = self.browser_tab_title(&tab_id);
         let (expand_thread, expand_tab) = (thread_id.clone(), tab_id);
@@ -1406,16 +1416,17 @@ impl Workspace {
                                 })),
                         ),
                 )
-                .child(match (view, fixed) {
-                    (Some(view), Some(((width, height), _))) => div()
+                .child(match (streamed, view, fixed) {
+                    (Some(page), _, _) => page,
+                    (None, Some(view), Some(((width, height), _))) => div()
                         .flex_1()
                         .min_h_0()
                         .flex()
                         .justify_center()
                         .child(div().w(px(width)).h(px(height)).child(view))
                         .into_any_element(),
-                    (Some(view), None) => div().flex_1().min_h_0().child(view).into_any_element(),
-                    (None, _) => div()
+                    (None, Some(view), None) => div().flex_1().min_h_0().child(view).into_any_element(),
+                    (None, None, _) => div()
                         .flex_1()
                         .flex()
                         .items_center()
