@@ -131,6 +131,8 @@ struct Confirm {
 const UNDO_TIMEOUT: Duration = Duration::from_secs(5);
 /// A batch command's environment has no socket (`chatViewSend.ts`'s wording).
 const NOT_CONNECTED: &str = "The environment is not connected.";
+/// `threadOperationFailure`: the connection lacks `orchestration:operate`.
+const NOT_OPERATE: &str = "This connection cannot change threads.";
 
 impl Workspace {
     fn thread(&self, thread_id: &str) -> Option<&crate::model::ThreadShell> {
@@ -541,7 +543,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(title) = self.thread(thread_id).map(|t| t.title.clone()) else { return };
+        // A read-only connection can't rename (`startRename`).
+        let Some(thread) = self.thread(thread_id).filter(|t| self.can_operate(&t.environment_id)) else { return };
+        let title = thread.title.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title.clone()));
         let subscription =
             cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
@@ -646,6 +650,8 @@ impl Workspace {
         });
         Some(ThreadMenu {
             thread_id: thread.id.clone(),
+            environment_id: thread.environment_id.clone(),
+            can_operate: self.can_operate(&thread.environment_id),
             origin,
             // Only the chat title finds in its thread (`onFindInThread`).
             find: origin == MenuOrigin::Title && self.thread_find_available(),
@@ -786,6 +792,9 @@ impl SnoozeItems {
 /// A thread's menu (`buildThreadActionMenuItems`), from a sidebar row or the chat title.
 pub(in crate::app) struct ThreadMenu {
     thread_id: String,
+    environment_id: gpui_kit::SharedString,
+    /// A read-only connection keeps navigation, read markers and copying; the rest is disabled.
+    can_operate: bool,
     origin: MenuOrigin,
     /// The environment's config has loaded, so pin, settle, snooze and regenerate apply.
     loaded: bool,
@@ -814,6 +823,11 @@ fn native_rows(menu: PopupMenu) -> PopupMenu {
     if cfg!(windows) { menu.item_text(Some("Segoe UI".into()), px(12.), px(26.)) } else { menu }
 }
 
+/// A submenu a read-only connection can't open: the web disables it and its children.
+fn locked_submenu(label: &'static str, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenuItem {
+    PopupMenuItem::submenu(label, PopupMenu::build(window, cx, |menu, _, _| menu)).disabled(true)
+}
+
 impl ThreadMenu {
     pub(in crate::app) fn build(
         self,
@@ -837,9 +851,26 @@ impl ThreadMenu {
                 })
             }};
         }
-        let command = |label: &str, kind: &'static str, fields: Value| {
-            act!(item(label), |this, _w, cx, id| this.thread_command(kind, &id, fields.clone(), cx))
-        };
+        // `act!` for an action that changes the thread: disabled on a read-only connection, and
+        // checked again on click, since the grant can change while the menu is open.
+        let can_operate = self.can_operate;
+        macro_rules! op {
+            ($item:expr, $disabled:expr, |$this:ident, $window:ident, $cx:ident, $id:ident| $body:expr) => {{
+                let view = view.clone();
+                let $id = self.thread_id.clone();
+                let environment = self.environment_id.clone();
+                $item.disabled($disabled || !can_operate).on_click(move |_, $window, $cx| {
+                    let _ = view.update($cx, |$this, $cx| {
+                        if $this.can_operate(&environment) {
+                            let _ = $body;
+                        } else {
+                            $this.error = Some(failure_message(Some("Thread action unavailable"), NOT_OPERATE).into());
+                            $cx.notify();
+                        }
+                    });
+                })
+            }};
+        }
         if self.find {
             menu = menu.item(act!(item("Find in thread"), |this, window, cx, _id| {
                 this.open_thread_find(window, cx);
@@ -851,17 +882,18 @@ impl ThreadMenu {
         }
         if self.loaded {
             menu = menu.item(if self.pinned {
-                act!(item("Unpin thread"), |this, window, cx, id| this.unpin_thread(&id, window, cx))
+                op!(item("Unpin thread"), false, |this, window, cx, id| this.unpin_thread(&id, window, cx))
             } else {
-                act!(item("Pin thread"), |this, _w, cx, id| this.pin_thread(&id, cx))
+                op!(item("Pin thread"), false, |this, _w, cx, id| this.pin_thread(&id, cx))
             });
             menu = menu.item(if self.settled {
-                act!(item("Un-settle thread"), |this, _w, cx, id| this.unsettle_thread(&id, cx))
+                op!(item("Un-settle thread"), false, |this, _w, cx, id| this.unsettle_thread(&id, cx))
             } else {
-                act!(item("Settle thread"), |this, window, cx, id| this.settle_thread(&id, advance, window, cx))
+                op!(item("Settle thread"), false, |this, window, cx, id| this.settle_thread(&id, advance, window, cx))
             });
             menu = match (&self.snooze, self.snoozed) {
-                (_, true) => menu.item(act!(item("Wake thread"), |this, _w, cx, id| this.wake_thread(&id, cx))),
+                (_, true) => menu.item(op!(item("Wake thread"), false, |this, _w, cx, id| this.wake_thread(&id, cx))),
+                (Some(_), false) if !can_operate => menu.item(locked_submenu("Snooze", window, cx)),
                 (Some(snooze), false) => {
                     let (snooze, view) = (snooze.clone(), view.clone());
                     menu.submenu("Snooze", window, cx, move |menu, _, _| {
@@ -872,29 +904,37 @@ impl ThreadMenu {
             };
         }
         menu = menu.separator();
-        menu =
-            menu.item(act!(item("Rename thread"), |this, window, cx, id| this.start_rename(&id, origin, window, cx)));
+        menu = menu
+            .item(op!(item("Rename thread"), false, |this, window, cx, id| this.start_rename(&id, origin, window, cx)));
         if self.loaded {
+            let regenerate = json!({"regenerateTitle": true});
             menu = menu.item(if self.regenerating {
                 item("Regenerating…").disabled(true)
             } else {
-                command("Regenerate title", "thread.metadata.update", json!({"regenerateTitle": true}))
+                op!(item("Regenerate title"), false, |this, _w, cx, id| this.thread_command(
+                    "thread.metadata.update",
+                    &id,
+                    regenerate.clone(),
+                    cx
+                ))
             });
         }
-        menu = menu.item(command("Mark unread", "thread.mark-unread", json!({})));
+        menu = menu.item(act!(item("Mark unread"), |this, _w, cx, id| this.thread_command(
+            "thread.mark-unread",
+            &id,
+            json!({}),
+            cx
+        )));
         if let Some((label, scope)) = self.filter {
-            let view = view.clone();
-            menu = menu.item(item(&label).on_click(move |_, _, cx| {
-                let _ = view.update(cx, |this, cx| this.set_scope(scope.clone(), cx));
-            }));
+            menu = menu.item(op!(item(&label), false, |this, _w, cx, _id| this.set_scope(scope.clone(), cx)));
         }
         if self.turn_into_project {
-            menu = menu.item(
-                act!(item("Turn into project"), |this, window, cx, id| this.turn_thread_into_project(&id, window, cx))
-                    .disabled(self.running),
-            );
+            menu = menu.item(op!(item("Turn into project"), self.running, |this, window, cx, id| this
+                .turn_thread_into_project(&id, window, cx)));
         }
-        if let Some(enabled) = self.auto_settle {
+        if self.auto_settle.is_some() && !can_operate {
+            menu = menu.item(locked_submenu("Auto-settle behavior", window, cx));
+        } else if let Some(enabled) = self.auto_settle {
             let (view, id) = (view.clone(), self.thread_id.clone());
             menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, _| {
                 let mut menu = native_rows(menu);
@@ -933,11 +973,10 @@ impl ThreadMenu {
         menu = menu.item(act!(item("Project settings"), |this, _w, cx, _id| this.open_settings("projects", cx)));
         menu = menu.separator();
         menu = menu.item(
-            act!(item("Archive thread"), |this, window, cx, id| this.archive_thread(&id, window, cx))
-                .disabled(self.running),
+            op!(item("Archive thread"), self.running, |this, window, cx, id| this.archive_thread(&id, window, cx))
         );
         let delete =
             if cfg!(target_os = "macos") { item("Delete").icon(Icon::new(Lucide::Trash)) } else { item("Delete") };
-        menu.item(act!(delete, |this, window, cx, id| this.delete_thread(&id, window, cx)))
+        menu.item(op!(delete, false, |this, window, cx, id| this.delete_thread(&id, window, cx)))
     }
 }

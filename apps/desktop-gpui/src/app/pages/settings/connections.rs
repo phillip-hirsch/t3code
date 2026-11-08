@@ -37,7 +37,7 @@ const SESSION_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// This client's `/api/auth/session` answer, as a page sees it.
 #[derive(Default)]
-pub(super) enum SessionLoad {
+pub(in crate::app) enum SessionLoad {
     #[default]
     Pending,
     Ready(Session),
@@ -46,7 +46,7 @@ pub(super) enum SessionLoad {
 }
 
 impl SessionLoad {
-    pub(super) fn session(&self) -> Option<&Session> {
+    pub(in crate::app) fn session(&self) -> Option<&Session> {
         match self {
             Self::Ready(session) => Some(session),
             _ => None,
@@ -54,14 +54,14 @@ impl SessionLoad {
     }
 
     /// A failed or pending check grants nothing, like `resolveRemoteOperateAccess`.
-    pub(super) fn grants(&self, scope: &str) -> bool {
+    pub(in crate::app) fn grants(&self, scope: &str) -> bool {
         self.session().is_some_and(|session| session.grants(scope))
     }
 }
 
 /// The session check every page that gates on grants uses: `apply` gets each answer, and a
 /// failure is retried every few seconds until one succeeds or the task is dropped.
-pub(super) fn check_session<T: 'static>(
+pub(in crate::app) fn check_session<T: 'static>(
     endpoint: Endpoint,
     cx: &mut Context<T>,
     apply: impl Fn(&mut T, SessionLoad, &mut Context<T>) + 'static,

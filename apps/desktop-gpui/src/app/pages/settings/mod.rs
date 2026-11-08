@@ -7,6 +7,7 @@ mod chat;
 pub(in crate::app) mod code;
 mod connections;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
+pub(in crate::app) use connections::{SessionLoad, check_session};
 mod desktop_rows;
 mod diagnostics;
 mod diffs;

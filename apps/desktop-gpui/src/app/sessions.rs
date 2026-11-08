@@ -12,6 +12,7 @@ use std::mem;
 use gpui_kit::{App, Context, Hsla, SharedString, Task, Window};
 use serde_json::{Value, json};
 
+use super::pages::settings::{SessionLoad, check_session};
 use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
@@ -35,6 +36,8 @@ pub(super) struct EnvironmentSession {
     generation: Option<u64>,
     /// `subscribeDeviceState`; `None` until this connection's first state arrives.
     pub device_state: Option<DeviceState>,
+    /// This client's grants there (`/api/auth/session`), checked on each connection.
+    grants: SessionLoad,
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
@@ -97,6 +100,12 @@ impl Workspace {
 
     fn session_mut(&mut self, environment_id: &str) -> Option<&mut EnvironmentSession> {
         self.sessions.iter_mut().find(|s| s.is(environment_id))
+    }
+
+    /// `useEnvironmentScope(environmentId, "orchestration:operate")`: whether this client may
+    /// change the environment's threads. A pending or failed check grants nothing.
+    pub(super) fn can_operate(&self, environment_id: &str) -> bool {
+        self.session(environment_id).is_some_and(|s| s.grants.grants("orchestration:operate"))
     }
 
     /// The open target lives on the primary environment (or nothing is open).
@@ -257,12 +266,21 @@ impl Workspace {
                 this.refresh_menu_items(cx);
             },
         );
-        let streams = vec![
+        let mut streams = vec![
             config_task,
             self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
         ];
+        if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
+            let id = environment_id.clone();
+            streams.push(check_session(endpoint, cx, move |this, grants, cx| {
+                if let Some(session) = this.session_mut(&id) {
+                    session.grants = grants;
+                }
+                this.notify_sidebar(cx);
+            }));
+        }
         let Some(session) = self.session_mut(&environment_id) else { return };
         session._streams = streams;
         session.device_state = None;
