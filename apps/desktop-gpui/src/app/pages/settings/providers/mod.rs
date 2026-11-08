@@ -146,8 +146,11 @@ impl Workspace {
         };
         let page =
             window.use_keyed_state(self.settings_state_key("settings-providers"), cx, |_, _| ProvidersPage::default());
-        let override_projects =
-            instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
+        let override_projects = instances::override_projects(
+            &view.scope.kind,
+            self.settings_environment().as_deref(),
+            self.settings_info().capability("projectProviderInstanceOverrides"),
+        );
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);
         let selected = {
             let chosen = page.read(cx).selected.clone();

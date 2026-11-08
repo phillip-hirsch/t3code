@@ -16,7 +16,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::super::widgets::{SettingsView, layer_row, reset_button};
+use super::super::widgets::{layer_row, reset_button};
 use super::accent::{accent_color_picker, hex_color, normalize_accent_color};
 use super::accounts::codex_setup_managed;
 use super::drivers::{self, Driver, EnvironmentField};
@@ -48,11 +48,14 @@ impl InstanceRow {
 
 pub(super) use crate::settings::scope::instance_enabled as resolve_enabled;
 
-/// The projects whose provider switches the page edits (`projectIds`), when the server keeps
-/// per-project provider overrides (`projectProviderInstanceOverrides`).
-pub(super) fn override_projects(view: &SettingsView, supported: bool) -> Vec<String> {
-    match &view.scope.kind {
-        ScopeKind::Project { members } if supported => members.iter().map(|m| m.id.clone()).collect(),
+/// The projects whose provider switches the page edits (`projectIds`): the scope's members on
+/// the providers' own environment, when its server keeps per-project provider overrides
+/// (`projectProviderInstanceOverrides`).
+pub(super) fn override_projects(kind: &ScopeKind, environment: Option<&str>, supported: bool) -> Vec<String> {
+    match kind {
+        ScopeKind::Project { members } if supported => {
+            members.iter().filter(|m| Some(m.environment_id.as_str()) == environment).map(|m| m.id.clone()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1981,6 +1984,25 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overrides_reach_only_the_scope_projects_on_the_providers_environment() {
+        let member = |id: &str, environment: &str| scope::Project {
+            id: id.into(),
+            environment_id: environment.into(),
+            name: id.into(),
+            workspace_root: format!("/{id}"),
+            legacy_model_selection: None,
+            legacy_thread_env_mode: None,
+        };
+        let kind =
+            ScopeKind::Project { members: vec![member("a", "local"), member("b", "remote"), member("c", "local")] };
+        assert_eq!(override_projects(&kind, Some("local"), true), ["a", "c"]);
+        assert_eq!(override_projects(&kind, Some("remote"), true), ["b"]);
+        assert!(override_projects(&kind, None, true).is_empty());
+        assert!(override_projects(&kind, Some("local"), false).is_empty());
+        assert!(override_projects(&ScopeKind::All, Some("local"), true).is_empty());
+    }
 
     #[test]
     fn rows_follow_the_web_order() {
