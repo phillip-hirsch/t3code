@@ -407,10 +407,11 @@ impl Workspace {
                 scroller.splice(range, count, cx);
             }
         });
+        self.sync_details(cx);
         cx.notify();
     }
 
-    fn side_chat_projection(&self) -> Option<&ThreadProjection> {
+    pub(super) fn side_chat_projection(&self) -> Option<&ThreadProjection> {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
     }
 

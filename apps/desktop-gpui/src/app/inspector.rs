@@ -291,15 +291,19 @@ impl Workspace {
         workspace_file.then(|| path.to_owned())
     }
 
-    /// The open entries of the timeline.
+    /// The open entries of the timeline and of the side chat on screen, which loads its own.
     fn shown_open_entries(&self) -> Vec<Rc<Entry>> {
-        open_entries(&self.rows).cloned().collect()
+        let side = self.side_chat.view.as_ref().map(|view| view.rows.clone());
+        let mut open: Vec<Rc<Entry>> = open_entries(&self.rows).cloned().collect();
+        open.extend(side.iter().flat_map(|rows| open_entries(rows)).cloned());
+        open
     }
 
     /// The thread and item an item was projected from, for the item RPCs.
     fn source_of(&self, item_id: &str) -> Option<(String, String)> {
-        let projection = self.thread.as_ref()?.state.projection.as_ref()?;
-        let row = projection.visible_turn_items.iter().find(|row| row.item.id == item_id)?;
+        let main = self.thread.as_ref().and_then(|thread| thread.state.projection.as_ref());
+        let rows = main.into_iter().chain(self.side_chat_projection()).flat_map(|p| &p.visible_turn_items);
+        let row = rows.into_iter().find(|row| row.item.id == item_id)?;
         Some((row.source_thread_id.clone(), row.source_item_id.clone()))
     }
 }
