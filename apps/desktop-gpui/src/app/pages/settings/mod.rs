@@ -18,7 +18,7 @@ mod model_select;
 
 mod providers;
 mod row_layout;
-pub(in crate::app) use providers::{chatgpt_usage_button, uses_chatgpt_sharing};
+pub(in crate::app) use providers::{chatgpt_usage_button, redacted_email, uses_chatgpt_sharing};
 pub(in crate::app) use widgets::device_only;
 mod search;
 mod snap_shot;

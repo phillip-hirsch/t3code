@@ -4,21 +4,23 @@
 
 mod prices;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::base::{FocusTrapElement as _, Popup};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, ThemeStyled as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Bounds, BoxShadow, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    AnyElement, App, Bounds, BoxShadow, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative,
-    rgb, svg,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, canvas, div, point, px,
+    relative, rgb, svg,
 };
 use serde_json::{Value, json};
 
@@ -68,6 +70,9 @@ pub(in crate::app) struct UsageState {
     pools: Option<(PoolsKey, Rc<[Pool]>)>,
     /// The page just opened, so its surface takes focus on the next render.
     focus_on_open: bool,
+    card: SegmentCard,
+    /// Each limit segment's focus handle, by [`segment_key`].
+    segment_focus: HashMap<String, FocusHandle>,
 }
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
@@ -153,6 +158,91 @@ fn redeem_busy(redeemed: &[Redeem], key: &str) -> bool {
     redeemed.iter().any(|r| r.key == key && !matches!(r.status, RedeemStatus::Done(_)))
 }
 
+/// `PopoverTrigger`'s default `delay` before a hovered segment opens its card.
+const CARD_OPEN_DELAY: Duration = Duration::from_millis(300);
+/// Long enough for the pointer to cross the gap between a segment and its card.
+const CARD_CLOSE_DELAY: Duration = Duration::from_millis(100);
+
+/// The limit segments' one shared card (`SegmentPopoverContext`): hovering a segment opens it
+/// there and moves it between segments; a click, Enter or Space pins it until dismissed.
+#[derive(Default)]
+pub(in crate::app) struct SegmentCard {
+    /// The segment the card describes.
+    open: Option<String>,
+    pinned: bool,
+    /// The segment under the pointer, and whether the pointer is on the card.
+    hovered_segment: Option<String>,
+    hovered_card: bool,
+    email_revealed: bool,
+    timer: Option<Task<()>>,
+}
+
+impl SegmentCard {
+    /// The pointer entered or left segment `key`; `Some` asks to [`Self::settle`] after a delay.
+    fn hover_segment(&mut self, key: &str, hovering: bool) -> Option<Duration> {
+        if hovering {
+            self.hovered_segment = Some(key.to_owned());
+        } else if self.hovered_segment.as_deref() == Some(key) {
+            self.hovered_segment = None;
+        } else {
+            return None;
+        }
+        self.timer = None;
+        match (self.open.as_deref(), hovering) {
+            (None, true) => Some(CARD_OPEN_DELAY),
+            (Some(open), true) if !self.pinned && open != key => {
+                self.show(key);
+                None
+            }
+            (Some(_), false) if !self.pinned && !self.hovered_card => Some(CARD_CLOSE_DELAY),
+            _ => None,
+        }
+    }
+
+    fn hover_card(&mut self, hovering: bool) -> Option<Duration> {
+        self.hovered_card = hovering;
+        self.timer = None;
+        (!hovering && self.open.is_some() && !self.pinned && self.hovered_segment.is_none()).then_some(CARD_CLOSE_DELAY)
+    }
+
+    /// A delayed hover change lands: the hovered segment's card opens, or it closes once
+    /// neither a segment nor the card is under the pointer.
+    fn settle(&mut self) {
+        self.timer = None;
+        if self.pinned {
+            return;
+        }
+        match self.hovered_segment.clone() {
+            Some(key) if self.open.is_none() => self.show(&key),
+            None if !self.hovered_card => self.close(),
+            _ => {}
+        }
+    }
+
+    /// A click, Enter or Space on segment `key`: pins its hover-opened card, opens it pinned,
+    /// or closes it when it was already pinned.
+    fn press(&mut self, key: &str) {
+        self.timer = None;
+        if self.open.as_deref() == Some(key) && self.pinned {
+            self.close();
+        } else {
+            self.show(key);
+            self.pinned = true;
+        }
+    }
+
+    fn show(&mut self, key: &str) {
+        if self.open.as_deref() != Some(key) {
+            self.email_revealed = false;
+        }
+        self.open = Some(key.to_owned());
+    }
+
+    fn close(&mut self) {
+        *self = Self { hovered_segment: self.hovered_segment.take(), ..Self::default() };
+    }
+}
+
 /// A usage window ending now, in the system time zone.
 fn local_window(days: u32) -> UsageWindow {
     let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
@@ -221,6 +311,8 @@ impl Default for UsageState {
             pools: None,
             chart: RefCell::default(),
             focus_on_open: false,
+            card: SegmentCard::default(),
+            segment_focus: HashMap::new(),
         }
     }
 }
@@ -524,6 +616,33 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    fn hover_usage_card(&mut self, segment: Option<&str>, hovering: bool, cx: &mut Context<Self>) {
+        let card = &mut self.usage.card;
+        let delay = match segment {
+            Some(key) => card.hover_segment(key, hovering),
+            None => card.hover_card(hovering),
+        };
+        cx.notify();
+        let Some(delay) = delay else { return };
+        self.usage.card.timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                this.usage.card.settle();
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Escape closes a limit segment's card before the modal.
+    pub(in crate::app) fn usage_card_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.usage.card.open.is_none() {
+            return false;
+        }
+        self.usage.card.close();
+        cx.notify();
+        true
     }
 
     fn refresh_usage(&mut self, cx: &mut Context<Self>) {
@@ -950,10 +1069,33 @@ impl Workspace {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
+        let keys: Vec<String> = pools
+            .iter()
+            .flat_map(|pool| {
+                pool.windows.iter().flat_map(move |window| {
+                    window.columns.iter().flatten().map(move |m| segment_key(pool, window, &pool.accounts[m.account]))
+                })
+            })
+            .collect();
+        self.usage.segment_focus.retain(|key, _| keys.contains(key));
+        for key in &keys {
+            self.usage.segment_focus.entry(key.clone()).or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
+        // The card's segment is gone, so it has nothing to anchor to.
+        if self.usage.card.open.as_ref().is_some_and(|open| !keys.contains(open)) {
+            self.usage.card.close();
+        }
+        let segments = Segments {
+            now,
+            hour12: self.hour12(),
+            redeemed: &self.usage.redeemed,
+            card: &self.usage.card,
+            focus: &self.usage.segment_focus,
+            view: cx.weak_entity(),
+            t,
+        };
         for pool in pools.iter() {
-            let view = cx.weak_entity();
-            let redeemed = &self.usage.redeemed;
-            body = body.child(pool_section(pool, now, redeemed, &view, t));
+            body = body.child(pool_section(pool, &segments, cx));
         }
         for (label, url, message, accounts) in links {
             let open = url.clone();
@@ -1918,8 +2060,25 @@ fn share_bar(
         .into_any_element()
 }
 
+/// What every limit segment reads: the clock, redeem progress, the shared card and focus handles.
+struct Segments<'a> {
+    now: i64,
+    hour12: bool,
+    redeemed: &'a [Redeem],
+    card: &'a SegmentCard,
+    focus: &'a HashMap<String, FocusHandle>,
+    view: WeakEntity<Workspace>,
+    t: &'a Tokens,
+}
+
+/// A segment's key: its account on one pooled window.
+fn segment_key(pool: &Pool, window: &PoolWindow, account: &logic::Account) -> String {
+    format!("{}-{}-{}-{}", pool.driver, window.kind, window.id, account.key)
+}
+
 /// `PoolSection`: one driver's windows, each pooled across its accounts.
-fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn pool_section(pool: &Pool, segments: &Segments<'_>, cx: &App) -> AnyElement {
+    let t = segments.t;
     let color = logic::driver_kind(&pool.driver).map_or(t.foreground, |kind| provider_color(kind, t));
     v_flex()
         .gap(px(12.))
@@ -1935,9 +2094,9 @@ fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Wo
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, redeemed, view, t)))
-        // The confirm closed with no popover to report back in, so progress and the outcome show here.
-        .children(redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
+        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, segments, cx)))
+        // The confirm closed the card, so progress and the outcome show here.
+        .children(segments.redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
             let status = match &r.status {
                 RedeemStatus::Confirming => return None,
                 RedeemStatus::Running => "Using reset credit…".to_owned(),
@@ -1955,21 +2114,14 @@ fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Wo
         .into_any_element()
 }
 
-fn pool_window_card(
-    pool: &Pool,
-    window: &PoolWindow,
-    color: Hsla,
-    now: i64,
-    redeemed: &[Redeem],
-    view: &WeakEntity<Workspace>,
-    t: &Tokens,
-) -> AnyElement {
+fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Segments<'_>, cx: &App) -> AnyElement {
+    let t = segments.t;
     let cursor = (pool.driver == "cursor").then(|| logic::CURSOR_WINDOWS.iter().find(|w| w.0 == window.id)).flatten();
     let label = cursor.map_or(window.label.clone(), |w| w.1.to_owned());
     let several = window.columns.len() > 1;
-    let segments = window.columns.iter().map(|member| {
+    let bars = window.columns.iter().map(|member| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, redeemed, view, t)
+        pool_segment(pool, window, member, color, segments, cx)
     });
     v_flex()
         .gap(px(12.))
@@ -2008,7 +2160,7 @@ fn pool_window_card(
                             el.child(div().text_xs().font_weight(FontWeight::MEDIUM).child(format!("↻ +{refill}%")))
                         }),
                 )
-                .child(h_flex().flex_1().min_w_0().gap(px(4.)).children(segments)),
+                .child(h_flex().flex_1().min_w_0().gap(px(4.)).children(bars)),
         )
         .children(cursor.map(|w| div().text_xs().text_color(t.muted_foreground).child(w.2)))
         .into_any_element()
@@ -2065,20 +2217,21 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
+/// `PoolSegment`: one account's bar, a button whose shared card (`SegmentPopover`) opens on
+/// hover, click, Enter or Space.
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
     member: &logic::Member,
-    several: bool,
     color: Hsla,
-    now: i64,
-    redeemed: &[Redeem],
-    view: &WeakEntity<Workspace>,
-    t: &Tokens,
+    segments: &Segments<'_>,
+    cx: &App,
 ) -> AnyElement {
+    let (t, now) = (segments.t, segments.now);
     let account = &pool.accounts[member.account];
+    let key = segment_key(pool, window, account);
+    let several = window.columns.len() > 1;
     let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0);
-    let redeem = account.redeem.clone().filter(|_| credits.is_some());
     let color = crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into());
     let remaining = logic::remaining_percent(&member.window);
     let time_left = logic::pace_remaining_percent(&member.window, now);
@@ -2090,40 +2243,22 @@ fn pool_segment(
         (None, Some(email)) => account_chip(email).into_any_element(),
         (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
     };
-    let signed_in = account.environments.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>().join(", ");
-    let where_label = match &account.source_label {
-        Some(source) => Some(("Via", source.clone())),
-        None => (!signed_in.is_empty()).then_some(("Signed in", signed_in)),
-    };
-    let details: Vec<(&'static str, String)> = [
-        account.plan.clone().map(|plan| ("Plan", plan)),
-        where_label,
-        Some(("Left", format!("{remaining}%"))),
-        resets_in.clone().map(|r| ("Resets", r.replace("resets in ", "in "))),
-        time_left.map(|left| ("Even pace", format!("{left}% left by now"))),
-        (member.refill_percent > 0. && several && remaining < 100).then(|| {
-            ("Restores", format!("+{}% of pool", (member.refill_percent / window.columns.len() as f64).round()))
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    // The web's popover holds a "Use reset" button; here the segment itself is that button.
-    let credit_line = credits.as_ref().filter(|_| redeem.is_some()).map(|c| logic::reset_credits_summary(c, now, true));
-    let border = t.border;
-    let title = account.name();
-    let email = account.email.clone().filter(|_| account.display_name.is_some());
+    let open = segments.card.open.as_deref() == Some(key.as_str());
     let fill = Hsla { a: color.a * 0.35, ..color };
-    div()
-        .id(ElementId::Name(format!("pool-{}-{}-{}", pool.driver, window.id, account.key).into()))
+    let ring = t.ring;
+    let view = segments.view.clone();
+    let mut segment = div()
+        .id(ElementId::Name(format!("pool-{key}").into()))
         .relative()
-        .flex_1()
-        .min_w_0()
+        .w_full()
         .h(px(32.))
         .rounded(px(6.))
         .bg(t.muted)
         .overflow_hidden()
         .cursor_pointer()
+        // `focus-visible:ring-2 ring-inset ring-ring`, and `ring-1 ring-border` while its card is open.
+        .focus_visible(move |s| s.shadow(vec![BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()]))
+        .when(open, |el| el.shadow(vec![BoxShadow::new(px(0.), px(0.), t.border).spread_radius(px(1.)).inset()]))
         .child(
             div().absolute().top_0().bottom_0().left_0().w(relative(remaining as f32 / 100.)).rounded(px(6.)).bg(fill),
         )
@@ -2176,48 +2311,171 @@ fn pool_segment(
                     )
                 }),
         )
-        .when_some(redeem.filter(|_| !redeem_busy(redeemed, &account.key)), |el, input| {
-            let (view, key, name) = (view.clone(), account.key.clone(), account.name());
-            el.on_click(move |_, window, cx| {
+        .on_hover({
+            let (view, key) = (view.clone(), key.clone());
+            move |hovering: &bool, _, cx| {
+                let _ = view.update(cx, |this, cx| this.hover_usage_card(Some(&key), *hovering, cx));
+            }
+        })
+        .on_click({
+            let (view, key) = (view.clone(), key.clone());
+            move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx);
+                    this.usage.card.press(&key);
+                    cx.notify();
                 });
-            })
+            }
+        });
+    if let Some(focus) = segments.focus.get(&key) {
+        segment = segment.track_focus(focus);
+    }
+    let popup = Popup::new(ElementId::Name(format!("pool-popup-{key}").into()), segment)
+        .flex_1()
+        .min_w_0()
+        .anchor(gpui_kit::Anchor::BottomCenter)
+        .offset(px(6.));
+    if !open {
+        return popup.into_any_element();
+    }
+    let card = v_flex()
+        .id(ElementId::Name(format!("pool-card-{key}").into()))
+        .occlude()
+        .popover_style(cx)
+        .p(px(16.))
+        .child(segment_card(pool, window, member, segments))
+        .on_hover({
+            let view = view.clone();
+            move |hovering: &bool, _, cx| {
+                let _ = view.update(cx, |this, cx| this.hover_usage_card(None, *hovering, cx));
+            }
         })
-        .tooltip(move |window, cx| {
-            let details = details.clone();
-            let title = title.clone();
-            let email = email.clone();
-            let credit_line = credit_line.clone();
-            Tooltip::element(move |_, _| {
-                v_flex()
-                    .w(px(288.))
-                    .gap(px(10.))
-                    .text_xs()
-                    .child(
-                        v_flex()
-                            .gap(px(2.))
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title.clone()))
-                            .children(email.clone().map(|e| div().child(e))),
+        // The segment's own click toggles the card.
+        .on_mouse_down_out(move |_, _, cx| {
+            let _ = view.update(cx, |this, cx| {
+                let card = &mut this.usage.card;
+                if card.hovered_segment.is_none() || card.hovered_segment != card.open {
+                    card.close();
+                    cx.notify();
+                }
+            });
+        });
+    popup.content(card).into_any_element()
+}
+
+/// `SegmentPopover`: the account, its plan and where it is signed in, the window, and its reset credits.
+fn segment_card(pool: &Pool, window: &PoolWindow, member: &logic::Member, segments: &Segments<'_>) -> impl IntoElement {
+    let (t, now) = (segments.t, segments.now);
+    let account = &pool.accounts[member.account];
+    let remaining = logic::remaining_percent(&member.window);
+    let time_left = logic::pace_remaining_percent(&member.window, now);
+    let resets_in = logic::format_resets_in(&member.window, now);
+    let signed_in = account.environments.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>().join(", ");
+    let where_row = if account.environments.is_empty() {
+        account.source_label.clone().map(|source| ("Via", source))
+    } else {
+        Some(("Signed in", signed_in))
+    };
+    let resets = member.window.resets_at.as_deref().and_then(|at| {
+        let local = chrono::DateTime::from_timestamp_millis(now)?.with_timezone(&Local);
+        let when = crate::timestamp::upcoming(at, &local, segments.hour12)?;
+        Some(match &resets_in {
+            Some(r) => format!("{when} · {}", r.replace("resets in ", "in ")),
+            None => when,
+        })
+    });
+    // `pool.resets`: a member with a reset clock restores its refill as a share of the pool.
+    let members = window.columns.iter().flatten().count().max(1);
+    let restores = (member.refill_percent / members as f64).round();
+    let restores = (member.window.resets_at.is_some() && restores > 0.).then(|| format!("+{restores}% of pool"));
+    let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0 && account.redeem.is_some());
+    let row = |label: &'static str, value: String| {
+        h_flex()
+            .gap(px(12.))
+            .child(div().w(px(72.)).flex_none().text_color(t.muted_foreground).child(label))
+            .child(div().min_w_0().text_color(t.foreground).child(value))
+    };
+    let section =
+        || v_flex().gap(px(4.)).border_t_1().border_color(Hsla { a: t.border.a * 0.6, ..t.border }).pt(px(10.));
+    let name = account.display_name.clone().unwrap_or_else(|| driver_label(&account.driver));
+    let avatar: Option<AnyElement> = if account.redeem.is_some() {
+        crate::assets::provider_icon(&account.driver).map(|(path, tint)| {
+            div()
+                .size(px(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(svg().path(path).size(px(16.)).text_color(tint.unwrap_or(Hsla { a: 0.8, ..t.foreground })))
+                .into_any_element()
+        })
+    } else {
+        account.email.as_deref().map(|email| account_chip(email).into_any_element())
+    };
+    let view = segments.view.clone();
+    v_flex()
+        .w(px(288.))
+        .gap(px(10.))
+        .text_xs()
+        .child(
+            v_flex()
+                .min_w_0()
+                .gap(px(2.))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.foreground)
+                        .children(avatar)
+                        .child(div().min_w_0().truncate().child(name)),
+                )
+                .children(account.email.as_deref().map(|email| {
+                    let revealed = segments.card.email_revealed;
+                    let view = view.clone();
+                    super::settings::redacted_email(&format!("pool-{}", account.key), email, revealed, t).on_click(
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.usage.card.email_revealed = !revealed;
+                                cx.notify();
+                            });
+                        },
                     )
-                    .children(details.iter().map(|(label, value)| {
-                        h_flex().gap(px(12.)).child(div().w(px(72.)).flex_none().child(*label)).child(value.clone())
-                    }))
-                    .children(credit_line.clone().map(|line| {
-                        h_flex().gap(px(12.)).child(line).child(
-                            div()
-                                .ml_auto()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(border)
-                                .px(px(6.))
-                                .child("Use reset"),
-                        )
-                    }))
-            })
-            .build(window, cx)
-        })
-        .into_any_element()
+                })),
+        )
+        .child(
+            section()
+                .children(account.plan.clone().map(|plan| row("Plan", plan)))
+                .children(where_row.map(|(label, value)| row(label, value))),
+        )
+        .child(
+            section()
+                .child(row("Left", format!("{remaining}%")))
+                .children(resets.map(|resets| row("Resets", resets)))
+                .children(time_left.map(|left| row("Even pace", format!("{left}% left by now"))))
+                .children(restores.map(|restores| row("Restores", restores))),
+        )
+        .children(credits.map(|credits| {
+            let busy = redeem_busy(segments.redeemed, &account.key);
+            let input = account.redeem.clone();
+            let (key, name) = (account.key.clone(), account.name());
+            section().text_color(t.muted_foreground).child(
+                h_flex().gap(px(12.)).child(logic::reset_credits_summary(&credits, now, true)).child(
+                    Button::new(ElementId::Name(format!("pool-reset-{}", account.key).into()))
+                        .outline()
+                        .xsmall()
+                        .ml_auto()
+                        .label(if busy { "Using…" } else { "Use reset" })
+                        .disabled(busy)
+                        .on_click(move |_, window, cx| {
+                            let Some(input) = input.clone() else { return };
+                            let _ = view.update(cx, |this, cx| {
+                                this.usage.card.close();
+                                this.redeem_reset_credit(key.clone(), name.clone(), input, window, cx);
+                            });
+                        }),
+                ),
+            )
+        }))
 }
 
 fn usage_skeleton(t: &Tokens) -> impl IntoElement {
@@ -2268,6 +2526,37 @@ fn usage_skeleton(t: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_card_follows_the_hovered_segment_and_a_press_pins_it() {
+        let mut card = SegmentCard::default();
+        assert_eq!(card.hover_segment("a", true), Some(CARD_OPEN_DELAY));
+        card.settle();
+        assert_eq!(card.open.as_deref(), Some("a"));
+        card.email_revealed = true;
+        assert_eq!(card.hover_segment("a", false), Some(CARD_CLOSE_DELAY));
+        assert_eq!(card.hover_segment("b", true), None, "an open card moves to the next segment at once");
+        assert_eq!((card.open.as_deref(), card.email_revealed), (Some("b"), false));
+        assert_eq!(card.hover_segment("b", false), Some(CARD_CLOSE_DELAY));
+        assert_eq!(card.hover_card(true), None, "crossing onto the card keeps it");
+        card.settle();
+        assert_eq!(card.open.as_deref(), Some("b"));
+        assert_eq!(card.hover_card(false), Some(CARD_CLOSE_DELAY));
+        card.settle();
+        assert_eq!(card.open, None);
+
+        card.hover_segment("a", true);
+        card.press("a");
+        assert!(card.pinned && card.open.as_deref() == Some("a"), "Enter or a click opens it without waiting");
+        assert_eq!(card.hover_segment("a", false), None, "a pinned card stays when the pointer leaves");
+        assert_eq!(card.hover_segment("b", true), None);
+        assert_eq!(card.open.as_deref(), Some("a"), "and does not follow the pointer");
+        card.press("b");
+        assert_eq!(card.open.as_deref(), Some("b"));
+        card.press("b");
+        assert_eq!(card.open, None, "a second press closes it");
+        assert_eq!(card.hovered_segment.as_deref(), Some("b"), "closing keeps track of the pointer");
+    }
 
     #[test]
     fn segmented_arrows_wrap_and_home_end_jump() {

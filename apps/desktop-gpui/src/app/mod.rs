@@ -1192,7 +1192,9 @@ impl Render for Workspace {
                     return;
                 }
                 if this.page.is_some_and(pages::Page::is_modal) && event.keystroke.key == "escape" {
-                    this.close_page(cx);
+                    if !this.usage_card_escape(cx) {
+                        this.close_page(cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
