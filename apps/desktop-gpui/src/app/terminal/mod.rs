@@ -511,7 +511,8 @@ impl Workspace {
             }
             None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
         };
-        match run.preview_url.clone() {
+        let environment = self.thread_environment(&thread_id);
+        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)) {
             Some(url) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
@@ -570,6 +571,7 @@ impl Workspace {
         };
         self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
+        let origin = self.thread_target(&thread_id).or_else(|| self.target.clone());
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
             if let (Ok(()), Some(data)) = (&result, then_write) {
@@ -580,7 +582,7 @@ impl Workspace {
                 Ok(()) => true,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.error = Some(error.to_string().into());
+                        this.set_error_from(origin.as_ref(), error.to_string().into());
                         cx.notify();
                     });
                     false

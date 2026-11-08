@@ -15,7 +15,7 @@ fn branch_choice(branch: Option<String>, worktree_path: Option<String>) -> Works
     match worktree_path {
         Some(path) => WorkspaceChoice {
             mode: Some(EnvMode::Worktree),
-            existing_worktree: Some((path, branch.clone())),
+            existing_worktree: Some(path),
             start_from_origin: Some(false),
             branch,
         },
@@ -76,7 +76,10 @@ mod tests {
     fn a_branch_thread_reuses_its_worktree_or_switches_locally() {
         let worktree = branch_choice(Some("feat".into()), Some("C:/wt/feat".into()));
         assert_eq!(worktree.mode, Some(EnvMode::Worktree));
-        assert_eq!(worktree.existing_worktree, Some(("C:/wt/feat".into(), Some("feat".into()))));
+        assert_eq!(
+            (worktree.existing_worktree.as_deref(), worktree.branch.as_deref()),
+            (Some("C:/wt/feat"), Some("feat"))
+        );
         let local = branch_choice(Some("feat".into()), None);
         assert_eq!(
             (local.mode, local.branch.as_deref(), local.start_from_origin),

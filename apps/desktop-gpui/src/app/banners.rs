@@ -373,6 +373,14 @@ impl Workspace {
         self.banners.errors.set(&target_key(Some(target)), &current, &mut self.error, error);
     }
 
+    /// [`Self::set_error_for`] the target work started on; with none, the window's error.
+    pub(super) fn set_error_from(&mut self, origin: Option<&Target>, error: SharedString) {
+        match origin {
+            Some(target) => self.set_error_for(target, error),
+            None => self.error = Some(error),
+        }
+    }
+
     /// The error the banner shows: this client's last failure, else the thread's runtime error.
     /// Returns it with the runtime class and code when it came from the server.
     fn thread_error(&self) -> Option<(String, Option<&str>, Option<&str>)> {

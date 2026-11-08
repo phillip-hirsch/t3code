@@ -184,7 +184,11 @@ impl Workspace {
     ) -> AnyElement {
         let bounds = self.title.bounds.clone();
         let focus = &self.title.crumbs[2];
-        let ring = focus_ring(focus, window, tokens.ring);
+        let quiet = &self.title.quiet_ring;
+        if !focus.is_focused(window) {
+            quiet.set(false);
+        }
+        let ring = focus_ring(focus, window, tokens.ring).filter(|_| !quiet.get());
         let chevron_shown = ring.is_some();
         h_flex()
             .id("thread-title")
@@ -218,6 +222,11 @@ impl Workspace {
                 canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, (), _, _| {}).absolute().size_full(),
             )
             .children(ring)
+            .on_key_down(cx.listener(|this, _, _, cx| {
+                if this.title.quiet_ring.replace(false) {
+                    cx.notify();
+                }
+            }))
             // Enter and Space open the menu at once, as a keyboard click does on the web.
             .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
                 if event.is_keyboard() {

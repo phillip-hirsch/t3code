@@ -275,8 +275,8 @@ impl Workspace {
                 this.draft_workspace.choice = match &worktree {
                     Some(path) => WorkspaceChoice {
                         mode: Some(EnvMode::Worktree),
-                        branch: Some(branch.clone()),
-                        existing_worktree: Some((path.clone(), Some(branch))),
+                        branch: Some(branch),
+                        existing_worktree: Some(path.clone()),
                         start_from_origin: None,
                     },
                     None => WorkspaceChoice {

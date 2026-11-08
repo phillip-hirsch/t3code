@@ -29,6 +29,9 @@ pub(super) struct TitleState {
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
     /// The breadcrumb's buttons (project, parent thread, title), tab stops like the web's.
     pub crumbs: [FocusHandle; 3],
+    /// Focus came back to the title from a menu the pointer opened: Electron's native menu
+    /// keeps its Escape from the page, so no `:focus-visible` ring until the next key there.
+    pub quiet_ring: Cell<bool>,
 }
 
 impl TitleState {
@@ -39,6 +42,7 @@ impl TitleState {
             rename: None,
             bounds: Rc::default(),
             crumbs: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            quiet_ring: Cell::new(false),
         }
     }
 }
@@ -142,12 +146,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let previous = window.focused(cx);
+        let pointer = !window.last_input_was_keyboard();
         menu.focus_handle(cx).focus(window, cx);
         let subscription = cx.subscribe_in(&menu, window, move |this, menu, _: &DismissEvent, window, cx| {
             this.title.menu = None;
             // An item that moved focus (Rename's input) keeps it.
             if let Some(previous) = previous.as_ref().filter(|_| menu.focus_handle(cx).contains_focused(window, cx)) {
                 previous.focus(window, cx);
+                this.title.quiet_ring.set(pointer);
             }
             cx.notify();
         });

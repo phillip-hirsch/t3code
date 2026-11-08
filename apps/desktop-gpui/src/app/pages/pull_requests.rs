@@ -371,7 +371,7 @@ impl Workspace {
             connected.retain(|(id, _)| Some(*id) == environment);
             return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
         }
-        let known = connected.iter().all(|(id, _)| self.shell.sequence(id) > 0);
+        let known = connected.iter().all(|(id, _)| self.shell.has_snapshot(id));
         if !known {
             return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
         }
