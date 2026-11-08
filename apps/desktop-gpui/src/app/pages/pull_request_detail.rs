@@ -46,6 +46,8 @@ mod header;
 pub(super) use header::checks_body;
 mod live;
 pub(in crate::app) use live::PanelLayout;
+mod segmented;
+use segmented::Segmented;
 pub(in crate::app) mod write;
 
 const CONVERSATION_PAGE: usize = 10;
@@ -850,6 +852,18 @@ impl Workspace {
         }
     }
 
+    fn select_pr_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.tab = tab;
+        if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
+            self.read_pr_guide(cx);
+        }
+        if tab == Tab::Code {
+            self.open_pr_code(cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_pr_disclosure(&mut self, key: String, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let toggled = Rc::make_mut(&mut panel.toggled);
@@ -1303,16 +1317,11 @@ impl Workspace {
         if detail.capabilities.diff {
             tabs.push((Tab::Code, "Code"));
         }
-        let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, cx, |this, tab, cx| {
-            let Some(panel) = this.pull_requests.panel.as_mut() else { return };
-            panel.tab = tab;
-            if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
-                this.read_pr_guide(cx);
-            }
-            if tab == Tab::Code {
-                this.open_pr_code(cx);
-            }
-            cx.notify();
+        let toggle = tabs.into_iter().fold(Segmented::new("pr-tab"), |group, (value, label)| {
+            let view = view.clone();
+            group.segment(label, label, value == tab, move |_, cx| {
+                view.update(cx, |this, cx| this.select_pr_tab(value, cx));
+            })
         });
         let status = match tab {
             Tab::Summary => Some(self.render_pr_checks_status(detail, checks_state, checks_stale, t, window, cx)),

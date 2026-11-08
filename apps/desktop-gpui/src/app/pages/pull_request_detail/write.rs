@@ -598,35 +598,20 @@ impl Workspace {
         let submitting = write.submitting;
         let review_label = if pending.is_empty() { "Review".to_owned() } else { format!("Review ({})", pending.len()) };
         let heading = if can_comment && !verdicts.is_empty() {
-            let pick = |mode: bool, label: String, cx: &mut Context<Self>| {
-                let pressed = review_mode == mode;
-                div()
-                    .id(if mode { "pr-composer-review" } else { "pr-composer-comment" })
-                    .h(px(24.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .text_color(if pressed { t.foreground } else { t.muted_foreground })
-                    .when(pressed, |el| el.bg(Hsla { a: t.input.a * 0.72, ..t.input }))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(write) = this.pr_write() {
-                            write.review_mode = mode;
-                        }
-                        cx.notify();
-                    }))
-            };
-            h_flex()
-                .p(px(2.))
-                .gap(px(2.))
-                .rounded(px(8.))
-                .bg(Hsla { a: t.input.a * 0.4, ..t.input })
-                .child(pick(false, "Comment".into(), cx))
-                .child(pick(true, review_label, cx))
+            let view = cx.entity();
+            [(false, "comment", "Comment".to_owned()), (true, "review", review_label)]
+                .into_iter()
+                .fold(Segmented::new("pr-composer-mode"), |group, (mode, key, label)| {
+                    let view = view.clone();
+                    group.segment(key, label, review_mode == mode, move |_, cx| {
+                        view.update(cx, |this, cx| {
+                            if let Some(write) = this.pr_write() {
+                                write.review_mode = mode;
+                            }
+                            cx.notify();
+                        });
+                    })
+                })
                 .into_any_element()
         } else {
             div()
@@ -1274,28 +1259,21 @@ impl Workspace {
         );
         let text = text_of(&input, cx);
         let empty = text.trim().is_empty();
-        let mode = |value: bool, label: &'static str, cx: &mut Context<Self>| {
-            let pressed = preview == value;
-            div()
-                .id(if value { "pr-editor-preview" } else { "pr-editor-write" })
-                .h(px(24.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .cursor_pointer()
-                .text_color(if pressed { t.foreground } else { t.muted_foreground })
-                .when(pressed, |el| el.bg(Hsla { a: t.input.a * 0.72, ..t.input }))
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(editing) = this.pr_write().and_then(|w| w.editing.as_mut()) {
-                        editing.preview = value;
-                    }
-                    cx.notify();
-                }))
-        };
+        let view = cx.entity();
+        let modes = [(false, "write", "Write"), (true, "preview", "Preview")].into_iter().fold(
+            Segmented::new("pr-editor-mode").disabled(saving),
+            |group, (value, key, label)| {
+                let view = view.clone();
+                group.segment(key, label, preview == value, move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(editing) = this.pr_write().and_then(|w| w.editing.as_mut()) {
+                            editing.preview = value;
+                        }
+                        cx.notify();
+                    });
+                })
+            },
+        );
         let body = if preview {
             let rendered = (!empty).then(|| self.pr_markdown("editor-preview", &text, cx)).flatten();
             div()
@@ -1321,15 +1299,7 @@ impl Workspace {
             v_flex()
                 .w_full()
                 .gap(px(8.))
-                .child(
-                    h_flex()
-                        .p(px(2.))
-                        .gap(px(2.))
-                        .rounded(px(8.))
-                        .bg(Hsla { a: t.input.a * 0.4, ..t.input })
-                        .child(mode(false, "Write", cx))
-                        .child(mode(true, "Preview", cx)),
-                )
+                .child(modes)
                 .child(body)
                 .child(
                     h_flex()
