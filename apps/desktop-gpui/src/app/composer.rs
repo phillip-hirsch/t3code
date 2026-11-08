@@ -462,10 +462,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         self.composer.update(cx, |state, cx| {
-            if !edit.is_noop() {
-                state.replace_ranges(&edit.changes, window, cx);
+            if edit.is_noop() {
+                state.set_selected_range(edit.select, cx);
+            } else {
+                state.replace_ranges(&edit.changes, edit.select, window, cx);
             }
-            state.set_selected_range(edit.select, cx);
         });
         true
     }

@@ -220,7 +220,10 @@ gpui-component's `src/text/compat.rs` forwards `on_task_toggle` from its `TextVi
 **Several ranges change in one undo step.** Enter in a numbered list adds an item and renumbers
 the ones after it, which may hold chips; one replacement over all of it would drop them. The
 patch, in `src/input/base/inline_tokens.rs`: `replace_ranges`, a public front for the crate's
-`replace_text_in_ranges` with the atomic intent `replace` uses.
+`replace_text_in_ranges` with the atomic intent `replace` uses. It takes the caret the edit
+leaves, which `replace_text_in_ranges_selecting` in `src/input/base/state.rs` sets before the step
+records its cursors, so redo restores that caret rather than one per range. Test there:
+`test_replace_ranges_redo_restores_chosen_selection`.
 
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
