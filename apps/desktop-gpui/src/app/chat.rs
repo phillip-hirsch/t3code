@@ -797,6 +797,15 @@ pub(super) fn render_row(
             }
         }
         Row::Handoff(handoff) => lane(8., handoff_divider(handoff, this, &t, cx)).into_any_element(),
+        Row::Approval { request_id, .. } => this
+            .update(cx, |workspace, cx| {
+                let approvals = workspace.open_projection().map(|p| p.pending_approvals()).unwrap_or_default();
+                let (request, item) = approvals.into_iter().find(|(request, _)| request.id == request_id.as_ref())?;
+                Some(workspace.render_approval(request, item, &t, cx))
+            })
+            .ok()
+            .flatten()
+            .map_or_else(|| div().into_any_element(), |approval| lane(0., approval).into_any_element()),
     }
 }
 

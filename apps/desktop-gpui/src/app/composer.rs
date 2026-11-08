@@ -747,7 +747,13 @@ impl Workspace {
                 .w_full()
                 // Only the stack takes the pointer; the transcript shows and scrolls around it.
                 .occlude()
-                .children(approvals.iter().map(|(request, item)| self.render_approval(request, *item, &t, cx)))
+                // Approvals the timeline shows where they were asked stay there.
+                .children(
+                    approvals
+                        .iter()
+                        .filter(|(request, _)| !self.timeline_shows_approval(&request.id))
+                        .map(|(request, item)| self.render_approval(request, *item, &t, cx)),
+                )
                 .children(self.render_banner_dock(&t, cx))
                 .child(
                     div()
@@ -1059,7 +1065,13 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_approval(
+    fn timeline_shows_approval(&self, request_id: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|row| matches!(row, crate::timeline::Row::Approval { request_id: id, .. } if id == request_id))
+    }
+
+    pub(super) fn render_approval(
         &self,
         request: &RuntimeRequest,
         item: Option<&TurnItem>,

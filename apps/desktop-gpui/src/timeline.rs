@@ -114,6 +114,11 @@ pub enum Row {
     },
     /// A provider handoff, or the one the composer's pick would start (`HandoffRow`).
     Handoff(Rc<HandoffRow>),
+    /// A pending approval where the agent asked for it, with its answers (`TimelinePendingApprovalRow`).
+    Approval {
+        id: SharedString,
+        request_id: SharedString,
+    },
     /// A queued follow-up, after the timeline (`QueuedRunsControl`).
     Queued {
         message: Rc<crate::queue::QueuedMessage>,
@@ -1877,8 +1882,9 @@ pub fn rows(
                         || e.question_answered
                         || is_pending(e)
                 };
-                // A pending approval is drawn once, with its buttons, by the composer.
-                if is_pending(work) {
+                // A pending approval shows where the agent asked, with its buttons.
+                if let Some(request_id) = work.approval_request_id.as_ref().filter(|_| is_pending(work)) {
+                    rows.push(Row::Approval { id: entry.id.clone(), request_id: request_id.clone() });
                     index += 1;
                     continue;
                 }
@@ -2319,6 +2325,7 @@ mod tests {
                 Row::Request(card) => format!("request {}", card.item_id),
                 Row::ModelSwitch { switch, .. } => format!("model-switch {} {}", switch.0.model, switch.1.model),
                 Row::Handoff(handoff) => format!("handoff {}", handoff.endpoints.to.instance_id),
+                Row::Approval { request_id, .. } => format!("approval {request_id}"),
             })
             .collect()
     }
@@ -3019,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_approval_is_left_to_the_composer() {
+    fn a_pending_approval_shows_where_it_was_asked() {
         let items = vec![
             item(
                 "u",
@@ -3047,7 +3054,7 @@ mod tests {
         let pending = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         p.runtime_requests = vec![request("resolved")];
         let resolved = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
-        assert_eq!(pending, ["user go", "working"]);
+        assert_eq!(pending, ["user go", "working", "approval q"]);
         assert_eq!(resolved, ["user go", "working", "live rm -rf build"]);
     }
 }
