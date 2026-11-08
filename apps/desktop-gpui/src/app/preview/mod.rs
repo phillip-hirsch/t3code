@@ -785,7 +785,7 @@ impl Workspace {
                 }
             }
             PageEvent::Failed { url, code, description } => {
-                tab.status = NavStatus::LoadFailed { url, title, code, description };
+                tab.status = NavStatus::LoadFailed { url, title, code, description, download: None };
             }
             PageEvent::OpenLink(url) => {
                 let thread_id = tab.thread_id.clone();

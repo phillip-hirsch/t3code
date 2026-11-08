@@ -29,7 +29,18 @@ pub enum NavStatus {
         code: i64,
         #[serde(default)]
         description: String,
+        /// The navigation was a file the server's browser downloaded instead of showing.
+        #[serde(default)]
+        download: Option<FileDownload>,
     },
+}
+
+/// `PreviewFileDownload`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDownload {
+    pub id: String,
+    pub file_name: String,
 }
 
 impl NavStatus {
@@ -56,8 +67,13 @@ impl NavStatus {
             NavStatus::Idle => json!({"_tag": "Idle"}),
             NavStatus::Loading { url, title } => json!({"_tag": "Loading", "url": url, "title": title}),
             NavStatus::Success { url, title } => json!({"_tag": "Success", "url": url, "title": title}),
-            NavStatus::LoadFailed { url, title, code, description } => {
-                json!({"_tag": "LoadFailed", "url": url, "title": title, "code": code, "description": description})
+            NavStatus::LoadFailed { url, title, code, description, download } => {
+                let mut status =
+                    json!({"_tag": "LoadFailed", "url": url, "title": title, "code": code, "description": description});
+                if let Some(download) = download {
+                    status["download"] = json!({"id": download.id, "fileName": download.file_name});
+                }
+                status
             }
         }
     }
@@ -441,6 +457,8 @@ impl ThreadPreviews {
             code: i64,
             #[serde(default)]
             description: String,
+            #[serde(default)]
+            download: Option<FileDownload>,
         }
         let event = Event::deserialize(event)?;
         if self.server_epoch.as_deref().is_some_and(|epoch| epoch != event.server_epoch) {
@@ -469,6 +487,7 @@ impl ThreadPreviews {
                     title: event.title,
                     code: event.code,
                     description: event.description,
+                    download: event.download,
                 };
                 session.updated_at = event.created_at;
             }
@@ -1252,6 +1271,15 @@ mod tests {
             "revision": 6, "url": "https://c.test/", "title": "", "code": -105, "description": "ERR_NAME_NOT_RESOLVED"});
         previews.apply_event(&failed).unwrap();
         assert!(matches!(previews.active().unwrap().nav_status, NavStatus::LoadFailed { code: -105, .. }));
+
+        let downloaded = json!({"type": "failed", "threadId": "t1", "tabId": "c", "createdAt": "4", "serverEpoch": "e1",
+            "revision": 6, "url": "https://c.test/a.zip", "title": "", "code": -3, "description": "ERR_ABORTED",
+            "download": {"id": "d1", "fileName": "a.zip"}});
+        previews.apply_event(&downloaded).unwrap();
+        let status = &previews.active().unwrap().nav_status;
+        let download = FileDownload { id: "d1".into(), file_name: "a.zip".into() };
+        assert!(matches!(status, NavStatus::LoadFailed { download: Some(d), .. } if *d == download));
+        assert_eq!(status.to_json()["download"], json!({"id": "d1", "fileName": "a.zip"}));
 
         let closed = json!({"type": "closed", "threadId": "t1", "tabId": "c", "createdAt": "5", "serverEpoch": "e1",
             "revision": 7});
