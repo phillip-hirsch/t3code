@@ -2194,7 +2194,9 @@ fn has_body(entry: &Entry, label: &str) -> bool {
 }
 
 fn expandable(entry: &Entry, label: &str) -> bool {
-    if entry.is_reasoning() {
+    if entry.question.is_some() {
+        true
+    } else if entry.is_reasoning() {
         entry.detail.is_some()
     } else {
         super::inspector::has_inspector(entry) || has_body(entry, label)
@@ -2239,6 +2241,9 @@ fn entry_details(
                 .into_any_element(),
         );
     }
+    if let Some(question) = &entry.question {
+        return Some(question_history(&entry.id, question, t));
+    }
     if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
         return Some(div().mt(px(2.)).mb(px(6.)).pb(px(8.)).child(inspector).into_any_element());
     }
@@ -2258,6 +2263,50 @@ fn entry_details(
             .child(body)
             .into_any_element(),
     )
+}
+
+/// A row's label: an answered request names its questions, then what was answered, which
+/// reads muted once the answers show below.
+fn entry_label(entry: &Entry, label: SharedString, expanded: bool, t: &Tokens) -> AnyElement {
+    let Some(question) = &entry.question else { return label.into_any_element() };
+    let heading = if question.heading.is_empty() { label } else { question.heading.clone() };
+    let Some(preview) = &question.preview else { return heading.into_any_element() };
+    h_flex()
+        .min_w_0()
+        .gap(px(6.))
+        .child(div().min_w_0().truncate().child(heading))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(if expanded { t.muted_foreground } else { t.foreground })
+                .child(preview.clone()),
+        )
+        .into_any_element()
+}
+
+/// `QuestionAnswerHistory`: each question, its answer, and the files sent with it.
+fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -> AnyElement {
+    let text = || div().text_size(px(TEXT)).line_height(px(LINE)).text_color(t.muted_foreground);
+    v_flex()
+        .id(ElementId::Name(format!("answers:{id}").into()))
+        .ml(px(28.))
+        .mt(px(8.))
+        .gap(px(8.))
+        .cursor_default()
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .children(question.questions.iter().map(|q| {
+            v_flex()
+                .gap(px(4.))
+                .children(q.text.clone().map(|question| text().child(question)))
+                .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
+                .when(!q.attachments.is_empty(), |el| {
+                    el.child(h_flex().flex_wrap().gap(px(8.)).children(
+                        q.attachments.iter().map(|name| text().text_color(t.foreground).underline().child(name.clone())),
+                    ))
+                })
+        }))
+        .into_any_element()
 }
 
 fn single_entry(
@@ -2312,6 +2361,7 @@ fn single_entry(
     } else {
         label.clone()
     };
+    let label_text = entry_label(entry, label_text, expanded, t);
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     let expandable = expandable(entry, label);
@@ -2335,6 +2385,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
     let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
     let expandable = expandable(entry, label);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
+    let shown = entry_label(entry, shown, expanded, t);
     let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
