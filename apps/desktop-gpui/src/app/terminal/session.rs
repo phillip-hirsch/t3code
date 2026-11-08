@@ -13,7 +13,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor};
 use gpui_kit::{
     AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -37,6 +37,14 @@ use crate::rpc::{RpcClient, RpcError, StreamEvent};
 const MAX_WRITE_UNITS: usize = 65_536;
 /// Drawer drags resize every frame; the PTY hears the size once it settles.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
+/// `CURSOR_BLINK_INTERVAL_MS`: a focused cursor blinks unless the app or reduced motion stops it.
+const CURSOR_BLINK: Duration = Duration::from_millis(500);
+
+/// Ghostty's defaults as the web sets them: the cursor blinks from the start and after a
+/// `DECSCUSR` reset.
+fn term_config() -> Config {
+    Config { default_cursor_style: CursorStyle { shape: CursorShape::Block, blinking: true }, ..Config::default() }
+}
 
 #[derive(Clone, Default)]
 pub(super) struct Listener(Rc<RefCell<Vec<Event>>>);
@@ -160,7 +168,7 @@ pub(super) struct Emulator {
 
 impl Emulator {
     fn new(size: GridSize, events: &Listener) -> Self {
-        Self { term: Term::new(Config::default(), &size, events.clone()), revision: 0 }
+        Self { term: Term::new(term_config(), &size, events.clone()), revision: 0 }
     }
 }
 
@@ -211,6 +219,13 @@ pub(super) struct TerminalSession {
     _attach: Option<Task<()>>,
     _resize: Option<Task<()>>,
     scrollbar: Scrollbar,
+    focused: bool,
+    /// Lit, or in the dark half of a blink.
+    cursor_on: bool,
+    /// Output since the last blink tick keeps the cursor lit through the next.
+    cursor_held: bool,
+    /// A blink loop is running.
+    blinking: bool,
     _focus: [Subscription; 4],
 }
 
@@ -263,8 +278,17 @@ impl TerminalSession {
         let focus = cx.focus_handle();
         let scrollbar = Scrollbar { focus: cx.focus_handle().tab_stop(true), track: Rc::default(), grab: None };
         let _focus = [
-            cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
-            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus(&focus, window, |this, _, cx| {
+                this.focused = true;
+                this.cursor_on = true;
+                this.blink(cx);
+                cx.notify();
+            }),
+            cx.on_blur(&focus, window, |this, _, cx| {
+                this.focused = false;
+                this.cursor_on = true;
+                cx.notify();
+            }),
             cx.on_focus(&scrollbar.focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&scrollbar.focus, window, |_, _, cx| cx.notify()),
         ];
@@ -292,6 +316,10 @@ impl TerminalSession {
             scroll_remainder: 0.,
             pointer: Default::default(),
             scrollbar,
+            focused: false,
+            cursor_on: true,
+            cursor_held: false,
+            blinking: false,
             _attach: None,
             _resize: None,
             _focus,
@@ -414,7 +442,7 @@ impl TerminalSession {
 
     fn reset(&mut self) {
         let size = self.shown_size();
-        *self.term = Term::new(Config::default(), &size, self.events.clone());
+        *self.term = Term::new(term_config(), &size, self.events.clone());
         self.parser = Processor::new();
     }
 
@@ -423,6 +451,9 @@ impl TerminalSession {
     fn feed(&mut self, data: &str, reply: bool, cx: &mut Context<Self>) {
         self.parser.advance(&mut *self.term, data.as_bytes());
         self.pointer.forget_hover();
+        self.cursor_on = true;
+        self.cursor_held = true;
+        self.blink(cx);
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
         for event in events {
             match event {
@@ -446,6 +477,39 @@ impl TerminalSession {
                 _ => {}
             }
         }
+    }
+
+    fn blinks(&self) -> bool {
+        self.focused && self.term.cursor_style().blinking && self.term.mode().contains(TermMode::SHOW_CURSOR)
+    }
+
+    /// Starts the focused cursor's blink (`scheduleCursorBlink`) unless it already runs.
+    fn blink(&mut self, cx: &mut Context<Self>) {
+        if self.blinking || !self.blinks() {
+            return;
+        }
+        self.blinking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK).await;
+                if !matches!(this.update(cx, Self::blink_tick), Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Half a blink; whether the blink goes on.
+    fn blink_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let held = std::mem::take(&mut self.cursor_held);
+        self.blinking = self.blinks() && !crate::desktop::snap_shot::reduced_motion();
+        let on = !self.blinking || held || !self.cursor_on;
+        if on != self.cursor_on {
+            self.cursor_on = on;
+            cx.notify();
+        }
+        self.blinking
     }
 
     fn system_message(&mut self, message: &str) {
@@ -747,7 +811,7 @@ impl Render for TerminalSession {
             .on_action(cx.listener(|this, _: &input::Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &input::Paste, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &input::SelectAll, _, cx| this.select_all(cx)))
-            .child(TerminalGrid { session: cx.entity(), theme, focused })
+            .child(TerminalGrid { session: cx.entity(), theme, focused, cursor_on: self.cursor_on })
             .children(self.render_scrollbar(window, cx))
             .children(self.render_selection_menu())
             .context_menu(menu)
@@ -824,6 +888,17 @@ impl EntityInputHandler for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cursor_blinks_until_the_app_asks_for_a_steady_one() {
+        let mut emulator = Emulator::new(GridSize { columns: 10, rows: 2 }, &Listener::default());
+        let mut parser: Processor = Processor::new();
+        assert!(emulator.cursor_style().blinking);
+        parser.advance(&mut *emulator, b"[2 q");
+        assert!(!emulator.cursor_style().blinking);
+        parser.advance(&mut *emulator, b"[0 q");
+        assert!(emulator.cursor_style().blinking);
+    }
 
     #[test]
     fn writes_split_below_the_server_limit_on_char_boundaries() {

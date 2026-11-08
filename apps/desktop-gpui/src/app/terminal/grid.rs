@@ -332,6 +332,8 @@ pub(super) struct TerminalGrid {
     pub session: Entity<TerminalSession>,
     pub theme: TerminalTheme,
     pub focused: bool,
+    /// Off in the dark half of the focused cursor's blink.
+    pub cursor_on: bool,
 }
 
 impl IntoElement for TerminalGrid {
@@ -429,7 +431,7 @@ impl Element for TerminalGrid {
         let cursor_point = content.cursor.point;
         let cursor_shape = content.cursor.shape;
         let display_offset = content.display_offset;
-        let show_cursor = display_offset == 0 && !content.mode.contains(TermMode::VI);
+        let show_cursor = self.cursor_on && display_offset == 0 && !content.mode.contains(TermMode::VI);
         let cell_origin =
             |row: usize, column: usize| origin + point(cell_width * column as f32, line_height * row as f32);
         let mut backgrounds = Vec::with_capacity(batched.backgrounds.len() + batched.selection.len());

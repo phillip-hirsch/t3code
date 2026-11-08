@@ -128,6 +128,7 @@ impl Workspace {
 
     /// Drops a closed terminal from its tab; the tab closes with its last terminal.
     pub(super) fn close_panel_terminal(&mut self, thread_id: &str, terminal_id: &str) {
+        let shown = self.shown_terminal_thread() == Some(thread_id);
         let mut emptied = Vec::new();
         for (surface, group) in self.terminals.panel.iter_mut().filter(|(_, g)| g.thread_id == thread_id) {
             let Some(index) = group.terminal_ids.iter().position(|id| id == terminal_id) else { continue };
@@ -137,7 +138,9 @@ impl Workspace {
                     if group.active == terminal_id {
                         group.active = next.clone();
                     }
-                    self.terminals.focus_pending = Some(group.active.clone());
+                    if shown {
+                        self.terminals.focus_pending = Some((thread_id.to_owned(), group.active.clone()));
+                    }
                 }
                 None => emptied.push(surface.clone()),
             }
@@ -159,17 +162,25 @@ impl Workspace {
         }
     }
 
-    /// Closing the tab asks first (`confirmTerminalClose`), then closes its terminals.
+    /// Drops the shown target's tab alone; its terminals keep running on the server.
+    fn drop_terminal_surface(&mut self, surface: String) {
+        self.terminals.panel.remove(&surface);
+        if let Some(target) = self.target.clone() {
+            self.drop_surface(&target, &Surface::Terminal(surface));
+        }
+    }
+
+    /// Closing the tab asks first (`confirmTerminalClose`), then closes its terminals. Without
+    /// `terminal:operate` only the tab closes, as in `useRightPanelSurfaceClose`.
     pub(in crate::app) fn request_close_terminal_surface(
         &mut self,
         surface: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(group) = self.terminals.panel.get(&surface).cloned() else {
-            if let Some(target) = self.target.clone() {
-                self.drop_surface(&target, &Surface::Terminal(surface));
-            }
+        let group = self.terminals.panel.get(&surface).cloned();
+        let Some(group) = group.filter(|group| self.terminal_operable(&group.thread_id)) else {
+            self.drop_terminal_surface(surface);
             cx.notify();
             return;
         };
@@ -195,7 +206,7 @@ impl Workspace {
         };
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (workspace, group) = (workspace.clone(), group.clone());
+            let (workspace, group, surface) = (workspace.clone(), group.clone(), surface.clone());
             alert
                 .title(title.clone())
                 .description(description.clone())
@@ -205,11 +216,17 @@ impl Workspace {
                 .centered()
                 .width(px(512.))
                 .on_ok(move |_, window, cx| {
-                    let (workspace, group) = (workspace.clone(), group.clone());
+                    let (workspace, group, surface) = (workspace.clone(), group.clone(), surface.clone());
                     window.defer(cx, move |_, cx| {
+                        // The grant is read again: it may have changed while the dialog was open.
                         let _ = workspace.update(cx, |this, cx| {
-                            for id in &group.terminal_ids {
-                                this.close_terminal(&group.thread_id, id, cx);
+                            if this.terminal_operable(&group.thread_id) {
+                                for id in &group.terminal_ids {
+                                    this.close_terminal(&group.thread_id, id, cx);
+                                }
+                            } else {
+                                this.drop_terminal_surface(surface);
+                                cx.notify();
                             }
                         });
                     });

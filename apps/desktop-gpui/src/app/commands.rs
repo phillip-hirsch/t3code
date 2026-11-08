@@ -427,7 +427,7 @@ fn next_area(shown: &[Area], current: Option<Area>, forward: bool) -> Option<Are
 }
 
 impl Workspace {
-    /// The areas on screen, in cycle order.
+    /// The areas on screen, in cycle order; a maximized panel hides the column beside it.
     fn shown_areas(&self, window: &Window) -> Vec<Area> {
         if self.settings.is_some() {
             return vec![Area::SettingsNav, Area::SettingsPage];
@@ -437,17 +437,21 @@ impl Workspace {
             // Usage is a modal with no areas of its own.
             Some(page) if page.is_modal() => return Vec::new(),
             Some(pages::Page::PullRequests) => {
-                vec![sidebar, (Area::Content, true), (Area::Panel, self.pull_request_panel_shown())]
+                let list = !self.pull_request_panel_maximized();
+                vec![sidebar, (Area::Content, list), (Area::Panel, self.pull_request_panel_shown())]
             }
             Some(_) => vec![sidebar],
-            None => vec![
-                sidebar,
-                (Area::Content, matches!(self.target, None | Some(Target::Thread { .. }))),
-                (Area::Composer, self.target.is_some()),
-                (Area::Details, self.details_shown(window)),
-                (Area::Panel, self.right_panel_open()),
-                (Area::Terminal, self.terminal_open()),
-            ],
+            None => {
+                let chat = !self.right_panel_maximized();
+                vec![
+                    sidebar,
+                    (Area::Content, chat && matches!(self.target, None | Some(Target::Thread { .. }))),
+                    (Area::Composer, chat && self.target.is_some()),
+                    (Area::Details, chat && self.details_shown(window)),
+                    (Area::Panel, self.right_panel_open()),
+                    (Area::Terminal, chat && self.terminal_open()),
+                ]
+            }
         };
         areas.into_iter().filter_map(|(area, on)| on.then_some(area)).collect()
     }
