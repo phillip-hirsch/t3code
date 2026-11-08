@@ -200,8 +200,7 @@ pub(super) fn header(
         .gap_2()
         .child(svg().path(icon).size(px(16.)).flex_none().text_color(icon_color))
         .on_click(move |_, _, cx| {
-            state.update(cx, |state, cx| state.set_file_collapsed(&fold_path, !collapsed, cx));
-            fold_view.update(cx, Workspace::remember_collapsed);
+            fold_view.update(cx, |this, cx| this.fold_diff_file(&fold_path, !collapsed, cx));
         })
         .child(
             div()

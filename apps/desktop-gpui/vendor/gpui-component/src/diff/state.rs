@@ -561,6 +561,38 @@ impl DiffState {
         self.selected_lines.clone()
     }
     /// Whether the file at `path` shows only its header.
+    /// The files with a row in the viewport or within `margin` below it, as file
+    /// indices, as of the last layout; empty before the first. Rows below the
+    /// viewport that were never laid out count at the row height.
+    pub fn files_near_viewport(&self, margin: Pixels) -> Range<usize> {
+        let viewport = self.list.viewport_bounds();
+        if self.rows.is_empty() || viewport.size.height <= px(0.) {
+            return 0..0;
+        }
+        let row_height = self.row_height.unwrap_or(px(20.));
+        let limit = viewport.bottom() + margin;
+        let first = self.list.logical_scroll_top().item_ix.min(self.rows.len() - 1);
+        let (mut last, mut next_top) = (first, viewport.top());
+        for ix in first..self.rows.len() {
+            let top = match self.list.bounds_for_item(ix) {
+                Some(bounds) => {
+                    next_top = bounds.bottom();
+                    bounds.top()
+                }
+                None => {
+                    let top = next_top;
+                    next_top += row_height;
+                    top
+                }
+            };
+            if top > limit {
+                break;
+            }
+            last = ix;
+        }
+        self.rows[first].file()..self.rows[last].file() + 1
+    }
+
     pub fn is_file_collapsed(&self, path: &str) -> bool {
         self.collapsed.contains(path)
     }

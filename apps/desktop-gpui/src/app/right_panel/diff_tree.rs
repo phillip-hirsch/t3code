@@ -251,10 +251,7 @@ impl Workspace {
                     this.rebuild_tree_rows(cx);
                 } else {
                     this.right_panel.tree_selected = Some(path.clone());
-                    this.right_panel.diff.update(cx, |state, cx| {
-                        state.set_file_collapsed(&path, false, cx);
-                        state.scroll_to_file(&path, cx);
-                    });
+                    this.reveal_diff_file(&path, cx);
                 }
                 cx.notify();
             }))

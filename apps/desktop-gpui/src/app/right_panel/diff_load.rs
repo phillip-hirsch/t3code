@@ -1,6 +1,8 @@
 //! The git diff's two-step read (`useReviewFilePatches`): the preview carries every file's stats,
 //! and a large or `metadataOnly` comparison sends its patches one file per request.
 
+use std::collections::VecDeque;
+
 use crate::turn_diff_tree::natural_cmp;
 
 use gpui_kit::component::diff::{DiffFile, DiffParseOptions};
@@ -10,6 +12,91 @@ use serde_json::{Value, json};
 const TRUNCATED_MARKER: &str = "\n\n[truncated]";
 /// Patch reads in flight at once (`patchReads` in client-runtime's review state).
 pub(super) const PATCH_READS: usize = 4;
+/// Files read before anything asks (`INITIAL_FILE_COUNT`), and each later batch's size.
+const BATCH: usize = 4;
+/// How far below the viewport a pending file's header asks for its patch (`rootMargin`).
+pub(super) const DEMAND_MARGIN: f32 = 600.;
+
+/// Where one file's patch read is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+    Unasked,
+    Queued,
+    Reading,
+    Done,
+}
+
+/// Which files' patches to read, and when (`useReviewFilePatches`' requested paths under
+/// client-runtime's `patchReads` limit): the first batch at once, then the files something asks
+/// for, each read once, at most [`PATCH_READS`] at a time, in the order asked.
+#[derive(Debug)]
+pub(super) struct PatchDemand {
+    reads: Vec<Read>,
+    queue: VecDeque<usize>,
+    in_flight: usize,
+}
+
+impl PatchDemand {
+    pub(super) fn new(len: usize) -> Self {
+        let mut demand = Self { reads: vec![Read::Unasked; len], queue: VecDeque::new(), in_flight: 0 };
+        demand.request(0..BATCH);
+        demand
+    }
+
+    /// `requestFiles`: asks for files not asked for yet.
+    pub(super) fn request(&mut self, indices: impl IntoIterator<Item = usize>) {
+        for index in indices {
+            if self.reads.get(index) == Some(&Read::Unasked) {
+                self.reads[index] = Read::Queued;
+                self.queue.push_back(index);
+            }
+        }
+    }
+
+    /// `loadNextFiles`: the batch after the files that settled in order, unless its first file
+    /// was already asked for and is on its way.
+    pub(super) fn load_next(&mut self, first_unsettled: usize) {
+        if self.reads.get(first_unsettled) == Some(&Read::Unasked) {
+            self.request(first_unsettled..first_unsettled + BATCH);
+        }
+    }
+
+    /// `retry`: reads a settled file again, ahead of the rest.
+    pub(super) fn retry(&mut self, index: usize) {
+        if self.reads.get(index) == Some(&Read::Done) {
+            self.reads[index] = Read::Queued;
+            self.queue.push_front(index);
+        }
+    }
+
+    /// Reads asked for that have not settled: the patch is still loading while any remain.
+    pub(super) fn outstanding(&self) -> usize {
+        self.reads.iter().filter(|read| matches!(read, Read::Queued | Read::Reading)).count()
+    }
+
+    pub(super) fn is_requested(&self, index: usize) -> bool {
+        self.reads.get(index).is_some_and(|read| *read != Read::Unasked)
+    }
+
+    /// The reads to start now.
+    pub(super) fn start(&mut self) -> Vec<usize> {
+        let mut started = Vec::new();
+        while self.in_flight < PATCH_READS {
+            let Some(index) = self.queue.pop_front() else { break };
+            self.reads[index] = Read::Reading;
+            self.in_flight += 1;
+            started.push(index);
+        }
+        started
+    }
+
+    pub(super) fn settle(&mut self, index: usize) {
+        if self.reads.get(index) == Some(&Read::Reading) {
+            self.reads[index] = Read::Done;
+            self.in_flight -= 1;
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FileStat {
@@ -116,8 +203,8 @@ pub(super) fn settle_file(file: &FileStat, reply: Option<&Value>, source_kind: &
     }
 }
 
-/// A header-only row that names the file, for a patch that did not load.
-fn placeholder(file: &FileStat) -> Vec<DiffFile> {
+/// A header-only row that names the file, for a patch that did not load or is still on its way.
+pub(super) fn placeholder(file: &FileStat) -> Vec<DiffFile> {
     let previous = file.previous_path.as_deref().unwrap_or(&file.path);
     parse_patch(
         &format!(
@@ -146,6 +233,39 @@ mod tests {
         // A complete patch renders as it is, and a truncated one without stats parses what it holds.
         assert!(deferred_files(&json!({"diff": "x", "truncated": false, "files": source["files"]})).is_empty());
         assert!(deferred_files(&json!({"diff": "x", "truncated": true})).is_empty());
+    }
+
+    #[test]
+    fn patches_load_the_first_batch_then_what_is_asked_for_a_few_at_a_time() {
+        let mut demand = PatchDemand::new(10);
+        assert_eq!(demand.start(), [0, 1, 2, 3]);
+        assert!(!demand.is_requested(4));
+        // A header scrolled near asks for its file; it waits for a free read.
+        demand.request([7, 7, 2]);
+        assert!(demand.is_requested(7));
+        assert_eq!(demand.start(), Vec::<usize>::new());
+        assert_eq!(demand.outstanding(), 5);
+        demand.settle(1);
+        assert_eq!(demand.start(), [7]);
+        // The next batch starts after the files that settled in order; while its first file is
+        // on its way, asking again adds nothing.
+        demand.load_next(4);
+        demand.load_next(4);
+        for index in [0, 2, 3, 7] {
+            demand.settle(index);
+        }
+        assert_eq!(demand.start(), [4, 5, 6]);
+        assert!(!demand.is_requested(8));
+        assert_eq!(demand.outstanding(), 3, "files nobody asked for are not loading");
+        // A retry jumps the queue; past the end nothing is asked for.
+        demand.request([8, 9, 12]);
+        demand.settle(4);
+        demand.retry(4);
+        demand.retry(9);
+        demand.settle(5);
+        assert_eq!(demand.start(), [4, 8, 9]);
+        demand.load_next(12);
+        assert!(!demand.is_requested(12));
     }
 
     #[test]

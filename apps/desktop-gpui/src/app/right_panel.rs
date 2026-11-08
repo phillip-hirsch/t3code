@@ -263,7 +263,7 @@ enum DiffLoad {
         head: Option<String>,
         base: Option<String>,
         truncated: bool,
-        /// Files whose patches are still loading.
+        /// Patch reads asked for that have not settled.
         pending: usize,
     },
     Empty(&'static str),
@@ -296,8 +296,37 @@ struct FilePatches {
     files: Vec<diff_load::FileStat>,
     /// `files` by path, for the headers' counts.
     stats: std::rc::Rc<HashMap<SharedString, diff_load::FileStat>>,
+    /// Each file's index in `files`, by path.
+    index: HashMap<SharedString, usize>,
+    /// The header-only row each file shows until its patch settles (the `:pending` rows).
+    placeholders: Vec<Vec<DiffFile>>,
     rows: Vec<Option<(Vec<DiffFile>, diff_load::FileState)>>,
-    _retries: Vec<Task<()>>,
+    demand: diff_load::PatchDemand,
+    _reads: Vec<Task<()>>,
+}
+
+impl FilePatches {
+    fn new(
+        selection: (Target, DiffScope),
+        client: RpcClient,
+        request: diff_load::PatchRequest,
+        files: Vec<diff_load::FileStat>,
+    ) -> Self {
+        let stats = files.iter().map(|file| (file.path.clone().into(), file.clone())).collect();
+        let index = files.iter().enumerate().map(|(index, file)| (file.path.clone().into(), index)).collect();
+        Self {
+            selection,
+            client,
+            request,
+            stats: std::rc::Rc::new(stats),
+            index,
+            placeholders: files.iter().map(diff_load::placeholder).collect(),
+            rows: vec![None; files.len()],
+            demand: diff_load::PatchDemand::new(files.len()),
+            files,
+            _reads: Vec::new(),
+        }
+    }
 }
 
 pub(super) struct RightPanel {
@@ -820,13 +849,89 @@ impl Workspace {
     /// Records the shown selection's folds once the user changes one.
     fn remember_collapsed(&mut self, cx: &mut Context<Self>) {
         let Some(shown) = self.right_panel.shown.clone() else { return };
+        // Rows without lines are folded for them, not by the user: one that did not load drops
+        // out, and one still loading keeps the fold it had.
+        let previous = self.current_folds();
         let state = self.right_panel.diff.read(cx);
-        // Rows that did not load are folded for them, not by the user.
         let failed =
-            |path: &&SharedString| self.right_panel.patch_states.get(*path) == Some(&diff_load::FileState::Failed);
-        let folded =
-            state.files().iter().map(DiffFile::path).filter(|path| state.is_file_collapsed(path) && !failed(path));
+            |path: &SharedString| self.right_panel.patch_states.get(path) == Some(&diff_load::FileState::Failed);
+        let folded = state.files().iter().map(DiffFile::path).filter(|path| {
+            if self.pending_patch(path).is_some() {
+                previous.contains(*path)
+            } else {
+                state.is_file_collapsed(path) && !failed(path)
+            }
+        });
         self.right_panel.collapsed.insert(shown, folded.cloned().collect());
+    }
+
+    /// The shown selection's folded files: as the user left them, else `diffFilesCollapsed`.
+    fn current_folds(&self) -> HashSet<SharedString> {
+        let Some(shown) = &self.right_panel.shown else { return HashSet::new() };
+        let paths: Vec<SharedString> = self.right_panel.all_diff_files.iter().map(|f| f.path().clone()).collect();
+        collapsed_files(
+            self.right_panel.collapsed.get(shown),
+            self.client_settings.values.bool("diffFilesCollapsed"),
+            &paths,
+        )
+    }
+
+    /// The index of `path` among the shown selection's lazily read files while its patch is
+    /// still on its way.
+    fn pending_patch(&self, path: &str) -> Option<usize> {
+        let patches = self.right_panel.patches.as_ref()?;
+        if self.right_panel.shown.as_ref() != Some(&patches.selection) {
+            return None;
+        }
+        patches.index.get(path).copied().filter(|index| patches.rows[*index].is_none())
+    }
+
+    /// Folds the shown files to `folded`, remembered for the selection; rows without lines stay
+    /// folded whatever the user chose.
+    fn set_diff_folds(&mut self, folded: HashSet<SharedString>, cx: &mut Context<Self>) {
+        let Some(shown) = self.right_panel.shown.clone() else { return };
+        let paths: Vec<SharedString> =
+            self.right_panel.diff.read(cx).files().iter().map(|file| file.path().clone()).collect();
+        let lineless: HashSet<SharedString> = paths
+            .iter()
+            .filter(|path| {
+                self.pending_patch(path).is_some()
+                    || self.right_panel.patch_states.get(*path) == Some(&diff_load::FileState::Failed)
+            })
+            .cloned()
+            .collect();
+        self.right_panel.diff.update(cx, |state, cx| {
+            for path in &paths {
+                state.set_file_collapsed(path, folded.contains(path) || lineless.contains(path), cx);
+            }
+        });
+        let failed =
+            |path: &SharedString| self.right_panel.patch_states.get(path) == Some(&diff_load::FileState::Failed);
+        let folded = folded.iter().filter(|path| !failed(path)).cloned().collect();
+        self.right_panel.collapsed.insert(shown, folded);
+        cx.notify();
+    }
+
+    /// The header's fold toggle (`toggleDiffFileCollapsed`): a file still loading unfolds and is
+    /// read at once.
+    pub(super) fn fold_diff_file(&mut self, path: &str, collapsed: bool, cx: &mut Context<Self>) {
+        let mut folded = self.current_folds();
+        if collapsed {
+            folded.insert(path.to_owned().into());
+        } else {
+            folded.remove(path);
+        }
+        self.set_diff_folds(folded, cx);
+        if let Some(index) = self.pending_patch(path).filter(|_| !collapsed) {
+            self.request_file_patches([index], cx);
+        }
+    }
+
+    /// `revealDiffFile`: unfolds the file, asks for its patch if it is still loading, and
+    /// scrolls to it.
+    fn reveal_diff_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.fold_diff_file(path, false, cx);
+        self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(path, cx));
     }
 
     /// `useProactivePanels` for turn diffs: with proactive panels on, a turn that just completed
@@ -1069,11 +1174,20 @@ impl Workspace {
                         result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind))
                     })
                     .await;
-            let (deferred, source_base) = match &parsed {
-                Ok(Some(parsed)) => (parsed.deferred.clone(), parsed.base.clone()),
-                _ => (Vec::new(), None),
+            // `useReviewFilePatches`: each file's patch on its own, as the viewport asks for them.
+            let source_base = match &parsed {
+                Ok(Some(parsed)) => parsed.base.clone(),
+                _ => None,
             };
-            let shown = this.update(cx, |this, cx| {
+            let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
+            let patch_request = source_kind.zip(cwd).map(|(source_kind, cwd)| diff_load::PatchRequest {
+                cwd,
+                base_ref,
+                commit_sha,
+                source_kind,
+                ignore_whitespace,
+            });
+            let _ = this.update(cx, |this, cx| {
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
@@ -1091,126 +1205,161 @@ impl Workspace {
                             let sum = |count: fn(&DiffFile) -> usize| parsed.files.iter().map(count).sum::<usize>();
                             (sum(DiffFile::additions), sum(DiffFile::deletions))
                         });
-                        this.show_diff_files(&selection, parsed.files, Install::Replace, cx);
+                        let pending = match patch_request.filter(|_| !parsed.deferred.is_empty()) {
+                            Some(request) => {
+                                let patches =
+                                    FilePatches::new(selection.clone(), client.clone(), request, parsed.deferred);
+                                let outstanding = patches.demand.outstanding();
+                                this.right_panel.patches = Some(patches);
+                                this.show_file_patches(Install::Replace, cx);
+                                this.start_patch_reads(cx);
+                                outstanding
+                            }
+                            None => {
+                                this.show_diff_files(&selection, parsed.files, Install::Replace, cx);
+                                0
+                            }
+                        };
                         DiffLoad::Ready {
                             additions,
                             deletions,
                             head: parsed.head,
                             base: parsed.base,
                             truncated: parsed.truncated,
-                            pending: parsed.deferred.len(),
+                            pending,
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
                 cx.notify();
             });
-            if shown.is_err() || deferred.is_empty() {
-                return;
-            }
-            // `useReviewFilePatches`: each file's patch on its own, a few at a time, in path order.
-            let (Some(source_kind), Some(cwd)) = (source_kind, cwd) else { return };
-            let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
-            let request = diff_load::PatchRequest { cwd, base_ref, commit_sha, source_kind, ignore_whitespace };
-            let started = this.update(cx, |this, _| {
-                this.right_panel.patches = Some(FilePatches {
-                    selection: selection.clone(),
-                    client: client.clone(),
-                    request: request.clone(),
-                    stats: std::rc::Rc::new(
-                        deferred.iter().map(|file| (file.path.clone().into(), file.clone())).collect(),
-                    ),
-                    files: deferred.clone(),
-                    rows: vec![None; deferred.len()],
-                    _retries: Vec::new(),
-                });
-            });
-            if started.is_err() {
-                return;
-            }
-            for (batch, files) in deferred.chunks(diff_load::PATCH_READS).enumerate() {
-                let requests = files.iter().map(|file| client.request("review.getDiffPreview", request.input(file)));
-                let replies = futures::future::join_all(requests).await;
-                let files = files.to_vec();
-                let settled = cx
-                    .background_executor()
-                    .spawn(async move {
-                        files
-                            .iter()
-                            .zip(replies)
-                            .map(|(file, reply)| {
-                                if let Err(error) = &reply {
-                                    log::warn!("diff file patch failed: {error}");
-                                }
-                                diff_load::settle_file(file, reply.as_ref().ok(), source_kind)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-                let first = batch * diff_load::PATCH_READS;
-                let shown = this.update(cx, |this, cx| this.settle_file_patches(first, settled, cx));
-                if !matches!(shown, Ok(true)) {
-                    return;
-                }
-            }
         }));
         cx.notify();
     }
 
-    /// Puts settled rows from `first` on into the lazily read files and shows them; false once
-    /// another selection replaced them.
-    fn settle_file_patches(
-        &mut self,
-        first: usize,
-        settled: Vec<(Vec<DiffFile>, diff_load::FileState)>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(patches) = &mut self.right_panel.patches else { return false };
-        for (row, result) in patches.rows.iter_mut().skip(first).zip(settled) {
-            *row = Some(result);
+    /// Starts the patch reads the demand lets run now; the patch shows it is loading while any
+    /// asked-for read is outstanding.
+    fn start_patch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        let outstanding = patches.demand.outstanding();
+        if let DiffLoad::Ready { pending, .. } = &mut self.right_panel.load
+            && *pending != outstanding
+        {
+            *pending = outstanding;
+            cx.notify();
         }
-        let settled = || patches.rows.iter().flatten();
-        let files: Vec<DiffFile> = settled().flat_map(|(files, _)| files.iter().cloned()).collect();
-        let states: HashMap<SharedString, diff_load::FileState> = settled()
-            .filter(|(_, state)| *state != diff_load::FileState::Loaded)
-            .flat_map(|(files, state)| files.iter().map(|file| (file.path().clone(), *state)))
-            .collect();
-        let pending = patches.rows.iter().filter(|row| row.is_none()).count();
+        for index in patches.demand.start() {
+            let (client, file) = (patches.client.clone(), patches.files[index].clone());
+            let (input, source_kind) = (patches.request.input(&file), patches.request.source_kind);
+            patches._reads.push(cx.spawn(async move |this, cx| {
+                let reply = client.request("review.getDiffPreview", input).await;
+                if let Err(error) = &reply {
+                    log::warn!("diff file patch failed: {error}");
+                }
+                let settled = cx
+                    .background_executor()
+                    .spawn(async move { diff_load::settle_file(&file, reply.as_ref().ok(), source_kind) })
+                    .await;
+                let _ = this.update(cx, |this, cx| this.settle_file_patch(index, settled, cx));
+            }));
+        }
+    }
+
+    /// Asks for files' patches by their index among the lazily read files.
+    fn request_file_patches(&mut self, indices: impl IntoIterator<Item = usize>, cx: &mut Context<Self>) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.demand.request(indices);
+        self.start_patch_reads(cx);
+    }
+
+    /// Puts a settled read in its file's place and starts the next one waiting.
+    fn settle_file_patch(
+        &mut self,
+        index: usize,
+        settled: (Vec<DiffFile>, diff_load::FileState),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.rows[index] = Some(settled);
+        patches.demand.settle(index);
+        self.start_patch_reads(cx);
+        self.show_file_patches(Install::Update, cx);
+    }
+
+    /// Shows every lazily read file: its patch once settled, else its placeholder header.
+    fn show_file_patches(&mut self, install: Install, cx: &mut Context<Self>) {
+        let Some(patches) = &self.right_panel.patches else { return };
+        let (mut files, mut states, mut lineless) = (Vec::new(), HashMap::new(), Vec::new());
+        for (row, placeholder) in patches.rows.iter().zip(&patches.placeholders) {
+            match row {
+                Some((rows, state)) => {
+                    if *state != diff_load::FileState::Loaded {
+                        states.extend(rows.iter().map(|file| (file.path().clone(), *state)));
+                    }
+                    if *state == diff_load::FileState::Failed {
+                        lineless.extend(rows.iter().map(|file| file.path().clone()));
+                    }
+                    files.extend(rows.iter().cloned());
+                }
+                None => {
+                    lineless.extend(placeholder.iter().map(|file| file.path().clone()));
+                    files.extend(placeholder.iter().cloned());
+                }
+            }
+        }
         let selection = patches.selection.clone();
         self.right_panel.patch_states = std::rc::Rc::new(states);
-        self.show_diff_files(&selection, files, Install::Update, cx);
-        // A row that did not load has no lines to show, so it stays folded.
-        let states = self.right_panel.patch_states.clone();
+        self.show_diff_files(&selection, files, install, cx);
+        // A row with no lines yet, or one that did not load, has nothing to unfold.
         self.right_panel.diff.update(cx, |state, cx| {
-            for (path, _) in states.iter().filter(|(_, state)| **state == diff_load::FileState::Failed) {
+            for path in &lineless {
                 state.set_file_collapsed(path, true, cx);
             }
         });
-        if let DiffLoad::Ready { pending: left, .. } = &mut self.right_panel.load {
-            *left = pending;
-        }
         self.rebuild_tree_rows(cx);
         cx.notify();
-        true
+    }
+
+    /// `DiffFileLoadingBoundary` and each pending header's `load`: reads the files whose headers
+    /// come within the demand margin below the viewport unless the user folded them, and the
+    /// next batch once the last file comes near.
+    fn request_visible_patches(&mut self, cx: &mut Context<Self>) {
+        let Some(patches) = &self.right_panel.patches else { return };
+        if self.right_panel.shown.as_ref() != Some(&patches.selection) || !patches.rows.iter().any(Option::is_none) {
+            return;
+        }
+        let state = self.right_panel.diff.read(cx);
+        let near = state.files_near_viewport(px(diff_load::DEMAND_MARGIN));
+        if near.is_empty() {
+            return;
+        }
+        let at_end = near.end >= state.files().len();
+        let asked: Vec<(usize, SharedString)> = state.files()[near]
+            .iter()
+            .filter_map(|file| Some((*patches.index.get(file.path())?, file.path().clone())))
+            .filter(|(index, _)| patches.rows[*index].is_none() && !patches.demand.is_requested(*index))
+            .collect();
+        let first_unsettled = patches.rows.iter().position(Option::is_none);
+        let indices: Vec<usize> = if asked.is_empty() {
+            Vec::new()
+        } else {
+            let folded = self.current_folds();
+            asked.into_iter().filter(|(_, path)| !folded.contains(path)).map(|(index, _)| index).collect()
+        };
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.demand.request(indices);
+        if let Some(first) = first_unsettled.filter(|_| at_end) {
+            patches.demand.load_next(first);
+        }
+        self.start_patch_reads(cx);
     }
 
     /// `retry`: reads a file whose patch did not load again.
     fn retry_file_patch(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(patches) = &mut self.right_panel.patches else { return };
-        let Some(index) = patches.files.iter().position(|file| file.path == path) else { return };
-        let (client, file) = (patches.client.clone(), patches.files[index].clone());
-        let (input, source_kind) = (patches.request.input(&file), patches.request.source_kind);
-        patches._retries.push(cx.spawn(async move |this, cx| {
-            let reply = client.request("review.getDiffPreview", input).await;
-            if let Err(error) = &reply {
-                log::warn!("diff file patch failed: {error}");
-            }
-            let settled = cx
-                .background_executor()
-                .spawn(async move { diff_load::settle_file(&file, reply.as_ref().ok(), source_kind) })
-                .await;
-            let _ = this.update(cx, |this, cx| this.settle_file_patches(index, vec![settled], cx));
-        }));
+        let Some(&index) = patches.index.get(path) else { return };
+        patches.demand.retry(index);
+        self.start_patch_reads(cx);
     }
 
     /// Puts a selection's loaded files in the patch, folded as the user left them.
@@ -1254,11 +1403,7 @@ impl Workspace {
             return;
         };
         self.right_panel.pending_reveal = None;
-        self.right_panel.diff.update(cx, |state, cx| {
-            state.set_file_collapsed(&path, false, cx);
-            state.scroll_to_file(&path, cx);
-        });
-        self.remember_collapsed(cx);
+        self.reveal_diff_file(&path, cx);
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -1287,6 +1432,9 @@ impl Workspace {
             return None;
         };
         self.sync_diff(window, cx);
+        if self.active_surface() == Some(&Surface::Diff) {
+            self.request_visible_patches(cx);
+        }
         let tokens = *theme::tokens(cx);
         let panel = self.panel_state().cloned().unwrap_or_default();
         // A newly active tab, or a new tab, can sit outside the scrolled strip.
@@ -2167,15 +2315,21 @@ impl Workspace {
                             icon_toggle("diff-collapse", path, false, tokens, cx)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.right_panel.diff.update(cx, |state, cx| {
-                                        let paths: Vec<SharedString> =
-                                            state.files().iter().map(|file| file.path().clone()).collect();
-                                        for path in &paths {
-                                            state.set_file_collapsed(path, !all_collapsed, cx);
-                                        }
-                                    });
-                                    this.remember_collapsed(cx);
-                                    cx.notify();
+                                    let shown: Vec<SharedString> = this
+                                        .right_panel
+                                        .diff
+                                        .read(cx)
+                                        .files()
+                                        .iter()
+                                        .map(|file| file.path().clone())
+                                        .collect();
+                                    let mut folded = this.current_folds();
+                                    if all_collapsed {
+                                        folded.retain(|path| !shown.contains(path));
+                                    } else {
+                                        folded.extend(shown);
+                                    }
+                                    this.set_diff_folds(folded, cx);
                                 })),
                         )
                     })
