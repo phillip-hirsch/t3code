@@ -18,9 +18,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _,
+    AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, Keystroke, ParentElement as _, PathPromptOptions, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    relative, svg,
 };
 use serde_json::{Value, json};
 
@@ -180,6 +181,19 @@ enum Description {
     Snippet(bool, Vec<(String, bool)>),
     /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, and its path.
     Location(Option<IconName>, SharedString, SharedString),
+    Thread(ThreadSubtitle),
+}
+
+/// `ThreadCommandSubtitle`: the project with its favicon and machine, the checkout, the provider,
+/// and whether it is the open thread.
+#[derive(Clone)]
+struct ThreadSubtitle {
+    project: Option<(String, SharedString)>,
+    location: SharedString,
+    branch: Option<SharedString>,
+    worktree: bool,
+    provider: Option<(&'static str, Option<Hsla>)>,
+    current: bool,
 }
 
 #[derive(Clone)]
@@ -189,6 +203,8 @@ struct Row {
     title: SharedString,
     /// Drawn after `title` at weight 600 ("New thread in **X**").
     strong: Option<SharedString>,
+    /// `ThreadRowContext`: the project beside a thread's title when a snippet takes its line.
+    context: Option<SharedString>,
     description: Option<Description>,
     time: Option<String>,
     shortcut: Option<SharedString>,
@@ -217,6 +233,7 @@ impl Row {
             icon,
             title: title.into(),
             strong: None,
+            context: None,
             description: None,
             time: None,
             shortcut: None,
@@ -1219,20 +1236,38 @@ impl Workspace {
     fn thread_row(&self, thread: &crate::model::ThreadShell, now: i64) -> Row {
         let mut row = Row::new(
             format!("thread-{}", thread.id),
-            RowIcon::Project(thread.project_id.clone()),
+            RowIcon::Lucide(IconName::MessageSquare),
             thread.title.clone(),
             Run::Thread(thread.id.clone()),
         );
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-        let mut parts: Vec<String> = project.map(|p| p.title.clone()).into_iter().collect();
-        parts.extend(thread.branch.clone());
-        if self.open_thread_id() == Some(&*thread.id) {
-            parts.push("Current thread".into());
-        }
-        row.description = Some(Description::Text(parts.join(" · ").into()));
+        let project = project.map(|p| p.title.trim()).filter(|title| !title.is_empty());
+        // `runtime?.providerInstanceId ?? modelSelection.instanceId`.
+        let instance = thread
+            .provider_instance_id
+            .as_deref()
+            .or_else(|| thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
+        let driver = instance.and_then(|i| self.env_info(&thread.environment_id)?.provider(i)).map(|p| &p.driver);
+        row.description = Some(Description::Thread(ThreadSubtitle {
+            project: project.map(|title| (thread.project_id.clone(), title.to_owned().into())),
+            location: self.location_label(&thread.environment_id),
+            branch: thread.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_owned().into()),
+            worktree: thread.worktree_path.as_deref().is_some_and(|path| !path.trim().is_empty()),
+            provider: driver.and_then(|driver| crate::assets::provider_icon(driver)),
+            current: self.open_thread_id() == Some(&*thread.id),
+        }));
         row.time = crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
             .map(|at| ago(now - at));
         row
+    }
+
+    /// `ThreadRowContext`: the project, and the machine when there are several, for a row whose
+    /// second line shows a message snippet instead.
+    fn thread_context(&self, thread: &crate::model::ThreadShell) -> Option<SharedString> {
+        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.trim());
+        let environment = (self.sessions().len() > 1).then(|| self.location_label(&thread.environment_id));
+        let parts: Vec<&str> = project.into_iter().chain(environment.as_deref()).filter(|p| !p.is_empty()).collect();
+        (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 
     fn thread_use(&self, thread: &crate::model::ThreadShell) -> search::ThreadUse {
@@ -1384,6 +1419,7 @@ impl Workspace {
                     query: super::find::query_for_message(&m.snippet, query),
                     message_id: m.message_id.clone(),
                 };
+                row.context = self.thread_context(thread);
                 let ranges = search::token_ranges(&m.snippet, query);
                 row.description = Some(Description::Snippet(m.user, search::split_ranges(&m.snippet, &ranges)));
                 row.time = m.at.as_deref().and_then(crate::timestamp::parse_ms).map(|at| ago(now - at));
@@ -2215,6 +2251,60 @@ impl Workspace {
         }
     }
 
+    /// `ThreadCommandSubtitle`'s line, its parts split by muted dots.
+    fn render_thread_subtitle(&self, subtitle: &ThreadSubtitle, tokens: &Tokens) -> AnyElement {
+        let muted = tokens.muted_foreground;
+        let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
+        let mut parts: Vec<AnyElement> = Vec::new();
+        if let Some((project_id, title)) = &subtitle.project {
+            let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+            let favicon = project.map(|p| super::sidebar::project_icon(p, tokens, false, 12., self.favicon(p)));
+            parts.push(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .children(favicon)
+                    .child(div().min_w_0().truncate().child(title.clone()))
+                    .child(dot())
+                    .child(div().flex_none().child(subtitle.location.clone()))
+                    .into_any_element(),
+            );
+        }
+        if let Some(branch) = &subtitle.branch {
+            let icon = if subtitle.worktree { IconName::FolderGit2 } else { IconName::Folder };
+            parts.push(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .child(Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
+                            .child(branch.clone()),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some((path, tint)) = subtitle.provider {
+            let color = tint.unwrap_or(tokens.foreground);
+            parts.push(svg().path(path).size(px(12.)).flex_none().text_color(color).opacity(0.7).into_any_element());
+        }
+        if subtitle.current {
+            parts.push(div().flex_none().child("Current thread").into_any_element());
+        }
+        let mut line = h_flex().min_w_0().max_w_full().gap(px(4.));
+        for (index, part) in parts.into_iter().enumerate() {
+            if index > 0 {
+                line = line.child(dot());
+            }
+            line = line.child(part);
+        }
+        line.into_any_element()
+    }
+
     /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity.
     fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens) -> AnyElement {
         let description = match &row.description {
@@ -2291,6 +2381,7 @@ impl Workspace {
                         .child(text.clone())
                 }))
                 .into_any_element(),
+            Description::Thread(subtitle) => self.render_thread_subtitle(subtitle, tokens),
         });
         let run = row.run.clone();
         let pin_shortcut = self.shortcut_label("thread.pin");
@@ -2334,9 +2425,20 @@ impl Workspace {
                                 .text_color(tokens.foreground)
                                 .child(
                                     div()
-                                        .when(row.strong.is_none(), |el| el.flex_1().min_w_0().truncate())
+                                        .when(row.strong.is_none(), |el| el.min_w_0().truncate())
+                                        .when(row.strong.is_none() && row.context.is_none(), gpui_kit::Styled::flex_1)
                                         .child(row.title.clone()),
                                 )
+                                .children(row.context.clone().map(|context| {
+                                    div()
+                                        .flex_none()
+                                        .max_w(relative(0.45))
+                                        .ml(px(6.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted.opacity(0.7))
+                                        .child(context)
+                                }))
                                 .children(row.strong.clone().map(|strong| {
                                     div()
                                         .min_w_0()
