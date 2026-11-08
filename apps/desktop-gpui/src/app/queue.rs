@@ -85,6 +85,11 @@ impl Workspace {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
     }
 
+    /// The context records of the queued message open in the composer, which its chips name.
+    pub(super) fn queue_edit_records(&self) -> &[Value] {
+        self.queue.edit.as_ref().map_or(&[], |edit| edit.records.as_slice())
+    }
+
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
     pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>)> {
         self.queue.edit.take().map(|edit| edit.saved)

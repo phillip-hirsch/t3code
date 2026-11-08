@@ -15,10 +15,10 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::git::{self, QuickKind};
+use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
-use crate::model::{DelegatedFrom, ThreadShell, TokenUsage, UsageLimits};
+use crate::model::{DelegatedFrom, ProjectScript, ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
@@ -26,6 +26,8 @@ pub(super) mod automations;
 pub(super) mod servers;
 
 const CARD_WIDTH: f32 = 280.;
+/// `quickActionDisabledReason` without `source-control:write`.
+const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
 const CARD_INSET: f32 = 12.;
 const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
@@ -46,6 +48,7 @@ struct CardColors {
     muted: Hsla,
     track: Hsla,
     tick: Hsla,
+    ring: Hsla,
 }
 
 impl CardColors {
@@ -64,6 +67,7 @@ impl CardColors {
             label: tokens.foreground.opacity(0.8),
             muted: tokens.muted_foreground,
             tick: tokens.foreground.opacity(0.6),
+            ring: tokens.ring,
             track: tokens.muted_foreground.opacity(if tokens.dark { 0.2 } else { 0.3 }),
         }
     }
@@ -171,25 +175,106 @@ pub(super) async fn resubscribe_after_backoff(
     });
 }
 
-impl Workspace {
-    /// Whether the card is on screen, inline or as the popover.
-    pub(super) fn details_shown(&self, window: &Window) -> bool {
-        self.target.is_some() && if self.details_inline(window) { self.details_open } else { self.details_popover }
+/// `t3code:right-panel` `threadPanelVisibilityByThreadKey`, kept with this device's client settings.
+pub(super) const DETAILS_VISIBILITY_KEY: &str = "threadPanelVisibilityByThreadKey";
+
+/// One thread's card: shown inline, and shown as the popover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Visibility {
+    pub inline_open: bool,
+    pub popover_open: bool,
+}
+
+/// `DEFAULT_THREAD_PANEL_VISIBILITY`.
+const DEFAULT_VISIBILITY: Visibility = Visibility { inline_open: true, popover_open: false };
+
+/// The card's visibility per thread (`threadPanelVisibilityByThreadKey`). A thread at the
+/// default keeps no entry, and only a collapsed inline card outlives the app.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct DetailsVisibility(std::collections::HashMap<String, Visibility>);
+
+impl DetailsVisibility {
+    /// `migratePersistedRightPanelState`: only `inlineOpen: false` entries come back.
+    pub(super) fn from_stored(stored: &Value) -> Self {
+        let collapsed = stored.as_object().into_iter().flatten().filter(|(_, v)| v["inlineOpen"] == false);
+        Self(collapsed.map(|(key, _)| (key.clone(), Visibility { inline_open: false, popover_open: false })).collect())
     }
 
-    /// The toggle drives whichever presentation the canvas allows.
+    pub(super) fn get(&self, key: &str) -> Visibility {
+        self.0.get(key).copied().unwrap_or(DEFAULT_VISIBILITY)
+    }
+
+    /// `updateThreadPanelVisibilityMap`; returns whether the stored subset changed.
+    fn update(&mut self, key: &str, change: impl FnOnce(&mut Visibility)) -> bool {
+        let before = self.get(key);
+        let mut next = before;
+        change(&mut next);
+        if next == DEFAULT_VISIBILITY {
+            self.0.remove(key);
+        } else {
+            self.0.insert(key.to_owned(), next);
+        }
+        before.inline_open != next.inline_open
+    }
+
+    /// `partialize`: the collapsed inline cards.
+    fn stored(&self) -> Value {
+        let collapsed = self.0.iter().filter(|(_, visibility)| !visibility.inline_open);
+        Value::Object(
+            collapsed.map(|(key, _)| (key.clone(), json!({"inlineOpen": false, "popoverOpen": false}))).collect(),
+        )
+    }
+}
+
+impl Workspace {
+    /// The open target's key in [`DetailsVisibility`] (`scopedThreadKey`).
+    fn details_key(&self) -> Option<String> {
+        match self.target.as_ref()? {
+            Target::Thread { env, id } => Some(format!("{env}:{id}")),
+            Target::Draft { env, project_id } => Some(format!("{env}:draft:{project_id}")),
+        }
+    }
+
+    /// The open target's card; nothing open shows no card.
+    pub(super) fn details_visibility(&self) -> Visibility {
+        self.details_key()
+            .map_or(Visibility { inline_open: false, popover_open: false }, |key| self.details_visibility.get(&key))
+    }
+
+    fn update_details(&mut self, change: impl FnOnce(&mut Visibility)) {
+        let Some(key) = self.details_key() else { return };
+        if self.details_visibility.update(&key, change) {
+            let stored = self.details_visibility.stored();
+            self.client_settings.apply(&serde_json::Map::from_iter([(DETAILS_VISIBILITY_KEY.to_owned(), stored)]));
+        }
+    }
+
+    /// Closes or opens the open thread's popover, without touching an unchanged entry.
+    pub(super) fn set_details_popover(&mut self, open: bool) {
+        if self.details_visibility().popover_open != open {
+            self.update_details(|visibility| visibility.popover_open = open);
+        }
+    }
+
+    /// Whether the card is on screen, inline or as the popover.
+    pub(super) fn details_shown(&self, window: &Window) -> bool {
+        let visibility = self.details_visibility();
+        if self.details_inline(window) { visibility.inline_open } else { visibility.popover_open }
+    }
+
+    /// The toggle drives whichever presentation the canvas allows, for the open thread only.
     pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.details_inline(window) {
-            self.details_open = !self.details_open;
+            self.update_details(|visibility| visibility.inline_open = !visibility.inline_open);
         } else {
-            self.details_popover = !self.details_popover;
+            self.update_details(|visibility| visibility.popover_open = !visibility.popover_open);
         }
         cx.notify();
     }
 
     pub(super) fn escape_details_popover(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.details_popover && event.keystroke.key == "escape" {
-            self.details_popover = false;
+        if self.details_visibility().popover_open && event.keystroke.key == "escape" {
+            self.set_details_popover(false);
             cx.stop_propagation();
             cx.notify();
         }
@@ -292,7 +377,7 @@ impl Workspace {
                     div()
                         .w(px(CARD_WIDTH))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.details_popover = false;
+                            this.set_details_popover(false);
                             cx.notify();
                         }))
                         .child(card.max_h(viewport.height - px(104.))),
@@ -524,11 +609,12 @@ impl Workspace {
         .detach();
     }
 
-    /// `ProjectScriptsControl` in panel mode: run the first script, pick or add one from the menu,
-    /// or "Add project script" while the project has none.
+    /// `ProjectScriptsControl` in panel mode: run the primary script, pick, import or add one from
+    /// the menu; "Actions" when no script can be primary; "Add project script" with none at all.
     fn scripts_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         use super::pages::settings::code::projects::scripts::{
-            ScriptInput, importable_scripts, resolve_project_scripts, script_icon,
+            ScriptInput, command_for_project_script, importable_scripts, resolve_project_scripts, script_icon,
+            shortcut_label_for_command,
         };
         let project = self.target_project()?;
         let project_id = project.id.clone();
@@ -550,66 +636,9 @@ impl Workspace {
             },
             None => Vec::new(),
         };
-        let scripts: Vec<(SharedString, ScriptRun)> = saved
-            .into_iter()
-            .map(|script| {
-                let stop_on_settle = script.stop_on_settle == Some(true);
-                (script.name.into(), ScriptRun { command: script.command.into(), stop_on_settle })
-            })
-            .collect();
-        let Some((name, run)) = scripts.first().cloned() else {
-            if !importable.is_empty() {
-                // `ProjectScriptsControl` with only `t3.json` actions: "Actions" opens the import menu.
-                let view = cx.entity();
-                let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-                    menu = menu.label("From t3.json");
-                    for input in &importable {
-                        let (pid, input) = (project_id.clone(), input.clone());
-                        let name = SharedString::from(input.name.clone());
-                        menu = menu.item(
-                            PopupMenuItem::element(move |_, cx| {
-                                h_flex().w_full().gap_2().child(name.clone()).child(
-                                    icon("icons/download.svg")
-                                        .with_size(px(14.))
-                                        .ml_auto()
-                                        .text_color(theme::tokens(cx).muted_foreground),
-                                )
-                            })
-                            .icon(gpui_kit::component::Icon::new(script_icon(&input.icon)))
-                            .on_click(window.listener_for(
-                                &view,
-                                move |this, _, window, cx| {
-                                    this.import_project_script(&pid, &input, window, cx);
-                                },
-                            )),
-                        );
-                    }
-                    let pid = project_id.clone();
-                    menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
-                        window.listener_for(&view, move |this, _, window, cx| {
-                            this.open_project_script_editor(&pid, None, window, cx);
-                        }),
-                    ))
-                };
-                return Some(
-                    select_row("details-project-actions", tokens, colors, cx)
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(10.))
-                                .child(icon("icons/wrench.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                                .child(div().flex_1().min_w_0().truncate().text_left().child("Actions")),
-                        )
-                        .child(select_chevron(tokens))
-                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                            build(menu.min_w(px(264.)), window, cx)
-                        })
-                        .into_any_element(),
-                );
-            }
+        if saved.is_empty() && importable.is_empty() {
             return Some(
-                action_row("details-add-script", colors, cx)
+                action_row("details-add-script", colors, true, cx)
                     .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .child(div().ml(px(2.)).truncate().child("Add project script"))
                     .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
@@ -618,21 +647,83 @@ impl Workspace {
                     }))
                     .into_any_element(),
             );
-        };
+        }
+        let primary = primary_script(&saved, self.last_invoked_script(&project_id))
+            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)));
+        let keybindings = self.server_info().keybindings_json();
+        let scripts: Vec<ScriptItem> = saved
+            .iter()
+            .map(|script| ScriptItem {
+                label: project_script_menu_label(script).into(),
+                name: script.name.clone().into(),
+                icon: script.icon.clone(),
+                shortcut: shortcut_label_for_command(keybindings, command_for_project_script(&script.id).as_deref())
+                    .map(Into::into),
+                run: ScriptRun::new(&project_id, script),
+            })
+            .collect();
+        // `scriptItems`: the scripts, then the `t3.json` ones to import, then "Add project script".
         let view = cx.entity();
-        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            for (name, run) in &scripts {
-                let run = run.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).icon(icon("icons/play.svg")).on_click(
-                    window.listener_for(&view, move |this, _, window, cx| this.run_project_script(&run, window, cx)),
-                ));
+        let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            let popup = cx.entity();
+            for item in &scripts {
+                let run = item.run.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(script_item_row(item, &view, &popup))
+                        .icon(gpui_kit::component::Icon::new(script_icon(&item.icon)))
+                        .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                            this.run_project_script(&run, window, cx);
+                        })),
+                );
             }
-            let project_id = project_id.clone();
-            menu.separator().item(PopupMenuItem::new("Add action").icon(icon("icons/plus.svg")).on_click(
+            if !importable.is_empty() {
+                if !scripts.is_empty() {
+                    menu = menu.separator();
+                }
+                menu = menu.label("From t3.json");
+            }
+            for input in &importable {
+                let (pid, input) = (project_id.clone(), input.clone());
+                let name = SharedString::from(input.name.clone());
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        h_flex().w_full().gap_2().child(name.clone()).child(
+                            icon("icons/download.svg")
+                                .with_size(px(14.))
+                                .ml_auto()
+                                .text_color(theme::tokens(cx).muted_foreground),
+                        )
+                    })
+                    .icon(gpui_kit::component::Icon::new(script_icon(&input.icon)))
+                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                        this.import_project_script(&pid, &input, window, cx);
+                    })),
+                );
+            }
+            let pid = project_id.clone();
+            menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.open_project_script_editor(&project_id, None, window, cx);
+                    this.open_project_script_editor(&pid, None, window, cx);
                 }),
             ))
+        };
+        let Some((name, run)) = primary else {
+            return Some(
+                select_row("details-project-actions", tokens, colors, cx)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(10.))
+                            .child(icon("icons/wrench.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                            .child(div().flex_1().min_w_0().truncate().text_left().child("Actions")),
+                    )
+                    .child(select_chevron(tokens))
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                        build(menu.min_w(px(264.)), window, cx)
+                    })
+                    .into_any_element(),
+            );
         };
         let tooltip: SharedString = format!("Run {name}").into();
         Some(
@@ -657,9 +748,31 @@ impl Workspace {
 
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cwd) = self.git_cwd() else { return };
-        let (command, stop_on_settle) = (run.command.to_string(), run.stop_on_settle);
-        window.dispatch_action(Box::new(super::RunInTerminal { cwd, command, stop_on_settle }), cx);
+        let Some(cwd) = self.git_cwd().filter(|_| self.can_run_scripts()) else { return };
+        self.remember_script(&run.project_id, &run.id);
+        window.dispatch_action(Box::new(super::RunInTerminal::script(cwd, &run.script)), cx);
+    }
+
+    /// `hasTerminalWriteAccess`: scripts run only with `terminal:operate` on the thread's environment.
+    pub(super) fn can_run_scripts(&self) -> bool {
+        self.active_environment().is_some_and(|environment| self.env_grants(environment, "terminal:operate"))
+    }
+
+    /// `lastInvokedScriptByProjectId[projectId]`: the script last run in the project on this device.
+    fn last_invoked_script(&self, project_id: &str) -> Option<&str> {
+        self.client_settings.values.get(LAST_INVOKED_SCRIPT_KEY)[project_id].as_str()
+    }
+
+    /// Remembers `script_id` as the project's last run script, which the card then offers first.
+    pub(super) fn remember_script(&mut self, project_id: &str, script_id: &str) {
+        if self.last_invoked_script(project_id) == Some(script_id) {
+            return;
+        }
+        let mut by_project =
+            self.client_settings.values.get(LAST_INVOKED_SCRIPT_KEY).as_object().cloned().unwrap_or_default();
+        by_project.insert(project_id.to_owned(), script_id.into());
+        let patch = serde_json::Map::from_iter([(LAST_INVOKED_SCRIPT_KEY.to_owned(), Value::Object(by_project))]);
+        self.client_settings.apply(&patch);
     }
 
     fn version_control_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
@@ -712,14 +825,14 @@ impl Workspace {
         let (actions_shown, changes_shown) =
             (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
         if status.local.is_repo {
-            let quick = git::quick_action(Some(status), self.vcs.running.is_some());
+            let quick = git::quick_action(Some(status), self.vcs.running().is_some());
             let (insertions, deletions, _) = git::changes_totals(status);
             let quiet_empty_draft = matches!(self.target, Some(Target::Draft { .. }))
-                && self.vcs.running.is_none()
+                && self.vcs.running().is_none()
                 && quick.disabled()
                 && insertions == 0
                 && deletions == 0;
-            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running.is_some()) {
+            if actions_shown && !quiet_empty_draft && (density == Density::Full || self.vcs.running().is_some()) {
                 rows.push(self.git_actions_row(status, &quick, tokens, colors, cx));
             }
             if changes_shown && !quiet_empty_draft {
@@ -733,13 +846,13 @@ impl Workspace {
                     min_density: Density::Essential,
                 });
             }
-            let running = self.vcs.running.is_some();
+            let running = self.vcs.running().is_some();
+            let enabled = !running && self.can_write_source_control();
             rows.push(
-                action_row("details-init-git", colors, cx)
-                    .when(running, |el| el.opacity(0.64))
+                action_row("details-init-git", colors, enabled, cx)
                     .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .child(div().ml(px(2.)).child(if running { "Initializing..." } else { "Initialize Git" }))
-                    .when(!running, |el| {
+                    .when(enabled, |el| {
                         el.on_click(
                             cx.listener(|this, _, _, cx| this.run_vcs_request("vcs.init", "Initializing...", cx)),
                         )
@@ -763,34 +876,38 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if let Some(progress) = self.vcs.running.clone() {
+        if let Some(progress) = self.vcs.running().cloned() {
             return row(colors)
                 .bg(if tokens.dark { hsla(0., 0., 1., 0.055) } else { hsla(0., 0., 0., 0.035) })
                 .child(icon("icons/refresh-cw.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
                 .child(div().flex_1().min_w_0().truncate().child(progress))
                 .into_any_element();
         }
-        let disabled = quick.disabled();
+        let can_write = self.can_write_source_control();
+        let disabled = quick.disabled() || !can_write;
         let kind = quick.kind.clone();
+        // `quickActionDisabledReason`: the missing grant first, then the action's own hint.
         let hint = match &quick.kind {
+            _ if !can_write => Some(SharedString::from(NO_SOURCE_CONTROL_WRITE)),
             QuickKind::Hint(hint) => Some(SharedString::from(hint.clone())),
             _ => None,
         };
         let view = cx.entity();
         let items = git::menu_actions(status, false);
-        let can_publish = status.local.is_repo && !status.local.has_primary_remote;
+        let can_publish = can_write && status.local.is_repo && !status.local.has_primary_remote;
         let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
             // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
             view.update(cx, super::Workspace::refresh_vcs);
             for item in &items {
                 let action = item.action;
                 menu = menu.item(
-                    PopupMenuItem::new(item.label.clone()).icon(icon(item.icon)).disabled(!item.enabled).on_click(
-                        window.listener_for(&view, move |this, _, window, cx| match action {
+                    PopupMenuItem::new(item.label.clone())
+                        .icon(icon(item.icon))
+                        .disabled(!can_write || !item.enabled)
+                        .on_click(window.listener_for(&view, move |this, _, window, cx| match action {
                             "commit" => this.open_commit_dialog(window, cx),
-                            action => this.run_git_action(action, None, cx),
-                        }),
-                    ),
+                            action => this.request_git_action(GitRequest::new(action), window, cx),
+                        })),
                 );
             }
             if can_publish {
@@ -804,13 +921,16 @@ impl Workspace {
         split_row("details-git", colors, cx)
             .child(
                 split_primary("details-git-primary", colors, !disabled, cx)
+                    // `aria-disabled` with its reason: still a tab stop.
+                    .when(disabled, |el| keyboard_button(el, colors))
                     .child(icon(quick.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
                     .child(div().min_w_0().truncate().child(quick.label.clone()))
                     .when_some(hint, |el, hint| {
                         el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| match &kind {
-                        QuickKind::Run(action) => this.run_git_action(action, None, cx),
+                        _ if !this.can_write_source_control() => {}
+                        QuickKind::Run(action) => this.request_git_action(GitRequest::new(action), window, cx),
                         QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
                         QuickKind::Publish => this.open_publish_dialog(window, cx),
                         QuickKind::Hint(_) => {}
@@ -841,6 +961,18 @@ impl Workspace {
                 message.focus_handle(cx).focus(window, cx);
             }
             let (message, view) = (message.clone(), view.clone());
+            let (can_write, can_branch) = {
+                let this = view.read(cx);
+                (this.can_write_source_control(), this.can_change_thread_branch())
+            };
+            let on_new_branch = {
+                let (message, view) = (message.clone(), view.clone());
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    let text = message.read(cx).value().trim().to_owned();
+                    view.update(cx, |this, cx| this.run_commit(text, true, cx));
+                    window.close_dialog(cx);
+                }
+            };
             dialog
                 .title("Commit changes")
                 .w(px(512.))
@@ -856,17 +988,100 @@ impl Workspace {
                         .child(field("Branch", div().text_sm().child(branch.clone())))
                         .child(field("Commit message (optional)", Input::new(&message))),
                 )
-                .footer(dialog_footer("commit-confirm", "Commit"))
+                .footer({
+                    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|button| button.outline().label("Cancel")))
+                        .child(
+                            Button::new("commit-new-branch")
+                                .outline()
+                                .label("Commit on new branch")
+                                .disabled(!can_branch)
+                                .on_click(on_new_branch),
+                        )
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("commit-confirm").primary().label("Commit").disabled(!can_write)),
+                        )
+                })
                 .on_ok(move |_, _, cx: &mut App| {
                     let text = message.read(cx).value().trim().to_owned();
-                    view.update(cx, |this, cx| this.run_commit(text, cx));
+                    view.update(cx, |this, cx| this.run_commit(text, false, cx));
                     true
                 })
         });
     }
 
-    fn run_commit(&mut self, message: String, cx: &mut Context<Self>) {
-        self.run_git_action("commit", (!message.is_empty()).then_some(message), cx);
+    /// `runDialogAction`, or `runDialogActionOnNewBranch` with `feature_branch`; neither asks
+    /// about the default ref.
+    fn run_commit(&mut self, message: String, feature_branch: bool, cx: &mut Context<Self>) {
+        let commit_message = (!message.is_empty()).then_some(message);
+        self.run_git_action(GitRequest { action: "commit", commit_message, feature_branch }, cx);
+    }
+
+    /// The default-ref confirmation: Abort, continue on `branch`, or continue on a feature branch.
+    pub(super) fn confirm_default_ref(
+        &mut self,
+        request: GitRequest,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+        let Some(status) = self.vcs.status.as_ref() else { return };
+        let has_changes = status.local.has_working_tree_changes;
+        let includes_commit = matches!(request.action, "commit" | "commit_push" | "commit_push_pr")
+            && (request.action == "commit" || has_changes || request.feature_branch);
+        let copy = git::default_ref_copy(request.action, &branch, includes_commit, status);
+        let unavailable: Option<SharedString> = git::feature_branch_unavailable(&branch, has_changes).map(Into::into);
+        let (title, description, continue_label): (SharedString, SharedString, SharedString) =
+            (copy.title.into(), copy.description.into(), copy.continue_label.into());
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = theme::tokens(cx).muted_foreground;
+            let (can_write, can_branch) = {
+                let this = view.read(cx);
+                (this.can_write_source_control(), this.can_change_thread_branch() && unavailable.is_none())
+            };
+            let run = |feature_branch: bool| {
+                let (view, request) = (view.clone(), request.clone());
+                move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                    let request = GitRequest { feature_branch, ..request.clone() };
+                    view.update(cx, |this, cx| this.run_git_action(request, cx));
+                    window.close_dialog(cx);
+                }
+            };
+            dialog
+                .title(title.clone())
+                .w(px(576.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child(description.clone()))
+                        .children(unavailable.clone().map(|reason| div().text_xs().text_color(muted).child(reason))),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            div().mr_auto().child(DialogClose::new().trigger(|button| button.outline().label("Abort"))),
+                        )
+                        .child(
+                            Button::new("default-ref-continue")
+                                .outline()
+                                .label(continue_label.clone())
+                                .disabled(!can_write)
+                                .on_click(run(false)),
+                        )
+                        .child(
+                            Button::new("default-ref-feature-branch")
+                                .primary()
+                                .label("Check out feature branch & continue")
+                                .disabled(!can_branch)
+                                .on_click(run(true)),
+                        ),
+                )
+        });
     }
 
     /// `PublishRepositoryDialog`: the first signed-in source-control provider, `account/` prefilled.
@@ -906,6 +1121,10 @@ impl Workspace {
         let repository =
             cx.new(|cx| InputState::new(window, cx).default_value(prefill).placeholder("owner/repository"));
         let public = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Advanced: the remote to add (`origin`) and its protocol (SSH unless HTTPS is picked).
+        let remote = cx.new(|cx| InputState::new(window, cx).default_value("origin").placeholder("origin"));
+        let https = std::rc::Rc::new(std::cell::Cell::new(false));
+        let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
         let view = cx.entity();
         let focus = std::cell::Cell::new(true);
         let title: SharedString = format!("Publish to {label}").into();
@@ -913,66 +1132,123 @@ impl Workspace {
             if focus.replace(false) {
                 repository.focus_handle(cx).focus(window, cx);
             }
-            let visibility = |id: &'static str, text: &'static str, value: bool| {
-                let public = public.clone();
+            let tokens = theme::tokens(cx);
+            let choice = |id: &'static str, text: &'static str, cell: &std::rc::Rc<std::cell::Cell<bool>>, value| {
+                let cell = cell.clone();
                 Button::new(id)
                     .label(text)
                     .small()
-                    .map(|b| if public.get() == value { b.primary() } else { b.outline() })
+                    .map(|b| if cell.get() == value { b.primary() } else { b.outline() })
                     .on_click(move |_, window, _| {
-                        public.set(value);
+                        cell.set(value);
                         window.refresh();
                     })
             };
-            let (repository, public, view, provider) =
-                (repository.clone(), public.clone(), view.clone(), provider.clone());
+            let small_field = |label: &'static str, input: AnyElement| {
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(div().text_xs().font_weight(gpui_kit::FontWeight::MEDIUM).child(label))
+                    .child(input)
+            };
+            let open = advanced.get();
+            let toggle = {
+                let advanced = advanced.clone();
+                let hover = tokens.foreground;
+                h_flex()
+                    .id("publish-advanced")
+                    .gap(px(4.))
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(tokens.muted_foreground)
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(hover))
+                    .child(
+                        icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                            .with_size(px(14.)),
+                    )
+                    .child("Advanced")
+                    .on_click(move |_, window, _| {
+                        advanced.set(!advanced.get());
+                        window.refresh();
+                    })
+            };
+            let options = open.then(|| {
+                h_flex()
+                    .mt_3()
+                    .gap_3()
+                    .items_start()
+                    .child(small_field("Remote", Input::new(&remote).into_any_element()))
+                    .child(small_field(
+                        "Protocol",
+                        h_flex()
+                            .gap_2()
+                            .child(choice("publish-ssh", "SSH", &https, false))
+                            .child(choice("publish-https", "HTTPS", &https, true))
+                            .into_any_element(),
+                    ))
+            });
+            let visibility = h_flex()
+                .gap_2()
+                .child(choice("publish-private", "Private", &public, false))
+                .child(choice("publish-public", "Public", &public, true));
+            let (repository, remote, public, https, view, provider) =
+                (repository.clone(), remote.clone(), public.clone(), https.clone(), view.clone(), provider.clone());
             dialog
                 .title(title.clone())
                 .w(px(448.))
-                .child(v_flex().gap_3().child(field("Repository", Input::new(&repository))).child(field(
-                    "Visibility",
-                    h_flex().gap_2().child(visibility("publish-private", "Private", false)).child(visibility(
-                        "publish-public",
-                        "Public",
-                        true,
-                    )),
-                )))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(field("Repository", Input::new(&repository)))
+                        .child(field("Visibility", visibility))
+                        .child(v_flex().child(toggle).children(options)),
+                )
                 .footer(dialog_footer("publish-confirm", "Publish"))
                 .on_ok(move |_, _, cx: &mut App| {
                     let repository = repository.read(cx).value().trim().to_owned();
                     if repository.is_empty() || repository.ends_with('/') {
                         return false;
                     }
-                    let visibility = if public.get() { "public" } else { "private" };
+                    let options = PublishOptions {
+                        visibility: if public.get() { "public" } else { "private" },
+                        remote_name: remote.read(cx).value().trim().to_owned(),
+                        protocol: if https.get() { "https" } else { "ssh" },
+                    };
                     let provider = provider.clone();
-                    view.update(cx, |this, cx| this.publish_repository(provider, repository, visibility, cx));
+                    view.update(cx, |this, cx| this.publish_repository(provider, repository, options, cx));
                     true
                 })
         });
     }
 
-    /// `sourceControl.publishRepository` with the web's defaults: `origin` over SSH.
-    fn publish_repository(&mut self, provider: String, repository: String, visibility: &str, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.vcs_client(), self.vcs.cwd.clone()) else { return };
+    /// `sourceControl.publishRepository`; a blank remote name is `origin`, as on the web.
+    fn publish_repository(
+        &mut self,
+        provider: String,
+        repository: String,
+        options: PublishOptions,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_write_source_control() {
+            return;
+        }
+        let Some(client) = self.vcs_client() else { return };
+        let Some(checkout) = self.vcs.start("Publishing repository...") else { return };
+        let remote_name = if options.remote_name.is_empty() { "origin".to_owned() } else { options.remote_name };
         let input = json!({
-            "cwd": cwd,
+            "cwd": checkout.1,
             "provider": provider,
             "repository": repository,
-            "visibility": visibility,
-            "remoteName": "origin",
-            "protocol": "ssh",
+            "visibility": options.visibility,
+            "remoteName": remote_name,
+            "protocol": options.protocol,
         });
-        self.vcs.running = Some("Publishing repository...".into());
         cx.spawn(async move |this, cx| {
             let result = client.request("sourceControl.publishRepository", input).await;
-            let _ = this.update(cx, |this, cx| {
-                this.vcs.running = None;
-                if let Err(error) = result {
-                    this.error = Some(error.to_string().into());
-                }
-                this.refresh_vcs(cx);
-                cx.notify();
-            });
+            let _ =
+                this.update(cx, |this, cx| this.finish_vcs(client, checkout, result.err().map(|e| e.to_string()), cx));
         })
         .detach();
         cx.notify();
@@ -992,7 +1268,7 @@ impl Workspace {
         let deletion = if deletions > 0 { git::deletion_color(tokens, scheme) } else { tokens.muted_foreground };
         // `changesBaseLabel`: working-tree totals have no base.
         let base_label: SharedString = base.map_or_else(|| "Uncommitted".into(), |base| format!("vs {base}").into());
-        action_row("details-changes", colors, cx)
+        action_row("details-changes", colors, true, cx)
             .child(icon("icons/file-diff.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
             .child(
                 h_flex()
@@ -1326,6 +1602,13 @@ fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>
     })
 }
 
+/// The publish dialog's visibility and its Advanced remote and protocol.
+struct PublishOptions {
+    visibility: &'static str,
+    remote_name: String,
+    protocol: &'static str,
+}
+
 /// Cancel and the confirming action; the action runs the dialog's `on_ok`.
 fn dialog_footer(id: &'static str, label: &'static str) -> impl IntoElement {
     use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
@@ -1357,10 +1640,36 @@ fn row(colors: &CardColors) -> gpui_kit::Div {
         .text_color(colors.label)
 }
 
-/// `part="row"`: a whole-row button with the panel's hover fill.
-fn action_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
+/// `part="row"`: a whole-row button with the panel's hover fill; a disabled one is dimmed and
+/// out of the tab order.
+fn action_row(
+    id: &'static str,
+    colors: &CardColors,
+    enabled: bool,
+    _: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     let hover = colors.hover;
-    row(colors).id(id).cursor_pointer().hover(move |style| style.bg(hover))
+    let row = row(colors).id(id);
+    if enabled {
+        keyboard_button(row.cursor_pointer().hover(move |style| style.bg(hover)), colors)
+    } else {
+        row.opacity(0.64)
+    }
+}
+
+/// `ThreadDetailsControl` as a keyboard button: a tab stop that Enter and Space click, with
+/// `focus-visible:ring-2 ring-inset`. The ring takes 2px of the row's 10px inset, so nothing moves.
+fn keyboard_button(
+    element: gpui_kit::Stateful<gpui_kit::Div>,
+    colors: &CardColors,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = colors.ring;
+    element
+        .tab_index(0)
+        .px(px(8.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
 }
 
 /// `THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS`: the pair shares one hover fill and shows its hairline.
@@ -1388,7 +1697,7 @@ fn split_primary(
         .text_size(px(13.))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
         .text_color(colors.label)
-        .when(enabled, |el| el.cursor_pointer().hover(move |style| style.bg(hover)))
+        .when(enabled, |el| keyboard_button(el.cursor_pointer().hover(move |style| style.bg(hover)), colors))
         .when(!enabled, |el| el.opacity(0.64))
 }
 
@@ -1633,10 +1942,109 @@ pub(super) fn format_context_tokens(value: u64) -> String {
 }
 
 /// A project script's run from the details card.
+/// One saved script in the card's menu.
+struct ScriptItem {
+    label: SharedString,
+    name: SharedString,
+    icon: String,
+    shortcut: Option<SharedString>,
+    run: ScriptRun,
+}
+
+/// `projectScriptMenuLabel`: the name with its setup and settle roles.
+fn project_script_menu_label(script: &ProjectScript) -> String {
+    let roles: Vec<&str> =
+        [(script.run_on_worktree_create, "setup"), (script.run_on_settle == Some(true), "on settle")]
+            .into_iter()
+            .filter_map(|(on, role)| on.then_some(role))
+            .collect();
+    if roles.is_empty() { script.name.clone() } else { format!("{} ({})", script.name, roles.join(", ")) }
+}
+
+/// A script's menu row: the label, its shortcut, and on hover the "Edit {name}" settings button
+/// in the shortcut's place, which opens the script's editor instead of running it.
+fn script_item_row(
+    item: &ScriptItem,
+    view: &gpui_kit::Entity<Workspace>,
+    popup: &gpui_kit::Entity<PopupMenu>,
+) -> impl Fn(&mut Window, &mut App) -> AnyElement + 'static {
+    let (label, name, shortcut) = (item.label.clone(), item.name.clone(), item.shortcut.clone());
+    let (project_id, script_id) = (item.run.project_id.clone(), item.run.id.clone());
+    let (view, popup) = (view.clone(), popup.clone());
+    move |_, cx| {
+        let tokens = *theme::tokens(cx);
+        let group: SharedString = format!("details-script-{script_id}").into();
+        let (view, popup, project_id, script_id) = (view.clone(), popup.clone(), project_id.clone(), script_id.clone());
+        let tooltip: SharedString = format!("Edit {name}").into();
+        let edit = div()
+            .id(ElementId::Name(format!("{group}-edit").into()))
+            .absolute()
+            .right_0()
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .invisible()
+            .group_hover(group.clone(), gpui_kit::Styled::visible)
+            .hover(move |style| style.bg(tokens.accent))
+            .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Settings).size(px(14.)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                view.update(cx, |this, cx| this.open_project_script_editor(&project_id, Some(&script_id), window, cx));
+                popup.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
+            });
+        h_flex()
+            .w_full()
+            .gap_2()
+            .group(group.clone())
+            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+            .child(
+                h_flex()
+                    .relative()
+                    .flex_none()
+                    .h(px(24.))
+                    .min_w(px(24.))
+                    .justify_end()
+                    .children(shortcut.clone().map(|shortcut| {
+                        div()
+                            .text_xs()
+                            .text_color(tokens.muted_foreground)
+                            .group_hover(group.clone(), |style| style.opacity(0.))
+                            .child(shortcut)
+                    }))
+                    .child(edit),
+            )
+            .into_any_element()
+    }
+}
+
 #[derive(Clone)]
 struct ScriptRun {
-    command: SharedString,
-    stop_on_settle: bool,
+    project_id: String,
+    id: String,
+    /// The whole script, so its run keeps `stopOnSettle` and its preview settings.
+    script: std::rc::Rc<ProjectScript>,
+}
+
+impl ScriptRun {
+    fn new(project_id: &str, script: &ProjectScript) -> Self {
+        Self { project_id: project_id.to_owned(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
+    }
+}
+
+/// `t3code:last-invoked-script-by-project`, kept with this device's client settings.
+const LAST_INVOKED_SCRIPT_KEY: &str = "lastInvokedScriptByProject";
+
+/// The card's run button: the script last run in the project, else `primaryProjectScript` (a
+/// regular script, then a setup one; a settle-only script is never primary).
+fn primary_script<'a>(scripts: &'a [ProjectScript], last_invoked: Option<&str>) -> Option<&'a ProjectScript> {
+    let settles = |script: &ProjectScript| script.run_on_settle == Some(true);
+    last_invoked
+        .and_then(|id| scripts.iter().find(|script| script.id == id))
+        .or_else(|| scripts.iter().find(|script| !script.run_on_worktree_create && !settles(script)))
+        .or_else(|| scripts.iter().find(|script| !settles(script)))
 }
 
 #[cfg(test)]
@@ -1660,6 +2068,60 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(format_context_tokens(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn the_primary_script_is_the_last_run_else_a_regular_then_a_setup_one() {
+        let script = |id: &str, setup: bool, settle: bool| ProjectScript {
+            id: id.into(),
+            name: id.into(),
+            command: id.into(),
+            icon: "play".into(),
+            run_on_worktree_create: setup,
+            run_on_settle: settle.then_some(true),
+            stop_on_settle: None,
+            run_async: None,
+            preview_url: None,
+            auto_open_preview: None,
+        };
+        let primary =
+            |scripts: &[ProjectScript], last: Option<&str>| primary_script(scripts, last).map(|s| s.id.clone());
+        let scripts = [script("setup", true, false), script("settle", false, true), script("dev", false, false)];
+        assert_eq!(primary(&scripts, None).as_deref(), Some("dev"));
+        assert_eq!(primary(&scripts, Some("settle")).as_deref(), Some("settle"), "the last run wins");
+        assert_eq!(primary(&scripts, Some("deleted")).as_deref(), Some("dev"));
+        assert_eq!(primary(&scripts[..2], None).as_deref(), Some("setup"));
+        assert_eq!(primary(&scripts[1..2], None), None, "a settle-only script is never primary");
+
+        // The run keeps the script's settle flag and the preview it opens automatically.
+        let mut dev = script("dev", false, false);
+        dev.stop_on_settle = Some(true);
+        dev.preview_url = Some("http://localhost:5173".into());
+        let run = |script: &ProjectScript| super::super::RunInTerminal::script("/repo".into(), script);
+        assert!(run(&dev).stop_on_settle);
+        assert_eq!(run(&dev).preview_url, None, "no autoOpenPreview, no preview");
+        dev.auto_open_preview = Some(true);
+        assert_eq!(run(&dev).preview_url.as_deref(), Some("http://localhost:5173"));
+        dev.preview_url = Some("  ".into());
+        assert_eq!(run(&dev).preview_url, None);
+    }
+
+    #[test]
+    fn details_visibility_is_per_thread_and_keeps_only_collapsed_cards() {
+        let mut visibility = DetailsVisibility::default();
+        assert!(visibility.update("e:a", |v| v.inline_open = false), "collapsing is stored");
+        assert!(!visibility.update("e:b", |v| v.popover_open = true), "a popover is not stored");
+        assert_eq!(visibility.get("e:a"), Visibility { inline_open: false, popover_open: false });
+        assert_eq!(visibility.get("e:b"), Visibility { inline_open: true, popover_open: true });
+        assert_eq!(visibility.get("e:c"), DEFAULT_VISIBILITY, "other threads keep the default");
+        assert_eq!(visibility.stored(), json!({"e:a": {"inlineOpen": false, "popoverOpen": false}}));
+
+        assert!(!DetailsVisibility::from_stored(&visibility.stored()).get("e:a").inline_open, "it survives a restart");
+        assert_eq!(DetailsVisibility::from_stored(&json!({"e:b": {"inlineOpen": true}})), DetailsVisibility::default());
+
+        assert!(visibility.update("e:a", |v| v.inline_open = true));
+        assert!(!visibility.update("e:b", |v| v.popover_open = false));
+        assert_eq!(visibility, DetailsVisibility::default(), "back at the default, no entries remain");
     }
 
     #[test]

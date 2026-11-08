@@ -4,7 +4,7 @@
 //! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
 //! values never fail a whole frame; only fields the UI reads are typed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::SharedString;
@@ -931,6 +931,71 @@ impl ThreadShell {
     }
 }
 
+/// `(environment id, thread id)`, a thread's identity across environments.
+pub type ThreadRef<'a> = (&'a str, &'a str);
+
+/// `hiddenThreadTagsAtom`: the tags an environment's tag filter hides, `None` while it is off.
+pub fn hidden_thread_tags(settings: &crate::settings::Settings) -> Option<Vec<String>> {
+    if !settings.bool("hideTaggedThreads") {
+        return None;
+    }
+    // Trimmed, so a hand-edited " private" still matches.
+    let tags: Vec<String> = settings
+        .get("hiddenThreadTags")
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!tags.is_empty()).then_some(tags)
+}
+
+/// `hiddenThreadKeys`: the threads the tag filter hides, given each hiding environment's tags.
+/// Subagents, side chats and delegated tasks follow their parent; while any environment hides
+/// tags, one whose parent isn't loaded stays hidden.
+pub fn hidden_threads<'a>(
+    threads: &'a [ThreadShell],
+    hidden_tags: &HashMap<&str, Vec<String>>,
+) -> HashSet<ThreadRef<'a>> {
+    if hidden_tags.is_empty() {
+        return HashSet::new();
+    }
+    let by_ref: HashMap<ThreadRef, &ThreadShell> =
+        threads.iter().map(|t| ((t.environment_id.as_ref(), t.id.as_str()), t)).collect();
+    let mut known = HashMap::new();
+    by_ref.keys().copied().filter(|key| is_hidden(*key, &by_ref, hidden_tags, &mut known)).collect()
+}
+
+fn is_hidden<'a>(
+    key: ThreadRef<'a>,
+    by_ref: &HashMap<ThreadRef<'a>, &'a ThreadShell>,
+    hidden_tags: &HashMap<&str, Vec<String>>,
+    known: &mut HashMap<ThreadRef<'a>, bool>,
+) -> bool {
+    if let Some(hidden) = known.get(&key) {
+        return *hidden;
+    }
+    let Some(thread) = by_ref.get(&key) else { return false };
+    let parent = match (&thread.lineage.parent_thread_id, &thread.delegated_from) {
+        (Some(parent), _) if !thread.is_listed() => Some((key.0, parent.as_str())),
+        (_, Some(from)) => Some((from.environment_id.as_str(), from.thread_id.as_str())),
+        _ => None,
+    };
+    let hidden = match parent {
+        Some(parent) if by_ref.contains_key(&parent) => {
+            // Seeded first, so a malformed cycle ends visible.
+            known.insert(key, false);
+            is_hidden(parent, by_ref, hidden_tags, known)
+        }
+        Some(_) => true,
+        None => hidden_tags.get(key.0).is_some_and(|tags| tags.iter().any(|tag| thread.tags.contains(tag))),
+    };
+    known.insert(key, hidden);
+    hidden
+}
+
 pub fn is_active_run_status(status: &str) -> bool {
     matches!(status, "preparing" | "queued" | "starting" | "running" | "waiting")
 }
@@ -1136,6 +1201,19 @@ pub struct AppThread {
     /// Why the last `checkpoint.rollback` failed, keyed by its command id.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
+    /// The thread's guest link, kept after it expires until the owner stops sharing.
+    #[serde(default)]
+    pub guest_share: Option<GuestShare>,
+}
+
+/// `ThreadGuestShare`: what the header shows of a guest link.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestShare {
+    pub expires_at: String,
+    /// Set once the guest redeems the link.
+    #[serde(default)]
+    pub guest_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1898,6 +1976,50 @@ mod tests {
 
     fn project(root: &str, identity: Option<&str>) -> Value {
         json!({"id": root, "title": root, "workspaceRoot": root, "repositoryIdentity": identity.map(|name| json!({"displayName": name, "canonicalKey": name})), "scripts": []})
+    }
+
+    #[test]
+    fn tagged_threads_hide_with_their_children_and_delegated_tasks() {
+        let shell = |env: &str, id: &str, fields: Value| {
+            let mut value = thread(id, "1");
+            value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let mut shell: ThreadShell = serde_json::from_value(value).unwrap();
+            shell.environment_id = env.to_owned().into();
+            shell
+        };
+        let subagent = |parent: &str| json!({"lineage": {"rootThreadId": parent, "parentThreadId": parent, "relationshipToParent": "subagent"}});
+        let threads = [
+            shell("a", "private", json!({"tags": ["private"]})),
+            shell("a", "plain", json!({"tags": ["work"]})),
+            shell("a", "child", subagent("private")),
+            shell("a", "orphan", subagent("missing")),
+            // A listed fork keeps its own visibility.
+            shell(
+                "a",
+                "fork",
+                json!({"lineage": {"rootThreadId": "private", "parentThreadId": "private", "relationshipToParent": "fork"}}),
+            ),
+            shell(
+                "b",
+                "delegated",
+                json!({"delegatedFrom": {"environmentId": "a", "threadId": "private", "title": "p"}}),
+            ),
+            // Environment b hides nothing, so its own tags stay visible.
+            shell("b", "private", json!({"tags": ["private"]})),
+        ];
+        let tags = HashMap::from([("a", vec!["private".to_owned()])]);
+        let mut hidden: Vec<_> = hidden_threads(&threads, &tags).into_iter().collect();
+        hidden.sort_unstable();
+        assert_eq!(hidden, [("a", "child"), ("a", "orphan"), ("a", "private"), ("b", "delegated")]);
+        assert!(hidden_threads(&threads, &HashMap::new()).is_empty());
+
+        let mut settings = crate::settings::Settings::server_defaults();
+        settings.set("hiddenThreadTags", json!([" private ", ""]));
+        assert_eq!(hidden_thread_tags(&settings), None);
+        settings.set("hideTaggedThreads", json!(true));
+        assert_eq!(hidden_thread_tags(&settings), Some(vec!["private".to_owned()]));
+        settings.set("hiddenThreadTags", json!([" "]));
+        assert_eq!(hidden_thread_tags(&settings), None);
     }
 
     #[test]

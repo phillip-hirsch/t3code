@@ -12,6 +12,7 @@ use std::mem;
 use gpui_kit::{App, Context, Hsla, SharedString, Task, Window};
 use serde_json::{Value, json};
 
+use super::pages::settings::{SessionLoad, check_session, operates_terminals};
 use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
@@ -35,11 +36,11 @@ pub(super) struct EnvironmentSession {
     generation: Option<u64>,
     /// `subscribeDeviceState`; `None` until this connection's first state arrives.
     pub device_state: Option<DeviceState>,
+    /// This client's grants there (`/api/auth/session`), checked on each connection.
+    grants: SessionLoad,
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
-    /// The session answered without `terminal:operate`: its terminals only show output.
-    pub terminal_read_only: bool,
     /// Config, terminal, preview and device streams, and the session's grants.
     _streams: Vec<Task<()>>,
     _shell: Option<Task<()>>,
@@ -48,6 +49,12 @@ pub(super) struct EnvironmentSession {
 impl EnvironmentSession {
     fn saved(id: SharedString) -> Self {
         Self { id: Some(id), ..Self::default() }
+    }
+
+    /// Only a session that answered without `terminal:operate` keeps its terminals to output;
+    /// the server still checks every write.
+    pub fn operates_terminals(&self) -> bool {
+        operates_terminals(&self.grants)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -99,6 +106,17 @@ impl Workspace {
 
     fn session_mut(&mut self, environment_id: &str) -> Option<&mut EnvironmentSession> {
         self.sessions.iter_mut().find(|s| s.is(environment_id))
+    }
+
+    /// `readEnvironmentScope`: whether this client holds `scope` on the environment. A pending
+    /// or failed check grants nothing.
+    pub(super) fn env_grants(&self, environment_id: &str, scope: &str) -> bool {
+        self.session(environment_id).is_some_and(|s| s.grants.grants(scope))
+    }
+
+    /// Whether this client may change the environment's threads.
+    pub(super) fn can_operate(&self, environment_id: &str) -> bool {
+        self.env_grants(environment_id, "orchestration:operate")
     }
 
     /// The open target lives on the primary environment (or nothing is open).
@@ -252,6 +270,8 @@ impl Workspace {
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
                 }
+                // Its thread tag filter may have changed.
+                this.retract_hidden_alerts(window, cx);
                 // Each environment's browser gets this client's profiles.
                 this.report_browser_profiles(cx);
                 this.notify_sidebar(cx);
@@ -267,10 +287,11 @@ impl Workspace {
         ];
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
-            streams.push(super::pages::settings::check_terminal_operate(endpoint, cx, move |this, operable| {
+            streams.push(check_session(endpoint, cx, move |this, grants, cx| {
                 if let Some(session) = this.session_mut(&id) {
-                    session.terminal_read_only = !operable;
+                    session.grants = grants;
                 }
+                this.notify_sidebar(cx);
             }));
         }
         let Some(session) = self.session_mut(&environment_id) else { return };
@@ -412,6 +433,7 @@ impl Workspace {
             self.start_session(id, window, cx);
         }
         if !removed.is_empty() {
+            self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
         }
         cx.notify();
@@ -458,6 +480,12 @@ impl Workspace {
     /// opens its draft from the open thread or draft; `None` hides the way in.
     pub(super) fn scratch_environment(&self) -> Option<SharedString> {
         scratch_environment_of(&self.sessions, self.target.as_ref().map(|target| target.environment().as_ref()))
+    }
+
+    /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is
+    /// offline; the primary counts only once its id is known.
+    pub(super) fn shells_bootstrapped(&self) -> bool {
+        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.sequence(id) > 0 || !s.is_connected()))
     }
 
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.

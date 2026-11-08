@@ -1,6 +1,7 @@
 //! The add/edit action dialog (`ProjectScriptEditorDialog` in `apps/web/src/components/projectScriptEditor.tsx`).
 //! Settings and the chat's "Add project script" both open it through
-//! [`Workspace::open_project_script_editor`]; it saves into the project's settings overrides.
+//! [`Workspace::open_project_script_editor`]; it saves into the project's settings overrides on
+//! the project's own environment.
 
 use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -19,10 +20,23 @@ use super::scripts::{
     next_project_script_id, resolve_project_scripts, script_icon,
 };
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::theme::{self, Tokens};
+
+/// The chat's editor needs `orchestration:operate` (`ProjectScriptEditorDialog`'s default
+/// `editScope`); Settings passes `settings:write`.
+const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
+const CANNOT_CHANGE_ACTIONS: &str = "This connection cannot change project actions.";
+const CANNOT_CHANGE_SHORTCUTS: &str = "This connection cannot change keyboard shortcuts.";
 
 pub(super) struct ScriptEditor {
     workspace: WeakEntity<Workspace>,
+    /// The project's environment, whose grants gate the form.
+    environment: SharedString,
+    edit_scope: &'static str,
+    /// The grants when the editor opened; every action checks them again.
+    can_edit: bool,
+    can_write_settings: bool,
     project_id: String,
     script_id: Option<String>,
     /// The ids of the project's current scripts, to validate a new script's shortcut.
@@ -58,8 +72,9 @@ impl Workspace {
         let initial = match script_id {
             None => ScriptInput::default(),
             Some(id) => {
-                match resolve_project_scripts(&self.settings_info().settings, project).iter().find(|s| s.id == id) {
-                    Some(script) => ScriptInput::from_script(script, self.settings_info().keybindings_json()),
+                let info = self.project_info(project);
+                match resolve_project_scripts(&info.settings, project).iter().find(|s| s.id == id) {
+                    Some(script) => ScriptInput::from_script(script, info.keybindings_json()),
                     None => return,
                 }
             }
@@ -78,10 +93,19 @@ impl Workspace {
     ) {
         let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else { return };
         let script_ids =
-            resolve_project_scripts(&self.settings_info().settings, project).into_iter().map(|s| s.id).collect();
+            resolve_project_scripts(&self.project_info(project).settings, project).into_iter().map(|s| s.id).collect();
+        let environment = project.environment_id.clone();
+        let edit_scope = if self.settings.is_some() { SETTINGS_WRITE } else { ORCHESTRATION_OPERATE };
+        let grants = Grants {
+            edit_scope,
+            can_edit: self.env_grants(&environment, edit_scope),
+            can_write_settings: self.env_grants(&environment, SETTINGS_WRITE),
+            environment,
+        };
         let workspace = cx.weak_entity();
-        let editor =
-            cx.new(|cx| ScriptEditor::new(workspace, project_id, script_id, script_ids, initial, error, window, cx));
+        let editor = cx.new(|cx| {
+            ScriptEditor::new(workspace, grants, project_id, script_id, script_ids, initial, error, window, cx)
+        });
         let title = if script_id.is_some() { "Edit Action" } else { "Add Action" };
         editor.update(cx, |editor, cx| editor.name.update(cx, |name, cx| name.focus(window, cx)));
         let footer =
@@ -92,9 +116,19 @@ impl Workspace {
     }
 }
 
+/// What the editor may change on the project's environment (`useEnvironmentScope`).
+struct Grants {
+    environment: SharedString,
+    edit_scope: &'static str,
+    can_edit: bool,
+    can_write_settings: bool,
+}
+
 impl ScriptEditor {
+    #[expect(clippy::too_many_arguments, reason = "the dialog's request, split into its parts")]
     fn new(
         workspace: WeakEntity<Workspace>,
+        grants: Grants,
         project_id: &str,
         script_id: Option<&str>,
         script_ids: Vec<String>,
@@ -128,6 +162,10 @@ impl ScriptEditor {
         let initial_keybinding = initial.keybinding.clone().flatten();
         Self {
             workspace,
+            environment: grants.environment,
+            edit_scope: grants.edit_scope,
+            can_edit: grants.can_edit,
+            can_write_settings: grants.can_write_settings,
             project_id: project_id.to_owned(),
             script_id: script_id.map(str::to_owned),
             script_ids,
@@ -153,6 +191,11 @@ impl ScriptEditor {
         }
     }
 
+    /// `readEnvironmentScope` on the project's environment, read again when the form acts.
+    fn grants(&self, scope: &str, cx: &gpui_kit::App) -> bool {
+        self.workspace.upgrade().is_some_and(|workspace| workspace.read(cx).env_grants(&self.environment, scope))
+    }
+
     fn has_preview_url(&self, cx: &Context<Self>) -> bool {
         !self.preview_url.read(cx).value().trim().is_empty()
     }
@@ -161,6 +204,9 @@ impl ScriptEditor {
     fn capture_keybinding(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "tab" || (key == "escape" && !event.keystroke.modifiers.modified()) {
+            return;
+        }
+        if !self.grants(self.edit_scope, cx) || !self.grants(SETTINGS_WRITE, cx) {
             return;
         }
         cx.stop_propagation();
@@ -176,6 +222,14 @@ impl ScriptEditor {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
+        }
+        if !self.grants(self.edit_scope, cx) {
+            return self.fail(CANNOT_CHANGE_ACTIONS, cx);
+        }
+        let typed = Some(self.keybinding.trim()).filter(|key| !key.is_empty());
+        let initial = self.initial_keybinding.as_deref().map(str::trim).filter(|key| !key.is_empty());
+        if typed != initial && !self.grants(SETTINGS_WRITE, cx) {
+            return self.fail(CANNOT_CHANGE_SHORTCUTS, cx);
         }
         let name = self.name.read(cx).value().trim().to_owned();
         let command = self.command.read(cx).value().trim().to_owned();
@@ -242,10 +296,15 @@ impl ScriptEditor {
     /// The delete confirmation; confirming closes both dialogs and deletes in the background.
     fn request_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(script_id) = self.script_id.clone() else { return };
+        if !self.grants(self.edit_scope, cx) {
+            return;
+        }
         let name = self.name.read(cx).value().to_string();
         let (workspace, project_id) = (self.workspace.clone(), self.project_id.clone());
+        let editor = cx.entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, project_id, script_id) = (workspace.clone(), project_id.clone(), script_id.clone());
+            let editor = editor.clone();
             alert
                 .title(format!("Delete action \"{name}\"?"))
                 .description("This action cannot be undone.")
@@ -254,6 +313,11 @@ impl ScriptEditor {
                 .ok_variant(ButtonVariant::Danger)
                 .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
+                    let edit_scope = editor.read(cx).edit_scope;
+                    if !editor.read(cx).grants(edit_scope, cx) {
+                        editor.update(cx, |editor, cx| editor.fail(CANNOT_CHANGE_ACTIONS, cx));
+                        return true;
+                    }
                     window.close_all_dialogs(cx);
                     let _ = workspace.update(cx, |workspace, cx| {
                         let task = workspace.delete_project_script(&project_id, &script_id, cx);
@@ -279,7 +343,7 @@ impl ScriptEditor {
                     .outline()
                     .size(px(36.))
                     .flex_none()
-                    .disabled(self.saving)
+                    .disabled(self.saving || !self.can_edit)
                     .tooltip("Choose icon")
                     .child(Icon::new(script_icon(&self.icon)).with_size(px(18.))),
             )
@@ -327,11 +391,15 @@ impl ScriptEditor {
     fn render_keybinding(&self, t: &Tokens, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.keybinding_focus.is_focused(window);
         let empty = self.keybinding.is_empty();
+        // `disabled={!canWriteSettings}` inside the form's disabled fieldset.
+        let enabled = !self.saving && self.can_edit && self.can_write_settings;
         div()
             .id("script-keybinding")
             .key_context(crate::app::keymap::CAPTURE_CONTEXT)
-            .track_focus(&self.keybinding_focus)
-            .on_key_down(cx.listener(Self::capture_keybinding))
+            .when(enabled, |el| {
+                el.track_focus(&self.keybinding_focus).on_key_down(cx.listener(Self::capture_keybinding))
+            })
+            .when(!enabled, |el| el.opacity(0.64))
             .h(px(36.))
             .px(px(12.))
             .flex()
@@ -401,6 +469,8 @@ impl Render for ScriptEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let has_preview = self.has_preview_url(cx);
+        // `<fieldset disabled={isSaving || !canEditActions}>`.
+        let enabled = !self.saving && self.can_edit;
         v_flex()
             .gap(px(16.))
             .child(div().text_sm().text_color(t.muted_foreground).child(
@@ -411,7 +481,7 @@ impl Render for ScriptEditor {
                     h_flex()
                         .gap(px(8.))
                         .child(self.render_icon_picker(&t, cx))
-                        .child(div().flex_1().child(Input::new(&self.name).disabled(self.saving))),
+                        .child(div().flex_1().child(Input::new(&self.name).disabled(!enabled))),
                 ),
             )
             .child(
@@ -424,19 +494,19 @@ impl Render for ScriptEditor {
                         &t,
                     )),
             )
-            .child(v_flex().gap(px(6.)).child(label("Command")).child(Textarea::new(&self.command).disabled(self.saving)))
+            .child(v_flex().gap(px(6.)).child(label("Command")).child(Textarea::new(&self.command).disabled(!enabled)))
             .child(
                 v_flex()
                     .gap(px(6.))
                     .child(label("Preview URL (optional)"))
-                    .child(Input::new(&self.preview_url).disabled(self.saving))
+                    .child(Input::new(&self.preview_url).disabled(!enabled))
                     .child(help("Open this URL in the in-app preview when this action runs.", &t)),
             )
             .child(toggle(
                 "script-run-on-create",
                 "Run automatically on worktree creation",
                 self.run_on_worktree_create,
-                !self.saving,
+                enabled,
                 &t,
                 set(cx.entity(), |this, on| this.run_on_worktree_create = on),
             ))
@@ -444,7 +514,7 @@ impl Render for ScriptEditor {
                 "script-wait-for-setup",
                 "Wait for it to finish before the agent starts",
                 self.wait_for_setup,
-                !self.saving && self.run_on_worktree_create,
+                enabled && self.run_on_worktree_create,
                 &t,
                 set(cx.entity(), |this, on| this.wait_for_setup = on),
             ))
@@ -452,7 +522,7 @@ impl Render for ScriptEditor {
                 "script-run-on-settle",
                 "Run in the thread's worktree when the thread settles",
                 self.run_on_settle,
-                !self.saving,
+                enabled,
                 &t,
                 set(cx.entity(), |this, on| this.run_on_settle = on),
             ))
@@ -460,7 +530,7 @@ impl Render for ScriptEditor {
                 "script-stop-on-settle",
                 "Stop this action when the thread settles",
                 self.stop_on_settle,
-                !self.saving,
+                enabled,
                 &t,
                 set(cx.entity(), |this, on| this.stop_on_settle = on),
             ))
@@ -468,7 +538,7 @@ impl Render for ScriptEditor {
                 "script-auto-open-preview",
                 "Open preview automatically when this action runs",
                 self.auto_open_preview,
-                !self.saving && has_preview,
+                enabled && has_preview,
                 &t,
                 set(cx.entity(), |this, on| this.auto_open_preview = on),
             ))
@@ -486,6 +556,8 @@ impl Render for EditorFooter {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let form = self.editor.read(cx);
         let (editing, saving) = (form.script_id.is_some(), form.saving);
+        // Delete and Save stay off while saving or without the edit grant.
+        let blocked = saving || !form.can_edit;
         let editor = self.editor.clone();
         let on_editor = move |run: fn(&mut ScriptEditor, &mut Window, &mut Context<ScriptEditor>)| {
             let editor = editor.clone();
@@ -503,7 +575,7 @@ impl Render for EditorFooter {
                         .danger()
                         .outline()
                         .label("Delete")
-                        .disabled(saving)
+                        .disabled(blocked)
                         .on_click(on_editor(ScriptEditor::request_delete)),
                 )
                 .child(div().flex_1())
@@ -517,7 +589,7 @@ impl Render for EditorFooter {
             .child(
                 Button::new("save-script")
                     .primary()
-                    .disabled(saving)
+                    .disabled(blocked)
                     .label(if saving {
                         "Saving…"
                     } else if editing {

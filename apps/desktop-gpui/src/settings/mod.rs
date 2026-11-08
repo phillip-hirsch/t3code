@@ -209,32 +209,27 @@ pub struct ClientSettings {
     pub themes: Library,
     stored_themes: StoredThemes,
     path: Option<PathBuf>,
+    /// The file exists but couldn't be read or decoded. Nothing is written over it, and the
+    /// app shows a recovery screen until a retry reads it (`FirstRunRecovery`).
+    pub read_failed: bool,
 }
 
 impl ClientSettings {
-    /// Reads `<T3 home>/userdata/client-settings.json`; a missing or unreadable file is the defaults.
+    /// Reads `<T3 home>/userdata/client-settings.json`; a missing file is the defaults.
     pub fn load() -> Self {
         Self::load_from(client_settings_path())
     }
 
     fn load_from(path: Option<PathBuf>) -> Self {
-        let document = match path.as_deref().map(std::fs::read_to_string) {
-            None => Some(Value::Null),
-            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(Value::Null),
-            Some(Err(_)) => None,
-            Some(Ok(raw)) => serde_json::from_str::<Value>(&raw).ok().filter(Value::is_object),
-        };
-        let Some(document) = document else {
-            log::warn!("could not read the client settings; leaving the file as it is");
-            let mut settings = Self::from_stored(&Value::Null, path);
-            settings.stored_themes = StoredThemes::Unreadable;
-            return settings;
-        };
-        let stored = match document.get("settings") {
-            Some(settings) => settings.clone(),
-            None => document,
-        };
-        Self::from_stored(&stored, path)
+        match path.as_deref().map_or(Ok(Value::Null), read_stored) {
+            Ok(stored) => Self::from_stored(&stored, path),
+            Err(()) => {
+                let mut settings = Self::from_stored(&Value::Null, path);
+                settings.stored_themes = StoredThemes::Unreadable;
+                settings.read_failed = true;
+                settings
+            }
+        }
     }
 
     fn from_stored(stored: &Value, path: Option<PathBuf>) -> Self {
@@ -254,6 +249,7 @@ impl ClientSettings {
             themes: Library::new(crate::theme_file::parse_stored_list(&stored[CUSTOM_THEMES_KEY])),
             stored_themes,
             path,
+            read_failed: false,
         }
     }
 
@@ -312,7 +308,7 @@ impl ClientSettings {
 
     /// Writes a temporary file and renames it over the old one, as the desktop app does.
     fn save(&mut self) -> std::io::Result<()> {
-        if matches!(self.stored_themes, StoredThemes::Unreadable) {
+        if self.read_failed || matches!(self.stored_themes, StoredThemes::Unreadable) {
             return Err(std::io::Error::other("the file on disk could not be read"));
         }
         let Some(path) = &self.path else { return Ok(()) };
@@ -359,6 +355,28 @@ fn merge_stored_themes(records: &[Value], themes: &[crate::themes::ThemeDefiniti
     }
     merged.extend(themes.iter().filter(|theme| !written.contains(theme.id.as_str())).map(crate::theme_file::stored));
     merged
+}
+
+/// `DesktopClientSettings.get`: the stored settings (the document's `settings`, or the document
+/// itself), `Null` when the file doesn't exist; a file that can't be read or isn't a JSON object fails.
+fn read_stored(path: &Path) -> Result<Value, ()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(error) => {
+            log::warn!("could not read {}: {error}", path.display());
+            return Err(());
+        }
+    };
+    let stored = match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(mut document)) => document.remove("settings").unwrap_or(Value::Object(document)),
+        Ok(other) => other,
+        Err(error) => {
+            log::warn!("could not decode {}: {error}", path.display());
+            return Err(());
+        }
+    };
+    stored.is_object().then_some(stored).ok_or(())
 }
 
 pub(crate) fn write_atomically(path: &Path, document: &Value) -> std::io::Result<()> {
@@ -410,6 +428,29 @@ mod tests {
         assert!(!contract.is_client_key("favorites") && contract.is_server_key("favorites"));
         assert!(contract.is_project_scoped("defaultThreadEnvMode"));
         assert_eq!(contract.search_item("delete-confirmation").map(|i| i.title.as_str()), Some("Delete confirmation"));
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_fails_and_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-client-settings-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client-settings.json");
+        assert_eq!(read_stored(&path), Ok(Value::Null));
+        for (raw, stored) in [
+            (r#"{"settings": {"timestampFormat": "24-hour"}}"#, Ok(json!({"timestampFormat": "24-hour"}))),
+            (r#"{"timestampFormat": "12-hour"}"#, Ok(json!({"timestampFormat": "12-hour"}))),
+            ("{not json", Err(())),
+            ("[]", Err(())),
+            (r#"{"settings": 1}"#, Err(())),
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            assert_eq!(read_stored(&path), stored, "{raw}");
+        }
+        let mut settings = ClientSettings::from_stored(&Value::Null, Some(path.clone()));
+        settings.read_failed = true;
+        settings.apply(json!({"timestampFormat": "24-hour"}).as_object().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"settings": 1}"#);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

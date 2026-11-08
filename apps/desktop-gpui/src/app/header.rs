@@ -4,9 +4,10 @@
 use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
+    AnyElement, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
 };
 
 use super::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
@@ -60,9 +61,12 @@ impl Workspace {
             }
         };
 
-        let crumb = |id: &'static str| {
+        // A breadcrumb button: a tab stop that Enter and Space activate, with the web's inset ring.
+        let crumb = |id: &'static str, focus: &FocusHandle, cx: &mut Context<Self>| {
             h_flex()
                 .id(id)
+                .track_focus(focus)
+                .relative()
                 .flex_none()
                 .min_w_0()
                 .gap(px(6.))
@@ -71,7 +75,10 @@ impl Workspace {
                 .cursor_pointer()
                 .occlude()
                 .hover(|style| style.text_color(tokens.foreground))
+                .children(focus_ring(focus, window, tokens.ring))
+                .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
         };
+        let [project_focus, parent_focus, _] = &self.title.crumbs;
         let separator = || div().flex_none().text_color(tokens.muted_foreground).child("/");
         // `WorkspaceBreadcrumb`'s nav clips its row inside the container's `pr-10` / `pr-24`.
         let mut breadcrumb = h_flex().flex_1().min_w_0().gap_3().overflow_hidden().text_sm().font_medium();
@@ -83,7 +90,7 @@ impl Workspace {
             breadcrumb = breadcrumb
                 .child(
                     // `WorkspaceBreadcrumbItem className="shrink"`: the project gives way to the title's `min-w-10`.
-                    crumb("crumb-project")
+                    crumb("crumb-project", project_focus, cx)
                         .flex_shrink(1.)
                         .child(super::sidebar::project_icon(project, &tokens, false, 14., self.favicon(project)))
                         .child(div().max_w(px(160.)).truncate().child(name))
@@ -98,7 +105,7 @@ impl Workspace {
             let parent_id = parent.id.clone();
             breadcrumb = breadcrumb
                 .child(
-                    crumb("crumb-parent")
+                    crumb("crumb-parent", parent_focus, cx)
                         .flex_shrink(1.)
                         .child(div().min_w_0().truncate().child(parent.title.clone()))
                         .on_click(
@@ -120,7 +127,7 @@ impl Workspace {
                 }))
                 .child(Input::new(&rename.input).small().text_color(tokens.foreground))
                 .into_any_element(),
-            (Some(Target::Thread { .. }), None) => self.render_title_button(title, &tokens, cx),
+            (Some(Target::Thread { .. }), None) => self.render_title_button(title, &tokens, window, cx),
             _ => div().min_w(px(40.)).flex_1().truncate().text_color(tokens.foreground).child(title).into_any_element(),
         };
         // `Badge variant="info" size="sm"`: "From {origin}", hidden while renaming.
@@ -146,16 +153,43 @@ impl Workspace {
         // `WorkspaceBreadcrumbItem current` (`min-w-10 flex-1`) in the clipped breadcrumb: the title
         // gives way first, then the chip is cut at the edge.
         let current = h_flex().min_w(px(40.)).flex_1().overflow_hidden().child(title).children(origin);
-        let container = h_flex().flex_1().min_w_0().pr(px(if panel_open { 40. } else { 96. }));
-        header.child(container.child(breadcrumb.child(current))).children(self.render_title_menu())
+        let container = h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_3()
+            .pr(px(if panel_open { 40. } else { 96. }))
+            .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx));
+        let share = self.render_guest_share_indicator(cx);
+        header.child(container.child(breadcrumb.child(current)).children(share)).children(self.render_title_menu())
+    }
+
+    /// `onContextMenu` on the breadcrumb container. On Windows only its buttons get the click:
+    /// the rest is the caption, where Windows shows the system menu as it does for Electron.
+    fn header_context_menu(
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&gpui_kit::MouseDownEvent, &mut Window, &mut gpui_kit::App) + 'static {
+        cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            this.context_click_header(event.position, window, cx);
+        })
     }
 
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
-    fn render_title_button(&self, title: SharedString, tokens: &theme::Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_title_button(
+        &self,
+        title: SharedString,
+        tokens: &theme::Tokens,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let bounds = self.title.bounds.clone();
+        let focus = &self.title.crumbs[2];
+        let ring = focus_ring(focus, window, tokens.ring);
+        let chevron_shown = ring.is_some();
         h_flex()
             .id("thread-title")
             .group("thread-title")
+            .track_focus(focus)
             .relative()
             .min_w_0()
             .flex_shrink(1.)
@@ -170,6 +204,7 @@ impl Workspace {
                     .flex_none()
                     .invisible()
                     .group_hover("thread-title", gpui_kit::Styled::visible)
+                    .when(chevron_shown, gpui_kit::Styled::visible)
                     .child(icon("icons/chevron-down.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -182,6 +217,14 @@ impl Workspace {
             .child(
                 canvas(move |element_bounds, _, _| bounds.set(element_bounds), |_, (), _, _| {}).absolute().size_full(),
             )
+            .children(ring)
+            // Enter and Space open the menu at once, as a keyboard click does on the web.
+            .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    this.click_title(1, true, window, cx);
+                }
+            }))
+            .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
             // Mouse-down, like the panel toggles: the drag region swallows the release.
             .on_mouse_down(
                 MouseButton::Left,
@@ -191,4 +234,10 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// `focus-visible:ring-2 ring-inset ring-ring`, drawn over the control so the text doesn't move.
+fn focus_ring(focus: &FocusHandle, window: &Window, ring: gpui_kit::Hsla) -> Option<gpui_kit::Div> {
+    (focus.is_focused(window) && window.last_input_was_keyboard())
+        .then(|| div().absolute().inset_0().rounded(px(4.)).border_2().border_color(ring))
 }

@@ -48,6 +48,7 @@ mod files;
 mod find;
 mod fresh_session;
 mod git;
+mod guest_share;
 mod header;
 mod host_picker;
 mod inspector;
@@ -70,6 +71,7 @@ mod preview;
 mod prompt_stash;
 mod queue;
 mod quit;
+mod recovery;
 mod request_cards;
 mod right_panel;
 mod send;
@@ -103,6 +105,17 @@ pub struct RunInTerminal {
     pub command: String,
     /// The script's `stopOnSettle`.
     pub stop_on_settle: bool,
+    /// The script's `previewUrl` when it has `autoOpenPreview`, opened once the command is written.
+    pub preview_url: Option<String>,
+}
+
+impl RunInTerminal {
+    /// A project script run in `cwd`.
+    fn script(cwd: String, script: &crate::model::ProjectScript) -> Self {
+        let preview_url =
+            script.preview_url.clone().filter(|url| script.auto_open_preview == Some(true) && !url.trim().is_empty());
+        Self { cwd, command: script.command.clone(), stop_on_settle: script.stop_on_settle == Some(true), preview_url }
+    }
 }
 pub use terminal::key_bindings as terminal_key_bindings;
 pub use titlebar::TRAFFIC_LIGHTS;
@@ -230,9 +243,8 @@ pub struct Workspace {
     /// The sheet's focus trap: Tab cycles inside it while it shows.
     sheet_trap: gpui_kit::FocusHandle,
     titlebar_focus: titlebar::TitlebarFocus,
-    details_open: bool,
-    /// The details card as a popover, while the canvas is too narrow for it inline.
-    details_popover: bool,
+    /// Each thread's details card, inline or as the popover while the canvas is too narrow.
+    details_visibility: details::DetailsVisibility,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
     /// The git status of the open target's workspace.
@@ -246,6 +258,7 @@ pub struct Workspace {
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
+    share_header: guest_share::ShareHeader,
     /// The composer's "Run on" picker and each draft's machine choice.
     host: host_picker::HostUi,
     _connection_task: Task<()>,
@@ -432,15 +445,17 @@ impl Workspace {
             sheet_focus: sidebar_sheet::SheetFocus::default(),
             sheet_trap: cx.focus_handle(),
             titlebar_focus: titlebar::TitlebarFocus::new(cx),
-            details_open: true,
-            details_popover: false,
+            details_visibility: details::DetailsVisibility::from_stored(
+                client_settings.values.get(details::DETAILS_VISIBILITY_KEY),
+            ),
             lineage_expanded: None,
             vcs: git::VcsWatch::default(),
             servers: Default::default(),
             automations: Default::default(),
             preferred_editor: None,
             right_panel: right_panel::RightPanel::new(cx),
-            title: thread_menu::TitleState::default(),
+            title: thread_menu::TitleState::new(cx),
+            share_header: Default::default(),
             host: host_picker::HostUi::new(cx),
             _connection_task: Self::connect(window, cx),
             landed: false,
@@ -1088,15 +1103,20 @@ fn project_name(project: &ProjectShell) -> SharedString {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.client_settings.read_failed {
+            return self.render_settings_recovery(window, cx);
+        }
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
         self.follow_rows_surface(cx);
+        self.sync_error_scope();
+        self.sync_saved_connection_banner(cx);
         self.sync_sheet_focus(window, cx);
         self.sidebar.fit_window(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
-            self.details_popover = false;
+            self.set_details_popover(false);
         }
         // A modal page covers the composer, so the editor behind it must not keep the keys.
         if window.focused(cx).is_none()
@@ -1257,5 +1277,6 @@ impl Render for Workspace {
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))
+            .into_any_element()
     }
 }

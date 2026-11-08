@@ -727,14 +727,16 @@ impl Workspace {
     }
 
     /// A request whose failure becomes an error notification titled `failure`.
-    /// Opens Providers on `environment` with `instance_id` selected (`openProviderSetup`).
+    /// Opens Providers on `environment` with `instance_id` selected (`openProviderSetup`); like the
+    /// web's navigation, which replaces the search, it leaves the project axis.
     pub(in crate::app) fn open_provider_settings(
         &mut self,
         environment: SharedString,
         instance_id: String,
         cx: &mut Context<Self>,
     ) {
-        self.settings_ui.scope = self.settings_ui.scope.with_machine(Some(environment.to_string()));
+        self.settings_ui.scope =
+            crate::settings::scope::ScopeSearch::default().with_machine(Some(environment.to_string()));
         self.settings_ui.provider_target = Some((environment, instance_id));
         self.open_settings("providers", cx);
     }

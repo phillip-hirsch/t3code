@@ -148,6 +148,19 @@ impl Attachment {
             .id()
     }
 
+    /// `removeComposerImage`: what to ask before removing an image the text still references
+    /// (`chips` are the composer's inline token ids); `None` removes it at once.
+    fn removal_question(&self, chips: &[String]) -> Option<String> {
+        let referenced = self.kind == Kind::Image && chips.contains(&self.chip_id());
+        referenced.then(|| {
+            format!(
+                "Remove {} from the message?
+It is referenced in your text; removing it also removes every reference.",
+                self.name
+            )
+        })
+    }
+
     /// The message's attachment entry for the upload `id`, plus its `context.records` entry
     /// when `text` links its chip.
     fn wire(&self, id: &str, text: &str) -> (Value, Option<Value>) {
@@ -667,18 +680,41 @@ impl Workspace {
         cx.spawn(async move |_, _| client.request("attachments.delete", json!({"attachmentId": id})).await).detach();
     }
 
+    /// The remove buttons: an image the text references asks first, as the web does.
+    pub(super) fn request_remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(attachment) = self.attachments.iter().find(|a| a.local_id == local_id) else { return };
+        let chips: Vec<String> = self.composer.read(cx).tokens().iter().map(|s| s.token().id().to_string()).collect();
+        let Some(question) = attachment.removal_question(&chips) else {
+            self.remove_attachment(local_id, window, cx);
+            return;
+        };
+        let answer = super::confirm::confirm(&question, true, window, cx);
+        let local_id = local_id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(true) {
+                let _ = this.update_in(cx, |this, window, cx| this.remove_attachment(&local_id, window, cx));
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };
         let attachment = self.attachments.remove(index);
         self.release_upload(&attachment, cx);
         let chip_id = attachment.chip_id();
+        // Every reference goes with it.
         self.composer.update(cx, |state, cx| {
-            if let Some(span) = state
-                .tokens()
-                .iter()
-                .find(|s| s.token().id().as_ref() == chip_id)
-                .map(gpui_kit::base::input::InlineTokenSpan::range)
-            {
+            let references = state.tokens().iter().filter(|s| s.token().id().as_ref() == chip_id).count();
+            for _ in 0..references {
+                let Some(span) = state
+                    .tokens()
+                    .iter()
+                    .find(|s| s.token().id().as_ref() == chip_id)
+                    .map(gpui_kit::base::input::InlineTokenSpan::range)
+                else {
+                    break;
+                };
                 state.set_selected_range(span, cx);
                 state.replace("", window, cx);
             }
@@ -829,7 +865,7 @@ impl Workspace {
                         let label = format!("Remove {}", attachment.name);
                         move |window, cx| Tooltip::new(label.clone()).build(window, cx)
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| this.remove_attachment(&id, window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| this.request_remove_attachment(&id, window, cx))),
             )
             .into_any_element()
     }
@@ -874,7 +910,7 @@ impl Workspace {
             })
             .child(
                 ghost_icon(ElementId::Name(format!("remove-{id}").into()), Lucide::X, t)
-                    .on_click(cx.listener(move |this, _, window, cx| this.remove_attachment(&id, window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| this.request_remove_attachment(&id, window, cx))),
             )
             .into_any_element()
     }
@@ -974,6 +1010,22 @@ mod tests {
         );
         assert_eq!(file.wire("up1", "no chip here").1, None);
         assert_eq!(file.chip_id(), "context:file/file_l1");
+    }
+
+    #[test]
+    fn removing_an_image_the_text_references_asks_first() {
+        let image = Attachment::restored_as("l2".into(), "image", "shot.png".into(), "image/png".into(), vec![1]);
+        let file = Attachment::restored_as("l1".into(), "file", "notes.txt".into(), "text/plain".into(), vec![1]);
+        let chips = vec![image.chip_id(), file.chip_id()];
+        assert_eq!(
+            image.removal_question(&chips).as_deref(),
+            Some(
+                "Remove shot.png from the message?
+It is referenced in your text; removing it also removes every reference."
+            )
+        );
+        assert_eq!(image.removal_question(&[file.chip_id()]), None, "an image the text doesn't reference goes at once");
+        assert_eq!(file.removal_question(&chips), None, "files never ask");
     }
 
     #[test]

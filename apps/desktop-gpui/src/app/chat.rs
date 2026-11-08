@@ -44,6 +44,15 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let (lane, _) = self.chat_layout(window);
         match (&self.target, &self.thread) {
+            // `IndexDraftLanding`: with no project the home asks what to work on, once every
+            // environment's shell has loaded, since a pending one can't prove there is none.
+            (None, _) if !self.shell.projects.iter().any(|p| p.archived_at.is_none()) => {
+                if self.shells_bootstrapped() {
+                    self.no_projects_hero(window, cx)
+                } else {
+                    div().into_any_element()
+                }
+            }
             (None, _) => no_thread(&t),
             // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
             (Some(Target::Draft { .. }), _) => div().into_any_element(),
@@ -323,6 +332,62 @@ fn scroll_to_end_button(
         .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
         .bg(Hsla { a: 0.8, ..t.background })
         .text_color(t.foreground)
+}
+
+impl Workspace {
+    /// `NoProjectsHero`: what to work on, with Add project and, where an environment offers a
+    /// "No project" home, Start without a project.
+    fn no_projects_hero(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::Sizable as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        let t = *theme::tokens(cx);
+        let scratch = self.scratch_environment();
+        // `text-2xl sm:text-3xl`.
+        let (size, line) = if window.viewport_size().width >= px(640.) { (30., 36.) } else { (24., 32.) };
+        let add = Button::new("no-projects-add").primary().small().icon(IconName::Plus).label("Add project").on_click(
+            cx.listener(|this, _, window, cx| this.open_palette(super::palette::View::AddProject, window, cx)),
+        );
+        let without = scratch.clone().map(|environment| {
+            Button::new("no-projects-scratch")
+                .outline()
+                .small()
+                .icon(IconName::MessageSquareDashed)
+                .label("Start without a project")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_scratch_thread(environment.clone(), None, window, cx);
+                }))
+        });
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(48.))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(512.))
+                    .px(px(32.))
+                    .py(px(48.))
+                    .items_center()
+                    .text_center()
+                    .child(
+                        div()
+                            .text_size(px(size))
+                            .line_height(px(line))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.foreground)
+                            .child("What should we work on?"),
+                    )
+                    .child(div().mt(px(4.)).text_sm().text_color(t.muted_foreground).child(if scratch.is_none() {
+                        "Add a project to start your first thread."
+                    } else {
+                        "Add a project, or start without one."
+                    }))
+                    .child(h_flex().mt(px(24.)).justify_center().gap(px(8.)).child(add).children(without)),
+            )
+            .into_any_element()
+    }
 }
 
 fn no_thread(t: &Tokens) -> AnyElement {
@@ -1623,7 +1688,7 @@ fn code_block_header(
                     if let Some(cwd) = this.upgrade().and_then(|w| w.read(cx).git_cwd()) {
                         let command = command.clone();
                         window.dispatch_action(
-                            Box::new(super::RunInTerminal { cwd, command, stop_on_settle: false }),
+                            Box::new(super::RunInTerminal { cwd, command, stop_on_settle: false, preview_url: None }),
                             cx,
                         );
                     }

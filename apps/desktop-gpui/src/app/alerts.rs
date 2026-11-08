@@ -1,7 +1,8 @@
 //! Thread alerts as sounds, in-app toasts and OS notifications, presented the
 //! way `ThreadNotificationCoordinator.tsx` does.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
@@ -16,14 +17,18 @@ use rodio::Source as _;
 
 use super::{Target, Workspace};
 use crate::inbox::Status;
-use crate::notifications::{Alert, Kind, Mode, ThreadAlerts};
+use crate::model::ThreadRef;
+use crate::notifications::{Alert, Kind, Mode, ThreadAlerts, ThreadKey};
 
 /// A click that needs the window, shared by the toast and the system notification.
 type Callback = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Each thread's toast ids that may still be on screen.
+type OpenToasts = Rc<RefCell<HashMap<ThreadKey, Vec<usize>>>>;
+
 /// In-app thread toasts. Each has its own id, so several stack as the web's do.
 struct ThreadToast;
-/// OS notifications, one per thread.
+/// OS notifications, one per thread, keyed by [`system_key`].
 struct ThreadSystemNotification;
 
 #[derive(Default)]
@@ -33,8 +38,10 @@ pub(super) struct AlertState {
     mode: Mode,
     /// Threads whose OS notifications may be on screen, counted by the taskbar badge;
     /// focusing the window clears them.
-    pending: HashSet<String>,
+    pending: HashSet<ThreadKey>,
     toasts: usize,
+    /// So hiding a thread can close its toasts.
+    open_toasts: OpenToasts,
 }
 
 impl Workspace {
@@ -52,30 +59,92 @@ impl Workspace {
         if !self.shell.live() {
             return;
         }
-        for alert in self.alerts.threads.get_or_insert_default().observe(&self.shell.threads) {
+        let alerts = self.alerts.threads.get_or_insert_default().observe(&self.shell.threads);
+        self.retract_hidden_alerts(window, cx);
+        if alerts.is_empty() {
+            return;
+        }
+        let hidden_tags = self.hidden_thread_tags();
+        let hidden = crate::model::hidden_threads(&self.shell.threads, &hidden_tags);
+        let alerts: Vec<Alert> = alerts
+            .into_iter()
+            .filter(|alert| !hidden.contains(&(alert.environment_id.as_ref(), alert.thread_id.as_str())))
+            .collect();
+        for alert in alerts {
             self.present_alert(alert, mode, window, cx);
         }
     }
 
+    /// The tags each environment's thread tag filter hides, for the environments that hide any.
+    fn hidden_thread_tags(&self) -> HashMap<&str, Vec<String>> {
+        self.sessions
+            .iter()
+            .filter_map(|s| Some((s.id.as_deref()?, crate::model::hidden_thread_tags(&s.server_info.settings)?)))
+            .collect()
+    }
+
+    /// Closes the toasts and OS notifications of threads the tag filter now hides. While some
+    /// environment hides tags, one whose thread left the list (archived) can't be judged, so it
+    /// closes too, as does an OS notification whose environment was removed.
+    pub(super) fn retract_hidden_alerts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.alerts.pending.is_empty() && self.alerts.open_toasts.borrow().is_empty() {
+            return;
+        }
+        let hidden_tags = self.hidden_thread_tags();
+        let hiding = !hidden_tags.is_empty();
+        let hidden = crate::model::hidden_threads(&self.shell.threads, &hidden_tags);
+        let listed: HashSet<ThreadRef> =
+            self.shell.threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+        let closes = |(env, id): &ThreadKey| {
+            let key = (env.as_ref(), id.as_str());
+            hidden.contains(&key) || (hiding && !listed.contains(&key))
+        };
+        let toasts: Vec<usize> = {
+            let mut open = self.alerts.open_toasts.borrow_mut();
+            let closing: Vec<ThreadKey> = open.keys().filter(|key| closes(key)).cloned().collect();
+            closing.iter().filter_map(|key| open.remove(key)).flatten().collect()
+        };
+        let removed = |env: &SharedString| !self.sessions.iter().any(|s| s.id.as_ref() == Some(env));
+        let closing: Vec<ThreadKey> =
+            self.alerts.pending.iter().filter(|key| closes(key) || removed(&key.0)).cloned().collect();
+        for toast in toasts {
+            window.remove_notification1::<ThreadToast>(toast, cx);
+        }
+        if closing.is_empty() {
+            return;
+        }
+        for key in closing {
+            window.remove_notification1::<ThreadSystemNotification>(system_key(&key), cx);
+            self.alerts.pending.remove(&key);
+        }
+        set_badge(window, self.alerts.pending.len());
+    }
+
     fn present_alert(&mut self, alert: Alert, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.shell.threads.iter().find(|t| t.id == alert.thread_id) else { return };
+        let key: ThreadKey = (alert.environment_id.clone(), alert.thread_id.clone());
+        let Some(thread) = self.shell.threads.iter().find(|t| t.environment_id == key.0 && t.id == key.1) else {
+            return;
+        };
         let body = SharedString::from(thread.title.clone());
         if mode.sound() {
             play_sound(alert.kind);
         }
         let workspace = cx.weak_entity();
-        let thread_id = alert.thread_id.clone();
+        let (env, thread_id) = key.clone();
         let open_thread: Callback = Rc::new(move |window, cx| {
             let _ = workspace.update(cx, |this, cx| {
                 this.close_settings(window, cx);
-                this.select_thread(thread_id.clone(), window, cx);
+                this.select_thread_in(env.clone(), thread_id.clone(), window, cx);
             });
         });
         let focused = window.is_window_active();
         // Settings and pages are routes of their own on the web, so they never count as the open thread.
         let on_screen = self.page.is_none()
             && self.settings.is_none()
-            && self.target.as_ref().is_some_and(|t| matches!(t, Target::Thread { id, .. } if *id == alert.thread_id));
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|t| matches!(t, Target::Thread { env, id } if *env == key.0 && *id == key.1));
         if focused && !on_screen && self.client_settings.values.bool("inAppNotificationsEnabled") {
             let t = *crate::theme::tokens(cx);
             let (icon, color) = match (alert.kind, alert.status) {
@@ -86,8 +155,11 @@ impl Workspace {
                 _ => (Lucide::MessageCircleQuestionMark, t.info_foreground),
             };
             self.alerts.toasts += 1;
+            let toast_id = self.alerts.toasts;
+            let open_toasts = self.alerts.open_toasts.clone();
+            open_toasts.borrow_mut().entry(key.clone()).or_default().push(toast_id);
             let toast = Notification::new()
-                .id1::<ThreadToast>(self.alerts.toasts)
+                .id1::<ThreadToast>(toast_id)
                 .icon(Icon::new(icon).text_color(color))
                 .title(alert.title())
                 .message(body)
@@ -101,22 +173,23 @@ impl Workspace {
                     ))
                 })
                 // Base UI toasts time out with an action too.
-                .autohide(true);
+                .autohide(true)
+                .on_close(move |_, _| forget_toast(&open_toasts, &key, toast_id));
             window.push_notification(toast, cx);
             return;
         }
         if !mode.desktop() || focused {
             return;
         }
-        self.alerts.pending.insert(alert.thread_id.clone());
-        set_badge(window, self.alerts.pending.len());
         let notification = Notification::new()
-            .id1::<ThreadSystemNotification>(SharedString::from(alert.thread_id.clone()))
+            .id1::<ThreadSystemNotification>(system_key(&key))
             .title(alert.title())
             .message(body)
             .system()
             .on_click(move |_, window, cx| open_thread(window, cx));
         window.push_notification(notification, cx);
+        self.alerts.pending.insert(key);
+        set_badge(window, self.alerts.pending.len());
     }
 
     /// Retracts the OS notifications, as focusing the web app's window does.
@@ -125,6 +198,22 @@ impl Workspace {
             self.alerts.pending.clear();
             window.remove_notification::<ThreadSystemNotification>(cx);
             set_badge(window, 0);
+        }
+    }
+}
+
+/// `threadNotificationTag`: one OS notification per environment and thread.
+fn system_key((env, thread_id): &ThreadKey) -> SharedString {
+    SharedString::from(format!("{env}\u{0}{thread_id}"))
+}
+
+/// `onRemove`: a toast closed by any means leaves its thread's list.
+fn forget_toast(open_toasts: &RefCell<HashMap<ThreadKey, Vec<usize>>>, key: &ThreadKey, toast_id: usize) {
+    let mut open = open_toasts.borrow_mut();
+    if let Some(ids) = open.get_mut(key) {
+        ids.retain(|id| *id != toast_id);
+        if ids.is_empty() {
+            open.remove(key);
         }
     }
 }

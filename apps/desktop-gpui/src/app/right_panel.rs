@@ -1320,7 +1320,7 @@ impl Workspace {
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
                     let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
-                    self.render_tab_bar(&panel, inset, &tokens, cx)
+                    self.render_tab_bar(&panel, inset, &tokens, window, cx)
                 })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
                 .child(deferred(handle).with_priority(1))
@@ -1372,6 +1372,7 @@ impl Workspace {
         panel: &PanelState,
         left_inset: Option<Pixels>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // `wco:pr-(--workspace-native-controls-inset)` plus the `w-24` spacer for the toggles.
@@ -1386,7 +1387,7 @@ impl Workspace {
         let tabs: Vec<AnyElement> = panel
             .surfaces
             .iter()
-            .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, cx))
+            .map(|surface| self.render_surface_tab(surface, panel.active.as_ref() == Some(surface), tokens, window, cx))
             .collect();
         let tab_bar = h_flex()
             .id("right-panel-tabbar")
@@ -1490,12 +1491,15 @@ impl Workspace {
             )
     }
 
-    /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover.
+    /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover
+    /// or keyboard focus. The close button and the title are separate tab stops, as the web's
+    /// two `<button>`s are.
     fn render_surface_tab(
         &self,
         surface: &Surface,
         active: bool,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (key, title, glyph): (SharedString, SharedString, AnyElement) = match surface {
@@ -1554,6 +1558,17 @@ impl Workspace {
         let (accent, foreground, muted) = (tokens.accent, tokens.foreground, tokens.muted);
         let (close, activate, middle, menu_surface) =
             (surface.clone(), surface.clone(), surface.clone(), surface.clone());
+        let title_activate = surface.clone();
+        // `group-focus-visible/close`: a keyboard-focused close button shows its X.
+        let close_focus = window
+            .use_keyed_state(ElementId::Name(format!("{group}:close-focus").into()), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let close_focused = close_focus.is_focused(window) && window.last_input_was_keyboard();
+        // The `outline-ring/50` focus outline, drawn 2px inside each button.
+        let ring = tokens.ring.opacity(0.5);
         h_flex()
             .id(ElementId::Name(group.clone()))
             .group(group.clone())
@@ -1585,13 +1600,23 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded(px(4.))
+                    .track_focus(&close_focus)
+                    .border_2()
+                    .border_color(gpui_kit::transparent_black())
+                    .focus_visible(move |style| style.border_color(ring))
                     .hover(move |style| style.bg(muted))
-                    .child(div().group_hover(group.clone(), gpui_kit::Styled::invisible).child(glyph))
+                    .child(
+                        div()
+                            .group_hover(group.clone(), gpui_kit::Styled::invisible)
+                            .when(close_focused, gpui_kit::Styled::invisible)
+                            .child(glyph),
+                    )
                     .child(
                         div()
                             .absolute()
                             .invisible()
-                            .group_hover(group, gpui_kit::Styled::visible)
+                            .group_hover(group.clone(), gpui_kit::Styled::visible)
+                            .when(close_focused, gpui_kit::Styled::visible)
                             .child(icon("icons/x.svg").with_size(px(12.))),
                     )
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -1600,7 +1625,23 @@ impl Workspace {
                         this.close_surface(close.clone(), window, cx);
                     })),
             )
-            .child(div().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{group}:title").into()))
+                    .tab_index(0)
+                    .min_w_0()
+                    .truncate()
+                    .mx(px(-2.))
+                    .rounded(px(4.))
+                    .border_2()
+                    .border_color(gpui_kit::transparent_black())
+                    .focus_visible(move |style| style.border_color(ring))
+                    .child(title)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.activate_surface(title_activate.clone(), window, cx);
+                    })),
+            )
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),

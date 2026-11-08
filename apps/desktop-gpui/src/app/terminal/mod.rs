@@ -356,7 +356,7 @@ impl Workspace {
     /// and close its terminals.
     pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
         let session = self.thread_environment(thread_id).and_then(|env| self.session(&env));
-        session.is_none_or(|session| !session.terminal_read_only)
+        session.is_none_or(super::sessions::EnvironmentSession::operates_terminals)
     }
 
     /// `terminalAvailable`: the chat has a project to start a shell in.
@@ -476,12 +476,13 @@ impl Workspace {
     /// Places a new terminal, then opens its shell (`launchTerminal`).
     fn launch_terminal(&mut self, thread_id: String, place: Place, cx: &mut Context<Self>) {
         let Some(launch) = self.terminal_launch() else { return };
-        self.launch_terminal_with(thread_id, place, launch, None, cx);
+        self.launch_terminal_with(thread_id, place, launch, None, cx).detach();
     }
 
     /// `runProjectScript`: types the command into an idle drawer terminal, or a new one opened in
     /// its cwd. A script that stops when the thread settles always gets a terminal of its own.
-    fn run_in_terminal(&mut self, run: &super::RunInTerminal, cx: &mut Context<Self>) {
+    /// Once the command is written, a script with `autoOpenPreview` opens its preview URL.
+    fn run_in_terminal(&mut self, run: &super::RunInTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.open_drawer_for_action() else { return };
         let Some(mut launch) = self.terminal_launch() else { return };
         launch.cwd.clone_from(&run.cwd);
@@ -491,13 +492,25 @@ impl Workspace {
         let drawer = self.terminals.drawer(thread_id.clone());
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
-        match reuse.filter(|_| !run.stop_on_settle) {
+        let written = match reuse.filter(|_| !run.stop_on_settle) {
             // Reopening a live terminal only updates its launch flags, as the web's launch does.
             Some(terminal_id) => {
                 drawer.set_active(&terminal_id);
-                self.open_terminal_session(thread_id, terminal_id, launch, Some(input), cx);
+                self.open_terminal_session(thread_id.clone(), terminal_id, launch, Some(input), cx)
             }
-            None => self.launch_terminal_with(thread_id, Place::New, launch, Some(input), cx),
+            None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
+        };
+        match run.preview_url.clone() {
+            Some(url) => cx
+                .spawn_in(window, async move |this, cx| {
+                    if written.await {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.open_preview_tab(thread_id, Some(url), window, cx);
+                        });
+                    }
+                })
+                .detach(),
+            None => written.detach(),
         }
         cx.notify();
     }
@@ -509,15 +522,15 @@ impl Workspace {
         launch: Launch,
         then_write: Option<String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<bool> {
         if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
-            return;
+            return Task::ready(false);
         }
         let terminal_id = self.next_terminal_id(&thread_id);
         if !self.terminals.drawer(thread_id.clone()).place(&terminal_id, place) {
-            return;
+            return Task::ready(false);
         }
-        self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx);
+        self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx)
     }
 
     /// A terminal id no drawer, panel tab or server session of the thread uses yet.
@@ -530,7 +543,8 @@ impl Workspace {
         layout::next_terminal_id(taken, suffix.as_deref())
     }
 
-    /// `terminal.open` (then an optional write) for a terminal already placed.
+    /// `terminal.open` (then an optional write) for a terminal already placed; resolves to
+    /// whether both succeeded.
     fn open_terminal_session(
         &mut self,
         thread_id: String,
@@ -538,10 +552,10 @@ impl Workspace {
         launch: Launch,
         then_write: Option<String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<bool> {
         // A terminal runs on its thread's environment (a draft's is the open one).
         let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
-            return;
+            return Task::ready(false);
         };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
@@ -551,14 +565,17 @@ impl Workspace {
                 let write = json!({"threadId": thread_id, "terminalId": terminal_id, "data": data});
                 result = client.request("terminal.write", write).await.map(drop);
             }
-            if let Err(error) = result {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(error.to_string().into());
-                    cx.notify();
-                });
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.error = Some(error.to_string().into());
+                        cx.notify();
+                    });
+                    false
+                }
             }
         })
-        .detach();
     }
 
     fn activate_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
@@ -831,7 +848,9 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &SplitTerminal, _, cx| this.split_terminal(Split::Horizontal, cx)))
             .on_action(cx.listener(|this, _: &SplitTerminalVertical, _, cx| this.split_terminal(Split::Vertical, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, _, cx| this.new_terminal(cx)))
-            .on_action(cx.listener(|this, action: &super::RunInTerminal, _, cx| this.run_in_terminal(action, cx)))
+            .on_action(
+                cx.listener(|this, action: &super::RunInTerminal, window, cx| this.run_in_terminal(action, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &CloseTerminal, window, cx| {
                 let active =
                     this.shown_terminal_thread().and_then(|id| this.terminals.drawers.get(id)).filter(|d| d.open);

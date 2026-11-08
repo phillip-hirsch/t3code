@@ -333,7 +333,7 @@ impl Workspace {
                         }
                     }
                     Err(error) => {
-                        this.error = Some(error.into());
+                        this.set_error_for(&origin, error.into());
                         if !text.is_empty() {
                             this.give_back_prompt(&origin, text, window, cx);
                         }
@@ -398,6 +398,7 @@ impl Workspace {
         }
         self.sending = true;
         self.error = None;
+        let origin = self.target.clone();
         cx.spawn_in(window, async move |this, cx| {
             let mut result = Ok(Value::Null);
             for command in commands {
@@ -408,8 +409,8 @@ impl Workspace {
             }
             let _ = this.update(cx, |this, cx| {
                 this.sending = false;
-                if let Err(error) = result {
-                    this.error = Some(format!("Could not resume thread. {error}").into());
+                if let (Err(error), Some(origin)) = (result, &origin) {
+                    this.set_error_for(origin, format!("Could not resume thread. {error}").into());
                 }
                 cx.notify();
             });

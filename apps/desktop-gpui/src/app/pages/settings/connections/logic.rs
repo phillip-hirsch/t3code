@@ -83,7 +83,7 @@ fn legacy_parent(scope: &str) -> Option<&'static str> {
 
 /// `GET /api/auth/session` (`AuthSessionState`).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(in crate::app::pages::settings) struct Session {
+pub(in crate::app) struct Session {
     pub authenticated: bool,
     /// `auth.policy`, e.g. "loopback-browser" or "remote-reachable".
     pub policy: Option<String>,

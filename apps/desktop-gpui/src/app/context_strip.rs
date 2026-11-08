@@ -105,6 +105,14 @@ pub(super) struct DraftWorkspaceState {
     thread_refs: Option<(Option<SharedString>, String, Value)>,
 }
 
+impl DraftWorkspaceState {
+    /// The existing worktree the draft of `project_id` picked (the web draft's `worktreePath`).
+    pub(super) fn existing_worktree(&self, project_id: &str) -> Option<&str> {
+        let (path, _) = self.choice.existing_worktree.as_ref()?;
+        (self.project_id.as_deref() == Some(project_id)).then_some(path.as_str())
+    }
+}
+
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
@@ -304,6 +312,14 @@ impl Workspace {
             return;
         }
         self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
+    }
+
+    /// `setDraftThreadContext` after a git action created `branch` for the draft of `project_id`.
+    pub(super) fn set_draft_branch(&mut self, project_id: &str, branch: String, cx: &mut Context<Self>) {
+        if self.draft_workspace.project_id.as_deref() == Some(project_id) {
+            self.draft_workspace.choice.branch = Some(branch);
+            cx.notify();
+        }
     }
 
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1024,7 +1040,16 @@ fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::clipboard_path;
+    use super::{DraftWorkspaceState, clipboard_path};
+
+    #[test]
+    fn a_draft_uses_the_worktree_it_picked_for_its_own_project() {
+        let mut state = DraftWorkspaceState { project_id: Some("p".into()), ..Default::default() };
+        assert_eq!(state.existing_worktree("p"), None);
+        state.choice.existing_worktree = Some(("/repo/wt".into(), Some("feature".into())));
+        assert_eq!(state.existing_worktree("p"), Some("/repo/wt"));
+        assert_eq!(state.existing_worktree("other"), None, "another project's draft keeps its root");
+    }
 
     #[test]
     fn windows_paths_copy_with_backslashes() {

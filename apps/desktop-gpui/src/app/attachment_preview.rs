@@ -116,7 +116,7 @@ impl Workspace {
                 let (view, local_id) = (view.clone(), local_id.clone());
                 action("preview-remove", Lucide::Trash, "Remove attachment").on_click(move |_, window, cx| {
                     window.close_dialog(cx);
-                    let _ = view.update(cx, |this, cx| this.remove_attachment(&local_id, window, cx));
+                    let _ = view.update(cx, |this, cx| this.request_remove_attachment(&local_id, window, cx));
                 })
             };
             let close = action("preview-close", Lucide::X, "Close").on_click(|_, window, cx| window.close_dialog(cx));

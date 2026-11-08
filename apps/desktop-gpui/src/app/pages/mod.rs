@@ -194,7 +194,10 @@ impl Workspace {
                 self.page = Some(page);
                 self.page_opened(cx);
             }
-            Location::Settings(section) => self.settings = Some(section),
+            Location::Settings(section) => {
+                self.focus_settings_on_open();
+                self.settings = Some(section);
+            }
         }
         self.notify_sidebar(cx);
         cx.notify();

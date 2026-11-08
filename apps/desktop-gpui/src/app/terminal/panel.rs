@@ -90,7 +90,7 @@ impl Workspace {
         };
         self.terminals.panel.insert(surface.clone(), group);
         self.open_surface(Surface::Terminal(surface), window, cx);
-        self.open_terminal_session(thread_id, terminal_id, launch, None, cx);
+        self.open_terminal_session(thread_id, terminal_id, launch, None, cx).detach();
     }
 
     /// `splitPanelTerminal`: another terminal in the tab's group, up to four.
@@ -113,7 +113,7 @@ impl Workspace {
             group.active = terminal_id.clone();
             group.split = split;
         }
-        self.open_terminal_session(thread_id, terminal_id, launch, None, cx);
+        self.open_terminal_session(thread_id, terminal_id, launch, None, cx).detach();
         cx.notify();
     }
 

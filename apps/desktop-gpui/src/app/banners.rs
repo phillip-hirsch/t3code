@@ -3,8 +3,8 @@
 //! composer's usage-limit recovery and offline notices (`UsageLimitRecoveryBanner.tsx`,
 //! `useSystemComposerBanners.tsx`).
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -19,6 +19,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::{Connection, Target, Workspace, new_id};
+use crate::environments::{Presented, SavedEnvironment};
 use crate::model::{Provider, ThreadShell};
 use crate::theme::Tokens;
 use crate::timestamp::parse_ms;
@@ -29,6 +30,8 @@ const CHATGPT_WORKSPACE_USAGE_LIMIT_CODE: &str = "subscription_sharing_workplace
 const CHATGPT_WORKSPACE_ADMIN_REQUEST: &str = "I've reached the limit for using my ChatGPT plan in T3 Code. Could you increase our workspace's usage limits so I can continue?\n\nGo to admin.openai.com → Workspace → Usage limits. Thank you!";
 /// `ENVIRONMENT_RECONNECT_WARNING_GRACE_MS`.
 const RECONNECT_GRACE: Duration = Duration::from_secs(2);
+/// `DISCONNECT_DELAY_MS`: how long a saved environment stays unavailable before Disconnect shows.
+const DISCONNECT_DELAY: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub(super) struct BannerUi {
@@ -48,6 +51,84 @@ pub(super) struct BannerUi {
     /// The mismatch the banner showed for; it stays until the mismatch changes.
     revealed_branch: Option<String>,
     restoring_branch: Option<String>,
+    errors: ScopedErrors,
+    /// The open target's saved environment while it reconnects, and while it is unavailable.
+    saved_reconnecting: Held,
+    saved_unavailable: Held,
+    disconnecting: bool,
+    /// Renders again when one of those holds reaches its delay.
+    _held_wake: Option<Task<()>>,
+}
+
+/// `useEnvironmentStateHeldFor`: since when an id has been the value it is now.
+#[derive(Default)]
+struct Held {
+    id: Option<SharedString>,
+    since: Option<Instant>,
+}
+
+impl Held {
+    /// Follows `id`; whether it changed, which starts the delay over.
+    fn follow(&mut self, id: Option<&SharedString>, now: Instant) -> bool {
+        if self.id.as_ref() == id {
+            return false;
+        }
+        self.id = id.cloned();
+        self.since = Some(now);
+        true
+    }
+
+    /// `id` has stayed the held value for `delay`.
+    fn held_for(&self, id: &str, delay: Duration, now: Instant) -> bool {
+        self.id.as_deref() == Some(id) && self.since.is_some_and(|since| now.duration_since(since) >= delay)
+    }
+
+    /// When it reaches `delay`, if it holds an id that has not yet.
+    fn deadline(&self, delay: Duration, now: Instant) -> Option<Instant> {
+        self.id.as_ref()?;
+        self.since.map(|since| since + delay).filter(|at| *at > now)
+    }
+}
+
+/// `localServerErrorsByThreadKey` / `localDraftErrorsByDraftId`: `Workspace::error` is the
+/// error of the thread or draft on screen; the others wait here until it shows again.
+#[derive(Default)]
+struct ScopedErrors {
+    /// The target key `Workspace::error` belongs to.
+    scope: String,
+    stashed: HashMap<String, SharedString>,
+}
+
+impl ScopedErrors {
+    /// Swaps `error` for the stashed one of `key` when the target on screen changed.
+    fn follow(&mut self, key: &str, error: &mut Option<SharedString>) {
+        if self.scope == key {
+            return;
+        }
+        if let Some(previous) = error.take() {
+            self.stashed.insert(std::mem::take(&mut self.scope), previous);
+        }
+        *error = self.stashed.remove(key);
+        key.clone_into(&mut self.scope);
+    }
+
+    /// Records a failure of the target `key`, on screen or not.
+    fn set(&mut self, key: &str, current: &str, error: &mut Option<SharedString>, value: SharedString) {
+        self.follow(current, error);
+        if key == current {
+            *error = Some(value);
+        } else {
+            self.stashed.insert(key.to_owned(), value);
+        }
+    }
+}
+
+fn target_key(target: Option<&Target>) -> String {
+    match target {
+        Some(Target::Thread { id, .. }) => id.clone(),
+        Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
+        None => String::new(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -277,11 +358,19 @@ impl Workspace {
     }
 
     fn thread_key(&self) -> String {
-        match &self.target {
-            Some(Target::Thread { id, .. }) => id.clone(),
-            Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
-            None => String::new(),
-        }
+        target_key(self.target.as_ref())
+    }
+
+    /// Keeps `error` with the thread or draft it was raised on; render calls it.
+    pub(super) fn sync_error_scope(&mut self) {
+        let key = self.thread_key();
+        self.banners.errors.follow(&key, &mut self.error);
+    }
+
+    /// A failure of `target`'s work that may land after the window moved elsewhere.
+    pub(super) fn set_error_for(&mut self, target: &Target, error: SharedString) {
+        let current = self.thread_key();
+        self.banners.errors.set(&target_key(Some(target)), &current, &mut self.error, error);
     }
 
     /// The error the banner shows: this client's last failure, else the thread's runtime error.
@@ -530,17 +619,148 @@ impl Workspace {
         }
     }
 
+    /// The open target's saved environment and its connection, when it is not connected.
+    fn unavailable_saved_environment(
+        &self,
+        cx: &gpui_kit::App,
+    ) -> Option<(SavedEnvironment, crate::environments::ConnectionState, Option<String>)> {
+        if self.target_on_primary() {
+            return None;
+        }
+        let id = self.active_environment()?;
+        let saved = self.saved_environments.read(cx);
+        let environment = saved.environments().iter().find(|e| e.environment_id == id.as_ref())?.clone();
+        let session = saved.session(id);
+        let state = session.map(|s| s.state.clone()).unwrap_or_default();
+        (state.presented() != Presented::Connected)
+            .then(|| (environment, state, session.and_then(|s| s.server_version.clone())))
+    }
+
+    /// Starts the saved environment's reconnect grace and disconnect delay as its state changes.
+    pub(super) fn sync_saved_connection_banner(&mut self, cx: &mut Context<Self>) {
+        let unavailable = self.unavailable_saved_environment(cx);
+        let id = unavailable.as_ref().map(|(e, ..)| SharedString::from(e.environment_id.clone()));
+        let reconnecting = unavailable
+            .as_ref()
+            .filter(|(_, state, _)| matches!(state.presented(), Presented::Connecting | Presented::Reconnecting))
+            .and(id.as_ref());
+        let now = Instant::now();
+        let changed = self.banners.saved_unavailable.follow(id.as_ref(), now)
+            | self.banners.saved_reconnecting.follow(reconnecting, now);
+        if !changed {
+            return;
+        }
+        if id.is_none() {
+            self.banners.disconnecting = false;
+        }
+        let mut deadlines: Vec<Instant> = [
+            self.banners.saved_reconnecting.deadline(RECONNECT_GRACE, now),
+            self.banners.saved_unavailable.deadline(DISCONNECT_DELAY, now),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        deadlines.sort();
+        self.banners._held_wake = (!deadlines.is_empty()).then(|| {
+            cx.spawn(async move |this, cx| {
+                for at in deadlines {
+                    cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+    }
+
+    /// `useSystemComposerBanners` for a saved environment: "<label> is reconnecting" once the
+    /// grace passes, "offline" otherwise, with Reconnect and, after a while, Disconnect server.
+    fn render_saved_offline_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (environment, state, server_version) = self.unavailable_saved_environment(cx)?;
+        let id = environment.environment_id.clone();
+        let presented = state.presented();
+        let reconnecting = matches!(presented, Presented::Connecting | Presented::Reconnecting);
+        let now = Instant::now();
+        if reconnecting && !self.banners.saved_reconnecting.held_for(&id, RECONNECT_GRACE, now) {
+            return None;
+        }
+        let label = environment.label.clone();
+        let title = format!("{label} is {}", if reconnecting { "reconnecting" } else { "offline" });
+        let headline = (environment.enabled && presented != Presented::Unsupported)
+            .then(|| crate::environments::diagnose(&label, &state, server_version.as_deref()))
+            .flatten()
+            .map(|diagnosis| SharedString::from(diagnosis.headline));
+        let reconnect = (!reconnecting).then(|| {
+            let (id, enabled) = (id.clone(), environment.enabled);
+            Button::new("reconnect-saved-environment")
+                .ghost()
+                .xsmall()
+                .label("Reconnect")
+                .on_click(cx.listener(move |this, _, window, cx| this.reconnect_saved(&id, enabled, window, cx)))
+        });
+        let disconnect = self.banners.saved_unavailable.held_for(&id, DISCONNECT_DELAY, now).then(|| {
+            Button::new("disconnect-saved-environment")
+                .ghost()
+                .xsmall()
+                .label("Disconnect server")
+                .tooltip("Hide this server's threads. Switch it on again in Environments.")
+                .disabled(self.banners.disconnecting)
+                .on_click(cx.listener(move |this, _, window, cx| this.disconnect_saved(&id, window, cx)))
+        });
+        let actions = (reconnect.is_some() || disconnect.is_some())
+            .then(|| h_flex().gap(px(2.)).children(reconnect).children(disconnect).into_any_element());
+        let variant = if presented == Presented::Error { Variant::Error } else { Variant::Warning };
+        Some(composer_banner(variant, Icon::new(IconName::WifiOff), SharedString::from(title), headline, actions, t))
+    }
+
+    /// `handleReconnectActiveEnvironment`: a switched-off environment is switched on, else retried now.
+    fn reconnect_saved(&mut self, id: &str, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if enabled {
+            self.saved_environments.update(cx, |saved, cx| saved.retry(id, cx));
+            return;
+        }
+        let saving = self.saved_environments.update(cx, |saved, cx| saved.set_enabled(id, true, cx));
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = saving.finished().await {
+                let _ = cx.update(|window, cx| {
+                    let toast = Notification::error(error).title("Could not reconnect environment");
+                    window.push_notification(toast, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// `handleDisconnectActiveEnvironment`: switches the environment off, which closes its threads.
+    fn disconnect_saved(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.banners.disconnecting = true;
+        cx.notify();
+        let saving = self.saved_environments.update(cx, |saved, cx| saved.set_enabled(id, false, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = saving.finished().await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.banners.disconnecting = false;
+                if let Err(error) = result {
+                    window.push_notification(Notification::error(error).title("Could not disconnect server"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// "<server> is reconnecting" while the socket retries, "offline" once the server is gone.
     fn render_offline_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.target_on_primary() {
+            return self.render_saved_offline_banner(t, cx);
+        }
         let (reconnecting, reason) = match &self.connection {
             Connection::Disconnected(reason) => (true, Some(reason.clone())),
             Connection::Connecting => (true, None),
             Connection::Failed(reason) => (false, Some(reason.clone())),
             _ => return None,
         };
-        // `connection` is the primary's; a saved environment's state shows in the footer.
-        if !self.banners.was_connected || (reconnecting && !self.banners.reconnect_warning) || !self.target_on_primary()
-        {
+        if !self.banners.was_connected || (reconnecting && !self.banners.reconnect_warning) {
             return None;
         }
         let label = self.primary_info().environment_label.clone().unwrap_or_else(|| "Server".into());
@@ -627,7 +847,7 @@ impl Workspace {
                     .label(if restoring { "Restoring..." } else { "Restore branch" })
                     .disabled(restoring)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
+                        this.request_restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
                     })),
             )
             .child(
@@ -649,6 +869,54 @@ impl Workspace {
             Some(actions.into_any_element()),
             t,
         ))
+    }
+
+    /// `handleRestoreThreadBranch`: a checkout with uncommitted changes asks first
+    /// (`BranchRestoreConfirmHost`), since they carry over or block the switch.
+    fn request_restore_thread_branch(
+        &mut self,
+        key: String,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_write_source_control() {
+            return;
+        }
+        if !self.vcs.status.as_ref().is_some_and(|status| status.local.has_working_tree_changes) {
+            return self.restore_thread_branch(key, branch, window, cx);
+        }
+        let name = branch.clone();
+        let ask = super::confirm::Ask {
+            title: std::rc::Rc::new(move |t, window| {
+                let text = format!("Switch to {name}?");
+                let base = gpui_kit::Font { weight: FontWeight::SEMIBOLD, ..window.text_style().font() };
+                let code = gpui_kit::Font { family: t.fonts.mono.into(), weight: FontWeight::MEDIUM, ..base.clone() };
+                let run = |len, font| gpui_kit::TextRun {
+                    len,
+                    font,
+                    color: t.foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let runs = vec![run("Switch to ".len(), base.clone()), run(name.len(), code), run(1, base)];
+                gpui_kit::StyledText::new(text).with_runs(runs).into_any_element()
+            }),
+            description: Some(
+                "You have uncommitted changes. They'll carry over to the other branch, or block the switch if they conflict."
+                    .into(),
+            ),
+            confirm_label: "Switch branch".into(),
+            destructive: false,
+        };
+        let answer = super::confirm::ask_confirmation(ask, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(true) {
+                let _ = this.update_in(cx, |this, window, cx| this.restore_thread_branch(key, branch, window, cx));
+            }
+        })
+        .detach();
     }
 
     /// `handleSwitchCheckoutToThread`: checks the branch out again, then points the thread at it.
@@ -1033,6 +1301,44 @@ mod tests {
             "usageLimitResetAt": "2026-01-01T12:00:00Z"});
         base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn a_held_environment_restarts_its_delay_whenever_it_changes() {
+        let start = Instant::now();
+        let later = |secs| start + Duration::from_secs(secs);
+        let (a, b) = (SharedString::from("a"), SharedString::from("b"));
+        let mut held = Held::default();
+        assert!(held.follow(Some(&a), start));
+        assert!(!held.follow(Some(&a), later(1)), "the same id keeps its start");
+        assert!(!held.held_for("a", DISCONNECT_DELAY, later(19)));
+        assert!(held.held_for("a", DISCONNECT_DELAY, later(20)));
+        assert_eq!(held.deadline(DISCONNECT_DELAY, later(5)), Some(later(20)));
+        assert!(held.follow(Some(&b), later(21)));
+        assert!(!held.held_for("a", DISCONNECT_DELAY, later(60)), "only the held id counts");
+        assert!(!held.held_for("b", DISCONNECT_DELAY, later(40)));
+        assert!(held.follow(None, later(41)));
+        assert_eq!(held.deadline(DISCONNECT_DELAY, later(41)), None);
+        assert!(held.follow(Some(&a), later(42)), "returning to an id starts it over");
+        assert!(!held.held_for("a", DISCONNECT_DELAY, later(50)));
+    }
+
+    #[test]
+    fn local_errors_stay_with_the_thread_they_were_raised_on() {
+        let mut errors = ScopedErrors::default();
+        let mut error = None;
+        errors.follow("a", &mut error);
+        error = Some(SharedString::from("send failed"));
+        errors.follow("b", &mut error);
+        assert_eq!(error, None, "thread b doesn't show a's error");
+        errors.set("a", "b", &mut error, "later failure".into());
+        assert_eq!(error, None, "a background failure of a waits for a");
+        errors.set("b", "b", &mut error, "b failed".into());
+        assert_eq!(error.as_deref(), Some("b failed"));
+        errors.follow("a", &mut error);
+        assert_eq!(error.as_deref(), Some("later failure"));
+        errors.follow("b", &mut error);
+        assert_eq!(error.as_deref(), Some("b failed"));
     }
 
     #[test]

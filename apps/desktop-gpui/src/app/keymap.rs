@@ -169,6 +169,30 @@ pub(super) fn resolve<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &Sh
     resolve_on(rules, keystroke, context, MAC)
 }
 
+/// `resolveChatShortcutCommand`: the primary's rules decide every command but a project
+/// script's, which comes from the rules of the environment the open thread lives on.
+pub(super) fn resolve_chat<'a>(
+    primary: &'a [Rule],
+    active: &'a [Rule],
+    keystroke: &Keystroke,
+    context: &ShortcutContext,
+) -> Option<&'a str> {
+    resolve_chat_on(primary, active, keystroke, context, MAC)
+}
+
+fn resolve_chat_on<'a>(
+    primary: &'a [Rule],
+    active: &'a [Rule],
+    keystroke: &Keystroke,
+    context: &ShortcutContext,
+    mac: bool,
+) -> Option<&'a str> {
+    match resolve_on(primary, keystroke, context, mac) {
+        Some(command) if script_id(command).is_none() => Some(command),
+        _ => resolve_on(active, keystroke, context, mac).filter(|command| script_id(command).is_some()),
+    }
+}
+
 /// [`resolve`] as on macOS (`mod` is Cmd) or elsewhere (`mod` is Ctrl).
 fn resolve_on<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutContext, mac: bool) -> Option<&'a str> {
     rules
@@ -555,6 +579,24 @@ mod tests {
         assert_eq!(toasts.handle(&bad, start + Duration::from_millis(600)), Some(Reload::Invalid("Bad rule".into())));
         assert_eq!(toasts.handle(&ok, start + Duration::from_secs(3)), Some(Reload::Updated));
         assert_eq!(toasts.handle(&serde_json::json!({"type": "settingsUpdated"}), start), None);
+    }
+
+    #[test]
+    fn script_shortcuts_come_from_the_open_environment() {
+        let rest = ShortcutContext::default();
+        let primary = merge_with_defaults(&[compile("mod+shift+1", "script.local.run", None).unwrap()]);
+        let remote = [
+            compile("mod+shift+1", "script.remote.run", None).unwrap(),
+            compile("mod+shift+2", "script.dev.run", None).unwrap(),
+            compile("mod+shift+3", "sidebar.toggle", None).unwrap(),
+            compile("mod+b", "script.shadowed.run", None).unwrap(),
+        ];
+        let resolve = |text| resolve_chat_on(&primary, &remote, &key(text), &rest, false);
+        assert_eq!(resolve("ctrl-shift-1"), Some("script.remote.run"), "the primary's script rule yields");
+        assert_eq!(resolve("ctrl-shift-2"), Some("script.dev.run"));
+        assert_eq!(resolve("ctrl-shift-3"), None, "the open environment binds only scripts");
+        assert_eq!(resolve("ctrl-b"), Some("sidebar.toggle"), "the primary's own commands win");
+        assert_eq!(resolve_chat_on(&primary, &primary, &key("ctrl-shift-1"), &rest, false), Some("script.local.run"));
     }
 
     #[test]

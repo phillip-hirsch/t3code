@@ -2,6 +2,7 @@
 //! approval rows above it (`TimelinePendingApprovalRow.tsx`) and the question
 //! banner attached to it (`ComposerPendingUserInputPanel.tsx`).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -677,6 +678,9 @@ impl Workspace {
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
         let chip_view = view.clone();
+        let hover_view = view.clone();
+        let pull_requests = Rc::new(pull_request_contexts(self.queue_edit_records()));
+        let chip_tooltip = self.render_chip_tooltip(&pull_requests, &t);
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -685,7 +689,17 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &t))
+            .token(move |token, _, _| render_chip(token, &pull_requests, &t))
+            // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
+            .on_token_hover(move |event, _, cx| {
+                let hovered = event.is_hovered().then(|| (event.token().id().to_string(), event.bounds()));
+                let _ = hover_view.update(cx, |this, cx| {
+                    if this.composer_ui.chip_hover != hovered {
+                        this.composer_ui.chip_hover = hovered;
+                        cx.notify();
+                    }
+                });
+            })
             // A file chip opens its preview (`composerContextActions.openFile`).
             .on_token_click(move |event, window, cx| {
                 if let Some(Chip::Context { kind, id, .. }) = Chip::from_id(event.token().id())
@@ -726,7 +740,7 @@ impl Workspace {
                     .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
                         // The placeholder wraps over the editor's two reserved lines without
                         // growing it, as Tiptap's zero-height `::before` does.
-                        div().relative().child(editor).when(self.composer_empty, |el| {
+                        div().relative().child(editor).children(chip_tooltip).when(self.composer_empty, |el| {
                             el.child(
                                 div()
                                     .absolute()
@@ -1626,10 +1640,19 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
     }
 }
 
-fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
+fn render_chip(
+    token: &InlineTokenContext,
+    pull_requests: &HashMap<String, PullRequestContext>,
+    t: &Tokens,
+) -> AnyElement {
     let id = token.token().id();
     let (accent, icon) = match Chip::from_id(id) {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
+        Some(Chip::Context { kind, id, .. })
+            if let Some(pr) = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
+        {
+            (rgb(0x0090cd), pr.state().0)
+        }
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
@@ -1646,6 +1669,118 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
         .child(Icon::new(icon).with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
         .into_any_element()
+}
+
+/// The kind of a context record that can carry a change request (`ReviewCommentContextRecord`).
+const REVIEW_COMMENT: &str = "review-comment";
+
+/// `PullRequestContextMetadata`: the change request a review-comment chip names.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestContext {
+    number: u64,
+    title: String,
+    url: String,
+    head_branch: String,
+    base_branch: String,
+    state: String,
+    is_draft: bool,
+}
+
+impl PullRequestContext {
+    /// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
+    fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
+        match self.state.as_str() {
+            "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
+            "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
+            _ if self.is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
+            _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
+        }
+    }
+
+    /// `capitalizeTerm(singular)` for the host the URL names (`findByChangeRequestUrl`).
+    fn noun(&self) -> &'static str {
+        let path = self.url.split(['?', '#']).next().unwrap_or_default();
+        if path.contains("/-/merge_requests/") {
+            "Merge request"
+        } else if ["/pull/", "/pulls/", "/pull-requests/", "/pullrequest/"].iter().any(|tail| path.contains(tail)) {
+            "Pull request"
+        } else {
+            "Change request"
+        }
+    }
+}
+
+/// The review-comment records' change requests, by the context id their chips carry.
+fn pull_request_contexts(records: &[Value]) -> HashMap<String, PullRequestContext> {
+    records
+        .iter()
+        .filter(|record| record["kind"].as_str() == Some(REVIEW_COMMENT))
+        .filter_map(|record| {
+            let id = record["contextId"].as_str()?.to_owned();
+            Some((id, serde::Deserialize::deserialize(&record["pullRequest"]).ok()?))
+        })
+        .collect()
+}
+
+impl Workspace {
+    /// `PullRequestContextDetails` in a tooltip above the hovered pull request chip.
+    fn render_chip_tooltip(
+        &self,
+        pull_requests: &HashMap<String, PullRequestContext>,
+        t: &Tokens,
+    ) -> Option<AnyElement> {
+        let (chip, bounds) = self.composer_ui.chip_hover.as_ref()?;
+        let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
+        let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
+        let (glyph, label, light, dark, alpha) = pr.state();
+        let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
+        let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
+        let details = v_flex()
+            .max_w(px(320.))
+            .gap(px(4.))
+            .py(px(2.))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
+                    .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
+                    .child(div().text_color(tone).child(label)),
+            )
+            .child(div().text_color(t.foreground).child(pr.title.clone()))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .text_size(px(10.))
+                    .text_color(t.muted_foreground)
+                    .child(branch(&pr.head_branch))
+                    .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
+                    .child(branch(&pr.base_branch)),
+            );
+        // `TooltipPopup side="top"`, placed in window coordinates over the chip.
+        let at = gpui_kit::point(bounds.left(), bounds.top() - px(4.));
+        Some(
+            gpui_kit::deferred(
+                gpui_kit::anchored().anchor(gpui_kit::Anchor::BottomLeft).position(at).child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.popover)
+                        .shadow_md()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .text_xs()
+                        .line_height(gpui_kit::relative(1.375))
+                        .child(details),
+                ),
+            )
+            .into_any_element(),
+        )
+    }
 }
 
 /// `ComposerControl size="sm"`: 28px tall, 8px padding inside a transparent 1px border,
@@ -1694,6 +1829,29 @@ fn black(alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_comment_chips_keep_their_change_request() {
+        let pr = |url: &str, state: &str, draft: bool| {
+            json!({"number": 7, "title": "Fix login", "url": url, "headBranch": "fix", "baseBranch": "main",
+                "state": state, "isDraft": draft})
+        };
+        let records = [
+            json!({"version": 1, "kind": "review-comment", "contextId": "rc-1", "label": "#7",
+                "pullRequest": pr("https://github.com/o/r/pull/7", "open", true)}),
+            json!({"version": 1, "kind": "review-comment", "contextId": "rc-2", "label": "a.ts:3"}),
+            json!({"version": 1, "kind": "terminal", "contextId": "t-1", "label": "x",
+                "pullRequest": pr("https://github.com/o/r/pull/7", "open", false)}),
+            json!({"version": 1, "kind": "review-comment", "contextId": "rc-3", "label": "!7",
+                "pullRequest": pr("https://gitlab.com/g/p/-/merge_requests/7", "merged", false)}),
+        ];
+        let contexts = pull_request_contexts(&records);
+        assert_eq!(contexts.len(), 2, "only review comments that carry one");
+        let draft = &contexts["rc-1"];
+        assert_eq!((draft.noun(), draft.state().1), ("Pull request", "Draft"));
+        let merged = &contexts["rc-3"];
+        assert_eq!((merged.noun(), merged.state().1), ("Merge request", "Merged"));
+    }
 
     #[test]
     fn a_failed_send_keeps_newer_text_after_it() {
