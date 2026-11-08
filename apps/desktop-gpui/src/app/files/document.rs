@@ -37,6 +37,11 @@ struct DocView {
 }
 
 impl Documents {
+    /// Drops `key`'s view, so its next draw builds it again.
+    pub(super) fn forget(&mut self, key: &FileKey) {
+        self.views.remove(key);
+    }
+
     /// Whether `key`'s diagram must be built for source `revision`.
     pub(super) fn stale(&self, key: &FileKey, revision: u64) -> bool {
         self.views.get(key).is_none_or(|doc| doc.content != revision)

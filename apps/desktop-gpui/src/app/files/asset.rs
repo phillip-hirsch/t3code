@@ -51,6 +51,11 @@ pub(super) struct Assets {
 }
 
 impl Assets {
+    /// Drops `key`'s parsed file, so its next draw fetches it again.
+    pub(super) fn forget(&mut self, key: &FileKey) {
+        self.states.remove(key);
+    }
+
     pub(super) fn viewer_mut(&mut self, key: &FileKey) -> Option<&mut Viewer> {
         match &mut self.states.get_mut(key)?.load {
             AssetLoad::Ready(viewer) => Some(viewer),

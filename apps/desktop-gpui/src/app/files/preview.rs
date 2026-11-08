@@ -257,6 +257,28 @@ impl Workspace {
         }
     }
 
+    /// `onRefreshSelectedFile`: the tree's Refresh reads the open file again (unless edits are
+    /// unsaved) and reloads its document view; media and PDFs keep what they show.
+    pub(super) fn refresh_selected_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.files.previews.get(key) else { return };
+        let (kind, folder, dirty) = (state.kind, matches!(state.load, Load::Folder), state.save.pending());
+        match kind {
+            logic::FileKind::Image | logic::FileKind::Video | logic::FileKind::Audio | logic::FileKind::Pdf => {}
+            _ if folder => {}
+            kind @ (logic::FileKind::Text | logic::FileKind::Html) => {
+                if !dirty {
+                    self.read_file(key.clone(), window, cx);
+                }
+                if kind == logic::FileKind::Html {
+                    self.files.documents.forget(key);
+                }
+            }
+            logic::FileKind::Font => self.files.documents.forget(key),
+            _ => self.files.assets.forget(key),
+        }
+        cx.notify();
+    }
+
     fn read_file(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&key.checkout.env) else { return };
         let Some(state) = self.files.previews.get_mut(&key) else { return };

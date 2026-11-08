@@ -464,6 +464,7 @@ impl Workspace {
                 .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
         };
         let refresh_key = key.clone();
+        let refresh_selected = selected.map(str::to_owned);
         let toggle_key = key.clone();
         let clear_key = key.clone();
         let subheader = h_flex()
@@ -478,7 +479,13 @@ impl Workspace {
                     IconName::RefreshCw,
                     if pending { "Refreshing…" } else { "Refresh files" }.into(),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.refresh_tree(&refresh_key, cx))),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.refresh_tree(&refresh_key, cx);
+                    if let Some(path) = &refresh_selected {
+                        let key = super::FileKey { checkout: refresh_key.clone(), path: path.clone() };
+                        this.refresh_selected_file(&key, window, cx);
+                    }
+                })),
             )
             .child(
                 div()
