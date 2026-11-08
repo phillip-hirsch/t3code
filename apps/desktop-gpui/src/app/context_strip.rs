@@ -13,8 +13,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, Keystroke, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
@@ -96,12 +96,67 @@ pub(super) struct DraftWorkspaceState {
     branch_search: Option<Entity<InputState>>,
     branch_query: String,
     _branch_search_changes: Option<Subscription>,
+    /// The open picker's `vcs.listRefs` pages for its search (`usePaginatedBranches`).
+    branch_pages: RefSearch,
+    /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
+    branch_highlight: Option<usize>,
+    branch_scroll: ScrollHandle,
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
     /// `vcs.listRefs` for an open thread's checkout, by environment and cwd (`persistComposerContextStrip`).
     thread_refs: Option<(Option<SharedString>, String, Value)>,
 }
+
+/// The ref pages loaded for the branch picker's search, merged by name like `usePaginatedBranches`.
+#[derive(Default)]
+struct RefSearch {
+    /// The sanitized query the pages answer; empty lists every ref.
+    query: String,
+    pages: Vec<Value>,
+    /// The page in flight, and whether it is a next page.
+    loading: Option<(Task<()>, bool)>,
+}
+
+impl RefSearch {
+    /// The refs of every page in order, a later page's copy of a name replacing the earlier one.
+    fn refs(&self) -> Vec<&Value> {
+        let mut refs: Vec<&Value> = Vec::new();
+        for item in self.pages.iter().filter_map(|page| page["refs"].as_array()).flatten() {
+            match refs.iter_mut().find(|known| known["name"] == item["name"]) {
+                Some(known) => *known = item,
+                None => refs.push(item),
+            }
+        }
+        refs
+    }
+
+    fn next_cursor(&self) -> Option<u64> {
+        self.pages.last().and_then(|page| page["nextCursor"].as_u64())
+    }
+
+    /// `statusText`: the first page loading, a next page loading, or how many refs show.
+    fn status(&self) -> Option<String> {
+        match (&self.loading, self.next_cursor()) {
+            (Some((_, false)), _) if self.pages.is_empty() => Some("Loading refs...".into()),
+            (Some((_, true)), _) => Some("Loading more refs...".into()),
+            (_, Some(_)) => {
+                let total = self.pages.iter().filter_map(|page| page["totalCount"].as_u64()).max().unwrap_or(0);
+                Some(format!("Showing {} of {total} refs", self.refs().len()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One row of the branch picker: a ref, or "Create new ref".
+enum BranchItem {
+    Ref(Value),
+    Create(String),
+}
+
+/// `shouldLoadNextBranchPageAfterScroll`'s distance from the end.
+const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when its project changes.
@@ -138,20 +193,124 @@ impl Workspace {
         }));
     }
 
-    /// Escape closes the branch picker.
+    /// The branch picker's combobox keys: Escape closes it, Up and Down highlight, Enter picks.
     pub(super) fn draft_workspace_key(
         &mut self,
         keystroke: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if keystroke.key != "escape" || !self.draft_workspace.branch_open {
+        if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
             return false;
         }
-        self.draft_workspace.branch_open = false;
-        self.focus_composer(window, cx);
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.draft_workspace.branch_open = false;
+                self.focus_composer(window, cx);
+            }
+            "down" | "up" => {
+                let count = self.branch_items().len();
+                if count == 0 {
+                    return true;
+                }
+                let state = &mut self.draft_workspace;
+                let next = step_highlight(state.branch_highlight, count, keystroke.key == "down");
+                state.branch_highlight = Some(next);
+                state.branch_scroll.scroll_to_item(next);
+                if next + 4 >= count {
+                    self.load_next_branch_page(cx);
+                }
+            }
+            "enter" => {
+                let Some(index) = self.draft_workspace.branch_highlight else { return false };
+                match self.branch_items().into_iter().nth(index) {
+                    Some(BranchItem::Ref(item)) => {
+                        let name = item["name"].as_str().unwrap_or_default().to_owned();
+                        self.select_branch(name, window, cx);
+                    }
+                    Some(BranchItem::Create(name)) => self.create_branch(name, cx),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
         cx.notify();
         true
+    }
+
+    /// The picker's rows: its loaded refs that match the search, then "Create new ref" when no
+    /// ref has that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
+    fn branch_items(&self) -> Vec<BranchItem> {
+        let state = &self.draft_workspace;
+        let (_, worktree_base, _) = self.branch_trigger();
+        let refs = state.branch_pages.refs();
+        let query = state.branch_query.to_lowercase();
+        let sanitized = new_thread::sanitize_new_ref_name(&query);
+        let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
+        let create =
+            (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
+        refs.into_iter()
+            .filter(|r| {
+                let name = r["name"].as_str().unwrap_or_default().to_lowercase();
+                query.is_empty() || name.contains(&query) || name.contains(&sanitized)
+            })
+            .map(|r| BranchItem::Ref(r.clone()))
+            .chain(create)
+            .collect()
+    }
+
+    /// Fetches the picker's first page for its current search, or the next page after the last.
+    fn load_branch_page(&mut self, next: bool, cx: &mut Context<Self>) {
+        let cursor = if next {
+            match (&self.draft_workspace.branch_pages.loading, self.draft_workspace.branch_pages.next_cursor()) {
+                (None, Some(cursor)) => Some(cursor),
+                _ => return,
+            }
+        } else {
+            None
+        };
+        let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
+        let query = self.draft_workspace.branch_pages.query.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let page = new_thread::list_ref_page(&client, &cwd, &query, cursor).await;
+            let _ = this.update(cx, |this, cx| {
+                let pages = &mut this.draft_workspace.branch_pages;
+                if pages.query != query {
+                    return;
+                }
+                pages.loading = None;
+                match page {
+                    Ok(page) => {
+                        if cursor.is_none() {
+                            pages.pages.clear();
+                        }
+                        pages.pages.push(page);
+                    }
+                    Err(error) => log::warn!("could not list refs: {error}"),
+                }
+                cx.notify();
+            });
+        });
+        self.draft_workspace.branch_pages.loading = Some((task, next));
+        cx.notify();
+    }
+
+    fn load_next_branch_page(&mut self, cx: &mut Context<Self>) {
+        self.load_branch_page(true, cx);
+    }
+
+    /// The search changed: a new query starts over from its first page.
+    fn search_branches(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let state = &mut self.draft_workspace;
+        state.branch_query = raw.trim().to_owned();
+        state.branch_highlight = (!state.branch_query.is_empty()).then_some(0);
+        state.branch_scroll.scroll_to_item(0);
+        let query = new_thread::sanitize_new_ref_name(raw);
+        if query == state.branch_pages.query {
+            return;
+        }
+        state.branch_pages = RefSearch { query, ..Default::default() };
+        self.load_branch_page(false, cx);
     }
 
     pub(super) fn draft_workspace_open_permissions(&mut self, cx: &mut Context<Self>) {
@@ -174,12 +333,18 @@ impl Workspace {
                         return;
                     }
                 };
-                if thread {
-                    this.draft_workspace.thread_refs = Some((environment, cwd, refs));
-                } else if this.draft_workspace.project_id == project_id {
-                    this.draft_workspace.refs = Some(refs);
-                } else {
+                let state = &mut this.draft_workspace;
+                if !thread && state.project_id != project_id {
                     return;
+                }
+                // An open picker without a search or further pages lists the fresh first page.
+                if state.branch_open && state.branch_pages.query.is_empty() && state.branch_pages.pages.len() <= 1 {
+                    state.branch_pages.pages = vec![refs.clone()];
+                }
+                if thread {
+                    state.thread_refs = Some((environment, cwd, refs));
+                } else {
+                    state.refs = Some(refs);
                 }
                 cx.notify();
             });
@@ -227,6 +392,18 @@ impl Workspace {
     /// `isGitRepo` as `ChatView` reads it: the checkout's live status, not its refs reply.
     pub(super) fn is_git_repo(&self) -> bool {
         self.vcs.is_repo()
+    }
+
+    /// `name`'s ref from the picker's pages, else the checkout's first page.
+    fn find_ref(&self, name: &str) -> Option<Value> {
+        let named = |r: &&Value| r["name"].as_str() == Some(name);
+        self.draft_workspace
+            .branch_pages
+            .refs()
+            .into_iter()
+            .find(named)
+            .or_else(|| self.ref_list().iter().find(named))
+            .cloned()
     }
 
     fn ref_list(&self) -> &[Value] {
@@ -285,11 +462,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let elsewhere = self
-            .ref_list()
-            .iter()
-            .find(|r| r["name"].as_str() == Some(&name))
-            .and_then(|r| r["worktreePath"].as_str().map(str::to_owned));
+        let elsewhere = self.find_ref(&name).and_then(|r| r["worktreePath"].as_str().map(str::to_owned));
         let root = self.composer_cwd();
         if let Some(path) = elsewhere {
             // Already checked out in a worktree: reuse it instead of switching.
@@ -365,7 +538,8 @@ impl Workspace {
                 self.draft_workspace._branch_search_changes =
                     Some(cx.subscribe_in(&search, window, |this, search, event, _, cx| {
                         if let InputEvent::Change = event {
-                            this.draft_workspace.branch_query = search.read(cx).value().trim().to_owned();
+                            let raw = search.read(cx).value().to_string();
+                            this.search_branches(&raw, cx);
                             cx.notify();
                         }
                     }));
@@ -377,8 +551,13 @@ impl Workspace {
             search.set_value("", window, cx);
             search.focus(window, cx);
         });
-        self.draft_workspace.branch_query.clear();
-        self.draft_workspace.branch_open = true;
+        // The checkout's first page until `refresh_refs` brings a fresh one.
+        let pages = self.refs().cloned().into_iter().collect();
+        let state = &mut self.draft_workspace;
+        state.branch_query.clear();
+        state.branch_highlight = None;
+        state.branch_open = true;
+        state.branch_pages = RefSearch { pages, ..Default::default() };
         self.refresh_refs(cx);
         cx.notify();
     }
@@ -388,9 +567,9 @@ impl Workspace {
     fn select_thread_branch(&mut self, thread_id: String, name: String, cx: &mut Context<Self>) {
         let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
         let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
-        let picked = self.ref_list().iter().find(|r| r["name"].as_str() == Some(name.as_str()));
-        let elsewhere = picked.and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
-        let is_default = picked.is_some_and(|r| r["isDefault"].as_bool() == Some(true));
+        let picked = self.find_ref(&name);
+        let elsewhere = picked.as_ref().and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
+        let is_default = picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true));
         if let Some(path) = elsewhere {
             let next = (!is_within(&root, &path)).then_some(path);
             self.set_thread_branch(&thread_id, &name, next, cx);
@@ -723,17 +902,38 @@ impl Workspace {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let query = self.draft_workspace.branch_query.to_lowercase();
-        let refs: Vec<&Value> = self
-            .ref_list()
-            .iter()
-            .filter(|r| query.is_empty() || r["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&query)))
-            .collect();
-        let exact =
-            self.ref_list().iter().any(|r| r["name"].as_str() == Some(self.draft_workspace.branch_query.as_str()));
-        let create = (!query.is_empty() && !exact && !worktree_base).then(|| self.draft_workspace.branch_query.clone());
-        let total = self.refs().and_then(|r| r["totalCount"].as_u64());
-        let rows = refs.iter().map(|r| {
+        let items = self.branch_items();
+        let highlight = self.draft_workspace.branch_highlight;
+        let empty = items.is_empty();
+        let rows = items.into_iter().enumerate().map(|(index, item)| {
+            let highlighted = highlight == Some(index);
+            let hover = cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                if this.draft_workspace.branch_highlight != Some(index) {
+                    this.draft_workspace.branch_highlight = Some(index);
+                    cx.notify();
+                }
+            });
+            let r = match item {
+                BranchItem::Ref(r) => r,
+                BranchItem::Create(name) => {
+                    let label = format!("Create new ref \"{name}\"");
+                    return div()
+                        .id("create-ref")
+                        .h(px(28.))
+                        .flex_none()
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                        .on_mouse_move(hover)
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.create_branch(name.clone(), cx)))
+                        .into_any_element();
+                }
+            };
             let name = r["name"].as_str().unwrap_or_default().to_owned();
             let badge = if r["current"].as_bool() == Some(true) {
                 Some("current")
@@ -758,8 +958,9 @@ impl Workspace {
                 .rounded(px(4.))
                 .text_sm()
                 .cursor_pointer()
-                .hover(|s| s.bg(t.accent))
                 .when(checked, |el| el.bg(t.foreground.opacity(0.08)))
+                .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                .on_mouse_move(hover)
                 .child(div().flex_1().min_w_0().truncate().text_color(t.foreground).child(name))
                 .children(badge.map(|badge| {
                     div()
@@ -772,7 +973,9 @@ impl Workspace {
                 }))
                 .on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
                 .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
+                .into_any_element()
         });
+        let rows: Vec<AnyElement> = rows.collect();
         let start_from_origin = self.draft_start_from_origin();
         v_flex()
             .id("branch-popover-body")
@@ -786,32 +989,33 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("branch-list")
+                    .track_scroll(&self.draft_workspace.branch_scroll)
                     .max_h(px(224.))
                     .overflow_y_scroll()
                     .py(px(8.))
                     .px(px(4.))
-                    .when(refs.is_empty() && create.is_none(), |el| {
+                    .on_scroll(cx.listener(|_, _: &gpui_kit::ScrollEvent, window, cx| {
+                        // After the list applies the scroll (`maybeFetchNextBranchPage`).
+                        cx.defer_in(window, |this, _, cx| {
+                            let scroll = &this.draft_workspace.branch_scroll;
+                            if f32::from(scroll.max_offset().y + scroll.offset().y) <= NEXT_PAGE_DISTANCE {
+                                this.load_next_branch_page(cx);
+                            }
+                        });
+                    }))
+                    .when(empty, |el| {
                         el.child(div().p(px(8.)).text_sm().text_color(t.muted_foreground).child("No refs found."))
                     })
-                    .children(rows)
-                    .children(create.map(|name| {
-                        let label = format!("Create new ref \"{name}\"");
-                        div()
-                            .id("create-ref")
-                            .h(px(28.))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.))
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.accent))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| this.create_branch(name.clone(), cx)))
-                    })),
+                    .children(rows),
             )
-            .children(total.map(|total| {
-                div().px(px(12.)).pb(px(6.)).text_xs().text_color(t.muted_foreground).child(format!("Showing {} of {total} refs", self.ref_list().len()))
+            .children(self.draft_workspace.branch_pages.status().map(|status| {
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.muted_foreground)
+                    .child(status)
             }))
             .when(worktree_base, |el| {
                 el.child(
@@ -1010,9 +1214,47 @@ fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
         .child(div().size(px(8.)).rounded_full().bg(if on { t.primary_foreground } else { t.muted_foreground }))
 }
 
+/// `Combobox` arrows: the first or last row from none, wrapping at either end.
+fn step_highlight(current: Option<usize>, count: usize, down: bool) -> usize {
+    match (down, current) {
+        (true, None) => 0,
+        (true, Some(i)) => (i + 1) % count,
+        (false, None | Some(0)) => count - 1,
+        (false, Some(i)) => (i - 1).min(count - 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::clipboard_path;
+    use super::{RefSearch, clipboard_path, step_highlight};
+    use serde_json::json;
+
+    #[test]
+    fn ref_pages_merge_by_name_and_say_how_many_show() {
+        let mut search = RefSearch::default();
+        assert_eq!(search.status(), None);
+        search.pages.push(json!({"refs": [{"name": "a"}, {"name": "b"}], "nextCursor": 2, "totalCount": 3}));
+        assert_eq!(search.next_cursor(), Some(2));
+        assert_eq!(search.status().as_deref(), Some("Showing 2 of 3 refs"));
+        search.pages.push(
+            json!({"refs": [{"name": "b", "current": true}, {"name": "c"}], "nextCursor": null, "totalCount": 3}),
+        );
+        let refs = search.refs();
+        let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(refs[1]["current"], true, "the later page's copy wins");
+        assert_eq!(search.next_cursor(), None);
+        assert_eq!(search.status(), None, "every ref shows");
+    }
+
+    #[test]
+    fn branch_arrows_wrap() {
+        assert_eq!(step_highlight(None, 3, true), 0);
+        assert_eq!(step_highlight(None, 3, false), 2);
+        assert_eq!(step_highlight(Some(2), 3, true), 0);
+        assert_eq!(step_highlight(Some(0), 3, false), 2);
+        assert_eq!(step_highlight(Some(5), 3, false), 2, "a highlight past a shrunk list comes back");
+    }
 
     #[test]
     fn windows_paths_copy_with_backslashes() {
