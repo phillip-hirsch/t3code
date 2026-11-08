@@ -361,6 +361,17 @@ impl UsageState {
         !self.loading() && (scan_changed || unread)
     }
 
+    /// A read of `ids` goes out; answers and failures from environments it no longer reads drop.
+    fn start_read(&mut self, ids: Vec<SharedString>) {
+        self.generation += 1;
+        self.failures.retain(|(id, _)| ids.contains(id));
+        if let Some((answers, _)) = &mut self.answers {
+            answers.retain(|kept| ids.iter().any(|id| id.as_ref() == kept.environment_id));
+        }
+        self.pending = ids;
+        self.recombine();
+    }
+
     /// A selected environment's usage read is still out.
     fn loading(&self) -> bool {
         self.pending.iter().any(|id| self.is_selected(id))
@@ -605,13 +616,12 @@ impl Workspace {
             .collect();
         self.usage.scan_settings = self.usage_scan();
         let usage = &mut self.usage;
+        usage.start_read(machines.iter().map(|(id, ..)| id.clone()).collect());
         if machines.is_empty() {
             usage.refreshing = false;
             return;
         }
-        usage.generation += 1;
         let generation = usage.generation;
-        usage.pending = machines.iter().map(|(id, ..)| id.clone()).collect();
         for (id, client, mut input) in machines {
             // A refresh re-prices the selected environments; every one is read so a pick shows at once.
             let reprice = refresh_rates && self.usage.is_selected(&id);
@@ -2880,6 +2890,9 @@ mod tests {
         assert!(usage.error().is_some());
         usage.publish(&b, Ok(summary_json(2., "box-b")), &month, true);
         assert_eq!((usage.error(), usage.merged.cost_usd), (None, 3.));
+        usage.failures.push(("c".into(), "down".into()));
+        usage.start_read(vec![a.clone()]);
+        assert_eq!((usage.error(), usage.merged.cost_usd), (None, 1.), "environments that left drop out");
         let mut refreshing = summary_json(4., "box-a");
         refreshing["sources"][0]["refreshing"] = json!(true);
         assert!(usage.publish(&a, Ok(refreshing), &local_window(7), true), "slow sources are asked again");
