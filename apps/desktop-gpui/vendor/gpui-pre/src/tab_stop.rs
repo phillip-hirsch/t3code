@@ -13,6 +13,8 @@ pub(crate) struct TabStopMap {
     pub(crate) insertion_history: Vec<TabStopOperation>,
     by_id: FxHashMap<FocusId, TabStopNode>,
     order: SumTree<TabStopNode>,
+    /// t3code: how many inert subtrees are being painted; nothing inside one is a tab stop.
+    inert: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -70,12 +72,15 @@ impl Default for TabStopMap {
             insertion_history: Vec::new(),
             by_id: FxHashMap::default(),
             order: SumTree::new(()),
+            inert: 0,
         }
     }
 }
 
 impl TabStopMap {
     pub fn insert(&mut self, focus_handle: &FocusHandle) {
+        let mut focus_handle = focus_handle.clone();
+        focus_handle.tab_stop &= self.inert == 0;
         self.insertion_history
             .push(TabStopOperation::Insert(focus_handle.clone()));
         let mut path = self.current_path.clone();
@@ -98,6 +103,15 @@ impl TabStopMap {
     pub fn end_group(&mut self) {
         self.insertion_history.push(TabStopOperation::GroupEnd);
         self.current_path.0.pop();
+    }
+
+    /// t3code: handles inserted until the matching [`Self::end_inert`] are not tab stops.
+    pub(crate) fn begin_inert(&mut self) {
+        self.inert += 1;
+    }
+
+    pub(crate) fn end_inert(&mut self) {
+        self.inert -= 1;
     }
 
     pub fn clear(&mut self) {

@@ -849,6 +849,13 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// t3code: like HTML `inert` for the keyboard: neither this element nor anything inside it
+    /// is a tab stop. Pointer events are untouched; cover the subtree to block those.
+    fn inert(mut self) -> Self {
+        self.interactivity().inert = true;
+        self
+    }
+
     /// Set the keymap context for this element. This will be used to determine
     /// which action to dispatch from the keymap.
     fn key_context<C, E>(mut self, key_context: C) -> Self
@@ -2240,6 +2247,8 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
+    /// t3code: see [`InteractiveElement::inert`].
+    pub(crate) inert: bool,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -2608,6 +2617,9 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
+                if self.inert {
+                    window.next_frame.tab_stops.begin_inert();
+                }
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
@@ -2699,6 +2711,9 @@ impl Interactivity {
                         });
                     });
                 });
+                if self.inert {
+                    window.next_frame.tab_stops.end_inert();
+                }
 
                 ((), element_state)
             },
@@ -6251,6 +6266,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(focused, Some(item_b.id));
+    }
+
+    /// t3code: three tab stops, the middle one inside an inert subtree.
+    struct InertFocus([FocusHandle; 3]);
+
+    impl Render for InertFocus {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let [before, inside, after] = &self.0;
+            div()
+                .child(div().track_focus(before))
+                .child(div().inert().child(div().track_focus(inside)))
+                .child(div().track_focus(after))
+        }
+    }
+
+    /// t3code: Tab skips everything inside an [`InteractiveElement::inert`] subtree.
+    #[test]
+    fn focus_next_skips_an_inert_subtree() {
+        let mut cx = TestAppContext::single();
+        let handles = cx.update(|cx| [(); 3].map(|()| cx.focus_handle().tab_stop(true)));
+        let [before, inside, after] = handles.clone();
+        let window: AnyWindowHandle = cx.add_window(move |_, _| InertFocus(handles)).into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let focused = cx
+            .update_window(window, |_, window, cx| {
+                window.focus(&before, cx);
+                window.focus_next(cx);
+                window.focused(cx).map(|handle| handle.id)
+            })
+            .unwrap();
+
+        assert_eq!(focused, Some(after.id));
+        assert_ne!(focused, Some(inside.id));
     }
 
     #[gpui::test]

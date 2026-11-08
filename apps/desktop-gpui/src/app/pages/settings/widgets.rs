@@ -1215,11 +1215,12 @@ impl Workspace {
                 .then(|| SharedString::from("Environment-wide setting. Select an environment to change it."))
         });
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
-        let (control, hug, body) = match control {
-            Some(RowControl::Body(field)) => (None, None, Some(field)),
-            Some(RowControl::Side(control)) => (Some(control), None, body),
-            Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body),
-            None => (None, None, body),
+        // A row's own body goes inert only with the row unavailable (`SettingsRow` children).
+        let (control, hug, body, inert_body) = match control {
+            Some(RowControl::Body(field)) => (None, None, Some(field), true),
+            Some(RowControl::Side(control)) => (Some(control), None, body, unavailable),
+            Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body, unavailable),
+            None => (None, None, body, unavailable),
         };
         let inert = if unavailable { Some(SharedString::default()) } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
@@ -1245,18 +1246,17 @@ impl Workspace {
         });
         frame.reset = reset.filter(|_| !unavailable);
         frame.description = description;
-        frame.body = body;
         frame.hug = hug;
-        // `inert`: a cover over the control takes its pointer events and carries the tooltip;
-        // `patch_lock` refuses what keyboard focus could still send.
-        let inert_control = |control: AnyElement| match inert.clone() {
+        // `inert`: a cover over the control or body takes its pointer events and carries the
+        // tooltip, the content leaves the tab order, and `patch_lock` still refuses writes.
+        let inert_part = |part: &str, content: AnyElement| match inert.clone() {
             Some(message) => div()
                 .flex_none()
                 .relative()
-                .child(div().opacity(0.5).child(control))
+                .child(div().inert().opacity(0.5).child(content))
                 .child(
                     div()
-                        .id(SharedString::from(format!("{id}-inert")))
+                        .id(SharedString::from(format!("{id}-{part}inert")))
                         .absolute()
                         .inset_0()
                         .block_mouse_except_scroll()
@@ -1265,10 +1265,11 @@ impl Workspace {
                         }),
                 )
                 .into_any_element(),
-            None => control,
+            None => content,
         };
-        frame.control = control.map(inert_control);
-        frame.control_beside = control_beside.map(inert_control);
+        frame.control = control.map(|control| inert_part("", control));
+        frame.control_beside = control_beside.map(|control| inert_part("", control));
+        frame.body = body.map(|body| if inert_body { inert_part("body-", body) } else { body });
         frame
             .render(&t)
             .id(group.clone())

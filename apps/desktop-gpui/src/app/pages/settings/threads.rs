@@ -96,18 +96,36 @@ fn project_automatic_model<'a>(target: ModelTarget<'a>) -> Option<ModelSelection
 }
 
 /// `resolveEffectiveDefaultModelSelection`: the picked model while the target's model
-/// preferences (else this device's) still show it, else the instance's first shown default.
+/// preferences (else this device's) still show it, else the instance's first shown default
+/// in its `modelOrder`.
 fn effective_model(target: ModelTarget, client: &Settings, selection: ModelSelection) -> ModelSelection {
     let Some(provider) = target.info.provider(&selection.instance_id) else { return selection };
     let preferences = Some(target.settings.get("providerModelPreferences"))
         .filter(|p| !p.is_null())
         .unwrap_or_else(|| client.get("providerModelPreferences"));
-    let hidden = &preferences[selection.instance_id.as_str()]["hiddenModels"];
-    let is_hidden = |slug: &str| hidden.as_array().is_some_and(|h| h.iter().any(|h| h.as_str() == Some(slug)));
-    let shown: Vec<_> = provider.models.iter().filter(|m| m.is_custom || !is_hidden(&m.slug)).collect();
+    let preferences = &preferences[selection.instance_id.as_str()];
+    let listed = |key: &str, slug: &str| {
+        preferences[key].as_array().and_then(|list| list.iter().position(|s| s.as_str() == Some(slug)))
+    };
+    let mut shown: Vec<_> =
+        provider.models.iter().filter(|m| m.is_custom || listed("hiddenModels", &m.slug).is_none()).collect();
     if shown.iter().any(|m| m.slug == selection.model) {
         return selection;
     }
+    // `preserveUnavailableSelection`: a dynamic catalog's pick that it no longer lists stays.
+    let dynamic = match provider.driver.as_str() {
+        "opencode" => true,
+        "antigravity" => selection.model != "antigravity-default",
+        _ => false,
+    };
+    if dynamic
+        && !selection.model.trim().is_empty()
+        && listed("hiddenModels", &selection.model).is_none()
+        && !provider.models.iter().any(|m| m.slug == selection.model)
+    {
+        return selection;
+    }
+    shown.sort_by_key(|m| listed("modelOrder", &m.slug).unwrap_or(usize::MAX));
     match shown.iter().find(|m| m.is_default == Some(true)).or(shown.first()) {
         Some(model) => ModelSelection { model: model.slug.clone(), ..selection },
         None => selection,
@@ -979,6 +997,38 @@ mod tests {
             !default_models_mixed(&hiding, [(&automatic, hidden), (&automatic, on(&both, None))]),
             "this device's preferences stand in for a target without its own"
         );
+
+        // The default is hidden and no other model is marked default: each target's order picks.
+        let three = info(json!([{"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
+            "models": [{"slug": "gpt", "isDefault": true}, {"slug": "mini"}, {"slug": "nano"}]}]));
+        let ordered = |order: Value| {
+            Settings::layered(
+                &Default::default(),
+                &json!({"providerModelPreferences": {"codex": {"hiddenModels": ["gpt"], "modelOrder": order}}}),
+            )
+        };
+        let (catalog, nano_first) = (ordered(json!([])), ordered(json!(["nano"])));
+        let with = |settings| Some(ModelTarget { info: &three, settings, project_id: None });
+        assert!(mixed([(&automatic, with(&catalog)), (&automatic, with(&nano_first))]), "the order picks the fallback");
+
+        // `preserveUnavailableSelection`: a dynamic catalog's missing pick stays unless hidden.
+        let dynamic = info(json!([
+            {"instanceId": "opencode", "driver": "opencode", "enabled": true, "models": [{"slug": "kimi"}]},
+            {"instanceId": "antigravity", "driver": "antigravity", "enabled": true, "models": [{"slug": "gemini"}]}
+        ]));
+        let resolve = |instance: &str, model: &str, settings| {
+            let stored = json!({"instanceId": instance, "model": model});
+            let target = ModelTarget { info: &dynamic, settings, project_id: None };
+            effective_default_model(&stored, target, &device).map(|s| s.model)
+        };
+        assert_eq!(resolve("opencode", "gone", &device).as_deref(), Some("gone"));
+        assert_eq!(resolve("antigravity", "gone", &device).as_deref(), Some("gone"));
+        assert_eq!(resolve("antigravity", "antigravity-default", &device).as_deref(), Some("gemini"));
+        let hiding_gone = Settings::layered(
+            &Default::default(),
+            &json!({"providerModelPreferences": {"opencode": {"hiddenModels": ["gone"], "modelOrder": []}}}),
+        );
+        assert_eq!(resolve("opencode", "gone", &hiding_gone).as_deref(), Some("kimi"), "a hidden pick falls back");
     }
 
     #[test]

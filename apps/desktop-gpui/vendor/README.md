@@ -83,6 +83,13 @@ color-dependent stroke dilation when the user allows smoothing. The patch, in
 `glyph_dilation_for_color` return 0. Dilation is part of the glyph cache key, so the next frame
 paints with the change. No test: only the macOS text system dilates.
 
+**Inert subtrees leave the tab order.** The web's settings put locked controls under HTML
+`inert`; 0.3.11 has no way to take a subtree out of keyboard focus. The patch:
+`InteractiveElement::inert` (`src/elements/div.rs`) brackets the element's paint with
+`TabStopMap::begin_inert`/`end_inert` (`src/tab_stop.rs`), and `TabStopMap::insert` records a
+handle inserted inside as no tab stop, so replayed cached views keep that. Pointer events are
+untouched. Test: `focus_next_skips_an_inert_subtree`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
