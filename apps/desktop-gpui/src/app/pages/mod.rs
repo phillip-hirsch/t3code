@@ -109,11 +109,21 @@ impl Workspace {
 
     pub(super) fn open_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.settings = None;
+        if self.page != Some(page) {
+            self.page_entered(page);
+        }
         self.page = Some(page);
         self.record_location();
         self.page_opened(cx);
         self.notify_sidebar(cx);
         cx.notify();
+    }
+
+    /// Arriving on a page from elsewhere: the Pull requests page takes focus (`startWorkspaceFocus`).
+    fn page_entered(&mut self, page: Page) {
+        if page == Page::PullRequests {
+            self.pull_requests.focus_on_render = true;
+        }
     }
 
     /// Starts the open page's reads.
@@ -191,6 +201,7 @@ impl Workspace {
             Location::Chat(Some(Target::Draft { project_id, .. })) => self.start_draft(project_id, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {
+                self.page_entered(page);
                 self.page = Some(page);
                 self.page_opened(cx);
             }

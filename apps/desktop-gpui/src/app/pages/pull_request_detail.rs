@@ -37,7 +37,7 @@ use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
-mod avatars;
+pub(super) mod avatars;
 pub(super) mod breakdown;
 mod code;
 mod completions;

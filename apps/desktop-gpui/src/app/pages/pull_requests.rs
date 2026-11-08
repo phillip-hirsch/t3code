@@ -92,6 +92,8 @@ enum Footer {
 
 /// The page's own state, kept while it is closed so reopening shows the last answer at once.
 pub(in crate::app) struct PullRequestsState {
+    /// Entered from elsewhere: the next render focuses the list's first control, its search.
+    pub(super) focus_on_render: bool,
     involvement: &'static str,
     state: &'static str,
     sort: &'static str,
@@ -152,6 +154,8 @@ pub(in crate::app) struct PullRequestsState {
     /// focus rests on (attached at the next render, which has the window).
     row_focus: std::collections::HashMap<String, (FocusHandle, Option<Subscription>)>,
     row_focus_unheard: bool,
+    /// The rows changed, so their authors' pictures may need reading.
+    avatars_unread: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
     /// Each tab's close button and title, as the web's two buttons: Tab reaches them, Enter or Space presses.
@@ -210,11 +214,13 @@ impl PullRequestsState {
             layout: super::pull_request_detail::PanelLayout::default(),
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
+            focus_on_render: false,
             prefetched: None,
             prefetch: None,
             facet_search: None,
             row_focus: std::collections::HashMap::new(),
             row_focus_unheard: false,
+            avatars_unread: false,
             row_popover: None,
             tab_menu: None,
             tab_focus: std::collections::HashMap::new(),
@@ -781,10 +787,23 @@ impl Workspace {
         state.row_focus.retain(|key, _| shown.contains(key));
         state.list_state.reset(rows.len());
         state.rows = Rc::from(rows);
+        state.avatars_unread = true;
     }
 
     pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.listen_to_pull_request_row_focus(window, cx);
+        if std::mem::take(&mut self.pull_requests.avatars_unread) {
+            let rows = self.pull_requests.rows.clone();
+            let urls = rows.iter().filter_map(|row| match row {
+                Row::Entry { entry, .. } => entry.author.as_ref()?.avatar_url.as_deref(),
+                _ => None,
+            });
+            super::pull_request_detail::avatars::read_avatars(urls, cx);
+        }
+        if std::mem::take(&mut self.pull_requests.focus_on_render) {
+            let search = gpui_kit::Focusable::focus_handle(self.pull_requests.search.read(cx), cx);
+            window.focus(&search, cx);
+        }
         let tokens = *theme::tokens(cx);
         let state = &self.pull_requests;
         let shown = state.rows.iter().any(|row| matches!(row, Row::Entry { .. }));
@@ -1808,7 +1827,9 @@ fn pull_request_row(
                 .flex_none()
                 .max_w(px(160.))
                 .gap(px(4.))
-                .child(
+                .child(super::pull_request_detail::avatars::avatar_at(
+                    entry.author.as_ref().and_then(|a| a.avatar_url.as_deref()),
+                    14.,
                     div()
                         .size(px(14.))
                         .flex_none()
@@ -1820,7 +1841,7 @@ fn pull_request_row(
                         .text_size(px(10.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(login.chars().next().unwrap_or('?').to_uppercase().to_string()),
-                )
+                ))
                 .when(meta_width >= 320., |el| el.child(div().truncate().child(login.to_owned())))
                 .tooltip(move |window, cx| Tooltip::new(author_tooltip.clone()).build(window, cx)),
         )
