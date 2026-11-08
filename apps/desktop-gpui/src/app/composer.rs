@@ -828,14 +828,23 @@ impl Workspace {
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| render_chip(token, &t))
-            // A file chip opens its preview (`composerContextActions.openFile`).
-            .on_token_click(move |event, window, cx| {
-                if let Some(Chip::Context { kind, id, .. }) = Chip::from_id(event.token().id())
-                    && kind == "file"
-                    && let Some(local_id) = id.strip_prefix("file_")
-                {
-                    let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+            // A file chip opens its preview: an uploaded file's (`composerContextActions.openFile`), or
+            // the workspace file a mention names in the panel (`openMention`).
+            .on_token_click(move |event, window, cx| match Chip::from_id(event.token().id()) {
+                Some(Chip::Context { kind, id, .. }) if kind == "file" => {
+                    if let Some(local_id) = id.strip_prefix("file_") {
+                        let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+                    }
                 }
+                Some(Chip::File { path }) => {
+                    // A folder mention's trailing slash goes, except a drive root's (`openFile`).
+                    let trimmed = path.trim_end_matches('/');
+                    let drive_root =
+                        trimmed.len() == 2 && trimmed.ends_with(':') && trimmed.as_bytes()[0].is_ascii_alphabetic();
+                    let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
+                    let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
+                }
+                _ => {}
             })
             .on_paste(move |item, window, cx| {
                 view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
@@ -1781,7 +1790,13 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
 
 fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
     let id = token.token().id();
-    let (accent, icon) = match Chip::from_id(id) {
+    let chip = Chip::from_id(id);
+    // `WorkspaceEntryTooltip`: a mention names its workspace path.
+    let path = match &chip {
+        Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
+        _ => None,
+    };
+    let (accent, icon) = match chip {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
@@ -1798,6 +1813,8 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
         .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
         .child(Icon::new(icon).with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
+        .when_some(path, |el, path| el.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)))
         .into_any_element()
 }
 
