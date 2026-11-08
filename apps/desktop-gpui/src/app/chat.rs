@@ -1845,7 +1845,7 @@ fn markdown_view(
         .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
             let wrap_key = key.clone();
-            code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx, move |workspace, cx| {
+            code_block_header(&header_this, &key, block, wrap, streaming, true, width, &t, cx, move |workspace, cx| {
                 workspace.toggle_code_wrap(&wrap_key, cx);
             })
         })
@@ -1920,7 +1920,8 @@ fn markdown_view(
         })
 }
 
-/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
+/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right, with
+/// "Run in terminal" for a shell block when `run` (`onRunCommand`) is set.
 /// `TextView` pins the actions 8px into the block's top-right corner over its own fill,
 /// so given the block's `width` the row spans it and paints the block's color.
 pub(super) fn code_block_header(
@@ -1929,6 +1930,7 @@ pub(super) fn code_block_header(
     block: &gpui_kit::base::text::CodeBlock,
     wrap: bool,
     streaming: bool,
+    run: bool,
     width: Option<f32>,
     t: &Tokens,
     cx: &App,
@@ -1961,7 +1963,7 @@ pub(super) fn code_block_header(
         });
     let lang = block.lang();
     let run = runnable_command(lang.as_deref().unwrap_or_default(), &code)
-        .filter(|_| !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
+        .filter(|_| run && !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
         .map(|command| {
             let this = this.clone();
             div()
