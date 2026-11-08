@@ -1440,6 +1440,22 @@ fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tok
 }
 
 impl Workspace {
+    /// Opens a file sent with an answer through a signed URL, as its link does on the web.
+    fn open_answer_attachment(&mut self, attachment_id: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let resource = serde_json::json!({"_tag": "attachment", "attachmentId": attachment_id});
+        cx.spawn(async move |_, cx| {
+            match client.request("assets.createUrl", serde_json::json!({"resource": resource})).await {
+                Ok(signed) => match signed["relativeUrl"].as_str() {
+                    Some(url) => cx.update(|cx| cx.open_url(&format!("{base}{url}"))),
+                    None => log::debug!("assets.createUrl for an answer attachment returned no URL"),
+                },
+                Err(error) => log::debug!("assets.createUrl for an answer attachment: {error}"),
+            }
+        })
+        .detach();
+    }
+
     /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
     fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
         let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
@@ -2495,7 +2511,7 @@ fn entry_text_details(
         );
     }
     if let Some(question) = &entry.question {
-        return Some(question_history(&entry.id, question, t));
+        return Some(question_history(&entry.id, question, this, t, cx));
     }
     // `WorkLogDetails`: a click or a text selection inside leaves the row open.
     if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
@@ -2608,8 +2624,44 @@ fn thread_read_label(
 }
 
 /// `QuestionAnswerHistory`: each question, its answer, and the files sent with it.
-fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -> AnyElement {
+fn question_history(
+    id: &str,
+    question: &work_log::QuestionAnswer,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    use gpui_kit::StyledImage as _;
     let text = || div().text_size(px(TEXT)).line_height(px(LINE)).text_color(t.muted_foreground);
+    let workspace = this.upgrade();
+    let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
+    let attachment = |index: usize, file: &work_log::AnswerAttachment| {
+        let image = file.id.as_deref().filter(|_| file.image).and_then(|id| workspace?.attachment_image(id));
+        let link = text()
+            .id(ElementId::Name(format!("answer-file:{id}:{index}").into()))
+            .text_color(t.foreground)
+            .underline()
+            .child(match image {
+                Some(image) => gpui_kit::img(image)
+                    .h(px(80.))
+                    .max_w(px(128.))
+                    .rounded(px(4.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .into_any_element(),
+                None => file.name.clone().into_any_element(),
+            });
+        match file.id.clone() {
+            Some(attachment_id) => {
+                let this = this.clone();
+                link.cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |workspace, cx| workspace.open_answer_attachment(&attachment_id, cx));
+                    })
+                    .into_any_element()
+            }
+            None => link.into_any_element(),
+        }
+    };
     v_flex()
         .id(ElementId::Name(format!("answers:{id}").into()))
         .ml(px(28.))
@@ -2624,11 +2676,10 @@ fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -
                 .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
                 .when(!q.attachments.is_empty(), |el| {
                     el.child(
-                        h_flex().flex_wrap().gap(px(8.)).children(
-                            q.attachments
-                                .iter()
-                                .map(|name| text().text_color(t.foreground).underline().child(name.clone())),
-                        ),
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .children(q.attachments.iter().enumerate().map(|(index, file)| attachment(index, file))),
                     )
                 })
         }))

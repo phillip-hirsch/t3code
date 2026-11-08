@@ -650,6 +650,18 @@ impl Row {
         matches!(self, Row::User { attribution: None, .. })
     }
 
+    /// The image attachments of the answers this row shows open.
+    pub fn open_answer_images(&self) -> impl Iterator<Item = &str> {
+        let entries: Vec<&Entry> = match self {
+            Row::Work(WorkRow { kind: WorkRowKind::Single { entry, expanded: true, .. }, .. }) => vec![entry],
+            Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
+                entries.iter().filter(|detail| detail.expanded).map(|detail| &*detail.entry).collect()
+            }
+            _ => Vec::new(),
+        };
+        entries.into_iter().filter_map(|entry| entry.question.as_ref()).flat_map(work_log::QuestionAnswer::image_ids)
+    }
+
     /// The row's identity across rebuilds (the web's `row.id`), which survives rows added or
     /// folded above it.
     pub fn key(&self) -> String {
@@ -660,7 +672,9 @@ impl Row {
             Row::Plan { id, .. } => format!("plan:{id}"),
             Row::Work(work) => format!("work:{}", work.id),
             Row::Working { .. } => "working".into(),
-            Row::TurnFold { key, .. } | Row::SubagentGroup { key, .. } | Row::AttemptFold { key, .. } => key.to_string(),
+            Row::TurnFold { key, .. } | Row::SubagentGroup { key, .. } | Row::AttemptFold { key, .. } => {
+                key.to_string()
+            }
             Row::Divider { id, .. } => format!("divider:{id}"),
             Row::Event { id, .. } => format!("event:{id}"),
             Row::System(divider) => format!("system:{}", divider.id),
