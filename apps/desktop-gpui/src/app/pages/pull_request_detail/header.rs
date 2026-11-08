@@ -79,43 +79,12 @@ impl Workspace {
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
         self.follow_pr_checks(key, cx);
+        self.read_pr_stack_of(key, cx);
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let Some(detail) = panel.detail.clone() else { return };
         let key = key.to_owned();
         let mut reference = panel.reference.to_json();
-        if detail.capabilities.stacks == Some(true) {
-            if let Some(panel) = self.pr_panel(&key) {
-                panel.stack_fresh = false;
-            }
-            let (client, key) = (client.clone(), key.clone());
-            let mut input = reference.clone();
-            if input.get("host").is_none()
-                && let Some((host, _, _)) = logic::parse_change_request_url(&detail.url)
-            {
-                input["host"] = json!(host);
-            }
-            cx.spawn(async move |this, cx| {
-                let result = client.request("pullRequests.stack", input).await;
-                let _ = this.update(cx, |this, cx| {
-                    let Some(panel) = this.pr_panel(&key) else { return };
-                    match result.map(serde_json::from_value::<Option<Stack>>) {
-                        Ok(Ok(stack)) => {
-                            panel.stack = stack.map(Rc::new);
-                            panel.stack_fresh = true;
-                            panel.stack_failed = false;
-                        }
-                        Ok(Err(error)) => {
-                            log::warn!("unreadable pull request stack: {error}");
-                            panel.stack_failed = true;
-                        }
-                        Err(_) => panel.stack_failed = true,
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         reference["host"] = json!(host);
         reference["repository"] = json!(repository);
@@ -144,6 +113,50 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// `key`'s stack membership (`usePullRequestStack`), on a host with stacks; Refresh and a
+    /// failed lookup's retry read it again, keeping the stack shown meanwhile as stale.
+    pub(super) fn read_pr_stack_of(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.pull_request_client_of(key) else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
+        let Some(detail) = panel.detail.clone().filter(|d| d.capabilities.stacks == Some(true)) else { return };
+        panel.stack_fresh = false;
+        let mut input = panel.reference.to_json();
+        if input.get("host").is_none()
+            && let Some((host, _, _)) = logic::parse_change_request_url(&detail.url)
+        {
+            input["host"] = json!(host);
+        }
+        let key = key.to_owned();
+        cx.spawn(async move |this, cx| {
+            let result = client.request("pullRequests.stack", input).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(panel) = this.pr_panel(&key) else { return };
+                match result.map(serde_json::from_value::<Option<Stack>>) {
+                    Ok(Ok(stack)) => {
+                        panel.stack = stack.map(Rc::new);
+                        panel.stack_fresh = true;
+                        panel.stack_failed = false;
+                    }
+                    Ok(Err(error)) => {
+                        log::warn!("unreadable pull request stack: {error}");
+                        panel.stack_failed = true;
+                    }
+                    Err(_) => panel.stack_failed = true,
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The shown pull request's stack, read again.
+    fn retry_pr_stack(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.shown_pr_key() {
+            self.read_pr_stack_of(&key, cx);
+            cx.notify();
+        }
     }
 
     /// The base branch, warning with the update buttons when the branch is behind it.
@@ -475,7 +488,7 @@ impl Workspace {
                 return vec![
                     ghost_button("pr-stack-retry", t)
                         .child("Retry stack lookup")
-                        .on_click(cx.listener(|this, _, _, cx| this.read_pr_extras(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_pr_stack(cx)))
                         .into_any_element(),
                 ];
             }
@@ -496,13 +509,21 @@ impl Workspace {
         let (merge_disabled, rebase_disabled) = (plan.merge_disabled || busy, plan.rebase_disabled || busy);
         let position = plan.position;
         let current = detail.number;
+        let failed = panel.stack_failed;
         let mut out = vec![
             ghost_button("pr-stack", t)
                 .tooltip(format!("View stack #{}, layer {position} of {}", stack.number, stack.layers.len()))
                 .child(Icon::new(Lucide::Layers).with_size(px(14.)))
                 .child(format!("{position}/{}", stack.layers.len()))
+                .when(failed, |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.)).text_color(t.warning)))
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu: PopupMenu, window, _| {
                     menu = menu.label(format!("Stack #{}", menu_stack.number));
+                    if failed {
+                        menu = menu.item(
+                            PopupMenuItem::new("Retry stack refresh")
+                                .on_click(window.listener_for(&view, |this, _, _, cx| this.retry_pr_stack(cx))),
+                        );
+                    }
                     for layer in menu_stack.layers.iter().rev() {
                         let number = layer.number;
                         let label =

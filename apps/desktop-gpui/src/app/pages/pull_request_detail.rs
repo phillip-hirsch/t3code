@@ -567,6 +567,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail_of(&key, cx);
+                this.read_pr_stack_of(&key, cx);
                 if this.shown_pr_key().as_deref() == Some(key.as_str()) {
                     this.refresh_pr_code(cx);
                 }
