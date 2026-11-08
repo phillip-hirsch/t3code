@@ -407,6 +407,9 @@ impl Workspace {
                 _ => {}
             }
         }
+        let answer_images: Vec<String> = rows.iter().flat_map(Row::open_answer_images).map(str::to_owned).collect();
+        self.load_attachment_images(answer_images.iter().map(String::as_str), cx);
+        let Some(view) = self.side_chat.view.as_mut() else { return };
         let was_empty = view.rows.is_empty();
         let Some((range, count)) = timeline::changed_range(&view.rows, &rows) else { return };
         let total = rows.len();

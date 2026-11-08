@@ -2672,10 +2672,10 @@ fn question_history(
     let text = || div().text_size(px(TEXT)).line_height(px(LINE)).text_color(t.muted_foreground);
     let workspace = this.upgrade();
     let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
-    let attachment = |index: usize, file: &work_log::AnswerAttachment| {
+    let attachment = |nth: usize, index: usize, file: &work_log::AnswerAttachment| {
         let image = file.id.as_deref().filter(|_| file.image).and_then(|id| workspace?.attachment_image(id));
         let link = text()
-            .id(ElementId::Name(format!("answer-file:{id}:{index}").into()))
+            .id(ElementId::Name(format!("answer-file:{id}:{nth}:{index}").into()))
             .text_color(t.foreground)
             .underline()
             .child(match image {
@@ -2706,17 +2706,16 @@ fn question_history(
         .gap(px(8.))
         .cursor_default()
         .on_click(|_, _, cx| cx.stop_propagation())
-        .children(question.questions.iter().map(|q| {
+        .children(question.questions.iter().enumerate().map(|(nth, q)| {
             v_flex()
                 .gap(px(4.))
                 .children(q.text.clone().map(|question| text().child(question)))
                 .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
                 .when(!q.attachments.is_empty(), |el| {
                     el.child(
-                        h_flex()
-                            .flex_wrap()
-                            .gap(px(8.))
-                            .children(q.attachments.iter().enumerate().map(|(index, file)| attachment(index, file))),
+                        h_flex().flex_wrap().gap(px(8.)).children(
+                            q.attachments.iter().enumerate().map(|(index, file)| attachment(nth, index, file)),
+                        ),
                     )
                 })
         }))
