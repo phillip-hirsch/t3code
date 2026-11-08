@@ -460,7 +460,7 @@ impl Workspace {
             landed: false,
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
-            usage: pages::UsageState::default(),
+            usage: pages::UsageState::new(&client_settings.values),
             settings: None,
             settings_ui: pages::settings::SettingsUi::new(window, cx),
             client_settings,

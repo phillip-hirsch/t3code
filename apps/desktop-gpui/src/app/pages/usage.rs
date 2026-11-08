@@ -152,6 +152,41 @@ fn local_window(days: u32) -> UsageWindow {
     UsageWindow::new(days, crate::timestamp::now_ms(), &Local, zone)
 }
 
+/// `t3code:usage-page-preferences:v1`, kept in `client-settings.json` as the web keeps it in local storage.
+const PREFERENCES_KEY: &str = "usagePagePreferences";
+
+/// `readUsagePagePreferences`: the stored metric, period and hidden providers, or the
+/// defaults (Limits, 30 days, every provider) when any of them does not decode.
+fn read_preferences(stored: &Value) -> (&'static str, u32, Vec<String>) {
+    let metric = logic::METRICS.iter().map(|(value, _)| *value).find(|value| stored["metric"] == *value);
+    let days = logic::WINDOWS.iter().map(|(days, _)| *days).find(|days| stored["windowDays"] == *days);
+    let known =
+        |kind: &Value| kind.as_str().filter(|kind| logic::PROVIDERS.iter().any(|p| p.0 == *kind)).map(str::to_owned);
+    let hidden = match &stored["hiddenProviders"] {
+        Value::Null => Some(Vec::new()),
+        Value::Array(kinds) => kinds.iter().map(known).collect(),
+        _ => None,
+    };
+    match (metric, days, hidden) {
+        (Some(metric), Some(days), Some(hidden)) => (metric, days, hidden),
+        _ => ("limits", 30, Vec::new()),
+    }
+}
+
+impl UsageState {
+    /// The page as the last session left it.
+    pub(in crate::app) fn new(client_settings: &crate::settings::Settings) -> Self {
+        let (metric, days, hidden) = read_preferences(client_settings.get(PREFERENCES_KEY));
+        Self { metric, days, hidden, window: local_window(days), ..Self::default() }
+    }
+
+    /// `saveUsagePagePreferences`.
+    fn preferences(&self) -> serde_json::Map<String, Value> {
+        let stored = json!({"metric": self.metric, "windowDays": self.days, "hiddenProviders": self.hidden});
+        serde_json::Map::from_iter([(PREFERENCES_KEY.to_owned(), stored)])
+    }
+}
+
 impl Default for UsageState {
     fn default() -> Self {
         Self {
@@ -208,8 +243,14 @@ impl Workspace {
         }
     }
 
+    fn save_usage_preferences(&mut self) {
+        let patch = self.usage.preferences();
+        self.client_settings.apply(&patch);
+    }
+
     fn select_usage_metric(&mut self, metric: &'static str, cx: &mut Context<Self>) {
         self.usage.metric = metric;
+        self.save_usage_preferences();
         self.usage.hover = None;
         if metric == "limits" {
             self.usage.limits_now = now_ms();
@@ -274,6 +315,7 @@ impl Workspace {
 
     fn select_usage_window(&mut self, days: u32, cx: &mut Context<Self>) {
         self.usage.days = days;
+        self.save_usage_preferences();
         self.usage.window = local_window(days);
         self.usage.hover = None;
         self.read_usage(false, cx);
@@ -281,6 +323,7 @@ impl Workspace {
 
     fn set_hidden_usage_providers(&mut self, hidden: Vec<String>, cx: &mut Context<Self>) {
         self.usage.hidden = hidden;
+        self.save_usage_preferences();
         self.remerge_usage();
         cx.notify();
     }
@@ -2027,4 +2070,25 @@ fn usage_skeleton(t: &Tokens) -> impl IntoElement {
                 .child(h_flex().justify_between().child(section_title("Breakdown")).child(bar(112., 28.)))
                 .child(div().h(px(176.)).rounded(px(6.)).bg(t.muted)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_preferences_survive_a_restart_and_bad_ones_fall_back() {
+        assert_eq!(read_preferences(&Value::Null), ("limits", 30, Vec::new()));
+        let usage = UsageState { metric: "tokens", days: 7, hidden: vec!["codex".into()], ..UsageState::default() };
+        let stored = Value::Object(usage.preferences());
+        assert_eq!(read_preferences(&stored[PREFERENCES_KEY]), ("tokens", 7, vec!["codex".to_owned()]));
+        assert_eq!(read_preferences(&json!({"metric": "cost", "windowDays": 1})), ("cost", 1, Vec::new()));
+        for bad in [
+            json!({"metric": "cost", "windowDays": 14}),
+            json!({"metric": "spend", "windowDays": 7}),
+            json!({"metric": "cost", "windowDays": 7, "hiddenProviders": ["codex", "nope"]}),
+        ] {
+            assert_eq!(read_preferences(&bad), ("limits", 30, Vec::new()), "{bad}");
+        }
+    }
 }
