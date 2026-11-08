@@ -44,6 +44,17 @@ enum ContentRow {
     Gap,
 }
 
+/// `useFilesystemReadAccess` for the project's environment.
+#[derive(Clone, PartialEq)]
+enum Access {
+    Checking,
+    Granted,
+    Denied(SharedString),
+}
+
+/// `useProjectContentSearch`'s error when the session cannot read files.
+const CANNOT_SEARCH: &str = "This connection cannot search host files.";
+
 #[derive(Default)]
 struct Search {
     /// The query the results answer.
@@ -60,6 +71,8 @@ pub(in crate::app) struct FileOverlay {
     /// The palette's query when it opened this; Esc restores it.
     parent_query: Option<String>,
     target: Option<ProjectTarget>,
+    access: Access,
+    _access_task: Option<Task<()>>,
     search: Search,
     highlight: usize,
     picks: Rc<[PickerMatch]>,
@@ -143,11 +156,31 @@ impl Workspace {
         } else {
             self.focus.focus(window, cx);
         }
+        let endpoint = target.as_ref().and_then(|t| self.env_endpoint(&t.checkout.env).cloned());
+        let (access, access_task) = match endpoint {
+            Some(endpoint) => {
+                let task = crate::app::pages::settings::check_filesystem_read(endpoint, cx, |this, read, cx| {
+                    let Some(overlay) = &mut this.files.overlay else { return };
+                    let access = match read {
+                        Some(true) => Access::Granted,
+                        Some(false) | None => Access::Denied(CANNOT_SEARCH.into()),
+                    };
+                    if overlay.access != access {
+                        overlay.access = access;
+                        this.run_file_search(cx);
+                    }
+                });
+                (Access::Checking, Some(task))
+            }
+            None => (Access::Denied("This environment is not connected.".into()), None),
+        };
         self.files.overlay = Some(FileOverlay {
             mode,
             input,
             parent_query,
             target,
+            access,
+            _access_task: access_task,
             search: Search::default(),
             highlight: 0,
             picks: Rc::default(),
@@ -193,6 +226,21 @@ impl Workspace {
         let raw = overlay.query(cx);
         overlay.search.generation += 1;
         let generation = overlay.search.generation;
+        // Nothing is searched until the session may read files; the picker shows the wait or the refusal.
+        match &overlay.access {
+            Access::Granted => {}
+            access => {
+                let error = match access {
+                    Access::Denied(error) => Some(error.clone()),
+                    _ => None,
+                };
+                overlay.search = Search { generation, pending: error.is_none(), error, ..Search::default() };
+                overlay.picks = Rc::default();
+                overlay.set_matches(Vec::new());
+                cx.notify();
+                return;
+            }
+        }
         let (method, payload) = match overlay.mode {
             OverlayMode::Files => {
                 let query: String = raw.trim().to_owned();
@@ -294,7 +342,8 @@ impl Workspace {
         let opened = match overlay.mode {
             OverlayMode::Files => overlay.picks.get(index).map(|pick| (pick.path.clone(), None)),
             OverlayMode::Content => {
-                let can_open = !overlay.search.pending && overlay.search.error.is_none();
+                let can_open =
+                    overlay.access == Access::Granted && !overlay.search.pending && overlay.search.error.is_none();
                 overlay.matches.get(index).filter(|_| can_open).map(|m| (m.path.clone(), Some(m.line)))
             }
         };
@@ -349,6 +398,8 @@ impl Workspace {
         let (fg, muted) = (tokens.foreground, tokens.muted_foreground);
         let mode = overlay.mode;
         let has_target = overlay.target.is_some();
+        // `disabled={!search.canReadFiles}` on the content search's field and options.
+        let enabled = has_target && (mode == OverlayMode::Files || overlay.access == Access::Granted);
         let toggles = (mode == OverlayMode::Content && has_target).then(|| self.render_content_toggles(&tokens, cx));
         let input_row =
             h_flex().flex_none().h(px(46.)).px(px(8.)).py(px(6.)).child(
@@ -363,7 +414,7 @@ impl Workspace {
                     )
                     .child(
                         div().flex_1().pl(px(32.)).when(toggles.is_some(), |el| el.pr(px(120.))).child(
-                            Input::new(&overlay.input).appearance(false).text_sm().h(px(34.)).disabled(!has_target),
+                            Input::new(&overlay.input).appearance(false).text_sm().h(px(34.)).disabled(!enabled),
                         ),
                     )
                     .children(toggles),
@@ -506,6 +557,7 @@ impl Workspace {
 
     fn render_content_toggles(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(overlay) = &self.files.overlay else { return div().into_any_element() };
+        let enabled = overlay.access == Access::Granted;
         let toggle = |id: &'static str,
                       label: &'static str,
                       active: bool,
@@ -520,19 +572,28 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .rounded(px(6.))
-                .cursor_pointer()
                 .text_xs()
                 .font_family(tokens.fonts.mono)
                 .map(|el| {
                     if active {
                         el.bg(tokens.background).text_color(tokens.foreground).shadow_xs()
                     } else {
-                        el.text_color(tokens.muted_foreground).hover(|s| s.text_color(tokens.foreground))
+                        el.text_color(tokens.muted_foreground)
+                            .when(enabled, |el| el.hover(|s| s.text_color(tokens.foreground)))
                     }
                 })
                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                 .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, window, cx| this.toggle_content_option(option, window, cx)))
+                .map(|el| {
+                    if enabled {
+                        el.cursor_pointer().on_click(
+                            cx.listener(move |this, _, window, cx| this.toggle_content_option(option, window, cx)),
+                        )
+                    } else {
+                        // `disabled:opacity-50`.
+                        el.opacity(0.5)
+                    }
+                })
                 .child(glyph)
         };
         h_flex()
@@ -573,8 +634,9 @@ impl Workspace {
         let muted = tokens.muted_foreground;
         let has_query = !overlay.query(cx).trim().is_empty();
         let search = &overlay.search;
+        let can_read = overlay.access == Access::Granted;
         let status: Option<AnyElement> =
-            (has_query || search.pending || search.error.is_some() || overlay.invalid_regex).then(|| {
+            (can_read && (has_query || search.pending || search.error.is_some() || overlay.invalid_regex)).then(|| {
                 let content: AnyElement = if search.pending {
                     h_flex().gap(px(8.)).child(Spinner::new().xsmall()).child("Searching…").into_any_element()
                 } else if let Some(error) = &search.error {
@@ -596,10 +658,11 @@ impl Workspace {
                     .into_any_element()
             });
         let body = if overlay.matches.is_empty() {
-            let text = if has_query && !search.pending && search.error.is_none() {
-                "No results found."
-            } else {
-                "Type to search across your project."
+            let text: SharedString = match &overlay.access {
+                Access::Checking => "Checking file access…".into(),
+                Access::Denied(error) => error.clone(),
+                Access::Granted if has_query && !search.pending && search.error.is_none() => "No results found.".into(),
+                Access::Granted => "Type to search across your project.".into(),
             };
             div()
                 .flex_1()
@@ -614,7 +677,7 @@ impl Workspace {
                 .into_any_element()
         } else {
             let (rows, groups, matches) = (overlay.rows.clone(), overlay.groups.clone(), overlay.matches.clone());
-            let can_open = !search.pending && search.error.is_none();
+            let can_open = can_read && !search.pending && search.error.is_none();
             let view = cx.entity().downgrade();
             list(overlay.content_list.clone(), move |index, _, cx| {
                 let Some(view) = view.upgrade() else { return div().into_any_element() };
