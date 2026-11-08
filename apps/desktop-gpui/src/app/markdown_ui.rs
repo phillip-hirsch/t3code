@@ -117,7 +117,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(client), Some(mut command)) = (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
+        let (Some(client), Some(mut command)) =
+            (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
         else {
             return;
         };
@@ -165,11 +166,11 @@ impl Workspace {
                 .disabled(true),
             );
             match path {
-                Some(path) => menu.separator().item(PopupMenuItem::new("View instructions").on_click(
-                    move |_, window, cx| {
+                Some(path) => {
+                    menu.separator().item(PopupMenuItem::new("View instructions").on_click(move |_, window, cx| {
                         let _ = view.update(cx, |w, cx| w.open_file(&path, None, window, cx));
-                    },
-                )),
+                    }))
+                }
                 None => menu,
             }
         });
@@ -415,7 +416,9 @@ pub(super) struct InlineSkill {
 fn pr_link_state(url: &str, links: &[crate::thread_pull_requests::PullRequestLink]) -> Option<bool> {
     let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
     Some(crate::thread_pull_requests::visible(links).any(|link| {
-        link.number == number && link.host.eq_ignore_ascii_case(&host) && link.repository.eq_ignore_ascii_case(&repository)
+        link.number == number
+            && link.host.eq_ignore_ascii_case(&host)
+            && link.repository.eq_ignore_ascii_case(&repository)
     }))
 }
 
@@ -1185,7 +1188,7 @@ mod tests {
         assert_eq!(pr_link_state("https://GitHub.com/acme/app/pull/7/files", &links), Some(true));
         assert_eq!(pr_link_state("https://github.com/acme/app/pull/8", &links), Some(false));
         assert_eq!(pr_link_state("https://github.com/acme/app/issues/7", &links), None);
-        let mut dismissed = links.clone();
+        let mut dismissed = links;
         dismissed[0].source = "stack-dismissed".into();
         assert_eq!(pr_link_state("https://github.com/acme/app/pull/7", &dismissed), Some(false));
         assert_eq!(

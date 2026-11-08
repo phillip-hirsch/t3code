@@ -1646,7 +1646,7 @@ fn markdown_view(
             let _ = link_this.update(cx, |workspace, cx| match crate::thread_links::parse(url) {
                 // A thread no longer here opens nothing, as its chip shows.
                 Some(_) => {
-                    let message_environment = workspace.active_environment().map(|e| e.to_string());
+                    let message_environment = workspace.active_environment().map(ToString::to_string);
                     let destination = super::markdown_ui::thread_link_destination(
                         url,
                         message_environment.as_deref(),
@@ -2393,9 +2393,13 @@ fn question_history(id: &str, question: &work_log::QuestionAnswer, t: &Tokens) -
                 .children(q.text.clone().map(|question| text().child(question)))
                 .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
                 .when(!q.attachments.is_empty(), |el| {
-                    el.child(h_flex().flex_wrap().gap(px(8.)).children(
-                        q.attachments.iter().map(|name| text().text_color(t.foreground).underline().child(name.clone())),
-                    ))
+                    el.child(
+                        h_flex().flex_wrap().gap(px(8.)).children(
+                            q.attachments
+                                .iter()
+                                .map(|name| text().text_color(t.foreground).underline().child(name.clone())),
+                        ),
+                    )
                 })
         }))
         .into_any_element()

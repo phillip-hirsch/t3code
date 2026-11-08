@@ -548,7 +548,9 @@ mod tests {
 
     #[test]
     fn viewed_images_preview_only_image_files() {
-        let viewed = |value: Value| viewed_image_path(&crate::work_log::entry_from_item(&Rc::new(item(value)))).map(str::to_owned);
+        let viewed = |value: Value| {
+            viewed_image_path(&crate::work_log::entry_from_item(&Rc::new(item(value)))).map(str::to_owned)
+        };
         let tool = |extra: Value| {
             let mut value = json!({"id": "i", "type": "dynamic_tool", "status": "completed", "toolName": "view_image"});
             value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());

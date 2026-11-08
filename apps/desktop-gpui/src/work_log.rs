@@ -378,9 +378,7 @@ pub fn entry_from_item(item: &Rc<TurnItem>) -> Entry {
 fn answer_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        Value::Array(items) => {
-            items.iter().map(answer_text).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")
-        }
+        Value::Array(items) => items.iter().map(answer_text).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", "),
         Value::Object(record) => record.get("answers").map(answer_text).unwrap_or_default(),
         _ => String::new(),
     }
@@ -407,7 +405,11 @@ fn question_answer(payload: &Value) -> Option<QuestionAnswer> {
     let questions: Vec<AnsweredQuestion> = ids
         .iter()
         .map(|id| AnsweredQuestion {
-            text: texts.and_then(|t| t.get(*id)).and_then(Value::as_str).filter(|t| !t.is_empty()).map(|t| t.to_owned().into()),
+            text: texts
+                .and_then(|t| t.get(*id))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_owned().into()),
             answer: answers.get(*id).map(answer_text).filter(|t| !t.is_empty()).map(Into::into),
             attachments: names(id),
         })
@@ -1331,7 +1333,8 @@ impl Entry {
 
     /// The thread a `t3_thread_read` call read (`threadReadTargetId`).
     pub fn thread_read_target(&self) -> Option<&str> {
-        let reads = self.item_type == "dynamic_tool" && self.t3.as_ref().is_some_and(|t3| t3.tool.summary == "thread-read");
+        let reads =
+            self.item_type == "dynamic_tool" && self.t3.as_ref().is_some_and(|t3| t3.tool.summary == "thread-read");
         let id = self.item.0.raw.pointer("/input/threadId").and_then(Value::as_str).map(str::trim);
         id.filter(|id| reads && !id.is_empty())
     }
@@ -1981,14 +1984,15 @@ mod tests {
         let question = e.question.unwrap();
         assert_eq!(question.heading, "Which color? Pick one · Why?");
         assert_eq!(question.preview.as_deref(), Some("Red, Blue · Extra"));
-        let rows: Vec<_> = question
-            .questions
-            .iter()
-            .map(|q| (q.text.as_deref(), q.answer.as_deref(), q.attachments.len()))
-            .collect();
+        let rows: Vec<_> =
+            question.questions.iter().map(|q| (q.text.as_deref(), q.answer.as_deref(), q.attachments.len())).collect();
         assert_eq!(
             rows,
-            [(Some("Which  color?\nPick one"), Some("Red, Blue"), 0), (Some("Why?"), None, 1), (None, Some("Extra"), 0)]
+            [
+                (Some("Which  color?\nPick one"), Some("Red, Blue"), 0),
+                (Some("Why?"), None, 1),
+                (None, Some("Extra"), 0)
+            ]
         );
         let only_files = entry(json!({"type": "user_input_request", "questions": [], "questionAnswer": {
             "requestId": "r", "answers": {}, "attachmentsByQuestionId": {"q": [{"name": "a.txt"}, {"name": "b.txt"}]},
