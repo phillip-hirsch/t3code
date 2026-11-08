@@ -1313,7 +1313,10 @@ impl Render for Workspace {
                             .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             // A maximized panel takes the row; the chat column keeps its state at zero width.
                             .when(self.right_panel_maximized(), |el| el.w_0().flex_none().overflow_hidden())
-                            .child(self.render_header(window, cx))
+                            // The Pull requests page heads its list column; its panel takes the top row.
+                            .when(self.page != Some(pages::Page::PullRequests), |el| {
+                                el.child(self.render_header(window, cx))
+                            })
                             .child(
                                 div()
                                     .id("chat-canvas")

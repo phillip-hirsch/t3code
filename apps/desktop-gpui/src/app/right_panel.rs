@@ -2773,7 +2773,7 @@ fn menu_icon(icon: Icon) -> Icon {
 }
 
 /// A "+" menu row (`SurfaceMenuItem`): icon, label, and its shortcut letter at the right.
-fn surface_item(icon: Icon, label: &'static str, shortcut: &'static str) -> PopupMenuItem {
+pub(super) fn surface_item(icon: Icon, label: &'static str, shortcut: &'static str) -> PopupMenuItem {
     PopupMenuItem::element(move |_, cx| {
         h_flex().w_full().gap_2().child(label).child(
             div()

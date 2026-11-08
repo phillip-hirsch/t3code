@@ -24,6 +24,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::super::Workspace;
+use super::super::git::SOURCE_CONTROL_WRITE;
 use super::super::sidebar::now_ms;
 use super::pull_requests::{label_chip, outline_button, relative_time, tone};
 use crate::pull_request_detail::{
@@ -36,7 +37,7 @@ use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
-mod avatars;
+pub(super) mod avatars;
 pub(super) mod breakdown;
 mod code;
 mod completions;
@@ -109,6 +110,8 @@ pub(in crate::app) struct Panel {
     copied: Option<&'static str>,
     _copied: Option<Task<()>>,
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
+    /// Markdown bodies whose code blocks scroll instead of wrapping (`MarkdownCodeBlock`'s wrap).
+    code_nowrap: HashSet<gpui_kit::EntityId>,
     /// The description as last written from here (`DescriptionDraft`).
     description_draft: Option<logic::DescriptionDraft>,
     summary_scroll: ScrollHandle,
@@ -129,6 +132,8 @@ pub(in crate::app) struct Panel {
     stack_failed: bool,
     /// The checks poll while the pull request is open (`usePullRequestChecksRefresh`).
     _checks_poll: Option<Task<()>>,
+    /// The poll's last answer, kept over each later detail read it is newer than.
+    checks_read: Option<logic::ChecksRead>,
     linked: Option<Vec<crate::app::palette::LinkedThread>>,
     checks_all: bool,
     maintainer_saving: bool,
@@ -181,6 +186,7 @@ impl Panel {
             copied: None,
             _copied: None,
             markdown: HashMap::new(),
+            code_nowrap: HashSet::new(),
             description_draft: None,
             summary_scroll: ScrollHandle::new(),
             timeline: ListState::new(0, ListAlignment::Top, px(600.)),
@@ -197,6 +203,7 @@ impl Panel {
             stack_fresh: false,
             stack_failed: false,
             _checks_poll: None,
+            checks_read: None,
             linked: None,
             checks_all: false,
             maintainer_saving: false,
@@ -317,7 +324,6 @@ impl Workspace {
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
-        self.check_pr_write_grant(&reference.project_id, cx);
         let writable = self.pr_write_grant(&reference.project_id) == Some(true);
         let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
@@ -367,9 +373,9 @@ impl Workspace {
     }
 
     /// The connection's `source-control:write` on the pull request's environment
-    /// (`useEnvironmentScope`); `None` while its session check runs.
+    /// (`useEnvironmentScope`), from its current session; `None` until that session's check answers.
     fn pr_write_grant(&self, project_id: &str) -> Option<bool> {
-        self.pull_requests.write_grants.get(&self.project_environment(project_id)?)?.0
+        self.env_grant(&self.project_environment(project_id)?, SOURCE_CONTROL_WRITE)
     }
 
     /// The pull request `key` names may be acted on.
@@ -377,25 +383,15 @@ impl Workspace {
         self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference.project_id) == Some(true))
     }
 
-    /// Asks the pull request's environment, once, what this connection may do there.
-    fn check_pr_write_grant(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let Some(environment) = self.project_environment(project_id) else { return };
-        if self.pull_requests.write_grants.contains_key(&environment) {
-            return;
-        }
-        let Some(endpoint) = self.env_endpoint(&environment).cloned() else { return };
-        let answered = environment.clone();
-        let task = super::settings::check_source_control_write(endpoint, cx, move |this: &mut Self, grant, cx| {
-            this.apply_pr_write_grant(&answered, grant, cx);
-        });
-        self.pull_requests.write_grants.insert(environment, (None, task));
-    }
-
-    /// A newly granted environment reads its pull requests again; one that grants nothing shows
-    /// them read-only.
-    fn apply_pr_write_grant(&mut self, environment: &SharedString, grant: Option<bool>, cx: &mut Context<Self>) {
-        let Some(entry) = self.pull_requests.write_grants.get_mut(environment) else { return };
-        let before = std::mem::replace(&mut entry.0, grant);
+    /// An environment's session answered (`before` was its grant): a newly granted environment
+    /// reads its pull requests again; one that grants nothing shows them read-only.
+    pub(in crate::app) fn apply_pr_write_grant(
+        &mut self,
+        environment: &SharedString,
+        before: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let grant = self.env_grant(environment, SOURCE_CONTROL_WRITE);
         let keys: Vec<String> = self
             .pull_requests
             .panel
@@ -488,6 +484,7 @@ impl Workspace {
                         Ok(Ok(detail)) => {
                             first = panel.detail.is_none();
                             landed = true;
+                            let detail = logic::keep_newer_checks(detail, panel.checks_read.as_ref());
                             panel.detail = Some(Rc::new(if writable { detail } else { logic::read_only(detail) }));
                             panel.detail_error = None;
                             panel.maintainer_choice = None;
@@ -563,6 +560,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail_of(&key, cx);
+                this.read_pr_stack_of(&key, cx);
                 if this.shown_pr_key().as_deref() == Some(key.as_str()) {
                     this.refresh_pr_code(cx);
                 }
@@ -910,6 +908,20 @@ impl Workspace {
         });
         panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
+    }
+
+    /// Whether the code blocks of the markdown body `state` wrap; they do until toggled.
+    fn pr_code_wraps(&self, state: &Entity<TextViewState>) -> bool {
+        self.pull_requests.panel.as_ref().is_none_or(|p| !p.code_nowrap.contains(&state.entity_id()))
+    }
+
+    fn toggle_pr_code_wrap(&mut self, id: gpui_kit::EntityId, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        if !panel.code_nowrap.remove(&id) {
+            panel.code_nowrap.insert(id);
+        }
+        panel.timeline.remeasure();
+        cx.notify();
     }
 
     /// The description shown: this client's draft while it is in force, else the host's.
@@ -1490,7 +1502,7 @@ impl Workspace {
             thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
         let attaches = self.pr_attaches_to_composer();
-        let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let can_fix = self.pr_can_fix(detail);
         let fix_findings = handoff::fix_labels(attaches).findings;
         let pickable = self.pr_pickable_environments(detail);
         let acting = self.pr_acting_project(detail);
@@ -1955,8 +1967,9 @@ impl Workspace {
             let text = if body.trim().is_empty() { "_No description provided._" } else { body.as_str() };
             let editable = logic::can_edit_change_request(detail);
             let view = cx.entity();
-            let markdown = self.pr_markdown("description", text, cx).map(|state| {
-                let markdown = pr_markdown_view(&state, t, view.clone());
+            let state = self.pr_markdown("description", text, cx);
+            let markdown = state.map(|state| {
+                let markdown = pr_markdown_view(&state, t, view.clone(), self.pr_code_wraps(&state));
                 if !editable {
                     return markdown;
                 }
@@ -2255,7 +2268,10 @@ impl Workspace {
                         .px(px(12.))
                         .pb(px(12.))
                         .gap(px(12.))
-                        .children(opened_body.map(|state| pr_markdown_view(&state, t, cx.entity())))
+                        .children(
+                            opened_body
+                                .map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
+                        )
                         .children(replies_column),
                 )
             })
@@ -2334,12 +2350,9 @@ impl Workspace {
                         .gap(px(4.))
                         .px(px(12.))
                         .py(px(12.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .children(markdown.map(|state| pr_markdown_view(&state, t, cx.entity()))),
-                        )
+                        .child(div().flex_1().min_w_0().children(
+                            markdown.map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
+                        ))
                         .children(edit),
                 ),
                 None => el,
@@ -2521,18 +2534,39 @@ fn known_method(method: &str) -> Option<&'static str> {
 }
 
 /// `PullRequestMarkdown`: the chat's markdown, with change request links routed like the web's.
-fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Workspace>) -> TextView {
+/// `wrap` is [`Workspace::pr_code_wraps`] for this body.
+fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Workspace>, wrap: bool) -> TextView {
     let view = view.downgrade();
-    TextView::new(state).style(super::super::chat::markdown_style(t, false, true)).selectable(true).on_link_click(
-        move |url, event, _, cx| {
+    let (header_view, id) = (view.clone(), state.entity_id());
+    let key: SharedString = format!("pr:{id}").into();
+    let t = *t;
+    TextView::new(state)
+        .style(super::super::chat::markdown_style(&t, false, wrap))
+        .inline_code_style(super::super::chat::inline_code_style(&t))
+        .selectable(true)
+        .code_block_actions(move |block, _, cx| {
+            super::super::chat::code_block_header(
+                &header_view,
+                &key,
+                block,
+                wrap,
+                false,
+                None,
+                &t,
+                cx,
+                move |this, cx| {
+                    this.toggle_pr_code_wrap(id, cx);
+                },
+            )
+        })
+        .on_link_click(move |url, event, _, cx| {
             let external = event.modifiers().secondary(cx);
             let opened =
                 !external && view.update(cx, |this, cx| this.open_change_request_link(url, cx)).unwrap_or(false);
             if !opened {
                 cx.open_url(url);
             }
-        },
-    )
+        })
 }
 
 /// `BackButton`: back to the thread's linked pull requests.
@@ -3209,7 +3243,8 @@ fn open_on_host_button(id: String, url: Option<String>, t: &Tokens) -> Option<im
 fn timeline_body(event: &Event, view: &Entity<Workspace>, t: &Tokens, cx: &mut App) -> Option<AnyElement> {
     let body = event.body.as_ref()?;
     let state = view.update(cx, |this, cx| this.pr_markdown(&format!("c:{}", event.id), body, cx))?;
-    Some(div().mt(px(12.)).child(pr_markdown_view(&state, t, view.clone())).into_any_element())
+    let wrap = view.read(cx).pr_code_wraps(&state);
+    Some(div().mt(px(12.)).child(pr_markdown_view(&state, t, view.clone(), wrap)).into_any_element())
 }
 
 /// `ConversationCard`.

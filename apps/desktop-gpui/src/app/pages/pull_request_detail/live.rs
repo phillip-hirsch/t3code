@@ -4,7 +4,11 @@
 
 use gpui_kit::{DismissEvent, DragMoveEvent, Empty, Focusable as _, MouseButton, Pixels, Point, ScrollEvent, deferred};
 
+use gpui_kit::component::button::ButtonCustomVariant;
+
 use super::*;
+use crate::app::right_panel::surface_item;
+use crate::app::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT};
 use crate::rpc::StreamEvent;
 
 /// `LIVE_REFRESH_INTERVAL_MS`: an open pull request is read again this often while the app is in front.
@@ -91,6 +95,32 @@ impl PanelLayout {
     pub(super) fn reveal(&mut self) -> bool {
         std::mem::take(&mut self.hidden)
     }
+}
+
+/// The "+" of the page's panel (`RightPanelTabs`'s add menu): the page offers no surface to add,
+/// so every row shows unavailable.
+fn render_add_surface_button(t: &Tokens, cx: &mut Context<Workspace>) -> impl IntoElement {
+    Button::new("pr-panel-add")
+        .custom(ButtonCustomVariant::new(cx).foreground(t.muted_foreground).hover(t.accent).active(t.accent))
+        .xsmall()
+        .icon(titlebar::icon("icons/plus.svg"))
+        .flex_none()
+        .size(px(24.))
+        .rounded(px(8.))
+        .dropdown_menu(|menu: PopupMenu, _, _| {
+            let rows = [
+                (Icon::new(Lucide::Globe), "Browser", "B"),
+                (titlebar::icon("icons/square-terminal.svg"), "Terminal", "T"),
+                (Icon::new(Lucide::Files), "Files", "F"),
+                (titlebar::icon("icons/file-diff.svg"), "Diff", "D"),
+                (Icon::new(Lucide::GitPullRequest), "Pull request", "P"),
+                (Icon::new(Lucide::Link), "Linked pull requests", "L"),
+                (Icon::new(Lucide::Smartphone), "Device", "M"),
+            ];
+            rows.into_iter().fold(menu.min_w(px(200.)), |menu, (icon, label, key)| {
+                menu.item(surface_item(icon, label, key).disabled(true))
+            })
+        })
 }
 
 /// `clamp(width)` between the panel's minimum and what leaves the list its own.
@@ -432,8 +462,8 @@ impl Workspace {
 
     /// `usePullRequestChecksRefresh`: an open pull request's checks are read through
     /// `pullRequests.checks` every 45 seconds while any run, else every minute, while it is on
-    /// screen and the app is in front. A server without the read, or a host that answers none,
-    /// ends the poll.
+    /// screen, connected and the app is in front. A server without the read, or a host that
+    /// answers none, ends the poll.
     pub(super) fn follow_pr_checks(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(panel) = self.pr_panel_ref(key) else { return };
         if panel._checks_poll.is_some()
@@ -457,10 +487,12 @@ impl Workspace {
                         let panel = this.pr_panel_ref(&key)?;
                         let detail = panel.detail.as_ref()?;
                         let idle = detail.state == list_logic::State::Open && !panel.detail_loading;
-                        let client = this.pull_request_client_of(&key)?;
+                        // A disconnected environment skips its turn; the poll resumes on reconnect.
+                        let client = this.pull_request_client_of(&key);
                         Some(
-                            (shown && idle && cx.active_window().is_some())
-                                .then(|| (client, panel.reference.to_json())),
+                            client
+                                .filter(|_| shown && idle && cx.active_window().is_some())
+                                .map(|client| (client, panel.reference.to_json())),
                         )
                     });
                     let Ok(Some(read)) = read else { break };
@@ -478,6 +510,7 @@ impl Workspace {
                             panel.detail = Some(Rc::new(merged));
                             cx.notify();
                         }
+                        panel.checks_read = Some(read);
                         true
                     });
                     if !matches!(keep, Ok(true)) {
@@ -525,7 +558,7 @@ impl Workspace {
     }
 
     /// The panel's width in this window.
-    pub(super) fn pr_panel_width(&self, window: &Window) -> f32 {
+    pub(in crate::app) fn pr_panel_width(&self, window: &Window) -> f32 {
         let viewport = f32::from(window.viewport_size().width);
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         clamp_panel_width(self.pull_requests.panel_width.unwrap_or(viewport / 2.), viewport - sidebar)
@@ -622,17 +655,15 @@ impl Workspace {
                 let panel = if shown { self.pull_requests.panel.as_ref() } else { self.pull_requests.parked.get(&key) };
                 let detail = panel.and_then(|p| p.detail.clone());
                 let seed = panel.and_then(|p| p.seed.clone()).or_else(|| self.pull_requests.entry_for(reference));
-                let title = detail.as_ref().map(|d| d.title.clone()).or_else(|| seed.as_ref().map(|s| s.title.clone()));
                 let (state, draft) = detail
                     .as_ref()
                     .map(|d| (d.state, d.is_draft))
                     .or_else(|| seed.as_ref().map(|s| (s.state, s.is_draft)))
                     .unwrap_or((list_logic::State::Open, false));
                 let (icon, color, _) = state_glyph(state, draft, t);
-                let label = match title {
-                    Some(title) => format!("#{} {title}", reference.number),
-                    None => format!("#{}", reference.number),
-                };
+                // `surfaceTitle`, also the title's tooltip.
+                let label: SharedString = format!("#{}", reference.number).into();
+                let tip = label.clone();
                 let group: SharedString = format!("pr-tab:{key}").into();
                 let (close, middle, activate) = (reference.clone(), reference.clone(), reference.clone());
                 let (menu, dragged, onto) = (reference.clone(), reference.clone(), reference.clone());
@@ -713,6 +744,7 @@ impl Workspace {
                                     this.open_pull_request_panel(activate_key.clone(), seed, cx);
                                 }
                             }))
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                             .child(label),
                     )
                     .on_mouse_down(
@@ -736,17 +768,22 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
-        h_flex()
-            .id("pr-tabs")
-            .h(px(40.))
+        // `RightPanelTabs mode="inline"` owning the titlebar row: a drag region clear of the panel
+        // toggles and the caption buttons, past a hidden sidebar's toggle while maximized.
+        let reserve = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET + px(96.);
+        let inset = (self.pull_request_panel_maximized() && !self.sidebar_open.docked())
+            .then(|| titlebar::collapsed_content_left(window));
+        let strip = h_flex()
+            .id("pr-tabbar")
+            .h(TITLEBAR_HEIGHT)
             .flex_none()
             .min_w_0()
-            .px(px(8.))
-            .gap(px(4.))
-            .overflow_x_scroll()
-            .border_b_1()
-            .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
-            .children(tabs)
+            .pl(inset.unwrap_or(px(8.)))
+            .pr(reserve)
+            .gap_1();
+        titlebar::drag_region(strip)
+            .child(h_flex().id("pr-tabs").min_w_0().h_full().gap_1().overflow_x_scroll().children(tabs))
+            .child(render_add_surface_button(t, cx))
             .into_any_element()
     }
 

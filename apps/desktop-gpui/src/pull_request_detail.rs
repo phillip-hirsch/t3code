@@ -889,6 +889,12 @@ pub fn with_checks(detail: &Detail, read: &ChecksRead, landed_later: bool) -> Op
     })
 }
 
+/// A detail read under the last checks read: the checks read stays while the detail is older,
+/// as from the server's detail cache (`resolvePullRequestDetailChecks` over a newer detail).
+pub fn keep_newer_checks(detail: Detail, read: Option<&ChecksRead>) -> Detail {
+    read.and_then(|read| with_checks(&detail, read, false)).unwrap_or(detail)
+}
+
 /// `pullRequestChecksState`.
 pub fn checks_state(checks: &[Check]) -> Option<&'static str> {
     let has = |status: &str| checks.iter().any(|c| c.status == status);
@@ -2417,6 +2423,12 @@ mod tests {
         assert!(with_checks(&base, &unordered, true).is_some() && with_checks(&base, &unordered, false).is_none());
         let landed = detail(json!({"state": "merged"}));
         assert_eq!(with_checks(&landed, &read, true).unwrap().state, State::Merged, "a merge stays merged");
+        let cached = detail(json!({"observedAt": 110.0, "checks": [{"name": "ci", "status": "pending"}]}));
+        let kept = keep_newer_checks(cached, Some(&read));
+        assert_eq!(kept.checks[0].status, "success", "an older detail keeps the newer checks read");
+        let fresh = detail(json!({"observedAt": 130.0, "checks": [{"name": "ci", "status": "failure"}]}));
+        assert_eq!(keep_newer_checks(fresh, Some(&read)).checks[0].status, "failure", "a newer detail wins");
+        assert_eq!(keep_newer_checks(base, None).checks[0].status, "pending", "no checks read leaves the detail");
     }
 
     #[test]

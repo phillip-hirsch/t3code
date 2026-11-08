@@ -114,6 +114,11 @@ impl Workspace {
         self.session(environment_id).is_some_and(|s| s.grants.grants(scope))
     }
 
+    /// `env_grants`, or `None` while the session check is pending or failing.
+    pub(super) fn env_grant(&self, environment_id: &str, scope: &str) -> Option<bool> {
+        Some(self.session(environment_id)?.grants.session()?.grants(scope))
+    }
+
     /// Whether this client may change the environment's threads.
     pub(super) fn can_operate(&self, environment_id: &str) -> bool {
         self.env_grants(environment_id, "orchestration:operate")
@@ -288,9 +293,11 @@ impl Workspace {
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {
+                let before = this.env_grant(&id, super::git::SOURCE_CONTROL_WRITE);
                 if let Some(session) = this.session_mut(&id) {
                     session.grants = grants;
                 }
+                this.apply_pr_write_grant(&id, before, cx);
                 this.notify_sidebar(cx);
             }));
         }

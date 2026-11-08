@@ -267,24 +267,35 @@ impl Workspace {
         let tokens = theme::tokens(cx);
         let (shown, maximized) = (self.pull_request_panel_shown(), self.pull_request_panel_maximized());
         let available = self.pull_request_panel_open();
-        let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool| {
+        let focus = &self.titlebar_focus;
+        // These act on press; Enter and Space reach them as keyboard clicks.
+        let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool, stop: &FocusHandle| {
             let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
             control(id)
                 .when(pressed, |el| el.bg(tokens.accent))
-                .when(enabled, |el| el.cursor_pointer().hover(|style| style.bg(tokens.accent)))
+                .when(enabled, |el| {
+                    keyboard_control(el.cursor_pointer().hover(|style| style.bg(tokens.accent)), stop, tokens.ring)
+                })
                 .child(icon(path).with_size(px(16.)).text_color(color))
         };
         let maximize = shown.then(|| {
             let label = if maximized { "Restore panel size" } else { "Maximize panel" };
             let path = if maximized { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" };
-            toggle("toggle-pr-panel-maximized", path, maximized, true).tooltip(tooltip(label)).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.toggle_pull_request_panel_maximized(cx);
-                }),
-            )
+            toggle("toggle-pr-panel-maximized", path, maximized, true, &focus.maximize)
+                .tooltip(tooltip(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_pull_request_panel_maximized(cx);
+                    }),
+                )
+                .on_click(cx.listener(|this, event, _, cx| {
+                    if is_keyboard(event) {
+                        this.toggle_pull_request_panel_maximized(cx);
+                    }
+                }))
         });
-        let panel = toggle("toggle-pr-panel", "icons/panel-right.svg", shown, available)
+        let panel = toggle("toggle-pr-panel", "icons/panel-right.svg", shown, available, &focus.right_panel)
             .tooltip(tooltip(if available {
                 self.with_shortcut("Toggle right panel", "rightPanel.toggle")
             } else {
@@ -297,6 +308,11 @@ impl Workspace {
                         this.toggle_pull_request_panel(cx);
                     }),
                 )
+                .on_click(cx.listener(|this, event, _, cx| {
+                    if is_keyboard(event) {
+                        this.toggle_pull_request_panel(cx);
+                    }
+                }))
             });
         div()
             .absolute()

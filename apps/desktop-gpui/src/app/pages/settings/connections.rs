@@ -70,18 +70,6 @@ pub(in crate::app) fn check_scope<T: 'static>(
     check_session(endpoint, cx, move |this, load, cx| apply(this, load.grants(scope), cx))
 }
 
-/// `useEnvironmentScope(environmentId, AuthSourceControlWriteScope)` for the pull request panel:
-/// `None` until the session answers; a failed check is retried and grants nothing meanwhile.
-pub(in crate::app) fn check_source_control_write<T: 'static>(
-    endpoint: Endpoint,
-    cx: &mut Context<T>,
-    apply: impl Fn(&mut T, Option<bool>, &mut Context<T>) + 'static,
-) -> Task<()> {
-    check_session(endpoint, cx, move |this, load, cx| {
-        apply(this, load.session().map(|session| session.grants(logic::SOURCE_CONTROL_WRITE)), cx);
-    })
-}
-
 /// The session check every page that gates on grants uses: `apply` gets each answer, and a
 /// failure is retried every few seconds until one succeeds or the task is dropped.
 pub(in crate::app) fn check_session<T: 'static>(

@@ -25,6 +25,8 @@ pub struct Actor {
     pub login: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

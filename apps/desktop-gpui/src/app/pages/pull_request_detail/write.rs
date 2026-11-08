@@ -1002,10 +1002,10 @@ impl Workspace {
     pub(super) fn render_pr_fix(&self, finding: logic::Finding, t: &Tokens, cx: &mut Context<Self>) -> Option<Button> {
         let panel = self.pull_requests.panel.as_ref()?;
         let detail = panel.detail.as_ref()?;
-        let attaches = self.pr_attaches_to_composer();
-        if !attaches {
-            self.shell.projects.iter().find(|p| p.id == detail.project_id)?;
+        if !self.pr_can_fix(detail) {
+            return None;
         }
+        let attaches = self.pr_attaches_to_composer();
         let labels = super::handoff::fix_labels(attaches);
         let label = if matches!(finding, logic::Finding::Check(_)) { labels.check } else { labels.finding };
         let key = finding.key();
@@ -1283,7 +1283,9 @@ impl Workspace {
                 .px(px(12.))
                 .py(px(8.))
                 .child(match rendered {
-                    Some(state) => pr_markdown_view(&state, t, cx.entity()).into_any_element(),
+                    Some(state) => {
+                        pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)).into_any_element()
+                    }
                     None => {
                         div().text_xs().text_color(t.muted_foreground).child("Nothing to preview.").into_any_element()
                     }

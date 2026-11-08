@@ -92,6 +92,8 @@ enum Footer {
 
 /// The page's own state, kept while it is closed so reopening shows the last answer at once.
 pub(in crate::app) struct PullRequestsState {
+    /// Entered from elsewhere: the next render focuses the list's first control, its search.
+    pub(super) focus_on_render: bool,
     involvement: &'static str,
     state: &'static str,
     sort: &'static str,
@@ -142,8 +144,6 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
     pub(super) _live_interval: Option<Task<()>>,
-    /// This connection's `source-control:write` per environment, `None` until its session answers.
-    pub(super) write_grants: std::collections::HashMap<SharedString, (Option<bool>, Task<()>)>,
     /// The detail read for a row the pointer rested on, so opening it paints from it, and the
     /// read in flight for the row it rests on now (`usePullRequestIntentPrefetch`).
     prefetched: Option<(String, Rc<crate::pull_request_detail::Detail>, Instant)>,
@@ -154,6 +154,8 @@ pub(in crate::app) struct PullRequestsState {
     /// focus rests on (attached at the next render, which has the window).
     row_focus: std::collections::HashMap<String, (FocusHandle, Option<Subscription>)>,
     row_focus_unheard: bool,
+    /// The rows changed, so their authors' pictures may need reading.
+    avatars_unread: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
     /// Each tab's close button and title, as the web's two buttons: Tab reaches them, Enter or Space presses.
@@ -212,12 +214,13 @@ impl PullRequestsState {
             layout: super::pull_request_detail::PanelLayout::default(),
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
-            write_grants: std::collections::HashMap::new(),
+            focus_on_render: false,
             prefetched: None,
             prefetch: None,
             facet_search: None,
             row_focus: std::collections::HashMap::new(),
             row_focus_unheard: false,
+            avatars_unread: false,
             row_popover: None,
             tab_menu: None,
             tab_focus: std::collections::HashMap::new(),
@@ -784,10 +787,23 @@ impl Workspace {
         state.row_focus.retain(|key, _| shown.contains(key));
         state.list_state.reset(rows.len());
         state.rows = Rc::from(rows);
+        state.avatars_unread = true;
     }
 
     pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.listen_to_pull_request_row_focus(window, cx);
+        if std::mem::take(&mut self.pull_requests.avatars_unread) {
+            let rows = self.pull_requests.rows.clone();
+            let urls = rows.iter().filter_map(|row| match row {
+                Row::Entry { entry, .. } => entry.author.as_ref()?.avatar_url.as_deref(),
+                _ => None,
+            });
+            super::pull_request_detail::avatars::read_avatars(urls, cx);
+        }
+        if std::mem::take(&mut self.pull_requests.focus_on_render) {
+            let search = gpui_kit::Focusable::focus_handle(self.pull_requests.search.read(cx), cx);
+            window.focus(&search, cx);
+        }
         let tokens = *theme::tokens(cx);
         let state = &self.pull_requests;
         let shown = state.rows.iter().any(|row| matches!(row, Row::Entry { .. }));
@@ -808,7 +824,12 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .min_h_0()
-            .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
+            .child(self.render_header(window, cx))
+            .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(
+                self.pull_request_column_width(window) >= LIST_TOOLBAR_ONE_ROW,
+                &tokens,
+                cx,
+            )))
             .child(div().flex_1().min_h_0().child(body));
         if !self.pull_request_panel_shown() {
             return column.into_any_element();
@@ -842,13 +863,21 @@ impl Workspace {
         }
     }
 
-    fn render_pull_request_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The list column's width: the main column less a panel beside it (`@container/pr-list`).
+    fn pull_request_column_width(&self, window: &Window) -> f32 {
+        let viewport = f32::from(window.viewport_size().width);
+        let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
+        let panel = if self.pull_request_panel_shown() { self.pr_panel_width(window) } else { 0. };
+        viewport - sidebar - panel
+    }
+
+    /// `wide`: the search shares the row with the controls; narrower, it takes a row of its own.
+    fn render_pull_request_toolbar(&self, wide: bool, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.pull_requests;
         let view = cx.entity();
         let search = h_flex()
             .id("pr-search")
-            .flex_1()
-            .min_w(px(96.))
+            .map(|el| if wide { el.flex_1().min_w(px(96.)) } else { el.w_full() })
             .h(px(32.))
             .px(px(10.))
             .gap(px(8.))
@@ -1386,6 +1415,9 @@ impl Workspace {
 }
 
 /// The centered `max-w-6xl` column every part of the page sits in.
+/// `@lg/pr-list` (32rem): from this column width the search shares the toolbar's first row.
+const LIST_TOOLBAR_ONE_ROW: f32 = 512.;
+
 fn page_frame() -> gpui_kit::Div {
     div().w_full().max_w(px(PAGE_MAX_WIDTH)).mx_auto().px(px(PAGE_GUTTER))
 }
@@ -1795,7 +1827,9 @@ fn pull_request_row(
                 .flex_none()
                 .max_w(px(160.))
                 .gap(px(4.))
-                .child(
+                .child(super::pull_request_detail::avatars::avatar_at(
+                    entry.author.as_ref().and_then(|a| a.avatar_url.as_deref()),
+                    14.,
                     div()
                         .size(px(14.))
                         .flex_none()
@@ -1807,7 +1841,7 @@ fn pull_request_row(
                         .text_size(px(10.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(login.chars().next().unwrap_or('?').to_uppercase().to_string()),
-                )
+                ))
                 .when(meta_width >= 320., |el| el.child(div().truncate().child(login.to_owned())))
                 .tooltip(move |window, cx| Tooltip::new(author_tooltip.clone()).build(window, cx)),
         )

@@ -22,15 +22,19 @@ fn cache() -> &'static Mutex<HashMap<String, Option<Arc<Image>>>> {
     CACHE.get_or_init(Default::default)
 }
 
-/// The picture for `actor`, once read.
-pub(super) fn avatar_image(actor: Option<&Actor>) -> Option<Arc<Image>> {
-    let url = actor?.avatar_url.as_deref()?;
-    cache().lock().ok()?.get(url).cloned().flatten()
+/// The picture at `url`, once read.
+fn avatar_image(url: Option<&str>) -> Option<Arc<Image>> {
+    cache().lock().ok()?.get(url?).cloned().flatten()
 }
 
 /// The round picture, or `fallback` while there is none.
 pub(super) fn avatar_or(actor: Option<&Actor>, size: f32, fallback: gpui_kit::Div) -> gpui_kit::Div {
-    match avatar_image(actor) {
+    avatar_at(actor.and_then(|a| a.avatar_url.as_deref()), size, fallback)
+}
+
+/// [`avatar_or`] for the picture at `url`.
+pub(in crate::app::pages) fn avatar_at(url: Option<&str>, size: f32, fallback: gpui_kit::Div) -> gpui_kit::Div {
+    match avatar_image(url) {
         Some(image) => div()
             .size(px(size))
             .flex_none()
@@ -67,6 +71,32 @@ async fn read(url: String) -> Option<Arc<Image>> {
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
+/// Reads the pictures at `urls` that are not read or being read; each one that lands repaints.
+pub(in crate::app::pages) fn read_avatars<'a>(urls: impl IntoIterator<Item = &'a str>, cx: &mut Context<Workspace>) {
+    let wanted: Vec<String> = {
+        let Ok(mut held) = cache().lock() else { return };
+        let mut wanted = Vec::new();
+        for url in urls {
+            if !held.contains_key(url) {
+                held.insert(url.to_owned(), None);
+                wanted.push(url.to_owned());
+            }
+        }
+        wanted
+    };
+    for url in wanted {
+        cx.spawn(async move |this, cx| {
+            if let Some(image) = read(url.clone()).await {
+                if let Ok(mut held) = cache().lock() {
+                    held.insert(url, Some(image));
+                }
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+}
+
 impl Workspace {
     /// Reads the pictures of everyone pull request `key` names that are not read yet.
     pub(super) fn read_pr_avatars(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -84,28 +114,6 @@ impl Workspace {
             actors.extend(activity.commits.iter().flat_map(|c| c.authors.iter()));
             actors.extend(activity.reviewers.iter().flatten());
         }
-        let wanted: Vec<String> = {
-            let Ok(mut held) = cache().lock() else { return };
-            let mut wanted = Vec::new();
-            for url in actors.iter().filter_map(|a| a.avatar_url.as_deref()) {
-                if !held.contains_key(url) {
-                    held.insert(url.to_owned(), None);
-                    wanted.push(url.to_owned());
-                }
-            }
-            wanted
-        };
-        for url in wanted {
-            cx.spawn(async move |this, cx| {
-                let image = read(url.clone()).await;
-                if let Some(image) = image {
-                    if let Ok(mut held) = cache().lock() {
-                        held.insert(url, Some(image));
-                    }
-                    let _ = this.update(cx, |_, cx| cx.notify());
-                }
-            })
-            .detach();
-        }
+        read_avatars(actors.iter().filter_map(|a| a.avatar_url.as_deref()), cx);
     }
 }
