@@ -251,6 +251,79 @@ pub fn list_lines<'a>(links: &'a [PullRequestLink]) -> Vec<ListLine<'a>> {
         .collect()
 }
 
+/// A change request a thread can link (`resolveLinkPullRequestInput`'s `link`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedLink {
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub url: String,
+}
+
+/// The browser URL of a project's change request (`pullRequestLinkProject(identity).webUrl`), for
+/// the hosts whose links name the repository.
+fn project_change_request_url(identity: &crate::model::RepositoryIdentity, number: u64) -> Option<String> {
+    let canonical = identity.canonical_key.as_deref()?;
+    let (host, path) = canonical.split_once('/').unwrap_or((canonical, ""));
+    let repository = identity
+        .display_name
+        .clone()
+        .or_else(|| Some(format!("{}/{}", identity.owner.as_ref()?, identity.name.as_ref()?)))?;
+    let (route, repository) = match identity.provider.as_deref()? {
+        "github" => ("pull", repository),
+        "gitlab" => ("-/merge_requests", repository),
+        "forgejo" | "gitcafe" => ("pulls", repository),
+        "bitbucket" => ("pull-requests", repository),
+        "azure-devops" => ("pullrequest", path.to_owned()),
+        _ => return None,
+    };
+    Some(match identity.web_url.as_deref() {
+        Some(web) => format!("{}/{route}/{number}", web.trim_end_matches('/')),
+        None => format!("https://{}/{repository}/{route}/{number}", host.to_lowercase()),
+    })
+}
+
+/// `parsePullRequestReference`'s checkout commands: `gh pr checkout 12`, `glab mr checkout 12`.
+fn checkout_argument(input: &str) -> Option<&str> {
+    let words: Vec<&str> = input.split_whitespace().collect();
+    match words.as_slice() {
+        ["gh", "pr", "checkout", argument] | ["glab", "mr", "checkout", argument] => Some(argument),
+        _ => None,
+    }
+}
+
+/// `resolveLinkPullRequestInput`: a change request URL, or `123` / `#123` in the thread's own
+/// repository. `None` is input that names nothing yet; an error says what is missing.
+pub fn resolve_link_input(
+    input: &str,
+    identity: Option<&crate::model::RepositoryIdentity>,
+) -> Option<Result<ResolvedLink, String>> {
+    let trimmed = input.trim();
+    let reference = checkout_argument(trimmed).unwrap_or(trimmed);
+    if let Some(link) = crate::pull_request_detail::parse_change_request(reference) {
+        let (host, repository, number) = (link.host, link.repository, link.number);
+        return Some(Ok(ResolvedLink { host, repository, number, url: reference.to_owned() }));
+    }
+    let digits = reference.strip_prefix('#').unwrap_or(reference);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = digits.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
+    let Some(identity) = identity.filter(|i| i.display_name.is_some() || (i.owner.is_some() && i.name.is_some()))
+    else {
+        return Some(Err(
+            "Paste the full pull request URL; this thread has no repository to resolve the number against.".into(),
+        ));
+    };
+    let link = project_change_request_url(identity, number)
+        .and_then(|url| Some((crate::pull_request_detail::parse_change_request(&url)?, url)));
+    let Some((link, url)) = link else {
+        let term = crate::pull_request_detail::terminology(identity.provider.as_deref().unwrap_or_default()).0;
+        return Some(Err(format!("Paste a full URL; this project's host has no known {term} URL.")));
+    };
+    Some(Ok(ResolvedLink { host: link.host, repository: link.repository, number: link.number, url }))
+}
+
 /// The host of a change request URL (`https://github.com/o/r/pull/1` → `github.com`).
 fn url_host(url: &str) -> Option<String> {
     url::Url::parse(url).ok()?.host_str().map(str::to_lowercase)
@@ -334,6 +407,30 @@ mod tests {
         let branch = LinkedPullRequest { number: 9, ..linked };
         assert_eq!(panel_target("p", &[], None, Some(&branch)).unwrap().number, 9);
         assert!(panel_target("p", &[], None, None).is_none());
+    }
+
+    #[test]
+    fn a_link_comes_from_a_url_or_a_number_in_the_threads_repository() {
+        let identity: crate::model::RepositoryIdentity = serde_json::from_value(
+            json!({"canonicalKey": "github.com/acme/app", "displayName": "acme/app", "provider": "github"}),
+        )
+        .unwrap();
+        let resolved = |input: &str, identity| {
+            resolve_link_input(input, identity).map(|r| r.map(|l| (l.host, l.repository, l.number, l.url)))
+        };
+        assert_eq!(
+            resolved("https://codeberg.org/Forge/App/pulls/3", None),
+            Some(Ok(("codeberg.org".into(), "forge/app".into(), 3, "https://codeberg.org/Forge/App/pulls/3".into())))
+        );
+        let pull = Some(Ok(("github.com".into(), "acme/app".into(), 42, "https://github.com/acme/app/pull/42".into())));
+        assert_eq!(resolved(" #42 ", Some(&identity)), pull);
+        assert_eq!(resolved("gh pr checkout 42", Some(&identity)), pull);
+        assert!(matches!(resolved("42", None), Some(Err(e)) if e.starts_with("Paste the full pull request URL")));
+        let unknown: crate::model::RepositoryIdentity =
+            serde_json::from_value(json!({"canonicalKey": "git.example.com/a/b", "displayName": "a/b"})).unwrap();
+        assert!(matches!(resolved("42", Some(&unknown)), Some(Err(e)) if e.contains("no known pull request URL")));
+        assert_eq!(resolved("abc", Some(&identity)), None);
+        assert_eq!(resolved("#0", Some(&identity)), None);
     }
 
     fn chained(

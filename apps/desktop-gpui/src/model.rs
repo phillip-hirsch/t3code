@@ -527,6 +527,13 @@ impl ServerInfo {
 pub struct RepositoryIdentity {
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The source control host kind ("github", "gitlab", ...).
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
     #[serde(default)]
     pub canonical_key: Option<String>,
     /// Work tree root, or the git dir for a bare repository.
