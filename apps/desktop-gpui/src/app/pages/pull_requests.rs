@@ -1158,6 +1158,14 @@ impl Workspace {
         let t = *t;
         let now = now_ms();
         let selected = self.pull_requests.panel.as_ref().map(|p| p.reference().clone());
+        // Rows name their host once several answer, and their server once several are connected.
+        let show_provider = self.pull_requests.list.as_ref().is_some_and(|l| l.providers.len() > 1);
+        let servers = self.pull_request_servers();
+        let environment_labels: Rc<std::collections::HashMap<String, SharedString>> = Rc::new(if servers.len() > 1 {
+            servers.into_iter().map(|(id, label, _)| (id.to_string(), label)).collect()
+        } else {
+            std::collections::HashMap::new()
+        });
         // Labels and author names show as the row's meta line widens (`@xs`, `@xl`, `@3xl`).
         let meta_width = f32::from(self.pull_requests.list_state.viewport_bounds().size.width).min(PAGE_MAX_WIDTH)
             - 2. * PAGE_GUTTER
@@ -1167,7 +1175,13 @@ impl Workspace {
                 Row::Header { key, label, count, first } => group_header(key, label, *count, *first, &t),
                 Row::Entry { entry, stat, elsewhere, first } => {
                     let selected = selected.as_ref().is_some_and(|r| *r == reference_of(entry));
-                    pull_request_row(entry, *stat, *elsewhere, *first, selected, meta_width, now, &view, &t, window, cx)
+                    let origin = RowOrigin {
+                        show_provider,
+                        environment: environment_labels.get(&entry.environment_id).cloned(),
+                    };
+                    pull_request_row(
+                        entry, *stat, *elsewhere, *first, selected, &origin, meta_width, now, &view, &t, window, cx,
+                    )
                 }
                 Row::Stale(error) => stale_banner(error.clone(), &view, &t, window),
                 Row::Footer(footer) => list_footer(*footer, &view, &t, window),
@@ -1546,12 +1560,40 @@ fn mix(a: Hsla, b: Hsla, share: f32) -> Hsla {
     gpui_kit::Rgba { r: lerp(a.r, b.r), g: lerp(a.g, b.g), b: lerp(a.b, b.b), a: 1. }.into()
 }
 
+/// Where a row came from, when the list spans several hosts or servers.
+struct RowOrigin {
+    show_provider: bool,
+    environment: Option<SharedString>,
+}
+
+/// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's is
+/// one color and follows the text, the others are drawn as they are.
+fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
+    let path = match kind {
+        "github" => {
+            return svg()
+                .path("icons/app/source-control/github.svg")
+                .size(px(size))
+                .text_color(color)
+                .into_any_element();
+        }
+        "gitlab" => "icons/app/source-control/gitlab.svg",
+        "bitbucket" => "icons/app/source-control/bitbucket.svg",
+        "azure-devops" => "icons/app/source-control/azure-devops.svg",
+        "forgejo" => "icons/app/source-control/forgejo.svg",
+        "gitcafe" => "icons/app/source-control/gitcafe.svg",
+        _ => "icons/app/source-control/git.svg",
+    };
+    gpui_kit::img(path).size(px(size)).into_any_element()
+}
+
 fn pull_request_row(
     entry: &Rc<Entry>,
     stat: Option<(u64, u64)>,
     elsewhere: bool,
     first: bool,
     selected: bool,
+    origin: &RowOrigin,
     meta_width: f32,
     now: i64,
     view: &Entity<Workspace>,
@@ -1645,6 +1687,17 @@ fn pull_request_row(
                     .tooltip(|window, cx| Tooltip::new("Matched in the description").build(window, cx)),
             )
         })
+        .when(origin.show_provider, |el| {
+            let name = logic::provider_name(&entry.provider);
+            el.child(
+                div()
+                    .id(ElementId::Name(id("provider").into()))
+                    .flex_none()
+                    .flex()
+                    .child(host_mark(&entry.provider, 12., t.muted_foreground))
+                    .tooltip(move |window, cx| Tooltip::new(name).build(window, cx)),
+            )
+        })
         .child(
             h_flex()
                 .id(ElementId::Name(id("author").into()))
@@ -1668,6 +1721,7 @@ fn pull_request_row(
                 .tooltip(move |window, cx| Tooltip::new(author_tooltip.clone()).build(window, cx)),
         )
         .child(div().min_w_0().truncate().child(entry.repository.clone()))
+        .children(origin.environment.clone().map(|label| div().min_w_0().max_w(px(128.)).truncate().child(label)))
         .when(shown_labels > 0, |el| {
             el.child(h_flex().min_w_0().gap(px(4.)).children(entry.labels.iter().take(shown_labels).enumerate().map(
                 |(index, label)| {
