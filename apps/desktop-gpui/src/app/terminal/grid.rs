@@ -414,6 +414,8 @@ impl Element for TerminalGrid {
         });
         let session = self.session.read(cx);
         let term = session.term();
+        // The drawn grid: the shared PTY's, capped to this fit.
+        let (columns, rows) = (term.columns(), term.screen_lines());
         // `terminalContentOriginY`: with scrollback, the last row sits on the bottom edge.
         let slack = bounds.size.height - PADDING * 2. - line_height * rows as f32;
         let top = if term.grid().history_size() > 0 { PADDING + slack.max(px(0.)) } else { PADDING };

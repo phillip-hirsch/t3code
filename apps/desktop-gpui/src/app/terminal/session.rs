@@ -51,6 +51,21 @@ struct GridSize {
     rows: usize,
 }
 
+impl GridSize {
+    /// The server's grid when it reports one, read from a snapshot or an `activity` event.
+    fn shared(source: &Value) -> Option<Self> {
+        let count = |key: &str| source[key].as_u64().and_then(|n| usize::try_from(n).ok());
+        Some(Self { columns: count("cols")?, rows: count("rows")? })
+    }
+
+    /// `applyGrid`: other clients share the PTY, so its grid is drawn, each axis capped to the
+    /// pane's own fit (the server lags a local resize, and observers never constrain it).
+    fn shown(measured: Self, shared: Option<Self>) -> Self {
+        let Some(shared) = shared else { return measured };
+        Self { columns: shared.columns.min(measured.columns), rows: shared.rows.min(measured.rows) }
+    }
+}
+
 impl Dimensions for GridSize {
     fn total_lines(&self) -> usize {
         self.rows
@@ -174,7 +189,10 @@ pub(super) struct TerminalSession {
     pub focus: FocusHandle,
     /// Written by the grid element each prepaint, read by mouse and IME handlers.
     pub geometry: Cell<Geometry>,
+    /// The grid that fits the pane; the PTY hears this one.
     size: Option<GridSize>,
+    /// The PTY's grid as the server last reported it.
+    shared_size: Option<GridSize>,
     sent_size: Option<GridSize>,
     running: bool,
     /// Without `terminal:operate` nothing is written to the PTY, and it is never resized.
@@ -246,6 +264,7 @@ impl TerminalSession {
             focus,
             geometry: Cell::default(),
             size: None,
+            shared_size: None,
             sent_size: None,
             running: false,
             read_only,
@@ -332,6 +351,7 @@ impl TerminalSession {
         match event["type"].as_str() {
             Some("snapshot" | "restarted") => {
                 let snapshot = &event["snapshot"];
+                self.shared_size = GridSize::shared(snapshot).or(self.shared_size);
                 self.reset();
                 self.feed(snapshot["history"].as_str().unwrap_or_default(), false, cx);
                 let status = snapshot["status"].as_str().unwrap_or_default();
@@ -349,6 +369,12 @@ impl TerminalSession {
                 self.feed(event["data"].as_str().unwrap_or_default(), true, cx);
             }
             Some("cleared") => self.reset(),
+            Some("activity") => {
+                if let Some(shared) = GridSize::shared(event) {
+                    self.shared_size = Some(shared);
+                    self.apply_grid();
+                }
+            }
             Some("exited") => self.on_exit("Process exited", cx),
             Some("closed") => self.on_exit("Terminal closed", cx),
             Some("error") => {
@@ -359,8 +385,19 @@ impl TerminalSession {
         }
     }
 
+    fn shown_size(&self) -> GridSize {
+        GridSize::shown(self.size.unwrap_or(GridSize { columns: 80, rows: 24 }), self.shared_size)
+    }
+
+    fn apply_grid(&mut self) {
+        let size = self.shown_size();
+        if (self.term.columns(), self.term.screen_lines()) != (size.columns, size.rows) {
+            self.term.resize(size);
+        }
+    }
+
     fn reset(&mut self) {
-        let size = self.size.unwrap_or(GridSize { columns: 80, rows: 24 });
+        let size = self.shown_size();
         *self.term = Term::new(Config::default(), &size, self.events.clone());
         self.parser = Processor::new();
     }
@@ -456,7 +493,7 @@ impl TerminalSession {
             return;
         }
         self.size = Some(size);
-        self.term.resize(size);
+        self.apply_grid();
         self._resize = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESIZE_DEBOUNCE).await;
             let _ = this.update(cx, TerminalSession::send_size);
@@ -683,6 +720,16 @@ mod tests {
     fn paste_brackets_when_asked_and_otherwise_sends_carriage_returns() {
         assert_eq!(paste_input("a\r\nb\nc", false), "a\rb\rc");
         assert_eq!(paste_input("ls\x1b[201~\n", true), "\x1b[200~ls[201~\n\x1b[201~");
+    }
+
+    #[test]
+    fn panes_draw_the_shared_grid_capped_to_their_fit() {
+        let fit = GridSize { columns: 100, rows: 30 };
+        assert_eq!(GridSize::shown(fit, None), fit);
+        let shared = GridSize::shared(&json!({"cols": 80, "rows": 40}));
+        assert_eq!(shared, Some(GridSize { columns: 80, rows: 40 }));
+        assert_eq!(GridSize::shown(fit, shared), GridSize { columns: 80, rows: 30 });
+        assert_eq!(GridSize::shared(&json!({"cols": 80})), None, "older servers send no grid");
     }
 
     #[test]
