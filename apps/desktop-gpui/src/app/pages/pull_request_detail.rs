@@ -280,7 +280,9 @@ impl Workspace {
         seed: Option<Rc<Entry>>,
         cx: &mut Context<Self>,
     ) {
+        self.pull_requests.panel_hidden = false;
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
+            cx.notify();
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
@@ -312,6 +314,7 @@ impl Workspace {
         self.pull_requests.panel = None;
         self.pull_requests.tabs.clear();
         self.pull_requests.parked.clear();
+        self.pull_requests.panel_maximized = false;
         cx.notify();
     }
 

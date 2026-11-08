@@ -76,6 +76,13 @@ impl Workspace {
         if let Some(handled) = self.usage_shortcut(command, context, cx) {
             return handled;
         }
+        if self.page == Some(pages::Page::PullRequests)
+            && self.settings.is_none()
+            && !palette_open
+            && self.pull_requests_page_command(command, held, window, cx)
+        {
+            return true;
+        }
         match command {
             "sidebar.toggle" => self.toggle_sidebar(cx),
             "threadPanel.toggle" if chat => self.toggle_details(window, cx),
@@ -196,6 +203,9 @@ impl Workspace {
                 if !held {
                     return self.cycle_host(window, cx);
                 }
+            }
+            "pullRequest.copyNumber" if self.settings.is_none() && !palette_open => {
+                return self.copy_pull_request_number(held, window, cx);
             }
             "composer.workspace" if chat => {
                 if !held {

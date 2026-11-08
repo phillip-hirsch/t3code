@@ -116,6 +116,9 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
     /// The panel's dragged width; `None` is half the window.
     pub(super) panel_width: Option<f32>,
+    /// The panel is collapsed with its tabs kept (`rightPanelStore.close`), or fills the page.
+    pub(super) panel_hidden: bool,
+    pub(super) panel_maximized: bool,
     /// `pullRequests.subscribeRefreshes` per connected environment, with the socket it runs on.
     pub(super) refreshes: std::collections::HashMap<SharedString, (RpcClient, Task<()>)>,
     /// The slow re-read while the app is in front; set once the page is followed.
@@ -169,6 +172,8 @@ impl PullRequestsState {
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
             panel_width: None,
+            panel_hidden: false,
+            panel_maximized: false,
             refreshes: std::collections::HashMap::new(),
             _live_interval: None,
             prefetched: None,
@@ -607,10 +612,16 @@ impl Workspace {
             .min_h_0()
             .child(page_frame().pt(px(24.)).pb(px(16.)).child(self.render_pull_request_toolbar(&tokens, cx)))
             .child(div().flex_1().min_h_0().child(body));
-        if self.pull_requests.panel.is_none() {
+        if self.pull_requests.panel.is_none() || self.pull_requests.panel_hidden {
             return column.into_any_element();
         }
-        h_flex().size_full().min_h_0().child(column).child(self.render_pr_panel_column(window, cx)).into_any_element()
+        let maximized = self.pull_requests.panel_maximized;
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .when(!maximized, |row| row.child(column))
+            .child(self.render_pr_panel_column(window, cx))
+            .into_any_element()
     }
 
     fn render_pull_request_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -938,7 +949,12 @@ impl Workspace {
         let view = cx.entity();
         let t = *t;
         let now = now_ms();
-        let selected = self.pull_requests.panel.as_ref().map(|p| p.reference().clone());
+        let selected = self
+            .pull_requests
+            .panel
+            .as_ref()
+            .filter(|_| !self.pull_requests.panel_hidden)
+            .map(|p| p.reference().clone());
         // Labels and author names show as the row's meta line widens (`@xs`, `@xl`, `@3xl`).
         let meta_width = f32::from(self.pull_requests.list_state.viewport_bounds().size.width).min(PAGE_MAX_WIDTH)
             - 2. * PAGE_GUTTER
