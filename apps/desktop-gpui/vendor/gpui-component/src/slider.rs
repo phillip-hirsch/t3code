@@ -90,6 +90,8 @@ pub struct Slider {
     disabled: bool,
     accessibility_label: Option<SharedString>,
     reverse: bool,
+    track_color: Option<Background>,
+    thumb_border: Option<(Pixels, Background)>,
 }
 
 impl Slider {
@@ -102,7 +104,23 @@ impl Slider {
             disabled: false,
             accessibility_label: None,
             reverse: false,
+            track_color: None,
+            thumb_border: None,
         }
+    }
+
+    /// The unfilled track's color, pressed or not, instead of the bar color
+    /// at 20% (40% while pressed).
+    pub fn track_color(mut self, color: impl Into<Background>) -> Self {
+        self.track_color = Some(color.into());
+        self
+    }
+
+    /// A solid border of `width` around the thumb, instead of 1px of the bar
+    /// color at 50%.
+    pub fn thumb_border(mut self, width: Pixels, color: impl Into<Background>) -> Self {
+        self.thumb_border = Some((width, color.into()));
+        self
     }
 
     /// As a horizontal slider.
@@ -199,6 +217,10 @@ impl RenderOnce for Slider {
                 .unwrap_or(default_radius),
         };
 
+        let (thumb_border_width, thumb_border_color) =
+            self.thumb_border.unwrap_or((px(1.), bar_color.opacity(0.5)));
+        let track = self.track_color.unwrap_or(bar_color.opacity(0.2));
+        let pressed_track = self.track_color.unwrap_or(bar_color.opacity(0.4));
         let ring_color = cx.theme().ring;
         let entity_id = self.state.entity_id();
         let start_ring = is_range.then(|| ThumbRing::new(entity_id, true, ring_color, window, cx));
@@ -222,9 +244,9 @@ impl RenderOnce for Slider {
                         .justify_center()
                         .flex_shrink_0()
                         .rounded_full_style(cx)
-                        .bg(bar_color.opacity(0.5))
+                        .bg(thumb_border_color)
                         .size_4()
-                        .p(px(1.))
+                        .p(thumb_border_width)
                         .on_hover({
                             let interaction = ring.interaction.clone();
                             move |entered, _, cx| {
@@ -298,8 +320,8 @@ impl RenderOnce for Slider {
                             .relative()
                             .when(axis.is_horizontal(), |this| this.w_full().h_1p5())
                             .when(axis.is_vertical(), |this| this.h_full().w_1p5())
-                            .bg(bar_color.opacity(0.2))
-                            .active(|this| this.bg(bar_color.opacity(0.4)))
+                            .bg(track)
+                            .active(move |this| this.bg(pressed_track))
                             .corner_radii(radius)
                             .child(
                                 div()

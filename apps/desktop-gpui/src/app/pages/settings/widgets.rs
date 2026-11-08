@@ -1596,7 +1596,17 @@ impl Workspace {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(format!("{value}{unit}")),
                             )
-                            .child(div().flex_1().min_w_0().child(Slider::new(&state).horizontal())),
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    // `.settings-slider`: a primary fill and thumb ring on a muted track.
+                                    Slider::new(&state)
+                                        .horizontal()
+                                        .bg(t.primary)
+                                        .text_color(t.background)
+                                        .track_color(t.muted_foreground.opacity(0.22))
+                                        .thumb_border(px(2.), t.primary),
+                                ),
+                            ),
                     )
                     .into_any_element()
             }
