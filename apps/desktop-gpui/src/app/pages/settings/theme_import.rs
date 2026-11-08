@@ -251,9 +251,9 @@ impl ThemeImport {
                     let library = this.library(cx).replace_collection(&extension.collection_id, themes.clone())?;
                     Ok((library, themes))
                 });
-                match installed {
-                    Ok((library, themes)) => {
-                        this.imported_many(library, &themes, updated, window, cx);
+                match installed.and_then(|(library, themes)| this.imported_many(library, &themes, updated, window, cx))
+                {
+                    Ok(()) => {
                         window.close_dialog(cx);
                         return;
                     }
@@ -300,11 +300,13 @@ impl ThemeImport {
         updated: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let _ = self.workspace.update(cx, |workspace, cx| {
-            let choice = ThemeChoice { library: library.clone(), ..workspace.client_settings.theme_choice() };
-            workspace.store_themes(library, choice, window, cx);
-        });
+    ) -> Result<(), String> {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let choice = ThemeChoice { library: library.clone(), ..workspace.client_settings.theme_choice() };
+                workspace.store_themes(library, choice, window, cx)
+            })
+            .unwrap_or(Ok(()))?;
         let verb = if updated { "updated" } else { "added" };
         let title = match themes {
             [theme] => format!("{} {verb}", theme.label),
@@ -312,24 +314,34 @@ impl ThemeImport {
         };
         let labels: Vec<&str> = themes.iter().map(|theme| theme.label.as_str()).collect();
         toast(window, cx, title, labels.join(", "));
+        Ok(())
     }
 
     /// `onImported`: a one-appearance theme becomes that appearance's theme; others the theme.
-    fn imported(&mut self, library: Library, theme: &ThemeDefinition, window: &mut Window, cx: &mut Context<Self>) {
+    fn imported(
+        &mut self,
+        library: Library,
+        theme: &ThemeDefinition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let modes = theme.modes();
-        let _ = self.workspace.update(cx, |workspace, cx| {
-            let mut choice = ThemeChoice { library: library.clone(), ..workspace.client_settings.theme_choice() };
-            match modes[..] {
-                [dark] => choice.assign_half(dark, Some(theme.id.clone())),
-                _ => choice.use_theme(Some(theme.id.clone())),
-            }
-            workspace.store_themes(library, choice, window, cx);
-        });
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let mut choice = ThemeChoice { library: library.clone(), ..workspace.client_settings.theme_choice() };
+                match modes[..] {
+                    [dark] => choice.assign_half(dark, Some(theme.id.clone())),
+                    _ => choice.use_theme(Some(theme.id.clone())),
+                }
+                workspace.store_themes(library, choice, window, cx)
+            })
+            .unwrap_or(Ok(()))?;
         let description = match modes[..] {
             [dark] => format!("It’s now your {} theme.", if dark { "dark" } else { "light" }),
             _ => "It’s now active.".to_owned(),
         };
         toast(window, cx, format!("{} added", theme.label), description);
+        Ok(())
     }
 
     fn choose_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -401,8 +413,11 @@ impl ThemeImport {
                 Err(error) => failures.push(format!("{}: {error}", theme.label)),
             }
         }
-        if !installed.is_empty() {
-            self.imported_many(library, &installed, false, window, cx);
+        if !installed.is_empty()
+            && let Err(error) = self.imported_many(library, &installed, false, window, cx)
+        {
+            failures.push(error);
+            installed.clear();
         }
         self.error = (!failures.is_empty()).then(|| failures.join("; "));
         if !conflicting.is_empty() {
@@ -440,8 +455,10 @@ impl ThemeImport {
                 Err(error) => failures.push(format!("{}: {error}", theme.label)),
             }
         }
-        if !resolved.is_empty() {
-            self.imported_many(library, &resolved, update, window, cx);
+        if !resolved.is_empty()
+            && let Err(error) = self.imported_many(library, &resolved, update, window, cx)
+        {
+            failures.push(error);
         }
         if !failures.is_empty() {
             self.error = Some(self.error.iter().cloned().chain(failures).collect::<Vec<_>>().join("; "));
@@ -464,14 +481,15 @@ impl ThemeImport {
             Ok(theme) if library.custom_theme(&theme.id).is_some() => {
                 (self.error, self.conflicts) = (None, Some(vec![theme]));
             }
-            Ok(theme) => match library.install(theme.clone()) {
-                Ok(library) => {
-                    self.imported(library, &theme, window, cx);
-                    window.close_dialog(cx);
-                    return;
+            Ok(theme) => {
+                match library.install(theme.clone()).and_then(|library| self.imported(library, &theme, window, cx)) {
+                    Ok(()) => {
+                        window.close_dialog(cx);
+                        return;
+                    }
+                    Err(error) => self.error = Some(error),
                 }
-                Err(error) => self.error = Some(error),
-            },
+            }
             Err(error) => self.error = Some(error),
         }
         cx.notify();

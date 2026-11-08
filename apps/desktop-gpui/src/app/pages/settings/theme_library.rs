@@ -643,8 +643,9 @@ impl Workspace {
                                 .disabled(count == 0)
                                 .label(remove_label)
                                 .on_click(move |_, window, cx| {
-                                    confirm.update(cx, |this, cx| this.remove_selected_themes(window, cx));
-                                    window.close_dialog(cx);
+                                    if confirm.update(cx, |this, cx| this.remove_selected_themes(window, cx)) {
+                                        window.close_dialog(cx);
+                                    }
                                 }),
                         ),
                 )
@@ -652,16 +653,21 @@ impl Workspace {
     }
 
     /// `handleConfirmRemoveTheme`: a removed base falls back to the standard palette and a
-    /// removed half is cleared, then the themes go.
-    fn remove_selected_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(removal) = self.settings_ui.theme_library.removal.take() else { return };
-        let ids: Vec<String> = removal.selected.into_iter().collect();
+    /// removed half is cleared, then the themes go. False keeps the dialog open after a failure.
+    fn remove_selected_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(removal) = self.settings_ui.theme_library.removal.as_ref() else { return true };
+        let ids: Vec<String> = removal.selected.iter().cloned().collect();
         if ids.is_empty() {
-            return;
+            return true;
         }
         let library = self.client_settings.themes.remove(&ids);
         let choice = ThemeChoice { library: library.clone(), ..self.client_settings.theme_choice().without(&ids) };
-        self.store_themes(library, choice, window, cx);
+        if self.store_themes(library, choice, window, cx).is_err() {
+            window.push_notification(Notification::error("Try again.").title("Couldn’t remove theme"), cx);
+            return false;
+        }
+        self.settings_ui.theme_library.removal = None;
+        true
     }
 }
 

@@ -630,16 +630,14 @@ impl ThemeEditor {
             cx.notify();
             return;
         }
-        match self.save(&name, cx) {
-            Ok((library, saved, outcome)) => {
-                let _ = self
-                    .workspace
-                    .update(cx, |workspace, cx| workspace.theme_saved(library, saved, outcome, window, cx));
-            }
-            Err(error) => {
-                self.error = Some(error);
-                cx.notify();
-            }
+        let saved = self.save(&name, cx).and_then(|(library, saved, outcome)| {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.theme_saved(library, saved, outcome, window, cx))
+                .unwrap_or(Ok(()))
+        });
+        if let Err(error) = saved {
+            self.error = Some(error);
+            cx.notify();
         }
     }
 
@@ -1366,28 +1364,28 @@ impl Workspace {
         self.open_theme_editor(Session { seed, ..Session::new(dark) }, window, cx);
     }
 
-    /// Stores the saved themes and the pick together, then paints.
+    /// Stores the saved themes and the pick together, then paints; a failed save changes nothing.
     pub(in crate::app) fn store_themes(
         &mut self,
         library: Library,
         choice: ThemeChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
+        self.client_settings.set_themes(library.clone(), choice.clone())?;
         if let Some(editor) = &self.theme_editor {
-            let library = library.clone();
             editor.update(cx, |editor, cx| {
                 editor.library = library;
                 cx.notify();
             });
         }
-        self.client_settings.set_themes(library, choice.clone());
         theme::set_preference(choice, window, cx);
         self.sync_composer_marks(cx);
         cx.notify();
+        Ok(())
     }
 
-    /// `ThemeEditorHost.handleSaved`.
+    /// `ThemeEditorHost.handleSaved`; on a failed save the editor stays open with the error.
     fn theme_saved(
         &mut self,
         library: Library,
@@ -1395,7 +1393,7 @@ impl Workspace {
         outcome: Saved,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         let mut choice = ThemeChoice { library: library.clone(), ..self.client_settings.theme_choice() };
         let (title, description) = match outcome {
             Saved::Merged(dark) => {
@@ -1417,10 +1415,15 @@ impl Workspace {
                 (format!("{} created", saved.label), "It’s now active.".to_owned())
             }
         };
-        self.theme_editor = None;
+        // The editor is mid-update (its submit called this), so it is out while the store runs.
+        let editor = self.theme_editor.take();
+        if let Err(error) = self.store_themes(library, choice, window, cx) {
+            self.theme_editor = editor;
+            return Err(error);
+        }
         theme::set_editor_preview(None, window, cx);
-        self.store_themes(library, choice, window, cx);
         toast(window, cx, title, description);
+        Ok(())
     }
 }
 
