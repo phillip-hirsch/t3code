@@ -227,6 +227,9 @@ pub(in crate::app) struct SettingsUi {
     /// The environment and scheduled task a link asked Scheduled tasks to open
     /// (`/settings/scheduled-tasks?environmentId&taskId`), until its editor closes.
     pub(in crate::app) scheduled_task_link: Option<(SharedString, String)>,
+    /// The environment Sharing & access was switched to ("Showing access for"); the primary
+    /// while it is `None` or no longer listed.
+    pub(in crate::app) access_environment: Option<SharedString>,
     search: Entity<InputState>,
     /// Below `md` the nav is an icon rail; searching expands it over the page (`compactSearchOpen`).
     compact_search_open: bool,
@@ -299,6 +302,7 @@ impl SettingsUi {
         Self {
             scope: ScopeSearch::default(),
             provider_target: None,
+            access_environment: None,
             scheduled_task_link: None,
             search,
             compact_search_open: false,

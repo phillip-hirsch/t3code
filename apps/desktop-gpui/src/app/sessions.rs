@@ -481,9 +481,22 @@ impl Workspace {
     /// scope's environment (`useSettingsScope().environment`), the primary on device pages.
     /// `None` when the scope selects no listed environment; it never falls back to the primary.
     fn settings_session(&self) -> Option<&EnvironmentSession> {
+        if self.settings.as_deref() == Some("access") {
+            return self.sessions.get(self.access_session_index());
+        }
         let device = self.settings.as_deref().is_some_and(super::pages::settings::device_only);
         let scoped = if device { None } else { self.scoped_settings_environment() };
         settings_session_index(&self.sessions, device, scoped.as_deref()).map(|index| &self.sessions[index])
+    }
+
+    /// The session Sharing & access reads (`resolveAccessEnvironmentId`).
+    fn access_session_index(&self) -> usize {
+        access_session_index(&self.sessions, self.settings_ui.access_environment.as_deref())
+    }
+
+    /// Sharing & access shows the primary, the one server this app may have started.
+    pub(super) fn access_is_primary(&self) -> bool {
+        self.access_session_index() == PRIMARY
     }
 
     /// The scope's server config, or an empty one (the contract's defaults, no providers)
@@ -505,6 +518,11 @@ impl Workspace {
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
         self.settings_session()?.id.clone()
     }
+}
+
+/// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
+fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
+    selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
 }
 
 /// Device pages read the primary; every other page reads only `scoped`'s session.
@@ -575,5 +593,10 @@ mod tests {
         assert_eq!(settings_session_index(&sessions, false, None), None);
         assert_eq!(settings_session_index(&sessions, false, Some("removed")), None);
         assert_eq!(settings_session_index(&sessions, true, None), Some(PRIMARY));
+
+        // Sharing & access reads the machine it was switched to, the primary once that one leaves.
+        assert_eq!(access_session_index(&sessions, Some("remote")), 1);
+        assert_eq!(access_session_index(&sessions, Some("removed")), PRIMARY);
+        assert_eq!(access_session_index(&sessions, None), PRIMARY);
     }
 }

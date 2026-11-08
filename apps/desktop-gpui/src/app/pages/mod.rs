@@ -138,7 +138,12 @@ impl Workspace {
 
     pub(super) fn open_settings(&mut self, section: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.focus_settings_on_open();
-        self.settings = Some(section.into());
+        let section = section.into();
+        // Each visit to Sharing & access starts on the primary, as the web's picker state does.
+        if self.settings.as_ref() != Some(&section) {
+            self.settings_ui.access_environment = None;
+        }
+        self.settings = Some(section);
         self.record_location();
         cx.notify();
     }
@@ -172,6 +177,7 @@ impl Workspace {
         }
         self.settings = None;
         self.page = None;
+        self.settings_ui.access_environment = None;
         match location {
             Location::Chat(Some(Target::Thread { id: thread_id, .. })) => self.select_thread(thread_id, window, cx),
             Location::Chat(Some(Target::Draft { project_id, .. })) => self.start_draft(project_id, window, cx),
