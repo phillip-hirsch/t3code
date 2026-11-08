@@ -51,7 +51,7 @@ pub(in crate::app) struct UsageState {
     mismatches: Vec<logic::ContractMismatch>,
     /// When the last answer landed, and each environment's prices and aliases the read went out with.
     answered_at: Option<i64>,
-    scan_settings: Vec<(SharedString, Value)>,
+    scan_settings: Vec<UsageScan>,
     /// Environments whose usage read is still out.
     pending: Vec<SharedString>,
     refreshing: bool,
@@ -79,6 +79,9 @@ pub(in crate::app) struct UsageState {
     /// Each limit segment's focus handle, by [`segment_key`].
     segment_focus: HashMap<String, FocusHandle>,
 }
+
+/// A connected environment, its socket and what a read there is priced and filtered with.
+type UsageScan = (SharedString, crate::rpc::SocketId, Value);
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
 
@@ -351,6 +354,13 @@ impl UsageState {
         });
     }
 
+    /// Whether the shown usage is read again: the scan's environments or settings changed,
+    /// whether or not the last read failed, or a pick of environments the last read missed.
+    fn needs_reread(&self, scan_changed: bool) -> bool {
+        let unread = self.summary.is_none() && self.answers.is_some() && self.error().is_none();
+        !self.loading() && (scan_changed || unread)
+    }
+
     /// A selected environment's usage read is still out.
     fn loading(&self) -> bool {
         self.pending.iter().any(|id| self.is_selected(id))
@@ -482,14 +492,17 @@ impl Workspace {
         }
     }
 
-    /// A connected environment's prices or model aliases differ from what the last read went out with.
+    /// An environment connected, reconnected or left, or its prices or model aliases changed,
+    /// since the last read went out.
     fn usage_scan_settings_changed(&self) -> bool {
-        let environments = self.usage_environments();
-        environments.len() != self.usage.scan_settings.len()
-            || environments
-                .iter()
-                .zip(&self.usage.scan_settings)
-                .any(|((id, _, info), (read_id, read))| id != read_id || scan_settings(info) != *read)
+        self.usage_scan() != self.usage.scan_settings
+    }
+
+    fn usage_scan(&self) -> Vec<UsageScan> {
+        self.sessions()
+            .iter()
+            .filter_map(|s| Some((s.id.clone()?, s.client.as_ref()?.socket_id(), scan_settings(&s.server_info))))
+            .collect()
     }
 
     /// `usage.*` on the open Usage page (`UsagePage.tsx`): `None` when `command` is not one;
@@ -590,8 +603,7 @@ impl Workspace {
             .into_iter()
             .map(|(id, client, filter)| (id, client, window.summary_input(&filter)))
             .collect();
-        self.usage.scan_settings =
-            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
+        self.usage.scan_settings = self.usage_scan();
         let usage = &mut self.usage;
         if machines.is_empty() {
             usage.refreshing = false;
@@ -1058,10 +1070,10 @@ impl Workspace {
         if limits {
             return self.render_limits(t, viewport, cx);
         }
-        // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
+        // Saved prices or aliases, or a connection that came or went, reprice the scan
+        // (`refreshTrigger`), even after a failure; a stale answer waits for a reopen.
         // So does a pick of environments the last read missed.
-        let unread = usage.summary.is_none() && usage.answers.is_some() && usage.error().is_none();
-        if !usage.loading() && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
+        if usage.needs_reread(self.usage_scan_settings_changed()) {
             let view = cx.entity();
             cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
         }
@@ -2848,5 +2860,17 @@ mod tests {
         assert!(usage.limits_due(&b, true, 1), "probing a leaves b due");
         assert!(usage.limits_due(&a, false, 1), "the refresh button always probes");
         assert!(usage.limits_due(&a, true, LIMITS_AUTO_REFRESH_MS));
+    }
+
+    #[test]
+    fn a_failed_read_runs_again_once_its_connection_changes() {
+        let usage = UsageState { failures: vec![("a".into(), "down".into())], ..UsageState::default() };
+        assert!(!usage.needs_reread(false));
+        assert!(usage.needs_reread(true), "a reconnect reads again though nothing answered");
+        let client = crate::rpc::RpcClient::unopened();
+        let socket = client.socket_id();
+        assert!(socket == client.socket_id(), "every clone names the one socket");
+        drop(client);
+        assert!(socket != crate::rpc::RpcClient::unopened().socket_id(), "a new socket differs");
     }
 }

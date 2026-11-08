@@ -108,7 +108,21 @@ pub struct RpcClient {
     closed: async_channel::Receiver<String>,
 }
 
+/// Names a client's socket without keeping it open; another connection never equals it.
+#[derive(Clone)]
+pub struct SocketId(std::sync::Weak<AtomicU64>);
+
+impl PartialEq for SocketId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
 impl RpcClient {
+    pub fn socket_id(&self) -> SocketId {
+        SocketId(Arc::downgrade(&self.next_id))
+    }
+
     /// Opens the socket on `runtime` and resolves once the upgrade succeeds.
     pub async fn connect(runtime: &tokio::runtime::Handle, options: ConnectOptions) -> Result<Self> {
         let (ready_tx, ready_rx) = oneshot::channel();
