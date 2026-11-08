@@ -2638,6 +2638,7 @@ impl CodeBlock {
                 .id("actions")
                 .absolute()
                 .top_2()
+                .left_0()
                 .right_2()
                 .bg(style.code_background())
                 .rounded(cx.theme().tokens.radius.md)

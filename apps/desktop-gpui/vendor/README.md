@@ -222,6 +222,12 @@ the ones after it, which may hold chips; one replacement over all of it would dr
 patch, in `src/input/base/inline_tokens.rs`: `replace_ranges`, a public front for the crate's
 `replace_text_in_ranges` with the atomic intent `replace` uses.
 
+**Code block actions span the top row.** The web's code block header puts the language on the
+left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
+own width, so the row could span the block only when the caller knew its width. The patch anchors
+the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
+`actions` container in `CodeBlock::render`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.

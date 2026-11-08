@@ -1922,8 +1922,8 @@ fn markdown_view(
 
 /// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right, with
 /// "Run in terminal" for a shell block when `run` (`onRunCommand`) is set.
-/// `TextView` pins the actions 8px into the block's top-right corner over its own fill,
-/// so given the block's `width` the row spans it and paints the block's color.
+/// `TextView` lays the actions over the block's top row, 8px from its top-right corner, so the
+/// row spans that (or the given `width`) and paints the block's color.
 pub(super) fn code_block_header(
     this: &WeakEntity<Workspace>,
     key: &SharedString,
@@ -1991,7 +1991,12 @@ pub(super) fn code_block_header(
     let copy = message_actions::code_copy_button(this, id, code, t, cx);
     let fill = t.background.blend(code_background(t));
     h_flex()
-        .when_some(width, |row, width| row.w(px(width - 8.)).pl(px(10.)).justify_between())
+        .map(|row| match width {
+            Some(width) => row.w(px(width - 8.)),
+            None => row.w_full(),
+        })
+        .pl(px(10.))
+        .justify_between()
         .mt(px(-2.))
         .mr(px(-2.))
         .rounded(px(6.))

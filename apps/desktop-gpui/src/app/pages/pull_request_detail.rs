@@ -2544,6 +2544,7 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
     TextView::new(state)
         .style(super::super::chat::markdown_style(&t, false, wrap))
         .inline_code_style(super::super::chat::inline_code_style(&t))
+        .link_underline(false)
         .selectable(true)
         .code_block_actions(move |block, _, cx| {
             super::super::chat::code_block_header(
