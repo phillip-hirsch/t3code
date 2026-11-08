@@ -178,7 +178,7 @@ pub struct Workspace {
     details: inspector::Details,
     /// Where each timeline was left, and where the open one scrolls once its rows arrive.
     positions: positions::Positions,
-    pending_position: Option<gpui_kit::ListOffset>,
+    pending_position: Option<positions::Remembered>,
     copy_feedback: message_actions::CopyFeedback,
     /// The minimap tick under the pointer.
     minimap_hover: Option<usize>,

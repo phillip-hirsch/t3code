@@ -649,6 +649,35 @@ impl Row {
     fn is_own_user_message(&self) -> bool {
         matches!(self, Row::User { attribution: None, .. })
     }
+
+    /// The row's identity across rebuilds (the web's `row.id`), which survives rows added or
+    /// folded above it.
+    pub fn key(&self) -> String {
+        match self {
+            Row::User { id, .. } => format!("user:{id}"),
+            Row::Assistant { id, .. } => format!("assistant:{id}"),
+            Row::AssistantMeta { id, .. } => format!("meta:{id}"),
+            Row::Plan { id, .. } => format!("plan:{id}"),
+            Row::Work(work) => format!("work:{}", work.id),
+            Row::Working { .. } => "working".into(),
+            Row::TurnFold { key, .. } | Row::SubagentGroup { key, .. } | Row::AttemptFold { key, .. } => key.to_string(),
+            Row::Divider { id, .. } => format!("divider:{id}"),
+            Row::Event { id, .. } => format!("event:{id}"),
+            Row::System(divider) => format!("system:{}", divider.id),
+            Row::Workflow { row, .. } => format!("workflow:{}", row.opening.message_id),
+            Row::Subagent(card) => format!("subagent:{}", card.id),
+            Row::Embed(embed) => format!("embed:{}", embed.id),
+            Row::CreatedThread { id, .. } => format!("created:{id}"),
+            Row::Request(card) => format!("request:{}", card.item_id),
+            Row::ModelSwitch { id, .. } => format!("model-switch:{id}"),
+            Row::Handoff(handoff) => format!("handoff:{}", handoff.id),
+            Row::Approval { id, .. } => format!("approval:{id}"),
+            Row::Queued { message, .. } => format!("queued:{}", message.message_id),
+            Row::Now(_) => "now".into(),
+            Row::WorktreeSetup { .. } => "worktree-setup".into(),
+            Row::QueueToggle { .. } => "queue-toggle".into(),
+        }
+    }
 }
 
 /// Keys in the expanded set, namespaced so groups, folds and entries never collide.
