@@ -656,6 +656,7 @@ impl RenderOnce for Button {
                 .clone()
         });
         let is_focused = focus_handle.is_focused(window);
+        let tooltip_focus = focus_handle.clone();
 
         let rounding = match self.rounded {
             ButtonRounded::Small => cx.theme().radius * 0.5,
@@ -896,13 +897,15 @@ impl RenderOnce for Button {
         })
         .map(|this| {
             if let Some(builder) = self.tooltip_builder {
-                this.managed_tooltip_with(
+                this.managed_tooltip_focusable(
+                    Some(tooltip_focus.clone()),
                     tooltip_placement,
                     tooltip_show_delay,
                     move |window, cx| builder(window, cx),
                 )
             } else if let Some((tooltip, action)) = self.tooltip {
-                this.managed_tooltip_with(
+                this.managed_tooltip_focusable(
+                    Some(tooltip_focus.clone()),
                     tooltip_placement,
                     tooltip_show_delay,
                     move |window, cx| {

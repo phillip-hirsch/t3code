@@ -6,8 +6,8 @@ use std::{
 };
 
 use gpui::{
-    Action, AnyElement, AnyView, App, AppContext, Bounds, Context, ElementId, GlobalElementId,
-    IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
+    Action, AnyElement, AnyView, App, AppContext, Bounds, Context, ElementId, FocusHandle,
+    GlobalElementId, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
 pub use gpui_base::TooltipDefaults;
@@ -212,11 +212,18 @@ pub(crate) struct ComponentTooltip {
 impl ComponentTooltip {
     /// Apply this tooltip to a `Stateful<Div>` (or any `ManagedTooltipExt` element).
     pub fn apply<E: ManagedTooltipExt>(self, el: E) -> E {
+        self.apply_focusable(el, None)
+    }
+
+    /// [`Self::apply`] to a trigger that takes `focus`, so keyboard focus shows the tooltip.
+    pub fn apply_focusable<E: ManagedTooltipExt>(self, el: E, focus: Option<FocusHandle>) -> E {
         let show_delay = self.show_delay;
         if let Some(builder) = self.builder {
-            el.managed_tooltip_with(None, show_delay, move |window, cx| builder(window, cx))
+            el.managed_tooltip_focusable(focus, None, show_delay, move |window, cx| {
+                builder(window, cx)
+            })
         } else if let Some((text, action)) = self.text {
-            el.managed_tooltip_with(None, show_delay, move |window, cx| {
+            el.managed_tooltip_focusable(focus, None, show_delay, move |window, cx| {
                 Tooltip::new(text.clone())
                     .when_some(action.clone(), |this, (action, context)| {
                         this.action(
@@ -268,11 +275,26 @@ pub(crate) trait ManagedTooltipExt:
         show_delay: Option<Duration>,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
     ) -> Self {
+        self.managed_tooltip_focusable(None, preferred_placement, show_delay, build_tooltip)
+    }
+
+    /// t3code: [`Self::managed_tooltip_with`] for a trigger that takes focus. Like the web's
+    /// `TooltipTrigger`, keyboard focus opens it at once, losing focus closes it, and Escape on
+    /// the trigger dismisses it.
+    fn managed_tooltip_focusable(
+        self,
+        focus: Option<FocusHandle>,
+        preferred_placement: Option<Placement>,
+        show_delay: Option<Duration>,
+        build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Self {
         let build_tooltip = Rc::new(build_tooltip);
         let trigger = Rc::new(RefCell::new(TooltipTrigger::default()));
         let trigger_writer = trigger.clone();
+        let has_focus = focus.is_some();
+        let focus_build = build_tooltip.clone();
 
-        self.on_prepaint(move |bounds, window, _| {
+        let this = self.on_prepaint(move |bounds, window, cx| {
             let id = window.with_global_id("managed-tooltip-trigger".into(), |id, _| id.clone());
             // GPUI retains keyed element state for cached subtrees too, and
             // drops it after a frame that no longer contains the trigger.
@@ -281,12 +303,57 @@ pub(crate) trait ManagedTooltipExt:
                 (Rc::downgrade(&state.0), state)
             });
             *trigger_writer.borrow_mut() = TooltipTrigger {
-                id: Some(id),
-                lifetime,
+                id: Some(id.clone()),
+                lifetime: lifetime.clone(),
                 bounds,
             };
-        })
-        .on_hover({
+            let Some(focus) = &focus else { return };
+            let focused = focus.is_focused(window);
+            let focus_id =
+                window.with_global_id("managed-tooltip-focus".into(), |id, _| id.clone());
+            let was_focused = window.with_element_state(&focus_id, |state: Option<bool>, _| {
+                (state.unwrap_or(false), focused)
+            });
+            // `useFocus({ visibleOnly })`: only keyboard focus opens it.
+            let open = focused && !was_focused && window.last_input_was_keyboard();
+            if open == (was_focused && !focused) {
+                return;
+            }
+            let build = focus_build.clone();
+            window.defer(cx, move |window, cx| {
+                let Some(overlay) =
+                    WindowState::tooltip_overlay_for_trigger(&id, lifetime, open, window, cx)
+                else {
+                    return;
+                };
+                overlay.update(cx, |overlay: &mut BaseTooltipOverlay, cx| {
+                    if !open {
+                        overlay.request_hide(window, cx);
+                        return;
+                    }
+                    let request =
+                        BaseTooltipRequest::new(bounds, move |window, cx| build(window, cx))
+                            .with_show_delay(Duration::ZERO);
+                    let request = match preferred_placement {
+                        Some(placement) => request.with_placement(placement),
+                        None => request,
+                    };
+                    overlay.request_show(request, window, cx);
+                });
+            });
+        });
+        let this = if has_focus {
+            this.on_key_down(|event, window, cx| {
+                if event.keystroke.key == "escape"
+                    && let Some(overlay) = WindowState::tooltip_overlay(window, cx)
+                {
+                    overlay.update(cx, |overlay, cx| overlay.hide(cx));
+                }
+            })
+        } else {
+            this
+        };
+        this.on_hover({
             let trigger = trigger.clone();
             let build_tooltip = build_tooltip.clone();
             move |hovered, window, cx| {

@@ -248,3 +248,13 @@ size. `src/radio.rs` draws the dot and grows the default size below 640px.
 448px wide with `radius_lg`. `src/dialog/dialog.rs` makes centered and 512px the defaults (an
 explicit `margin_top` still places one from the top) and rounds the surface 16px;
 `src/dialog/footer.rs` rounds the footer 15px to sit inside the border.
+
+**Tooltips follow keyboard focus.** The web's `TooltipTrigger` opens on keyboard focus
+(`useFocus({ visibleOnly })`), closes on blur and dismisses on Escape; 0.9.0's managed tooltips
+answer the pointer only. `src/tooltip.rs` adds `managed_tooltip_focusable` (and
+`ComponentTooltip::apply_focusable`), which watches the trigger's focus handle at prepaint and
+shows the tooltip at once on a keyboard focus, hides it on blur, and hides it on Escape;
+`Button`, `Checkbox` and `Radio` pass their focus handles.
+
+**Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
+gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.

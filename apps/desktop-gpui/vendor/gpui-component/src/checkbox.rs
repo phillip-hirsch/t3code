@@ -359,7 +359,10 @@ impl RenderOnce for Checkbox {
                 // not move focus, including while disabled.
                 window.prevent_default();
             })
-            .map(|this| self.tooltip.apply(this))
+            .map(|this| {
+                self.tooltip
+                    .apply_focusable(this, Some(focus_handle.clone()))
+            })
     }
 }
 

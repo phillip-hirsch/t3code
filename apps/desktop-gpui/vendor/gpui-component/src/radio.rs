@@ -289,7 +289,10 @@ impl RenderOnce for Radio {
                     on_click(&next, window, cx);
                 })
             })
-            .map(|this| self.tooltip.apply(this))
+            .map(|this| {
+                self.tooltip
+                    .apply_focusable(this, Some(focus_handle.clone()))
+            })
     }
 }
 
