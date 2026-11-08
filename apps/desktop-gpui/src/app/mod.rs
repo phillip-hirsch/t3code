@@ -832,6 +832,7 @@ impl Workspace {
         self.insert_worktree_setup(&mut new_rows);
         new_rows.extend(self.now_rows(cx));
         let mut queue = self.queue_rows();
+        self.load_queue_images(cx);
         if !queued.is_empty() {
             let at = queue.iter().position(|row| matches!(row, Row::QueueToggle { .. })).unwrap_or(queue.len());
             if let Some(Row::Queued { last, .. }) = at.checked_sub(1).and_then(|i| queue.get_mut(i)) {

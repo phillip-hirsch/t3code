@@ -996,7 +996,7 @@ impl Workspace {
     }
 }
 
-fn overlay_button(id: ElementId, icon: Lucide) -> gpui_kit::Stateful<gpui_kit::Div> {
+pub(super) fn overlay_button(id: ElementId, icon: Lucide) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(id)
         .absolute()

@@ -923,24 +923,32 @@ impl Workspace {
             .children(subagent_bar)
             .when(!subagent, |surface| {
                 surface
-                    .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
-                        // The placeholder wraps over the editor's two reserved lines without
-                        // growing it, as Tiptap's zero-height `::before` does.
-                        div().relative().child(editor).when(self.composer_empty, |el| {
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .font_family(t.fonts.composer)
-                                    .text_size(px(t.fonts.prompt_size))
-                                    .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
-                                    .text_color(t.muted_foreground)
-                                    .child(placeholder),
-                            )
-                        }),
-                    ))
+                    .child(
+                        v_flex()
+                            .px(px(16.))
+                            .pt(px(16.))
+                            .pb(px(8.))
+                            .children(self.render_queue_edit_attachments(&t, cx))
+                            .children(self.render_attachments(&t, cx))
+                            .child(
+                                // The placeholder wraps over the editor's two reserved lines without
+                                // growing it, as Tiptap's zero-height `::before` does.
+                                div().relative().child(editor).when(self.composer_empty, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .right_0()
+                                            .font_family(t.fonts.composer)
+                                            .text_size(px(t.fonts.prompt_size))
+                                            .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
+                                            .text_color(t.muted_foreground)
+                                            .child(placeholder),
+                                    )
+                                }),
+                            ),
+                    )
                     .children(self.composer_ui.length_error.clone().map(|error| {
                         div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
                     }))

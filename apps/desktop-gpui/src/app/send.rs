@@ -41,11 +41,12 @@ impl PendingSend {
                 run_id: SharedString::default(),
                 message_id: self.message_id.clone().into(),
                 text: self.text.clone(),
-                preview: crate::queue::preview_text(&self.text).into(),
+                preview: crate::queue::preview_text(&self.text, false).into(),
                 editable: false,
                 created_at: Some(self.created_at.clone()),
                 sent_by_t3code: false,
                 fresh_context: false,
+                images: Vec::new(),
             };
             return Row::Queued { message: Rc::new(message), last: true };
         }

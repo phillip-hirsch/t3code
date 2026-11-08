@@ -25,6 +25,15 @@ pub struct QueuedMessage {
     pub sent_by_t3code: bool,
     /// It starts a fresh provider session (`/clear`).
     pub fresh_context: bool,
+    /// Its image attachments, shown as thumbnails above the text.
+    pub images: Vec<QueuedImage>,
+}
+
+/// An image a queued message carries: its attachment id, and its name for a missing preview.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueuedImage {
+    pub id: SharedString,
+    pub name: SharedString,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -116,10 +125,21 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
                 .and_then(Value::as_str)
                 .unwrap_or("Queued message")
                 .to_owned();
+            let images: Vec<QueuedImage> = item
+                .and_then(|item| item.raw.get("attachments"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|attachment| attachment["type"] == "image")
+                .filter_map(|attachment| {
+                    let id = attachment["id"].as_str()?.to_owned().into();
+                    Some(QueuedImage { id, name: attachment["name"].as_str().unwrap_or_default().to_owned().into() })
+                })
+                .collect();
             QueuedMessage {
                 run_id: run.id.clone().into(),
                 message_id: message_id.into(),
-                preview: preview_text(&text).into(),
+                preview: preview_text(&text, !images.is_empty()).into(),
                 text: text.into(),
                 editable: guest.is_none(),
                 created_at: item
@@ -127,6 +147,7 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
                     .map(|at| at.to_owned().into()),
                 sent_by_t3code: guest.is_none() && item.is_some_and(sent_by_t3code),
                 fresh_context: run.fresh_context,
+                images,
             }
         })
         .collect();
@@ -180,8 +201,9 @@ fn is_compaction_command(item: &TurnItem) -> bool {
 }
 
 /// The preview `QueuedRunsControl` shows: nothing for a files-only message, context
-/// chips (`[label](t3-context://…)`) as their labels.
-pub fn preview_text(text: &str) -> String {
+/// chips (`[label](t3-context://…)`) as their labels, and image chips (`![label](…/image/…)`)
+/// as nothing when the message shows its thumbnails.
+pub fn preview_text(text: &str, thumbnails: bool) -> String {
     if text == ATTACHMENT_ONLY_PROMPT {
         return String::new();
     }
@@ -195,8 +217,11 @@ pub fn preview_text(text: &str) -> String {
         });
         match chip {
             Some((label_end, end)) if !rest[open + 1..label_end].contains('[') => {
-                out.push_str(&rest[..open]);
-                out.push_str(&rest[open + 1..label_end]);
+                let image = open > 0 && rest.as_bytes()[open - 1] == b'!';
+                out.push_str(&rest[..if image { open - 1 } else { open }]);
+                if !(image && thumbnails && rest[label_end..].starts_with("](t3-context://image/")) {
+                    out.push_str(&rest[open + 1..label_end]);
+                }
                 rest = &rest[end..];
             }
             _ => {
@@ -311,6 +336,20 @@ run it";
     }
 
     #[test]
+    fn queued_messages_carry_their_image_attachments() {
+        let runs = json!([{"id": "q", "status": "queued", "ordinal": 1, "userMessageId": "m"}]);
+        let mut item = message("m", "see ![a.png](t3-context://image/image_1)");
+        item["attachments"] = json!([
+            {"type": "image", "id": "att-1", "name": "a.png"},
+            {"type": "file", "id": "att-2", "name": "notes.txt"},
+        ]);
+        let state = derive(&projection(runs, vec![item], json!({})), false);
+        let queued = &state.queued[0];
+        assert_eq!(queued.images, [QueuedImage { id: "att-1".into(), name: "a.png".into() }]);
+        assert_eq!(queued.preview.as_ref(), "see");
+    }
+
+    #[test]
     fn guest_messages_show_the_guests_words_and_stay_read_only() {
         let runs = json!([{"id": "q", "status": "queued", "ordinal": 1, "userMessageId": "m"}]);
         let mut item = message("m", "Guest Ada says: hi");
@@ -322,9 +361,12 @@ run it";
 
     #[test]
     fn preview_shows_chip_labels_and_hides_the_files_only_prompt() {
-        assert_eq!(preview_text("see [main.rs](t3-context://file/1) now "), "see main.rs now");
-        assert_eq!(preview_text("[a] [b](https://x)"), "[a] [b](https://x)");
-        assert_eq!(preview_text(ATTACHMENT_ONLY_PROMPT), "");
+        assert_eq!(preview_text("see [main.rs](t3-context://file/1) now ", false), "see main.rs now");
+        assert_eq!(preview_text("[a] [b](https://x)", false), "[a] [b](https://x)");
+        assert_eq!(preview_text(ATTACHMENT_ONLY_PROMPT, false), "");
+        let image = "look ![shot.png](t3-context://image/image_1) here";
+        assert_eq!(preview_text(image, false), "look shot.png here");
+        assert_eq!(preview_text(image, true), "look  here", "the thumbnail stands for the image");
         assert_eq!(edit_text(ATTACHMENT_ONLY_PROMPT), "");
     }
 }
