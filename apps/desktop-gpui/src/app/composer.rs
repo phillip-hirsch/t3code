@@ -1164,7 +1164,8 @@ impl Workspace {
         let follow_up = self.follow_up_behavior();
         let alternate = if follow_up == "queue" { "steer" } else { "queue" };
         let held = if self.ctrl_held { Intent::Alternate } else { Intent::Foreground };
-        let queue = running && super::send::queues(follow_up, held);
+        let can_steer = !self.open_projection().is_some_and(crate::model::ThreadProjection::is_compacting);
+        let queue = running && super::send::queues(follow_up, held, can_steer);
         let content: AnyElement = if busy {
             Spinner::new().small().color(icon).into_any_element()
         } else if editing {
@@ -1178,6 +1179,7 @@ impl Workspace {
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
             (Some(reason), _) => Some(reason.into()),
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
+            (None, true) if !can_steer => Some("Queue message".into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
                 let context = super::keymap::ShortcutContext {

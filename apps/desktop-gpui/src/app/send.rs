@@ -38,9 +38,9 @@ pub(super) fn sends_on(keystroke: &Keystroke, requires_modifier: bool) -> bool {
 }
 
 /// `resolveComposerDispatchMode`: a running turn takes `followUpBehavior`, and the
-/// alternate path the other of steer and queue.
-pub(super) fn queues(follow_up: &str, intent: Intent) -> bool {
-    (follow_up == "queue") != (intent == Intent::Alternate)
+/// alternate path the other of steer and queue; a turn that cannot steer (compacting) queues.
+pub(super) fn queues(follow_up: &str, intent: Intent, can_steer: bool) -> bool {
+    !can_steer || (follow_up == "queue") != (intent == Intent::Alternate)
 }
 
 /// `message.dispatch`'s delivery fields; `queue` picks queueing over steering while a turn runs.
@@ -186,11 +186,9 @@ impl Workspace {
                 };
                 settings_commands.extend(self.interaction_mode_command(&thread_id, interaction_mode));
                 sent_mode = Some(interaction_mode);
-                let running = self
-                    .thread
-                    .as_ref()
-                    .and_then(|t| t.state.projection.as_ref())
-                    .is_some_and(super::super::model::ThreadProjection::is_running);
+                let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
+                let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
+                let can_steer = !projection.is_some_and(super::super::model::ThreadProjection::is_compacting);
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
@@ -199,7 +197,7 @@ impl Workspace {
                     // A fresh session starts its own turn, so it never steers into the running one.
                     dispatch: dispatch_fields(
                         running,
-                        fresh_arm.is_some() || queues(self.follow_up_behavior(), intent),
+                        fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
                     ),
                     model: self.model_override.as_ref(),
                     source_plan: follow_up
@@ -432,14 +430,16 @@ mod tests {
         let (steer, queue) =
             ((json!({"type": "start_immediately"}), Some("steer")), (json!({"type": "queue_after_active"}), None));
         assert_eq!(
-            dispatch_fields(false, queues("queue", Intent::Alternate)),
+            dispatch_fields(false, queues("queue", Intent::Alternate, true)),
             (json!({"type": "start_immediately"}), Some("auto"))
         );
-        assert_eq!(dispatch_fields(true, queues("steer", Intent::Foreground)), steer);
-        assert_eq!(dispatch_fields(true, queues("steer", Intent::Alternate)), queue);
-        assert_eq!(dispatch_fields(true, queues("steer", Intent::AndNewThread)), steer);
-        assert_eq!(dispatch_fields(true, queues("queue", Intent::Foreground)), queue);
-        assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate)), steer);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::Foreground, true)), steer);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::Alternate, true)), queue);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::AndNewThread, true)), steer);
+        assert_eq!(dispatch_fields(true, queues("queue", Intent::Foreground, true)), queue);
+        assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate, true)), steer);
+        assert_eq!(dispatch_fields(true, queues("steer", Intent::Foreground, false)), queue, "compaction queues");
+        assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate, false)), queue);
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
                 text: "hi".into(),
                 attachments: vec![json!({"id": "a1"})],
                 context: Some(json!({"version": 1, "records": []})),
-                dispatch: dispatch_fields(true, queues("steer", Intent::Foreground)),
+                dispatch: dispatch_fields(true, queues("steer", Intent::Foreground, true)),
                 model,
                 source_plan,
                 fresh_context: false,
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(command["modelSelection"], model.to_json());
         assert_eq!(command["sourcePlanRef"], json!({"threadId": "t1", "planId": "p1"}));
         let queued = ThreadMessage {
-            dispatch: dispatch_fields(true, queues("queue", Intent::Foreground)),
+            dispatch: dispatch_fields(true, queues("queue", Intent::Foreground, true)),
             ..message(None, None)
         };
         let queued = queued.command();

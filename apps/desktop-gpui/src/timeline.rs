@@ -606,9 +606,7 @@ pub fn entry_key(entry_id: &str) -> SharedString {
 /// `isCompactionCommandMessage` and `idleCompactionOf`: a bare `/compact`, and why the
 /// server sent it on its own (`Some("beforeCacheExpires" | "onReturn")`).
 fn compaction_command(item: &TurnItem) -> Option<Option<&'static str>> {
-    let bare = item.str("text").is_some_and(|text| text.trim().eq_ignore_ascii_case("/compact"))
-        && item.raw.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty);
-    if !bare {
+    if !item.is_bare_compact() {
         return None;
     }
     Some(match item.str("idleCompaction") {

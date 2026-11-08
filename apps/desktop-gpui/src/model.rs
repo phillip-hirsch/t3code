@@ -1364,6 +1364,12 @@ impl TurnItem {
     pub fn bool(&self, key: &str) -> bool {
         self.raw.get(key).and_then(Value::as_bool) == Some(true)
     }
+
+    /// A bare `/compact` prompt (`isCompactCommandMessage`): it runs a compaction, not a turn.
+    pub fn is_bare_compact(&self) -> bool {
+        self.str("text").is_some_and(|text| text.trim().eq_ignore_ascii_case("/compact"))
+            && self.raw.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1553,6 +1559,29 @@ impl ThreadProjection {
 
     pub fn is_running(&self) -> bool {
         self.runs.iter().any(|run| is_active_run_status(&run.status))
+    }
+
+    /// `isCompacting` in `ChatView.tsx`: the active run is compacting, so it cannot take steering.
+    pub fn is_compacting(&self) -> bool {
+        let Some(run) = self.interruptible_run().map(|run| Some(&run.id)) else { return false };
+        let compaction = |done: bool| {
+            self.visible_turn_items.iter().any(|row| {
+                let item = &row.item;
+                item.item_type == "compaction"
+                    && item.run_id.as_ref() == run
+                    && if done {
+                        matches!(item.status.as_str(), "completed" | "failed" | "interrupted" | "cancelled")
+                    } else {
+                        item.status == "running"
+                    }
+            })
+        };
+        let compact_request = self
+            .visible_turn_items
+            .iter()
+            .rfind(|row| row.item.item_type == "user_message")
+            .is_some_and(|row| row.item.is_bare_compact() && row.item.run_id.as_ref() == run);
+        compaction(false) || (compact_request && !compaction(true))
     }
 
     /// The run `run.interrupt` should target: the last unfinished one.
@@ -2060,6 +2089,29 @@ mod tests {
         let project: ProjectShell =
             serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
         assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+    }
+
+    #[test]
+    fn a_compacting_run_cannot_take_steering() {
+        let compacting = |items: &[Value]| {
+            let mut state = ThreadState::default();
+            state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(items)})).unwrap();
+            state.projection.unwrap().is_compacting()
+        };
+        let mut compact = item("u", "user_message", "r1", 1);
+        compact["text"] = json!(" /Compact ");
+        let mut prompt = item("u2", "user_message", "r1", 3);
+        prompt["text"] = json!("hi");
+        let compaction = |status: &str| {
+            let mut item = item("c", "compaction", "r1", 2);
+            item["status"] = json!(status);
+            item
+        };
+        assert!(compacting(&[compact.clone()]), "a bare /compact before its compaction item lands");
+        assert!(!compacting(&[compact.clone(), compaction("completed")]));
+        assert!(compacting(&[prompt.clone(), compaction("running")]), "an automatic compaction mid-turn");
+        assert!(!compacting(&[compact, compaction("completed"), prompt.clone()]));
+        assert!(!compacting(&[prompt]));
     }
 
     #[test]
