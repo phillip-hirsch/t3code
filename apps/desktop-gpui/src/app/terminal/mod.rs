@@ -8,6 +8,7 @@ mod layout;
 mod links;
 mod mouse;
 mod panel;
+mod scrollbar;
 mod session;
 
 pub(in crate::app) use self::grid::TerminalTheme;
