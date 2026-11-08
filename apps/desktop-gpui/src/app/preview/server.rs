@@ -692,6 +692,8 @@ impl Workspace {
         if let Some(profile) = &session.profile_id {
             input["profileId"] = profile.clone().into();
         }
+        // The moved tab opens where the move started, even if another thread shows by then.
+        let origin = self.target.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -701,7 +703,9 @@ impl Workspace {
                     Ok(moved) => {
                         let tab = moved.tab_id.clone();
                         this.preview.threads.entry(session.thread_id.clone()).or_default().apply_snapshot(moved, true);
-                        this.open_surface(Surface::Browser(tab), window, cx);
+                        if let Some(origin) = &origin {
+                            this.open_surface_on(origin, Surface::Browser(tab), window, cx);
+                        }
                         this.close_preview_tab(session.thread_id.clone(), session.tab_id.clone(), window, cx);
                     }
                     Err(error) => window.push_notification(

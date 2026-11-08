@@ -628,6 +628,22 @@ impl Workspace {
         cx.notify();
     }
 
+    /// [`open_surface`](Self::open_surface) on `target`'s panel, which may not be the one showing.
+    pub(super) fn open_surface_on(
+        &mut self,
+        target: &Target,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target.as_ref() == Some(target) {
+            return self.open_surface(surface, window, cx);
+        }
+        let panel = self.right_panel.panels.entry(target.clone()).or_default();
+        panel.user_revision += 1;
+        panel.upsert(surface);
+    }
+
     fn activate_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = self.user_panel_state().filter(|panel| panel.surfaces.contains(&surface)) {
             panel.open = true;
