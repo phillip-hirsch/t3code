@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::model::{ModelSelection, ProjectShell, ServerInfo};
+use crate::settings::scope::{Scope, ScopeKind};
 
 /// `ScheduledTask` (`packages/contracts/src/scheduledTask.ts`). The schedule, workspace
 /// strategy and model selection stay raw so a save sends back what it did not edit.
@@ -463,10 +464,28 @@ pub(super) fn default_model(info: &ServerInfo, project: Option<&ProjectShell>) -
 }
 
 /// `defaultScheduledTaskProjectId` for the unscoped (global) selection: a pinned open project, then any open one.
-pub(super) fn default_project_id(projects: &[ProjectShell]) -> String {
+/// `defaultScheduledTaskProjectId`: a pinned open project, then any open one; an archived one
+/// only when Settings is scoped to it, so that scope can still save.
+pub(super) fn default_project_id(projects: &[ProjectShell], scoped_to_project: bool) -> String {
     let mut open = projects.iter().filter(|p| p.archived_at.is_none());
     let first = open.clone().next();
-    open.find(|p| p.pinned_at.is_some()).or(first).map(|p| p.id.clone()).unwrap_or_default()
+    let fallback = projects.first().filter(|_| scoped_to_project);
+    open.find(|p| p.pinned_at.is_some()).or(first).or(fallback).map(|p| p.id.clone()).unwrap_or_default()
+}
+
+/// `matchesScheduledTaskScope`: a task shows, and a project can take one, when its environment
+/// is selected and, under a project scope, it belongs to one of the picked checkouts.
+pub(super) fn matches_scope(scope: &Scope, environment_id: &str, project_id: &str) -> bool {
+    if !scope.environment_ids.iter().any(|id| id == environment_id) {
+        return false;
+    }
+    match &scope.kind {
+        ScopeKind::Unavailable { .. } => false,
+        ScopeKind::Project { members } => {
+            members.iter().any(|m| m.environment_id == environment_id && m.id == project_id)
+        }
+        ScopeKind::All | ScopeKind::Environment => true,
+    }
 }
 
 const RUNTIME_MODES: [&str; 4] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
@@ -722,9 +741,39 @@ mod tests {
 
     #[test]
     fn default_project_prefers_pinned_open_projects() {
-        assert_eq!(default_project_id(&[project("a", false, false), project("b", true, false)]), "b");
-        assert_eq!(default_project_id(&[project("a", true, true), project("b", false, false)]), "b");
-        assert_eq!(default_project_id(&[project("a", false, true)]), "");
+        assert_eq!(default_project_id(&[project("a", false, false), project("b", true, false)], false), "b");
+        assert_eq!(default_project_id(&[project("a", true, true), project("b", false, false)], false), "b");
+        assert_eq!(default_project_id(&[project("a", false, true)], false), "");
+        assert_eq!(default_project_id(&[project("a", false, true)], true), "a");
+    }
+
+    #[test]
+    fn tasks_match_the_selected_environments_and_picked_checkouts() {
+        use crate::settings::scope::Project;
+        let scope = |kind, environments: &[&str]| Scope {
+            kind,
+            label: String::new(),
+            environment_ids: environments.iter().map(|id| (*id).to_owned()).collect(),
+        };
+        let checkout = |id: &str, environment: &str| Project {
+            id: id.into(),
+            environment_id: environment.into(),
+            name: "repo".into(),
+            workspace_root: "/repo".into(),
+            legacy_model_selection: None,
+            legacy_thread_env_mode: None,
+        };
+        let all = scope(ScopeKind::All, &["laptop", "server"]);
+        assert!(matches_scope(&all, "server", "p9"));
+        assert!(!matches_scope(&all, "gone", "p9"));
+        let laptop = scope(ScopeKind::Environment, &["laptop"]);
+        assert!(matches_scope(&laptop, "laptop", "p9"));
+        assert!(!matches_scope(&laptop, "server", "p9"));
+        let project = scope(ScopeKind::Project { members: vec![checkout("p1", "laptop")] }, &["laptop"]);
+        assert!(matches_scope(&project, "laptop", "p1"));
+        assert!(!matches_scope(&project, "laptop", "p2"));
+        let unavailable = scope(ScopeKind::Unavailable { message: "gone" }, &["laptop"]);
+        assert!(!matches_scope(&unavailable, "laptop", "p1"));
     }
 
     fn info(providers: Value, settings: Value) -> ServerInfo {

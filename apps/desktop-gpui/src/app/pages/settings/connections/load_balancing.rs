@@ -97,7 +97,7 @@ impl Workspace {
                         text_xs(div().min_w_0().truncate().text_color(t.muted_foreground)).child(summary)
                     })),
             )
-            .child(switch(&toggle_id, enabled, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            .child(switch(&toggle_id, enabled, false).on_click(cx.listener(move |this, _, window, cx| {
                 this.update_settings(json!({"loadBalancingEnabled": !enabled}), window, cx);
             })));
         let body = open.then(|| {

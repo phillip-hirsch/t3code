@@ -205,3 +205,44 @@ fn owner_applies_requested_value_before_the_next_activation(cx: &mut TestAppCont
         assert!(!owner.read(cx).checked);
     });
 }
+
+#[gpui::test]
+fn radio_group_arrows_move_focus_and_selection_from_the_selected_radio(cx: &mut TestAppContext) {
+    struct Owner {
+        selected: usize,
+        requests: Vec<usize>,
+    }
+
+    impl Render for Owner {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("owner").tab_group().child(
+                RadioGroup::new("group")
+                    .selected_index(Some(self.selected))
+                    .child(Radio::new("first").label("First"))
+                    .child(Radio::new("second").label("Second").disabled(true))
+                    .child(Radio::new("third").label("Third"))
+                    .on_change(cx.listener(|owner, ix: &usize, _, cx| {
+                        owner.requests.push(*ix);
+                        owner.selected = *ix;
+                        cx.notify();
+                    })),
+            )
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let (owner, visual) = cx.add_window_view(|_, _| Owner {
+        selected: 2,
+        requests: Vec::new(),
+    });
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.focus_next(cx);
+    });
+    for key in ["down", "up"] {
+        visual.simulate_keystrokes(key);
+        visual.run_until_parked();
+    }
+    // Tab reached the selected radio; Down wrapped past the end and Up skipped the disabled one.
+    assert_eq!(owner.read_with(visual, |owner, _| owner.requests.clone()), vec![0, 2]);
+}

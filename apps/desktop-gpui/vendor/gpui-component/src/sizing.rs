@@ -154,13 +154,13 @@ impl Size {
         }
     }
 
-    /// Returns an input's height, as [`StyleSized::input_h`] sets it.
-    pub(crate) fn input_height(&self) -> Pixels {
+    /// Returns an input's height in rems, as [`StyleSized::input_h`] sets it.
+    pub(crate) fn input_height_rems(&self) -> f32 {
         match self {
-            Self::Large => px(44.),
-            Self::Medium => px(32.),
-            Self::XSmall => px(20.),
-            _ => px(24.),
+            Self::Large => 2.75,
+            Self::Medium => 2.,
+            Self::XSmall => 1.25,
+            _ => 1.5,
         }
     }
 

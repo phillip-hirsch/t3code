@@ -249,11 +249,13 @@ pub struct Appearance {
     /// `glassOpacity`, 40-100 percent.
     pub glass: f32,
     pub fonts: Fonts,
+    /// `fontSmoothing`: thin grayscale text smoothing instead of the macOS default.
+    pub thin_smoothing: bool,
 }
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { contrast: 100., glass: 80., fonts: Fonts::default() }
+        Self { contrast: 100., glass: 80., fonts: Fonts::default(), thin_smoothing: true }
     }
 }
 
@@ -268,6 +270,7 @@ impl Appearance {
             contrast: percent("appearanceContrast", 100.).clamp(50., 200.),
             glass: percent("glassOpacity", 80.).clamp(40., 100.),
             fonts: Fonts::from_settings(settings),
+            thin_smoothing: settings.get("fontSmoothing").as_bool().unwrap_or(true),
         }
     }
 }
@@ -427,7 +430,7 @@ impl Tokens {
             row_hover: c.sidebar_row_hover,
             row_active: c.sidebar_row_active,
             sheet_row_hover: c.sidebar_row_hover,
-            sheet_row_selected: c.sidebar_row_active,
+            sheet_row_selected: c.sidebar_row_selected,
             icon: c.icon_muted,
         };
         self
@@ -583,6 +586,7 @@ pub fn sync(window: &mut Window, cx: &mut App) {
     let choice = cx.try_global::<Preference>().map(|preference| preference.0.clone()).unwrap_or_default();
     let mut appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
     appearance.fonts = appearance.fonts.installed_or_default(cx);
+    cx.text_system().set_thin_font_smoothing(appearance.thin_smoothing);
     let base = match cx.try_global::<EditorPreview>().and_then(|preview| preview.0) {
         Some((dark, colors)) => if dark { Tokens::dark() } else { Tokens::light() }.themed(&colors),
         None => Tokens::for_choice(&choice, system_dark(window)),
@@ -743,6 +747,12 @@ mod tests {
         let unset = fonts(serde_json::json!({ TYPOGRAPHY_ADVANCED_KEY: true, "fontFamilyCode": "Courier New" }));
         assert_eq!(unset.terminal, FONT_MONO, "an unset terminal font is the default stack, not the code font");
         assert_eq!((separate.prompt_size, separate.terminal_size), (16., 11.));
+        let thin = |stored: serde_json::Value| {
+            Appearance::from_settings(&Settings::layered(&crate::settings::contract().client_defaults, &stored))
+                .thin_smoothing
+        };
+        assert!(thin(serde_json::Value::Null), "thin smoothing is the default, as on the web");
+        assert!(!thin(serde_json::json!({ "fontSmoothing": false })));
     }
 
     #[test]
@@ -754,6 +764,7 @@ mod tests {
         assert_eq!(hex_of(tokens.background), hex_of(colors.canvas));
         assert_eq!(hex_of(tokens.primary), hex_of(colors.message_action));
         assert_eq!(hex_of(tokens.sidebar.row_active), hex_of(colors.sidebar_row_active));
+        assert_eq!(hex_of(tokens.sidebar.sheet_row_selected), hex_of(colors.sidebar_row_selected));
         assert_eq!(
             hex_of(Tokens::for_choice(&Default::default(), false).background),
             hex_of(Tokens::light().background)

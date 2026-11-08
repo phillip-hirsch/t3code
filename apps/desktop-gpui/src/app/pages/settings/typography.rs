@@ -8,7 +8,7 @@ use gpui_kit::component::{Icon, IndexPath, Sizable as _, WindowExt as _, h_flex,
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative, rems, rgb,
+    Styled as _, Subscription, Window, div, px, relative, rems, rgb,
 };
 use serde_json::{Map, Value, json};
 
@@ -186,21 +186,35 @@ impl Workspace {
             ),
         );
         let separate_switch =
-            switch(&"separate-fonts".into(), separate, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            switch(&"separate-fonts".into(), separate, false).on_click(cx.listener(move |this, _, window, cx| {
                 let patch = Map::from_iter([(TYPOGRAPHY_ADVANCED_KEY.to_owned(), Value::Bool(!separate))]);
                 this.client_settings.apply(&patch);
                 theme::set_appearance(theme::Appearance::from_settings(&this.client_settings.values), window, cx);
                 cx.notify();
             }));
-        // `FontSmoothingRow` is macOS-only, and GPUI has no grayscale smoothing to switch to.
-        let advanced = [self.setting_row(
-            view,
-            SettingRow::new("separate-fonts")
-                .description("Set the prompt, code, and terminal fonts separately instead of one monospace font.")
-                .control(separate_switch),
-            window,
-            cx,
-        )];
+        let mut advanced = vec![
+            self.setting_row(
+                view,
+                SettingRow::new("separate-fonts")
+                    .description("Set the prompt, code, and terminal fonts separately instead of one monospace font.")
+                    .control(separate_switch),
+                window,
+                cx,
+            ),
+        ];
+        if cfg!(target_os = "macos") {
+            advanced.push(
+                self.setting_row(
+                    view,
+                    SettingRow::new("font-smoothing")
+                        .description("Use thinner grayscale text smoothing instead of the macOS default.")
+                        .setting("fontSmoothing")
+                        .switch(),
+                    window,
+                    cx,
+                ),
+            );
+        }
         items.push(self.advanced_fold("typography", advanced, cx));
         settings_section("typography", "Typography", items, &t)
     }
@@ -235,15 +249,14 @@ impl Workspace {
         let below_sm = window.viewport_size().width < px(640.);
         // `min-w-36 flex-1 sm:w-44 sm:flex-none` on the picker's wrapper.
         let family_picker = |stacked: bool| {
-            // `SelectButton size="sm"`; the popup is `w-72`, or the trigger's width when the
-            // stacked trigger is the wider.
+            // `SelectButton size="sm"`; the popup is `w-72`, at least the trigger's width.
             let select = t
                 .breakpoint
                 .control_text(Select::new(&picker).small())
                 .w_full()
                 .h(px(t.breakpoint.pick(32., 28.)))
                 .px(px(9.))
-                .when(!(stacked && below_sm), |select| select.menu_width(px(288.)))
+                .menu_width(px(288.))
                 .placeholder(row.default_family.clone())
                 .search_placeholder("Search fonts…");
             div()

@@ -76,6 +76,13 @@ edges (`collisionPadding`). The patch:
 - Tests: the focus test above and `tooltip_hides_when_its_element_moves_from_under_a_still_mouse`
   check the placement.
 
+**Text can drop macOS font smoothing.** The web's Font smoothing setting (on by default) sets
+`-webkit-font-smoothing: antialiased`, thin grayscale text. 0.3.11 always applies macOS's
+color-dependent stroke dilation when the user allows smoothing. The patch, in
+`src/text_system.rs`: `TextSystem::set_thin_font_smoothing`, which makes
+`glyph_dilation_for_color` return 0. Dilation is part of the glyph cache key, so the next frame
+paints with the change. No test: only the macOS text system dilates.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -221,13 +228,14 @@ menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
 
-**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 4px taller
-with 16px text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
+**Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 0.25rem taller
+with 1rem text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
 an input the same at every width. Files:
 
-- `src/input/input.rs`: `Input::render` adds the 4px and `text_base` below 640px, before the
+- `src/input/input.rs`: `Input::render` adds the 0.25rem and `text_base` below 640px, before the
   caller's style refinement, so a call site's own height or text size still wins.
-- `src/sizing.rs`: `Size::input_height`, the height `input_h` sets.
+- `src/sizing.rs`: `Size::input_height_rems`, the height `input_h` sets, in rems so it scales with the
+  interface font size.
 
 **A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
 its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
@@ -237,3 +245,36 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
 `rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
+
+**A selected radio shows a dot.** The web's `Radio` marks the selection with a centered dot
+(`size-2 sm:size-1.5`) in a `size-4.5 sm:size-4` circle; 0.9.0 draws the checkbox's checkmark at one
+size. `src/radio.rs` draws the dot and grows the default size below 640px.
+
+**A radio group moves with the arrow keys.** The web's `RadioGroup` (Base UI) is one tab stop, the
+selected radio or else the first enabled one, and the arrow keys move focus and the selection to the
+next enabled radio, wrapping; it can carry an accessible name. 0.9.0's `RadioGroup` made every radio a
+tab stop and ignored the arrows. `src/radio.rs`: the group owns its radios' focus handles, sets their
+tab stops, handles Up/Down/Left/Right (`arrow_target`) and takes `accessibility_label`. Tests:
+`arrow_keys_wrap_and_skip_disabled_radios`, and in `tests/integration/controlled_change_callbacks.rs`,
+`radio_group_arrows_move_focus_and_selection_from_the_selected_radio`.
+
+**Dialogs take the web's default geometry.** The web's `DialogPopup` centers in the window,
+`max-w-lg` (512px) wide with `rounded-2xl` corners; 0.9.0 sat dialogs a tenth of the viewport down,
+448px wide with `radius_lg`. `src/dialog/dialog.rs` makes centered and 512px the defaults (an
+explicit `margin_top` still places one from the top) and rounds the surface 16px;
+`src/dialog/footer.rs` rounds the footer 15px to sit inside the border.
+
+**Tooltips follow keyboard focus.** The web's `TooltipTrigger` opens on keyboard focus
+(`useFocus({ visibleOnly })`), closes on blur and dismisses on Escape; 0.9.0's managed tooltips
+answer the pointer only. `src/tooltip.rs` adds `managed_tooltip_focusable` (and
+`ComponentTooltip::apply_focusable`), which watches the trigger's focus handle at prepaint and
+shows the tooltip at once on a keyboard focus, hides it on blur, and hides it on Escape;
+`Button`, `Checkbox` and `Radio` pass their focus handles.
+
+**A select's popup is at least its trigger's width.** The web's select and combobox popups set
+their own width with `min-w-(--anchor-width) max-w-(--available-width)`; 0.9.0's `Select` with a
+`menu_width` used that width alone, so a wide trigger had a narrower popup. In `src/select.rs` a
+set width is at least the trigger's and at most the window's less the 8px margins.
+
+**Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
+gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.

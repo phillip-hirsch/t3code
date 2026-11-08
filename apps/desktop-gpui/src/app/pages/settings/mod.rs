@@ -41,14 +41,14 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, FocusHandle, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle, SharedString,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::{Map, Value};
 
 use crate::app::Workspace;
 use crate::settings::scope::{ScopeKind, ScopeSearch};
-use crate::settings::{SearchItem, ThemePreference, contract};
+use crate::settings::{SearchItem, TYPOGRAPHY_ADVANCED_KEY, ThemePreference, contract};
 use crate::theme::{self, Tokens};
 use crate::themes::ThemeChoice;
 use widgets::SettingsView;
@@ -146,6 +146,40 @@ fn section_nav_step<'a>(key: &str, sections: &[&'a str], focused: &str) -> Optio
     Some(sections[next])
 }
 
+/// The vertical scroll offset that brings a row spanning `row` (top, bottom) into a viewport
+/// spanning `viewport` with the least movement (`scrollIntoView({ block: "nearest" })`).
+fn nearest_scroll_offset(offset: Pixels, viewport: (Pixels, Pixels), row: (Pixels, Pixels)) -> Pixels {
+    if row.0 < viewport.0 {
+        (offset + viewport.0 - row.0).min(px(0.))
+    } else if row.1 > viewport.1 {
+        offset - (row.1 - viewport.1)
+    } else {
+        offset
+    }
+}
+
+/// Scrolls the nav row `id` into view on its first paint after the arrow keys move to it.
+fn reveal_nav_row(id: &'static str, pending: Rc<Cell<Option<&'static str>>>, scroll: ScrollHandle) -> impl IntoElement {
+    gpui_kit::canvas(
+        move |bounds, window, _| {
+            if pending.take() != Some(id) {
+                return;
+            }
+            let viewport = scroll.bounds();
+            let offset = scroll.offset();
+            let y =
+                nearest_scroll_offset(offset.y, (viewport.top(), viewport.bottom()), (bounds.top(), bounds.bottom()));
+            if y != offset.y {
+                scroll.set_offset(gpui_kit::point(offset.x, y));
+                window.request_animation_frame();
+            }
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 fn nav_section(id: &str) -> &str {
     DETAIL_PAGES.iter().find(|(page, ..)| *page == id).map_or(id, |(.., parent)| parent)
 }
@@ -187,6 +221,15 @@ pub(in crate::app) struct SettingsUi {
     pub(in crate::app) providers_narrow: bool,
     /// The provider editor is too narrow for its rows' controls to sit beside their titles.
     pub(in crate::app) provider_rows_stacked: bool,
+    /// The environment and provider instance a navigation asked Providers to open
+    /// (`/settings/providers?environmentId&instanceId`), until the page takes it.
+    pub(in crate::app) provider_target: Option<(SharedString, String)>,
+    /// The environment and scheduled task a link asked Scheduled tasks to open
+    /// (`/settings/scheduled-tasks?environmentId&taskId`), until its editor closes.
+    pub(in crate::app) scheduled_task_link: Option<(SharedString, String)>,
+    /// The environment Sharing & access was switched to ("Showing access for"); the primary
+    /// while it is `None` or no longer listed.
+    pub(in crate::app) access_environment: Option<SharedString>,
     search: Entity<InputState>,
     /// Below `md` the nav is an icon rail; searching expands it over the page (`compactSearchOpen`).
     compact_search_open: bool,
@@ -222,6 +265,13 @@ pub(in crate::app) struct SettingsUi {
     /// The section the arrow keys last moved to and the page that was open then: the nav's one
     /// Tab stop while that page stays open (`useSettingsSectionNavigation`).
     nav_tab_stop: Option<(&'static str, SharedString)>,
+    nav_scroll: ScrollHandle,
+    /// The row the arrow keys just moved to, scrolled into view on its next paint.
+    nav_reveal: Rc<Cell<Option<&'static str>>>,
+    /// The last focused field's pending commit, run before Settings closes.
+    focused_field: Option<fields::FieldFlush>,
+    /// Each connected environment's session check, for its `settings:write` grant.
+    grants: HashMap<String, (gpui_kit::Task<()>, connections::SessionLoad)>,
     _search_subscription: Subscription,
 }
 
@@ -251,6 +301,9 @@ impl SettingsUi {
         });
         Self {
             scope: ScopeSearch::default(),
+            provider_target: None,
+            access_environment: None,
+            scheduled_task_link: None,
             search,
             compact_search_open: false,
             active_result: 0,
@@ -273,6 +326,10 @@ impl SettingsUi {
             focus_on_render: false,
             nav_focus: HashMap::new(),
             nav_tab_stop: None,
+            nav_scroll: ScrollHandle::new(),
+            nav_reveal: Rc::default(),
+            focused_field: None,
+            grants: HashMap::new(),
             _search_subscription: subscription,
         }
     }
@@ -433,8 +490,10 @@ impl Workspace {
         }
         let t = *theme::tokens(cx);
         let view = self.settings_view();
+        self.load_scope_project_files(&view, cx);
+        self.check_settings_grants(cx);
         self.sync_scope_project_picker(&view, window, cx);
-        let content = self.render_settings_section(&section, &view, window, cx);
+        let content = self.with_section_target(|this| this.render_settings_section(&section, &view, window, cx), &t);
         let titlebar = f32::from(crate::app::titlebar::native_titlebar_height(window));
         let insets = modal_insets(f32::from(window.viewport_size().width), titlebar);
         Some(
@@ -449,7 +508,7 @@ impl Workspace {
                         .absolute()
                         .inset_0()
                         .bg(theme::dialog_backdrop(&t))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx))),
                 )
                 .child(
                     div()
@@ -531,7 +590,7 @@ impl Workspace {
             self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
             return true;
         }
-        self.close_settings(cx);
+        self.close_settings(window, cx);
         true
     }
 
@@ -570,13 +629,15 @@ impl Workspace {
         self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
         self.settings_ui.compact_search_open = false;
         let target = item.target_id.clone().unwrap_or_else(|| item.id.clone());
-        // A row inside a fold opens it first.
-        if matches!(target.as_str(), "panel-animations" | "environment-identification" | "composer-context") {
-            self.settings_ui.advanced_open.insert("appearance");
+        if let Some(fold) = advanced_fold_for(&target) {
+            self.settings_ui.advanced_open.insert(fold);
         }
-        if matches!(target.as_str(), "browser-default-viewport" | "browser-default-zoom" | "browser-default-appearance")
-        {
-            self.settings_ui.advanced_open.insert("browser");
+        // `revealSettingsSearchTarget`: these rows exist only with separate fonts on, and the
+        // terminal reads the same flag, so it stays on.
+        if matches!(target.as_str(), "prompt-font" | "terminal-font") {
+            let patch = Map::from_iter([(TYPOGRAPHY_ADVANCED_KEY.to_owned(), Value::Bool(true))]);
+            self.client_settings.apply(&patch);
+            theme::set_appearance(theme::Appearance::from_settings(&self.client_settings.values), window, cx);
         }
         self.open_settings(item.to.clone(), cx);
         self.settings_ui.target = Some(target.into());
@@ -605,6 +666,7 @@ impl Workspace {
                 let Some(next) = section_nav_step(key, &nav_sections(), focused) else { return };
                 let page = self.settings.clone().unwrap_or_default();
                 self.settings_ui.nav_tab_stop = Some((next, page));
+                self.settings_ui.nav_reveal.set(Some(next));
                 if let Some(handle) = self.settings_ui.nav_focus.get(next) {
                     window.focus(handle, cx);
                 }
@@ -612,6 +674,13 @@ impl Workspace {
             }
         }
         cx.stop_propagation();
+    }
+
+    /// Commits the focused field's draft before Settings unmounts it.
+    pub(in crate::app) fn flush_settings_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(flush) = self.settings_ui.focused_field.take() {
+            flush(self, window, cx);
+        }
     }
 
     pub(super) fn select_settings_section(&mut self, id: &'static str, cx: &mut Context<Self>) {
@@ -789,6 +858,8 @@ impl Workspace {
                 self.settings_ui.nav_focus.entry(id).or_insert_with(|| cx.focus_handle());
             }
             let nav_focus = &self.settings_ui.nav_focus;
+            let nav_scroll = &self.settings_ui.nav_scroll;
+            let nav_reveal = &self.settings_ui.nav_reveal;
             let keyboard = window.last_input_was_keyboard();
             let groups =
                 v_flex().gap(px(16.)).children(SETTINGS.iter().enumerate().map(|(index, (heading, items))| {
@@ -813,8 +884,12 @@ impl Workspace {
                             // `focus-visible:ring-2 focus-visible:ring-inset ring-ring`
                             let ring = (keyboard && focus.is_focused(window))
                                 .then(|| vec![BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset()]);
+                            let reveal = (nav_reveal.get() == Some(id))
+                                .then(|| reveal_nav_row(id, nav_reveal.clone(), nav_scroll.clone()));
                             h_flex()
                                 .id(SharedString::from(format!("settings-nav-{id}")))
+                                .relative()
+                                .children(reveal)
                                 .track_focus(&focus)
                                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                                     this.on_settings_nav_key(id, event, window, cx);
@@ -865,6 +940,7 @@ impl Workspace {
             .bg(sb.sheet)
             .text_color(sb.foreground)
             .overflow_y_scroll()
+            .track_scroll(&self.settings_ui.nav_scroll)
             .p(px(8.))
             .gap(px(8.))
             .children(search_row)
@@ -925,7 +1001,7 @@ impl Workspace {
                         .rounded(px(8.))
                         .child(Icon::new(IconName::X).size(px(16.)))
                         .tooltip("Close (Esc)")
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx))),
                 ),
             )
             .into_any_element()
@@ -1086,9 +1162,36 @@ fn kbd(key: &'static str, t: &Tokens) -> impl IntoElement {
         .child(key)
 }
 
+/// The `AdvancedSettings` fold each search target sits in (its `targetIds`), so a jump opens it
+/// before the row is laid out.
+fn advanced_fold_for(target: &str) -> Option<&'static str> {
+    const FOLDS: &[(&str, &[&str])] = &[
+        ("appearance", &["panel-animations", "environment-identification", "appearance-interface", "composer-context"]),
+        ("browser", &["browser-default-viewport", "browser-default-zoom", "browser-default-appearance"]),
+        ("chat", &["skills-in-slash-menu"]),
+        ("threads", &["thread-title-instructions", "response-streaming"]),
+        ("typography", &["separate-fonts", "font-smoothing"]),
+        ("source-control", &["follow-change-request-templates", "source-control-writer-model"]),
+        ("worktree-creation", &["worktree-submodules"]),
+        ("worktree-cleanup", &["storage-worktrees", "storage-worktree-keep-when"]),
+    ];
+    FOLDS.iter().find(|(_, targets)| targets.contains(&target)).map(|(fold, _)| *fold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_jump_opens_the_fold_its_target_sits_in() {
+        assert_eq!(advanced_fold_for("skills-in-slash-menu"), Some("chat"));
+        assert_eq!(advanced_fold_for("response-streaming"), Some("threads"));
+        assert_eq!(advanced_fold_for("separate-fonts"), Some("typography"));
+        assert_eq!(advanced_fold_for("appearance-interface"), Some("appearance"));
+        assert_eq!(advanced_fold_for("storage-worktrees"), Some("worktree-cleanup"));
+        assert_eq!(advanced_fold_for("prompt-font"), None, "shown by separate fonts, not a fold");
+        assert_eq!(advanced_fold_for("word-wrap"), None);
+    }
 
     #[test]
     fn arrow_keys_walk_the_settings_sections_and_stop_at_the_ends() {
@@ -1101,6 +1204,15 @@ mod tests {
         assert_eq!(section_nav_step("home", &sections, "chat"), Some("general"));
         assert_eq!(section_nav_step("right", &sections, "general"), None, "sections are leaves");
         assert!(nav_sections().starts_with(&["general", "appearance"]));
+    }
+
+    #[test]
+    fn a_nav_row_scrolls_into_view_by_the_nearest_edge() {
+        let viewport = (px(100.), px(300.));
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(120.), px(152.))), px(-40.), "already in view");
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(290.), px(322.))), px(-62.), "below: bottom edge");
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(80.), px(112.))), px(-20.), "above: top edge");
+        assert_eq!(nearest_scroll_offset(px(-10.), viewport, (px(60.), px(92.))), px(0.), "never past the top");
     }
 
     #[test]

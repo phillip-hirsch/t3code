@@ -1,7 +1,7 @@
 //! Settings sections in the general group; see `SETTINGS` in `mod.rs`.
 
 use gpui_kit::component::menu::DropdownMenu as _;
-use gpui_kit::{Anchor, AnyElement, Context, StatefulInteractiveElement as _, Window};
+use gpui_kit::{Anchor, AnyElement, Context, Window};
 use serde_json::json;
 
 use super::widgets::{SettingRow, select_trigger, settings_section, switch};
@@ -35,8 +35,8 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let grouping = view.str("sidebarProjectGroupingMode").to_owned();
-        let grouping_switch = switch(&"project-grouping".into(), grouping != "separate", false, &t).on_click(
-            cx.listener(move |this, _, window, cx| {
+        let grouping_switch = switch(&"project-grouping".into(), grouping != "separate", false).on_click(cx.listener(
+            move |this, _, window, cx| {
                 let next = if grouping == "separate" {
                     this.settings_ui.last_grouping_mode
                 } else {
@@ -45,8 +45,8 @@ impl Workspace {
                     "separate"
                 };
                 this.update_settings(json!({ "sidebarProjectGroupingMode": next }), window, cx);
-            }),
-        );
+            },
+        ));
 
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let notifications = [

@@ -1,6 +1,8 @@
 //! The instance list and the selected instance's editor (`ProviderInstanceCard.tsx`,
 //! `ProviderSettingsForm.tsx`, `providerStatus.ts`, the row building in `ProviderSettingsPanel.tsx`).
 
+use std::collections::HashSet;
+
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
@@ -14,7 +16,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::super::widgets::{SettingsView, layer_row, reset_button};
+use super::super::widgets::{layer_row, reset_button};
 use super::accent::{accent_color_picker, hex_color, normalize_accent_color};
 use super::accounts::codex_setup_managed;
 use super::drivers::{self, Driver, EnvironmentField};
@@ -46,11 +48,14 @@ impl InstanceRow {
 
 pub(super) use crate::settings::scope::instance_enabled as resolve_enabled;
 
-/// The projects whose provider switches the page edits (`projectIds`), when the server keeps
-/// per-project provider overrides (`projectProviderInstanceOverrides`).
-pub(super) fn override_projects(view: &SettingsView, supported: bool) -> Vec<String> {
-    match &view.scope.kind {
-        ScopeKind::Project { members } if supported => members.iter().map(|m| m.id.clone()).collect(),
+/// The projects whose provider switches the page edits (`projectIds`): the scope's members on
+/// the providers' own environment, when its server keeps per-project provider overrides
+/// (`projectProviderInstanceOverrides`).
+pub(super) fn override_projects(kind: &ScopeKind, environment: Option<&str>, supported: bool) -> Vec<String> {
+    match kind {
+        ScopeKind::Project { members } if supported => {
+            members.iter().filter(|m| Some(m.environment_id.as_str()) == environment).map(|m| m.id.clone()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -426,6 +431,51 @@ pub(super) fn with_key(instance: &Value, key: &str, value: Option<Value>) -> Val
     Value::Object(next)
 }
 
+/// `managedInstanceLocks(...)`'s environment part: the variables an administrator pins by
+/// name, whether it pins the whole environment, and why.
+pub(super) struct EnvironmentLocks {
+    names: HashSet<String>,
+    whole: bool,
+    reason: SharedString,
+}
+
+impl EnvironmentLocks {
+    pub(super) fn of(policy: &Value, driver: &str) -> Option<Self> {
+        let paths = policy.pointer(&format!("/limits/providers/lockedInstanceFields/{driver}"))?.as_array()?;
+        let paths: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let organization = policy.get("organization").and_then(Value::as_str).unwrap_or_default();
+        Some(Self {
+            names: paths.iter().filter_map(|p| p.strip_prefix("environment.")).map(str::to_owned).collect(),
+            whole: paths.contains(&"environment"),
+            reason: format!("Managed by {organization}.").into(),
+        })
+    }
+
+    /// The reason a variable is not editable, when it is pinned or the whole environment is.
+    fn locking(&self, name: &str) -> Option<SharedString> {
+        (self.whole || self.names.contains(name)).then(|| self.reason.clone())
+    }
+}
+
+/// A variable the policy pins: its name and why, with nothing to edit or remove.
+fn pinned_variable(name: &str, reason: &SharedString, t: &Tokens) -> AnyElement {
+    h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .gap(px(6.))
+        .child(div().min_w_0().w(px(176.)).truncate().font_family(t.fonts.mono).text_xs().child(name.to_owned()))
+        .child(div().text_xs().text_color(t.muted_foreground).child(reason.clone()))
+        .into_any_element()
+}
+
+/// A row name the policy pins: renaming into it is ignored, as the web's `updateVariable`.
+fn pinned_name(policy: &Value, driver: &str, name: &str) -> bool {
+    EnvironmentLocks::of(policy, driver).is_some_and(|locks| locks.names.contains(name))
+}
+
 fn environment(instance: &Value) -> Vec<Value> {
     instance.get("environment").and_then(Value::as_array).cloned().unwrap_or_default()
 }
@@ -724,7 +774,8 @@ impl Workspace {
                 && p.pointer("/versionAdvisory/canInstallVersion") == Some(&json!(true))
         });
         let can_update = live.as_ref().is_some_and(is_settings_update_candidate);
-        let action = if advisory.target_version.is_some() { can_install } else { can_update };
+        let action =
+            !self.providers_read_only() && if advisory.target_version.is_some() { can_install } else { can_update };
         let icon = if facts.compatibility_warning {
             gpui_kit::assets::IconName::TriangleAlert
         } else {
@@ -976,6 +1027,7 @@ impl Workspace {
                     })
                     .child(
                         switch(SharedString::from(format!("provider-enabled-{}", row.id)), facts.enabled)
+                            .disabled(self.providers_read_only())
                             .accessibility_label(format!("Enable {}", facts.name))
                             .on_change(cx.listener({
                                 let projects = override_projects.to_vec();
@@ -1145,8 +1197,10 @@ impl Workspace {
         } else {
             self.render_provider_account(&row.id, window, cx).into_iter().collect()
         };
+        let locks = EnvironmentLocks::of(&self.settings_info().managed_policy, &row.driver);
         for field in driver.map_or(&[][..], |d| d.environment_fields) {
-            setup.push(self.render_environment_field(page, row, &instance, field, &t, window, cx));
+            let managed = locks.as_ref().and_then(|locks| locks.locking(field.name));
+            setup.push(self.render_environment_field(page, row, &instance, field, managed, &t, window, cx));
         }
         if !setup.is_empty() {
             sections.push(section("Setup", None, None, setup, false, &t).into_any_element());
@@ -1194,14 +1248,15 @@ impl Workspace {
                 "Environment",
                 None,
                 None,
-                [self.render_environment_variables(page, row, &instance, &t, window, cx)],
+                self.render_environment_section(page, row, &instance, locks.as_ref(), &t, window, cx),
                 false,
                 &t,
             )
             .into_any_element(),
         );
 
-        sections.extend(self.render_acp_session_management(&row.id, false, window, cx));
+        let read_only = self.providers_read_only();
+        sections.extend(self.render_acp_session_management(&row.id, read_only, window, cx));
 
         if driver.is_some() {
             let models = self.render_models_section(page, row, live.as_ref(), &instance, window, cx);
@@ -1395,10 +1450,12 @@ impl Workspace {
                 this.persist_provider_instance(&instance_id, next, window, cx);
             },
         );
-        let input = text_input(&input, (!self.settings_ui.provider_rows_stacked).then_some(224.));
+        let read_only = self.providers_read_only();
+        let input = text_input(&input, (!self.settings_ui.provider_rows_stacked).then_some(224.)).disabled(read_only);
         h_flex()
             .gap_2()
             .justify_end()
+            .when(read_only, |el| el.opacity(0.5))
             .when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::w_full)
             .child(picker)
             .child(input.when(self.settings_ui.provider_rows_stacked, gpui_kit::Styled::flex_1))
@@ -1412,10 +1469,12 @@ impl Workspace {
         row: &InstanceRow,
         instance: &Value,
         field: &'static EnvironmentField,
+        managed: Option<SharedString>,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let read_only = self.providers_read_only();
         let variable = environment(instance).into_iter().find(|v| v["name"] == field.name);
         let redacted = variable.as_ref().is_some_and(|v| v["valueRedacted"] == true);
         let value = variable.as_ref().filter(|_| !redacted).and_then(|v| v["value"].as_str()).unwrap_or_default();
@@ -1453,8 +1512,8 @@ impl Workspace {
         let control = h_flex()
             .map(|el| if stacked { el.w_full() } else { el.w(px(224.)) })
             .gap_2()
-            .child(text_input(&input, None).flex_1())
-            .when(variable.is_some(), |el| {
+            .child(text_input(&input, None).flex_1().disabled(read_only || managed.is_some()))
+            .when(variable.is_some() && managed.is_none() && !read_only, |el| {
                 el.child(
                     ghost_icon_button(
                         SharedString::from(format!("env-field-clear-{}", field.name)),
@@ -1470,7 +1529,17 @@ impl Workspace {
                     })),
                 )
             });
-        settings_row(field.label, field.description, Some(control.into_any_element()), stacked, t).into_any_element()
+        let control = match managed {
+            // `SettingsRow`'s `inertControl`.
+            Some(reason) => div()
+                .id(SharedString::from(format!("env-field-managed-{}", field.name)))
+                .opacity(0.5)
+                .child(control)
+                .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
+                .into_any_element(),
+            None => control.when(read_only, |el| el.opacity(0.5)).into_any_element(),
+        };
+        settings_row(field.label, field.description, Some(control), stacked, t).into_any_element()
     }
 
     /// The saved instance behind a list row, looked up again when a deferred edit commits.
@@ -1526,15 +1595,59 @@ impl Workspace {
     }
 
     /// Generic variables (`ProviderEnvironmentSection`): rows of name, value and sensitivity.
+    /// The Environment section's rows: a whole-environment lock's notice over the editor, which
+    /// it leaves inert.
+    fn render_environment_section(
+        &mut self,
+        page: &Entity<ProvidersPage>,
+        row: &InstanceRow,
+        instance: &Value,
+        locks: Option<&EnvironmentLocks>,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let editor = self.render_environment_variables(page, row, instance, locks, t, window, cx);
+        if self.providers_read_only() {
+            return vec![div().opacity(0.5).child(editor).into_any_element()];
+        }
+        match locks.filter(|locks| locks.whole) {
+            // `ManagedNotice`.
+            Some(locks) => vec![
+                h_flex()
+                    .px_4()
+                    .pt_3()
+                    .items_start()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child(
+                        Icon::empty()
+                            .path("icons/building.svg")
+                            .size(px(14.))
+                            .mt(px(2.))
+                            .flex_none()
+                            .text_color(t.muted_foreground),
+                    )
+                    .child(locks.reason.clone())
+                    .into_any_element(),
+                div().opacity(0.5).child(editor).into_any_element(),
+            ],
+            None => vec![editor],
+        }
+    }
+
     fn render_environment_variables(
         &mut self,
         page: &Entity<ProvidersPage>,
         row: &InstanceRow,
         instance: &Value,
+        locks: Option<&EnvironmentLocks>,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let inert = self.providers_read_only() || locks.is_some_and(|locks| locks.whole);
         let dedicated: Vec<&str> =
             drivers::driver(&row.driver).map_or(vec![], |d| d.environment_fields.iter().map(|f| f.name).collect());
         let generic: Vec<Value> = environment(instance)
@@ -1546,6 +1659,7 @@ impl Workspace {
         let add_page = page.clone();
         let add_button = outline_button("provider-env-add", "Add variable")
             .icon(Icon::new(gpui_kit::assets::IconName::Plus).size(px(12.)))
+            .disabled(inert)
             .on_click(cx.listener(move |_, _, _, cx| {
                 add_page.update(cx, |page, cx| {
                     page.environment.next_id += 1;
@@ -1564,7 +1678,10 @@ impl Workspace {
         let editors = rows
             .iter()
             .enumerate()
-            .map(|(index, env)| self.render_environment_variable(page, row, &dedicated, env, index, t, window, cx))
+            .map(|(index, env)| match locks.filter(|locks| locks.names.contains(&env.name)) {
+                Some(locks) => pinned_variable(&env.name, &locks.reason, t),
+                None => self.render_environment_variable(page, row, &dedicated, env, index, inert, t, window, cx),
+            })
             .collect::<Vec<_>>();
         settings_row("Variables", Some("API keys, base URLs, and other per-instance CLI settings."), Some(add_button.into_any_element()), self.settings_ui.provider_rows_stacked, t)
             .flex_wrap()
@@ -1593,11 +1710,13 @@ impl Workspace {
         dedicated: &[&str],
         env: &EnvRow,
         index: usize,
+        inert: bool,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = env.id;
+        let driver = row.driver.clone();
         let dedicated: Vec<String> = dedicated.iter().map(|s| (*s).to_owned()).collect();
         let publish = move |this: &mut Workspace,
                             page: &Entity<ProvidersPage>,
@@ -1649,6 +1768,9 @@ impl Workspace {
                 cx,
                 move |this, name, window, cx| {
                     let name = name.trim().to_owned();
+                    if pinned_name(&this.settings_info().managed_policy, &driver, &name) {
+                        return;
+                    }
                     update(this, &move |row: &mut EnvRow| row.name = name.clone(), window, cx);
                 },
             )
@@ -1724,7 +1846,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap(px(6.))
-                    .child(text_input(&name_input, None).flex_1().disabled(env.redacted == Some(true)))
+                    .child(text_input(&name_input, None).flex_1().disabled(inert || env.redacted == Some(true)))
                     .child(
                         ghost_icon_button(
                             SharedString::from(format!("env-remove-{id}")),
@@ -1732,17 +1854,18 @@ impl Workspace {
                             t,
                         )
                         .size(px(20.))
+                        .disabled(inert)
                         .tooltip(format!("Remove environment variable {label}"))
                         .on_click(remove),
                     ),
             )
-            .child(h_flex().gap(px(6.)).child(text_input(&value_input, None).flex_1()).when(
+            .child(h_flex().gap(px(6.)).child(text_input(&value_input, None).flex_1().disabled(inert)).when(
                 env.value.is_string(),
                 |el| {
                     el.child(
                         ghost_icon_button(SharedString::from(format!("env-sensitive-{id}")), lock, t)
                             .size(px(20.))
-                            .disabled(env.redacted == Some(true))
+                            .disabled(inert || env.redacted == Some(true))
                             .tooltip(if env.sensitive { "Sensitive, stored separately" } else { "Plain text" })
                             .on_click(toggle),
                     )
@@ -1863,6 +1986,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overrides_reach_only_the_scope_projects_on_the_providers_environment() {
+        let member = |id: &str, environment: &str| scope::Project {
+            id: id.into(),
+            environment_id: environment.into(),
+            name: id.into(),
+            workspace_root: format!("/{id}"),
+            legacy_model_selection: None,
+            legacy_thread_env_mode: None,
+        };
+        let kind =
+            ScopeKind::Project { members: vec![member("a", "local"), member("b", "remote"), member("c", "local")] };
+        assert_eq!(override_projects(&kind, Some("local"), true), ["a", "c"]);
+        assert_eq!(override_projects(&kind, Some("remote"), true), ["b"]);
+        assert!(override_projects(&kind, None, true).is_empty());
+        assert!(override_projects(&kind, Some("local"), false).is_empty());
+        assert!(override_projects(&ScopeKind::All, Some("local"), true).is_empty());
+    }
+
+    #[test]
     fn rows_follow_the_web_order() {
         let settings = json!({"providerInstances": {
             "codex_work": {"driver": "codex", "displayName": "Work"},
@@ -1953,6 +2095,25 @@ mod tests {
         let labeled = json!({"providerInstances": {"codex": {"driver": "codex", "displayName": "Work"}}});
         assert_eq!(with_display_name(&labeled, &[], "codex", "  "), Some(json!({"driver": "codex"})));
         assert_eq!(with_display_name(&settings, &[], "codex_gone", "Work"), None);
+    }
+
+    #[test]
+    fn policy_locks_pin_variables_or_the_whole_environment() {
+        let policy = json!({
+            "organization": "Acme",
+            "limits": {"providers": {"lockedInstanceFields": {
+                "codex": ["environment.OPENAI_BASE_URL", "config.binaryPath"],
+                "claudeAgent": ["environment"]
+            }}}
+        });
+        let codex = EnvironmentLocks::of(&policy, "codex").unwrap();
+        assert_eq!(codex.locking("OPENAI_BASE_URL").as_deref(), Some("Managed by Acme."));
+        assert_eq!(codex.locking("OTHER"), None);
+        assert!(pinned_name(&policy, "codex", "OPENAI_BASE_URL"));
+        let claude = EnvironmentLocks::of(&policy, "claudeAgent").unwrap();
+        assert!(claude.whole && claude.locking("ANY").is_some());
+        assert!(!pinned_name(&policy, "claudeAgent", "ANY"), "a whole lock pins no name");
+        assert!(EnvironmentLocks::of(&policy, "grok").is_none());
     }
 
     #[test]

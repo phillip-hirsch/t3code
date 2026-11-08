@@ -2,10 +2,10 @@
 //! `apps/web/src/components/settings/IntegrationsSettings.tsx`, with `DeviceToolVersions` and
 //! `DeviceHostUpdates` from `apps/web/src/components/device/`). Device sources are in `sources.rs`.
 //!
-//! The web runs each device change on every selected environment; GPUI has one. Scoped in the web:
-//! "Agents can use devices" (`enableAgentDeviceAccess`) has a project override, written as a plain
-//! setting there; "Use devices" (`enableDeviceSupport`) is environment-only. Without a scope here,
-//! both go through `device.configure` like the web's environment scope.
+//! Each device change runs `device.configure` on every selected environment. "Agents can use
+//! devices" (`enableAgentDeviceAccess`) has a project override, written as a plain scoped setting
+//! under a project scope; "Use devices" (`enableDeviceSupport`) and the device sources are
+//! environment-only, so a project scope can't change them.
 
 mod sources;
 
@@ -23,11 +23,13 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
-use crate::app::pages::settings::widgets::SettingsView;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::widgets::{RowFrame, settings_section};
+use crate::app::pages::settings::widgets::{SelectedEnvironment, SettingsView};
 use crate::device::{DeviceState, Pending, SetupStatus, Tool, ToolVersions, tool_version_label};
 use crate::rpc::RpcClient;
 use crate::rpc::RpcError;
+use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
 impl Workspace {
@@ -58,19 +60,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sections = [self.render_device_integration(cx), self.render_device_sources(window, cx)];
+        let project_scope = matches!(view.scope.kind, ScopeKind::Project { .. });
+        let sections = [
+            self.render_device_integration(view, project_scope, cx),
+            self.render_device_sources(project_scope, window, cx),
+        ];
         self.settings_page("devices", view, sections, cx)
     }
 
     /// `DeviceIntegrationControls`: the hub and agent access switches, and the local host's progress.
-    fn render_device_integration(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_device_integration(
+        &self,
+        view: &SettingsView,
+        project_scope: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let empty = DeviceState::default();
         let state = self.settings_device_state().unwrap_or(&empty);
         let connected = self.settings_client().is_some();
         let loaded = connected && self.settings_device_state().is_some();
-        let setting = |key: &str| self.settings_info().settings.bool(key);
-        let (enabled, agent_enabled) = (setting("enableDeviceSupport"), setting("enableAgentDeviceAccess"));
+        let can_configure = self.can_configure_devices();
+        let selected = view.selected_environments();
+        let any_connected = selected.iter().any(|e| e.settings.is_some());
+        let any_hub_enabled = selected.iter().filter_map(|e| e.settings).any(|s| s.bool("enableDeviceSupport"));
+        let enabled = self.settings_info().settings.bool("enableDeviceSupport");
+        let agent_enabled = view.value("enableAgentDeviceAccess").as_bool() == Some(true);
         let busy = state.readiness().busy;
         let pending = self.devices.pending;
 
@@ -88,7 +103,7 @@ impl Workspace {
                     Switch::new("device-hub-switch")
                         .checked(enabled)
                         .accessibility_label("Device hub")
-                        .disabled(!loaded || busy || pending.is_some())
+                        .disabled(!can_configure || project_scope || !loaded || busy || pending.is_some())
                         .on_click(cx.listener(|this, checked: &bool, window, cx| {
                             let mut input = json!({ "enabled": *checked });
                             if *checked {
@@ -115,8 +130,17 @@ impl Workspace {
                     Switch::new("agent-device-access-switch")
                         .checked(agent_enabled)
                         .accessibility_label("Agent device access")
-                        .disabled(!loaded || !enabled || busy || pending.is_some())
-                        .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                        .disabled(
+                            !can_configure
+                                || !any_connected
+                                || (!project_scope && (!loaded || !any_hub_enabled || busy))
+                                || pending.is_some(),
+                        )
+                        .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                            if project_scope {
+                                this.update_settings(json!({ "enableAgentDeviceAccess": *checked }), window, cx);
+                                return;
+                            }
                             this.configure_devices(
                                 Pending::Agent,
                                 json!({ "agentAccessEnabled": *checked }),
@@ -311,18 +335,40 @@ impl Workspace {
         )
     }
 
-    /// `device.configure` with the hub or agent switch's change; the state stream reports the result.
+    /// `canConfigure`: this connection may write settings on the environment the page reads.
+    fn can_configure_devices(&self) -> bool {
+        self.settings_environment().is_some_and(|environment| self.environment_grants(&environment, SETTINGS_WRITE))
+    }
+
+    /// `device.configure` with the hub or agent switch's change on every selected environment;
+    /// the state streams report the results, and one toast names the environments that failed.
     fn configure_devices(&mut self, kind: Pending, input: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.settings_client() else { return };
+        if self.settings_client().is_none() || !self.can_configure_devices() {
+            return;
+        }
+        let view = self.settings_view();
+        let (targets, mut failed) = configure_targets(&view.selected_environments());
+        let requests: Vec<_> = targets
+            .into_iter()
+            .map(|(id, label)| {
+                let (client, input) = (self.env_client(id), input.clone());
+                async move {
+                    let sent = match client {
+                        Some(client) => client.request("device.configure", input).await.is_ok(),
+                        None => false,
+                    };
+                    (label, sent)
+                }
+            })
+            .collect();
         self.devices.pending = Some(kind);
-        let label = self.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("device.configure", input).await;
+            let results = futures::future::join_all(requests).await;
+            failed.extend(results.into_iter().filter(|(_, sent)| !sent).map(|(label, _)| label));
             let _ = this.update_in(cx, |this, window, cx| {
                 this.devices.pending = None;
-                if let Err(error) = result {
-                    log::warn!("device.configure failed: {error}");
-                    let note = Notification::error(format!("Could not update {label}: {}", error_message(&error)))
+                if !failed.is_empty() {
+                    let note = Notification::error(format!("Could not update {}.", failed.join(", ")))
                         .title("Device settings not saved on all environments");
                     window.push_notification(note, cx);
                 }
@@ -370,6 +416,17 @@ impl Workspace {
     }
 }
 
+/// Where a device change goes: the selected environments it can be sent to (id, label), and the
+/// labels of those that fail up front, disconnected or without `settings:write`.
+fn configure_targets<'a>(selected: &[SelectedEnvironment<'a>]) -> (Vec<(&'a str, String)>, Vec<String>) {
+    let (sendable, refused): (Vec<_>, Vec<_>) =
+        selected.iter().partition(|environment| environment.settings.is_some() && environment.can_write);
+    (
+        sendable.into_iter().map(|e| (e.id, e.label.to_owned())).collect(),
+        refused.into_iter().map(|e| e.label.to_owned()).collect(),
+    )
+}
+
 /// `formatEnvironmentQueryError`: the failure's message, else a generic line.
 fn error_message(error: &RpcError) -> String {
     match error {
@@ -415,4 +472,25 @@ fn version_row(label: &'static str, value: String, t: &Tokens) -> Div {
         .gap(px(24.))
         .child(div().text_color(t.muted_foreground).child(label))
         .child(div().font_family(t.fonts.mono).text_right().child(SharedString::from(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    #[test]
+    fn device_changes_go_to_every_writable_connected_environment_and_name_the_rest() {
+        let settings = Settings::default();
+        let env = |id, settings, can_write| SelectedEnvironment { id, label: id, settings, can_write };
+        let selected = [
+            env("laptop", Some(&settings), true),
+            env("server", None, true),
+            env("guest", Some(&settings), false),
+            env("studio", Some(&settings), true),
+        ];
+        let (targets, failed) = configure_targets(&selected);
+        assert_eq!(targets, [("laptop", "laptop".to_owned()), ("studio", "studio".to_owned())]);
+        assert_eq!(failed, ["server", "guest"]);
+    }
 }

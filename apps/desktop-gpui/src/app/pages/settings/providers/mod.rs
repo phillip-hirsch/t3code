@@ -32,12 +32,15 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::connections::SessionLoad;
+use super::connections::logic::PROVIDERS_MANAGE;
 use super::system::background;
 use super::widgets::{SettingRow, select_trigger};
 use crate::app::Workspace;
 use crate::settings::contract;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
+use crate::usage::provider_display_name;
 
 /// A driver's label and its settings that may name a secret reference, with their field labels.
 pub(super) fn driver_secret_fields(kind: &str) -> Option<(&'static str, Vec<(&'static str, &'static str)>)> {
@@ -45,10 +48,32 @@ pub(super) fn driver_secret_fields(kind: &str) -> Option<(&'static str, Vec<(&'s
     Some((driver.label, driver.fields.iter().filter(|f| f.secret).map(|f| (f.key, f.label)).collect()))
 }
 
+/// What this session may do with the environment's providers (`classifyProviderEnvironmentAccess`
+/// over `resolveRemoteOperateAccess`): a failed session check reads as view-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProviderAccess {
+    Checking,
+    ReadOnly,
+    Editable,
+}
+
+impl ProviderAccess {
+    fn of(load: Option<&SessionLoad>) -> Self {
+        match load {
+            None | Some(SessionLoad::Pending) => Self::Checking,
+            Some(load) if load.grants(PROVIDERS_MANAGE) => Self::Editable,
+            Some(_) => Self::ReadOnly,
+        }
+    }
+}
+
 /// What the page keeps between frames, like the panel's React state.
 #[derive(Default)]
 pub(super) struct ProvidersPage {
     selected: Option<String>,
+    /// The instance a navigation asked for (`targetInstanceId`); while it stays selected and
+    /// unlisted, the editor says so instead of showing another provider.
+    target: Option<String>,
     refreshing: bool,
     /// Instances whose `server.updateProvider` call is in flight.
     updating: HashSet<String>,
@@ -89,6 +114,77 @@ fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
     })
 }
 
+/// The row the editor shows and whether a navigation's target is missing (`targetInstanceMissing`):
+/// the selected row, else the first unless the selection is a target that is no longer listed.
+fn selected_row(
+    rows: &[instances::InstanceRow],
+    selected: Option<&str>,
+    target: Option<&str>,
+) -> (Option<instances::InstanceRow>, bool) {
+    let missing = target.is_some() && selected == target && !rows.iter().any(|row| Some(row.id.as_str()) == target);
+    let row = rows.iter().find(|row| Some(row.id.as_str()) == selected).or(if missing { None } else { rows.first() });
+    (row.cloned(), missing)
+}
+
+/// One environment's "Update all" candidates, as `(driver, instance id)`.
+struct UpdateMachine {
+    environment: SharedString,
+    label: String,
+    candidates: Vec<(String, String)>,
+}
+
+/// One dispatched `server.updateProvider` (`ProviderUpdateRun`).
+struct UpdateRun {
+    machine: String,
+    driver: String,
+    instance_id: String,
+    result: Result<Value, crate::rpc::RpcError>,
+}
+
+/// `getProviderUpdateRunToastView`: whether all succeeded, the title and the description.
+fn update_runs_summary(runs: &[UpdateRun]) -> Option<(bool, String, String)> {
+    if runs.is_empty() {
+        return None;
+    }
+    let failures: Vec<String> = runs
+        .iter()
+        .filter_map(|run| {
+            let label = format!("{} · {}", run.machine, provider_display_name(&run.driver));
+            match &run.result {
+                Err(error) => Some(format!("{label}: {}", acp::rpc_message(error))),
+                Ok(reply) => {
+                    let state = reply["providers"]
+                        .as_array()
+                        .and_then(|providers| providers.iter().find(|p| p["instanceId"] == run.instance_id.as_str()))
+                        .map(|provider| &provider["updateState"]);
+                    (state.and_then(|s| s["status"].as_str()) != Some("succeeded")).then(|| {
+                        let message =
+                            state.and_then(|s| s["message"].as_str()).unwrap_or("Provider update did not finish.");
+                        format!("{label}: {message}")
+                    })
+                }
+            }
+        })
+        .collect();
+    let total = runs.len();
+    if failures.is_empty() {
+        let (title, description) = if total == 1 {
+            ("Provider updated".to_owned(), "New sessions will use the updated provider.")
+        } else {
+            (format!("{total} providers updated"), "New sessions will use the updated providers.")
+        };
+        return Some((true, title, description.to_owned()));
+    }
+    let title = if failures.len() < total {
+        format!("{} of {total} provider updates failed", failures.len())
+    } else if total == 1 {
+        "Provider update failed".to_owned()
+    } else {
+        "Provider updates failed".to_owned()
+    };
+    Some((false, title, failures.join("\n")))
+}
+
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
 fn card_height(window: &Window) -> f32 {
     (f32::from(window.viewport_size().height) - 176.).clamp(512., 704.)
@@ -106,14 +202,43 @@ impl Workspace {
             let note = div().px_4().text_sm().text_color(t.muted_foreground).child(message);
             return self.settings_page("providers", &view, [note.into_any_element()], cx);
         }
+        let read_only = match self.provider_access() {
+            ProviderAccess::Checking => {
+                let note = v_flex()
+                    .px_4()
+                    .gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Loading provider settings"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(t.muted_foreground)
+                            .child("Checking what this session is allowed to change."),
+                    );
+                return self.settings_page("providers", &view, [note.into_any_element()], cx);
+            }
+            ProviderAccess::ReadOnly => true,
+            ProviderAccess::Editable => false,
+        };
         let page =
             window.use_keyed_state(self.settings_state_key("settings-providers"), cx, |_, _| ProvidersPage::default());
-        let override_projects =
-            instances::override_projects(&view, self.settings_info().capability("projectProviderInstanceOverrides"));
+        let override_projects = instances::override_projects(
+            &view.scope.kind,
+            self.settings_environment().as_deref(),
+            self.settings_info().capability("projectProviderInstanceOverrides"),
+        );
+        // A target for another environment is dropped, like the web's per-environment target.
+        if let Some((environment, instance)) = self.settings_ui.provider_target.take()
+            && self.settings_environment().as_ref() == Some(&environment)
+        {
+            page.update(cx, |page, _| {
+                page.selected = Some(instance.clone());
+                page.target = Some(instance);
+            });
+        }
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);
-        let selected = {
-            let chosen = page.read(cx).selected.clone();
-            rows.iter().find(|row| Some(&row.id) == chosen.as_ref()).or(rows.first()).cloned()
+        let (selected, target_missing) = {
+            let page = page.read(cx);
+            selected_row(&rows, page.selected.as_deref(), page.target.as_deref())
         };
         let list = rows
             .iter()
@@ -131,6 +256,14 @@ impl Workspace {
         let editor =
             selected.as_ref().map(|row| self.render_instance_editor(&page, row, &override_projects, window, cx));
 
+        // `canAddProvider`: nothing to add when read-only or when the policy allows no driver.
+        let can_add = !read_only
+            && self
+                .settings_info()
+                .managed_policy
+                .pointer("/limits/providers/allowedDrivers")
+                .and_then(Value::as_array)
+                .is_none_or(|allowed| !allowed.is_empty());
         let add_row = div()
             .id("providers-add-row")
             .flex()
@@ -193,7 +326,7 @@ impl Workspace {
                     })
                     .border_color(t.border.opacity(0.6))
                     .bg(t.muted.opacity(0.1))
-                    .child(divided(list.into_iter().chain([add_row.into_any_element()]), &t)),
+                    .child(divided(list.into_iter().chain(can_add.then(|| add_row.into_any_element())), &t)),
             )
             .child(
                 div()
@@ -206,7 +339,11 @@ impl Workspace {
                             .p_6()
                             .text_sm()
                             .text_color(t.muted_foreground)
-                            .child("No providers configured.")
+                            .child(if target_missing {
+                                "This provider instance is no longer available on this device."
+                            } else {
+                                "No providers configured."
+                            })
                             .into_any_element(),
                     }),
             );
@@ -219,22 +356,35 @@ impl Workspace {
                     .px_4()
                     .justify_between()
                     .gap_4()
-                    .child(
-                        h_flex().gap_1().child(section_title("Providers", &t)).child(
+                    .child(h_flex().gap_1().child(section_title("Providers", &t)).when(can_add, |el| {
+                        el.child(
                             ghost_icon_button("providers-add", gpui_kit::assets::IconName::Plus, &t)
                                 .tooltip("Add provider")
                                 .on_click(cx.listener({
                                     let page = page.clone();
                                     move |this, _, window, cx| this.open_add_provider_dialog(page.clone(), window, cx)
                                 })),
-                        ),
-                    )
+                        )
+                    }))
                     .child(self.render_providers_header_actions(&page, &t, cx)),
             )
+            .when(read_only, |el| {
+                let label = view.label_of(self.settings_environment().as_deref().unwrap_or_default()).to_owned();
+                let description = format!("This session can view {label}'s providers but can't change their settings.");
+                el.child(
+                    div()
+                        .overflow_hidden()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(t.border.opacity(0.6))
+                        .bg(t.card.opacity(0.4))
+                        .child(settings_row("Limited permissions", Some(&description), None, false, &t)),
+                )
+            })
             .child(card);
         let content = [
             providers.into_any_element(),
-            self.render_usage_limit_sources(window, cx),
+            self.render_usage_limit_sources(cx),
             self.render_providers_advanced(window, cx).into_any_element(),
         ];
         self.settings_page("providers", &view, content, cx)
@@ -250,7 +400,18 @@ impl Workspace {
         let state = page.read(cx);
         let refreshing = state.refreshing;
         let updating_all = state.updating_all;
-        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
+        let machines = self.provider_update_machines();
+        // `ProviderUpdatesAction`'s tooltip: each machine and the providers it would update.
+        let update_tooltip: SharedString = machines
+            .iter()
+            .map(|machine| {
+                let names: Vec<&str> =
+                    machine.candidates.iter().map(|(driver, _)| provider_display_name(driver)).collect();
+                format!("{}: {}", machine.label, names.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
         let label: Option<SharedString> = if refreshing {
             Some("Refreshing providers".into())
         } else {
@@ -261,11 +422,11 @@ impl Workspace {
         h_flex()
             .gap_2()
             .mr(px(-8.))
-            .when(!candidates.is_empty() || updating_all, |el| {
+            .when(!machines.is_empty() || updating_all, |el| {
                 el.child(
                     ghost_text_button("providers-update-all", if updating_all { "Updating…" } else { "Update all" }, t)
                         .disabled(updating_all)
-                        .tooltip("Update every provider with an update available")
+                        .when(!machines.is_empty(), |button| button.tooltip(update_tooltip))
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.update_all_providers(&update_page, window, cx)),
                         ),
@@ -398,6 +559,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.providers_read_only() {
+            return;
+        }
         let settings = &self.settings_info().settings;
         let previous = instances::instance_config(settings, instance_id);
         let disabling = !instances::resolve_enabled(&next) && previous.as_ref().is_none_or(instances::resolve_enabled);
@@ -457,7 +621,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !page.update(cx, |page, _| page.updating.insert(instance_id.to_owned())) {
+        if self.providers_read_only() || !page.update(cx, |page, _| page.updating.insert(instance_id.to_owned())) {
             return;
         }
         let mut payload = json!({"provider": driver, "instanceId": instance_id});
@@ -493,33 +657,65 @@ impl Workspace {
         );
     }
 
-    /// "Update all": every one-click update candidate, then one summary notification.
+    /// `useProviderUpdates().machines`: each connected environment this session may manage,
+    /// with its one-click update candidates.
+    fn provider_update_machines(&self) -> Vec<UpdateMachine> {
+        self.sessions
+            .iter()
+            .filter(|session| session.is_connected())
+            .filter_map(|session| {
+                let id = session.id.clone()?;
+                if !self.environment_grants(&id, PROVIDERS_MANAGE) {
+                    return None;
+                }
+                let candidates = instances::one_click_update_candidates(&session.server_info.providers_json);
+                let label = session.server_info.environment_label.clone().unwrap_or_else(|| id.to_string());
+                (!candidates.is_empty()).then_some(UpdateMachine { environment: id, label, candidates })
+            })
+            .collect()
+    }
+
+    /// "Update all": every machine's candidates at once, then one summary notification.
     fn update_all_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
-        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
-        let Some(client) = self.settings_client() else { return };
-        if candidates.is_empty() || page.read(cx).updating_all {
+        let machines = self.provider_update_machines();
+        if machines.is_empty() || page.read(cx).updating_all {
             return;
         }
+        let requests: Vec<_> = machines
+            .into_iter()
+            .filter_map(|machine| Some((self.env_client(&machine.environment)?, machine)))
+            .flat_map(|(client, machine)| {
+                machine.candidates.into_iter().map(move |(driver, instance_id)| {
+                    let (client, environment, label) =
+                        (client.clone(), machine.environment.clone(), machine.label.clone());
+                    async move {
+                        let payload = json!({"provider": driver, "instanceId": instance_id});
+                        let result = client.request("server.updateProvider", payload).await;
+                        (environment, UpdateRun { machine: label, driver, instance_id, result })
+                    }
+                })
+            })
+            .collect();
         page.update(cx, |page, cx| {
             page.updating_all = true;
             cx.notify();
         });
         let page = page.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let mut failures = Vec::new();
-            for (driver, instance_id) in candidates {
-                let payload = json!({"provider": driver, "instanceId": instance_id});
-                if let Err(error) = client.request("server.updateProvider", payload).await {
-                    failures
-                        .push(format!("{}: {error}", drivers::driver(&driver).map_or(driver.as_str(), |d| d.label)));
+            let runs = futures::future::join_all(requests).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (environment, run) in &runs {
+                    if let Ok(reply) = &run.result {
+                        this.apply_environment_event(
+                            environment,
+                            &json!({"type": "providerStatuses", "payload": reply}),
+                        );
+                    }
                 }
-            }
-            let _ = this.update_in(cx, |_, window, cx| {
-                if !failures.is_empty() {
-                    window.push_notification(
-                        Notification::error(failures.join("\n")).title("Some providers could not update"),
-                        cx,
-                    );
+                let runs: Vec<UpdateRun> = runs.into_iter().map(|(_, run)| run).collect();
+                if let Some((ok, title, description)) = update_runs_summary(&runs) {
+                    let note = if ok { Notification::success(description) } else { Notification::error(description) };
+                    window.push_notification(note.title(title), cx);
                 }
                 page.update(cx, |page, cx| {
                     page.updating_all = false;
@@ -531,6 +727,35 @@ impl Workspace {
     }
 
     /// A request whose failure becomes an error notification titled `failure`.
+    /// Opens Providers on `environment` with `instance_id` selected (`openProviderSetup`).
+    pub(in crate::app) fn open_provider_settings(
+        &mut self,
+        environment: SharedString,
+        instance_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_ui.scope = self.settings_ui.scope.with_machine(Some(environment.to_string()));
+        self.settings_ui.provider_target = Some((environment, instance_id));
+        self.open_settings("providers", cx);
+    }
+
+    /// What this session may do with the Settings environment's providers.
+    pub(super) fn provider_access(&self) -> ProviderAccess {
+        let environment = self.settings_environment();
+        let load = environment.and_then(|id| self.settings_ui.grants.get(id.as_ref())).map(|(_, load)| load);
+        ProviderAccess::of(load)
+    }
+
+    /// Whether this connection's session on `environment` grants `scope` (`readEnvironmentScope`).
+    pub(super) fn environment_grants(&self, environment: &str, scope: &str) -> bool {
+        self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.grants(scope))
+    }
+
+    /// Provider mutations wait for `providers:manage` (`readOnly` across the panel).
+    pub(super) fn providers_read_only(&self) -> bool {
+        self.provider_access() != ProviderAccess::Editable
+    }
+
     fn providers_request(
         &mut self,
         method: &'static str,
@@ -887,4 +1112,68 @@ fn text_input(state: &Entity<InputState>, width: Option<f32>) -> Input {
 
 fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(6.)).flex_none().rounded_full().bg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::pages::settings::connections::logic::Session;
+
+    #[test]
+    fn update_all_summarizes_every_machine_like_the_web_toast() {
+        let run = |machine: &str, driver: &str, result| UpdateRun {
+            machine: machine.into(),
+            driver: driver.into(),
+            instance_id: driver.into(),
+            result,
+        };
+        let reply = |instance: &str, status: &str| {
+            Ok(
+                json!({"providers": [{"instanceId": instance, "updateState": {"status": status, "message": "npm failed"}}]}),
+            )
+        };
+        assert_eq!(update_runs_summary(&[]), None);
+        assert_eq!(
+            update_runs_summary(&[run("Laptop", "codex", reply("codex", "succeeded"))]),
+            Some((true, "Provider updated".into(), "New sessions will use the updated provider.".into()))
+        );
+        let failed = crate::rpc::RpcError::Failure(json!({"message": "offline"}));
+        assert_eq!(
+            update_runs_summary(&[
+                run("Laptop", "codex", reply("codex", "succeeded")),
+                run("Server", "claudeAgent", reply("claudeAgent", "failed")),
+                run("Server", "codex", Err(failed)),
+            ]),
+            Some((
+                false,
+                "2 of 3 provider updates failed".into(),
+                "Server · Claude: npm failed
+Server · Codex: offline"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_navigation_target_opens_its_provider_or_says_it_is_gone() {
+        let rows = instances::instance_rows(&json!({"providerInstances": {"codex_work": {"driver": "codex"}}}), &[]);
+        let id = |(row, missing): (Option<instances::InstanceRow>, bool)| (row.map(|r| r.id), missing);
+        assert_eq!(id(selected_row(&rows, Some("codex_work"), Some("codex_work"))), (Some("codex_work".into()), false));
+        assert_eq!(id(selected_row(&rows, Some("gone"), Some("gone"))), (None, true));
+        // Picking another row, or a stale plain selection, falls back to the first row.
+        assert_eq!(id(selected_row(&rows, Some("codex_work"), Some("gone"))), (Some("codex_work".into()), false));
+        assert_eq!(id(selected_row(&rows, Some("gone"), None)), (Some("codex".into()), false));
+        assert_eq!(id(selected_row(&[], None, None)), (None, false));
+    }
+
+    #[test]
+    fn provider_access_needs_a_providers_manage_grant() {
+        let ready =
+            |scopes: Value| SessionLoad::Ready(Session::from_json(&json!({"authenticated": true, "scopes": scopes})));
+        assert_eq!(ProviderAccess::of(None), ProviderAccess::Checking);
+        assert_eq!(ProviderAccess::of(Some(&SessionLoad::Pending)), ProviderAccess::Checking);
+        assert_eq!(ProviderAccess::of(Some(&SessionLoad::Failed)), ProviderAccess::ReadOnly);
+        assert_eq!(ProviderAccess::of(Some(&ready(json!(["orchestration:read"])))), ProviderAccess::ReadOnly);
+        assert_eq!(ProviderAccess::of(Some(&ready(json!(["providers:manage"])))), ProviderAccess::Editable);
+    }
 }

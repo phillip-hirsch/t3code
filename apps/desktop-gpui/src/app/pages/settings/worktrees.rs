@@ -7,9 +7,7 @@
 
 use gpui_kit::component::input::NumberInput;
 use gpui_kit::component::{Sizable as _, h_flex};
-use gpui_kit::{
-    AnyElement, Context, IntoElement, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
-};
+use gpui_kit::{AnyElement, Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
 use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
@@ -135,7 +133,7 @@ impl Workspace {
         let sections = [
             settings_section("creation", "Creation", creation, &t),
             settings_section("branches", "Branches", branches, &t),
-            settings_section("cleanup", "Cleanup", cleanup, &t),
+            settings_section("storage-worktrees", "Cleanup", cleanup, &t),
         ];
         self.settings_page("worktrees", view, sections, cx)
     }
@@ -207,7 +205,7 @@ impl Workspace {
         }
         let toggle = |field: &'static str, cx: &mut Context<Self>| {
             let on = cleanup[field] == true;
-            switch(&field.into(), on, false, &t)
+            switch(&field.into(), on, false)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.update_settings(cleanup_patch(project_scope, field, json!(!on)), window, cx);
                 }))
@@ -227,25 +225,37 @@ impl Workspace {
                 this.update_settings(cleanup_patch(project_scope, "worktreeKeepWhen", json!(value)), window, cx);
             })
         });
-        let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
+        // `lockablePath`: the whole policy at project scope, else its storage default too.
+        let lockable = |field: &str| {
+            let paths = ["worktreeCleanup".to_owned(), format!("storageCleanup.{field}")];
+            paths.into_iter().take(if project_scope { 1 } else { 2 })
+        };
+        let mut row = |this: &mut Self, row: SettingRow, field: &str| {
+            // `serverScoped={!isProjectScope}`
+            let row = if project_scope { row } else { row.server_scoped() };
+            this.setting_row(view, row.managed_paths(lockable(field)), window, cx)
+        };
         rows.extend([
             row(
                 self,
                 SettingRow::titled("worktree-on-delete", "Delete worktrees with deleted threads")
                     .description("Remove unused worktrees when active or archived threads are deleted. Worktrees with local changes are kept.")
                     .control(on_delete),
+                "worktreeOnDelete",
             ),
             row(
                 self,
                 SettingRow::titled("worktree-on-merge", "Delete merged worktrees")
                     .description("Remove worktrees whose pull request is merged and whose commits are included in the default branch.")
                     .control(on_merge),
+                "worktreeOnMerge",
             ),
             row(
                 self,
                 SettingRow::titled("worktree-after-days", "Delete inactive worktrees")
                     .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
                     .control(after),
+                "worktreeAfterDays",
             ),
         ]);
         let mut folded = Vec::new();
@@ -255,6 +265,7 @@ impl Workspace {
                 SettingRow::titled("worktree-settled-after-days", "Delete settled worktrees")
                     .description("Remove worktrees this many days after their thread settles. Set 0 days to remove them at the next cleanup. Branches and thread history are kept.")
                     .control(settled_after),
+                "worktreeSettledAfterDays",
             ));
         }
         folded.push(row(
@@ -262,6 +273,7 @@ impl Workspace {
             SettingRow::titled("worktree-unchanged", "Delete unchanged worktrees")
                 .description("Remove worktrees with no commits beyond the default branch.")
                 .control(unchanged),
+            "worktreeUnchanged",
         ));
         if let Some(keep_select) = keep_select {
             folded.push(row(
@@ -273,6 +285,7 @@ impl Workspace {
                         _ => "Keeps edits and untracked files. Deletes ignored files, including .env.",
                     })
                     .control(keep_select),
+                "worktreeKeepWhen",
             ));
         }
         rows.push(self.advanced_fold("worktree-cleanup", folded, cx));
@@ -312,7 +325,7 @@ impl Workspace {
         h_flex()
             .gap(px(12.))
             .child(value)
-            .child(switch(&field.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
+            .child(switch(&field.into(), on, false).on_click(cx.listener(move |this, _, window, cx| {
                 let days = if on { Value::Null } else { json!(8) };
                 this.update_settings(cleanup_patch(project_scope, field, days), window, cx);
             })))

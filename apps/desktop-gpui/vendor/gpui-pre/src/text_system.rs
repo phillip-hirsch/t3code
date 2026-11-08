@@ -33,7 +33,7 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -238,6 +238,7 @@ pub struct TextSystem {
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
+    thin_font_smoothing: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -281,7 +282,15 @@ impl TextSystem {
                 generation: missing_glyph_generation,
                 receiver,
             })),
+            thin_font_smoothing: AtomicBool::new(false),
         }
+    }
+
+    /// Paints text with thin grayscale smoothing instead of the platform's color-dependent
+    /// stroke dilation (macOS font smoothing), as `-webkit-font-smoothing: antialiased` does.
+    /// Glyphs are cached per dilation, so a window's next frame paints with the change.
+    pub fn set_thin_font_smoothing(&self, thin: bool) {
+        self.thin_font_smoothing.store(thin, Ordering::Relaxed);
     }
 
     /// Get sorted, unique font family names available to the platform text system.
@@ -552,6 +561,9 @@ impl TextSystem {
 
     /// Returns the dilation level to use for a glyph painted in the given color.
     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        if self.thin_font_smoothing.load(Ordering::Relaxed) {
+            return 0;
+        }
         self.platform_text_system.glyph_dilation_for_color(color)
     }
 

@@ -56,6 +56,7 @@ theme_colors! {
     sidebar_muted_foreground = "sidebarMutedForeground",
     sidebar_row_hover = "sidebarRowHover",
     sidebar_row_active = "sidebarRowActive",
+    sidebar_row_selected = "sidebarRowSelected",
     sidebar_border = "sidebarBorder",
 }
 

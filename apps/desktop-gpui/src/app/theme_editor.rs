@@ -312,10 +312,13 @@ impl ThemeEditor {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(name_value));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter colors"));
         let mut subscriptions = vec![
-            cx.subscribe_in(&name, window, |this, _, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&name, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.error = None;
-                    this.follow_merge_target(cx);
+                    if this.follow_merge_target(cx) {
+                        this.sync_fields(window, cx);
+                        this.preview(window, cx);
+                    }
                     cx.notify();
                 }
             }),
@@ -369,7 +372,9 @@ impl ThemeEditor {
             bounds: Rc::default(),
             _subscriptions: subscriptions,
         };
-        editor.follow_merge_target(cx);
+        if editor.follow_merge_target(cx) {
+            editor.sync_fields(window, cx);
+        }
         editor.preview(window, cx);
         editor
     }
@@ -392,18 +397,20 @@ impl ThemeEditor {
         })
     }
 
-    /// Moves the draft off an appearance the merge target already has.
-    fn follow_merge_target(&mut self, cx: &mut Context<Self>) {
+    /// Moves the draft off an appearance the merge target already has; true when it moved, so
+    /// the fields and preview show the other palette.
+    fn follow_merge_target(&mut self, cx: &mut Context<Self>) -> bool {
         let target = self.merge_target(cx).filter(|_| self.editing.is_none());
         let key = target.map(|t| format!("{}:{:?}", t.id, t.modes()));
         let only_this_mode = target.is_some_and(|t| t.modes() == [self.dark]);
         if key == self.merge_key {
-            return;
+            return false;
         }
         self.merge_key = key;
         if only_this_mode {
             self.dark = !self.dark;
         }
+        only_this_mode
     }
 
     /// Why an appearance cannot be edited, if it cannot.
@@ -630,16 +637,14 @@ impl ThemeEditor {
             cx.notify();
             return;
         }
-        match self.save(&name, cx) {
-            Ok((library, saved, outcome)) => {
-                let _ = self
-                    .workspace
-                    .update(cx, |workspace, cx| workspace.theme_saved(library, saved, outcome, window, cx));
-            }
-            Err(error) => {
-                self.error = Some(error);
-                cx.notify();
-            }
+        let saved = self.save(&name, cx).and_then(|(library, saved, outcome)| {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.theme_saved(library, saved, outcome, window, cx))
+                .unwrap_or(Ok(()))
+        });
+        if let Err(error) = saved {
+            self.error = Some(error);
+            cx.notify();
         }
     }
 
@@ -1030,15 +1035,22 @@ impl ThemeEditor {
                             .gap(px(8.))
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .cursor_pointer()
-                            .child("Advanced")
-                            .child(super::pages::settings::widgets::switch(
-                                &"theme-editor-advanced".into(),
-                                advanced,
-                                false,
-                                t,
+                            // A `<label>`: its text toggles the switch too.
+                            .child(div().id("theme-editor-advanced-label").cursor_pointer().child("Advanced").on_click(
+                                cx.listener(move |this, _, window, cx| this.set_advanced(!advanced, window, cx)),
                             ))
-                            .on_click(cx.listener(move |this, _, window, cx| this.set_advanced(!advanced, window, cx))),
+                            .child(
+                                super::pages::settings::widgets::switch(
+                                    &"theme-editor-advanced".into(),
+                                    advanced,
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, next: &bool, window, cx| {
+                                        this.set_advanced(*next, window, cx);
+                                    },
+                                )),
+                            ),
                     ),
             );
         let fields: AnyElement = if advanced {
@@ -1359,28 +1371,28 @@ impl Workspace {
         self.open_theme_editor(Session { seed, ..Session::new(dark) }, window, cx);
     }
 
-    /// Stores the saved themes and the pick together, then paints.
+    /// Stores the saved themes and the pick together, then paints; a failed save changes nothing.
     pub(in crate::app) fn store_themes(
         &mut self,
         library: Library,
         choice: ThemeChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
+        self.client_settings.set_themes(library.clone(), choice.clone())?;
         if let Some(editor) = &self.theme_editor {
-            let library = library.clone();
             editor.update(cx, |editor, cx| {
                 editor.library = library;
                 cx.notify();
             });
         }
-        self.client_settings.set_themes(library, choice.clone());
         theme::set_preference(choice, window, cx);
         self.sync_composer_marks(cx);
         cx.notify();
+        Ok(())
     }
 
-    /// `ThemeEditorHost.handleSaved`.
+    /// `ThemeEditorHost.handleSaved`; on a failed save the editor stays open with the error.
     fn theme_saved(
         &mut self,
         library: Library,
@@ -1388,7 +1400,7 @@ impl Workspace {
         outcome: Saved,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         let mut choice = ThemeChoice { library: library.clone(), ..self.client_settings.theme_choice() };
         let (title, description) = match outcome {
             Saved::Merged(dark) => {
@@ -1410,10 +1422,15 @@ impl Workspace {
                 (format!("{} created", saved.label), "It’s now active.".to_owned())
             }
         };
-        self.theme_editor = None;
+        // The editor is mid-update (its submit called this), so it is out while the store runs.
+        let editor = self.theme_editor.take();
+        if let Err(error) = self.store_themes(library, choice, window, cx) {
+            self.theme_editor = editor;
+            return Err(error);
+        }
         theme::set_editor_preview(None, window, cx);
-        self.store_themes(library, choice, window, cx);
         toast(window, cx, title, description);
+        Ok(())
     }
 }
 

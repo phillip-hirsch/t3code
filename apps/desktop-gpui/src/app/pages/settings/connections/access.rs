@@ -32,6 +32,7 @@ use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
 use crate::rpc::{RpcClient, StreamEvent};
+use crate::settings::scope;
 use crate::theme::{self, Tokens};
 
 /// Everything the access page holds while it is open.
@@ -221,17 +222,92 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let state = window.use_keyed_state("settings-access", cx, |_, _| AccessState::default());
+        // Keyed by environment, so pairing credentials and pending work never carry over.
+        let key = format!("settings-access:{}", self.settings_environment().as_deref().unwrap_or_default());
+        let state = window.use_keyed_state(SharedString::from(key), cx, |_, _| AccessState::default());
         let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
         state.update(cx, |state, cx| state.start(client, endpoint, cx));
         let t = *theme::tokens(cx);
-        let local_rows = self.local_backend_rows(window, cx, &t);
-        let mut sections = vec![self.environment_card(&state, local_rows, window, cx, &t)];
+        let local_rows = if self.access_is_primary() { self.local_backend_rows(window, cx, &t) } else { None };
+        let mut sections: Vec<AnyElement> = self.access_environment_picker(cx, &t).into_iter().collect();
+        sections.push(self.environment_card(&state, local_rows, window, cx, &t));
         let s = state.read(cx);
         if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
         self.settings_page("access", view, sections, cx)
+    }
+
+    /// "Showing access for": the primary and every enabled saved environment, once there are several.
+    fn access_environment_picker(&self, cx: &mut Context<Self>, t: &Tokens) -> Option<AnyElement> {
+        let candidates: Vec<(scope::Labeled, &str, bool)> = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let id = s.id.as_deref()?;
+                let label = s.server_info.environment_label.as_deref().unwrap_or(id);
+                let url = s.endpoint.as_ref().map(|e| e.http_base.as_str());
+                Some(((id, label, url), s.server_info.machine_kind(), s.is_connected()))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return None;
+        }
+        let labeled: Vec<scope::Labeled> = candidates.iter().map(|(labeled, ..)| *labeled).collect();
+        // `settingsScopeEnvironmentLabel`.
+        let name = |id: &str, label: &str| match scope::environment_secondary(id, &labeled) {
+            Some(secondary) => format!("{label} \u{b7} {secondary}"),
+            None => label.to_owned(),
+        };
+        let selected = self.settings_environment();
+        let current = candidates.iter().find(|((id, ..), ..)| selected.as_deref() == Some(*id));
+        let current = current.map(|((id, label, _), ..)| name(id, label)).unwrap_or_default();
+        let choices: Vec<(SharedString, String, &'static str, bool)> = candidates
+            .iter()
+            .map(|&((id, label, _), machine, connected)| {
+                (id.into(), name(id, label), logic::machine_icon(machine), connected)
+            })
+            .collect();
+        let workspace = cx.entity().downgrade();
+        let trigger = Button::new("access-environment")
+            .outline()
+            .small()
+            .max_w(px(288.))
+            .label(current)
+            .dropdown_caret(true)
+            .accessibility_label("Environment")
+            .dropdown_menu(move |mut menu, _, _| {
+                for (id, name, icon, connected) in &choices {
+                    let (id, name, icon, connected) = (id.clone(), name.clone(), *icon, *connected);
+                    let workspace = workspace.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let t = theme::tokens(cx);
+                            h_flex()
+                                .min_w_0()
+                                .gap(px(8.))
+                                .child(ui::glyph(icon, 14., t.foreground))
+                                .child(div().min_w_0().truncate().child(name.clone()))
+                                .when(!connected, |el| {
+                                    el.child(text_xs(div().flex_none().text_color(t.muted_foreground)).child("Offline"))
+                                })
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                this.settings_ui.access_environment = Some(id.clone());
+                                cx.notify();
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        Some(
+            text_sm(h_flex().min_w_0().gap(px(6.)).px(px(16.)).text_color(t.muted_foreground))
+                .child(div().flex_none().child("Showing access for"))
+                .child(trigger)
+                .into_any_element(),
+        )
     }
 
     /// The `connections-environment` section: name, icon menu, policy, version, network access, permissions.

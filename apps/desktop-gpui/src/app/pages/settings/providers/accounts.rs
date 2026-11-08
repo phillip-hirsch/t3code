@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 use super::codex_callback;
 
 mod antigravity;
+use super::super::connections::logic::PROVIDERS_MANAGE;
 use super::super::scoped_client;
 use super::super::widgets::RowFrame;
 use crate::app::Workspace;
@@ -75,6 +76,9 @@ struct AuthMethod {
     id: String,
     #[serde(default)]
     account_email: Option<String>,
+    /// An incomplete ChatGPT connection the server can forget.
+    #[serde(default)]
+    can_remove: bool,
     name: String,
 }
 
@@ -192,6 +196,21 @@ fn settle_authorization_page(state: Option<&AuthState>, flow_id: Option<&str>) -
         return None;
     }
     browser_url(state).map(Some)
+}
+
+/// `ChatGptAccountPicker`'s profiles and selection: the picked profile while it is listed,
+/// else the first profile, else a different account.
+fn picker_choice(methods: &[AuthMethod], selection: Option<&str>) -> (Vec<AuthMethod>, String) {
+    let profiles: Vec<AuthMethod> = methods.iter().filter(|m| m.id.starts_with("chatgpt-profile:")).cloned().collect();
+    let selected = match selection {
+        Some(CHANGE_ACCOUNT) => CHANGE_ACCOUNT.to_owned(),
+        selection => profiles
+            .iter()
+            .find(|p| Some(p.id.as_str()) == selection)
+            .or(profiles.first())
+            .map_or(CHANGE_ACCOUNT.to_owned(), |p| p.id.clone()),
+    };
+    (profiles, selected)
 }
 
 fn browser_url(state: &AuthState) -> Option<String> {
@@ -399,6 +418,10 @@ impl Workspace {
         let driver = instance["driver"].as_str().unwrap_or(&provider.driver);
         let codex_managed = driver == "codex" && codex_setup_managed(&instance["config"]);
         let can_authenticate = provider.setup.as_ref().map(|setup| setup.can_authenticate);
+        // A view-only session sees the managed Codex setup but no sign-in or API-key rows.
+        if !codex_managed && self.providers_read_only() {
+            return None;
+        }
         if !codex_managed && can_authenticate != Some(true) && !(provider.driver == "acpRegistry" && provider.installed)
         {
             if driver == "cursor" && can_authenticate == Some(false) {
@@ -954,27 +977,19 @@ impl AccountSection {
             let modal = modal.entrance(DialogEntrance::None);
             let t = *theme::tokens(cx);
             let this = section.read(cx);
-            let profiles: Vec<AuthMethod> = this
-                .auth
-                .data
-                .as_ref()
-                .and_then(|auth| auth.methods.as_ref())
-                .map(|methods| methods.iter().filter(|m| m.id.starts_with("chatgpt-profile:")).cloned().collect())
-                .unwrap_or_default();
-            let selected = match this.picker_selection.as_deref() {
-                Some(CHANGE_ACCOUNT) => CHANGE_ACCOUNT.to_owned(),
-                selection => profiles
-                    .iter()
-                    .find(|p| Some(p.id.as_str()) == selection)
-                    .or(profiles.first())
-                    .map_or(CHANGE_ACCOUNT.to_owned(), |p| p.id.clone()),
-            };
-            let option = |id: String, label: String, bold_break: bool| {
-                let picked = section.clone();
-                let value = id.clone();
-                div()
-                    .id(SharedString::from(format!("picker-{id}")))
-                    .flex()
+            let methods = this.auth.data.as_ref().and_then(|auth| auth.methods.as_deref()).unwrap_or_default();
+            let (profiles, selected) = picker_choice(methods, this.picker_selection.as_deref());
+            let disabled = this.snapshot(cx).is_none_or(|snapshot| {
+                let view = CodexView::new(this, &snapshot);
+                view.unavailable || view.busy
+            });
+            let removable = profiles.iter().any(|p| p.id == selected && p.can_remove);
+            let error = this.error.clone();
+            let ids: Vec<String> = profiles.iter().map(|p| p.id.clone()).chain([CHANGE_ACCOUNT.to_owned()]).collect();
+            let option = |id: &str, label: SharedString| {
+                Radio::new(SharedString::from(format!("picker-{id}")))
+                    .accessibility_label(label.clone())
+                    .w_full()
                     .items_center()
                     .gap_3()
                     .cursor_pointer()
@@ -984,23 +999,35 @@ impl AccountSection {
                     .px_3()
                     .py_3()
                     .text_sm()
-                    .child(Radio::new(SharedString::from(format!("picker-radio-{id}"))).checked(selected == id))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .font_weight(FontWeight::MEDIUM)
-                            .when(bold_break, gpui_kit::Styled::truncate)
-                            .child(label),
-                    )
-                    .on_click(move |_, _, cx| {
-                        picked.update(cx, |this, cx| {
-                            this.picker_selection = Some(value.clone());
-                            cx.notify();
-                        });
-                    })
+                    .child(div().min_w_0().font_weight(FontWeight::MEDIUM).child(label))
             };
+            let picked = section.clone();
+            let accounts = gpui_kit::component::radio::RadioGroup::vertical("chatgpt-account-picker")
+                .accessibility_label("ChatGPT account to connect")
+                .disabled(disabled)
+                .selected_index(ids.iter().position(|id| *id == selected))
+                .children(profiles.iter().map(|p| option(&p.id, p.name.clone().into())))
+                .child(option(CHANGE_ACCOUNT, "Use a different account".into()))
+                .on_change(move |ix, _, cx| {
+                    let Some(id) = ids.get(*ix).cloned() else { return };
+                    picked.update(cx, |this, cx| {
+                        this.picker_selection = Some(id);
+                        cx.notify();
+                    });
+                });
+            let remove = removable.then(|| {
+                let removing = section.clone();
+                let method_id = selected.clone();
+                let permitted = this.can_remove_auth_method(cx);
+                button("picker-remove", "Remove connection").ghost().disabled(disabled || !permitted).on_click(
+                    move |_, _, cx| {
+                        let method_id = method_id.clone();
+                        removing.update(cx, |this, cx| this.remove_auth_method(method_id, cx));
+                    },
+                )
+            });
             let confirm = section.clone();
-            let chosen = selected.clone();
+            let chosen = selected;
             modal
                 .w(px(512.))
                 .title("Reconnect ChatGPT")
@@ -1013,15 +1040,13 @@ impl AccountSection {
                                 .text_color(t.muted_foreground)
                                 .child("On OpenAI, sign in with the account you choose here."),
                         )
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .children(profiles.iter().map(|p| option(p.id.clone(), p.name.clone(), true)))
-                                .child(option(CHANGE_ACCOUNT.to_owned(), "Use a different account".into(), false)),
-                        ),
+                        .child(accounts)
+                        .when_some(error, |el, error| {
+                            el.child(div().text_sm().text_color(t.error_foreground).child(error))
+                        }),
                 )
-                .footer(h_flex().w_full().justify_end().child(
-                    chatgpt_connection_button("picker-continue", "Continue with ChatGPT").on_click(
+                .footer(h_flex().w_full().justify_end().gap_2().children(remove).child(
+                    chatgpt_connection_button("picker-continue", "Continue with ChatGPT").disabled(disabled).on_click(
                         move |_, window, cx| {
                             window.close_dialog(cx);
                             let method = chosen.clone();
@@ -1038,6 +1063,21 @@ impl AccountSection {
                     ),
                 ))
         });
+    }
+
+    /// `removeProviderAuthMethod.permissionAtom`: removal needs `providers:manage` on this environment.
+    fn can_remove_auth_method(&self, cx: &App) -> bool {
+        let (Some(workspace), Some(scope)) = (self.workspace.upgrade(), self.scope.as_ref()) else { return false };
+        workspace.read(cx).environment_grants(scope, PROVIDERS_MANAGE)
+    }
+
+    /// Forgets an incomplete ChatGPT connection; the picker stays open on the updated list.
+    fn remove_auth_method(&mut self, method_id: String, cx: &mut Context<Self>) {
+        if !self.can_remove_auth_method(cx) {
+            return;
+        }
+        let payload = json!({ "instanceId": self.instance_id, "methodId": method_id });
+        self.run("provider.auth.removeMethod", payload, "Codex setup failed. Try again.", cx, |_, _, _| {});
     }
 
     // --- Generic sign-in actions ------------------------------------------
@@ -1416,7 +1456,7 @@ impl AccountSection {
             text(reconnect_email.unwrap_or_else(|| "Use your ChatGPT subscription.".into()))
         };
 
-        let read_only = false;
+        let read_only = self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only());
         let pending = self.pending;
         let can_start = if view.installed {
             setup.as_ref().is_some_and(|s| s.can_authenticate)
@@ -2280,6 +2320,26 @@ mod tests {
         for phase in ["failed", "cancelled", "succeeded"] {
             assert_eq!(settle_authorization_page(Some(&auth("flow-1", phase, None)), Some("flow-1")), Some(None));
         }
+    }
+
+    #[test]
+    fn the_account_picker_keeps_a_listed_pick_and_offers_removal_only_where_allowed() {
+        let methods: Vec<AuthMethod> = serde_json::from_value(json!([
+            { "id": "chatgpt", "name": "ChatGPT", "description": null, "type": "agent" },
+            { "id": "chatgpt-profile:a", "name": "a@example.com", "description": null, "type": "agent" },
+            { "id": "chatgpt-profile:b", "name": "b@example.com", "canRemove": true, "description": null, "type": "agent" },
+        ]))
+        .unwrap();
+        let removable = |selection| {
+            let (profiles, selected) = picker_choice(&methods, selection);
+            (selected.clone(), profiles.iter().any(|p| p.id == selected && p.can_remove))
+        };
+        assert_eq!(removable(None), ("chatgpt-profile:a".into(), false));
+        assert_eq!(removable(Some("chatgpt-profile:b")), ("chatgpt-profile:b".into(), true));
+        // A removed profile falls back to the first one left.
+        assert_eq!(removable(Some("chatgpt-profile:gone")), ("chatgpt-profile:a".into(), false));
+        assert_eq!(removable(Some(CHANGE_ACCOUNT)), (CHANGE_ACCOUNT.into(), false));
+        assert_eq!(picker_choice(&methods[..1], None).1, CHANGE_ACCOUNT);
     }
 
     #[test]

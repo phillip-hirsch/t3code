@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::{Button as Pressable, Checkbox};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
@@ -10,9 +11,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, hsla, linear_color_stop, linear_gradient,
-    px, relative,
+    AnyElement, App, BoxShadow, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, hsla,
+    linear_color_stop, linear_gradient, px, relative,
 };
 
 use super::widgets::subheading;
@@ -229,8 +230,12 @@ impl Workspace {
                 });
             })
             .child(div().grid().grid_cols(columns.unwrap_or(2)).gap(px(CARD_GAP)).children(rendered));
+        // `SettingsSection id="appearance"`: Color scheme and Themes are its search targets.
+        let target = self.settings_ui.target.as_deref() == Some("appearance");
         v_flex()
-            .id("theme")
+            .id("appearance")
+            .relative()
+            .when(target, |el| el.child(self.scroll_target_marker()))
             .gap(px(12.))
             .child(subheading(title("color-scheme", "Color scheme")))
             .child(tiles)
@@ -252,8 +257,12 @@ impl Workspace {
                 ThemePreference::Light => wireframe(&[(&light, None)], t),
                 ThemePreference::Dark => wireframe(&[(&dark, None)], t),
             };
-            v_flex()
-                .id(SharedString::from(format!("color-scheme-{}", mode.id())))
+            Pressable::new(SharedString::from(format!("color-scheme-{}", mode.id())))
+                .selected(active)
+                .flex_col()
+                .items_stretch()
+                .justify_start()
+                .focus_visible(move |s| s.shadow(vec![focus_ring(t.foreground.opacity(0.6))]))
                 .flex_1()
                 .gap(px(6.))
                 .p(px(8.))
@@ -278,6 +287,7 @@ impl Workspace {
                     div()
                         .text_center()
                         .text_xs()
+                        .line_height(px(16.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if active { t.foreground } else { t.muted_foreground })
                         .child(label),
@@ -414,6 +424,22 @@ impl Workspace {
             );
         }
         let on_use = card.on_use;
+        let name_use = on_use.clone();
+        let name = Pressable::new(SharedString::from(format!("theme-name-{key}")))
+            .min_w_0()
+            .justify_start()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_sm()
+            .line_height(px(20.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(t.foreground)
+            .focus_visible(move |s| s.shadow(vec![focus_ring(t.ring)]))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.use_card_action(&name_use, window, cx);
+            }))
+            .child(div().min_w_0().truncate().child(label));
         v_flex()
             .id(SharedString::from(format!("theme-card-{key}")))
             .overflow_hidden()
@@ -432,16 +458,7 @@ impl Workspace {
                     .px(px(12.))
                     .pb(px(12.))
                     .pt(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(t.foreground)
-                            .child(label),
-                    )
+                    .child(div().flex_1().min_w_0().child(h_flex().child(name)))
                     .child(h_flex().flex_none().gap(px(4.)).children(actions)),
             )
             .into_any_element()
@@ -539,8 +556,8 @@ impl Workspace {
                 let colors = Preview::of(theme.colors_for(dark).unwrap_or(&theme.colors));
                 let (fan_key, id, index) = (key.to_owned(), theme.id.clone(), *theme_index);
                 layer = layer.child(
-                    div()
-                        .id(SharedString::from(format!("theme-fan-{key}-{mode}-{}", theme.id)))
+                    Pressable::new(SharedString::from(format!("theme-fan-{key}-{mode}-{}", theme.id)))
+                        .focus_visible(move |s| s.shadow(vec![focus_ring(t.ring)]))
                         .absolute()
                         .top(px(4. + y))
                         .left(relative(0.5))
@@ -639,8 +656,9 @@ impl Workspace {
                                 .disabled(count == 0)
                                 .label(remove_label)
                                 .on_click(move |_, window, cx| {
-                                    confirm.update(cx, |this, cx| this.remove_selected_themes(window, cx));
-                                    window.close_dialog(cx);
+                                    if confirm.update(cx, |this, cx| this.remove_selected_themes(window, cx)) {
+                                        window.close_dialog(cx);
+                                    }
                                 }),
                         ),
                 )
@@ -648,16 +666,21 @@ impl Workspace {
     }
 
     /// `handleConfirmRemoveTheme`: a removed base falls back to the standard palette and a
-    /// removed half is cleared, then the themes go.
-    fn remove_selected_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(removal) = self.settings_ui.theme_library.removal.take() else { return };
-        let ids: Vec<String> = removal.selected.into_iter().collect();
+    /// removed half is cleared, then the themes go. False keeps the dialog open after a failure.
+    fn remove_selected_themes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(removal) = self.settings_ui.theme_library.removal.as_ref() else { return true };
+        let ids: Vec<String> = removal.selected.iter().cloned().collect();
         if ids.is_empty() {
-            return;
+            return true;
         }
         let library = self.client_settings.themes.remove(&ids);
         let choice = ThemeChoice { library: library.clone(), ..self.client_settings.theme_choice().without(&ids) };
-        self.store_themes(library, choice, window, cx);
+        if self.store_themes(library, choice, window, cx).is_err() {
+            window.push_notification(Notification::error("Try again.").title("Couldn’t remove theme"), cx);
+            return false;
+        }
+        self.settings_ui.theme_library.removal = None;
+        true
     }
 }
 
@@ -670,8 +693,13 @@ fn removal_tile(
 ) -> AnyElement {
     let checked = removal.selected.contains(&variant.id);
     let (id, workspace) = (variant.id.clone(), workspace.clone());
-    v_flex()
-        .id(SharedString::from(format!("remove-theme-{}", variant.id)))
+    let ring = focus_ring(t.ring);
+    Checkbox::new(SharedString::from(format!("remove-theme-{}", variant.id)))
+        .checked(checked)
+        .accessibility_label(format!("Remove {}", variant.label))
+        .focus_visible(move |s| s.shadow(vec![ring]))
+        .flex()
+        .flex_col()
         .relative()
         .min_h(px(112.))
         .items_center()
@@ -722,7 +750,7 @@ fn removal_tile(
                 .text_color(t.foreground)
                 .child(variant.label.clone()),
         )
-        .on_click(move |_, _, cx| {
+        .on_change(move |_, _, _, cx| {
             workspace.update(cx, |this, cx| {
                 if let Some(removal) = &mut this.settings_ui.theme_library.removal
                     && !removal.selected.remove(&id)
@@ -733,6 +761,11 @@ fn removal_tile(
             });
         })
         .into_any_element()
+}
+
+/// `focus-visible`'s 2px ring, drawn inside the control's edge.
+fn focus_ring(color: Hsla) -> BoxShadow {
+    BoxShadow::new(px(0.), px(0.), color).spread_radius(px(2.)).inset()
 }
 
 /// `downloadThemeFile`: saves `<id>.json` where the person picks.
@@ -763,9 +796,11 @@ fn export_theme(theme: &ThemeDefinition, window: &mut Window, cx: &mut App) {
 }
 
 /// A theme circle with the picked ring and the sun or moon badge.
-fn circle_button(id: SharedString, colors: &Preview, dark: bool, picked: bool, t: &Tokens) -> gpui_kit::Stateful<Div> {
-    div()
-        .id(id)
+fn circle_button(id: SharedString, colors: &Preview, dark: bool, picked: bool, t: &Tokens) -> Pressable {
+    let ring = focus_ring(t.foreground.opacity(0.6));
+    Pressable::new(id)
+        .selected(picked)
+        .focus_visible(move |s| s.shadow(vec![ring]))
         .relative()
         .size(px(68.))
         .p(px(6.))

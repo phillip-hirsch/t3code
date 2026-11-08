@@ -1,5 +1,5 @@
-//! `StorageCleanupSections` (`StorageSettings.tsx`) and `DatabaseStorageNotice` for the one
-//! environment this client talks to.
+//! `StorageCleanupSections` (`StorageSettings.tsx`) and `DatabaseStorageNotice` for the
+//! selected, connected environments.
 
 use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName;
@@ -14,9 +14,12 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::super::connections::logic::SETTINGS_WRITE;
 use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
 use super::{format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
+use crate::app::sessions::EnvironmentSession;
 use crate::rpc::{RpcClient, StreamEvent};
 use crate::theme::{self, Tokens};
 
@@ -33,44 +36,75 @@ enum Report {
     Ready(Option<Value>),
 }
 
-pub(super) struct StorageState {
+/// What a selected, connected environment offers the storage sections.
+pub(super) struct MachineSpec {
+    id: String,
+    label: SharedString,
+    client: RpcClient,
+    /// `storageCleanupRun`: it runs cleanup and reports the last run.
+    runs_cleanup: bool,
+    /// `databaseStorage`: it reports reclaimable database space.
+    database: bool,
+}
+
+/// One environment's last run and database status.
+struct Machine {
+    id: String,
+    label: SharedString,
+    client: RpcClient,
+    runs_cleanup: bool,
     report: Report,
     database: Option<Value>,
-    running: bool,
-    last_run_open: bool,
     /// The web keeps this per environment in local storage; this client keeps it while Settings is open.
     database_dismissed: bool,
+}
+
+pub(super) struct StorageState {
+    machines: Vec<Machine>,
+    running: bool,
+    last_run_open: bool,
     _streams: Vec<Task<()>>,
 }
 
 impl StorageState {
-    fn new(client: Option<RpcClient>, cx: &mut Context<Self>) -> Self {
-        let streams = client
-            .map(|client| {
-                vec![
-                    Self::follow(&client, "server.getStorageCleanupReport", cx, |this, event| match event {
-                        StreamEvent::Item(report) => this.report = Report::Ready(Some(report).filter(|r| !r.is_null())),
-                        StreamEvent::End(Err(_)) if matches!(this.report, Report::Loading) => {
-                            this.report = Report::Failed;
+    fn new(specs: Vec<MachineSpec>, cx: &mut Context<Self>) -> Self {
+        let mut streams = Vec::new();
+        for (index, spec) in specs.iter().enumerate() {
+            if spec.runs_cleanup {
+                streams.push(Self::follow(&spec.client, "server.getStorageCleanupReport", cx, move |this, event| {
+                    let machine = &mut this.machines[index];
+                    match event {
+                        StreamEvent::Item(report) => {
+                            machine.report = Report::Ready(Some(report).filter(|r| !r.is_null()));
+                        }
+                        StreamEvent::End(Err(_)) if matches!(machine.report, Report::Loading) => {
+                            machine.report = Report::Failed;
                         }
                         StreamEvent::End(_) => {}
-                    }),
-                    Self::follow(&client, "server.getDatabaseStorage", cx, |this, event| {
-                        if let StreamEvent::Item(status) = event {
-                            this.database = Some(status).filter(|s| !s.is_null());
-                        }
-                    }),
-                ]
-            })
-            .unwrap_or_default();
-        Self {
-            report: Report::Loading,
-            database: None,
-            running: false,
-            last_run_open: false,
-            database_dismissed: false,
-            _streams: streams,
+                    }
+                }));
+            }
+            if spec.database {
+                streams.push(Self::follow(&spec.client, "server.getDatabaseStorage", cx, move |this, event| {
+                    if let StreamEvent::Item(status) = event {
+                        this.machines[index].database = Some(status).filter(|s| !s.is_null());
+                    }
+                }));
+            }
         }
+        let machines = specs
+            .into_iter()
+            .map(|spec| Machine {
+                id: spec.id,
+                label: spec.label,
+                client: spec.client,
+                runs_cleanup: spec.runs_cleanup,
+                report: Report::Loading,
+                database: None,
+                database_dismissed: false,
+            })
+            .collect();
+        Self { machines, running: false, last_run_open: false, _streams: streams }
     }
 
     fn follow(
@@ -185,27 +219,41 @@ fn group_digits(value: u64) -> String {
 }
 
 impl Workspace {
-    pub(super) fn render_storage_sections(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn render_storage_sections(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
-        let client = self.settings_client();
-        let key = self.settings_state_key("settings-storage");
-        let state = window.use_keyed_state(key, cx, |_, cx| StorageState::new(client, cx));
-        let info = &self.settings_info();
-        let (cleanup, cleanup_run, database) = (
-            info.capability("storageCleanup"),
-            info.capability("storageCleanupRun"),
-            info.capability("databaseStorage"),
-        );
+        let connected: Vec<&EnvironmentSession> =
+            view.connected_environment_ids().iter().filter_map(|id| self.session(id)).collect();
+        let cleanup = connected.iter().all(|s| s.server_info.capability("storageCleanup"));
+        let key = connected.iter().filter_map(|s| s.id.as_deref()).collect::<Vec<_>>().join("\u{1f}");
+        let specs: Vec<MachineSpec> = connected
+            .iter()
+            .filter_map(|s| {
+                let id = s.id.as_deref()?.to_owned();
+                Some(MachineSpec {
+                    label: s.server_info.environment_label.clone().unwrap_or_else(|| id.clone()).into(),
+                    client: s.client.clone()?,
+                    runs_cleanup: s.server_info.capability("storageCleanupRun"),
+                    database: s.server_info.capability("databaseStorage"),
+                    id,
+                })
+            })
+            .collect();
+        let state = window.use_keyed_state(SharedString::from(format!("settings-storage:{key}")), cx, |_, cx| {
+            StorageState::new(specs, cx)
+        });
         let mut sections = Vec::new();
-        if database {
-            sections.extend(self.render_database_notice(&state, &t, cx));
-        }
+        sections.extend(render_database_notice(&state, &t, cx));
         if !cleanup {
             let notice = note(
                 "Update the selected environments to use storage cleanup, or choose a machine that supports it.",
                 &t,
             );
-            sections.push(loose_section("artifacts-and-logs", "Artifacts and logs", [notice]));
+            sections.push(loose_section("storage-artifacts", "Artifacts and logs", [notice]));
             return sections;
         }
         let rows = [
@@ -234,8 +282,8 @@ impl Workspace {
             let control = self.retention_control(key, title, field.as_ref(), &t, cx);
             RowFrame::new(title).description(text(description)).control(control).render(&t).into_any_element()
         });
-        sections.push(settings_section("artifacts-and-logs", "Artifacts and logs", rows, &t));
-        if cleanup_run {
+        sections.push(settings_section("storage-artifacts", "Artifacts and logs", rows, &t));
+        if state.read(cx).machines.iter().any(|m| m.runs_cleanup) {
             sections.push(self.render_cleanup(&state, &t, cx));
         }
         sections
@@ -278,130 +326,167 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `CleanupSection`: the manual run and the last run's results.
+    /// `CleanupSection`: the manual run on every machine that may run it, and each one's last run.
     fn render_cleanup(&self, state: &Entity<StorageState>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let has_rules = has_rules(self.settings_json());
         let storage = state.read(cx);
-        let report = match &storage.report {
-            Report::Ready(report) => report.clone(),
-            _ => None,
-        };
+        let supported: Vec<&Machine> = storage.machines.iter().filter(|m| m.runs_cleanup).collect();
+        let has_rules =
+            supported.iter().any(|m| self.session(&m.id).is_some_and(|s| has_rules(&s.server_info.settings)));
+        let allowed: Vec<(SharedString, RpcClient)> = supported
+            .iter()
+            .filter(|m| self.environment_grants(&m.id, SETTINGS_WRITE))
+            .map(|m| (m.label.clone(), m.client.clone()))
+            .collect();
+        let now = now_ms();
         let description = if has_rules {
-            match &storage.report {
-                Report::Ready(Some(report)) => last_run_description(report, now_ms()),
-                Report::Ready(None) => "Cleanup hasn't run yet.".into(),
-                Report::Failed => "Could not load the last run.".into(),
-                Report::Loading => "Loading last run…".into(),
-            }
+            let named = supported.len() > 1;
+            let lines = supported.iter().map(|m| {
+                let line = machine_description(&m.report, now);
+                text(if named { format!("{}: {line}", m.label) } else { line })
+            });
+            v_flex().children(lines).into_any_element()
         } else {
-            "Turn on a cleanup rule to use this.".to_owned()
+            text("Turn on a cleanup rule to use this.")
         };
         let running = storage.running;
-        let last_run_open = storage.last_run_open;
-        let label: SharedString =
-            self.settings_info().environment_label.clone().unwrap_or_else(|| "this machine".into()).into();
-        let client = self.settings_client();
         let run_state = state.clone();
-        let run_label = label.clone();
         let delete_now = Button::new("storage-delete-now")
             .outline()
             .small()
             .label(if running { "Deleting…" } else { "Delete now" })
-            .disabled(running || !has_rules || client.is_none())
-            .on_click(move |_, window, cx| {
-                let Some(client) = client.clone() else { return };
-                run_storage_cleanup(client, run_state.clone(), run_label.clone(), window, cx);
-            });
+            .disabled(running || !has_rules || allowed.is_empty())
+            .on_click(move |_, window, cx| run_storage_cleanup(allowed.clone(), run_state.clone(), window, cx));
         let mut blocks = vec![card(
-            [RowFrame::new("Delete now")
-                .description(text(description))
-                .control(delete_now)
-                .render(t)
-                .into_any_element()],
+            [RowFrame::new("Delete now").description(description).control(delete_now).render(t).into_any_element()],
             t,
         )];
-        if let Some(report) = report {
+        let reports: Vec<(&SharedString, &Value)> = supported
+            .iter()
+            .filter_map(|m| match &m.report {
+                Report::Ready(Some(report)) => Some((&m.label, report)),
+                _ => None,
+            })
+            .collect();
+        if !reports.is_empty() {
+            let counts: Vec<(&str, String)> =
+                reports.iter().map(|(label, report)| (label.as_ref(), counts_label(report))).collect();
+            let summary = last_run_summary(&counts, storage.machines.len());
             let toggle = state.downgrade();
-            let mut rows = vec![fold_header(
-                "storage-last-run",
-                "Last run",
-                counts_label(&report).into(),
-                last_run_open,
-                t,
-                move |_, cx| {
-                    let _ = toggle.update(cx, |state, cx| {
-                        state.last_run_open = !state.last_run_open;
-                        cx.notify();
-                    });
-                },
-            )];
-            if last_run_open {
-                rows.extend(cleanup_results(&report, &label, t));
+            let open = storage.last_run_open;
+            let mut rows = vec![fold_header("storage-last-run", "Last run", summary.into(), open, t, move |_, cx| {
+                let _ = toggle.update(cx, |state, cx| {
+                    state.last_run_open = !state.last_run_open;
+                    cx.notify();
+                });
+            })];
+            if open {
+                for (label, report) in &reports {
+                    rows.extend(cleanup_results(report, label, t));
+                }
             }
             blocks.push(card(rows, t));
         }
         loose_section("cleanup", "Cleanup", blocks)
     }
+}
 
-    /// `DatabaseStorageNotice`: suggests `t3 doctor` while the database holds a GiB or more of freed pages.
-    fn render_database_notice(
-        &self,
-        state: &Entity<StorageState>,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let storage = state.read(cx);
-        let status = storage.database.as_ref().filter(|_| !storage.database_dismissed)?;
+/// A machine's line under Delete now.
+fn machine_description(report: &Report, now_ms: i64) -> String {
+    match report {
+        Report::Ready(Some(report)) => last_run_description(report, now_ms),
+        Report::Ready(None) => "Cleanup hasn't run yet.".into(),
+        Report::Failed => "Could not load the last run.".into(),
+        Report::Loading => "Loading last run…".into(),
+    }
+}
+
+/// `lastRunSummary`: one machine's counts, "… on every machine" when every machine agrees, else
+/// each machine's counts by name.
+fn last_run_summary(entries: &[(&str, String)], machine_count: usize) -> String {
+    let Some((_, first)) = entries.first() else { return String::new() };
+    if machine_count <= 1 {
+        return first.clone();
+    }
+    if entries.len() == machine_count && entries.iter().all(|(_, counts)| counts == first) {
+        return format!("{first} on every machine");
+    }
+    entries.iter().map(|(label, counts)| format!("{label}: {counts}")).collect::<Vec<_>>().join(" · ")
+}
+
+/// `DatabaseStorageNotice`: suggests `t3 doctor` on each machine whose database holds a GiB or
+/// more of freed pages.
+fn render_database_notice(state: &Entity<StorageState>, t: &Tokens, cx: &App) -> Option<AnyElement> {
+    let storage = state.read(cx);
+    let visible: Vec<(usize, &Machine, &Value)> = storage
+        .machines
+        .iter()
+        .enumerate()
+        .filter(|(_, machine)| !machine.database_dismissed)
+        .filter_map(|(index, machine)| {
+            let status = machine.database.as_ref()?;
+            let reclaimable = status["reclaimableBytes"].as_f64().unwrap_or(0.);
+            let recommended = status["incrementalVacuumEnabled"] != true && reclaimable >= COMPACTION_RECOMMENDED_BYTES;
+            recommended.then_some((index, machine, status))
+        })
+        .collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let mut rows = vec![
+        RowFrame::new("Reclaim freed database space")
+            .description(text(
+                "These databases still hold space freed by history cleanup. Run the command on each machine to reclaim it. It restarts the background service. Quit the desktop app first if it hosts the environment.",
+            ))
+            .render(t)
+            .into_any_element(),
+    ];
+    for (index, machine, status) in visible {
         let reclaimable = status["reclaimableBytes"].as_f64().unwrap_or(0.);
-        if status["incrementalVacuumEnabled"] == true || reclaimable < COMPACTION_RECOMMENDED_BYTES {
-            return None;
-        }
         let command = status["compactCommand"].as_str().unwrap_or_default().to_owned();
-        let label = self.settings_info().environment_label.clone().unwrap_or_default();
         let dismiss = state.downgrade();
         let copied = command.clone();
         let controls = h_flex()
             .flex_wrap()
             .gap_1p5()
             .child(
-                Button::new("database-copy")
+                Button::new(SharedString::from(format!("database-copy-{index}")))
                     .outline()
                     .xsmall()
                     .label("Copy command")
                     .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))),
             )
-            .child(Button::new("database-dismiss").ghost().xsmall().label("Dismiss").on_click(move |_, _, cx| {
-                let _ = dismiss.update(cx, |state, cx| {
-                    state.database_dismissed = true;
-                    cx.notify();
-                });
-            }));
-        let rows = [
-            RowFrame::new("Reclaim freed database space")
-                .description(text(
-                    "These databases still hold space freed by history cleanup. Run the command on each machine to reclaim it. It restarts the background service. Quit the desktop app first if it hosts the environment.",
-                ))
-                .render(t)
-                .into_any_element(),
-            RowFrame::new(format!("{:.1} GiB on {label}", reclaimable / COMPACTION_RECOMMENDED_BYTES))
+            .child(
+                Button::new(SharedString::from(format!("database-dismiss-{index}")))
+                    .ghost()
+                    .xsmall()
+                    .label("Dismiss")
+                    .on_click(move |_, _, cx| {
+                        let _ = dismiss.update(cx, |state, cx| {
+                            state.machines[index].database_dismissed = true;
+                            cx.notify();
+                        });
+                    }),
+            );
+        rows.push(
+            RowFrame::new(format!("{:.1} GiB on {}", reclaimable / COMPACTION_RECOMMENDED_BYTES, machine.label))
                 .description(div().font_family(t.fonts.mono).child(command))
                 .control(controls)
                 .render(t)
                 .into_any_element(),
-        ];
-        Some(settings_section("database", "Database", rows, t))
+        );
     }
+    Some(settings_section("database", "Database", rows, t))
 }
 
-/// `server.runStorageCleanup`; failures come back as a toast, as the web shows them.
+/// `server.runStorageCleanup` on each target at once; failures come back as toasts, as the web
+/// shows them.
 fn run_storage_cleanup(
-    client: RpcClient,
+    targets: Vec<(SharedString, RpcClient)>,
     state: Entity<StorageState>,
-    label: SharedString,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if state.read(cx).running {
+    if state.read(cx).running || targets.is_empty() {
         return;
     }
     state.update(cx, |state, cx| {
@@ -410,24 +495,29 @@ fn run_storage_cleanup(
     });
     window
         .spawn(cx, async move |cx| {
-            let result = client.request("server.runStorageCleanup", json!({})).await;
+            let runs = targets.into_iter().map(|(label, client)| async move {
+                (label, client.request("server.runStorageCleanup", json!({})).await)
+            });
+            let results = futures::future::join_all(runs).await;
             let _ = cx.update(|window, cx| {
                 state.update(cx, |state, cx| {
                     state.running = false;
                     cx.notify();
                 });
-                match result {
-                    Ok(report) => {
-                        let failed = report["entries"]
-                            .as_array()
-                            .and_then(|entries| entries.iter().find(|entry| entry["outcome"] == "failed"));
-                        if let Some(entry) = failed {
-                            let reason = entry["reason"].as_str().unwrap_or_default().to_owned();
-                            notify_error(window, cx, format!("Cleanup failed on {label}"), reason);
+                for (label, result) in results {
+                    match result {
+                        Ok(report) => {
+                            let failed = report["entries"]
+                                .as_array()
+                                .and_then(|entries| entries.iter().find(|entry| entry["outcome"] == "failed"));
+                            if let Some(entry) = failed {
+                                let reason = entry["reason"].as_str().unwrap_or_default().to_owned();
+                                notify_error(window, cx, format!("Cleanup failed on {label}"), reason);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        notify_error(window, cx, format!("Could not run cleanup on {label}"), error.to_string());
+                        Err(error) => {
+                            notify_error(window, cx, format!("Could not run cleanup on {label}"), error.to_string());
+                        }
                     }
                 }
             });
@@ -542,6 +632,21 @@ mod tests {
         let report = json!({"finishedAt": "2026-11-05T11:00:00Z", "bytesFreed": 2048,
             "counts": {"removed": 3, "kept": 1, "failed": 1}});
         assert_eq!(counts_label(&report), "3 removed, 1 kept, 1 failed");
+        let (one, other) = ("1 removed, 0 kept".to_owned(), "2 removed, 0 kept".to_owned());
+        assert_eq!(last_run_summary(&[("Laptop", one.clone())], 1), one);
+        assert_eq!(
+            last_run_summary(&[("Laptop", one.clone()), ("Desk", one.clone())], 2),
+            "1 removed, 0 kept on every machine"
+        );
+        assert_eq!(
+            last_run_summary(&[("Laptop", one.clone())], 2),
+            "Laptop: 1 removed, 0 kept",
+            "a machine that never ran keeps the summary per machine"
+        );
+        assert_eq!(
+            last_run_summary(&[("Laptop", one), ("Desk", other)], 2),
+            "Laptop: 1 removed, 0 kept · Desk: 2 removed, 0 kept"
+        );
         let now = crate::timestamp::parse_ms("2026-11-05T12:00:00Z").unwrap();
         assert_eq!(
             last_run_description(&report, now),

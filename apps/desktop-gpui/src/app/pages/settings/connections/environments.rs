@@ -1,6 +1,6 @@
 //! Environments (`ConnectionsSettings view="environments"`): this app's local
-//! environment switch and saved remote environments (`saved.rs`), then this
-//! environment's linked environments (`LinkedEnvironmentsSettings.tsx`). Load
+//! environment switch and saved remote environments (`saved.rs`), then each connected
+//! host's linked environments (`LinkedEnvironmentsSettings.tsx`). Load
 //! balancing and pull request sharing route work across environments, which this
 //! client does not do yet, so it never shows them.
 
@@ -22,6 +22,7 @@ use super::{SessionLoad, check_session, error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
+use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -58,37 +59,67 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let state = window.use_keyed_state("settings-environments", cx, |_, _| EnvironmentsState::default());
-        let started = state.read(cx).started;
-        if let (Some(client), Some(endpoint), false) =
-            (self.settings_client(), self.settings_endpoint().cloned(), started)
-        {
-            state.update(cx, |state, cx| {
-                state.started = true;
-                state._tasks.push(check_session(endpoint, cx, move |this, session, cx| {
-                    if session.grants(ACCESS_READ) {
-                        this.load_links(Some(client.clone()), cx);
-                    }
-                    this.session = session;
-                }));
-            });
-        }
         let t = *theme::tokens(cx);
         let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
-        let info = &self.settings_info();
-        let offers_links = info.capability("peerLinks") && info.settings.bool("linkedEnvironmentsEnabled");
-        let readable = state.read(cx).session.grants(ACCESS_READ);
-        if offers_links && readable && self.settings_client().is_some() {
-            sections.push(self.linked_environments(&state, cx, &t));
+        // `usePeerLinkHosts`: connected hosts offering links whose session may read them.
+        let hosts: Vec<(SharedString, String, RpcClient, Endpoint)> = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.server_info.capability("peerLinks") && s.server_info.settings.bool("linkedEnvironmentsEnabled")
+            })
+            .filter_map(|s| {
+                let id = s.id.clone()?;
+                let label = s.server_info.environment_label.clone().unwrap_or_else(|| id.to_string());
+                Some((id, label, s.client.clone()?, s.endpoint.clone()?))
+            })
+            .collect();
+        let mut readable = Vec::new();
+        for (id, label, client, endpoint) in hosts {
+            let key = SharedString::from(format!("settings-environments:{id}"));
+            let state = window.use_keyed_state(key, cx, |_, _| EnvironmentsState::default());
+            if !state.read(cx).started {
+                let loader = client.clone();
+                state.update(cx, |state, cx| {
+                    state.started = true;
+                    state._tasks.push(check_session(endpoint, cx, move |this, session, cx| {
+                        if session.grants(ACCESS_READ) {
+                            this.load_links(Some(loader.clone()), cx);
+                        }
+                        this.session = session;
+                    }));
+                });
+            }
+            if state.read(cx).session.grants(ACCESS_READ) {
+                readable.push((id, label, client, state));
+            }
+        }
+        let multiple = readable.len() > 1;
+        for (index, (id, label, client, state)) in readable.into_iter().enumerate() {
+            // The first is the search's "Linked environments" target; headings name their host
+            // once there are several.
+            let section_id: SharedString =
+                if index == 0 { "linked-environments".into() } else { format!("linked-environments-{id}").into() };
+            let title =
+                if multiple { format!("Linked environments \u{b7} {label}") } else { "Linked environments".into() };
+            sections.push(self.linked_environments(&state, client, section_id, title, cx, &t));
         }
         sections.extend(self.load_balancing_section(cx));
         self.settings_page("connections", view, sections, cx)
     }
 
-    fn linked_environments(&self, state: &Entity<EnvironmentsState>, cx: &App, t: &Tokens) -> AnyElement {
+    fn linked_environments(
+        &self,
+        state: &Entity<EnvironmentsState>,
+        client: RpcClient,
+        id: SharedString,
+        title: String,
+        cx: &App,
+        t: &Tokens,
+    ) -> AnyElement {
         let s = state.read(cx);
         let can_link = s.session.grants(ACCESS_WRITE);
-        let client = self.settings_client();
+        let client = Some(client);
         let action = can_link.then(|| {
             let (client, state) = (client.clone(), state.downgrade());
             WebButton::new("link-environment", "Link")
@@ -113,7 +144,7 @@ impl Workspace {
                 links.iter().map(|link| linked_row(state, s, link, can_link, client.clone(), now, t)).collect()
             }
         };
-        section_with_action("linked-environments", "Linked environments", action, rows, t)
+        section_with_action(id, title, action, rows, t)
     }
 }
 

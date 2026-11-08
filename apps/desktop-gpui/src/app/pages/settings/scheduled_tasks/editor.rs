@@ -27,22 +27,25 @@ use super::worktree_mode::{self, NewWorktreeMode};
 use super::{ScheduledTasksView, notify_error};
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
+use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::widgets::select_trigger;
 use crate::model::{ModelSelection, ProjectShell};
 use crate::rpc::RpcClient;
+use crate::settings::scope::Scope;
 use crate::theme::{self, Tokens};
 
-/// Opens the editor for `task`, or for a new task when it is `None`.
+/// Opens the editor for `task`, or for a new task when it is `None`, on `target`'s environment
+/// and socket, under Settings' `scope`.
 pub(super) fn open(
     workspace: WeakEntity<Workspace>,
     list: WeakEntity<ScheduledTasksView>,
-    environment: SharedString,
-    client: RpcClient,
+    target: (SharedString, RpcClient),
     task: Option<ScheduledTask>,
+    scope: Scope,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let editor = cx.new(|cx| TaskEditor::new(workspace, list, environment, client, task, window, cx));
+    let editor = cx.new(|cx| TaskEditor::new(workspace, list, target, task, scope, window, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         // The form keeps the dialog open while a save is in flight, as `onOpenChange` does.
         let saving = editor.read(cx).saving;
@@ -57,6 +60,8 @@ pub(super) struct TaskEditor {
     environment: SharedString,
     pub(super) client: RpcClient,
     task: Option<ScheduledTask>,
+    /// Settings' scope when the editor opened: which environments and projects it offers.
+    scope: Scope,
     pub(super) draft: DraftState,
     pub(super) saving: bool,
     /// Locks before the next render and stays locked after a successful create, like `submissionPending`.
@@ -74,26 +79,32 @@ pub(super) struct TaskEditor {
     _subscriptions: Vec<Subscription>,
 }
 
+/// The projects on `environment` that `scope` offers (`projectsOn`).
+fn scoped_projects(workspace: &Workspace, scope: &Scope, environment: &str) -> Vec<ProjectShell> {
+    let offered =
+        |p: &&ProjectShell| p.environment_id == environment && logic::matches_scope(scope, environment, &p.id);
+    workspace.shell.projects.iter().filter(offered).cloned().collect()
+}
+
 impl TaskEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
         list: WeakEntity<ScheduledTasksView>,
-        environment: SharedString,
-        client: RpcClient,
+        (environment, client): (SharedString, RpcClient),
         task: Option<ScheduledTask>,
+        scope: Scope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let draft = match &task {
             Some(task) => logic::task_to_draft(task, &Local),
             None => {
-                let projects: Vec<ProjectShell> = workspace
-                    .upgrade()
-                    .map(|w| {
-                        w.read(cx).shell.projects.iter().filter(|p| p.environment_id == environment).cloned().collect()
-                    })
-                    .unwrap_or_default();
-                DraftState { project_id: logic::default_project_id(&projects), ..DraftState::default() }
+                let projects =
+                    workspace.upgrade().map(|w| scoped_projects(w.read(cx), &scope, &environment)).unwrap_or_default();
+                DraftState {
+                    project_id: logic::default_project_id(&projects, scope.is_project()),
+                    ..DraftState::default()
+                }
             }
         };
         let text = |placeholder: &str, value: &str, window: &mut Window, cx: &mut Context<Self>| {
@@ -174,6 +185,7 @@ impl TaskEditor {
             environment,
             client,
             task,
+            scope,
             draft,
             saving: false,
             submission_pending: false,
@@ -190,9 +202,46 @@ impl TaskEditor {
         }
     }
 
-    /// The tasks the list has loaded; `None` while it loads or failed.
+    /// The tasks the list has loaded on the editor's environment; `None` while they load or
+    /// failed. A new task on an environment the list doesn't read has nothing to wait for.
     fn loaded_tasks(&self, cx: &App) -> Option<super::Tasks> {
-        self.list.upgrade()?.read(cx).loaded_tasks()
+        let list = self.list.upgrade()?;
+        let list = list.read(cx);
+        match list.tasks_on(&self.environment) {
+            Some(tasks) => tasks,
+            None => self.draft.editing_id.is_none().then(|| super::Tasks::from([])),
+        }
+    }
+
+    /// `upsertScheduledTask.permissionAtom`: this connection may operate on the environment.
+    fn can_operate(&self, cx: &App) -> bool {
+        self.workspace
+            .upgrade()
+            .is_some_and(|w| w.read(cx).environment_grants(&self.environment, ORCHESTRATION_OPERATE))
+    }
+
+    /// "Runs on" picked another connected environment: its projects, models and checkouts
+    /// replace the ones picked on the last (`setEnvironmentId` and the draft reset beside it).
+    fn set_environment(&mut self, environment: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let Some(client) = workspace.read(cx).env_client(&environment) else { return };
+        if self.task.is_some() || environment == self.environment {
+            return;
+        }
+        let projects = scoped_projects(workspace.read(cx), &self.scope, &environment);
+        self.draft.project_id = logic::default_project_id(&projects, self.scope.is_project());
+        self.draft.model_key.clear();
+        self.draft.base_model_selection = None;
+        self.draft.existing_worktree_path.clear();
+        self.checkout.update(cx, |input, cx| input.set_value("", window, cx));
+        let context = WebhookContext::new(client.clone(), &environment, &workspace, cx);
+        self.webhook.update(cx, |fields, cx| fields.set_context(context, cx));
+        let cwd = projects.iter().find(|p| p.id == self.draft.project_id).map(|p| p.workspace_root.clone());
+        let worktree_client = client.clone();
+        self.worktree = cx.new(|cx| NewWorktreeMode::new(worktree_client, cwd, None, window, cx));
+        self.environment = environment;
+        self.client = client;
+        cx.notify();
     }
 
     fn set_saving(&mut self, saving: bool, cx: &mut Context<Self>) {
@@ -230,16 +279,16 @@ impl TaskEditor {
         self.draft.editing_id.is_some() && self.loaded_tasks(cx).is_some() && self.live_task(cx).is_none()
     }
 
-    /// Open projects pinned first; the chosen one stays listed after it is archived.
+    /// The scope's open projects, pinned first; the chosen one stays listed after it is archived.
     fn projects(&self, cx: &App) -> Vec<ProjectShell> {
         let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
-        let keep = |p: &&ProjectShell| {
-            p.environment_id == self.environment
-                && (p.archived_at.is_none()
-                    || p.id == self.draft.project_id
-                    || self.task.as_ref().is_some_and(|task| task.project_id == p.id))
+        let keep = |p: &ProjectShell| {
+            p.archived_at.is_none()
+                || p.id == self.draft.project_id
+                || self.task.as_ref().is_some_and(|task| task.project_id == p.id)
         };
-        let mut projects: Vec<_> = workspace.read(cx).shell.projects.iter().filter(keep).cloned().collect();
+        let mut projects = scoped_projects(workspace.read(cx), &self.scope, &self.environment);
+        projects.retain(keep);
         projects.sort_by_key(|p| p.pinned_at.is_none());
         projects
     }
@@ -285,7 +334,12 @@ impl TaskEditor {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.submission_pending || self.saving || self.editing_task_missing(cx) || !self.connected(cx) {
+        if !self.can_operate(cx)
+            || self.submission_pending
+            || self.saving
+            || self.editing_task_missing(cx)
+            || !self.connected(cx)
+        {
             return;
         }
         let Some(workspace) = self.workspace.upgrade() else { return };
@@ -444,8 +498,20 @@ impl Render for TaskEditor {
         let projects = self.projects(cx);
         let project = self.selected_project(&projects);
         let selection = self.active_selection(project, cx);
-        let (offers_once, denial, env_label, machine, destination) = {
+        let (offers_once, denial, env_label, machine, destination, environments) = {
             let workspace = workspace.read(cx);
+            // `connectedEnvironments`: the selected environments this client is connected to.
+            let environments: Vec<(SharedString, String, &'static str)> = self
+                .scope
+                .environment_ids
+                .iter()
+                .filter(|id| workspace.env_client(id).is_some())
+                .filter_map(|id| {
+                    let info = workspace.env_info(id)?;
+                    let label = info.environment_label.clone().unwrap_or_else(|| id.clone());
+                    Some((SharedString::from(id.clone()), label, machine_icon(info.machine_kind())))
+                })
+                .collect();
             let Some(info) = workspace.env_info(&self.environment) else { return div().into_any_element() };
             let destination = (!self.draft.thread_id.is_empty() && self.draft.thread_mode != ThreadMode::NewThread)
                 .then(|| {
@@ -464,6 +530,7 @@ impl Render for TaskEditor {
                 info.environment_label.clone().unwrap_or_else(|| "Unavailable environment".into()),
                 machine_icon(info.machine_kind()),
                 destination,
+                environments,
             )
         };
         let disabled = self.saving;
@@ -489,16 +556,34 @@ impl Render for TaskEditor {
                 })
         });
 
-        // Runs on: the one environment this client is connected to.
+        // Runs on: a new task can move to any connected environment the scope selects.
         let environment = h_flex()
             .min_w_0()
             .gap(px(8.))
             .child(svg().path(machine).size(px(16.)).flex_none().text_color(t.foreground))
-            .child(div().min_w_0().truncate().child(env_label.clone()));
+            .child(div().min_w_0().truncate().child(env_label));
+        let current_environment = self.environment.clone();
         let runs_on = select_trigger(&"scheduled-task-environment".into(), environment, 0., &t)
             .w_full()
             .disabled(self.task.is_some() || disabled)
-            .dropdown_menu(move |menu, _, _| menu.item(PopupMenuItem::new(env_label.clone()).checked(true)));
+            .dropdown_menu({
+                let editor = editor.clone();
+                move |mut menu, window, _| {
+                    for (id, label, icon) in &environments {
+                        let id = id.clone();
+                        let item = PopupMenuItem::new(label.clone())
+                            .icon(gpui_kit::component::Icon::empty().path(*icon))
+                            .checked(id == current_environment);
+                        menu = menu.item(item.on_click(window.listener_for(
+                            &editor,
+                            move |this: &mut TaskEditor, _, window, cx| {
+                                this.set_environment(id.clone(), window, cx);
+                            },
+                        )));
+                    }
+                    menu
+                }
+            });
 
         let duplicate_titles =
             |project: &ProjectShell| projects.iter().filter(|p| p.title == project.title).count() > 1;
@@ -671,7 +756,7 @@ impl Render for TaskEditor {
             |task| matches!(task.schedule(), Schedule::Interval { every_ms } if every_ms < MIN_INTERVAL_MS),
         );
         let webhook_blocked = draft.enabled && mode == ScheduleMode::Webhook && denial.is_some();
-        let can_save = connected && !disabled && !missing && tasks_loaded && !webhook_blocked;
+        let can_save = self.can_operate(cx) && connected && !disabled && !missing && tasks_loaded && !webhook_blocked;
         let editing = draft.editing_id.is_some();
         let enabled = draft.enabled;
         let new_worktree = (workspace_mode == WorkspaceMode::Worktree)

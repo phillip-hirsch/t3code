@@ -11,18 +11,19 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::NumberInput;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
 use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
 use super::super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, settings_section, switch};
 use crate::app::Workspace;
-use crate::model::ModelSelection;
+use crate::model::{ModelSelection, ServerInfo};
 use crate::theme::tokens;
 
 #[path = "snooze.rs"]
@@ -40,7 +41,55 @@ const RUNTIME_MODES: [(&str, &str, &str, Lucide); 4] = [
     ("full-access", "Full access", "Allow commands and edits without prompts.", Lucide::ShieldOff),
 ];
 const DEFAULT_RUNTIME_MODE: &str = "full-access";
-const AUTO_SETTLE_DEFAULT_DAYS: i64 = 3;
+
+/// `managedRuntimeModeDenial`: why the policy's `maxRuntimeMode` rules out `mode`.
+fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
+    let organization = policy["organization"].as_str()?;
+    let ceiling = policy.pointer("/limits/maxRuntimeMode").and_then(Value::as_str)?;
+    let rank = |mode: &str| RUNTIME_MODES.iter().position(|(id, ..)| *id == mode);
+    let (_, label, ..) = RUNTIME_MODES[rank(ceiling)?];
+    (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
+}
+
+/// The model a target's new threads start with: its stored default while that provider is
+/// selectable, else the environment's automatic pick.
+fn effective_default_model(stored: &Value, info: &ServerInfo) -> Option<ModelSelection> {
+    let stored: Option<ModelSelection> = serde::Deserialize::deserialize(stored).ok();
+    stored
+        .filter(|s| info.provider(&s.instance_id).is_some_and(crate::model::Provider::is_selectable))
+        .or_else(|| info.automatic_model())
+}
+
+/// `defaultModelSelectionsAreMixed`: the targets differ in their stored default or in the model
+/// it resolves to on their own environment.
+fn default_models_mixed<'a>(targets: impl IntoIterator<Item = (&'a Value, Option<&'a ServerInfo>)>) -> bool {
+    let mut resolved =
+        targets.into_iter().map(|(stored, info)| (stored, info.and_then(|info| effective_default_model(stored, info))));
+    let Some(first) = resolved.next() else { return false };
+    resolved.any(|other| other != first)
+}
+
+/// Whether a target's environment runs `pick`: the instance is there with the same driver,
+/// enabled for the target and available, and offers the model.
+fn offers_model(
+    info: &ServerInfo,
+    settings: &crate::settings::Settings,
+    project_id: Option<&str>,
+    driver: Option<&str>,
+    pick: &ModelSelection,
+) -> bool {
+    info.provider(&pick.instance_id).is_some_and(|provider| {
+        Some(provider.driver.as_str()) == driver
+            && provider.availability.as_deref() != Some("unavailable")
+            && crate::settings::scope::provider_instance_enabled(settings, project_id, &pick.instance_id)
+            && provider.models.iter().any(|m| m.slug == pick.model)
+    })
+}
+
+/// The days the inactivity switch turns back on with (`AUTO_SETTLE_DEFAULT_DAYS`).
+fn auto_settle_default_days() -> i64 {
+    crate::settings::contract().default_value("sidebarAutoSettleAfterDays").as_i64().unwrap_or(7)
+}
 
 /// The snooze editor's draft. Rows keep a key across edits and sorts so a row's own fields
 /// stay with it; edits build on the draft so a second edit before the first echoes back
@@ -168,20 +217,20 @@ impl Workspace {
     ) -> AnyElement {
         let t = *tokens(cx);
         let project_scope = view.scope.is_project();
-        let mixed = view.mixed(&["defaultModelSelection"]);
+        let mixed = default_models_mixed(
+            view.targets
+                .iter()
+                .map(|target| (target.settings.get("defaultModelSelection"), self.env_info(&target.environment_id))),
+        );
         let automatic =
             !view.targets.is_empty() && view.targets.iter().all(|t| t.settings.get("defaultModelSelection").is_null());
         let pick = |key: &'static str| {
             move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-                this.update_settings(json!({ key: pick.to_json() }), window, cx);
+                this.save_scoped_model(key, pick, window, cx);
             }
         };
-        let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("defaultModelSelection")).ok();
-        let selection = stored
-            .filter(|s| {
-                self.settings_info().provider(&s.instance_id).is_some_and(crate::model::Provider::is_selectable)
-            })
-            .or_else(|| self.settings_info().automatic_model());
+        let selection = effective_default_model(view.value("defaultModelSelection"), self.settings_info());
+        let denial = selection.as_ref().filter(|_| !mixed).and_then(|s| self.scoped_model_denial(view, s));
         let model: AnyElement = match &selection {
             Some(selection) => h_flex()
                 .gap(px(6.))
@@ -193,7 +242,7 @@ impl Workspace {
                     cx,
                     pick("defaultModelSelection"),
                 ))
-                .children(if mixed {
+                .children(if mixed || denial.is_some() {
                     None
                 } else {
                     self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection"))
@@ -201,10 +250,12 @@ impl Workspace {
                 .into_any_element(),
             None => muted(if mixed { "Mixed" } else { "No providers available" }, &t).into_any_element(),
         };
-        let model_status = mixed.then(|| {
-            let differ = if automatic { "Automatic defaults differ." } else { "Defaults differ." };
-            format!("{differ} Select one environment or choose a shared model to edit effort.")
-        });
+        let model_status = mixed
+            .then(|| {
+                let differ = if automatic { "Automatic defaults differ." } else { "Defaults differ." };
+                format!("{differ} Select one environment or choose a shared model to edit effort.")
+            })
+            .or(denial);
         let mut rows = vec![
             self.setting_row(
                 view,
@@ -283,10 +334,47 @@ impl Workspace {
                 cx,
             ),
         );
-        settings_section("new-threads", "New threads", rows, &t)
+        settings_section("project-defaults", "New threads", rows, &t)
     }
 
     /// The fallback picker: the stored model, else the default shown as "None".
+    /// `useScopedModelDisabledReason`: why `pick` cannot be every selected target's model.
+    pub(in crate::app::pages::settings) fn scoped_model_denial(
+        &self,
+        view: &SettingsView,
+        pick: &ModelSelection,
+    ) -> Option<String> {
+        let driver = self.settings_info().provider(&pick.instance_id).map(|p| p.driver.as_str());
+        view.targets.iter().find_map(|target| {
+            let info = &self.session(&target.environment_id).filter(|s| s.is_connected())?.server_info;
+            let project = target.project_id.as_deref();
+            (!offers_model(info, &target.settings, project, driver, pick)).then(|| {
+                let label = view.label_of(&target.environment_id);
+                format!("This model is unavailable on {label}. Select that environment to choose its model separately.")
+            })
+        })
+    }
+
+    /// Writes a model row's pick through the scope unless a target cannot run it.
+    fn save_scoped_model(
+        &mut self,
+        key: &'static str,
+        pick: ModelSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.scoped_model_denial(&self.settings_view(), &pick) {
+            let title = match key {
+                "fallbackModelSelection" => "Fallback model not saved",
+                "textGenerationModelSelection" => "Text generation model not saved",
+                _ => "Default model not saved",
+            };
+            window.push_notification(Notification::error(reason).title(title), cx);
+            return;
+        }
+        self.update_settings(json!({ key: pick.to_json() }), window, cx);
+    }
+
     fn fallback_model_control(
         &mut self,
         view: &SettingsView,
@@ -296,7 +384,7 @@ impl Workspace {
         let t = *tokens(cx);
         let mixed = view.mixed(&["fallbackModelSelection"]);
         let pick = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-            this.update_settings(json!({ "fallbackModelSelection": pick.to_json() }), window, cx);
+            this.save_scoped_model("fallbackModelSelection", pick, window, cx);
         };
         let stored: Option<ModelSelection> = serde::Deserialize::deserialize(view.value("fallbackModelSelection")).ok();
         let Some(shown) = stored.as_ref().or(default) else {
@@ -328,13 +416,19 @@ impl Workspace {
         };
         let (_, label, _, icon) =
             RUNTIME_MODES.iter().find(|(id, ..)| *id == current).copied().unwrap_or(RUNTIME_MODES[3]);
+        let denials: Vec<Option<SharedString>> = RUNTIME_MODES
+            .iter()
+            .map(|(mode, ..)| view.first_managed_denial(|policy| runtime_mode_denial(policy, mode)).map(Into::into))
+            .collect();
         let view = cx.entity();
         trigger("default-permissions", &t)
             .children((!mixed).then(|| Icon::new(icon).with_size(px(14.)).text_color(t.muted_foreground)))
             .child(div().flex_1().child(if mixed { "Mixed" } else { label }))
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).opacity(0.7))
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
-                for (mode, label, description, icon) in RUNTIME_MODES {
+                for ((mode, label, description, icon), denial) in RUNTIME_MODES.into_iter().zip(denials.clone()) {
+                    let disabled = denial.is_some();
+                    let description: SharedString = denial.unwrap_or_else(|| description.into());
                     menu = menu.item(
                         PopupMenuItem::element(move |_, cx| {
                             let t = tokens(cx);
@@ -353,9 +447,10 @@ impl Workspace {
                                         .text_xs()
                                         .line_height(px(16.))
                                         .text_color(t.muted_foreground)
-                                        .child(description),
+                                        .child(description.clone()),
                                 )
                         })
+                        .disabled(disabled)
                         .checked(mode == current)
                         .on_click(window.listener_for(&view, move |this, _, window, cx| {
                             this.update_settings(json!({ "defaultRuntimeMode": mode }), window, cx);
@@ -373,11 +468,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let t = *tokens(cx);
         let days = view.value("sidebarAutoSettleAfterDays").as_i64();
-        let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false, &t).on_click(cx.listener(
+        let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false).on_click(cx.listener(
             move |this, _, window, cx| {
-                let days = days.is_none().then_some(AUTO_SETTLE_DEFAULT_DAYS);
+                let days = days.is_none().then(auto_settle_default_days);
                 this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx);
             },
         ));
@@ -441,7 +535,7 @@ impl Workspace {
         let connected = self.settings_client().is_some();
         let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
             let resolved = resolve_text_generation(Some(&pick), &this.settings_info().providers).unwrap_or(pick);
-            this.update_settings(json!({ "textGenerationModelSelection": resolved.to_json() }), window, cx);
+            this.save_scoped_model("textGenerationModelSelection", resolved, window, cx);
         };
         let control: AnyElement = match (&selection, connected) {
             (_, false) => muted("Connect an environment to choose its text generation model.", &t).into_any_element(),
@@ -753,4 +847,68 @@ impl Workspace {
 
 fn env_mode_label(mode: &str) -> &'static str {
     if mode == "worktree" { "New worktree" } else { "Current checkout" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(providers: Value) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        info.providers = serde_json::from_value(providers).unwrap();
+        info
+    }
+
+    #[test]
+    fn automatic_defaults_differ_when_they_resolve_differently() {
+        let codex = info(json!([{"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
+            "models": [{"slug": "gpt", "isDefault": true}]}]));
+        let claude = info(json!([{"instanceId": "claude", "driver": "claudeAgent", "enabled": true, "status": "ready",
+            "models": [{"slug": "opus", "isDefault": true}]}]));
+        let automatic = Value::Null;
+        assert!(default_models_mixed([(&automatic, Some(&codex)), (&automatic, Some(&claude))]));
+        assert!(!default_models_mixed([(&automatic, Some(&codex)), (&automatic, Some(&codex))]));
+        let pinned = json!({"instanceId": "codex", "model": "gpt"});
+        assert!(default_models_mixed([(&pinned, Some(&codex)), (&automatic, Some(&codex))]), "stored values differ");
+    }
+
+    #[test]
+    fn a_target_must_offer_the_picked_model() {
+        let env = info(json!([
+            {"instanceId": "codex", "driver": "codex", "enabled": true, "models": [{"slug": "gpt"}]},
+            {"instanceId": "grok", "driver": "grok", "enabled": true, "availability": "unavailable", "models": [{"slug": "g"}]}
+        ]));
+        let settings = crate::settings::Settings::layered(
+            &Default::default(),
+            &json!({
+                "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": false}}}}
+            }),
+        );
+        let pick = |instance: &str, model: &str| ModelSelection {
+            instance_id: instance.into(),
+            model: model.into(),
+            options: None,
+        };
+        assert!(offers_model(&env, &settings, None, Some("codex"), &pick("codex", "gpt")));
+        assert!(
+            !offers_model(&env, &settings, Some("p"), Some("codex"), &pick("codex", "gpt")),
+            "disabled for the project"
+        );
+        assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("codex", "other")), "no such model");
+        assert!(!offers_model(&env, &settings, None, Some("claudeAgent"), &pick("codex", "gpt")), "another driver");
+        assert!(!offers_model(&env, &settings, None, Some("grok"), &pick("grok", "g")), "unavailable");
+        assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("missing", "gpt")));
+    }
+
+    #[test]
+    fn a_policy_ceiling_rules_out_the_broader_permissions() {
+        let policy = json!({"organization": "Acme", "limits": {"maxRuntimeMode": "auto-accept-edits"}});
+        assert_eq!(runtime_mode_denial(&policy, "approval-required"), None);
+        assert_eq!(runtime_mode_denial(&policy, "auto-accept-edits"), None);
+        assert_eq!(
+            runtime_mode_denial(&policy, "full-access").as_deref(),
+            Some("Acme limits threads to Auto-accept edits.")
+        );
+        assert_eq!(runtime_mode_denial(&Value::Null, "full-access"), None);
+    }
 }

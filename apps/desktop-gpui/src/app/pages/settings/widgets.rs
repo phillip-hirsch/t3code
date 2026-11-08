@@ -13,6 +13,7 @@
 //! values from `view` (`SettingsView::value`). See `general.rs` for both kinds. Rows that are
 //! not one setting (a keybinding, a host, a task) draw the same chrome with [`RowFrame`].
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -26,13 +27,15 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
+    AnyElement, AppContext as _, BoxShadow, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px, svg,
 };
 use serde_json::{Map, Value};
 
 use super::code::projects::icon::project_icon;
-use super::connections::logic::machine_icon;
+use super::connections::SessionLoad;
+use super::connections::logic::{SETTINGS_WRITE, machine_icon};
 use super::row_layout::RowLayout;
 use crate::app::{Workspace, project_name};
 use crate::project_groups::ProjectGroup;
@@ -63,6 +66,10 @@ struct ViewEnvironment {
     machine: String,
     /// `None` while disconnected.
     settings: Option<Settings>,
+    /// This connection's session grants `settings:write`; not while its check is pending.
+    can_write: bool,
+    /// The server's `managedPolicy` summary, `Null` when unmanaged.
+    policy: Value,
 }
 
 impl ViewEnvironment {
@@ -72,6 +79,50 @@ impl ViewEnvironment {
 }
 
 impl SettingsView {
+    /// The selected environments that are connected (`connectedEnvironments`), for whether a
+    /// row may write and what an administrator locks.
+    fn row_authorities(&self) -> Vec<RowAuthority<'_>> {
+        self.environments
+            .iter()
+            .filter(|e| e.settings.is_some() && self.scope.environment_ids.contains(&e.id))
+            .map(|e| RowAuthority { label: &e.label, can_write: e.can_write, policy: &e.policy })
+            .collect()
+    }
+
+    /// The selected, connected environments' ids (`connectedEnvironments`).
+    pub(in crate::app) fn connected_environment_ids(&self) -> Vec<SharedString> {
+        self.environments
+            .iter()
+            .filter(|e| e.settings.is_some() && self.scope.environment_ids.contains(&e.id))
+            .map(|e| e.id.clone().into())
+            .collect()
+    }
+
+    /// The selected environments, connected or not (`useSettingsScope().environments`).
+    pub(in crate::app) fn selected_environments(&self) -> Vec<SelectedEnvironment<'_>> {
+        self.environments
+            .iter()
+            .filter(|e| self.scope.environment_ids.contains(&e.id))
+            .map(|e| SelectedEnvironment {
+                id: &e.id,
+                label: &e.label,
+                settings: e.settings.as_ref(),
+                can_write: e.can_write,
+            })
+            .collect()
+    }
+
+    /// Some environment is connected and this connection may write settings on each one.
+    pub(in crate::app) fn can_write_connected(&self) -> bool {
+        let authorities = self.row_authorities();
+        !authorities.is_empty() && authorities.iter().all(|authority| authority.can_write)
+    }
+
+    /// `firstManagedDenial` over the selected, connected environments' policies.
+    pub(in crate::app) fn first_managed_denial(&self, deny: impl Fn(&Value) -> Option<String>) -> Option<String> {
+        self.row_authorities().iter().find_map(|authority| deny(authority.policy))
+    }
+
     pub(in crate::app) fn environments(&self) -> Vec<scope::Environment<'_>> {
         self.environments.iter().map(ViewEnvironment::scoped).collect()
     }
@@ -126,6 +177,16 @@ impl SettingsView {
     }
 }
 
+/// A selected environment as a page that acts on each one sees it.
+pub(in crate::app) struct SelectedEnvironment<'a> {
+    pub(in crate::app) id: &'a str,
+    pub(in crate::app) label: &'a str,
+    /// `None` while disconnected.
+    pub(in crate::app) settings: Option<&'a Settings>,
+    /// This connection's session grants `settings:write` there.
+    pub(in crate::app) can_write: bool,
+}
+
 /// A server write on its way, with what the toast and the dropped-key check need.
 struct PendingWrite {
     client: Option<crate::rpc::RpcClient>,
@@ -150,6 +211,10 @@ pub(in crate::app) struct SettingRow {
     /// A reset the row works out itself, replacing the bound keys' default.
     reset: Option<Option<Value>>,
     unavailable: bool,
+    /// Edits server settings although no key is bound (`serverScoped`).
+    server_scoped: bool,
+    /// Dot paths inside a setting an administrator can lock (`managedPaths`).
+    managed_paths: Vec<String>,
 }
 
 enum Control {
@@ -198,7 +263,21 @@ impl SettingRow {
             control_beside: None,
             unavailable: false,
             reset: None,
+            server_scoped: false,
+            managed_paths: Vec::new(),
         }
+    }
+
+    /// The row edits server settings (`serverScoped`), so it needs a connected, writable target.
+    pub(in crate::app) fn server_scoped(mut self) -> Self {
+        self.server_scoped = true;
+        self
+    }
+
+    /// Dot paths an administrator's policy can lock besides the bound keys (`managedPaths`).
+    pub(in crate::app) fn managed_paths(mut self, paths: impl IntoIterator<Item = String>) -> Self {
+        self.managed_paths.extend(paths);
+        self
     }
 
     pub(in crate::app) fn tip(mut self, tip: impl Into<SharedString>) -> Self {
@@ -321,17 +400,135 @@ pub(in crate::app) fn loose_section(
     section_frame(id, title, None, v_flex().gap(px(4.)).children(blocks).into_any_element())
 }
 
+/// A selected, connected environment as a row's availability sees it.
+struct RowAuthority<'a> {
+    label: &'a str,
+    can_write: bool,
+    policy: &'a Value,
+}
+
+/// `isManagedSettingPath`: `path` is locked, or inside or around a locked path.
+fn is_managed_path(policy: &Value, path: &str) -> bool {
+    let within = |inner: &str, outer: &str| inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('.'));
+    policy["lockedSettings"].as_array().is_some_and(|locked| {
+        locked
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|locked| locked == path || within(locked, path) || within(path, locked))
+    })
+}
+
+/// Why a row's control is inert, in `SettingsRow`'s order: an administrator's lock on any
+/// target, then no connected target, then a target this connection may not write. A locked
+/// row offers no reset either.
+fn row_lock(
+    authorities: &[RowAuthority],
+    lockable: &[&str],
+    server_scoped: bool,
+    disconnected: bool,
+) -> Option<SharedString> {
+    let managed_by = authorities
+        .iter()
+        .find(|authority| lockable.iter().any(|path| is_managed_path(authority.policy, path)))
+        .map(|authority| authority.policy["organization"].as_str().unwrap_or_default());
+    if let Some(organization) = managed_by {
+        return Some(format!("Managed by {organization}.").into());
+    }
+    if !server_scoped {
+        return None;
+    }
+    if disconnected {
+        return Some("Reconnect the selected environment to change this setting.".into());
+    }
+    let denied: Vec<&str> =
+        authorities.iter().filter(|authority| !authority.can_write).map(|authority| authority.label).collect();
+    (!denied.is_empty())
+        .then(|| format!("This connection lacks permission to change settings on {}.", denied.join(", ")).into())
+}
+
+/// A search target as the page's sections see it while they build.
+#[derive(Clone)]
+pub(super) struct SectionTarget {
+    id: SharedString,
+    jumps: u64,
+    pending: Rc<Cell<u8>>,
+    scroll: ScrollHandle,
+    tokens: Tokens,
+}
+
+thread_local! {
+    /// Set by [`Workspace::with_section_target`]; the section builders take no workspace.
+    static SECTION_TARGET: RefCell<Option<SectionTarget>> = const { RefCell::new(None) };
+}
+
+impl SectionTarget {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn jumps(&self) -> u64 {
+        self.jumps
+    }
+
+    /// Scrolls the row the jump lands on into view and pulses it.
+    pub(super) fn mark<E: gpui_kit::ParentElement>(self, el: E) -> E {
+        el.child(scroll_target_marker(self.pending, self.scroll)).child(jump_pulse(self.jumps, &self.tokens))
+    }
+}
+
+/// Builds with `target` visible to [`section_frame`], for content a child entity renders.
+pub(super) fn with_target<R>(target: Option<SectionTarget>, build: impl FnOnce() -> R) -> R {
+    let previous = SECTION_TARGET.replace(target);
+    let built = build();
+    SECTION_TARGET.set(previous);
+    built
+}
+
+/// The jump target when it names section `id`.
+fn section_target(id: &ElementId) -> Option<SectionTarget> {
+    SECTION_TARGET
+        .with_borrow(|target| target.as_ref().filter(|target| *id == ElementId::Name(target.id.clone())).cloned())
+}
+
+/// Scrolls its parent to the middle of the page's viewport on the jump's first paints.
+fn scroll_target_marker(pending: Rc<Cell<u8>>, scroll: ScrollHandle) -> impl IntoElement {
+    gpui_kit::canvas(
+        move |bounds, window, _| {
+            let Some(left) = pending.get().checked_sub(1) else { return };
+            pending.set(left);
+            if left > 0 {
+                window.request_animation_frame();
+            }
+            let viewport = scroll.bounds();
+            let offset = scroll.offset();
+            let centered = viewport.center().y - bounds.center().y;
+            scroll.set_offset(gpui_kit::point(offset.x, (offset.y + centered).min(px(0.))));
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 fn section_frame(
     id: impl Into<ElementId>,
     title: impl IntoElement,
     action: Option<AnyElement>,
     body: AnyElement,
 ) -> AnyElement {
+    let id = id.into();
+    let target = section_target(&id);
     v_flex()
         .id(id)
         .gap(px(10.))
         .child(
+            // A section a search jumps to centers and pulses its header (`data-settings-scroll-target`).
             h_flex()
+                .relative()
+                .when_some(target, |el, target| {
+                    el.child(scroll_target_marker(target.pending, target.scroll))
+                        .child(jump_pulse(target.jumps, &target.tokens))
+                })
                 .min_h(px(28.))
                 .px(px(16.))
                 .justify_between()
@@ -562,6 +759,7 @@ fn scope_groups(groups: &[ProjectGroup]) -> Vec<scope::Group> {
                     id: m.project.id.clone(),
                     environment_id: m.project.environment_id.to_string(),
                     name: project_name(&m.project).to_string(),
+                    workspace_root: m.project.workspace_root.clone(),
                     legacy_model_selection: m
                         .project
                         .default_model_selection
@@ -594,10 +792,14 @@ impl Workspace {
             .filter_map(|session| {
                 let id = session.id.as_ref()?.to_string();
                 let info = &session.server_info;
+                let can_write =
+                    self.settings_ui.grants.get(&id).is_some_and(|(_, session)| session.grants(SETTINGS_WRITE));
                 Some(ViewEnvironment {
                     label: info.environment_label.clone().unwrap_or_else(|| id.clone()),
                     machine: info.machine_kind().to_owned(),
                     settings: session.is_connected().then(|| info.settings.clone()),
+                    can_write,
+                    policy: info.managed_policy.clone(),
                     id,
                 })
             })
@@ -613,12 +815,48 @@ impl Workspace {
         };
         let environments = view.environments();
         let (search, scope) = self.resolve_settings_scope(&scope_groups, &environments);
-        let targets = scope::targets(&scope, &environments);
+        let targets = scope::targets(&scope, &environments, |project| {
+            let key = (SharedString::from(project.environment_id.clone()), project.workspace_root.clone());
+            self.t3_project_files.get(&key).filter(|file| !matches!(file, crate::model::T3ProjectFile::Loading))
+        });
         drop(environments);
         view.search = search;
         view.scope = scope;
         view.targets = targets;
         view
+    }
+
+    /// Checks each connected environment's session for `settings:write` once per connection
+    /// (`useEnvironmentsWithScope`); a disconnected one is asked again when it returns.
+    pub(super) fn check_settings_grants(&mut self, cx: &mut Context<Self>) {
+        let connected: Vec<(String, crate::backend::Endpoint)> = self
+            .sessions
+            .iter()
+            .filter(|session| session.is_connected())
+            .filter_map(|session| Some((session.id.as_ref()?.to_string(), session.endpoint.clone()?)))
+            .collect();
+        let grants = &mut self.settings_ui.grants;
+        grants.retain(|id, _| connected.iter().any(|(connected, _)| connected == id));
+        for (id, endpoint) in connected {
+            if grants.contains_key(&id) {
+                continue;
+            }
+            let key = id.clone();
+            let task = super::connections::check_session(endpoint, cx, move |this: &mut Self, session, _| {
+                if let Some((_, load)) = this.settings_ui.grants.get_mut(&key) {
+                    *load = session;
+                }
+            });
+            grants.insert(id, (task, SessionLoad::Pending));
+        }
+    }
+
+    /// Starts reading the selected checkouts' `t3.json` for the file tier (`useMemberProjectFiles`).
+    pub(super) fn load_scope_project_files(&mut self, view: &SettingsView, cx: &mut Context<Self>) {
+        let ScopeKind::Project { members } = &view.scope.kind else { return };
+        for member in members {
+            self.t3_project_file(&member.environment_id.clone().into(), &member.workspace_root, cx);
+        }
     }
 
     /// The environment a scoped page reads and acts on (`useSettingsScope().environment`),
@@ -922,19 +1160,20 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let keys = row.keys.clone();
-        let server_scoped = keys.iter().any(|k| contract().is_server_key(k));
+        let server_scoped = row.server_scoped || keys.iter().any(|k| contract().is_server_key(k));
         let project_scope = view.scope.is_project();
         let scoped_keys: Vec<&'static str> = keys.iter().copied().filter(|k| contract().is_project_scoped(k)).collect();
         let mixed = !keys.is_empty() && view.mixed(&keys);
         let environment_wide = project_scope && server_scoped && scoped_keys.is_empty();
-        let disconnected = server_scoped && view.targets.is_empty();
+        let lockable: Vec<&str> = keys.iter().copied().chain(row.managed_paths.iter().map(String::as_str)).collect();
+        let lock = row_lock(&view.row_authorities(), &lockable, server_scoped, view.targets.is_empty());
         let overriding: Vec<String> = match (view.environment().and_then(|e| e.settings), project_scope) {
             (Some(settings), false) => scope::overriding_projects(settings, &scoped_keys),
             _ => Vec::new(),
         };
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
-        let reset = self.render_reset(view, &row, &scoped_keys, mixed, disconnected, cx);
+        let reset = self.render_reset(view, &row, &scoped_keys, mixed, lock.is_some(), cx);
         let SettingRow { id, title, description, status, tip, body, control, control_beside, unavailable, .. } = row;
         let (state, summary) = match view.environment() {
             Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
@@ -945,13 +1184,10 @@ impl Workspace {
         let quiet_marker = quiet_marker
             && self.settings_ui.open_marker.as_ref() != Some(&id)
             && matches!(state, InheritanceState::Default | InheritanceState::Environment);
-        let inert = if disconnected {
-            Some("Reconnect the selected environment to change this setting.")
-        } else if environment_wide {
-            Some("Environment-wide setting. Select an environment to change it.")
-        } else {
-            None
-        };
+        let inert = lock.or_else(|| {
+            environment_wide
+                .then(|| SharedString::from("Environment-wide setting. Select an environment to change it."))
+        });
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
         let (control, hug, body) = match control {
             Some(RowControl::Body(field)) => (None, None, Some(field)),
@@ -959,7 +1195,7 @@ impl Workspace {
             Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body),
             None => (None, None, body),
         };
-        let inert = if unavailable { Some("") } else { inert };
+        let inert = if unavailable { Some(SharedString::default()) } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
         let title = h_flex().gap(px(6.)).child(title).when_some(tip, |el, tip| {
@@ -985,13 +1221,15 @@ impl Workspace {
         frame.description = description;
         frame.body = body;
         frame.hug = hug;
-        let inert_control = |control: AnyElement| match inert {
+        let inert_control = |control: AnyElement| match inert.clone() {
             Some(message) => div()
                 .id(SharedString::from(format!("{id}-inert")))
                 .flex_none()
                 .opacity(0.5)
                 .occlude()
-                .when(!message.is_empty(), |el| el.tooltip(move |window, cx| Tooltip::new(message).build(window, cx)))
+                .when(!message.is_empty(), |el| {
+                    el.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
+                })
                 .child(control)
                 .into_any_element(),
             None => control,
@@ -1013,10 +1251,10 @@ impl Workspace {
         row: &SettingRow,
         scoped_keys: &[&'static str],
         mixed: bool,
-        disconnected: bool,
+        locked: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if disconnected {
+        if locked {
             return None;
         }
         // At project scope a scoped row only resets its override, whatever its own reset.
@@ -1260,9 +1498,9 @@ impl Workspace {
             (Control::Element(element), _) => element,
             (Control::Switch, Some(key)) => {
                 let checked = view.bool(key);
-                switch(id, checked, mixed, &t)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.update_settings(serde_json::json!({ key: !checked || mixed }), window, cx);
+                switch(id, checked, mixed)
+                    .on_click(cx.listener(move |this, next: &bool, window, cx| {
+                        this.update_settings(serde_json::json!({ key: *next }), window, cx);
                     }))
                     .into_any_element()
             }
@@ -1456,25 +1694,25 @@ impl Workspace {
     }
 
     /// Marks the row a search jumped to; scrolls it into view on its first paint.
-    fn scroll_target_marker(&self) -> impl IntoElement {
-        let pending = self.settings_ui.scroll_pending.clone();
-        let scroll = self.settings_ui.scroll.clone();
-        gpui_kit::canvas(
-            move |bounds, window, _| {
-                let Some(left) = pending.get().checked_sub(1) else { return };
-                pending.set(left);
-                if left > 0 {
-                    window.request_animation_frame();
-                }
-                let viewport = scroll.bounds();
-                let offset = scroll.offset();
-                let centered = viewport.center().y - bounds.center().y;
-                scroll.set_offset(gpui_kit::point(offset.x, (offset.y + centered).min(px(0.))));
-            },
-            |_, (), _, _| {},
-        )
-        .absolute()
-        .size_full()
+    pub(super) fn scroll_target_marker(&self) -> impl IntoElement {
+        scroll_target_marker(self.settings_ui.scroll_pending.clone(), self.settings_ui.scroll.clone())
+    }
+
+    /// Builds a settings page's content with `self.settings_ui.target` visible to its sections,
+    /// which [`section_frame`] reads to scroll to and pulse a section a search jumped to.
+    pub(super) fn with_section_target<R>(&mut self, build: impl FnOnce(&mut Self) -> R, t: &Tokens) -> R {
+        with_target(self.section_target(t), || build(self))
+    }
+
+    /// The search jump in progress, as a page's sections see it.
+    pub(super) fn section_target(&self, t: &Tokens) -> Option<SectionTarget> {
+        self.settings_ui.target.clone().map(|id| SectionTarget {
+            id,
+            jumps: self.settings_ui.jumps,
+            pending: self.settings_ui.scroll_pending.clone(),
+            scroll: self.settings_ui.scroll.clone(),
+            tokens: *t,
+        })
     }
 
     /// "Applying settings for [project] across [environment]" (`SettingsScopeSentence`).
@@ -1641,37 +1879,9 @@ pub(in crate::app) fn layer_row(layer: &scope::Layer, t: &Tokens) -> impl IntoEl
         )
 }
 
-/// The web's `Switch`: a 30×18 track and a 14px thumb (38×22 and 18px below `sm`).
-pub(in crate::app) fn switch(
-    id: &SharedString,
-    checked: bool,
-    mixed: bool,
-    t: &Tokens,
-) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let on = checked && !mixed;
-    let thumb: Hsla = if on || !t.dark { t.background } else { t.muted_foreground };
-    let size = switch_thumb_size(false, t);
-    div()
-        .id(SharedString::from(format!("{id}-switch")))
-        .flex_none()
-        .w(px(size * 2. - 2.))
-        .h(px(size + 2.))
-        .p(px(2.))
-        .rounded_full()
-        .cursor_pointer()
-        .bg(if on { t.primary } else { t.input })
-        .flex()
-        .items_center()
-        .map(|el| {
-            if mixed {
-                el.justify_center()
-            } else if on {
-                el.justify_end()
-            } else {
-                el.justify_start()
-            }
-        })
-        .child(div().size(px(size - 2.)).rounded_full().bg(thumb).when(mixed, |el| el.opacity(0.7)))
+/// The web's `Switch` for row `id`; a mixed one turns on when pressed.
+pub(in crate::app) fn switch(id: &SharedString, checked: bool, mixed: bool) -> Switch {
+    Switch::new(SharedString::from(format!("{id}-switch"))).checked(checked).mixed(mixed)
 }
 
 /// `--thumb-size`: `--spacing(5) sm:--spacing(4)`, or `--spacing(4) sm:--spacing(3.5)` at `size="sm"`.
@@ -1685,6 +1895,7 @@ fn switch_thumb_size(small: bool, t: &Tokens) -> f32 {
 pub(in crate::app) struct Switch {
     id: ElementId,
     checked: bool,
+    mixed: bool,
     disabled: bool,
     small: bool,
     label: Option<SharedString>,
@@ -1696,11 +1907,25 @@ type OnToggle = Rc<dyn Fn(&bool, &mut Window, &mut gpui_kit::App)>;
 
 impl Switch {
     pub(in crate::app) fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, disabled: false, small: false, label: None, on_change: None }
+        Self {
+            id: id.into(),
+            checked: false,
+            mixed: false,
+            disabled: false,
+            small: false,
+            label: None,
+            on_change: None,
+        }
     }
 
     pub(in crate::app) fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    /// Neither on nor off (`mixed`): the thumb centered, and a press turns it on.
+    pub(in crate::app) fn mixed(mut self, mixed: bool) -> Self {
+        self.mixed = mixed;
         self
     }
 
@@ -1740,15 +1965,21 @@ impl gpui_kit::RenderOnce for Switch {
         let size = switch_thumb_size(self.small, &t);
         // `disabled:opacity-64` on the track and thumb alike.
         let fade = if self.disabled { 0.64 } else { 1. };
-        let track = if self.checked { t.primary } else { t.input };
+        let mixed = self.mixed;
+        // `data-[mixed]:bg-input`; the thumb keeps its checked color.
+        let track = if self.checked && !mixed { t.primary } else { t.input };
         let thumb = if self.checked || !t.dark { t.background } else { t.muted_foreground };
+        // `focus-visible:ring-2 ring-inset ring-ring`
+        let ring = BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset();
         gpui_kit::base::Switch::new(self.id)
             .checked(self.checked)
+            .mixed(mixed)
             .disabled(self.disabled)
             .when_some(self.label, gpui_kit::base::Switch::accessibility_label)
             .when_some(self.on_change, |el, on_change| {
-                el.on_change(move |checked, _, window, cx| on_change(&checked, window, cx))
+                el.on_change(move |checked, _, window, cx| on_change(&(checked || mixed), window, cx))
             })
+            .focus_visible(move |s| s.shadow(vec![ring]))
             .flex_none()
             .w(px(size * 2. - 2.))
             .h(px(size + 2.))
@@ -1756,10 +1987,14 @@ impl gpui_kit::RenderOnce for Switch {
             .rounded_full()
             .flex()
             .items_center()
-            .when(self.checked, gpui_kit::Styled::justify_end)
+            .map(|el| match (mixed, self.checked) {
+                (true, _) => el.justify_center(),
+                (false, true) => el.justify_end(),
+                (false, false) => el,
+            })
             .bg(track.opacity(fade))
             .when(!self.disabled, gpui_kit::Styled::cursor_pointer)
-            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade)))
+            .child(div().size(px(size - 2.)).rounded_full().bg(thumb.opacity(fade * if mixed { 0.7 } else { 1. })))
     }
 }
 
@@ -2127,6 +2362,7 @@ fn panel_preview(duration_ms: f32, window: &mut Window, cx: &mut gpui_kit::App, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_search_jump_pulses_twice_then_shows_nothing() {
@@ -2135,5 +2371,48 @@ mod tests {
         assert!(at(650.) < 1e-4, "and clears before the second: {}", at(650.));
         assert!((at(975.) - 1.).abs() < 1e-4, "the second peaks: {}", at(975.));
         assert!(at(1300.) < 1e-4, "nothing remains once it ends: {}", at(1300.));
+    }
+
+    #[test]
+    fn a_row_locks_for_policy_first_then_for_write_grants() {
+        let acme =
+            json!({"organization": "Acme", "lockedSettings": ["storageCleanup.logsAfterDays", "worktreeCleanup"]});
+        let open = Value::Null;
+        let env = |label, can_write, policy| RowAuthority { label, can_write, policy };
+        assert!(is_managed_path(&acme, "storageCleanup"), "a parent of a locked path");
+        assert!(is_managed_path(&acme, "worktreeCleanup.mode"), "inside a locked path");
+        assert!(!is_managed_path(&acme, "storageCleanup.logs"), "a sibling sharing a prefix");
+
+        let both = [env("Studio", true, &open), env("Laptop", false, &acme)];
+        let lock = |lockable: &[&str], server_scoped| row_lock(&both, lockable, server_scoped, false);
+        assert_eq!(lock(&["worktreeCleanup"], true).as_deref(), Some("Managed by Acme."));
+        assert_eq!(
+            lock(&["defaultRuntimeMode"], true).as_deref(),
+            Some("This connection lacks permission to change settings on Laptop.")
+        );
+        assert_eq!(lock(&["defaultRuntimeMode"], false), None, "device rows need no grant");
+        let writable = [env("Studio", true, &open)];
+        assert_eq!(row_lock(&writable, &["defaultRuntimeMode"], true, false), None);
+        assert_eq!(
+            row_lock(&[], &["defaultRuntimeMode"], true, true).as_deref(),
+            Some("Reconnect the selected environment to change this setting.")
+        );
+    }
+
+    #[test]
+    fn a_search_target_reaches_only_the_section_it_names_while_the_page_builds() {
+        let name = |id: &str| ElementId::Name(SharedString::from(id.to_owned()));
+        let target = SectionTarget {
+            id: "project-defaults".into(),
+            jumps: 1,
+            pending: Rc::default(),
+            scroll: ScrollHandle::new(),
+            tokens: Tokens::light(),
+        };
+        assert!(section_target(&name("project-defaults")).is_none(), "no page is building");
+        SECTION_TARGET.set(Some(target));
+        assert!(section_target(&name("project-defaults")).is_some());
+        assert!(section_target(&name("new-threads")).is_none());
+        SECTION_TARGET.set(None);
     }
 }

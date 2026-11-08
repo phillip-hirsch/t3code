@@ -6,10 +6,10 @@ use serde_json::Value;
 
 use crate::timestamp::parse_ms;
 
-pub(super) const ORCHESTRATION_READ: &str = "orchestration:read";
+pub(in crate::app::pages::settings) const ORCHESTRATION_READ: &str = "orchestration:read";
 pub(in crate::app::pages::settings) const ORCHESTRATION_OPERATE: &str = "orchestration:operate";
 pub(in crate::app::pages::settings) const SETTINGS_WRITE: &str = "settings:write";
-pub(super) const PROVIDERS_MANAGE: &str = "providers:manage";
+pub(in crate::app::pages::settings) const PROVIDERS_MANAGE: &str = "providers:manage";
 pub(in crate::app::pages::settings) const ENVIRONMENT_MAINTAIN: &str = "environment:maintain";
 const PREVIEW_OPERATE: &str = "preview:operate";
 pub(in crate::app::pages::settings) const DIAGNOSTICS_READ: &str = "diagnostics:read";

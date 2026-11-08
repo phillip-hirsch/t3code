@@ -6,16 +6,16 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{Icon, Sizable as _};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, Context, Div, ElementId, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div,
-    px, svg,
+    AnyElement, App, Context, Div, ElementId, FontWeight, IntoElement, ParentElement as _, SharedString, Styled as _,
+    Window, div, px, svg,
 };
 use serde_json::Value;
 
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
-use crate::model::{ModelSelection, Provider};
+use crate::model::{ModelSelection, OptionChoice, OptionDescriptor, Provider};
 use crate::model_label;
 use crate::theme::{Tokens, tokens};
 
@@ -96,8 +96,8 @@ impl Workspace {
             .child(trigger_label(name))
     }
 
-    /// `TraitsPicker` with prompt-injected effort left out: the model's effort levels and its
-    /// on/off options. `None` when the model has neither.
+    /// `TraitsPicker` with prompt-injected effort left out: every select's choices, then each
+    /// on/off option. `None` when the model has nothing to pick (`hasAnyControls`).
     pub(in crate::app) fn traits_picker(
         &self,
         id: impl Into<ElementId>,
@@ -107,11 +107,7 @@ impl Workspace {
     ) -> Option<AnyElement> {
         let t = *tokens(cx);
         let descriptors = self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors.clone();
-        let effort = model_label::reasoning(&descriptors).filter(|d| d.kind == "select").cloned();
-        let toggles: Vec<_> = descriptors.iter().filter(|d| d.kind == "boolean").cloned().collect();
-        if effort.is_none() && toggles.is_empty() {
-            return None;
-        }
+        let (selects, toggles) = trait_controls(&descriptors)?;
         let label = model_label::effort_label(&descriptors, selection).unwrap_or_else(|| "Options".into());
         let current = selection.clone();
         let view = cx.entity();
@@ -122,37 +118,87 @@ impl Workspace {
                 .child(Icon::new(Lucide::Gauge).with_size(px(16.)).flex_none().text_color(t.muted_foreground))
                 .child(trigger_label(label.into()))
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu: PopupMenu, window, _| {
-                    if let Some(effort) = &effort {
-                        let value = model_label::current_value(effort, &current);
-                        menu = menu.label(effort.label.clone());
-                        for option in effort.options.iter().filter(|o| !effort.prompt_injected_values.contains(&o.id)) {
-                            let pick = model_label::with_option(&current, &effort.id, Value::String(option.id.clone()));
-                            let on_pick = on_pick.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(option.label.clone())
-                                    .checked(value.as_ref().and_then(Value::as_str) == Some(&option.id))
-                                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                        on_pick(this, pick.clone(), window, cx);
-                                    })),
-                            );
+                    let item = |menu: PopupMenu, row: PopupMenuItem, pick: ModelSelection| {
+                        let on_pick = on_pick.clone();
+                        menu.item(row.on_click(window.listener_for(&view, move |this, _, window, cx| {
+                            on_pick(this, pick.clone(), window, cx);
+                        })))
+                    };
+                    for (index, select) in selects.iter().enumerate() {
+                        if index > 0 {
+                            menu = menu.separator();
+                        }
+                        let value = model_label::current_value(select, &current);
+                        menu = menu.label(select.label.clone());
+                        for option in select.options.iter().filter(|o| !select.prompt_injected_values.contains(&o.id)) {
+                            let checked = value.as_ref().and_then(Value::as_str) == Some(&option.id);
+                            let pick = model_label::with_option(&current, &select.id, Value::String(option.id.clone()));
+                            menu = item(menu, choice_row(option, &t).checked(checked), pick);
                         }
                     }
-                    for toggle in &toggles {
-                        let on =
-                            model_label::current_value(toggle, &current).and_then(|v| v.as_bool()).unwrap_or(false);
-                        let pick = model_label::with_option(&current, &toggle.id, Value::Bool(!on));
-                        let on_pick = on_pick.clone();
-                        menu = menu.separator().item(PopupMenuItem::new(toggle.label.clone()).checked(on).on_click(
-                            window.listener_for(&view, move |this, _, window, cx| {
-                                on_pick(this, pick.clone(), window, cx);
-                            }),
-                        ));
+                    for (index, toggle) in toggles.iter().enumerate() {
+                        if index > 0 || !selects.is_empty() {
+                            menu = menu.separator();
+                        }
+                        let on = model_label::current_value(toggle, &current).and_then(|v| v.as_bool()) == Some(true);
+                        menu = menu.label(toggle.label.clone());
+                        for (label, value) in [("On", true), ("Off", false)] {
+                            let pick = model_label::with_option(&current, &toggle.id, Value::Bool(value));
+                            menu = item(menu, PopupMenuItem::new(label).checked(on == value), pick);
+                        }
                     }
                     menu
                 })
                 .into_any_element(),
         )
     }
+}
+
+/// `getTraitsSectionVisibility` for a settings row: the model's selects and toggles, or `None`
+/// when it offers no select and neither Fast mode nor Thinking.
+fn trait_controls(descriptors: &[OptionDescriptor]) -> Option<(Vec<OptionDescriptor>, Vec<OptionDescriptor>)> {
+    let of = |kind: &str| descriptors.iter().filter(|d| d.kind == kind).cloned().collect::<Vec<_>>();
+    let (selects, toggles) = (of("select"), of("boolean"));
+    let known_toggle = toggles.iter().any(|d| matches!(d.id.as_str(), "fastMode" | "thinking"));
+    (!selects.is_empty() || known_toggle).then_some((selects, toggles))
+}
+
+/// A select choice: its label with an outline "Default" badge, and its description below.
+fn choice_row(option: &OptionChoice, t: &Tokens) -> PopupMenuItem {
+    let (label, default, description) = (option.label.clone(), option.is_default, option.description.clone());
+    let t = *t;
+    PopupMenuItem::element(move |_, _| {
+        let badge = div()
+            .flex_none()
+            .h(px(16.))
+            .min_w(px(16.))
+            .px(px(3.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(t.input)
+            .bg(if t.dark { t.input.opacity(0.32) } else { t.background })
+            .text_size(px(10.))
+            .line_height(px(10.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(t.foreground)
+            .child("Default");
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().min_w_0().truncate().child(label.clone()))
+                    .children(default.then_some(badge)),
+            )
+            .children(description.clone().map(|description| {
+                div().max_w(px(224.)).text_xs().text_color(t.muted_foreground.opacity(0.8)).child(description)
+            }))
+    })
 }
 
 /// A muted line in a row's control slot, as the web's `text-sm text-muted-foreground` spans.
@@ -198,6 +244,22 @@ pub(in crate::app) fn resolve_text_generation(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn traits_list_every_select_and_need_a_known_control() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "low", "label": "Low"}]},
+            {"id": "agent", "label": "Agent", "type": "select", "options": [{"id": "build", "label": "Build"}]},
+            {"id": "fastMode", "label": "Fast mode", "type": "boolean"}
+        ]))
+        .unwrap();
+        let (selects, toggles) = trait_controls(&descriptors).unwrap();
+        let ids = |list: &[OptionDescriptor]| list.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert_eq!((ids(&selects), ids(&toggles)), (vec!["effort".into(), "agent".into()], vec!["fastMode".into()]));
+        let unknown: Vec<OptionDescriptor> =
+            serde_json::from_value(json!([{"id": "other", "label": "Other", "type": "boolean"}])).unwrap();
+        assert!(trait_controls(&unknown).is_none(), "only Fast mode or Thinking toggles count on their own");
+    }
 
     #[test]
     fn text_generation_falls_back_to_a_cheap_default() {

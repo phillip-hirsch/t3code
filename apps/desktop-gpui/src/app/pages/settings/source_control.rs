@@ -17,8 +17,9 @@ use crate::app::pages::settings::widgets::Switch;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, HighlightStyle, Hsla,
@@ -33,6 +34,7 @@ use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::model::ModelSelection;
 use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
@@ -894,6 +896,7 @@ impl Workspace {
             (state.sign_in.clone(), state.copied, state.signed_in_revealed)
         };
         let failed = matches!(sign_in, SignIn::Failed(_)) && !signed_in;
+        let can_sign_in = self.can_sign_in();
         let input = json!({ "provider": kind, "host": app.host });
         let subtitle: AnyElement;
         let action: AnyElement;
@@ -930,6 +933,7 @@ impl Workspace {
                 .outline()
                 .xsmall()
                 .label("Sign out")
+                .disabled(!can_sign_in)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     state.update(cx, |state, _| state.sign_in = SignIn::Idle);
                     // The whole map: other hosts' redaction markers keep their sessions.
@@ -979,7 +983,7 @@ impl Workspace {
                 .xsmall()
                 .when(starting, |el| el.child(Spinner::new().xsmall()))
                 .label(if matches!(sign_in, SignIn::Failed(_)) { "Try again" } else { "Sign in with GitHub" })
-                .disabled(starting)
+                .disabled(!can_sign_in || starting)
                 .on_click(cx.listener(move |this, _, _, cx| this.start_sign_in(&state, input.clone(), cx)))
                 .into_any_element();
         }
@@ -1072,8 +1076,17 @@ impl Workspace {
         card.into_any_element()
     }
 
+    /// `sourceControl.signInStart`'s permission (`settings:write`) on the settings environment,
+    /// which sign-out shares.
+    fn can_sign_in(&self) -> bool {
+        self.settings_environment().is_some_and(|environment| self.environment_grants(&environment, SETTINGS_WRITE))
+    }
+
     /// `signIn`: start the device flow, show its code, then wait for the user to approve it.
     fn start_sign_in(&mut self, state: &Entity<SourceControlState>, input: Value, cx: &mut Context<Self>) {
+        if !self.can_sign_in() {
+            return;
+        }
         let Some(client) = self.settings_client() else { return };
         state.update(cx, |state, cx| {
             state.sign_in = SignIn::Starting;
@@ -1704,18 +1717,23 @@ impl Workspace {
         );
         let typed = instructions_field.clone();
         let custom = mode == "custom";
-        let style_options =
-            WRITING_STYLES.iter().map(|(id, label, _)| (*id, SharedString::from(*label), *id == mode)).collect();
+        let mode_mixed = style_field_mixed(&view.targets, "mode");
+        let writing_style_mixed = mode_mixed || style_field_mixed(&view.targets, "customInstructions");
+        let style_options = WRITING_STYLES
+            .iter()
+            .map(|(id, label, _)| (*id, SharedString::from(*label), !mode_mixed && *id == mode))
+            .collect();
         let style_select = self.menu_select(
             "writing-style",
             style_options,
-            mode_label,
+            if mode_mixed { "Mixed" } else { mode_label },
             224.,
             cx,
             move |this, picked: &str, window, cx| {
-                // Carries what was typed into the custom instructions along with the mode.
+                // Carries what was typed into the custom instructions along with the mode; a
+                // mixed selection shows no instructions to carry.
                 let mut style = json!({ "mode": picked });
-                if custom {
+                if custom && !writing_style_mixed {
                     style["customInstructions"] = json!(typed.value(cx).trim());
                 }
                 this.update_settings(json!({ "sourceControlWritingStyle": style }), window, cx);
@@ -1738,16 +1756,23 @@ impl Workspace {
         let guide_control = (guides && connected).then(|| {
             let guide: Option<ModelSelection> =
                 serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
+            let mixed = view.mixed(&["reviewGuideModelSelection"]);
             let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
             let guide_selection = guide_usable.cloned().or_else(|| active.clone());
             self.dedicated_model_control(
-                "review-guide-model",
-                "reviewGuideModelSelection",
-                guide.is_some(),
-                guide_selection.filter(|_| guide.is_some() && can_dedicate),
-                active.clone(),
-                guide.is_none() && !can_dedicate,
-                None,
+                DedicatedModel {
+                    id: "review-guide-model",
+                    key: "reviewGuideModelSelection",
+                    refused: "Review guide model not saved",
+                    on: guide.is_some(),
+                    mixed,
+                    switch_mixed: mixed,
+                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_dedicate),
+                    enable_with: active.clone(),
+                    check_enable: true,
+                    dimmed: guide.is_none() && !can_dedicate,
+                    note: None,
+                },
                 cx,
             )
         });
@@ -1755,23 +1780,32 @@ impl Workspace {
             let note =
                 (writer.is_some() && !can_dedicate).then(|| muted("No text generation providers available.", &t));
             self.dedicated_model_control(
-                "writer-model",
-                "sourceControlWriterModelSelection",
-                writer.is_some(),
-                active.clone().filter(|_| writer.is_some() && can_dedicate),
-                default_selection.clone(),
-                false,
-                note,
+                DedicatedModel {
+                    id: "writer-model",
+                    key: "sourceControlWriterModelSelection",
+                    refused: "Source control writer model not saved",
+                    on: writer.is_some(),
+                    mixed: view.mixed(&["sourceControlWriterModelSelection"]),
+                    switch_mixed: false,
+                    selection: active.clone().filter(|_| writer.is_some() && can_dedicate),
+                    enable_with: default_selection.clone(),
+                    check_enable: false,
+                    dimmed: false,
+                    note,
+                },
                 cx,
             )
         });
+        let instructions_for_all = writing_style_mixed.then(|| self.instructions_for_all(window, cx));
 
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let mut style_row = SettingRow::new("source-control-writing-style")
             .description(mode_description)
             .setting("sourceControlWritingStyle")
             .control(style_select);
-        if custom {
+        if let Some(body) = instructions_for_all {
+            style_row = style_row.body(body);
+        } else if custom {
             style_row = style_row.body(textarea_body(&instructions_field));
         }
         let mut rows = vec![
@@ -1804,7 +1838,7 @@ impl Workspace {
             ));
         }
         let follow = style["followChangeRequestTemplates"] != false;
-        let follow = switch(&"follow-change-request-templates".into(), follow, false, &t).on_click(cx.listener(
+        let follow = switch(&"follow-change-request-templates".into(), follow, false).on_click(cx.listener(
             move |this, _, window, cx| {
                 this.update_settings(
                     json!({ "sourceControlWritingStyle": { "followChangeRequestTemplates": !follow } }),
@@ -1836,22 +1870,87 @@ impl Workspace {
         rows
     }
 
+    /// The mixed writing style's way out (`writingStyleMixed`): one set of custom instructions
+    /// written to every selected target, only once Apply is pressed.
+    fn instructions_for_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // Whether the draft is open, and its generation, so each opening starts empty.
+        let draft =
+            window.use_keyed_state(self.settings_state_key("source-control-instructions-for-all"), cx, |_, _| {
+                (false, 0_u32)
+            });
+        let (editing, generation) = *draft.read(cx);
+        let content = if editing {
+            let field = self.text_field(
+                &format!("source-control-instructions-for-all-{generation}"),
+                "",
+                "Write the instructions each selected environment should use.",
+                true,
+                None,
+                window,
+                cx,
+                |_, _, _, _| {},
+            );
+            let typed = field.clone();
+            let apply = Button::new("apply-instructions-to-all")
+                .outline()
+                .small()
+                .label("Apply instructions to all")
+                .disabled(field.value(cx).is_empty())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let text = typed.value(cx);
+                    if text.is_empty() {
+                        return;
+                    }
+                    let style = json!({ "mode": "custom", "customInstructions": text.trim() });
+                    this.update_settings(json!({ "sourceControlWritingStyle": style }), window, cx);
+                    draft.update(cx, |draft, cx| {
+                        draft.0 = false;
+                        cx.notify();
+                    });
+                }));
+            v_flex().gap_2().child(field.element()).child(h_flex().child(apply)).into_any_element()
+        } else {
+            Button::new("write-instructions-for-all")
+                .outline()
+                .small()
+                .label("Write custom instructions for all")
+                .on_click(move |_, _, cx| {
+                    draft.update(cx, |draft, cx| {
+                        *draft = (true, draft.1.wrapping_add(1));
+                        cx.notify();
+                    });
+                })
+                .into_any_element()
+        };
+        div().mt(px(12.)).pb(px(14.)).max_w(px(672.)).child(content).into_any_element()
+    }
+
     /// A model a feature can dedicate: the picker while on, and a switch that turns it on with
-    /// `enable_with` or off (null), so the feature falls back to its parent model.
-    fn dedicated_model_control(
-        &self,
-        id: &'static str,
-        key: &'static str,
-        on: bool,
-        selection: Option<ModelSelection>,
-        enable_with: Option<ModelSelection>,
-        dimmed: bool,
-        note: Option<gpui_kit::Div>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let t = *tokens(cx);
+    /// `enable_with` or off (null), so the feature falls back to its parent model. A pick that
+    /// some selected target can't run is refused with a toast (`useScopedModelDisabledReason`).
+    fn dedicated_model_control(&self, row: DedicatedModel, cx: &mut Context<Self>) -> AnyElement {
+        let DedicatedModel {
+            id,
+            key,
+            refused,
+            on,
+            mixed,
+            switch_mixed,
+            selection,
+            enable_with,
+            check_enable,
+            dimmed,
+            note,
+        } = row;
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ key: value }), window, cx);
+        };
+        let checked_set = move |this: &mut Self, pick: &ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
+            if let Some(reason) = this.scoped_model_denial(&this.settings_view(), pick) {
+                window.push_notification(Notification::error(reason).title(refused), cx);
+                return;
+            }
+            set(this, pick.to_json(), window, cx);
         };
         let traits_id: &'static str = if id == "writer-model" { "writer-traits" } else { "review-guide-traits" };
         h_flex()
@@ -1863,27 +1962,28 @@ impl Workspace {
                 el.child(self.model_picker(
                     id,
                     Some(&selection),
-                    None,
+                    mixed.then_some("Mixed"),
                     generates_text,
                     cx,
                     move |this, pick, window, cx| {
-                        set(this, json!({ "instanceId": pick.instance_id, "model": pick.model }), window, cx);
+                        let pick = ModelSelection { options: None, ..pick };
+                        checked_set(this, &pick, window, cx);
                     },
                 ))
-                .children(self.traits_picker(
-                    traits_id,
-                    &selection,
-                    cx,
-                    move |this, pick, window, cx| set(this, pick.to_json(), window, cx),
-                ))
+                .when(!mixed, |el| {
+                    el.children(self.traits_picker(traits_id, &selection, cx, move |this, pick, window, cx| {
+                        set(this, pick.to_json(), window, cx);
+                    }))
+                })
             })
-            .child(switch(&id.into(), on, false, &t).on_click(cx.listener(move |this, _, window, cx| {
-                match (on, &enable_with) {
+            .child(switch(&id.into(), on && !switch_mixed, switch_mixed).on_click(cx.listener(
+                move |this, _, window, cx| match (on && !switch_mixed, &enable_with) {
                     (true, _) => set(this, Value::Null, window, cx),
+                    (false, Some(selection)) if check_enable => checked_set(this, selection, window, cx),
                     (false, Some(selection)) => set(this, selection.to_json(), window, cx),
                     (false, None) => {}
-                }
-            })))
+                },
+            )))
             .when(dimmed, |el| el.opacity(0.5))
             .into_any_element()
     }
@@ -1990,9 +2090,50 @@ fn skeleton_rows(t: &Tokens) -> Vec<AnyElement> {
         .collect()
 }
 
+/// A dedicated model row's pieces (`ProviderModelPicker`, `TraitsPicker` and the switch).
+struct DedicatedModel {
+    id: &'static str,
+    key: &'static str,
+    /// The toast title when a pick can't run on every selected target.
+    refused: &'static str,
+    on: bool,
+    /// The targets differ, so the picker reads "Mixed" and the traits stay hidden.
+    mixed: bool,
+    /// The switch shows the mixed state too (the review guide's).
+    switch_mixed: bool,
+    selection: Option<ModelSelection>,
+    enable_with: Option<ModelSelection>,
+    /// Turning it on checks `enable_with` against every target first.
+    check_enable: bool,
+    dimmed: bool,
+    note: Option<gpui_kit::Div>,
+}
+
+/// `styleFieldMixed`: the selected targets differ in one writing-style field.
+fn style_field_mixed(targets: &[crate::settings::scope::Target], field: &str) -> bool {
+    let value =
+        |target: &crate::settings::scope::Target| target.settings.get("sourceControlWritingStyle")[field].clone();
+    targets.first().is_some_and(|first| targets.iter().any(|target| value(target) != value(first)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writing_style_fields_mix_only_where_targets_differ() {
+        let target = |mode: &str, instructions: &str| {
+            let mut settings = crate::settings::Settings::server_defaults();
+            let style = json!({"mode": mode, "customInstructions": instructions, "followChangeRequestTemplates": true});
+            settings.set("sourceControlWritingStyle", style);
+            crate::settings::scope::resolve_project_settings("env", &settings, None, None)
+        };
+        let targets = [target("custom", "Be brief."), target("custom", "Be thorough.")];
+        assert!(!style_field_mixed(&targets, "mode"));
+        assert!(style_field_mixed(&targets, "customInstructions"));
+        assert!(!style_field_mixed(&targets[..1], "customInstructions"));
+        assert!(!style_field_mixed(&[], "mode"));
+    }
 
     #[test]
     fn accounts_group_by_host() {

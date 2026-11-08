@@ -74,7 +74,13 @@ struct SourceRow {
 }
 
 impl Workspace {
-    pub(in crate::app) fn render_device_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// `project_scope`: sources are environment-wide, so a project scope can't change them.
+    pub(in crate::app) fn render_device_sources(
+        &mut self,
+        project_scope: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sources =
             window.use_keyed_state(self.settings_state_key("device-sources"), cx, |_, _| DeviceSources::default());
         let t = *tokens(cx);
@@ -85,7 +91,7 @@ impl Workspace {
         let state = self.settings_device_state();
         let supports_eas = state.is_some_and(|state| state.supports_eas_hosts);
         let supports_simlock = state.is_some_and(|state| state.supports_simlock_hosts) && simlock_enabled;
-        let disabled = model.busy || self.settings_client().is_none();
+        let disabled = project_scope || model.busy || self.settings_client().is_none();
         let rows = source_rows(settings, state, enabled, &model.testing, supports_eas, supports_simlock);
         let view = cx.entity();
 

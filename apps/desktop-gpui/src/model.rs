@@ -101,6 +101,8 @@ pub struct OptionChoice {
     pub id: String,
     pub label: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub is_default: bool,
 }
 
@@ -587,6 +589,7 @@ impl ProjectShell {
             id: self.id.clone(),
             environment_id: self.environment_id.to_string(),
             name: self.title.clone(),
+            workspace_root: self.workspace_root.clone(),
             legacy_model_selection: self.default_model_selection.as_ref().map(ModelSelection::to_json),
             legacy_thread_env_mode: self.default_thread_env_mode.clone(),
         }
@@ -624,7 +627,11 @@ pub enum T3ProjectFile {
     Missing,
     /// Present but fails to decode, so everything it declares is ignored.
     Invalid,
-    Valid(Vec<T3ProjectFileScript>),
+    Valid {
+        scripts: Vec<T3ProjectFileScript>,
+        /// The settings it backs (`PROJECT_FILE_BACKED_SETTINGS`) that it sets, by key.
+        settings: serde_json::Map<String, Value>,
+    },
 }
 
 /// `T3ProjectFileScript` (`packages/contracts/src/t3ProjectFile.ts`).
@@ -653,21 +660,46 @@ impl T3ProjectFile {
     /// `parseT3ProjectFile`: one bad script invalidates the whole file, like the schema decode.
     pub fn parse(contents: &str) -> Self {
         let Ok(Value::Object(file)) = serde_json::from_str::<Value>(contents) else { return Self::Invalid };
-        let Some(scripts) = file.get("scripts") else { return Self::Valid(Vec::new()) };
+        let literal = |key: &str, allowed: &[&str]| {
+            file.get(key).is_none_or(|value| value.as_str().is_some_and(|value| allowed.contains(&value)))
+        };
+        let fields_valid = file.get("$schema").is_none_or(Value::is_string)
+            && file.get("iconPath").is_none_or(|path| {
+                path.as_str().is_some_and(|path| !path.trim().is_empty() && path.chars().count() <= 512)
+            })
+            && literal("defaultThreadEnvMode", &["local", "worktree"])
+            && literal("worktreeSubmodules", &["recursive", "top-level", "none"]);
+        if !fields_valid {
+            return Self::Invalid;
+        }
+        let settings = ["defaultThreadEnvMode", "worktreeSubmodules"]
+            .into_iter()
+            .filter_map(|key| Some((key.to_owned(), file.get(key)?.clone())))
+            .collect();
+        let Some(scripts) = file.get("scripts") else { return Self::Valid { scripts: Vec::new(), settings } };
         let Ok(scripts) = Vec::<T3ProjectFileScript>::deserialize(scripts) else { return Self::Invalid };
-        let valid = scripts.iter().all(|script| {
-            !script.name.trim().is_empty()
-                && !script.command.trim().is_empty()
-                && script.icon.as_deref().is_none_or(|icon| PROJECT_SCRIPT_ICONS.contains(&icon))
-                && script.preview_url.as_deref().is_none_or(|url| !url.trim().is_empty())
-        });
-        if valid { Self::Valid(scripts) } else { Self::Invalid }
+        let valid = scripts.len() <= 50
+            && scripts.iter().all(|script| {
+                !script.name.trim().is_empty()
+                    && !script.command.trim().is_empty()
+                    && script.icon.as_deref().is_none_or(|icon| PROJECT_SCRIPT_ICONS.contains(&icon))
+                    && script.preview_url.as_deref().is_none_or(|url| !url.trim().is_empty())
+            });
+        if valid { Self::Valid { scripts, settings } } else { Self::Invalid }
     }
 
     pub fn scripts(&self) -> &[T3ProjectFileScript] {
         match self {
-            Self::Valid(scripts) => scripts,
+            Self::Valid { scripts, .. } => scripts,
             _ => &[],
+        }
+    }
+
+    /// The value it sets for file-backed setting `key`.
+    pub fn setting(&self, key: &str) -> Option<&Value> {
+        match self {
+            Self::Valid { settings, .. } => settings.get(key),
+            _ => None,
         }
     }
 }
@@ -791,6 +823,8 @@ pub struct ThreadShell {
     pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub delegated_from: Option<DelegatedFrom>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]
