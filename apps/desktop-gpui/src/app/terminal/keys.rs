@@ -72,6 +72,11 @@ fn key_action_on(
             ("v", false) => Some(KeyAction::Paste),
             ("home", true) if !alt_screen => Some(KeyAction::Scroll(History::Top)),
             ("end", true) if !alt_screen => Some(KeyAction::Scroll(History::Bottom)),
+            // `isTerminalClearShortcut`, `terminalNavigationShortcutData`, `terminalDeleteShortcutData`.
+            ("k", false) => Some(KeyAction::Send("\x0c".into())),
+            ("left", false) => Some(KeyAction::Send("\x01".into())),
+            ("right", false) => Some(KeyAction::Send("\x05".into())),
+            ("backspace", false) => Some(KeyAction::Send("\x15".into())),
             _ => None,
         };
     }
@@ -229,7 +234,13 @@ mod tests {
         assert_eq!(mac("cmd-v", false), Some(KeyAction::Paste));
         assert_eq!(mac("cmd-a", false), Some(KeyAction::SelectAll));
         assert_eq!(mac("cmd-shift-home", false), Some(KeyAction::Scroll(History::Top)));
-        assert_eq!(mac("cmd-k", false), None, "other ⌘ chords are the app's");
+        assert_eq!(mac("cmd-k", false), Some(KeyAction::Send("\x0c".into())));
+        assert_eq!(mac("cmd-left", false), Some(KeyAction::Send("\x01".into())));
+        assert_eq!(mac("cmd-right", false), Some(KeyAction::Send("\x05".into())));
+        assert_eq!(mac("cmd-backspace", false), Some(KeyAction::Send("\x15".into())));
+        assert_eq!(mac("cmd-shift-left", false), None);
+        assert_eq!(mac("alt-left", false), Some(KeyAction::Send("\x1bb".into())));
+        assert_eq!(mac("cmd-j", false), None, "other ⌘ chords are the app's");
         assert_eq!(mac("ctrl-c", true), Some(KeyAction::Send("".into())), "Ctrl+C interrupts even over a selection");
         assert_eq!(mac("ctrl-v", false), Some(KeyAction::Send("".into())));
         assert_eq!(mac("shift-pageup", false), Some(KeyAction::Scroll(History::PageUp)));
