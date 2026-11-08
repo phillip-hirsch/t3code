@@ -231,6 +231,24 @@ impl Workspace {
             return div().flex_1().into_any_element();
         };
         let limit = group.terminal_ids.len() >= layout::MAX_PER_GROUP;
+        // `ThreadTerminalDrawer` in panel mode: the session sidebar once the tab splits.
+        let has_sidebar = group.terminal_ids.len() > 1;
+        let panes = self.render_pane_group(&group.terminal_ids, &group.active, group.split == Split::Vertical, &tokens);
+        let side = if has_sidebar {
+            let sidebar = super::SidebarModel {
+                thread_id: &group.thread_id,
+                groups: vec![(surface, group.terminal_ids.as_slice(), group.split)],
+                active: &group.active,
+                limit,
+                panel: Some(surface.to_owned()),
+            };
+            self.render_terminal_sidebar(&sidebar, &tokens, window, cx).into_any_element()
+        } else if group.terminal_ids.is_empty() {
+            div().into_any_element()
+        } else {
+            self.render_floating_actions(group.active.clone(), limit, Some(surface.to_owned()), &tokens, window, cx)
+                .into_any_element()
+        };
         div()
             .id("terminal-panel")
             .relative()
@@ -238,16 +256,9 @@ impl Workspace {
             .min_h_0()
             .flex()
             .bg(tokens.background)
-            .child(self.render_pane_group(&group.terminal_ids, &group.active, group.split == Split::Vertical, &tokens))
-            .when(!group.terminal_ids.is_empty(), |el| {
-                el.child(self.render_floating_actions(
-                    group.active.clone(),
-                    limit,
-                    Some(surface.to_owned()),
-                    &tokens,
-                    cx,
-                ))
-            })
+            .when(has_sidebar, |el| el.gap(px(6.)))
+            .child(panes)
+            .child(side)
             .into_any_element()
     }
 }

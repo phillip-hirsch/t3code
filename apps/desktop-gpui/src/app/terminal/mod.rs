@@ -23,9 +23,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, Div, DragMoveEvent, EmptyView, Entity, InteractiveElement as _,
-    IntoElement, KeyBinding, NoAction, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, Window, div, px, rgb,
+    AnyElement, AnyView, App, AppContext as _, Context, Div, DragMoveEvent, EmptyView, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, NoAction, ParentElement as _, SharedString, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window, div, px, rgb,
 };
 use serde_json::{Value, json};
 
@@ -892,7 +892,20 @@ impl Workspace {
                 .bg(tokens.background)
                 .when(has_sidebar, |el| el.gap(px(6.)))
                 .child(self.render_terminal_panes(drawer, &tokens))
-                .when(has_sidebar, |el| el.child(self.render_terminal_sidebar(&thread_id, drawer, &tokens, cx)))
+                .when(has_sidebar, |el| {
+                    let sidebar = SidebarModel {
+                        thread_id: &thread_id,
+                        groups: drawer
+                            .sorted_groups()
+                            .into_iter()
+                            .map(|g| (g.id.as_str(), g.terminal_ids.as_slice(), g.split))
+                            .collect(),
+                        active: &drawer.active_id,
+                        limit: drawer.split_limit_reached(),
+                        panel: None,
+                    };
+                    el.child(self.render_terminal_sidebar(&sidebar, &tokens, window, cx))
+                })
                 .into_any_element()
         };
         let limit = drawer.split_limit_reached();
@@ -917,7 +930,7 @@ impl Workspace {
                 }))
                 .child(body)
                 .when(!has_sidebar && !drawer.terminal_ids.is_empty(), |el| {
-                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, cx))
+                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, window, cx))
                 })
                 .child(handle)
                 .into_any_element(),
@@ -966,49 +979,58 @@ impl Workspace {
         limit: bool,
         panel: Option<String>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let border = tokens.border.opacity(0.8);
         let separator = || div().h(px(16.)).w(px(1.)).bg(border);
         let operable = self.shown_terminal_operable();
-        let button = |id: &'static str, path: &'static str, disabled: bool| {
-            action_button(id, path, disabled || !operable, tokens)
+        let scope = panel.clone().unwrap_or_else(|| "drawer".into());
+        let mut button = |id: &'static str, path: &'static str, disabled: bool| {
+            let el = action_button(id, path, disabled || !operable, tokens)
                 .p(px(4.))
-                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent)))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent)));
+            keyboard_button(el, format!("{scope}-{id}"), !disabled && operable, tokens, window, cx)
         };
-        div().absolute().top(px(8.)).right(px(8.)).child(
-            h_flex()
-                .id("terminal-floating-actions")
-                .occlude()
-                .items_center()
-                .overflow_hidden()
-                .rounded(px(6.))
-                .border_1()
-                .border_color(border)
-                .bg(tokens.background)
-                .shadow_xs()
-                .child(self.wire_split(
-                    button("terminal-split", "icons/square-split-horizontal.svg", limit),
-                    Split::Horizontal,
-                    limit,
-                    operable,
-                    panel.clone(),
-                    cx,
-                ))
-                .child(separator())
-                .child(self.wire_split(
-                    button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
-                    Split::Vertical,
-                    limit,
-                    operable,
-                    panel.clone(),
-                    cx,
-                ))
-                .child(separator())
-                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, operable, cx))
-                .child(separator())
-                .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, operable, cx)),
-        )
+        let buttons = [
+            button("terminal-split", "icons/square-split-horizontal.svg", limit),
+            button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
+            button("terminal-new", "icons/plus.svg", false),
+            button("terminal-close", "icons/trash-2.svg", false),
+        ];
+        let actions = self.wire_actions(buttons, active, limit, operable, panel, cx);
+        let mut row = h_flex()
+            .id("terminal-floating-actions")
+            .occlude()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(border)
+            .bg(tokens.background)
+            .shadow_xs();
+        for (index, action) in actions.into_iter().enumerate() {
+            row = row.when(index > 0, |el| el.child(separator())).child(action);
+        }
+        div().absolute().top(px(8.)).right(px(8.)).child(row)
+    }
+
+    /// Split, split vertically, new and close, in that order.
+    fn wire_actions(
+        &self,
+        [split, split_vertical, new, close]: [Stateful<Div>; 4],
+        active: String,
+        limit: bool,
+        operable: bool,
+        panel: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> [Stateful<Div>; 4] {
+        [
+            self.wire_split(split, Split::Horizontal, limit, operable, panel.clone(), cx),
+            self.wire_split(split_vertical, Split::Vertical, limit, operable, panel.clone(), cx),
+            self.wire_new(new, panel, operable, cx),
+            self.wire_close(close, active, operable, cx),
+        ]
     }
 
     fn wire_split(
@@ -1076,104 +1098,114 @@ impl Workspace {
         self.shown_terminal_thread().is_none_or(|thread_id| self.terminal_operable(thread_id))
     }
 
-    /// The session list beside split panes once a thread has several terminals.
-    fn render_terminal_sidebar(
-        &self,
+    /// Shows `terminal_id` in the drawer, or in its panel tab when the sidebar is a tab's.
+    fn activate_sidebar_terminal(
+        &mut self,
         thread_id: &str,
-        drawer: &DrawerLayout,
+        terminal_id: &str,
+        panel: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if panel.is_none() {
+            self.activate_terminal(terminal_id, cx);
+            return;
+        }
+        self.activate_panel_terminal(thread_id, terminal_id, cx);
+        self.terminals.focus_pending = Some(terminal_id.to_owned());
+        cx.notify();
+    }
+
+    /// The session list beside split panes once a drawer or panel tab has several terminals.
+    pub(super) fn render_terminal_sidebar(
+        &self,
+        sidebar: &SidebarModel<'_>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let SidebarModel { thread_id, groups, active, limit, panel } = sidebar;
+        let (thread_id, active, limit) = (*thread_id, *active, *limit);
         let border = tokens.border.opacity(0.7);
-        let limit = drawer.split_limit_reached();
         let operable = self.terminal_operable(thread_id);
-        let header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
-            action_button(id, path, disabled || !operable, tokens)
+        let scope = panel.clone().unwrap_or_else(|| "drawer".into());
+        let mut header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
+            let el = action_button(id, path, disabled || !operable, tokens)
                 .h_full()
                 .px(px(4.))
                 .when(!first, |el| el.border_l_1().border_color(border))
-                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))));
+            keyboard_button(el, format!("{scope}-sidebar-{id}"), !disabled && operable, tokens, window, cx)
         };
-        let active = drawer.active_id.clone();
-        let header = h_flex().h(px(22.)).flex_none().justify_end().border_b_1().border_color(border).child(
-            h_flex()
-                .h_full()
-                .child(self.wire_split(
-                    header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
-                    Split::Horizontal,
-                    limit,
-                    operable,
-                    None,
-                    cx,
-                ))
-                .child(self.wire_split(
-                    header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
-                    Split::Vertical,
-                    limit,
-                    operable,
-                    None,
-                    cx,
-                ))
-                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, operable, cx))
-                .child(self.wire_close(
-                    header_button("terminal-close", "icons/trash-2.svg", false, false),
-                    active,
-                    operable,
-                    cx,
-                )),
-        );
-        let groups = drawer.sorted_groups();
-        let show_headers = groups.len() > 1 || groups.iter().any(|g| g.terminal_ids.len() > 1);
-        let list = v_flex().id("terminal-session-list").flex_1().min_h_0().overflow_y_scroll().p(px(4.)).children(
-            groups.into_iter().map(|group| {
-                let group_active = group.terminal_ids.contains(&drawer.active_id);
-                let header = show_headers.then(|| {
-                    let (path, label) = match (group.terminal_ids.len() > 1, group.split) {
-                        (false, _) => ("icons/square.svg", "Single"),
-                        (true, Split::Vertical) => ("icons/square-split-vertical.svg", "Stacked"),
-                        (true, Split::Horizontal) => ("icons/square-split-horizontal.svg", "Side by side"),
-                    };
-                    let target = if group_active { drawer.active_id.clone() } else { group.terminal_ids[0].clone() };
-                    let color = if group_active { tokens.foreground } else { tokens.muted_foreground };
-                    h_flex()
-                        .id(SharedString::from(format!("terminal-group-{}", group.id)))
-                        .h(px(22.))
-                        .w_full()
-                        .gap(px(4.))
-                        .px(px(6.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .line_height(px(16.))
-                        .text_color(color)
-                        .map(|el| {
-                            if group_active {
-                                el.bg(tokens.accent.opacity(0.5))
-                            } else {
-                                el.hover(|s| s.bg(tokens.accent.opacity(0.4)).text_color(tokens.foreground))
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(&target, cx)))
-                        .child(icon(path).with_size(px(12.)).flex_none())
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .line_height(px(14.))
-                                .text_color(tokens.muted_foreground.opacity(0.7))
-                                .child(group.terminal_ids.len().to_string()),
-                        )
-                });
-                let rows: Vec<_> = group
-                    .terminal_ids
-                    .iter()
-                    .map(|terminal_id| {
-                        self.render_terminal_row(thread_id, terminal_id, terminal_id == &drawer.active_id, tokens, cx)
+        let buttons = [
+            header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
+            header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
+            header_button("terminal-new", "icons/plus.svg", false, false),
+            header_button("terminal-close", "icons/trash-2.svg", false, false),
+        ];
+        let actions = self.wire_actions(buttons, active.to_owned(), limit, operable, panel.clone(), cx);
+        let header = h_flex()
+            .h(px(22.))
+            .flex_none()
+            .justify_end()
+            .border_b_1()
+            .border_color(border)
+            .child(h_flex().h_full().children(actions));
+        let show_headers = groups.len() > 1 || groups.iter().any(|(_, ids, _)| ids.len() > 1);
+        let mut list_groups = Vec::with_capacity(groups.len());
+        for (group_id, ids, split) in groups {
+            let group_active = ids.iter().any(|id| id == active);
+            let header = show_headers.then(|| {
+                let (path, label) = match (ids.len() > 1, split) {
+                    (false, _) => ("icons/square.svg", "Single"),
+                    (true, Split::Vertical) => ("icons/square-split-vertical.svg", "Stacked"),
+                    (true, Split::Horizontal) => ("icons/square-split-horizontal.svg", "Side by side"),
+                };
+                let target = if group_active { active.to_owned() } else { ids[0].clone() };
+                let color = if group_active { tokens.foreground } else { tokens.muted_foreground };
+                let (thread, panel) = (thread_id.to_owned(), panel.clone());
+                let el = h_flex()
+                    .id(SharedString::from(format!("terminal-group-{group_id}")))
+                    .h(px(22.))
+                    .w_full()
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(color)
+                    .map(|el| {
+                        if group_active {
+                            el.bg(tokens.accent.opacity(0.5))
+                        } else {
+                            el.hover(|s| s.bg(tokens.accent.opacity(0.4)).text_color(tokens.foreground))
+                        }
                     })
-                    .collect();
-                v_flex().pb(px(2.)).children(header).child(v_flex().gap(px(2.)).children(rows))
-            }),
-        );
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.activate_sidebar_terminal(&thread, &target, panel.as_deref(), cx);
+                    }))
+                    .child(icon(path).with_size(px(12.)).flex_none())
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .line_height(px(14.))
+                            .text_color(tokens.muted_foreground.opacity(0.7))
+                            .child(ids.len().to_string()),
+                    );
+                keyboard_button(el, format!("{scope}-group-{group_id}"), true, tokens, window, cx)
+            });
+            let rows: Vec<_> = ids
+                .iter()
+                .map(|terminal_id| {
+                    let row = RowModel { thread_id, terminal_id, active: terminal_id == active, scope: &scope };
+                    self.render_terminal_row(&row, panel.as_deref(), tokens, window, cx)
+                })
+                .collect();
+            list_groups.push(v_flex().pb(px(2.)).children(header).child(v_flex().gap(px(2.)).children(rows)));
+        }
+        let list =
+            v_flex().id("terminal-session-list").flex_1().min_h_0().overflow_y_scroll().p(px(4.)).children(list_groups);
         v_flex()
             .w(px(144.))
             .flex_none()
@@ -1187,12 +1219,13 @@ impl Workspace {
 
     fn render_terminal_row(
         &self,
-        thread_id: &str,
-        terminal_id: &str,
-        active: bool,
+        row: &RowModel<'_>,
+        panel: Option<&str>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let RowModel { thread_id, terminal_id, active, scope } = *row;
         let label = self.terminals.label(thread_id, terminal_id);
         let close_label: SharedString = if active {
             self.with_terminal_shortcut(&format!("Close {label}"), "terminal.close")
@@ -1202,13 +1235,63 @@ impl Workspace {
         .into();
         let group = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_id, activate_id) = (terminal_id.to_owned(), terminal_id.to_owned());
+        let (thread, panel) = (thread_id.to_owned(), panel.map(str::to_owned));
         let operable = self.terminal_operable(thread_id);
         let glyph = |path: &'static str| {
             div().absolute().inset_0().flex().items_center().justify_center().child(icon(path).with_size(px(12.)))
         };
+        let close = div()
+            .id(SharedString::from(format!("terminal-row-close-{terminal_id}")))
+            .relative()
+            .size(px(16.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.));
+        // Without the grant the row shows only its terminal icon.
+        let close = if operable {
+            let focus = control_focus(format!("{scope}-row-close-{terminal_id}"), window, cx);
+            // `group-focus-visible/close`: the keyboard-focused close button shows its X.
+            let focused = focus.is_focused(window);
+            let close = close
+                .cursor_pointer()
+                .hover(|s| s.bg(tokens.muted))
+                .tooltip(tooltip(close_label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_terminal(close_id.clone(), window, cx);
+                }))
+                .map(|el| {
+                    if focused {
+                        el.child(glyph("icons/x.svg"))
+                    } else {
+                        el.child(
+                            glyph("icons/square-terminal.svg").group_hover(group.clone(), gpui_kit::Styled::invisible),
+                        )
+                        .child(glyph("icons/x.svg").invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
+                    }
+                });
+            super::titlebar::keyboard_control(close, &focus, tokens.ring)
+        } else {
+            close.child(glyph("icons/square-terminal.svg"))
+        };
+        let activate = div()
+            .id(SharedString::from(format!("terminal-row-label-{terminal_id}")))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_sidebar_terminal(&thread, &activate_id, panel.as_deref(), cx);
+            }))
+            .child(div().truncate().child(label));
+        let activate = keyboard_button(activate, format!("{scope}-row-label-{terminal_id}"), true, tokens, window, cx);
         h_flex()
             .id(group.clone())
-            .group(group.clone())
+            .group(group)
             .h(px(24.))
             .w_full()
             .gap(px(2.))
@@ -1224,47 +1307,8 @@ impl Workspace {
                         .hover(|s| s.bg(tokens.accent.opacity(0.6)).text_color(tokens.foreground))
                 }
             })
-            .child(
-                div()
-                    .id(SharedString::from(format!("terminal-row-close-{terminal_id}")))
-                    .relative()
-                    .size(px(16.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .map(|el| {
-                        // Without the grant the row shows only its terminal icon.
-                        if !operable {
-                            return el.child(glyph("icons/square-terminal.svg"));
-                        }
-                        el.cursor_pointer()
-                            .hover(|s| s.bg(tokens.muted))
-                            .tooltip(tooltip(close_label))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.request_close_terminal(close_id.clone(), window, cx);
-                            }))
-                            .child(
-                                glyph("icons/square-terminal.svg")
-                                    .group_hover(group.clone(), gpui_kit::Styled::invisible),
-                            )
-                            .child(glyph("icons/x.svg").invisible().group_hover(group, gpui_kit::Styled::visible))
-                    }),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("terminal-row-label-{terminal_id}")))
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(&activate_id, cx)))
-                    .child(div().truncate().child(label)),
-            )
+            .child(close)
+            .child(activate)
     }
 
     /// The sidebar row's indicator: teal while a terminal process runs. It
@@ -1312,6 +1356,47 @@ impl Workspace {
         self.terminals.focus_pending = Some(terminal_id);
         cx.notify();
     }
+}
+
+/// What a session sidebar lists: the drawer's groups, or a panel tab's one group.
+pub(super) struct SidebarModel<'a> {
+    thread_id: &'a str,
+    /// Each group's id, terminals and split, in the sidebar's order.
+    groups: Vec<(&'a str, &'a [String], Split)>,
+    active: &'a str,
+    limit: bool,
+    /// The panel tab's surface; `None` for the drawer.
+    panel: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RowModel<'a> {
+    thread_id: &'a str,
+    terminal_id: &'a str,
+    active: bool,
+    /// Keeps the drawer's and each panel tab's focus handles apart.
+    scope: &'a str,
+}
+
+/// A control's focus handle, kept while it renders.
+fn control_focus(key: String, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window.use_keyed_state(SharedString::from(key), cx, |_, cx| cx.focus_handle().tab_stop(true)).read(cx).clone()
+}
+
+/// A drawer control as the web's `<button>`: a tab stop that Enter and Space press.
+fn keyboard_button(
+    el: Stateful<Div>,
+    key: String,
+    enabled: bool,
+    tokens: &Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    if !enabled {
+        return el;
+    }
+    let focus = control_focus(key, window, cx);
+    super::titlebar::keyboard_control(el, &focus, tokens.ring)
 }
 
 /// A drawer action button: a 13px icon in `text-foreground/90`, dimmed when disabled.
