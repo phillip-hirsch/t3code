@@ -1418,6 +1418,38 @@ pub struct ThreadProjection {
     pub provider_sessions: Vec<ProviderSession>,
     #[serde(default, deserialize_with = "lossy")]
     pub plans: Vec<PlanArtifact>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub subagents: Vec<Subagent>,
+}
+
+/// `OrchestrationV2Subagent`, as far as Thread details reads it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
+    /// `provider_native` or `app_owned`.
+    pub origin: String,
+    pub driver: String,
+    #[serde(default)]
+    pub native_task_ref: Option<NativeTaskRef>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTaskRef {
+    #[serde(default)]
+    pub native_id: Option<String>,
+    pub strength: String,
 }
 
 impl ThreadProjection {
@@ -1648,6 +1680,7 @@ impl ThreadProjection {
             "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
             "plan.updated" => upsert(&mut self.plans, PlanArtifact::deserialize(payload)?, |p| &p.id),
+            "subagent.updated" => upsert(&mut self.subagents, Subagent::deserialize(payload)?, |a| &a.id),
             "provider-session.attached" | "provider-session.updated" => {
                 upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
             }

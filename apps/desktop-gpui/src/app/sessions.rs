@@ -333,6 +333,7 @@ impl Workspace {
                 this.track_visit(cx);
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
+                this.sync_lineage_titles(cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {

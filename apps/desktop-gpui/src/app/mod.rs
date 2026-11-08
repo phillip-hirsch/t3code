@@ -236,6 +236,7 @@ pub struct Workspace {
     details_popover: bool,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
+    lineage: details::lineage::LineageUi,
     /// The git status of the open target's workspace.
     vcs: git::VcsWatch,
     /// Local servers, while the details card's Servers section can show.
@@ -434,6 +435,7 @@ impl Workspace {
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
+            lineage: Default::default(),
             vcs: git::VcsWatch::default(),
             servers: Default::default(),
             automations: Default::default(),
@@ -820,6 +822,7 @@ impl Workspace {
         self.sync_working_tick(&new_rows, cx);
         self.sync_subagent_tick(cx);
         self.sync_child_approvals(cx);
+        self.sync_lineage_titles(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::from(new_rows);

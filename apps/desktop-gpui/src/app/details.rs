@@ -15,6 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use self::lineage::{Relationships, Relative};
 use super::git::{self, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
@@ -23,6 +24,7 @@ use crate::theme::{self, Tokens};
 use crate::thread_details;
 
 pub(super) mod automations;
+pub(super) mod lineage;
 pub(super) mod servers;
 
 const CARD_WIDTH: f32 = 280.;
@@ -210,12 +212,15 @@ impl Workspace {
         };
         // Built once at full density; when the card must shrink, only the two sections
         // whose rows depend on density are built again.
-        let mut sections: [Option<Section>; 7] = [
+        let relationships = self.open_relationships().unwrap_or_default();
+        let mut sections: [Option<Section>; 8] = [
             self.workspace_section(&tokens, &colors, cx),
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
             self.automations_section(&tokens, &colors, cx),
-            self.lineage_section(&tokens, &colors, cx).filter(|_| self.lineage_shown()),
+            self.lineage_section(&relationships, &tokens, &colors, cx).filter(|_| self.details_item_shown("lineage")),
+            self.side_chats_section(&relationships, &tokens, &colors, cx)
+                .filter(|_| self.details_item_shown("sideChats")),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
         ];
@@ -308,10 +313,6 @@ impl Workspace {
     }
 
     /// The lineage section holds both the lineage and the side chats items.
-    fn lineage_shown(&self) -> bool {
-        self.details_item_shown("lineage") || self.details_item_shown("sideChats")
-    }
-
     fn workspace_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
         self.workspace_section_at(Density::Full, tokens, colors, cx).map(|mut section| {
             // Compact keeps Open in and the scripts row; essential keeps only scripts.
@@ -1024,54 +1025,48 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `ThreadRelationshipsPanel` from the shell: the parent thread, running
-    /// subagents, and settled ones folded under "Previous agents".
-    fn lineage_section(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<Section> {
+    /// `ThreadRelationshipsControl`'s Lineage: the parent thread, running subagents, and
+    /// settled ones folded under "Previous agents".
+    fn lineage_section(
+        &self,
+        relationships: &Relationships,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Section> {
         let Some(Target::Thread { id, .. }) = &self.target else { return None };
         let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
-        let parent = thread.lineage.parent_thread_id.as_ref().and_then(|parent| self.thread_shell(parent));
-        let (previous, active): (Vec<&ThreadShell>, Vec<&ThreadShell>) = self
-            .shell
-            .threads
-            .iter()
-            .filter(|child| {
-                child.lineage.parent_thread_id.as_ref() == Some(id)
-                    && child.lineage.relationship_to_parent.as_deref() == Some("subagent")
-            })
-            .partition(|child| is_settled_status(&child.status));
+        let Relationships { parent, active, previous, side_chats } = relationships;
         let can_detach = self
             .open_projection()
             .and_then(|projection| projection.provider_session())
             .is_some_and(|session| !matches!(session.status.as_str(), "stopped" | "error"));
         let delegated = thread.delegated_from.as_ref();
-        if parent.is_none() && active.is_empty() && previous.is_empty() && !can_detach && delegated.is_none() {
+        let unthreaded = self.open_projection().map_or(0, |projection| {
+            projection
+                .subagents
+                .iter()
+                .filter(|agent| agent.child_thread_id.is_none() && agent.status == "running")
+                .count()
+        });
+        let running = unthreaded + active.iter().filter(|row| row.status.as_deref() == Some("running")).count();
+        // Disconnect lives in this heading, so a thread with only side chats still shows it.
+        let visible = parent.is_some()
+            || !active.is_empty()
+            || !previous.is_empty()
+            || running > 0
+            || delegated.is_some()
+            || (can_detach && !side_chats.is_empty());
+        if !visible {
             return None;
         }
-        let relationship_row = |thread: &ThreadShell, path: &'static str, cx: &mut Context<Self>| {
-            let thread_id = thread.id.clone();
-            row(colors)
-                .id(ElementId::Name(format!("details-lineage-{thread_id}").into()))
-                .cursor_pointer()
-                .hover(|style| style.bg(colors.hover))
-                .child(icon(path).with_size(px(16.)).text_color(tokens.muted_foreground))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .line_height(px(16.))
-                        .text_color(tokens.foreground.opacity(0.85))
-                        .child(thread.title.clone()),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.select_thread(thread_id.clone(), window, cx)))
-        };
-        let heading: SharedString = match active.len() {
+        let heading: SharedString = match running {
             0 => "Lineage".into(),
             running => format!("Lineage · {running} running").into(),
         };
         let mut rows = 0usize;
-        let show_heading = parent.is_some() || !active.is_empty() || can_detach || delegated.is_some();
+        // A lone "Previous agents" row names itself; the heading returns for status or actions.
+        let show_heading = running > 0 || can_detach || parent.is_some() || !active.is_empty() || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
             let actions = can_detach.then(|| self.lineage_menu(tokens, colors, cx));
             el.child(section_heading(heading, tokens).children(actions))
@@ -1081,11 +1076,12 @@ impl Workspace {
             rows += 1;
         }
         if let Some(parent) = parent {
-            section = section.child(relationship_row(parent, "icons/corner-left-up.svg", cx));
+            section =
+                section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
             rows += 1;
         }
-        for child in &active {
-            section = section.child(relationship_row(child, "icons/bot.svg", cx));
+        for child in active {
+            section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
             rows += 1;
         }
         if !previous.is_empty() {
@@ -1122,8 +1118,8 @@ impl Workspace {
                     })),
             );
             if expanded {
-                for child in &previous {
-                    section = section.child(relationship_row(child, "icons/bot.svg", cx));
+                for child in previous {
+                    section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
                     rows += 1;
                 }
             }
@@ -1133,6 +1129,106 @@ impl Workspace {
             element: section.into_any_element(),
             min_density: Density::Full,
         })
+    }
+
+    /// `ThreadRelationshipsControl`'s Side chats: the open thread's side chats, which open in
+    /// its side chat panel.
+    fn side_chats_section(
+        &self,
+        relationships: &Relationships,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Section> {
+        let side_chats = &relationships.side_chats;
+        if side_chats.is_empty() {
+            return None;
+        }
+        let heading: SharedString =
+            match side_chats.iter().filter(|row| row.status.as_deref() == Some("running")).count() {
+                0 => "Side chats".into(),
+                running => format!("Side chats · {running} running").into(),
+            };
+        let section = v_flex().child(section_heading(heading, tokens)).children(
+            side_chats
+                .iter()
+                .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, tokens, colors, cx)),
+        );
+        Some(Section {
+            height: side_chats.len() as f32 * ROW_HEIGHT + HEADING_HEIGHT,
+            element: section.into_any_element(),
+            min_density: Density::Full,
+        })
+    }
+
+    /// One related thread; a running subagent's row shows Stop on hover.
+    fn relationship_row(
+        &self,
+        relative: &Relative,
+        path: &'static str,
+        side_chat: bool,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let thread_id = relative.thread_id.clone();
+        let group: SharedString = format!("details-lineage-{thread_id}").into();
+        let stopping = self.lineage.stopping.as_deref() == Some(thread_id.as_str());
+        let stop = relative.stop.clone().map(|stop| {
+            let (thread_id, title) = (thread_id.clone(), relative.title.clone());
+            let busy = self.lineage.stopping.is_some();
+            div()
+                .id(ElementId::Name(format!("details-lineage-stop-{thread_id}").into()))
+                .absolute()
+                .right(px(4.))
+                .top(px((ROW_HEIGHT - 24.) / 2.))
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .text_color(tokens.error)
+                .when(!stopping, |el| el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
+                .when(!busy, |el| el.cursor_pointer().hover(|s| s.bg(tokens.error.opacity(0.1))))
+                .when(busy && !stopping, |el| el.opacity(0.5))
+                .child(if stopping {
+                    gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+                } else {
+                    div().size(px(9.)).rounded(px(1.5)).bg(tokens.error).into_any_element()
+                })
+                .tooltip(move |window, cx| Tooltip::new(format!("Stop subagent {title}")).build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.stop_subagent(thread_id.clone(), stop.clone(), window, cx);
+                }))
+        });
+        let has_stop = stop.is_some();
+        row(colors)
+            .id(ElementId::Name(group.clone()))
+            .group(group)
+            .relative()
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.hover))
+            .child(icon(path).with_size(px(16.)).text_color(tokens.muted_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .line_height(px(16.))
+                    .text_color(tokens.foreground.opacity(0.85))
+                    .when(has_stop, |el| el.pr(px(24.)))
+                    .child(relative.title.clone()),
+            )
+            .children(stop)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if side_chat {
+                    this.open_surface(super::right_panel::Surface::SideChat(thread_id.clone()), window, cx);
+                } else {
+                    this.select_thread(thread_id.clone(), window, cx);
+                }
+            }))
     }
 
     /// `DelegatedFromRow`: the thread on a linked environment whose agent delegated this one.
@@ -1244,10 +1340,6 @@ impl Workspace {
         }
     }
 
-    fn thread_shell(&self, id: &str) -> Option<&ThreadShell> {
-        self.shell.threads.iter().find(|thread| thread.id == id)
-    }
-
     /// The selected provider's limit windows; each bar reads as room left.
     fn usage_section(&self, tokens: &Tokens, colors: &CardColors) -> Option<Section> {
         let selection = self.composer_model()?;
@@ -1335,10 +1427,6 @@ fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
 }
 
 /// The statuses `ThreadRelationshipsControl.tsx` files under "Previous agents".
-fn is_settled_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "error" | "cancelled" | "interrupted" | "idle")
-}
-
 /// `THREAD_DETAILS_PANEL_LOCKED_ROW_CLASS`: 32px, 10px inset and gap, 13px medium.
 fn row(colors: &CardColors) -> gpui_kit::Div {
     h_flex()
