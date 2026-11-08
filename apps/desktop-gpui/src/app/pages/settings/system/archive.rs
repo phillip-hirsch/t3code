@@ -1,14 +1,14 @@
 //! `ArchivedThreadsPanel`: the selected environments' archived threads by project, with
-//! Unarchive and, from the context menu, Delete.
+//! Unarchive and Delete on each row and in its context menu.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariant};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     Styled as _, Task, Window, div, px,
@@ -66,16 +66,25 @@ pub(super) struct ArchiveState {
     /// each with its page.
     pages: Vec<(String, PageState)>,
     loads: HashMap<String, Task<()>>,
+    /// Rows with an Unarchive or Delete running or awaiting confirmation; their actions wait.
+    pending: HashSet<Target>,
 }
 
 impl ArchiveState {
-    fn new(clients: Vec<(String, RpcClient)>, cx: &mut Context<Self>) -> Self {
+    /// An environment without a connection reads as a failed page, as its query fails on the web.
+    fn new(clients: Vec<(String, Option<RpcClient>)>, cx: &mut Context<Self>) -> Self {
         let mut state = Self {
-            pages: clients.iter().map(|(id, _)| (id.clone(), PageState::Loading)).collect(),
+            pages: clients
+                .iter()
+                .map(|(id, client)| (id.clone(), if client.is_some() { PageState::Loading } else { PageState::Failed }))
+                .collect(),
             loads: HashMap::new(),
+            pending: HashSet::new(),
         };
         for (id, client) in clients {
-            state.load(id, client, cx);
+            if let Some(client) = client {
+                state.load(id, client, cx);
+            }
         }
         state
     }
@@ -333,15 +342,18 @@ impl Workspace {
         let mut environment_ids: Vec<&str> = view.scope.environment_ids.iter().map(String::as_str).collect();
         environment_ids.sort_unstable();
         environment_ids.dedup();
-        let key = SharedString::from(format!("settings-archive:{}", environment_ids.join("\u{1f}")));
-        let clients: Vec<(String, RpcClient)> =
-            environment_ids.iter().filter_map(|id| Some(((*id).to_owned(), self.env_client(id)?))).collect();
+        let clients: Vec<(String, Option<RpcClient>)> =
+            environment_ids.iter().map(|id| ((*id).to_owned(), self.env_client(id))).collect();
+        // A connection coming or going starts a fresh load.
+        let key: Vec<String> =
+            clients.iter().map(|(id, client)| format!("{id}{}", if client.is_some() { "" } else { "!" })).collect();
+        let key = SharedString::from(format!("settings-archive:{}", key.join("\u{1f}")));
         let state = window.use_keyed_state(key, cx, |_, cx| ArchiveState::new(clients, cx));
-        let (pages, loading, failed, connected) = {
+        let (pages, loading, failed) = {
             let state = state.read(cx);
             let loading = state.pages.iter().any(|(_, page)| matches!(page, PageState::Loading));
             let failed = state.pages.iter().any(|(_, page)| matches!(page, PageState::Failed));
-            (state.loaded(), loading, failed, !state.pages.is_empty())
+            (state.loaded(), loading, failed)
         };
         let hidden = self.hidden_archived(&pages);
         let members = match &view.scope.kind {
@@ -357,10 +369,10 @@ impl Workspace {
                     "Checking connected environments.",
                 )
             } else {
-                let (title, description) = match (connected, failed) {
-                    (false, _) => ("Could not load archived threads", "Not connected to the server."),
-                    (true, true) => ("Could not load archived threads", "Failed to load archived threads."),
-                    (true, false) => ("No archived threads", "Archived threads will appear here."),
+                let (title, description) = if failed {
+                    ("Could not load archived threads", "Failed to load archived threads.")
+                } else {
+                    ("No archived threads", "Archived threads will appear here.")
                 };
                 (
                     Icon::new(IconName::Archive).size(px(14.)).text_color(t.muted_foreground).into_any_element(),
@@ -475,56 +487,110 @@ impl Workspace {
         let target = Target { environment_id: environment_id.to_owned().into(), thread_id: thread.id.clone().into() };
         let row_id = format!("{environment_id}-{}", thread.id);
         let title = SharedString::from(thread.title.clone());
+        let pending = state.read(cx).pending.contains(&target);
         let view = cx.entity();
-        let unarchive_button = {
-            let (view, state, target) = (view.clone(), state.clone(), target.clone());
-            Button::new(SharedString::from(format!("unarchive-{row_id}")))
+        let action = |action: Action, icon: Icon| {
+            let (view, state, target, title) = (view.clone(), state.clone(), target.clone(), title.clone());
+            let label = action.label();
+            let button = Button::new(SharedString::from(format!("{}-{row_id}", action.id())))
                 .outline()
-                .small()
-                .icon(Icon::new(IconName::ArchiveX))
-                .label("Unarchive")
-                .on_click(move |_, window, cx| unarchive(&view, &state, &target, window, cx))
+                .size(px(28.))
+                .icon(icon.size(px(14.)))
+                .tooltip(label)
+                .accessibility_label(format!("{label} {title}"))
+                .disabled(pending)
+                .on_click(move |_, window, cx| act(action, &view, &state, &target, &title, window, cx));
+            if action == Action::Delete { button.danger() } else { button }
         };
-        let state = state.clone();
+        let controls = h_flex()
+            .flex_none()
+            .gap_2()
+            .child(action(Action::Unarchive, Icon::new(IconName::ArchiveX)))
+            .child(action(Action::Delete, Icon::empty().path("icons/trash-2.svg")));
+        let (state, error) = (state.clone(), t.error);
         div()
             .id(SharedString::from(format!("archived-{row_id}")))
-            .child(RowFrame::new(title.clone()).description(text(description)).control(unarchive_button).render(t))
-            .context_menu(move |menu, _, _| {
-                let unarchive_item = {
-                    let (view, state, target) = (view.clone(), state.clone(), target.clone());
-                    move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                        unarchive(&view, &state, &target, window, cx);
-                    }
-                };
-                let delete_item = {
+            .child(RowFrame::new(title.clone()).description(text(description)).control(controls).render(t))
+            .context_menu(move |menu, _, cx| {
+                // No menu while the row's action runs, so it can't be sent twice.
+                if state.read(cx).pending.contains(&target) {
+                    return menu;
+                }
+                let item = |action: Action| {
                     let (view, state, target, title) = (view.clone(), state.clone(), target.clone(), title.clone());
                     move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                        delete(view.clone(), state.clone(), target.clone(), title.clone(), window, cx);
+                        act(action, &view, &state, &target, &title, window, cx);
                     }
                 };
-                menu.item(PopupMenuItem::new("Unarchive").on_click(unarchive_item))
-                    .item(PopupMenuItem::new("Delete").on_click(delete_item))
+                let delete = PopupMenuItem::element(move |_, _| div().text_color(error).child(Action::Delete.label()));
+                menu.item(PopupMenuItem::new(Action::Unarchive.label()).on_click(item(Action::Unarchive)))
+                    .item(delete.on_click(item(Action::Delete)))
             })
             .into_any_element()
     }
 }
 
 /// The archived thread a row acts on.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Target {
     environment_id: SharedString,
     thread_id: SharedString,
 }
 
-fn unarchive(
+/// `ARCHIVE_ACTIONS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Unarchive,
+    Delete,
+}
+
+impl Action {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Unarchive => "unarchive",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unarchive => "Unarchive",
+            Self::Delete => "Delete",
+        }
+    }
+}
+
+/// `handleThreadAction`: one action per row at a time, held through Delete's confirmation.
+fn act(
+    action: Action,
     view: &Entity<Workspace>,
     state: &Entity<ArchiveState>,
     target: &Target,
+    title: &SharedString,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let command = json!({"type": "thread.unarchive", "commandId": new_id(), "threadId": target.thread_id});
-    dispatch_and_reload(view, state, target, command, "Failed to unarchive thread", window, cx);
+    let claimed = state.update(cx, |state, cx| {
+        cx.notify();
+        state.pending.insert(target.clone())
+    });
+    if !claimed {
+        return;
+    }
+    match action {
+        Action::Unarchive => {
+            let command = json!({"type": "thread.unarchive", "commandId": new_id(), "threadId": target.thread_id});
+            dispatch_and_reload(view, state, target, command, "Failed to unarchive thread", window, cx);
+        }
+        Action::Delete => delete(view.clone(), state.clone(), target.clone(), title.clone(), window, cx),
+    }
+}
+
+fn release(state: &Entity<ArchiveState>, target: &Target, cx: &mut App) {
+    state.update(cx, |state, cx| {
+        state.pending.remove(target);
+        cx.notify();
+    });
 }
 
 /// `confirmAndDeleteThread`.
@@ -544,6 +610,7 @@ fn delete(
     let command = json!({"type": "thread.delete", "commandId": new_id(), "threadId": target.thread_id});
     match step {
         DeleteStep::Refuse => {
+            release(&state, &target, cx);
             notify_error(window, cx, "Failed to delete thread", "This connection cannot change threads.");
         }
         DeleteStep::Delete => {
@@ -551,6 +618,7 @@ fn delete(
         }
         DeleteStep::Confirm => window.open_alert_dialog(cx, move |dialog, _, _| {
             let (view, state, target, command) = (view.clone(), state.clone(), target.clone(), command.clone());
+            let (cancel_state, cancel_target) = (state.clone(), target.clone());
             dialog
                 .title(format!("Delete thread \"{title}\"?"))
                 .description("This permanently clears conversation history for this thread.")
@@ -561,10 +629,16 @@ fn delete(
                     dispatch_and_reload(&view, &state, &target, command.clone(), "Failed to delete thread", window, cx);
                     true
                 })
+                // Cancel, Escape and the backdrop all land here.
+                .on_cancel(move |_, _, cx| {
+                    release(&cancel_state, &cancel_target, cx);
+                    true
+                })
         }),
     }
 }
 
+/// Runs a row's command, then frees the row and, once it lands, reloads that environment's page.
 fn dispatch_and_reload(
     view: &Entity<Workspace>,
     state: &Entity<ArchiveState>,
@@ -574,20 +648,31 @@ fn dispatch_and_reload(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(client) = view.read(cx).env_client(&target.environment_id) else { return };
-    let (state, environment_id) = (state.clone(), target.environment_id.to_string());
+    let Some(client) = view.read(cx).env_client(&target.environment_id) else {
+        release(state, target, cx);
+        return;
+    };
+    let (state, target) = (state.clone(), target.clone());
     window
         .spawn(cx, async move |cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = cx.update(|window, cx| match result {
-                Ok(_) => state.update(cx, |state, cx| state.load(environment_id, client, cx)),
-                // The web shows the error's message, else a generic line; never the tagged form.
-                Err(crate::rpc::RpcError::Disconnected(_)) => {}
-                Err(crate::rpc::RpcError::Failure(error)) => {
-                    let message = error["message"].as_str().unwrap_or("An error occurred.").to_owned();
-                    notify_error(window, cx, failure, message);
+                Ok(_) => {
+                    release(&state, &target, cx);
+                    state.update(cx, |state, cx| state.load(target.environment_id.to_string(), client, cx));
                 }
-                Err(crate::rpc::RpcError::Defect(_)) => notify_error(window, cx, failure, "An error occurred."),
+                // The web shows the error's message, else a generic line; never the tagged form.
+                Err(error) => {
+                    release(&state, &target, cx);
+                    match error {
+                        crate::rpc::RpcError::Disconnected(_) => {}
+                        crate::rpc::RpcError::Failure(error) => {
+                            let message = error["message"].as_str().unwrap_or("An error occurred.").to_owned();
+                            notify_error(window, cx, failure, message);
+                        }
+                        crate::rpc::RpcError::Defect(_) => notify_error(window, cx, failure, "An error occurred."),
+                    }
+                }
             });
         })
         .detach();
