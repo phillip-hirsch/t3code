@@ -28,7 +28,8 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup};
+use self::groups::{GroupingMode, GroupingSettings, Member, ProjectGroup, ScopedGroup};
+use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::connections::ui::tooltip;
 use crate::app::pages::settings::widgets::{RowFrame, SettingsView, card, reset_button, settings_section};
 use crate::app::{Workspace, new_id};
@@ -89,9 +90,12 @@ impl Workspace {
         };
         let t = *theme::tokens(cx);
         let group = self.scoped_project_group(view);
-        let detail = group.is_some();
+        let detail = group.as_ref().is_some_and(|scoped| !scoped.group.members.is_empty());
         let content = match (group, &view.scope.kind) {
-            (Some(group), _) => self.render_project_detail(&panel, view, &group, window, cx),
+            (Some(scoped), _) if scoped.group.members.is_empty() => {
+                vec![self.render_scope_unavailable("This project has no checkout on this environment.", &t, cx)]
+            }
+            (Some(scoped), _) => self.render_project_detail(&panel, view, &scoped, window, cx),
             (None, ScopeKind::Unavailable { message }) => vec![self.render_scope_unavailable(message, &t, cx)],
             (None, _) => vec![self.render_project_choices(view, &t, cx)],
         };
@@ -108,10 +112,21 @@ impl Workspace {
         )
     }
 
-    /// The group the scope picked, while it resolves.
-    fn scoped_project_group(&self, view: &SettingsView) -> Option<ProjectGroup> {
+    /// The group the scope picked, while it resolves, narrowed to the picked machine.
+    fn scoped_project_group(&self, view: &SettingsView) -> Option<ScopedGroup> {
         let key = self.settings_ui.scope.project.as_ref().filter(|_| view.scope.is_project())?;
-        view.groups.iter().find(|group| &group.key == key).cloned()
+        let whole = view.groups.iter().find(|group| &group.key == key)?;
+        Some(groups::narrow(whole, self.settings_ui.scope.machine.as_deref()))
+    }
+
+    /// Whether this connection may change projects on `environment` (`orchestration:operate`).
+    fn can_edit_projects_on(&self, environment: &str) -> bool {
+        self.environment_grants(environment, ORCHESTRATION_OPERATE)
+    }
+
+    /// `canEditGroup`: every one of `members`' environments is editable.
+    fn can_edit_members(&self, members: &[Member]) -> bool {
+        members.iter().all(|m| self.can_edit_projects_on(&m.project.environment_id))
     }
 
     /// `ProjectSettingsPanel`: when a grouping change moves the picked checkouts to another
@@ -257,7 +272,10 @@ impl Workspace {
 
     fn rename_project(&mut self, title: String, was_edited: bool, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.settings_view();
-        let Some(group) = self.scoped_project_group(&view) else { return };
+        let Some(ScopedGroup { group, .. }) = self.scoped_project_group(&view) else { return };
+        if group.members.is_empty() || !self.can_edit_members(&group.members) {
+            return;
+        }
         if title.is_empty() {
             window.push_notification(Notification::warning("Project title cannot be empty"), cx);
             return;
@@ -378,29 +396,37 @@ impl Workspace {
     /// so rows don't hold copies of their group.
     fn remove_group_members(&mut self, key: &str, checkout: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.settings_view();
-        let Some(group) = view.groups.iter().find(|group| group.key == key) else { return };
+        let Some(scoped) = self.scoped_project_group(&view).filter(|scoped| scoped.group.key == key) else { return };
         let members: Vec<Member> =
-            group.members.iter().filter(|m| checkout.is_none_or(|c| m.physical_key == c)).cloned().collect();
-        self.remove_project_members(group, members, window, cx);
+            scoped.group.members.iter().filter(|m| checkout.is_none_or(|c| m.physical_key == c)).cloned().collect();
+        if members.is_empty() || !self.can_edit_members(&members) {
+            return;
+        }
+        self.remove_project_members(&scoped, members, window, cx);
     }
 
     fn remove_project_members(
         &mut self,
-        group: &ProjectGroup,
+        scoped: &ScopedGroup,
         members: Vec<Member>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let group = &scoped.group;
         let refs: Vec<&Member> = members.iter().collect();
-        // One environment: the scope always holds every checkout of the group.
+        let environment_label = match members.as_slice() {
+            [member] => self.env_info(&member.project.environment_id).and_then(|info| info.environment_label.clone()),
+            _ => None,
+        };
         let (whole_group, message) = groups::plan_removal(
             &refs,
             group.members.len(),
-            false,
+            scoped.has_other_members,
             &group.display_name,
-            self.settings_info().environment_label.as_deref(),
+            environment_label.as_deref(),
             &self.shell.threads,
         );
+        let clear_selection = whole_group && !scoped.has_other_members;
         let (title, description) = message.split_once('\n').unwrap_or((&message, ""));
         let (title, description) = (SharedString::from(title.to_owned()), SharedString::from(description.to_owned()));
         let workspace = cx.weak_entity();
@@ -416,7 +442,7 @@ impl Workspace {
                 .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
                     let ids = ids.clone();
-                    let _ = workspace.update(cx, |this, cx| this.delete_projects(ids, whole_group, window, cx));
+                    let _ = workspace.update(cx, |this, cx| this.delete_projects(ids, clear_selection, window, cx));
                     true
                 })
         });
@@ -514,11 +540,13 @@ impl Workspace {
         &mut self,
         panel: &Entity<ProjectsPanel>,
         view: &SettingsView,
-        group: &ProjectGroup,
+        scoped: &ScopedGroup,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let group = &scoped.group;
         let tokens = *theme::tokens(cx);
+        let can_edit = self.can_edit_members(&group.members);
         let representative = group.members[0].clone();
         let state = panel.read(cx);
         let (saving_icon, organizing, images, name) =
@@ -543,7 +571,7 @@ impl Workspace {
 
         let name_reset = can_reset_scratch_title.then(|| {
             let ids = ids.clone();
-            reset_button(&"reset-project-name".into(), "Reset to default", cx).on_click(cx.listener(
+            reset_button(&"reset-project-name".into(), "Reset to default", cx).disabled(!can_edit).on_click(cx.listener(
                 move |this, _, window, cx| {
                     let update = json!({"title": groups::SCRATCH_PROJECT_TITLE});
                     this.update_projects(ids.clone(), update, "Failed to rename project", window, cx, |_, _| {});
@@ -553,7 +581,7 @@ impl Workspace {
         let icon_reset = icon_customized.then(|| {
             let (ids, panel) = (ids.clone(), panel.clone());
             let update = groups::default_icon_update(representative.is_scratch);
-            reset_button(&"reset-project-icon".into(), "Reset to default", cx).disabled(saving_icon).on_click(
+            reset_button(&"reset-project-icon".into(), "Reset to default", cx).disabled(saving_icon || !can_edit).on_click(
                 cx.listener(move |this, _, window, cx| {
                     this.set_project_icon(&panel, ids.clone(), update.clone(), window, cx);
                 }),
@@ -632,7 +660,7 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Choose icon")
-                        .disabled(saving_icon)
+                        .disabled(saving_icon || !can_edit)
                         .on_click(open_icons),
                 )
                 .child(
@@ -640,16 +668,26 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Choose file")
-                        .disabled(saving_icon)
+                        .disabled(saving_icon || !can_edit)
                         .on_click(open_files),
                 )
         };
 
-        let mut overview = vec![
+        // Shared settings write every checkout in view, so each one's environment must allow it.
+        let notice = (!can_edit).then(|| {
+            let text = if group.members.len() > 1 {
+                "Shared settings require permission to change every checkout in this group."
+            } else {
+                "This connection cannot change this project."
+            };
+            div().px_4().py_2().text_sm().text_color(tokens.muted_foreground).child(text).into_any_element()
+        });
+        let mut overview: Vec<AnyElement> = notice.into_iter().collect();
+        overview.extend([
             RowFrame::new("Name")
                 .description("The shared name for this project group in the sidebar and thread lists.")
                 .reset(name_reset.map(IntoElement::into_any_element))
-                .control(div().w(px(256.)).child(Input::new(&name).small()).into_any_element())
+                .control(div().w(px(256.)).child(Input::new(&name).small().disabled(!can_edit)).into_any_element())
                 .render(&tokens)
                 .into_any_element(),
             RowFrame::new("Project icon")
@@ -661,10 +699,12 @@ impl Workspace {
                 .control(icon_controls.into_any_element())
                 .render(&tokens)
                 .into_any_element(),
-        ];
-        if self.settings_info().capability("projectOrganization") {
+        ]);
+        // Pin and archive belong to the whole project, even when one machine is picked.
+        let all_ids = member_ids(&scoped.whole_members);
+        if self.can_edit_members(&scoped.whole_members) && self.settings_info().capability("projectOrganization") {
             let pin = {
-                let (panel, all_ids) = (panel.clone(), ids.clone());
+                let (panel, all_ids) = (panel.clone(), all_ids.clone());
                 Switch::new("pin-project").checked(group.pinned).disabled(organizing).on_click(cx.listener(
                     move |this, checked: &bool, window, cx| {
                         let title = if *checked { "Failed to pin project" } else { "Failed to unpin project" };
@@ -674,7 +714,7 @@ impl Workspace {
             };
             let archived = group.archived;
             let archive = {
-                let (panel, all_ids) = (panel.clone(), ids);
+                let (panel, all_ids) = (panel.clone(), all_ids);
                 Button::new("archive-project")
                     .outline()
                     .small()
@@ -713,7 +753,7 @@ impl Workspace {
         }
 
         let checkouts = self.render_checkouts(group, cx);
-        let danger = self.render_project_danger(group, cx);
+        let danger = self.render_project_danger(group, scoped.has_other_members, can_edit, cx);
         let alert = h_flex()
             .gap_2()
             .px(px(14.))
@@ -796,6 +836,7 @@ impl Workspace {
                     .outline()
                     .small()
                     .label("Remove")
+                    .disabled(!self.can_edit_projects_on(&member.project.environment_id))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.remove_group_members(&key, Some(&checkout), window, cx);
                     }))
@@ -811,10 +852,22 @@ impl Workspace {
         settings_section("checkouts", "Checkouts", rows, &tokens)
     }
 
-    fn render_project_danger(&mut self, group: &ProjectGroup, cx: &mut Context<Self>) -> AnyElement {
+    fn render_project_danger(
+        &mut self,
+        group: &ProjectGroup,
+        has_other_members: bool,
+        can_edit: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let count = group.members.len();
-        let (title, description, label) = if count > 1 {
+        let (title, description, label) = if has_other_members {
+            (
+                "Remove checkout".to_owned(),
+                "Deletes the selected machine's checkout entries and their threads. Other machines and files on disk are not touched.".to_owned(),
+                "Remove checkout",
+            )
+        } else if count > 1 {
             (
                 "Remove this project everywhere".to_owned(),
                 format!(
@@ -837,6 +890,7 @@ impl Workspace {
                 .small()
                 .icon(Icon::new(IconName::Trash).size(px(16.)))
                 .label(label)
+                .disabled(!can_edit)
                 .on_click(cx.listener(move |this, _, window, cx| this.remove_group_members(&key, None, window, cx)))
         };
         settings_section(

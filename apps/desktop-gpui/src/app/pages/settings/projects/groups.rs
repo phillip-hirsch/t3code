@@ -28,6 +28,23 @@ pub(super) fn build_groups(
     groups
 }
 
+/// A picked project as the panel edits it (`scopedGroup`): the group narrowed to the picked
+/// machine's checkouts, and every checkout, which pin and archive still write.
+pub(super) struct ScopedGroup {
+    pub(super) group: ProjectGroup,
+    pub(super) whole_members: Vec<Member>,
+    /// Checkouts on other machines are left out (`hasOtherMembers`).
+    pub(super) has_other_members: bool,
+}
+
+/// `ProjectSettingsPanel`'s member filter: only `machine`'s checkouts, when one is picked.
+pub(super) fn narrow(group: &ProjectGroup, machine: Option<&str>) -> ScopedGroup {
+    let mut scoped = group.clone();
+    scoped.members.retain(|m| machine.is_none_or(|id| m.project.environment_id == id));
+    let has_other_members = scoped.members.len() < group.members.len();
+    ScopedGroup { group: scoped, whole_members: group.members.clone(), has_other_members }
+}
+
 /// The group a former selection's checkouts joined after a grouping rule moved them.
 pub(super) fn successor<'a>(groups: &'a [ProjectGroup], member_keys: &[String]) -> Option<&'a ProjectGroup> {
     groups.iter().find(|group| group.members.iter().any(|m| member_keys.contains(&m.physical_key)))
@@ -125,6 +142,32 @@ mod tests {
             "updatedAt": "2026-11-01T00:00:00.000Z",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_picked_machine_narrows_the_group_to_its_checkouts() {
+        let member = |id: &str, environment: &str| {
+            let mut project = project(id, &format!("/{id}"), Value::Null);
+            project.environment_id = environment.into();
+            Member { project, physical_key: id.into(), is_scratch: false }
+        };
+        let group = ProjectGroup {
+            key: "repo".into(),
+            display_name: "repo".into(),
+            members: vec![member("a", "laptop"), member("b", "server"), member("c", "laptop")],
+            project_ids: vec!["a".into(), "b".into(), "c".into()],
+            pinned: false,
+            archived: false,
+        };
+        let ids = |members: &[Member]| members.iter().map(|m| m.project.id.clone()).collect::<Vec<_>>();
+        let scoped = narrow(&group, Some("laptop"));
+        assert_eq!(ids(&scoped.group.members), ["a", "c"]);
+        assert_eq!(ids(&scoped.whole_members), ["a", "b", "c"]);
+        assert!(scoped.has_other_members);
+        let all = narrow(&group, None);
+        assert_eq!(ids(&all.group.members), ["a", "b", "c"]);
+        assert!(!all.has_other_members);
+        assert!(narrow(&group, Some("gone")).group.members.is_empty());
     }
 
     #[test]
