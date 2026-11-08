@@ -158,6 +158,14 @@ impl Terminals {
         self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
     }
 
+    /// The server terminal an empty drawer opens on: a running one first, never a panel tab's.
+    fn drawer_reuse(&self, thread_id: &str) -> Option<String> {
+        let panel = self.panel_ids(thread_id);
+        let free = |id: &&str| !panel.iter().any(|p| p == id);
+        let known = self.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
+        self.running(thread_id).into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
+    }
+
     fn label(&self, thread_id: &str, terminal_id: &str) -> String {
         let summary = self.summaries(thread_id).iter().find(|s| s.terminal_id == terminal_id);
         layout::terminal_label(terminal_id, summary.map(|s| s.label.as_str()))
@@ -341,10 +349,7 @@ impl Workspace {
             self.focus_composer(window, cx);
         } else if drawer.terminal_ids.is_empty() {
             // A setup or agent-started shell already runs: show it instead of starting another.
-            let running = self.terminals.running(&thread_id).first().map(std::string::ToString::to_string);
-            let existing =
-                running.or_else(|| self.terminals.summaries(&thread_id).first().map(|s| s.terminal_id.clone()));
-            match existing {
+            match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
                     self.terminals.drawers.entry(thread_id).or_default().ensure(&id);
                     self.terminals.focus_pending = Some(id);
@@ -572,7 +577,8 @@ impl Workspace {
             }
             let client = self.thread_client(&thread_id);
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
-            let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, window, cx));
+            let read_only = !self.terminal_operable(&thread_id);
+            let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, read_only, window, cx));
             let _events = cx.subscribe_in(&session, window, |this, session, event: &SessionEvent, window, cx| {
                 let (thread_id, terminal_id) = {
                     let session = session.read(cx);
@@ -1227,5 +1233,24 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn an_empty_drawer_reuses_a_server_terminal_no_panel_tab_shows() {
+        let mut terminals = Terminals::default();
+        let summary = |id: &str, running: bool| json!({"threadId": "t", "terminalId": id, "hasRunningSubprocess": running, "label": ""});
+        let snapshot = json!({"type": "snapshot", "terminals": [summary("default", false), summary("term-2", true), summary("term-3", false)]});
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("term-2"), "a running terminal first");
+        let group = |ids: &[&str]| panel::PanelGroup {
+            thread_id: "t".into(),
+            terminal_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            active: ids[0].into(),
+            split: Split::Horizontal,
+        };
+        terminals.panel.insert("surface".into(), group(&["term-2"]));
+        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("default"));
+        terminals.panel.insert("surface".into(), group(&["term-2", "default", "term-3"]));
+        assert_eq!(terminals.drawer_reuse("t"), None);
     }
 }
