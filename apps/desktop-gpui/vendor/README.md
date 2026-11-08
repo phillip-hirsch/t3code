@@ -232,6 +232,12 @@ leaves, which `replace_text_in_ranges_selecting` in `src/input/base/state.rs` se
 records its cursors, so redo restores that caret rather than one per range. Test there:
 `test_replace_ranges_redo_restores_chosen_selection`.
 
+**Code block actions span the top row.** The web's code block header puts the language on the
+left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
+own width, so the row could span the block only when the caller knew its width. The patch anchors
+the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
+`actions` container in `CodeBlock::render`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.

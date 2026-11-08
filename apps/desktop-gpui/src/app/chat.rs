@@ -1845,7 +1845,7 @@ fn markdown_view(
         .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
             let wrap_key = key.clone();
-            code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx, move |workspace, cx| {
+            code_block_header(&header_this, &key, block, wrap, streaming, true, width, &t, cx, move |workspace, cx| {
                 workspace.toggle_code_wrap(&wrap_key, cx);
             })
         })
@@ -1920,15 +1920,17 @@ fn markdown_view(
         })
 }
 
-/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
-/// `TextView` pins the actions 8px into the block's top-right corner over its own fill,
-/// so given the block's `width` the row spans it and paints the block's color.
+/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right, with
+/// "Run in terminal" for a shell block when `run` (`onRunCommand`) is set.
+/// `TextView` lays the actions over the block's top row, 8px from its top-right corner, so the
+/// row spans that (or the given `width`) and paints the block's color.
 pub(super) fn code_block_header(
     this: &WeakEntity<Workspace>,
     key: &SharedString,
     block: &gpui_kit::base::text::CodeBlock,
     wrap: bool,
     streaming: bool,
+    run: bool,
     width: Option<f32>,
     t: &Tokens,
     cx: &App,
@@ -1961,7 +1963,7 @@ pub(super) fn code_block_header(
         });
     let lang = block.lang();
     let run = runnable_command(lang.as_deref().unwrap_or_default(), &code)
-        .filter(|_| !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
+        .filter(|_| run && !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
         .map(|command| {
             let this = this.clone();
             div()
@@ -1989,7 +1991,12 @@ pub(super) fn code_block_header(
     let copy = message_actions::code_copy_button(this, id, code, t, cx);
     let fill = t.background.blend(code_background(t));
     h_flex()
-        .when_some(width, |row, width| row.w(px(width - 8.)).pl(px(10.)).justify_between())
+        .map(|row| match width {
+            Some(width) => row.w(px(width - 8.)),
+            None => row.w_full(),
+        })
+        .pl(px(10.))
+        .justify_between()
         .mt(px(-2.))
         .mr(px(-2.))
         .rounded(px(6.))

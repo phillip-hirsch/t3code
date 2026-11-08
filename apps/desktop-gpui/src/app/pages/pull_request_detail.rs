@@ -2533,7 +2533,8 @@ fn known_method(method: &str) -> Option<&'static str> {
     logic::MERGE_METHODS.iter().map(|m| m.0).find(|m| *m == method)
 }
 
-/// `PullRequestMarkdown`: the chat's markdown, with change request links routed like the web's.
+/// `PullRequestMarkdown`: the chat's markdown, with change request links routed like the web's
+/// and no "Run in terminal" on code blocks.
 /// `wrap` is [`Workspace::pr_code_wraps`] for this body.
 fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Workspace>, wrap: bool) -> TextView {
     let view = view.downgrade();
@@ -2543,6 +2544,7 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
     TextView::new(state)
         .style(super::super::chat::markdown_style(&t, false, wrap))
         .inline_code_style(super::super::chat::inline_code_style(&t))
+        .link_underline(false)
         .selectable(true)
         .code_block_actions(move |block, _, cx| {
             super::super::chat::code_block_header(
@@ -2550,6 +2552,8 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
                 &key,
                 block,
                 wrap,
+                false,
+                // No `onRunCommand`: a terminal here would open in the last active thread.
                 false,
                 None,
                 &t,
