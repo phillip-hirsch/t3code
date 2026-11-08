@@ -1,4 +1,4 @@
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 use crate::{
     ActiveTheme, AxisExt, Sizable, Size, StyledExt, h_flex, text::Text, tooltip::ComponentTooltip,
@@ -6,8 +6,8 @@ use crate::{
 };
 use crate::{StyleSized as _, ThemeStyled as _};
 use gpui::{
-    AnyElement, App, Axis, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
+    AnyElement, App, Axis, ElementId, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder, relative, rems,
 };
 use gpui_base::{Radio as BaseRadio, RadioGroup as BaseRadioGroup};
@@ -34,6 +34,8 @@ pub struct Radio {
     position_in_set: Option<usize>,
     size_of_set: Option<usize>,
     focus_ring_enabled: bool,
+    /// Set by a [`RadioGroup`], which moves focus between its radios.
+    focus_handle: Option<FocusHandle>,
 }
 
 impl Radio {
@@ -57,6 +59,7 @@ impl Radio {
             position_in_set: None,
             size_of_set: None,
             focus_ring_enabled: true,
+            focus_handle: None,
         }
     }
 
@@ -185,10 +188,12 @@ impl RenderOnce for Radio {
         };
         let indicator_size = rems(indicator_rems);
         let dot_size = rems(if narrow { 0.5 } else { indicator_rems * 0.375 });
-        let focus_handle = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone();
+        let focus_handle = self.focus_handle.clone().unwrap_or_else(|| {
+            window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
         let is_focused = focus_handle.is_focused(window);
         let disabled = self.disabled;
         let accessibility_label = self
@@ -305,6 +310,7 @@ pub struct RadioGroup {
     layout: Axis,
     selected_index: Option<usize>,
     disabled: bool,
+    accessibility_label: Option<SharedString>,
     on_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
 }
 
@@ -318,6 +324,7 @@ impl RadioGroup {
             layout: Axis::Vertical,
             selected_index: None,
             disabled: false,
+            accessibility_label: None,
             radios: vec![],
         }
     }
@@ -366,6 +373,12 @@ impl RadioGroup {
         self
     }
 
+    /// Set the name a screen reader announces for the group.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = Some(label.into());
+        self
+    }
+
     /// Add a child Radio element.
     pub fn child(mut self, child: impl Into<Radio>) -> Self {
         self.radios.push(child.into());
@@ -403,8 +416,17 @@ impl From<String> for Radio {
     }
 }
 
+/// The radio an arrow key moves to from `current`: the next enabled one in
+/// `step`'s direction, wrapping around the group.
+fn arrow_target(enabled: &[bool], current: usize, step: isize) -> Option<usize> {
+    let total = enabled.len() as isize;
+    (1..total)
+        .map(|offset| (current as isize + step * offset).rem_euclid(total) as usize)
+        .find(|&ix| enabled[ix])
+}
+
 impl RenderOnce for RadioGroup {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let on_click = self.on_click;
         let disabled = self.disabled;
         let selected_ix = self.selected_index;
@@ -415,9 +437,57 @@ impl RenderOnce for RadioGroup {
             h_flex().w_full().flex_wrap()
         };
 
+        // t3code: like the web's RadioGroup, Tab reaches only the selected radio (or the
+        // first enabled one) and the arrow keys move focus and the selection.
         let total = self.radios.len();
+        let handles = window.use_keyed_state(
+            ElementId::NamedChild(Arc::new(self.id.clone()), "focus".into()),
+            cx,
+            |_, _| Vec::<FocusHandle>::new(),
+        );
+        let handles = handles.update(cx, |handles, cx| {
+            handles.resize_with(total, || cx.focus_handle());
+            handles.clone()
+        });
+        let enabled: Vec<bool> = self
+            .radios
+            .iter()
+            .map(|radio| !disabled && !radio.disabled)
+            .collect();
+        let tab_stop = selected_ix
+            .filter(|&ix| enabled.get(ix) == Some(&true))
+            .or_else(|| enabled.iter().position(|&enabled| enabled));
+        let navigate = on_click.clone().filter(|_| !disabled).map(|on_click| {
+            let handles = handles.clone();
+            let enabled = enabled.clone();
+            move |event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut App| {
+                let step = match event.keystroke.key.as_str() {
+                    "down" | "right" => 1,
+                    "up" | "left" => -1,
+                    _ => return,
+                };
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let Some(current) = handles.iter().position(|handle| handle.is_focused(window))
+                else {
+                    return;
+                };
+                let Some(next) = arrow_target(&enabled, current, step) else {
+                    return;
+                };
+                cx.stop_propagation();
+                window.focus(&handles[next], cx);
+                on_click(&next, window, cx);
+            }
+        });
+
         BaseRadioGroup::new(self.id)
             .axis(self.layout)
+            .when_some(self.accessibility_label, |this, label| {
+                this.aria_label(label)
+            })
+            .when_some(navigate, |this, navigate| this.on_key_down(navigate))
             .refine_style(&self.style)
             .child(
                 base.gap_3()
@@ -427,10 +497,12 @@ impl RenderOnce for RadioGroup {
                         radio.id = ix.into();
                         radio.position_in_set = Some(ix + 1);
                         radio.size_of_set = Some(total);
+                        radio.focus_handle = Some(handles[ix].clone());
                         let item_disabled = radio.disabled;
                         radio
                             .disabled(disabled || item_disabled)
                             .checked(checked)
+                            .tab_stop(tab_stop == Some(ix))
                             .when_some(on_click.clone(), |this, on_click| {
                                 this.on_click(move |_, window, cx| on_click(&ix, window, cx))
                             })
@@ -442,6 +514,17 @@ impl RenderOnce for RadioGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_keys_wrap_and_skip_disabled_radios() {
+        let enabled = [true, false, true, true];
+        assert_eq!(arrow_target(&enabled, 0, 1), Some(2));
+        assert_eq!(arrow_target(&enabled, 3, 1), Some(0));
+        assert_eq!(arrow_target(&enabled, 0, -1), Some(3));
+        assert_eq!(arrow_target(&enabled, 2, -1), Some(0));
+        assert_eq!(arrow_target(&[true, false], 0, 1), None);
+        assert_eq!(arrow_target(&[true], 0, 1), None);
+    }
 
     #[test]
     fn an_explicit_accessibility_label_replaces_the_visible_one() {

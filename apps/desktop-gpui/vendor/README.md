@@ -250,6 +250,14 @@ trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPop
 (`size-2 sm:size-1.5`) in a `size-4.5 sm:size-4` circle; 0.9.0 draws the checkbox's checkmark at one
 size. `src/radio.rs` draws the dot and grows the default size below 640px.
 
+**A radio group moves with the arrow keys.** The web's `RadioGroup` (Base UI) is one tab stop, the
+selected radio or else the first enabled one, and the arrow keys move focus and the selection to the
+next enabled radio, wrapping; it can carry an accessible name. 0.9.0's `RadioGroup` made every radio a
+tab stop and ignored the arrows. `src/radio.rs`: the group owns its radios' focus handles, sets their
+tab stops, handles Up/Down/Left/Right (`arrow_target`) and takes `accessibility_label`. Tests:
+`arrow_keys_wrap_and_skip_disabled_radios`, and in `tests/integration/controlled_change_callbacks.rs`,
+`radio_group_arrows_move_focus_and_selection_from_the_selected_radio`.
+
 **Dialogs take the web's default geometry.** The web's `DialogPopup` centers in the window,
 `max-w-lg` (512px) wide with `rounded-2xl` corners; 0.9.0 sat dialogs a tenth of the viewport down,
 448px wide with `radius_lg`. `src/dialog/dialog.rs` makes centered and 512px the defaults (an
