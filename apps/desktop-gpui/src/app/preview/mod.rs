@@ -1021,6 +1021,15 @@ impl Workspace {
         let url = self.active_url();
         let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
         let reload_tab = session.map(|s| s.tab_id.clone());
+        let unreachable = match server_tab {
+            Some(s) => matches!(s.nav_status, NavStatus::LoadFailed { .. }),
+            None => hosted.is_some_and(|tab| matches!(tab.status, NavStatus::LoadFailed { .. })),
+        };
+        // `onPictureInPicture`: float the tab over the chat, or stop floating it.
+        let float = session.map(|s| {
+            let floating = self.preview.floating.get(thread_id) == Some(&s.tab_id);
+            (s.tab_id.clone(), floating, !unreachable && (server_tab.is_some() || hosted.is_some()))
+        });
         let server_tab = server_tab.map(|s| s.tab_id.clone());
         let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
@@ -1108,6 +1117,24 @@ impl Workspace {
                         )
                     }),
             )
+            .children(float.map(|(tab, floating, enabled)| {
+                let label = if floating { "Close floating preview" } else { "Float preview over chat" };
+                let thread = thread_id.to_owned();
+                icon_button("preview-float", IconName::PictureInPicture2, enabled, tokens)
+                    .when(floating, |el| el.bg(tokens.secondary).text_color(tokens.primary))
+                    .tooltip(tooltip(label))
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            if floating {
+                                this.preview.floating.remove(&thread);
+                                cx.notify();
+                            } else {
+                                this.preview.floating.insert(thread.clone(), tab.clone());
+                                this.close_right_panel(cx);
+                            }
+                        }))
+                    })
+            }))
             .child(self.render_preview_menu(session, has_page, menu_corner, tokens, cx))
             .when(loading, |el| {
                 el.child(div().absolute().left_0().right_0().bottom(px(-1.)).h(px(2.)).bg(tokens.primary))

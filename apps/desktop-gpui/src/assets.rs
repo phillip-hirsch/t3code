@@ -67,6 +67,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "archive-x",
     "file-x",
     "history",
+    "picture-in-picture-2",
     "radio-tower",
     "arrow-down-up",
     "app-window",
