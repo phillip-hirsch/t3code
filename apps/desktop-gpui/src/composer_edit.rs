@@ -7,26 +7,32 @@ use std::ops::Range;
 
 use crate::composer_markdown::{is_closing_fence, opening_fence};
 
-/// Replace `range` with `text`, then select `select`.
+/// Replace each of `changes` (disjoint, ascending, in the text before the edit), then select
+/// `select`. Separate changes leave the chips between them in place.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Edit {
-    pub range: Range<usize>,
-    pub text: String,
+    pub changes: Vec<(Range<usize>, String)>,
     pub select: Range<usize>,
 }
 
 impl Edit {
     fn caret(range: Range<usize>, text: String, caret: usize) -> Self {
-        Self { range, text, select: caret..caret }
+        Self { changes: vec![(range, text)], select: caret..caret }
     }
 
     /// Consumes the key without changing the text.
     fn keep(select: Range<usize>) -> Self {
-        Self { range: select.start..select.start, text: String::new(), select }
+        Self { changes: Vec::new(), select }
+    }
+
+    /// `self` followed by `later`, changes that all sit after it.
+    fn then(mut self, later: Vec<(Range<usize>, String)>) -> Self {
+        self.changes.extend(later);
+        self
     }
 
     pub fn is_noop(&self) -> bool {
-        self.range.is_empty() && self.text.is_empty()
+        self.changes.iter().all(|(range, text)| range.is_empty() && text.is_empty())
     }
 }
 
@@ -190,19 +196,18 @@ fn nested_number(marker: &Marker, previous: Option<&Marker>) -> (usize, String) 
 }
 
 /// `renumberFollowingItems`: the siblings after `after_line_end`, counted on from `marker`'s
-/// next number, as (end of the rewritten text, its replacement).
+/// next number, as one change per number rewritten.
 fn renumber_following(
     value: &str,
     after_line_end: usize,
     marker: &Marker,
     tokens: &[Range<usize>],
-) -> Option<(usize, String)> {
-    let Kind::Ordered { number, delimiter } = &marker.kind else { return None };
+) -> Vec<(Range<usize>, String)> {
+    let mut changes = Vec::new();
+    let Kind::Ordered { number, delimiter } = &marker.kind else { return changes };
     let base = indent_width(&marker.indent, 0);
-    let mut expected = number.parse::<u64>().ok()?.checked_add(2)?;
-    let mut parts = String::new();
-    let (mut position, mut copied) = (after_line_end, after_line_end);
-    let mut changed = false;
+    let Some(mut expected) = number.parse::<u64>().ok().and_then(|n| n.checked_add(2)) else { return changes };
+    let mut position = after_line_end;
     while position < value.len() && expected < 1 << 53 {
         let line_start = position + 1;
         let line_end = value[line_start..].find('\n').map_or(value.len(), |i| line_start + i);
@@ -230,14 +235,11 @@ fn renumber_following(
             expected.to_string()
         };
         if replacement != *current_number {
-            parts.push_str(&value[copied..number_start]);
-            parts.push_str(&replacement);
-            copied = number_start + current_number.len();
-            changed = true;
+            changes.push((number_start..number_start + current_number.len(), replacement));
         }
         expected += 1;
     }
-    changed.then_some((copied, parts))
+    changes
 }
 
 /// `listContinuationForEnter`: a new item after this one, or an empty item lifted a level.
@@ -256,21 +258,13 @@ pub fn list_enter(value: &str, cursor: usize, tokens: &[Range<usize>]) -> Option
         let replacement = parent.as_ref().map(next_marker_text).unwrap_or_default();
         let caret = line.start + replacement.len();
         let end = cursor.max(marker_end);
-        if let Some(parent) = &parent
-            && let Some((until, renumbered)) = renumber_following(value, line.end, parent, tokens)
-        {
-            let text = format!("{replacement}{}{renumbered}", &value[end..line.end]);
-            return Some(Edit::caret(line.start..until, text, caret));
-        }
-        return Some(Edit::caret(line.start..end, replacement, caret));
+        let renumbered = parent.as_ref().map(|parent| renumber_following(value, line.end, parent, tokens));
+        return Some(Edit::caret(line.start..end, replacement, caret).then(renumbered.unwrap_or_default()));
     }
     let insertion = format!("\n{}", next_marker_text(&parsed.marker));
     let caret = cursor + insertion.len();
-    if let Some((until, renumbered)) = renumber_following(value, line.end, &parsed.marker, tokens) {
-        let text = format!("{insertion}{}{renumbered}", &value[cursor..line.end]);
-        return Some(Edit::caret(cursor..until, text, caret));
-    }
-    Some(Edit::caret(cursor..cursor, insertion, caret))
+    let renumbered = renumber_following(value, line.end, &parsed.marker, tokens);
+    Some(Edit::caret(cursor..cursor, insertion, caret).then(renumbered))
 }
 
 /// `listIndentForTab`: nests the item under the one above, at that item's content column.
@@ -339,14 +333,9 @@ pub fn list_outdent(value: &str, cursor: usize, tokens: &[Range<usize>]) -> Opti
     } else {
         cursor - replaced_end + line.start + replacement.len()
     };
-    if continues
-        && let Some(parent) = &parent
-        && let Some((until, renumbered)) = renumber_following(value, line.end, parent, tokens)
-    {
-        let text = format!("{replacement}{}{renumbered}", &value[replaced_end..line.end]);
-        return Some(Edit::caret(line.start..until, text, caret));
-    }
-    Some(Edit::caret(line.start..replaced_end, replacement, caret))
+    let renumbered =
+        parent.as_ref().filter(|_| continues).map(|parent| renumber_following(value, line.end, parent, tokens));
+    Some(Edit::caret(line.start..replaced_end, replacement, caret).then(renumbered.unwrap_or_default()))
 }
 
 const CODE_INDENT: &str = "  ";
@@ -456,7 +445,9 @@ pub fn code_tab(text: &str, selection: Range<usize>, outdent: bool) -> Option<Ed
     }
     let line_start =
         text[block.code.start..selection.start].rfind('\n').map_or(block.code.start, |i| block.code.start + i + 1);
-    let search = selection.start.max(selection.end.saturating_sub(1)).min(block.code.end);
+    // The selection's last character, so a selection ending after a newline leaves the next line.
+    let last = text[..selection.end].char_indices().next_back().map_or(0, |(i, _)| i);
+    let search = selection.start.max(last).min(block.code.end);
     let line_end = text[search..block.code.end].find('\n').map_or(block.code.end, |i| search + i);
     let original: Vec<&str> = text[line_start..line_end].split('\n').collect();
     let next: Vec<String> = original
@@ -480,7 +471,7 @@ pub fn code_tab(text: &str, selection: Range<usize>, outdent: bool) -> Option<Ed
     let total = delta(replacement.len(), before.len());
     let from = (selection.start.cast_signed() + first).max(line_start.cast_signed()).cast_unsigned();
     let to = (selection.end.cast_signed() + total).max(from.cast_signed()).cast_unsigned();
-    Some(Edit { range: line_start..line_end, text: replacement, select: from..to })
+    Some(Edit { changes: vec![(line_start..line_end, replacement)], select: from..to })
 }
 
 #[cfg(test)]
@@ -488,7 +479,11 @@ mod tests {
     use super::*;
 
     fn apply(value: &str, edit: &Edit) -> String {
-        format!("{}{}{}", &value[..edit.range.start], edit.text, &value[edit.range.end..])
+        let mut value = value.to_owned();
+        for (range, text) in edit.changes.iter().rev() {
+            value.replace_range(range.clone(), text);
+        }
+        value
     }
 
     fn enter(value: &str, cursor: usize) -> String {
@@ -538,8 +533,10 @@ mod tests {
         // A newline inside a chip starts no item.
         let value = "1. a\n2. [f\n2. g](x) \n3. b";
         let chip = 8..19;
-        let edit = list_enter(value, 4, &[chip]).unwrap();
+        let edit = list_enter(value, 4, std::slice::from_ref(&chip)).unwrap();
         assert_eq!(apply(value, &edit), "1. a\n2. \n3. [f\n2. g](x) \n4. b");
+        // Renumbering past a chip leaves it in place, so its attachment stays.
+        assert!(edit.changes.iter().all(|(range, _)| range.end <= chip.start || range.start >= chip.end));
     }
 
     #[test]
@@ -613,6 +610,9 @@ mod tests {
         let edit = code_tab(indented, 6..9, true).unwrap();
         assert_eq!((apply(indented, &edit), edit.select), ("```\na\nb\n```".to_owned(), 4..6));
         assert!(code_tab("```\na\n```", 4..4, true).unwrap().is_noop());
+        let wide = "```\n  \u{e9}\n```";
+        let edit = code_tab(wide, 6..8, true).unwrap();
+        assert_eq!((apply(wide, &edit), edit.select), ("```\n\u{e9}\n```".to_owned(), 4..6));
         assert_eq!(code_tab("- a", 3..3, false), None);
     }
 }

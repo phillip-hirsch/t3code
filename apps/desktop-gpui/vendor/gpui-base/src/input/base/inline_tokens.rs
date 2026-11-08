@@ -409,6 +409,19 @@ macro_rules! token_api {
             ) -> Result<(), InlineTokenError> {
                 self.replace_token(range, token, window, cx)
             }
+            /// Replace disjoint UTF-8 byte ranges of the current text as one undo step; the
+            /// tokens between them stay.
+            pub fn replace_ranges(
+                &mut self,
+                edits: &[(Range<usize>, String)],
+                window: &mut Window,
+                cx: &mut Context<Self>,
+            ) {
+                self.with_edits_allowed(|this| {
+                    this.undo_manager.set_pending_intent(EditIntent::Atomic);
+                    this.replace_text_in_ranges(edits, window, cx);
+                });
+            }
             pub fn tokens(&self) -> &[InlineTokenSpan] {
                 self.token_spans()
             }

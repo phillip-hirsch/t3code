@@ -463,8 +463,7 @@ impl Workspace {
     ) -> bool {
         self.composer.update(cx, |state, cx| {
             if !edit.is_noop() {
-                state.set_selected_range(edit.range, cx);
-                state.replace(edit.text, window, cx);
+                state.replace_ranges(&edit.changes, window, cx);
             }
             state.set_selected_range(edit.select, cx);
         });
@@ -1213,19 +1212,27 @@ impl Workspace {
         let busy = self.sending || self.saving_queue_edit();
         if can_resume && !sendable {
             let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
-            let content = if self.sending {
-                Spinner::new().small().color(t.primary_foreground).into_any_element()
+            // The web's send button in its resume state: the same stage art, a filled play.
+            let stage = self.stage_art();
+            let (fill, icon) = if stage.is_some() {
+                (gpui_kit::transparent_black(), gpui_kit::white())
             } else {
-                Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
+                (t.primary, t.primary_foreground)
             };
-            let resume = round_button("resume", t.primary, t.primary, t);
+            let content = if self.sending {
+                Spinner::new().small().color(icon).into_any_element()
+            } else {
+                Icon::empty().path("icons/app/play-filled.svg").with_size(px(16.)).text_color(icon).into_any_element()
+            };
+            let resume = round_button("resume", fill, t.primary, t);
             let resume = if enabled { action_control(resume, &self.composer_action_focus[PRIMARY], t) } else { resume };
             return resume
-                .child(content)
+                .when_some(stage, |el, art| el.relative().child(super::sidebar::stage_button_art(art, t.dark)))
+                .child(div().relative().child(content))
                 .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
                 .when(enabled, |el| {
                     el.cursor_pointer()
-                        .hover(|s| s.bg(t.primary_hover))
+                        .when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover)))
                         .on_click(cx.listener(|this, _, window, cx| this.resume_thread(window, cx)))
                 })
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))

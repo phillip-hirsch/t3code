@@ -51,12 +51,16 @@ pub(in crate::app) struct UsageState {
     mismatches: Vec<logic::ContractMismatch>,
     /// When the last answer landed, and each environment's prices and aliases the read went out with.
     answered_at: Option<i64>,
-    scan_settings: Vec<(SharedString, Value)>,
-    loading: bool,
+    scan_settings: Vec<UsageScan>,
+    /// Environments whose usage read is still out.
+    pending: Vec<SharedString>,
     refreshing: bool,
     generation: u64,
     limits_now: i64,
-    limits_refreshed_at: Option<i64>,
+    /// Per environment, as the web's `refreshUsageLimits`: probes still out, and when an
+    /// automatic probe may run again.
+    limits_pending: Vec<SharedString>,
+    limits_after: HashMap<SharedString, i64>,
     by_time: bool,
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
@@ -75,6 +79,9 @@ pub(in crate::app) struct UsageState {
     /// Each limit segment's focus handle, by [`segment_key`].
     segment_focus: HashMap<String, FocusHandle>,
 }
+
+/// A connected environment, its socket and what a read there is priced and filtered with.
+type UsageScan = (SharedString, crate::rpc::SocketId, Value);
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
 
@@ -300,11 +307,12 @@ impl Default for UsageState {
             mismatches: Vec::new(),
             answered_at: None,
             scan_settings: Vec::new(),
-            loading: false,
+            pending: Vec::new(),
             refreshing: false,
             generation: 0,
             limits_now: now_ms(),
-            limits_refreshed_at: None,
+            limits_pending: Vec::new(),
+            limits_after: HashMap::new(),
             by_time: false,
             hover: None,
             scroll: ScrollHandle::new(),
@@ -344,6 +352,88 @@ impl UsageState {
             Some((summary, _)) => logic::merge(summary, &self.hidden),
             None => Merged::default(),
         });
+    }
+
+    /// Whether the shown usage is read again: the scan's environments or settings changed,
+    /// whether or not the last read failed, or a pick of environments the last read missed.
+    fn needs_reread(&self, scan_changed: bool) -> bool {
+        let unread = self.summary.is_none() && self.answers.is_some() && self.error().is_none();
+        !self.loading() && (scan_changed || unread)
+    }
+
+    /// A selected environment's usage read is still out.
+    fn loading(&self) -> bool {
+        self.pending.iter().any(|id| self.is_selected(id))
+    }
+
+    /// One environment's answer to a read of `window`, shown as soon as it lands; the first
+    /// answer for a new window replaces the kept ones. Whether to ask again once its slow
+    /// sources finish (`awaitRefresh`).
+    fn publish(
+        &mut self,
+        environment_id: &SharedString,
+        result: Result<Value, crate::rpc::RpcError>,
+        window: &UsageWindow,
+        first_attempt: bool,
+    ) -> bool {
+        self.failures.retain(|(id, _)| id != environment_id);
+        let summary = match result.map(serde_json::from_value::<Summary>) {
+            Ok(Ok(summary)) => Some(summary),
+            Ok(Err(error)) => {
+                self.failures.push((environment_id.clone(), format!("Unreadable usage summary: {error}")));
+                None
+            }
+            Err(error) => {
+                self.failures.push((environment_id.clone(), usage_error(&error)));
+                None
+            }
+        };
+        let again = first_attempt && summary.as_ref().is_some_and(Summary::refreshing);
+        match summary {
+            Some(summary) => {
+                let answer = logic::EnvironmentUsage { environment_id: environment_id.to_string(), summary };
+                let answers = match &mut self.answers {
+                    Some((answers, shown)) if shown == window => answers,
+                    answers => &mut answers.insert((Vec::new(), window.clone())).0,
+                };
+                match answers.iter_mut().find(|kept| kept.environment_id == environment_id.as_ref()) {
+                    Some(kept) => *kept = answer,
+                    None => answers.push(answer),
+                }
+                self.answered_at = Some(now_ms());
+            }
+            // A machine that fails to answer leaves the others' usage showing.
+            None => {
+                if let Some((answers, _)) = &mut self.answers {
+                    answers.retain(|kept| kept.environment_id != environment_id.as_ref());
+                }
+            }
+        }
+        if !again {
+            self.pending.retain(|id| id != environment_id);
+        }
+        if !self.loading() {
+            self.refreshing = false;
+        }
+        self.recombine();
+        again
+    }
+
+    /// Whether to probe this environment's limits now: never while a probe is out, and an
+    /// automatic one only past its own cooldown.
+    fn limits_due(&self, environment_id: &SharedString, automatic: bool, now: i64) -> bool {
+        !self.limits_pending.contains(environment_id)
+            && (!automatic || self.limits_after.get(environment_id).is_none_or(|after| now >= *after))
+    }
+
+    /// A probe of this environment's limits settled.
+    fn limits_probed(&mut self, environment_id: &SharedString, now: i64) {
+        self.limits_pending.retain(|id| id != environment_id);
+        self.limits_after.insert(environment_id.clone(), now + LIMITS_AUTO_REFRESH_MS);
+        self.limits_now = now;
+        if !self.limits_pending.iter().any(|id| self.is_selected(id)) {
+            self.refreshing = false;
+        }
     }
 
     /// Why nothing shows: the first selected environment's failure.
@@ -395,21 +485,24 @@ impl Workspace {
     /// Reads usage again when the shown answer is stale or was priced differently; the old one
     /// stays on screen until the new one lands.
     fn revalidate_usage(&mut self, cx: &mut Context<Self>) {
-        if !self.usage.loading
+        if !self.usage.loading()
             && logic::needs_read(self.usage.answered_at, now_ms(), self.usage_scan_settings_changed())
         {
             self.read_usage(false, cx);
         }
     }
 
-    /// A connected environment's prices or model aliases differ from what the last read went out with.
+    /// An environment connected, reconnected or left, or its prices or model aliases changed,
+    /// since the last read went out.
     fn usage_scan_settings_changed(&self) -> bool {
-        let environments = self.usage_environments();
-        environments.len() != self.usage.scan_settings.len()
-            || environments
-                .iter()
-                .zip(&self.usage.scan_settings)
-                .any(|((id, _, info), (read_id, read))| id != read_id || scan_settings(info) != *read)
+        self.usage_scan() != self.usage.scan_settings
+    }
+
+    fn usage_scan(&self) -> Vec<UsageScan> {
+        self.sessions()
+            .iter()
+            .filter_map(|s| Some((s.id.clone()?, s.client.as_ref()?.socket_id(), scan_settings(&s.server_info))))
+            .collect()
     }
 
     /// `usage.*` on the open Usage page (`UsagePage.tsx`): `None` when `command` is not one;
@@ -505,118 +598,80 @@ impl Workspace {
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
         let window = self.usage.window.clone();
-        let machines: Vec<(String, crate::rpc::RpcClient, Value)> = self
+        let machines: Vec<(SharedString, crate::rpc::RpcClient, Value)> = self
             .usage_machines()
             .into_iter()
-            .map(|(id, client, filter)| (id.to_string(), client, window.summary_input(&filter)))
+            .map(|(id, client, filter)| (id, client, window.summary_input(&filter)))
             .collect();
+        self.usage.scan_settings = self.usage_scan();
+        let usage = &mut self.usage;
         if machines.is_empty() {
+            usage.refreshing = false;
             return;
         }
-        let scan: Vec<(SharedString, Value)> =
-            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
-        // A refresh re-prices the selected environments; every one is read so a pick shows at once.
-        let rated: Vec<crate::rpc::RpcClient> = machines
-            .iter()
-            .filter(|(id, ..)| refresh_rates && self.usage.is_selected(id))
-            .map(|(_, client, _)| client.clone())
-            .collect();
-        let usage = &mut self.usage;
-        usage.scan_settings = scan;
         usage.generation += 1;
         let generation = usage.generation;
-        usage.loading = true;
-        cx.spawn(async move |this, cx| {
-            let refreshes = rated.iter().map(|client| client.request("server.refreshUsageRates", json!({})));
-            futures::future::join_all(refreshes).await;
-            let mut machines = machines;
-            for attempt in 0..2 {
-                let reads = machines.iter().map(|(id, client, input)| {
-                    let input = input.clone();
-                    async move { (id.clone(), client.request("server.getUsageSummary", input).await) }
-                });
-                let results = futures::future::join_all(reads).await;
-                let mut again = false;
-                let applied = this.update(cx, |this, cx| {
-                    let usage = &mut this.usage;
-                    if usage.generation != generation {
+        usage.pending = machines.iter().map(|(id, ..)| id.clone()).collect();
+        for (id, client, mut input) in machines {
+            // A refresh re-prices the selected environments; every one is read so a pick shows at once.
+            let reprice = refresh_rates && self.usage.is_selected(&id);
+            let window = window.clone();
+            // Each environment's answer shows when it lands, not when the slowest one does.
+            cx.spawn(async move |this, cx| {
+                if reprice {
+                    let _ = client.request("server.refreshUsageRates", json!({})).await;
+                }
+                for attempt in 0..2 {
+                    let result = client.request("server.getUsageSummary", input.clone()).await;
+                    let mut again = false;
+                    let applied = this.update(cx, |this, cx| {
+                        if this.usage.generation == generation {
+                            again = this.usage.publish(&id, result, &window, attempt == 0);
+                            cx.notify();
+                        }
+                    });
+                    if applied.is_err() || !again {
                         return;
                     }
-                    // A machine that fails to answer leaves the others' usage showing.
-                    let mut answers = Vec::new();
-                    usage.failures.clear();
-                    for (environment_id, result) in results {
-                        let failure = match result.map(serde_json::from_value::<Summary>) {
-                            Ok(Ok(summary)) => {
-                                answers.push(logic::EnvironmentUsage { environment_id, summary });
-                                continue;
-                            }
-                            Ok(Err(error)) => format!("Unreadable usage summary: {error}"),
-                            Err(error) => usage_error(&error),
-                        };
-                        usage.failures.push((environment_id.into(), failure));
-                    }
-                    again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
-                    if !answers.is_empty() {
-                        usage.answered_at = Some(now_ms());
-                        usage.answers = Some((answers, window.clone()));
-                    }
-                    usage.recombine();
-                    this.usage.loading = again;
-                    if !again {
-                        this.usage.refreshing = false;
-                    }
-                    cx.notify();
-                });
-                if applied.is_err() || !again {
-                    return;
-                }
-                for (_, _, input) in &mut machines {
                     input["awaitRefresh"] = json!(true);
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
     /// Re-probes provider limits (`refreshUsageLimits`): automatic refreshes wait five minutes
     /// between probes.
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
-        let mut machines = self.usage_machines();
-        machines.retain(|(id, ..)| self.usage.is_selected(id));
-        if machines.is_empty() {
-            return;
-        }
         let now = now_ms();
-        if automatic && self.usage.limits_refreshed_at.is_some_and(|at| now - at < LIMITS_AUTO_REFRESH_MS) {
-            return;
-        }
-        self.usage.limits_refreshed_at = Some(now);
+        let usage = &self.usage;
+        let mut machines = self.usage_machines();
+        machines.retain(|(id, ..)| usage.is_selected(id) && usage.limits_due(id, automatic, now));
+        let usage = &mut self.usage;
         if !automatic {
-            self.usage.refreshing = true;
+            // A probe already out counts as this refresh, as the web awaits it.
+            usage.refreshing = !machines.is_empty() || usage.limits_pending.iter().any(|id| usage.is_selected(id));
         }
-        cx.spawn(async move |this, cx| {
-            let probes = machines.iter().map(|(id, client, _)| async move {
-                (id, client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await)
-            });
-            let results = futures::future::join_all(probes).await;
-            let _ = this.update(cx, |this, cx| {
-                // Each answer lands on the environment that gave it, if it is still here.
-                for (id, result) in results {
-                    let (Ok(payload), Some(info)) = (result, this.env_info_mut(id)) else { continue };
-                    let event = json!({"type": "providerStatuses", "payload": payload});
-                    if let Err(error) = info.apply(&event) {
-                        log::warn!("refreshed providers did not decode: {error}");
+        for (id, client, _) in machines {
+            usage.limits_pending.push(id.clone());
+            cx.spawn(async move |this, cx| {
+                let result =
+                    client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await;
+                let _ = this.update(cx, |this, cx| {
+                    // The answer lands on the environment that gave it, if it is still here.
+                    if let (Ok(payload), Some(info)) = (result, this.env_info_mut(&id)) {
+                        let event = json!({"type": "providerStatuses", "payload": payload});
+                        if let Err(error) = info.apply(&event) {
+                            log::warn!("refreshed providers did not decode: {error}");
+                        }
                     }
-                }
-                this.usage.limits_now = now_ms();
-                this.usage.limits_refreshed_at = Some(now_ms());
-                this.usage.refreshing = false;
-                cx.notify();
-            });
-        })
-        .detach();
+                    this.usage.limits_probed(&id, now_ms());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -825,9 +880,9 @@ impl Workspace {
                     "Unavailable"
                 } else if answer.is_some_and(|answer| !answer.summary.compatible()) {
                     "Update required"
-                } else if usage.loading && answer.is_none() {
+                } else if usage.pending.contains(id) && answer.is_none() {
                     "Scanning…"
-                } else if usage.loading {
+                } else if usage.pending.contains(id) {
                     "Refreshing…"
                 } else {
                     "Ready"
@@ -1015,10 +1070,10 @@ impl Workspace {
         if limits {
             return self.render_limits(t, viewport, cx);
         }
-        // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
+        // Saved prices or aliases, or a connection that came or went, reprice the scan
+        // (`refreshTrigger`), even after a failure; a stale answer waits for a reopen.
         // So does a pick of environments the last read missed.
-        let unread = usage.summary.is_none() && usage.answers.is_some() && usage.error().is_none();
-        if !usage.loading && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
+        if usage.needs_reread(self.usage_scan_settings_changed()) {
             let view = cx.entity();
             cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
         }
@@ -1169,7 +1224,7 @@ impl Workspace {
         let usage = &self.usage;
         let merged = usage.merged.clone();
         let tokens = usage.tokens();
-        let dim = |el: gpui_kit::Div| if usage.loading || usage.refreshing { el.opacity(0.4) } else { el };
+        let dim = |el: gpui_kit::Div| if usage.loading() || usage.refreshing { el.opacity(0.4) } else { el };
         let providers = logic::active_providers(&merged);
         let hourly = window.hours.is_some();
         let messages = summary.source_messages(&usage.hidden);
@@ -2202,9 +2257,14 @@ fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Se
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!("{}%", window.remaining_percent)),
                             )
-                            .child(div().text_sm().text_color(t.muted_foreground).child("left"))
-                            .children(
-                                window.pace.map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                            // One baseline item, as the web's `inline-flex items-center` span: the
+                            // pace icon centers on "left" instead of hanging below the line.
+                            .child(
+                                h_flex().gap(px(8.)).text_sm().text_color(t.muted_foreground).child("left").children(
+                                    window
+                                        .pace
+                                        .map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                                ),
                             ),
                     )
                     .when_some(window.next_refill.filter(|_| several), |el, refill| {
@@ -2291,6 +2351,11 @@ fn pool_segment(
     let name = account_name(account);
     let open = segments.card.open.as_deref() == Some(key.as_str());
     let fill = Hsla { a: color.a * 0.35, ..color };
+    // What the next reset gives back, hatched at the bar's spent end.
+    #[expect(clippy::cast_possible_truncation, reason = "a percentage")]
+    let refill = (100. - f64::from(remaining)).min(member.refill_percent) as f32;
+    let hatched = (remaining < 100 && logic::reset_ms(&member.window).is_some() && refill > 0.)
+        .then(|| hatch(Hsla { a: color.a * 0.2, ..color }, refill / 100.));
     let ring = t.ring;
     let view = segments.view.clone();
     let mut segment = div()
@@ -2308,6 +2373,7 @@ fn pool_segment(
         .child(
             div().absolute().top_0().bottom_0().left_0().w(relative(remaining as f32 / 100.)).rounded(px(6.)).bg(fill),
         )
+        .children(hatched)
         .children(time_left.map(|left| {
             div()
                 .absolute()
@@ -2516,6 +2582,31 @@ fn legend_row(
             });
         })
         .into_any_element()
+}
+
+/// `repeating-linear-gradient(135deg, color 0 1px, transparent 1px 5px)` over the right
+/// `width` of a bar.
+fn hatch(color: Hsla, width: f32) -> impl IntoElement {
+    const PERIOD: f32 = 5. * std::f32::consts::SQRT_2;
+    div().absolute().top_0().bottom_0().right_0().w(relative(width)).overflow_hidden().child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let mut offset = 0.;
+                while offset < width + height {
+                    let mut line = PathBuilder::stroke(px(1.));
+                    line.move_to(bounds.origin + point(px(offset), px(0.)));
+                    line.line_to(bounds.origin + point(px(offset - height), px(height)));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, color);
+                    }
+                    offset += PERIOD;
+                }
+            },
+        )
+        .size_full(),
+    )
 }
 
 /// `SegmentPopover`: the account, its plan and where it is signed in, the window, and its reset credits.
@@ -2730,7 +2821,11 @@ mod tests {
     }
 
     fn summary(cost: f64, host: &str) -> Summary {
-        serde_json::from_value(json!({
+        serde_json::from_value(summary_json(cost, host)).unwrap()
+    }
+
+    fn summary_json(cost: f64, host: &str) -> Value {
+        json!({
             "contractVersion": 6, "readAt": "2026-11-01T00:00:00Z",
             "buckets": [{
                 "day": "2026-11-01", "provider": "codex", "model": "m", "sourcePath": "/codex",
@@ -2738,8 +2833,7 @@ mod tests {
                 "costUsd": cost, "cacheSavingsUsd": 0, "costSource": "modelPriced", "records": 1, "unpricedRecords": 0, "sessions": 1,
             }],
             "sources": [{"fingerprint": {"provider": "codex", "resolvedHomePath": "/codex", "hostId": host}, "status": "ok"}],
-        }))
-        .unwrap()
+        })
     }
 
     #[test]
@@ -2764,5 +2858,55 @@ mod tests {
         usage.selected = Some(Vec::new());
         usage.recombine();
         assert!(usage.summary.is_none());
+    }
+
+    #[test]
+    fn each_environment_shows_as_soon_as_it_answers() {
+        let (a, b): (SharedString, SharedString) = ("a".into(), "b".into());
+        let month = local_window(30);
+        let mut usage = UsageState {
+            selected: Some(vec![a.clone()]),
+            pending: vec![a.clone(), b.clone()],
+            ..UsageState::default()
+        };
+        assert!(usage.loading());
+        assert!(!usage.publish(&a, Ok(summary_json(1., "box-a")), &month, true));
+        assert_eq!(usage.merged.cost_usd, 1., "a shows while b is still reading");
+        assert!(!usage.loading(), "only the picked environments' reads count");
+        usage.selected = None;
+        assert!(usage.loading());
+        usage.publish(&b, Err(crate::rpc::RpcError::Disconnected("gone".into())), &month, true);
+        assert_eq!((usage.loading(), usage.merged.cost_usd), (false, 1.), "b's failure leaves a showing");
+        assert!(usage.error().is_some());
+        usage.publish(&b, Ok(summary_json(2., "box-b")), &month, true);
+        assert_eq!((usage.error(), usage.merged.cost_usd), (None, 3.));
+        let mut refreshing = summary_json(4., "box-a");
+        refreshing["sources"][0]["refreshing"] = json!(true);
+        assert!(usage.publish(&a, Ok(refreshing), &local_window(7), true), "slow sources are asked again");
+        assert_eq!(usage.merged.cost_usd, 4., "the first answer for a new period replaces the kept ones");
+    }
+
+    #[test]
+    fn limits_cool_down_per_environment() {
+        let (a, b): (SharedString, SharedString) = ("a".into(), "b".into());
+        let mut usage = UsageState { limits_pending: vec![a.clone()], ..UsageState::default() };
+        assert!(!usage.limits_due(&a, false, 0), "a probe still out is not repeated");
+        usage.limits_probed(&a, 0);
+        assert!(!usage.limits_due(&a, true, 1));
+        assert!(usage.limits_due(&b, true, 1), "probing a leaves b due");
+        assert!(usage.limits_due(&a, false, 1), "the refresh button always probes");
+        assert!(usage.limits_due(&a, true, LIMITS_AUTO_REFRESH_MS));
+    }
+
+    #[test]
+    fn a_failed_read_runs_again_once_its_connection_changes() {
+        let usage = UsageState { failures: vec![("a".into(), "down".into())], ..UsageState::default() };
+        assert!(!usage.needs_reread(false));
+        assert!(usage.needs_reread(true), "a reconnect reads again though nothing answered");
+        let client = crate::rpc::RpcClient::unopened();
+        let socket = client.socket_id();
+        assert!(socket == client.socket_id(), "every clone names the one socket");
+        drop(client);
+        assert!(socket != crate::rpc::RpcClient::unopened().socket_id(), "a new socket differs");
     }
 }
