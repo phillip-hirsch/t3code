@@ -407,10 +407,8 @@ impl Workspace {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
             return Vec::new();
         };
-        let messages =
-            projection.visible_turn_items.iter().map(|row| &row.item).filter(|item| {
-                item.item_type == "user_message" && item.raw.get("attribution").is_none_or(Value::is_null)
-            });
+        let messages = (projection.visible_turn_items.iter().map(|row| &row.item))
+            .filter(|item| item.item_type == "user_message" && crate::queue::sent_by_user(item));
         composer_text::history_entries(messages.filter_map(|item| item.str("text")))
     }
 

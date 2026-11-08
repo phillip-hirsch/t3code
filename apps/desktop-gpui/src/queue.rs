@@ -156,6 +156,23 @@ pub fn sent_by_agent(item: &TurnItem) -> bool {
         && !item.str("text").is_some_and(|text| text.starts_with("[Triggered by schedule task: "))
 }
 
+/// `resolveUserMessagePresentation`'s `null` attribution: the user typed it, not a guest, an
+/// automation (or its legacy prefixed message), another agent or T3 Code itself.
+pub fn sent_by_user(item: &TurnItem) -> bool {
+    let legacy_automation = item.str("text").is_some_and(|text| text.starts_with("[Triggered by schedule task: "))
+        && item.str("messageId").is_some_and(|id| {
+            id.strip_prefix("scheduled-task-message:")
+                .and_then(|rest| rest.rsplit_once(':'))
+                .and_then(|(rest, trigger)| (trigger == "scheduled" || trigger == "manual").then_some(rest))
+                .and_then(|rest| rest.rsplit_once(':'))
+                .is_some_and(|(task, n)| !task.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        });
+    item.raw.get("scheduledTaskId").is_none_or(Value::is_null)
+        && item.raw.pointer("/context/guest").is_none_or(Value::is_null)
+        && item.str("createdBy") != Some("agent")
+        && !legacy_automation
+}
+
 /// `isCompactionCommandMessage`.
 fn is_compaction_command(item: &TurnItem) -> bool {
     let attachments = item.raw.get("attachments").and_then(Value::as_array).map_or(0, Vec::len);
@@ -271,6 +288,26 @@ mod tests {
         let fresh = derive(&projection(fresh_runs, compacting, session(false)), false);
         assert!(fresh.can_send(&fresh.queued[0]), "but it may skip a compaction");
         assert_eq!(state.send_tooltip(), "Skip compaction and send this message");
+    }
+
+    #[test]
+    fn only_messages_the_user_typed_count_as_theirs() {
+        let item = |patch: Value| {
+            let mut raw = message("m", "hi");
+            raw.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            serde_json::from_value::<TurnItem>(raw).unwrap()
+        };
+        assert!(sent_by_user(&item(json!({"createdBy": "user", "creationSource": "web"}))));
+        assert!(sent_by_user(&item(json!({"scheduledTaskId": null}))));
+        assert!(!sent_by_user(&item(json!({"context": {"guest": {"name": "Ada", "text": "hi"}}}))));
+        assert!(!sent_by_user(&item(json!({"scheduledTaskId": "task-1"}))));
+        assert!(!sent_by_user(&item(json!({"createdBy": "agent", "creationSource": "server"}))));
+        assert!(!sent_by_user(&item(json!({"createdBy": "agent", "creationSource": "provider"}))));
+        let legacy = "[Triggered by schedule task: Daily]
+
+run it";
+        assert!(!sent_by_user(&item(json!({"text": legacy, "messageId": "scheduled-task-message:t1:3:manual"}))));
+        assert!(sent_by_user(&item(json!({"text": legacy, "messageId": "m"}))));
     }
 
     #[test]
