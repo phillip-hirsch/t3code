@@ -16,13 +16,17 @@ use serde_json::json;
 
 use super::provider_update::dedupe_by_driver;
 use crate::app::Workspace;
-use crate::model::Provider;
+use crate::model::{Provider, ServerInfo};
 use crate::rpc::RpcClient;
 use crate::usage::provider_display_name;
+
+/// The grant a provider update needs on its machine.
+const PROVIDERS_MANAGE: &str = "providers:manage";
 
 /// One machine's share of the run: its name, its socket, and `(driver, instanceId)` per provider.
 #[derive(Clone)]
 pub(super) struct MachineUpdate {
+    pub(super) environment_id: SharedString,
     pub(super) label: String,
     pub(super) client: RpcClient,
     pub(super) candidates: Vec<(String, String)>,
@@ -34,6 +38,21 @@ fn candidates(providers: &[Provider]) -> Vec<(String, String)> {
         .into_iter()
         .map(|p| (p.driver.clone(), p.instance_id.clone()))
         .collect()
+}
+
+/// A connected machine's share, when this client may manage its providers (`useProviderUpdates`
+/// skips the others) and one of them can update.
+fn machine_update(
+    environment_id: Option<&SharedString>,
+    manages: bool,
+    client: Option<&RpcClient>,
+    info: &ServerInfo,
+) -> Option<MachineUpdate> {
+    let environment_id = environment_id.filter(|_| manages)?.clone();
+    let client = client?.clone();
+    let candidates = candidates(&info.providers);
+    let label = info.environment_label.clone().unwrap_or_else(|| "Server".into());
+    (!candidates.is_empty()).then_some(MachineUpdate { environment_id, label, client, candidates })
 }
 
 /// `countLabel`: "1 provider", "2 providers".
@@ -52,15 +71,13 @@ fn describe(machines: &[(String, Vec<String>)]) -> (String, String, String) {
 }
 
 impl Workspace {
-    /// Connected machines with a provider to update, the primary first.
+    /// Connected machines this client manages with a provider to update, the primary first.
     pub(super) fn provider_update_plan(&self) -> Vec<MachineUpdate> {
         self.sessions()
             .iter()
             .filter_map(|session| {
-                let client = session.client.clone()?;
-                let candidates = candidates(&session.server_info.providers);
-                let label = session.server_info.environment_label.clone().unwrap_or_else(|| "Server".into());
-                (!candidates.is_empty()).then_some(MachineUpdate { label, client, candidates })
+                let manages = session.id.as_ref().is_some_and(|id| self.env_grants(id, PROVIDERS_MANAGE));
+                machine_update(session.id.as_ref(), manages, session.client.as_ref(), &session.server_info)
             })
             .collect()
     }
@@ -166,10 +183,12 @@ impl Workspace {
         });
     }
 
-    /// `updateAll`: every machine's providers at once; a failure leaves the others updating.
+    /// `updateAll`: every machine's providers at once; a failure leaves the others updating. A
+    /// machine whose grant was revoked while the dialog was open is skipped.
     fn run_provider_updates(&mut self, plan: Vec<MachineUpdate>, cx: &mut Context<Self>) {
         let requests: Vec<_> = plan
             .into_iter()
+            .filter(|machine| self.env_grants(&machine.environment_id, PROVIDERS_MANAGE))
             .flat_map(|machine| {
                 machine.candidates.into_iter().map(move |(driver, instance_id)| {
                     let client = machine.client.clone();
@@ -205,4 +224,26 @@ fn named(plan: &[MachineUpdate]) -> Vec<(String, Vec<String>)> {
             (machine.label.clone(), providers.collect())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_machines_this_client_manages_join_the_update() {
+        let behind = json!({
+            "instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready",
+            "version": "1.2.0", "checkedAt": "2026-11-05T10:00:00.000Z",
+            "versionAdvisory": {"status": "behind_latest", "latestVersion": "2.0.0", "canUpdate": true},
+        });
+        let mut info = ServerInfo::default();
+        info.providers = vec![serde_json::from_value(behind).unwrap()];
+        let (id, client) = (SharedString::from("mac"), RpcClient::unopened());
+        let plan = machine_update(Some(&id), true, Some(&client), &info).expect("a managed machine updates");
+        assert_eq!(plan.candidates, [("codex".to_owned(), "codex".to_owned())]);
+        assert!(machine_update(Some(&id), false, Some(&client), &info).is_none(), "read-only machines are left out");
+        assert!(machine_update(None, true, Some(&client), &info).is_none());
+        assert!(machine_update(Some(&id), true, None, &info).is_none(), "a disconnected machine waits");
+    }
 }
