@@ -48,15 +48,22 @@ pub(in crate::app) fn confirm(
             let _ = sender.send(confirmed);
         }
     };
+    // `AlertDialogPopup` focuses its first tabbable control, Cancel, and Enter presses
+    // whichever button has focus, so a stray Enter never confirms a destructive action.
+    let cancel_focus = cx.focus_handle();
+    let ok_focus = cx.focus_handle();
+    let focus = cancel_focus.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let t = theme::tokens(cx);
         let ok = send.clone();
-        let action = Button::new("confirm-dialog-ok").label("Confirm").on_click(move |_, window, cx| {
-            ok(true);
-            window.close_dialog(cx);
-        });
+        let action =
+            Button::new("confirm-dialog-ok").label("Confirm").track_focus(&ok_focus).on_click(move |_, window, cx| {
+                ok(true);
+                window.close_dialog(cx);
+            });
         let action = if destructive { action.danger() } else { action.primary() };
         let enter = send.clone();
+        let (enter_ok, enter_cancel) = (ok_focus.clone(), cancel_focus.clone());
         // `AlertDialogPopup`: centred, `max-w-lg`, `dialog-glass` (`rounded-2xl`, a white/8% edge
         // in dark mode); the header and the footer bring their own padding.
         dialog
@@ -68,6 +75,7 @@ pub(in crate::app) fn confirm(
             .rounded(px(16.))
             .border_color(if t.dark { white().opacity(0.08) } else { t.foreground.opacity(0.1) })
             .close_button(false)
+            .overlay_closable(false)
             .child(
                 v_flex()
                     .gap(px(8.))
@@ -97,15 +105,20 @@ pub(in crate::app) fn confirm(
                         Button::new("confirm-dialog-cancel")
                             .label("Cancel")
                             .outline()
+                            .track_focus(&cancel_focus)
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(action),
             )
-            .on_ok(move |_, _, _| {
-                enter(true);
-                true
+            .on_ok(move |_, window, _| {
+                if enter_ok.is_focused(window) {
+                    enter(true);
+                    return true;
+                }
+                enter_cancel.is_focused(window)
             })
     });
+    focus.focus(window, cx);
     receiver
 }
 
