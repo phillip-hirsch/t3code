@@ -318,6 +318,8 @@ pub(super) struct RightPanel {
     loaded: Option<DiffKey>,
     load: DiffLoad,
     _task: Option<Task<()>>,
+    /// The branch's commits for the scope menu, read beside the diff (`branchCommitsQuery`).
+    _commits_task: Option<Task<()>>,
     /// The wrap and whitespace toggles; unset, they follow `wordWrap` and `diffIgnoreWhitespace`.
     wrap: Option<bool>,
     ignore_whitespace: Option<bool>,
@@ -382,6 +384,7 @@ impl RightPanel {
             loaded: None,
             load: DiffLoad::Idle,
             _task: None,
+            _commits_task: None,
             wrap: None,
             ignore_whitespace: None,
             diff_mount: None,
@@ -1036,13 +1039,20 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.clone().filter(|_| source_kind.is_some()).map(|cwd| {
+        if let Some(cwd) = cwd.clone() {
             let mut input = json!({"cwd": cwd});
             if let Some(base) = remembered_base.clone() {
                 input["baseRef"] = base.into();
             }
-            input
-        });
+            let client = client.clone();
+            self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
+                let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+                let _ = this.update(cx, |this, cx| {
+                    this.right_panel.commits = parse_commits(&reply);
+                    cx.notify();
+                });
+            }));
+        }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
             _ => None,
@@ -1053,10 +1063,6 @@ impl Workspace {
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
             let (method, input) = request;
             let result = client.request(method, input).await;
-            let commits = match commits_request {
-                Some(input) => client.request("review.getBranchCommits", input).await.ok(),
-                None => None,
-            };
             let parsed =
                 cx.background_executor()
                     .spawn(async move {
@@ -1068,16 +1074,6 @@ impl Workspace {
                 _ => (Vec::new(), None),
             };
             let shown = this.update(cx, |this, cx| {
-                if let Some(commits) = commits {
-                    this.right_panel.commits = commits["commits"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|c| {
-                            Some(Commit { sha: c["sha"].as_str()?.into(), subject: c["subject"].as_str()?.into() })
-                        })
-                        .collect();
-                }
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
@@ -2592,6 +2588,16 @@ struct ParsedDiff {
     head: Option<String>,
     base: Option<String>,
     truncated: bool,
+}
+
+/// `review.getBranchCommits`' commits, newest first as the server lists them.
+fn parse_commits(reply: &Value) -> Vec<Commit> {
+    reply["commits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some(Commit { sha: c["sha"].as_str()?.into(), subject: c["subject"].as_str()?.into() }))
+        .collect()
 }
 
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
