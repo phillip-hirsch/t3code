@@ -1088,15 +1088,12 @@ impl Workspace {
                             });
                         });
                     })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .justify_end()
-                            .gap(px(2.))
-                            .child(self.render_model_picker(t, cx))
-                            .children(mode_block),
-                    )
+                    .child(h_flex().flex_1().min_w_0().justify_end().gap(px(2.)).map(|el| {
+                        match self.render_provider_unavailable(t, cx) {
+                            Some(unavailable) => el.child(unavailable),
+                            None => el.child(self.render_model_picker(t, cx)).children(mode_block),
+                        }
+                    }))
                     .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
             )

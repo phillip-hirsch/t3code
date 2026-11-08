@@ -68,6 +68,8 @@ pub struct ProviderModel {
     pub badge: Option<String>,
     #[serde(default)]
     pub is_legacy: bool,
+    #[serde(default)]
+    pub is_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -363,9 +363,22 @@ impl Workspace {
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
         };
-        let models =
-            |p: &'a Provider| p.models.iter().filter(move |m| !Self::model_hidden(info, p, m)).map(move |m| (p, m));
-        let providers = info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
+        // `shouldIncludeModelPickerOption`: an OpenCode or Antigravity provider that is not ready
+        // still lists the model the thread is on when that model became unavailable.
+        let kept_unavailable = move |p: &Provider, m: &ProviderModel| {
+            p.enabled
+                && matches!(p.driver.as_str(), "opencode" | "antigravity")
+                && current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug)
+                && m.is_unavailable
+        };
+        let models = move |p: &'a Provider| {
+            let ready = ready(&p);
+            p.models
+                .iter()
+                .filter(move |m| !Self::model_hidden(info, p, m) && (ready || kept_unavailable(p, m)))
+                .map(move |m| (p, m))
+        };
+        let providers = info.providers.iter().filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -574,6 +587,99 @@ impl Workspace {
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
 
+    /// `showProviderUnavailable`: no provider the composer may use is enabled and available, so
+    /// the controls give way to provider setup, or say there is none.
+    pub(super) fn render_provider_unavailable(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // `providerCatalogPending`: until the server's config arrives, the picker stays.
+        if self.client().is_none() || self.server_info().config.is_null() {
+            return None;
+        }
+        let lock = self.composer_provider_lock();
+        let requested = self.composer_model().map(|s| s.instance_id);
+        let allowed = |p: &&Provider| lock.as_ref().is_none_or(|lock| lock.allows(p));
+        let providers = &self.server_info().providers;
+        let usable = providers.iter().filter(allowed).any(|p| {
+            p.enabled
+                && p.availability.as_deref() != Some("unavailable")
+                && (p.status != "error" || requested.as_ref() == Some(&p.instance_id))
+        });
+        if usable {
+            return None;
+        }
+        // `providerSetupInstanceId`: the provider asked for, else the first with a setup.
+        let setup = requested.is_some() || (lock.is_none() && providers.iter().any(super::banners::has_setup));
+        let label = if setup { "Open provider settings" } else { "No provider available" };
+        Some(
+            control_button("provider-unavailable", t)
+                .flex_none()
+                .disabled(!setup)
+                .child(h_flex().gap(px(6.)).child(Icon::new(Lucide::CircleAlert).with_size(px(16.))).child(label))
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings("providers", cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// `providerSetupEntries` (`ModelPickerProviderNotices`): providers needing setup that the open
+    /// tab names, or every one when an empty favorites list would show nothing.
+    fn picker_setup_entries(&self, tab: &Tab, rows_empty: bool) -> Vec<&Provider> {
+        if self.picker.host.is_some() || !self.picker.query.is_empty() {
+            return Vec::new();
+        }
+        let Some(info) = self.picker_info() else { return Vec::new() };
+        info.providers
+            .iter()
+            .filter(|p| self.picker_includes(p) && offers_setup(p))
+            .filter(|p| match tab {
+                Tab::Provider(id) => &p.instance_id == id,
+                Tab::Favorites => rows_empty,
+            })
+            .collect()
+    }
+
+    fn render_setup_notices(&self, entries: &[&Provider], t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let several = entries.len() > 1;
+        v_flex()
+            .id("picker-setup")
+            .flex_none()
+            .max_h(px(176.))
+            .overflow_y_scroll()
+            .p(px(8.))
+            .border_t_1()
+            .border_color(t.border.opacity(0.7))
+            .children(entries.iter().map(|provider| {
+                let label = if several {
+                    let name = provider.display_name.clone().unwrap_or_else(|| provider.instance_id.clone());
+                    format!("Set up {name}")
+                } else {
+                    "Open provider setup".to_owned()
+                };
+                v_flex()
+                    .px(px(4.))
+                    .py(px(6.))
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(t.muted_foreground)
+                            .line_clamp(3)
+                            .child(super::banners::provider_status_message(provider)),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("picker-setup-{}", provider.instance_id).into()))
+                            .mt(px(4.))
+                            .cursor_pointer()
+                            .text_color(t.foreground)
+                            .hover(gpui_kit::Styled::underline)
+                            .child(label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_model_picker(window, cx);
+                                this.open_settings("providers", cx);
+                            })),
+                    )
+            }))
+            .into_any_element()
+    }
+
     /// A picker without the effort column (`ProviderModelPicker` with no `effortColumn`) on `trigger`.
     pub(in crate::app) fn undocked_model_picker(
         &self,
@@ -635,6 +741,7 @@ impl Workspace {
         let searching = !self.picker.query.is_empty();
         let (rows, has_legacy) = self.picker_rows(current);
         let tab = self.picker_tab(current);
+        let setup = self.picker_setup_entries(&tab, rows.is_empty());
         let search = self.picker.search.clone();
         let list = v_flex()
             .id("picker-list")
@@ -647,7 +754,7 @@ impl Workspace {
             .pr(px(12.))
             .py(px(10.))
             .gap(px(2.))
-            .when(rows.is_empty(), |el| {
+            .when(rows.is_empty() && setup.is_empty(), |el| {
                 let text = if tab == Tab::Favorites && !searching { "No favorites yet" } else { "No models found" };
                 el.child(div().p(px(8.)).flex().justify_center().text_sm().text_color(t.muted_foreground).child(text))
             })
@@ -708,6 +815,7 @@ impl Workspace {
             .when(!searching, |el| el.border_l_1().border_color(rule))
             .child(search_row)
             .child(list)
+            .when(!setup.is_empty(), |el| el.child(self.render_setup_notices(&setup, t, cx)))
             .children(list_footer);
         v_flex()
             .id("model-picker-body")
@@ -788,6 +896,8 @@ impl Workspace {
         let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
         let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
+            // A provider needing setup opens its tab, which offers the setup.
+            let selectable = ready || (self.picker.host.is_none() && offers_setup(p));
             let name = p.display_name.clone().unwrap_or_else(|| p.instance_id.clone());
             let tooltip: SharedString = match (ready, p.availability.as_deref(), &p.message) {
                 (true, ..) => name.clone().into(),
@@ -805,10 +915,10 @@ impl Workspace {
                     div().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).child(initials(&name)).into_any_element()
                 }
             };
-            button(ElementId::Name(format!("rail-{id}").into()), *tab == Tab::Provider(id.clone()), ready)
+            button(ElementId::Name(format!("rail-{id}").into()), *tab == Tab::Provider(id.clone()), selectable)
                 .child(div().size(px(24.)).flex().items_center().justify_center().child(icon))
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .when(ready, |el| {
+                .when(selectable, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         this.picker.tab = Some(Tab::Provider(id.clone()));
                         this.picker.highlighted = None;
@@ -1286,6 +1396,20 @@ fn fast_bolt(ultra: bool) -> AnyElement {
         .into_any_element()
 }
 
+/// `shouldOfferModelPickerSetup`: an enabled provider with a setup that is not ready, not
+/// installed, signed out, or has no model to run.
+fn offers_setup(provider: &Provider) -> bool {
+    let ready =
+        provider.enabled && provider.availability.as_deref() != Some("unavailable") && provider.status == "ready";
+    provider.enabled
+        && provider.status != "disabled"
+        && super::banners::has_setup(provider)
+        && (!ready
+            || !provider.installed
+            || provider.auth.status == "unauthenticated"
+            || provider.models.iter().all(|m| m.is_unavailable))
+}
+
 fn option_row(id: ElementId, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     h_flex()
         .id(id)
@@ -1381,6 +1505,24 @@ mod tests {
         assert_eq!(ProviderLock::of(&projection(true), &providers), None, "a handoff may switch providers");
         let fresh: ThreadProjection = serde_json::from_value(json!({"thread": {"id": "t", "title": "t"}})).unwrap();
         assert_eq!(ProviderLock::of(&fresh, &providers), None, "an unstarted thread picks freely");
+    }
+
+    #[test]
+    fn a_provider_with_setup_offers_it_until_it_can_run() {
+        let provider = |extra: Value| -> Provider {
+            let mut value = json!({"instanceId": "c", "driver": "codex", "enabled": true, "status": "ready",
+                "installed": true, "auth": {"status": "authenticated"}, "models": [{"slug": "m"}],
+                "setup": {"canAuthenticate": true, "canInstall": true}});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        assert!(!offers_setup(&provider(json!({}))), "a ready provider needs nothing");
+        assert!(offers_setup(&provider(json!({"installed": false}))));
+        assert!(offers_setup(&provider(json!({"auth": {"status": "unauthenticated"}}))));
+        assert!(offers_setup(&provider(json!({"status": "error"}))));
+        assert!(offers_setup(&provider(json!({"models": [{"slug": "m", "isUnavailable": true}]}))));
+        assert!(!offers_setup(&provider(json!({"status": "error", "setup": null}))), "nothing to set up");
+        assert!(!offers_setup(&provider(json!({"enabled": false, "status": "error"}))));
     }
 
     #[test]
