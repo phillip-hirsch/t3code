@@ -238,7 +238,7 @@ impl Workspace {
                 if held {
                     return true;
                 }
-                return self.open_favorite_editor(cx);
+                return self.open_favorite_editor(window, cx);
             }
             "appearance.cycle" => {
                 if !held {

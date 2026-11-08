@@ -12,8 +12,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
+use super::FileKey;
 use crate::app::Workspace;
 use crate::app::details::{editor_icon, editor_label};
+use crate::app::right_panel::Surface;
 use crate::theme::Tokens;
 
 /// What the file manager does with a file (`revealFileManager`).
@@ -25,6 +27,35 @@ pub(super) enum FileManager {
 }
 
 impl Workspace {
+    /// The Open in button: the file in the preferred editor. Returns whether there was one.
+    fn open_file_in_preferred_editor(
+        &mut self,
+        absolute: String,
+        file_manager: FileManager,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.preferred_editor_id() else { return false };
+        let title = format!("Could not open in {}", editor_label(&editor));
+        let reveal = file_manager == FileManager::Reveal && editor == "file-manager";
+        self.preferred_editor = Some(editor.clone());
+        self.open_path_in_editor(absolute, editor, reveal, title, window, cx);
+        true
+    }
+
+    /// `editor.openFavorite` while a file tab shows: it presses that tab's Open in button
+    /// (`registerOpenFavoriteEditorCommand`). `None` when no file tab shows.
+    pub(in crate::app) fn open_favorite_in_file_surface(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let Some(Surface::File(path)) = self.active_surface().cloned() else { return None };
+        let checkout = self.project_target()?.checkout;
+        let (absolute, file_manager) = self.file_open_in_target(&FileKey { checkout, path });
+        Some(self.open_file_in_preferred_editor(absolute, file_manager, window, cx))
+    }
+
     pub(super) fn render_file_open_in(
         &self,
         absolute: String,
@@ -87,11 +118,7 @@ impl Workspace {
             })
             .tooltip(|window, cx| Tooltip::new("Open file in preferred editor").build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
-                let Some(editor) = this.preferred_editor_id() else { return };
-                let title = format!("Could not open in {}", editor_label(&editor));
-                let reveal = file_manager == FileManager::Reveal && editor == "file-manager";
-                this.preferred_editor = Some(editor.clone());
-                this.open_path_in_editor(absolute.clone(), editor, reveal, title, window, cx);
+                this.open_file_in_preferred_editor(absolute.clone(), file_manager, window, cx);
             }));
         h_flex()
             .flex_none()
