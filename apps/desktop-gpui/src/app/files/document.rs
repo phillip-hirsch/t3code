@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{Sizable as _, WindowExt as _, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
@@ -17,14 +19,20 @@ use serde_json::{Value, json};
 
 use super::FileKey;
 use super::logic::{self, FileKind};
+use super::media::MediaKind;
 use crate::app::{Target, Workspace};
 
 /// Document views kept alive while not drawn, so switching tabs back keeps the page.
 const KEPT_VIEWS: usize = 2;
 
 struct DocView {
+    kind: FileKind,
     view: Option<Entity<WebView>>,
     failed: Option<String>,
+    /// The URL the page loaded, for a failed video's "Open in browser".
+    url: Option<String>,
+    /// Drawn last frame: a media file that stops drawing pauses, as the web's unmount does.
+    drawn: bool,
     /// The workspace mutation and `fileRevision` the page loaded.
     mutation: (Option<String>, Option<String>),
     revision: Option<String>,
@@ -34,7 +42,73 @@ struct DocView {
     used: u64,
     _task: Option<Task<()>>,
     _links: Option<Task<()>>,
+    _media: Option<Task<()>>,
 }
+
+impl DocView {
+    fn new(kind: FileKind, mutation: (Option<String>, Option<String>), content: u64) -> Self {
+        Self {
+            kind,
+            view: None,
+            failed: None,
+            url: None,
+            drawn: false,
+            mutation,
+            revision: None,
+            content,
+            shown: false,
+            used: 0,
+            _task: None,
+            _links: None,
+            _media: None,
+        }
+    }
+}
+
+/// What a media page's script reports through `window.ipc`.
+#[derive(Debug, PartialEq)]
+enum MediaMessage {
+    /// The element could not play its source (`onError`).
+    Failed,
+    /// A video's context menu, at a point of the page.
+    Menu { x: f32, y: f32 },
+}
+
+fn media_message(body: &str) -> Option<MediaMessage> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    #[expect(clippy::cast_possible_truncation, reason = "page coordinates are small")]
+    let coordinate = |name: &str| value[name].as_f64().map(|v| v as f32).filter(|v| v.is_finite()).unwrap_or(0.);
+    match value["type"].as_str()? {
+        "error" => Some(MediaMessage::Failed),
+        "menu" => Some(MediaMessage::Menu { x: coordinate("x"), y: coordinate("y") }),
+        _ => None,
+    }
+}
+
+/// The media element's bridge (`MediaVideoPlayer`, `AudioPreview`): a changed file loads once
+/// playback pauses, and a failure the element can't recover from by loading a newer source is
+/// reported.
+const MEDIA_SCRIPT: &str = "const m=document.getElementById('m');let next=null;\
+const post=(message)=>window.ipc.postMessage(JSON.stringify(message));\
+const load=(u)=>{next=null;m.src=u;};const adopt=()=>{if(next!==null&&m.paused)load(next);};\
+m.addEventListener('pause',adopt);m.addEventListener('ended',adopt);\
+m.addEventListener('error',()=>{if(next!==null)load(next);else post({type:'error'});});\
+window.t3Media={adopt:(u)=>{next=u;adopt();},pause:()=>m.pause()};";
+
+/// `MediaActions` on a video: the app's menu replaces the engine's, at the pointer or, from the
+/// keyboard, under the video.
+const VIDEO_MENU_SCRIPT: &str = "const menu=(x,y)=>{if(x===0&&y===0){const r=m.getBoundingClientRect();x=r.left;y=r.bottom;}\
+post({type:'menu',x,y});};\
+document.addEventListener('contextmenu',(e)=>{e.preventDefault();menu(e.clientX,e.clientY);});\
+document.addEventListener('keydown',(e)=>{if(e.key==='ContextMenu'||(e.shiftKey&&e.key==='F10')){\
+e.preventDefault();menu(0,0);}});";
+
+/// Hands a media page the file's new URL (see [`MEDIA_SCRIPT`]).
+fn media_adopt_script(url: &str) -> String {
+    format!("window.t3Media&&window.t3Media.adopt({})", serde_json::to_string(url).unwrap_or_default())
+}
+
+const MEDIA_PAUSE_SCRIPT: &str = "window.t3Media&&window.t3Media.pause()";
 
 impl Documents {
     /// Drops `key`'s view, so its next draw builds it again.
@@ -92,13 +166,16 @@ fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Pag
         FileKind::Video => shell(
             "display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box",
             format!(
-                "<video controls playsinline preload=\"metadata\" src=\"{src}\" \
-                 style=\"max-width:min(100%,64rem);max-height:100%\"></video>"
+                "<video id=\"m\" controls playsinline preload=\"metadata\" src=\"{src}\" \
+                 style=\"max-width:min(100%,64rem);max-height:100%\"></video><script>{MEDIA_SCRIPT}{VIDEO_MENU_SCRIPT}</script>"
             ),
         ),
         FileKind::Audio => shell(
             "display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box",
-            format!("<audio controls preload=\"metadata\" src=\"{src}\" style=\"width:100%;max-width:36rem\"></audio>"),
+            format!(
+                "<audio id=\"m\" controls preload=\"metadata\" src=\"{src}\" \
+                 style=\"width:100%;max-width:36rem\"></audio><script>{MEDIA_SCRIPT}</script>"
+            ),
         ),
         _ => shell(
             "background:#fff",
@@ -264,33 +341,39 @@ impl Workspace {
         let mutation = self.files.mutation.clone();
         let documents = &mut self.files.documents;
         documents.drawn = Some(key.clone());
-        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView {
-            view: None,
-            failed: None,
-            mutation: mutation.clone(),
-            revision: None,
-            content: 0,
-            shown: false,
-            used: 0,
-            _task: None,
-            _links: None,
-        });
+        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
             self.start_document(key.clone(), kind, window, cx);
         } else if state.view.is_some() && state.mutation != mutation {
             state.mutation = mutation;
             self.refresh_document(key.clone(), kind, window, cx);
         }
+        let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
         match (&state.view, &state.failed) {
-            (Some(view), _) => div().flex_1().min_h_0().size_full().child(view.clone()).into_any_element(),
+            (Some(view), _) => {
+                div().flex_1().min_h_0().size_full().child(view.clone()).children(menu).into_any_element()
+            }
             (None, Some(error)) if kind == FileKind::Font => {
                 super::chrome::no_preview(format!("{error} Save it to open in another app."), &tokens)
             }
+            (None, Some(_)) if kind == FileKind::Video => {
+                let url = state.url.clone();
+                self.render_video_failure(key, url, menu, &tokens, cx)
+            }
+            (None, Some(_)) if kind == FileKind::Audio => {
+                let retry = key.clone();
+                let button = super::chrome::retry_button("document-retry", &tokens).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.files.documents.views.remove(&retry);
+                        cx.notify();
+                    },
+                ));
+                super::chrome::failure("Unable to load audio.", Some(button), &tokens)
+            }
             (None, Some(_)) => {
                 let retry = key.clone();
-                let message =
-                    if kind == FileKind::Audio { "Unable to load audio." } else { "Unable to load file preview." };
+                let message = "Unable to load file preview.";
                 v_flex()
                     .flex_1()
                     .items_center()
@@ -331,6 +414,109 @@ impl Workspace {
         self.asset_resource(key, if kind == FileKind::Html { "workspace-file" } else { "media-file" })
     }
 
+    /// `MediaVideoPlayer`'s failed state: the file's name, Retry video, and Open in browser once
+    /// a URL was signed. The media actions menu still opens on it.
+    fn render_video_failure(
+        &self,
+        key: &FileKey,
+        url: Option<String>,
+        menu: Option<AnyElement>,
+        tokens: &crate::theme::Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = logic::file_name(&key.path).to_owned();
+        let (retry, menu_key) = (key.clone(), key.clone());
+        let label =
+            if name.is_empty() { "Video unavailable".to_owned() } else { format!("Video unavailable · {name}") };
+        let open = url.filter(|url| url.starts_with("http:") || url.starts_with("https:")).map(|url| {
+            Button::new("video-open-browser")
+                .secondary()
+                .small()
+                .icon(IconName::ExternalLink)
+                .label("Open in browser")
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        });
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .p(px(16.))
+            .child(
+                v_flex()
+                    .id("video-failure")
+                    .w_full()
+                    .max_w(px(1024.))
+                    .aspect_ratio(16. / 9.)
+                    .max_h_full()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(tokens.border.opacity(0.4))
+                    .bg(tokens.muted.opacity(0.4))
+                    .p(px(16.))
+                    .text_center()
+                    .text_sm()
+                    .text_color(tokens.muted_foreground)
+                    .on_mouse_down(
+                        gpui_kit::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                            this.open_media_menu(&menu_key, MediaKind::Video, None, event.position, window, cx);
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(Icon::new(IconName::TriangleAlert).size(px(14.)).flex_none())
+                            .child(label),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap(px(8.))
+                            .child(
+                                Button::new("video-retry")
+                                    .secondary()
+                                    .small()
+                                    .icon(IconName::RotateCw)
+                                    .label("Retry video")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.files.documents.views.remove(&retry);
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(open),
+                    ),
+            )
+            .children(menu)
+            .into_any_element()
+    }
+
+    /// A media page's report: a playback failure shows the failed state, a video's context
+    /// menu opens the media actions.
+    fn on_media_message(&mut self, key: &FileKey, message: MediaMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.files.documents.views.get_mut(key) else { return };
+        match message {
+            MediaMessage::Failed => {
+                log::warn!("file preview: the media element could not play {}", key.path);
+                state.view = None;
+                state.failed = Some("playback".into());
+                cx.notify();
+            }
+            MediaMessage::Menu { x, y } => {
+                let Some(view) = &state.view else { return };
+                let origin = view.read(cx).bounds().origin;
+                let position = gpui_kit::point(origin.x + px(x), origin.y + px(y));
+                self.open_media_menu(key, MediaKind::Video, None, position, window, cx);
+            }
+        }
+    }
+
     fn start_document(&mut self, key: FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some((client, endpoint)) = self.file_connection(&key) else { return };
         let resource = self.document_resource(&key, kind);
@@ -346,6 +532,17 @@ impl Workspace {
                     cx.update(|cx| cx.open_url(&url));
                 }
             }
+        });
+        let (media, reports) = async_channel::unbounded::<String>();
+        let media_key = key.clone();
+        let media_task = matches!(kind, FileKind::Video | FileKind::Audio).then(|| {
+            cx.spawn_in(window, async move |this, cx| {
+                while let Ok(body) = reports.recv().await {
+                    let Some(message) = media_message(&body) else { continue };
+                    let _ =
+                        this.update_in(cx, |this, window, cx| this.on_media_message(&media_key, message, window, cx));
+                }
+            })
         });
         let task = cx.spawn_in(window, async move |this, cx| {
             let minted =
@@ -363,11 +560,17 @@ impl Workspace {
             let prepared = match (minted, font) {
                 (Ok(_), Some(Err(error))) | (Err(error), _) => Err(error),
                 (Ok((url, revision)), font) => {
-                    let builder =
+                    let mut builder =
                         wry::WebViewBuilder::new().with_devtools(true).with_new_window_req_handler(move |url, _| {
                             let _ = links.try_send(url);
                             wry::NewWindowResponse::Deny
                         });
+                    if matches!(kind, FileKind::Video | FileKind::Audio) {
+                        builder = builder.with_ipc_handler(move |request| {
+                            let _ = media.try_send(request.into_body());
+                        });
+                    }
+                    let loaded = url.clone();
                     let builder = match (font, document_page(kind, &url, &background, dark)) {
                         (Some(Ok((bytes, mime))), _) => {
                             let page = font_specimen(&background, &foreground, dark);
@@ -388,17 +591,23 @@ impl Workspace {
                         (_, Page::Url(url)) => builder.with_url(url),
                         (_, Page::Html(html)) => builder.with_html(html),
                     };
-                    Ok((builder, revision))
+                    Ok((builder, revision, loaded))
                 }
             };
             let _ = this.update_in(cx, |this, window, cx| match prepared {
-                Ok((builder, revision)) => this.build_view(request_key, builder, revision, window, cx),
+                Ok((builder, revision, loaded)) => {
+                    if let Some(state) = this.files.documents.views.get_mut(&request_key) {
+                        state.url = Some(loaded);
+                    }
+                    this.build_view(request_key, builder, revision, window, cx);
+                }
                 Err(error) => this.fail_view(&request_key, error, cx),
             });
         });
         if let Some(state) = self.files.documents.views.get_mut(&key) {
             state._task = Some(task);
             state._links = Some(links_task);
+            state._media = media_task;
         }
     }
 
@@ -487,20 +696,7 @@ impl Workspace {
                         .unwrap_or_default()
                 })
                 .with_url(MERMAID_PAGE_URL);
-            documents.views.insert(
-                key.clone(),
-                DocView {
-                    view: None,
-                    failed: None,
-                    mutation,
-                    revision: None,
-                    content: revision,
-                    shown: false,
-                    used: 0,
-                    _task: None,
-                    _links: None,
-                },
-            );
+            documents.views.insert(key.clone(), DocView::new(FileKind::Text, mutation, revision));
             self.build_view(key.clone(), builder, None, window, cx);
         }
         match self.files.documents.views.get(key).map(|doc| (&doc.view, &doc.failed)) {
@@ -540,10 +736,16 @@ impl Workspace {
                 state.revision = revision;
                 if let Some(view) = &state.view {
                     let raw = view.read(cx).raw();
-                    let _ = match document_page(kind, &url, &background, dark) {
-                        Page::Url(url) => raw.load_url(&url),
-                        Page::Html(html) => raw.load_html(&html),
+                    // Media keep playing what they play; the new bytes load once playback pauses.
+                    let _ = if matches!(kind, FileKind::Video | FileKind::Audio) {
+                        raw.evaluate_script(&media_adopt_script(&url))
+                    } else {
+                        match document_page(kind, &url, &background, dark) {
+                            Page::Url(url) => raw.load_url(&url),
+                            Page::Html(html) => raw.load_html(&html),
+                        }
                     };
+                    state.url = Some(url);
                 }
             });
         });
@@ -565,6 +767,11 @@ impl Workspace {
             if drawn {
                 doc.used = frame;
             }
+            let media = matches!(doc.kind, FileKind::Video | FileKind::Audio);
+            if let Some(view) = doc.view.as_ref().filter(|_| media && doc.drawn && !drawn) {
+                let _ = view.read(cx).raw().evaluate_script(MEDIA_PAUSE_SCRIPT);
+            }
+            doc.drawn = drawn;
             let shown = drawn && !covered;
             if let Some(view) = doc.view.as_ref().filter(|_| doc.shown != shown) {
                 doc.shown = shown;
@@ -613,7 +820,11 @@ mod tests {
         assert!(html.contains("sandbox=\"allow-scripts allow-forms allow-popups allow-downloads\""));
         assert!(html.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;\""), "the URL is escaped");
         let Page::Html(audio) = document_page(FileKind::Audio, "u", "#123456", true) else { panic!() };
-        assert!(audio.contains("<audio controls") && audio.contains("background:#123456"));
+        assert!(audio.contains("<audio id=\"m\" controls") && audio.contains("background:#123456"));
+        assert!(audio.contains("window.t3Media") && !audio.contains("contextmenu"), "audio has no media actions");
+        let Page::Html(video) = document_page(FileKind::Video, "u", "#000", true) else { panic!() };
+        assert!(video.contains("window.t3Media") && video.contains("'contextmenu'"));
+        assert_eq!(media_adopt_script("http://h/a\"b"), r#"window.t3Media&&window.t3Media.adopt("http://h/a\"b")"#);
         assert!(audio.contains("content=\"dark\""));
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
@@ -638,6 +849,15 @@ mod tests {
         assert!(page.contains("const source = \"graph TD\\n A\\u003c/script>\\u003cb>x\\u003c/b>\";"));
         assert!(page.contains("default-src 'none'") && page.contains("--pele-bg:#000"));
         assert!(pele_script().starts_with(b"/*! Pele 1.8.0"), "the vendored renderer decompresses");
+    }
+
+    #[test]
+    fn media_pages_report_failures_and_menus() {
+        assert_eq!(media_message(r#"{"type":"error"}"#), Some(MediaMessage::Failed));
+        assert_eq!(media_message(r#"{"type":"menu","x":12.5,"y":40}"#), Some(MediaMessage::Menu { x: 12.5, y: 40. }));
+        assert_eq!(media_message(r#"{"type":"menu"}"#), Some(MediaMessage::Menu { x: 0., y: 0. }));
+        assert_eq!(media_message(r#"{"type":"other"}"#), None);
+        assert_eq!(media_message("not json"), None);
     }
 
     #[test]

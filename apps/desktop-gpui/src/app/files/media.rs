@@ -17,12 +17,14 @@ use crate::app::Workspace;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum MediaKind {
     Image,
+    Video,
 }
 
 impl MediaKind {
     fn noun(self) -> &'static str {
         match self {
             Self::Image => "image",
+            Self::Video => "video",
         }
     }
 }
