@@ -1283,7 +1283,9 @@ impl Workspace {
                 .px(px(12.))
                 .py(px(8.))
                 .child(match rendered {
-                    Some(state) => pr_markdown_view(&state, t, cx.entity()).into_any_element(),
+                    Some(state) => {
+                        pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)).into_any_element()
+                    }
                     None => {
                         div().text_xs().text_color(t.muted_foreground).child("Nothing to preview.").into_any_element()
                     }

@@ -1350,7 +1350,7 @@ impl Workspace {
                 let time = parse_ms(&comment.created_at).map(|at| relative_time(now - at)).unwrap_or_default();
                 let markdown = logic::visible_body(&comment.body)
                     .and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), &b, cx))
-                    .map(|state| pr_markdown_view(&state, t, cx.entity()));
+                    .map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)));
                 let can_edit = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).is_some_and(|d| {
                     logic::can_edit_comment(d, "review-comment", comment.author.as_ref(), comment.can_edit)
                 });

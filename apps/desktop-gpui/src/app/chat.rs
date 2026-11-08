@@ -1780,12 +1780,7 @@ fn markdown_view(
     t: &Tokens,
 ) -> TextView {
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
-    let inline_code = StyleRefinement::default()
-        .bg(alpha(t.foreground, 0.1))
-        .rounded(px(4.))
-        .px(px(4.9))
-        .py(px(1.4))
-        .text_size(px(11.9));
+    let inline_code = inline_code_style(t);
     let t = *t;
     let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
     let table_key = key.clone();
@@ -1797,7 +1792,10 @@ fn markdown_view(
         // The user's typed newlines break lines (`lineBreaks`, remark-breaks).
         .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
-            code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx)
+            let wrap_key = key.clone();
+            code_block_header(&header_this, &key, block, wrap, streaming, width, &t, cx, move |workspace, cx| {
+                workspace.toggle_code_wrap(&wrap_key, cx);
+            })
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
@@ -1873,7 +1871,7 @@ fn markdown_view(
 /// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right.
 /// `TextView` pins the actions 8px into the block's top-right corner over its own fill,
 /// so given the block's `width` the row spans it and paints the block's color.
-fn code_block_header(
+pub(super) fn code_block_header(
     this: &WeakEntity<Workspace>,
     key: &SharedString,
     block: &gpui_kit::base::text::CodeBlock,
@@ -1882,13 +1880,13 @@ fn code_block_header(
     width: Option<f32>,
     t: &Tokens,
     cx: &App,
+    toggle_wrap: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
 ) -> AnyElement {
     let label_color = alpha(t.foreground, 0.72);
     let code: SharedString = block.code();
     // Its place in the source keeps two identical blocks apart and skips hashing every frame.
     let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
     let id: SharedString = format!("code:{key}:{at:x}").into();
-    let wrap_key = key.clone();
     let wrap_this = this.clone();
     let wrap_button = div()
         .id("wrap")
@@ -1907,7 +1905,7 @@ fn code_block_header(
                 .build(window, cx)
         })
         .on_click(move |_, _, cx| {
-            let _ = wrap_this.update(cx, |workspace, cx| workspace.toggle_code_wrap(&wrap_key, cx));
+            let _ = wrap_this.update(cx, |workspace, cx| toggle_wrap(workspace, cx));
         });
     let lang = block.lang();
     let run = runnable_command(lang.as_deref().unwrap_or_default(), &code)
@@ -1974,6 +1972,11 @@ fn runnable_command(lang: &str, code: &str) -> Option<String> {
 /// FNV-1a, to tell apart code blocks that carry no source span.
 fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+}
+
+/// `.chat-markdown code`: inline code's chip.
+pub(super) fn inline_code_style(t: &Tokens) -> StyleRefinement {
+    StyleRefinement::default().bg(alpha(t.foreground, 0.1)).rounded(px(4.)).px(px(4.9)).py(px(1.4)).text_size(px(11.9))
 }
 
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
