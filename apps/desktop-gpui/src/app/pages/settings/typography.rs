@@ -245,15 +245,14 @@ impl Workspace {
         let below_sm = window.viewport_size().width < px(640.);
         // `min-w-36 flex-1 sm:w-44 sm:flex-none` on the picker's wrapper.
         let family_picker = |stacked: bool| {
-            // `SelectButton size="sm"`; the popup is `w-72`, or the trigger's width when the
-            // stacked trigger is the wider.
+            // `SelectButton size="sm"`; the popup is `w-72`, at least the trigger's width.
             let select = t
                 .breakpoint
                 .control_text(Select::new(&picker).small())
                 .w_full()
                 .h(px(t.breakpoint.pick(32., 28.)))
                 .px(px(9.))
-                .when(!(stacked && below_sm), |select| select.menu_width(px(288.)))
+                .menu_width(px(288.))
                 .placeholder(row.default_family.clone())
                 .search_placeholder("Search fonts…");
             div()
