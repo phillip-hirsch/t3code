@@ -100,6 +100,8 @@ enum Run {
     ThreadIn(SharedString, String),
     Project(String),
     Settings(&'static str),
+    /// One setting: its section, scrolled to its row.
+    Setting(&'static crate::settings::SearchItem),
     /// Settings › Projects with this project's group picked.
     ProjectSettings(String),
     Page(Page),
@@ -172,6 +174,8 @@ struct Row {
     quality: f32,
     /// Shown dimmed, and neither highlighted nor run (`DisabledCommandPaletteResultRow`).
     disabled: bool,
+    /// Listed after the other rows of its group (`secondary`).
+    secondary: bool,
 }
 
 impl Row {
@@ -191,6 +195,7 @@ impl Row {
             data_terms: Vec::new(),
             quality: 0.,
             disabled: false,
+            secondary: false,
         }
     }
 }
@@ -1122,17 +1127,7 @@ impl Workspace {
             .collect();
         let suggestions = nested_rows(&action_rows, submenus, &tokens);
         let project_rows = self.project_search_rows();
-        let settings: Vec<Row> = super::pages::settings_sections()
-            .map(|(group, id, label)| {
-                let mut row =
-                    Row::new(format!("settings-{id}"), RowIcon::Lucide(IconName::Settings), label, Run::Settings(id));
-                row.description = Some(Description::Text(match group {
-                    Some(group) => format!("Settings · {group}").into(),
-                    None => "Settings".into(),
-                }));
-                row
-            })
-            .collect();
+        let settings = setting_rows();
         let linked = palette.linked.as_ref().filter(|linked| linked.query == query).map(LinkedSearch::rows);
         let rank = |typos: bool| {
             let actions = score_rows(action_rows.clone(), &tokens, typos);
@@ -1170,7 +1165,10 @@ impl Workspace {
                     _ if threads_matched => SECONDARY_LIMIT,
                     _ => usize::MAX,
                 };
-                let rows: Vec<Row> = rows.into_iter().map(|(row, _)| row).take(limit).collect();
+                let mut rows: Vec<Row> = rows.into_iter().map(|(row, _)| row).collect();
+                // Secondary rows stay below the rest; the sort is stable, so score order holds.
+                rows.sort_by_key(|row| row.secondary);
+                rows.truncate(limit);
                 let best = rows
                     .iter()
                     .map(|r| search::class(r.quality.min(if label == "Threads" { 1.49 } else { f32::MAX })))
@@ -1404,6 +1402,7 @@ impl Workspace {
             Run::ThreadIn(environment, thread_id) => self.select_thread_in(environment, thread_id, window, cx),
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
+            Run::Setting(item) => self.open_settings_search_result(item, window, cx),
             Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
             Run::Page(page) => self.open_page(page, cx),
             Run::Find => self.open_thread_find_or_explain(window, cx),
@@ -2103,6 +2102,28 @@ fn no_project_index(entries: &[NoProjectEntry]) -> usize {
     (entries.iter().filter(|e| !e.scratch && e.pinned).count() + 1).min(projects)
 }
 
+/// `settingsSearchItems`: each setting by its title, section and aliases, opening its row.
+fn setting_rows() -> Vec<Row> {
+    super::pages::palette_settings()
+        .map(|(item, section)| {
+            let title = SharedString::new_static(item.title.as_str());
+            let mut row = Row::new(
+                format!("setting:{}", item.id),
+                RowIcon::Lucide(IconName::Settings),
+                title,
+                Run::Setting(item),
+            );
+            row.description = Some(Description::Text(format!("Settings · {section}").into()));
+            row.data_terms = std::iter::once(section)
+                .chain(item.search_terms.iter().map(String::as_str))
+                .map(SharedString::new_static)
+                .collect();
+            row.secondary = item.secondary;
+            row
+        })
+        .collect()
+}
+
 /// A row's name as a query reads it: the title and the bold part after it.
 fn row_name(row: &Row) -> String {
     match &row.strong {
@@ -2242,6 +2263,14 @@ mod tests {
         assert_eq!(titles("new thread"), ["Change theme: Dracula"], "a query naming the submenu wants the submenu");
         let suggestions = nested_rows(&actions, children(), &search::fold_query("x"));
         assert!(suggestions.iter().all(|r| r.terms.is_empty() && r.data_terms.is_empty()), "only the combined title");
+    }
+
+    #[test]
+    fn settings_search_lists_each_setting_and_opens_its_row() {
+        let found = score_rows(setting_rows(), &search::fold_query("delete confirmation"), false);
+        let (row, _) = found.first().expect("a setting");
+        assert!(matches!(row.run, Run::Setting(item) if item.id == "delete-confirmation"));
+        assert!(matches!(&row.description, Some(Description::Text(text)) if text.starts_with("Settings · ")));
     }
 
     #[test]

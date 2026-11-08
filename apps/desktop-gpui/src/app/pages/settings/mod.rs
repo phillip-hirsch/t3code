@@ -116,6 +116,14 @@ pub(in crate::app) fn section_enabled(id: &str) -> bool {
 const DETAIL_PAGES: &[(&str, &str, &str)] =
     &[("diagnostics", "Diagnostics", "maintenance"), ("open-source-licenses", "Open source licenses", "about")];
 
+/// The shipped settings in enabled sections, each with its section's label.
+pub(super) fn searchable_settings() -> impl Iterator<Item = (&'static SearchItem, &'static str)> {
+    search::shipped()
+        .iter()
+        .filter(|(item, _)| section_enabled(&item.to))
+        .filter_map(|(item, _)| Some((*item, section_label(&item.to)?)))
+}
+
 /// The section's label (`SETTINGS_SECTION_LABELS`).
 pub(super) fn section_label(id: &str) -> Option<&'static str> {
     SETTINGS
@@ -567,7 +575,12 @@ impl Workspace {
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).
-    fn open_settings_search_result(&mut self, item: &SearchItem, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn open_settings_search_result(
+        &mut self,
+        item: &SearchItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_ui.search.update(cx, |search, cx| search.set_value("", window, cx));
         self.settings_ui.compact_search_open = false;
         let target = item.target_id.clone().unwrap_or_else(|| item.id.clone());
