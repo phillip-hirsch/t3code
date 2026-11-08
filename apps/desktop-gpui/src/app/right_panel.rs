@@ -172,6 +172,17 @@ impl PanelState {
         }
     }
 
+    /// `moveSurface`: a dragged tab takes `to`'s place, the tabs between shifting over.
+    fn move_surface(&mut self, surface: &Surface, to: &Surface) {
+        let (Some(from), Some(to)) =
+            (self.surfaces.iter().position(|s| s == surface), self.surfaces.iter().position(|s| s == to))
+        else {
+            return;
+        };
+        let moved = self.surfaces.remove(from);
+        self.surfaces.insert(to, moved);
+    }
+
     /// `openFile`: a file's tab replaces the standalone Files tree and keeps its place when open.
     fn open_file(&mut self, path: String) {
         self.surfaces.retain(|s| *s != Surface::Files);
@@ -403,6 +414,32 @@ impl RightPanel {
 
 /// Drag payload for the left-edge resize handle.
 struct RightPanelResize;
+
+/// A tab dragged along the strip (`SortableTabList`).
+struct DraggedTab(Surface);
+
+/// The pill that follows the pointer while a tab drags.
+struct TabDragPreview {
+    title: SharedString,
+    colors: (Hsla, Hsla),
+}
+
+impl gpui_kit::Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (background, foreground) = self.colors;
+        div()
+            .h(px(24.))
+            .max_w(px(144.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .bg(background)
+            .text_color(foreground)
+            .text_xs()
+            .child(div().min_w_0().truncate().child(self.title.clone()))
+    }
+}
 
 impl Workspace {
     fn panel_state(&self) -> Option<&PanelState> {
@@ -1663,6 +1700,7 @@ impl Workspace {
         let (accent, foreground, muted) = (tokens.accent, tokens.foreground, tokens.muted);
         let (close, activate, middle, menu_surface) =
             (surface.clone(), surface.clone(), surface.clone(), surface.clone());
+        let (dragged, drop_target, drag_title) = (surface.clone(), surface.clone(), title.clone());
         h_flex()
             .id(ElementId::Name(group.clone()))
             .group(group.clone())
@@ -1715,6 +1753,17 @@ impl Workspace {
                 cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.activate_surface(activate.clone(), window, cx)))
+            .on_drag(DraggedTab(dragged), move |_, _, _, cx| {
+                let title = drag_title.clone();
+                cx.new(|_| TabDragPreview { title, colors: (accent, foreground) })
+            })
+            .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent.opacity(0.6)))
+            .on_drop(cx.listener(move |this, DraggedTab(surface): &DraggedTab, _, cx| {
+                if let Some(panel) = this.panel_state_mut() {
+                    panel.move_surface(surface, &drop_target);
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
@@ -2732,6 +2781,29 @@ fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len:
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn a_dragged_tab_takes_the_place_of_the_tab_it_drops_on() {
+        let mut panel = PanelState {
+            surfaces: vec![Surface::Diff, Surface::Files, Surface::PullRequests, Surface::Terminal("t".into())],
+            ..PanelState::default()
+        };
+        let order = |panel: &PanelState| panel.surfaces.clone();
+        panel.move_surface(&Surface::Diff, &Surface::PullRequests);
+        assert_eq!(
+            order(&panel),
+            [Surface::Files, Surface::PullRequests, Surface::Diff, Surface::Terminal("t".into())]
+        );
+        panel.move_surface(&Surface::Terminal("t".into()), &Surface::Files);
+        assert_eq!(
+            order(&panel),
+            [Surface::Terminal("t".into()), Surface::Files, Surface::PullRequests, Surface::Diff]
+        );
+        let before = order(&panel);
+        panel.move_surface(&Surface::Files, &Surface::Files);
+        panel.move_surface(&Surface::SideChat("gone".into()), &Surface::Files);
+        assert_eq!(order(&panel), before);
+    }
 
     #[test]
     fn launcher_arrows_wrap_through_the_available_rows() {
