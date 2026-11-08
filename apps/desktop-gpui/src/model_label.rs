@@ -40,7 +40,7 @@ const VARIANT_WORDS: &[&str] = &[
     "transcribe",
 ];
 
-const REASONING_IDS: [&str; 5] = ["reasoningEffort", "effort", "reasoning", "variant", "thinking"];
+pub(crate) const REASONING_IDS: [&str; 5] = ["reasoningEffort", "effort", "reasoning", "variant", "thinking"];
 
 /// `providerClients` model families per driver.
 fn native_families(driver: &str) -> &'static [&'static str] {

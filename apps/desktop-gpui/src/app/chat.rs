@@ -784,12 +784,105 @@ pub(super) fn render_row(
         }
         Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
         Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
+        Row::ModelSwitch { switch, .. } => {
+            let label = this.upgrade().and_then(|workspace| {
+                crate::handoff::model_switch_label(&switch.0, &switch.1, &workspace.read(cx).server_info().providers)
+            });
+            match label {
+                Some(label) => {
+                    let center = div().px(px(8.)).py(px(4.)).font_weight(FontWeight::MEDIUM).child(label);
+                    lane(8., divider_frame(center.into_any_element(), t.muted_foreground, &t)).into_any_element()
+                }
+                None => div().into_any_element(),
+            }
+        }
+        Row::Handoff(handoff) => lane(8., handoff_divider(handoff, this, &t, cx)).into_any_element(),
     }
+}
+
+/// `TimelineSystemDivider`'s frame: `center` between hairlines, in `text-2xs`.
+fn divider_frame(center: AnyElement, color: Hsla, t: &Tokens) -> gpui_kit::Div {
+    let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
+    h_flex()
+        .min_w_0()
+        .gap(px(8.))
+        .py(px(8.))
+        .text_size(px(11.))
+        .text_color(color)
+        .child(line())
+        .child(center)
+        .child(line())
+}
+
+/// `providerTextColor`: the provider's brand color for its name, where it has one.
+fn provider_text_color(driver: &str, t: &Tokens) -> Option<Hsla> {
+    match driver {
+        "codex" => Some(t.foreground),
+        "antigravity" => Some(rgb(0x5b87bf).into()),
+        _ => crate::assets::provider_icon(driver).and_then(|(_, tint)| tint),
+    }
+}
+
+/// `HandoffRow`: "Context handoff", then where it came from and went, each provider's icon and
+/// model; red when the handoff failed.
+fn handoff_divider(handoff: &timeline::HandoffRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &App) -> AnyElement {
+    let workspace = this.upgrade();
+    let providers = workspace.as_ref().map_or(&[][..], |w| w.read(cx).server_info().providers.as_slice());
+    let endpoint = |index: usize, endpoint: &crate::handoff::Endpoint| {
+        let (label, display) = crate::handoff::endpoint_label(endpoint, providers);
+        let driver = providers
+            .iter()
+            .find(|provider| provider.instance_id == endpoint.instance_id)
+            .map_or(endpoint.instance_id.as_str(), |provider| provider.driver.as_str());
+        let icon = match crate::assets::provider_icon(driver) {
+            Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(IconName::Bot).size(px(14.)),
+        };
+        let tooltip: SharedString = format!("{display} · {label}").into();
+        h_flex()
+            .id(ElementId::Name(format!("handoff:{}:{index}", handoff.id).into()))
+            .min_w_0()
+            .gap(px(6.))
+            .child(icon.flex_none())
+            .child(
+                div()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .when_some(provider_text_color(driver, t), gpui_kit::Styled::text_color)
+                    .child(label),
+            )
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+    };
+    let count = handoff.endpoints.from.len();
+    let mut detail = h_flex().min_w_0().flex_wrap().justify_center().gap(px(6.)).opacity(0.7);
+    for (index, from) in handoff.endpoints.from.iter().enumerate() {
+        detail =
+            detail.child(endpoint(index, from).when(index + 1 < count, |el| el.child(div().ml(px(-4.)).child(","))));
+    }
+    if count > 0 {
+        detail = detail.child(Icon::new(IconName::ArrowRight).size(px(12.)).flex_none());
+    }
+    detail = detail.child(endpoint(count, &handoff.endpoints.to));
+    let center = h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .justify_center()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .child(Icon::new(IconName::ArrowRightLeft).size(px(12.)).flex_none())
+        .child(div().font_weight(FontWeight::MEDIUM).child(if handoff.pending {
+            "Context handoff pending"
+        } else {
+            "Context handoff"
+        }))
+        .child(detail);
+    let color = if handoff.failed { t.error } else { t.muted_foreground };
+    divider_frame(center.into_any_element(), color, t).into_any_element()
 }
 
 /// `TimelineSystemDivider`: icon, label and detail between hairlines; a pill when it opens a thread.
 fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
-    let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
     let icon = match divider.icon {
         timeline::DividerIcon::Stop => IconName::CircleStop,
         timeline::DividerIcon::Fork => IconName::GitFork,
@@ -835,16 +928,7 @@ fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace
             .py(px(4.))
             .into_any_element(),
     };
-    h_flex()
-        .min_w_0()
-        .gap(px(8.))
-        .py(px(8.))
-        .text_size(px(11.))
-        .text_color(t.muted_foreground)
-        .child(line())
-        .child(center)
-        .child(line())
-        .into_any_element()
+    divider_frame(center, t.muted_foreground, t).into_any_element()
 }
 
 /// "Open chat" on a created thread, "Open subagent" on a subagent's notification (`WorkEntryLogRow`).

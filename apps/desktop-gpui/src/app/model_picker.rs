@@ -232,6 +232,8 @@ impl Workspace {
         self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
         self.refresh_menu_items(cx);
+        // A pick on another harness shows its pending handoff at the timeline's end.
+        self.refresh_rows(cx);
         cx.notify();
     }
 

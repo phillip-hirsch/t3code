@@ -106,6 +106,12 @@ pub struct OptionChoice {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Continuation {
+    pub group_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Provider {
     pub instance_id: String,
     #[serde(default)]
@@ -147,6 +153,9 @@ pub struct Provider {
     pub native_sessions: Option<NativeSessions>,
     #[serde(default)]
     pub configurable_providers: bool,
+    /// Instances sharing a `groupKey` continue one conversation, so switching needs no handoff.
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
     #[serde(default)]
     pub supports_conversation_rollback: Option<bool>,
     #[serde(default, deserialize_with = "lossy")]
@@ -1210,6 +1219,12 @@ pub struct Run {
     /// Starts a new provider conversation; earlier runs stay visible but never reach the provider.
     #[serde(default)]
     pub fresh_context: bool,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub context_handoff_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

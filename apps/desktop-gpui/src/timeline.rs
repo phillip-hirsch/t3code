@@ -107,6 +107,13 @@ pub enum Row {
     },
     /// A secret or link an agent asked for, while it waits on the user (`SecretRequestCard`, `LinkRequestCard`).
     Request(Rc<RequestCard>),
+    /// A same-harness model or effort change before the message it took effect with (`ModelSwitchRow`).
+    ModelSwitch {
+        id: SharedString,
+        switch: Rc<(model::ModelSelection, model::ModelSelection)>,
+    },
+    /// A provider handoff, or the one the composer's pick would start (`HandoffRow`).
+    Handoff(Rc<HandoffRow>),
     /// A queued follow-up, after the timeline (`QueuedRunsControl`).
     Queued {
         message: Rc<crate::queue::QueuedMessage>,
@@ -124,6 +131,15 @@ pub enum Row {
         total: usize,
         expanded: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffRow {
+    pub id: SharedString,
+    pub endpoints: crate::handoff::Endpoints,
+    pub failed: bool,
+    /// Not sent yet: the composer's pick runs on another harness than the thread's last run.
+    pub pending: bool,
 }
 
 /// An `html_render` page or an MCP app's attachment (`htmlRenderFromToolItem`, `mcpAppFromToolItem`).
@@ -640,6 +656,8 @@ enum Kind {
         attribution: Option<Attribution>,
         /// `/clear` or an automation started a new provider session with this message.
         fresh_context: bool,
+        /// `modelSwitch`: the model or effort change that took effect with it.
+        model_switch: Option<Rc<(model::ModelSelection, model::ModelSelection)>>,
     },
     Assistant {
         text: SharedString,
@@ -655,6 +673,8 @@ enum Kind {
     },
     Embed(Rc<Embed>),
     Request(Rc<RequestCard>),
+    /// A `handoff` item, whose endpoints read the thread's runs.
+    Handoff(Rc<TurnItem>),
 }
 
 struct TimelineEntry {
@@ -803,6 +823,16 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 attribution,
                 compaction: compaction_command(item),
                 fresh_context: item.bool("freshContext"),
+                model_switch: item
+                    .raw
+                    .get("modelSwitch")
+                    .and_then(|switch| Some((switch.get("from")?, switch.get("to")?)))
+                    .and_then(|(from, to)| {
+                        Some(Rc::new((
+                            serde_json::from_value(from.clone()).ok()?,
+                            serde_json::from_value(to.clone()).ok()?,
+                        )))
+                    }),
             }
         }
         "assistant_message" => Kind::Assistant { text: text("text"), streaming: item.bool("streaming") },
@@ -813,18 +843,15 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
         "link_request" if item.str("linkStatus") == Some("pending") && !inherited => {
             Kind::Request(Rc::new(request_card(item)))
         }
-        "fork"
-        | "handoff"
-        | "run_interrupt_request"
-        | "run_interrupt_result"
-        | "secret_request"
-        | "link_request"
-        | "subagent" => Kind::Event {
-            label: event_label(item, inherited).into(),
-            item_type: item.item_type.clone().into(),
-            subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
-            system: system_divider(item).map(Rc::new),
-        },
+        "handoff" => Kind::Handoff(item.clone()),
+        "fork" | "run_interrupt_request" | "run_interrupt_result" | "secret_request" | "link_request" | "subagent" => {
+            Kind::Event {
+                label: event_label(item, inherited).into(),
+                item_type: item.item_type.clone().into(),
+                subagent: (item.item_type == "subagent").then(|| Rc::new(subagent_card(item))),
+                system: system_divider(item).map(Rc::new),
+            }
+        }
         _ => match embed(item) {
             Some(embed) => Kind::Embed(Rc::new(embed)),
             None => Kind::Work(Rc::new(work_log::entry_from_item(item))),
@@ -858,7 +885,6 @@ fn event_label(item: &TurnItem, inherited: bool) -> String {
     let text = |key: &str| item.str(key).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
     match item.item_type.as_str() {
         "fork" => "Forked thread".into(),
-        "handoff" => "Switched provider".into(),
         // `secretRequestDisplay` for an answered request.
         "secret_request" => {
             let outcome = match item.str("secretStatus") {
@@ -1932,6 +1958,12 @@ pub fn rows(
             Kind::Event { system: Some(divider), .. } => rows.push(Row::System(divider.clone())),
             Kind::Embed(embed) => rows.push(Row::Embed(embed.clone())),
             Kind::Request(card) => rows.push(Row::Request(card.clone())),
+            Kind::Handoff(item) => rows.push(Row::Handoff(Rc::new(HandoffRow {
+                id: entry.id.clone(),
+                endpoints: crate::handoff::resolve_endpoints(item, &projection.runs),
+                failed: entry.status == "failed",
+                pending: false,
+            }))),
             Kind::Event { label, .. } => rows.push(Row::Event { id: entry.id.clone(), label: label.clone() }),
             Kind::User { compaction: Some(_), .. } if entry.run_id.is_some() => {
                 let run = entry.run_id.as_ref().expect("a run");
@@ -1946,7 +1978,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, attribution, fresh_context, .. } => {
+            Kind::User { text, steer, attribution, fresh_context, model_switch, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -1955,6 +1987,12 @@ pub fn rows(
                         icon: DividerIcon::Eraser,
                         action: None,
                     })));
+                }
+                if let Some(switch) = model_switch {
+                    rows.push(Row::ModelSwitch {
+                        id: format!("model-switch:{}", entry.id).into(),
+                        switch: switch.clone(),
+                    });
                 }
                 rows.push(Row::User {
                     id: entry.id.clone(),
@@ -2279,6 +2317,8 @@ mod tests {
                 Row::WorktreeSetup { snapshot, .. } => format!("setup {}", snapshot.phase),
                 Row::System(divider) => format!("system {}", divider.label),
                 Row::Request(card) => format!("request {}", card.item_id),
+                Row::ModelSwitch { switch, .. } => format!("model-switch {} {}", switch.0.model, switch.1.model),
+                Row::Handoff(handoff) => format!("handoff {}", handoff.endpoints.to.instance_id),
             })
             .collect()
     }
@@ -2691,6 +2731,24 @@ mod tests {
         let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
         let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
         assert_eq!(described, ["system New session", "user go", "assistant looking"]);
+
+        // A model switch sits right above its message; a handoff is its own divider.
+        let mut items = turn("r1")[..2].to_vec();
+        items[0]["modelSwitch"] =
+            json!({"from": {"instanceId": "codex", "model": "a"}, "to": {"instanceId": "codex", "model": "b"}});
+        items.insert(
+            0,
+            item(
+                "h",
+                "handoff",
+                "r1",
+                "2026-11-04T09:59:00.000Z",
+                json!({"fromProviderInstanceIds": ["claude"], "toProviderInstanceId": "codex"}),
+            ),
+        );
+        let p = projection(items, json!([{"id": "r1", "status": "completed"}]));
+        let described = describe(&rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default()));
+        assert_eq!(described, ["handoff codex", "model-switch a b", "user go", "assistant looking"]);
     }
 
     #[test]

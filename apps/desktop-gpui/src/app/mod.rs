@@ -802,6 +802,8 @@ impl Workspace {
         self.apply_workflow_opening(&mut new_rows, cx);
         self.sync_worktree_setup(cx);
         self.insert_worktree_setup(&mut new_rows);
+        // The footer: a pending handoff, what the thread is doing now, then the queue.
+        new_rows.extend(self.pending_handoff_row());
         new_rows.extend(self.now_rows(cx));
         new_rows.extend(self.queue_rows());
         let was_empty = self.rows.is_empty();
@@ -946,6 +948,25 @@ impl Workspace {
             }
             None => None,
         }
+    }
+
+    /// `resolvePendingHandoff` for the composer's pick, when its provider can take a turn.
+    fn pending_handoff_row(&self) -> Option<timeline::Row> {
+        let projection = self.thread.as_ref()?.state.projection.as_ref()?;
+        let selection = self.composer_model()?;
+        let providers = &self.server_info().providers;
+        let usable = providers.iter().any(|provider| {
+            provider.instance_id == selection.instance_id
+                && provider.enabled
+                && provider.availability.as_deref() != Some("unavailable")
+        });
+        let endpoints = crate::handoff::pending(projection, usable.then_some(&selection), providers)?;
+        Some(timeline::Row::Handoff(Rc::new(timeline::HandoffRow {
+            id: "pending-handoff".into(),
+            endpoints,
+            failed: false,
+            pending: true,
+        })))
     }
 
     /// The model a new draft carries from where it was started: the composer's pick, else the open
