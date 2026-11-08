@@ -414,6 +414,7 @@ pub(super) struct RightPanel {
     /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     toolbar_focus: DiffToolbarFocus,
+    tree_pane: diff_tree::TreePane,
     _diff_events: Subscription,
 }
 
@@ -470,6 +471,7 @@ impl RightPanel {
             tree_rows: std::rc::Rc::new([]),
             pending_reveal: None,
             toolbar_focus: DiffToolbarFocus::new(cx),
+            tree_pane: diff_tree::TreePane::new(cx),
             _diff_events: diff_events,
         }
     }
@@ -2591,7 +2593,10 @@ impl Workspace {
                                 .into_any_element(),
                             }
                         })
-                        .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
+                        .when(tree_open, |el| {
+                            let row = self.right_panel_width(window).unwrap_or_default();
+                            el.child(self.render_diff_tree(row, tokens, window, cx))
+                        }),
                 )
                 // `DiffFileLoadingBoundary` while file patches are still on their way.
                 .when(pending > 0, |el| {
