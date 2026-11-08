@@ -32,6 +32,8 @@ const LIST: f32 = 316.;
 const EFFORT: f32 = 192.;
 const BODY_HEIGHT: f32 = 346.;
 const COMPOSER: &str = "model-picker";
+/// `ChatGptSharingControl`'s `speedNotice`.
+const CHATGPT_SPEED_NOTICE: &str = "Fast and Ultrafast are unavailable with this ChatGPT connection. Use an existing Codex CLI login for speed options your account supports.";
 
 /// `onInstanceModelChange` for a picker outside the composer.
 pub(in crate::app) type OnPick = Rc<dyn Fn(&mut Workspace, ModelSelection, &mut Window, &mut Context<Workspace>)>;
@@ -843,7 +845,6 @@ impl Workspace {
         if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
             return None;
         }
-        const NOTICE: &str = "Fast and Ultrafast are unavailable with this ChatGPT connection. Use an existing Codex CLI login for speed options your account supports.";
         let plan = h_flex()
             .id("chatgpt-sharing")
             .gap(px(8.))
@@ -851,7 +852,7 @@ impl Workspace {
             .text_color(t.muted_foreground)
             .child(svg().path("icons/app/openai.svg").size(px(14.)).flex_none().text_color(t.muted_foreground))
             .child("Using ChatGPT plan")
-            .tooltip(|window, cx| Tooltip::new(NOTICE).build(window, cx));
+            .tooltip(|window, cx| Tooltip::new(CHATGPT_SPEED_NOTICE).build(window, cx));
         Some(
             h_flex()
                 .flex_none()
