@@ -1649,6 +1649,22 @@ pub fn limit_notices(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&s
                 notices.push(format!("{}: {notice}", label(name)));
             }
         }
+        for source in environment.sources.as_array().into_iter().flatten() {
+            let accounts = source["accounts"].as_array().map_or(&[][..], Vec::as_slice);
+            // `UsageLimitsSection` drops a source whose every account is a hidden provider's.
+            let visible = accounts
+                .iter()
+                .filter(|account| !hidden_drivers.contains(&account["driver"].as_str().unwrap_or_default()));
+            if visible.count() == 0 && !accounts.is_empty() {
+                continue;
+            }
+            let name = source["label"].as_str().unwrap_or_default();
+            if let Some(error) = source["error"].as_str() {
+                notices.push(format!("{}: {error}", label(name)));
+            } else if accounts.is_empty() {
+                notices.push(format!("{}: No accounts reported.", label(name)));
+            }
+        }
     }
     notices
 }
@@ -2042,6 +2058,17 @@ mod tests {
         assert_eq!(me.redeem, Some(("env-b".into(), json!({"instanceId": "codex"}))));
         assert_eq!(accounts[1].source_label.as_deref(), Some("Server · Team hub"));
         assert!(limit_notices(&environments, &[]).iter().any(|n| n.starts_with("Server · claude")));
+        let failed = json!([
+            {"id": "down", "label": "Down hub", "accounts": [], "error": "Connection refused."},
+            {"id": "empty", "label": "Empty hub", "accounts": []},
+            {"id": "hidden", "label": "Codex hub", "error": "Stale.", "accounts": [{"id": "a", "driver": "codex"}]},
+        ]);
+        let hubs = [LimitEnvironment { id: "env-a", label: "Laptop", providers: &[], sources: &failed }];
+        assert_eq!(
+            limit_notices(&hubs, &[]),
+            ["Down hub: Connection refused.", "Empty hub: No accounts reported.", "Codex hub: Stale."]
+        );
+        assert_eq!(limit_notices(&hubs, &["codex"]).len(), 2, "a hub of only hidden accounts says nothing");
     }
 
     #[test]
