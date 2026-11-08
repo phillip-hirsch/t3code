@@ -205,6 +205,18 @@ soft break inside a text node becomes a newline. Files:
 and stay selectable. `src/selectable_text.rs`: `SelectableText::highlights`, passing through to its
 `StyledText`.
 
+**Task checkboxes can toggle.** The web's rendered Markdown file checks a task off by editing its
+`[ ]` (`onTaskListChange`). 0.9.0's checkboxes only show their state. The patch adds
+`TextView::on_task_toggle`: with a handler, a task's checkbox takes clicks and passes the list
+item's source offset and the state it asks for; the app edits the source. Files:
+
+- `src/text/text_view.rs`: `TaskToggleFn`, the `task_toggle_handler` field and builder.
+- `src/text/state.rs`: the handler, passed into each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::task_toggle_handler`; `render_list_item` and
+  `render_list_item_row` make the checkbox clickable.
+
+gpui-component's `src/text/compat.rs` forwards `on_task_toggle` from its `TextView`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -296,7 +308,7 @@ set width is at least the trigger's and at most the window's less the 8px margin
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
 
 **A dropdown menu can open from a shortcut.** The web opens the composer's Workspace menu with
-`composer.workspace` (Mod+Shift+X). 0.9.0's `DropdownMenuPopover` opens only from its trigger.
+`composer.workspace` (Mod+Shift+X) and the right panel's "+" menu with `rightPanel.new`. 0.9.0's `DropdownMenuPopover` opens only from its trigger.
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
 
@@ -306,3 +318,13 @@ passing through to gpui-base's (see its "Soft breaks can render as line breaks")
 **A thread's timeline reopens where it was left.** 0.9.0's `MessageScrollerState` scrolls only to
 a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
 it, the `logical_scroll_top` it reported.
+
+**A diff says which files are near the viewport, and pins the current file's header.** The web
+reads a large diff's patches as their headers come within 600px of the viewport, and its file
+headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
+
+- `DiffState::files_near_viewport`: the file indices with a row in the viewport or within a margin
+  below it, counting rows never laid out at the row height.
+- `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
+  scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
+  the next file's header as it arrives; a canvas records its height for the push.

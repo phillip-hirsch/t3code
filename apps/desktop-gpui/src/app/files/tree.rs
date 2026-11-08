@@ -95,10 +95,33 @@ pub(super) struct TreeState {
     /// Keyboard focus and the row it is on (the web tree's roving focus).
     focus: FocusHandle,
     focused: Option<String>,
-    /// The selection last revealed, with its request.
-    revealed: Option<(String, u64)>,
+    reveal: Reveal,
     mutation: Option<(Option<String>, Option<String>)>,
     _subscription: Subscription,
+}
+
+/// Which selections the tree reveals (`handledRevealRef`, `treeSelectionPathRef`).
+#[derive(Default)]
+struct Reveal {
+    /// The selection last revealed, with its request.
+    handled: Option<(String, u64)>,
+    /// The file the tree itself just opened.
+    from_tree: Option<String>,
+}
+
+impl Reveal {
+    /// Whether `request` still needs revealing. A file opened from the tree shows already, and
+    /// revealing it would close the search it was found with.
+    fn wants(&mut self, request: &(String, u64)) -> bool {
+        if self.handled.as_ref() == Some(request) {
+            return false;
+        }
+        if self.from_tree.take().is_some_and(|path| path == request.0) {
+            self.handled = Some(request.clone());
+            return false;
+        }
+        true
+    }
 }
 
 impl TreeState {
@@ -209,7 +232,7 @@ impl Workspace {
                 scroll: UniformListScrollHandle::new(),
                 focus: cx.focus_handle(),
                 focused: None,
-                revealed: None,
+                reveal: Reveal::default(),
                 mutation: None,
                 _subscription: subscription,
             },
@@ -416,7 +439,7 @@ impl Workspace {
         let Some(selected) = selected.filter(|s| !s.is_empty()) else { return };
         let Some(tree) = self.tree(root) else { return };
         let request = (selected.to_owned(), reveal);
-        if tree.revealed.as_ref() == Some(&request) {
+        if !tree.reveal.wants(&request) {
             return;
         }
         let ancestors = logic::ancestors(selected);
@@ -435,9 +458,9 @@ impl Workspace {
         }
         if let Some(index) = tree.rows.iter().position(|r| r.path == selected) {
             tree.scroll.scroll_to_item(index, ScrollStrategy::Center);
-            tree.revealed = Some(request);
+            tree.reveal.handled = Some(request);
         } else if known {
-            tree.revealed = Some(request);
+            tree.reveal.handled = Some(request);
         }
         self.load_open_folders(root, cx);
     }
@@ -454,6 +477,7 @@ impl Workspace {
         self.ensure_tree(root, window, cx);
         self.sync_tree(root, selected, reveal, window, cx);
         let tokens = *crate::theme::tokens(cx);
+        let host = self.is_host_tree(root);
         let Some(tree) = self.tree(root) else { return div().into_any_element() };
         if tree.rows_dirty {
             tree.rebuild_rows();
@@ -488,6 +512,7 @@ impl Workspace {
                 .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
         };
         let refresh_key = key.clone();
+        let refresh_selected = selected.map(str::to_owned);
         let toggle_key = key.clone();
         let clear_key = key.clone();
         let subheader = h_flex()
@@ -502,7 +527,13 @@ impl Workspace {
                     IconName::RefreshCw,
                     if pending { "Refreshing…" } else { "Refresh files" }.into(),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.refresh_tree(&refresh_key, cx))),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.refresh_tree(&refresh_key, cx);
+                    if let Some(path) = &refresh_selected {
+                        let key = super::FileKey { checkout: refresh_key.clone(), path: path.clone() };
+                        this.refresh_selected_file(&key, window, cx);
+                    }
+                })),
             )
             .child(
                 div()
@@ -519,7 +550,7 @@ impl Workspace {
                     // `InputGroupInput size="sm"` in a `sm:text-sm` group.
                     .child(Input::new(&query).appearance(false).text_sm().h(px(28.)).px(px(8.))),
             )
-            .when(has_folders, |el| {
+            .when(has_folders && !host, |el| {
                 el.child(
                     icon_button(
                         "files-expand-all",
@@ -652,7 +683,7 @@ impl Workspace {
                     if row.kind == EntryKind::Directory {
                         self.toggle_tree_folder(root, &row, cx);
                     } else {
-                        self.open_file(&row.path, None, window, cx);
+                        self.open_tree_file(root, &row.path, window, cx);
                     }
                 }
                 None
@@ -665,6 +696,14 @@ impl Workspace {
         }
         cx.notify();
         true
+    }
+
+    fn open_tree_file(&mut self, root: &Checkout, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree(root) {
+            tree.reveal.from_tree = Some(path.to_owned());
+        }
+        let path = if self.is_host_tree(root) { logic::absolute_path(&root.cwd, path) } else { path.to_owned() };
+        self.open_file(&path, None, window, cx);
     }
 
     fn tree_row(
@@ -721,7 +760,7 @@ impl Workspace {
                 if click_row.kind == EntryKind::Directory {
                     this.toggle_tree_folder(&click_key, &click_row, cx);
                 } else {
-                    this.open_file(&click_row.path, None, window, cx);
+                    this.open_tree_file(&click_key, &click_row.path, window, cx);
                 }
             }))
             .child(
@@ -755,7 +794,9 @@ impl Workspace {
             )
         });
         let absolute = logic::absolute_path(cwd, path);
-        let path = path.to_owned();
+        // A host folder's rows are mentioned by their host paths.
+        let host = self.project_target().is_none_or(|target| target.checkout.cwd != cwd);
+        let mention_path = if host { absolute.clone() } else { path.to_owned() };
         move |mut menu, window, cx| {
             super::track_menu(&view, cx);
             let open_in = |editor: String, reveal: bool, title: String| {
@@ -805,8 +846,8 @@ impl Workspace {
                     sub
                 });
             }
-            let mention = composer_text::file_link(&path);
-            let (copy_path, add_path) = (path.clone(), path.clone());
+            let mention = composer_text::file_link(&mention_path);
+            let (copy_path, add_path) = (mention_path.clone(), mention_path.clone());
             menu.item(PopupMenuItem::new("Copy mention").on_click(move |_, window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(mention.clone()));
                 window.push_notification(Notification::success(copy_path.clone()).title("Mention copied"), cx);
@@ -863,5 +904,28 @@ impl Workspace {
         });
         self.sync_composer_empty(cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reveal;
+
+    #[test]
+    fn files_opened_from_the_tree_are_not_revealed_again() {
+        let mut reveal = Reveal::default();
+        let request = |path: &str, id: u64| (path.to_owned(), id);
+        // A file opened elsewhere is revealed once per request.
+        assert!(reveal.wants(&request("a.rs", 1)));
+        reveal.handled = Some(request("a.rs", 1));
+        assert!(!reveal.wants(&request("a.rs", 1)));
+        // A search result the tree opened stays put, so the search stays open.
+        reveal.from_tree = Some("src/b.rs".into());
+        assert!(!reveal.wants(&request("src/b.rs", 1)));
+        assert!(!reveal.wants(&request("src/b.rs", 1)));
+        // The mark lasts one selection: a later outside one is revealed.
+        reveal.from_tree = Some("src/b.rs".into());
+        assert!(reveal.wants(&request("c.rs", 2)));
+        assert!(reveal.from_tree.is_none());
     }
 }

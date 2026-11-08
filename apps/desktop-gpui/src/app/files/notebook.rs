@@ -35,7 +35,7 @@ pub(super) enum CellKind {
 pub(super) enum Output {
     Text(String),
     Image(ImageFormat, Vec<u8>),
-    /// HTML outputs render in a frame on the web; here their plain-text fallback shows.
+    /// Sanitized HTML (`sanitizeDocumentHtml`), which renders in the web's document frame.
     Html(String),
 }
 
@@ -114,6 +114,10 @@ pub(super) fn open_notebook(bytes: &[u8]) -> Result<NotebookData, String> {
                     continue;
                 }
                 let html = notebook_text(&data["text/html"], CELL_TEXT_LIMIT)?;
+                if !html.trim().is_empty() {
+                    parsed.push(Output::Html(sanitize_html(&html)));
+                    continue;
+                }
                 let plain = match &output["text"] {
                     Value::Null => match &data["text/plain"] {
                         Value::Null => &output["traceback"],
@@ -122,9 +126,8 @@ pub(super) fn open_notebook(bytes: &[u8]) -> Result<NotebookData, String> {
                     text => text,
                 };
                 let plain = notebook_text(plain, CELL_TEXT_LIMIT)?;
-                let output = if html.trim().is_empty() { Output::Text(plain) } else { Output::Html(plain) };
-                if !matches!(&output, Output::Text(text) if text.trim().is_empty()) {
-                    parsed.push(output);
+                if !plain.trim().is_empty() {
+                    parsed.push(Output::Text(plain));
                 }
             }
             Ok(Cell {
@@ -139,6 +142,164 @@ pub(super) fn open_notebook(bytes: &[u8]) -> Result<NotebookData, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(NotebookData { language, cells })
+}
+
+/// `sanitizeDocumentHtml`'s allowed tags; others go, keeping their text unless listed in
+/// `DROPPED_WITH_CONTENT` (`DOMPurify`'s `FORBID_CONTENTS`).
+const HTML_TAGS: &[&str] = &[
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "div",
+    "span",
+    "strong",
+    "b",
+    "em",
+    "i",
+    "u",
+    "s",
+    "ul",
+    "ol",
+    "li",
+    "blockquote",
+    "pre",
+    "code",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "caption",
+    "figure",
+    "figcaption",
+    "br",
+    "hr",
+    "sub",
+    "sup",
+    "dl",
+    "dt",
+    "dd",
+    "img",
+];
+const HTML_VOID: &[&str] = &["br", "hr", "img"];
+const DROPPED_WITH_CONTENT: &[&str] = &[
+    "annotation-xml",
+    "audio",
+    "colgroup",
+    "desc",
+    "foreignobject",
+    "head",
+    "iframe",
+    "math",
+    "mi",
+    "mn",
+    "mo",
+    "ms",
+    "mtext",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+    "script",
+    "style",
+    "svg",
+    "template",
+    "title",
+    "video",
+    "xmp",
+    "object",
+    "embed",
+    "textarea",
+    "select",
+];
+const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+
+/// An image source the document may show: an inline PNG, JPEG, GIF or WebP, nothing it loads.
+fn inline_image(src: &str) -> bool {
+    let Some((head, data)) = src.split_once(',') else { return false };
+    let head = head.to_ascii_lowercase();
+    let mime = head.strip_prefix("data:image/").and_then(|rest| rest.strip_suffix(";base64"));
+    let body = data.trim_end_matches('=');
+    matches!(mime, Some("png" | "jpeg" | "gif" | "webp"))
+        && data.len() - body.len() <= 2
+        && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+fn escape_html(text: &str, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+}
+
+fn write_html(node: &markup5ever_rcdom::Handle, out: &mut String) {
+    use markup5ever_rcdom::NodeData;
+    let children = |out: &mut String| node.children.borrow().iter().for_each(|child| write_html(child, out));
+    match &node.data {
+        NodeData::Document => children(out),
+        NodeData::Text { contents } => escape_html(&contents.borrow(), out),
+        NodeData::Element { name, attrs, .. } => {
+            let tag = name.local.as_ref();
+            if name.ns.as_ref() != HTML_NAMESPACE || !HTML_TAGS.contains(&tag) {
+                if !DROPPED_WITH_CONTENT.contains(&tag.to_ascii_lowercase().as_str()) {
+                    children(out);
+                }
+                return;
+            }
+            let attrs = attrs.borrow();
+            let value = |key: &str| {
+                attrs.iter().find(|a| a.name.ns.is_empty() && a.name.local.as_ref() == key).map(|a| a.value.to_string())
+            };
+            if tag == "img" && !value("src").is_some_and(|src| inline_image(&src)) {
+                return;
+            }
+            out.push('<');
+            out.push_str(tag);
+            for key in ["src", "alt", "colspan", "rowspan", "data-odf-whitespace"] {
+                if let Some(value) = value(key) {
+                    out.push(' ');
+                    out.push_str(key);
+                    out.push_str("=\"");
+                    escape_html(&value, out);
+                    out.push('"');
+                }
+            }
+            out.push('>');
+            if !HTML_VOID.contains(&tag) {
+                children(out);
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `sanitizeDocumentHtml`: only the document tags and attributes the web keeps, and only inline
+/// images, so a saved output loads, links and runs nothing.
+pub(super) fn sanitize_html(source: &str) -> String {
+    use html5ever::tendril::TendrilSink as _;
+    use html5ever::{LocalName, Namespace, QualName};
+    let body = QualName::new(None, Namespace::from(HTML_NAMESPACE), LocalName::from("body"));
+    let dom = html5ever::parse_fragment(markup5ever_rcdom::RcDom::default(), Default::default(), body, Vec::new())
+        .one(source);
+    let mut out = String::new();
+    // The fragment parses under an `html` element of its own.
+    for root in dom.document.children.borrow().iter() {
+        root.children.borrow().iter().for_each(|child| write_html(child, &mut out));
+    }
+    out
 }
 
 /// Re-parses after each pass: dropping a link's brackets can join text into new syntax.
@@ -239,6 +400,7 @@ struct CellViews {
     markdown: Option<Entity<TextViewState>>,
     editor: Option<Entity<EditorState>>,
     images: Vec<Option<Arc<Image>>>,
+    html: Vec<Option<Entity<TextViewState>>>,
 }
 
 pub(super) struct Notebook {
@@ -292,6 +454,14 @@ impl Workspace {
                     _ => None,
                 })
                 .collect();
+            views.html = cell
+                .outputs
+                .iter()
+                .map(|output| match output {
+                    Output::Html(html) => Some(cx.new(|cx| TextViewState::html(html, cx))),
+                    _ => None,
+                })
+                .collect();
             notebook.views.push(views);
         }
         let border = tokens.border.opacity(0.6);
@@ -333,13 +503,14 @@ impl Workspace {
                     ),
                 );
             }
-            for (output, image) in cell.outputs.iter().zip(&views.images) {
-                let body: AnyElement = match (output, image) {
-                    (_, Some(image)) => div()
+            for ((output, image), html) in cell.outputs.iter().zip(&views.images).zip(&views.html) {
+                let body: AnyElement = match (output, image, html) {
+                    (_, Some(image), _) => div()
                         .p(px(16.))
                         .child(img(image.clone()).max_w_full().max_h(px(384.)).object_fit(ObjectFit::Contain))
                         .into_any_element(),
-                    (Output::Text(text) | Output::Html(text), _) => div()
+                    (_, _, Some(html)) => div().p(px(16.)).child(TextView::new(html)).into_any_element(),
+                    (Output::Text(text), _, _) => div()
                         .p(px(16.))
                         .text_xs()
                         .font_family(tokens.fonts.mono)
@@ -446,7 +617,7 @@ mod tests {
         assert_eq!(data.cells[1].kind, CellKind::Code);
         assert_eq!(data.cells[1].outputs.len(), 3, "blank outputs are dropped");
         assert_eq!(data.cells[1].outputs[0], Output::Text("1\n".into()));
-        assert_eq!(data.cells[1].outputs[1], Output::Html("x".into()));
+        assert_eq!(data.cells[1].outputs[1], Output::Html("<b>x</b>".into()), "HTML outputs keep their markup");
         assert!(matches!(data.cells[1].outputs[2], Output::Image(ImageFormat::Png, _)));
         assert_eq!(data.cells[2].kind, CellKind::Raw);
         let v3 = serde_json::json!({"nbformat": 3, "cells": []});
@@ -454,6 +625,22 @@ mod tests {
             open_notebook(v3.to_string().as_bytes()).err().unwrap(),
             "Preview supports version 4 notebooks with up to 500 cells."
         );
+    }
+
+    #[test]
+    fn notebook_html_keeps_document_markup_and_loads_nothing() {
+        assert_eq!(
+            sanitize_html(r#"<table><tr><th colspan="2" style="color:red">a&amp;b</th></tr></table>"#),
+            r#"<table><tbody><tr><th colspan="2">a&amp;b</th></tr></tbody></table>"#
+        );
+        assert_eq!(sanitize_html(r#"<a href="https://x" onclick="y()">link</a> <em>t</em>"#), "link <em>t</em>");
+        assert_eq!(sanitize_html("a<script>alert(1)</script><style>p{}</style><svg><text>s</text></svg>b"), "ab");
+        assert_eq!(sanitize_html(r#"<img src="http://x/a.png"><img src="data:image/svg+xml;base64,PHN2Zz4=">"#), "");
+        assert_eq!(
+            sanitize_html(r#"<img src="data:image/png;base64,iVBORw0KGgo=" alt='p"q'>"#),
+            r#"<img src="data:image/png;base64,iVBORw0KGgo=" alt="p&quot;q">"#
+        );
+        assert_eq!(sanitize_html("<!-- c --><unknown>kept</unknown>"), "kept");
     }
 
     /// Every node that loads or links a URL, in `text` as the renderer parses it.

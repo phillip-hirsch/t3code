@@ -550,6 +550,20 @@ pub struct RepositoryIdentity {
     pub name: Option<String>,
     #[serde(default)]
     pub origin: Option<RepositoryOrigin>,
+    /// The code host's kind (`github`, `gitlab`, ...), when known.
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub locator: Option<RepositoryLocator>,
+}
+
+/// The git remote a repository was identified from.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryLocator {
+    pub remote_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

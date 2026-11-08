@@ -54,6 +54,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 log = "0.4"
 # Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
 markdown = "1"
+# Notebook HTML outputs are sanitized before they render; gpui-base's HTML view already builds both.
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }

@@ -27,6 +27,9 @@ use crate::app::{Target, Workspace};
 use crate::rpc::RpcError;
 use crate::theme::Tokens;
 
+/// `AuthFilesystemWriteScope`.
+const FILESYSTEM_WRITE: &str = "filesystem:write";
+
 /// `LARGE_TEXT_MAX_BYTES`.
 const FULL_FILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -43,6 +46,13 @@ const CONTENT_MIN: f32 = 256.;
 enum FullFile {
     Loading,
     Ready { editor: Entity<EditorState>, table: Option<std::rc::Rc<super::table::Table>> },
+    Failed,
+}
+
+/// A workspace image's fetch (`useAssetUrlState` and the image's own load).
+enum WorkspaceImage {
+    Loading,
+    Ready(std::sync::Arc<gpui_kit::Image>),
     Failed,
 }
 
@@ -86,6 +96,8 @@ pub(super) struct PreviewState {
     applied_wrap: Option<bool>,
     mutation: Option<(Option<String>, Option<String>)>,
     revealed: Option<u64>,
+    /// The open request the rendered view was picked over (`handledReveal`).
+    rendered_reveal: Option<u64>,
     _read: Option<Task<()>>,
     _full: Option<Task<()>>,
     _save: Option<Task<()>>,
@@ -109,6 +121,7 @@ impl PreviewState {
             applied_wrap: None,
             mutation: None,
             revealed: None,
+            rendered_reveal: None,
             _read: None,
             _full: None,
             _save: None,
@@ -174,14 +187,28 @@ impl Rendered {
     }
 }
 
+/// `revealHandled`: a line reveal shows the source until the rendered view is picked over it.
+fn reveal_handled(reveal: Option<(Option<u32>, u64)>, rendered_reveal: Option<u64>) -> bool {
+    match reveal {
+        Some((Some(_), request)) => rendered_reveal == Some(request),
+        _ => true,
+    }
+}
+
 impl super::FilesState {
-    pub(super) fn shows_rendered(&self, mode: Rendered) -> bool {
-        match mode {
+    /// The rendered view `key` shows in `mode`: the preference, unless a line reveal holds the source.
+    pub(super) fn shows_rendered(&self, key: &FileKey, mode: Rendered) -> bool {
+        let preferred = match mode {
             Rendered::Markdown => self.render_markdown,
             Rendered::Html => !self.html_source,
             Rendered::Table => !self.table_source,
             Rendered::Mermaid => !self.mermaid_source,
-        }
+        };
+        preferred
+            && reveal_handled(
+                self.reveals.get(key).copied(),
+                self.previews.get(key).and_then(|state| state.rendered_reveal),
+            )
     }
 
     pub(super) fn set_rendered(&mut self, mode: Rendered, rendered: bool) {
@@ -208,10 +235,10 @@ impl Workspace {
             return;
         }
         let path = logic::normalize_open_path(path);
-        if let (Some(line), Some(target)) = (line, self.project_target()) {
+        if let Some(target) = self.project_target() {
             self.files.reveal_requests += 1;
             let key = FileKey { checkout: target.checkout, path: path.clone() };
-            self.files.reveals.insert(key, (line.max(1), self.files.reveal_requests));
+            self.files.reveals.insert(key, (line.map(|line| line.max(1)), self.files.reveal_requests));
         }
         self.open_file_surface(path, window, cx);
     }
@@ -229,6 +256,13 @@ impl Workspace {
         state.mutation = Some(mutation);
         if state.kind == logic::FileKind::Image {
             state.load = Load::Image;
+            // `workspace-revision`: a mutation fetches the image again.
+            if changed {
+                let resource = self.image_resource(key);
+                if let Some(images) = self.files.images.get(&key.checkout.env) {
+                    images.update(cx, |images, _| images.forget(&resource));
+                }
+            }
         } else if state.kind.is_asset() {
             state.load = Load::Asset;
         } else if fresh || (changed && !dirty) {
@@ -249,12 +283,42 @@ impl Workspace {
             state.applied_wrap = Some(wrap);
             editor.update(cx, |editor, cx| editor.set_soft_wrap(wrap, window, cx));
         }
-        if let Some((line, request)) = reveal.filter(|(_, request)| state.revealed != Some(*request)) {
+        // The full file shows in place of the first megabyte once it loads, so the line waits for it.
+        let shown = match &state.full {
+            None => Some(editor),
+            Some(FullFile::Ready { editor, .. }) => Some(editor.clone()),
+            Some(FullFile::Loading | FullFile::Failed) => None,
+        };
+        if let (Some(editor), Some((Some(line), request))) = (shown, reveal)
+            && state.revealed != Some(request)
+        {
             state.revealed = Some(request);
             editor.update(cx, |editor, cx| editor.set_cursor_position(Position::new(line - 1, 0), window, cx));
             // The caret moves without taking focus: the composer keeps it, as when the web's palette closes.
             self.focus_composer(window, cx);
         }
+    }
+
+    /// `onRefreshSelectedFile`: the tree's Refresh reads the open file again (unless edits are
+    /// unsaved) and reloads its document view; media and PDFs keep what they show.
+    pub(super) fn refresh_selected_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.files.previews.get(key) else { return };
+        let (kind, folder, dirty) = (state.kind, matches!(state.load, Load::Folder), state.save.pending());
+        match kind {
+            logic::FileKind::Image | logic::FileKind::Video | logic::FileKind::Audio | logic::FileKind::Pdf => {}
+            _ if folder => {}
+            kind @ (logic::FileKind::Text | logic::FileKind::Html) => {
+                if !dirty {
+                    self.read_file(key.clone(), window, cx);
+                }
+                if kind == logic::FileKind::Html {
+                    self.files.documents.forget(key);
+                }
+            }
+            logic::FileKind::Font => self.files.documents.forget(key),
+            _ => self.files.assets.forget(key),
+        }
+        cx.notify();
     }
 
     fn read_file(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -378,6 +442,8 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(state) = this.files.previews.get_mut(&request_key) else { return };
+                // A new viewer takes the open request's line again, like the web's remounted one.
+                state.revealed = None;
                 state.full = Some(match text {
                     Ok((text, cells)) => {
                         let editor = cx.new(|cx| EditorState::new(window, cx).language("text").default_value(text));
@@ -435,9 +501,53 @@ impl Workspace {
         }
     }
 
-    /// An environment's socket is back: its files' unsaved edits write again, like the web's
-    /// `subscribeWritable` recovery, after the usual debounce.
+    fn toggle_markdown_task(
+        &mut self,
+        key: &FileKey,
+        item_start: usize,
+        checked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.files.previews.get(key) else { return };
+        let (Some(editor), markdown) = (state.editor.clone(), state.markdown.clone()) else { return };
+        let Some(next) = logic::set_markdown_task(&editor.read(cx).value(), item_start, checked) else { return };
+        if let Some(markdown) = markdown {
+            markdown.update(cx, |view, cx| view.set_text(&next, cx));
+        }
+        editor.update(cx, |editor, cx| editor.set_value(next, window, cx));
+        self.change_file(key, cx);
+    }
+
+    /// An environment's socket is back: its grants are asked again, and its files' unsaved
+    /// edits write again once it may write, like the web's `subscribeWritable` recovery.
     pub(in crate::app) fn resume_file_saves(&mut self, env: &str, cx: &mut Context<Self>) {
+        self.files.writable.remove(env);
+        self.resume_pending_saves(env, cx);
+    }
+
+    /// `useEnvironmentScope(environmentId, AuthFilesystemWriteScope)`: whether files on `env`
+    /// are editable, `None` while its session is being asked.
+    fn can_write_files(&mut self, env: &SharedString, cx: &mut Context<Self>) -> Option<bool> {
+        if let Some((granted, _)) = self.files.writable.get(env) {
+            return *granted;
+        }
+        let endpoint = self.env_endpoint(env)?.clone();
+        let answered = env.clone();
+        let task =
+            crate::app::pages::settings::check_scope(endpoint, FILESYSTEM_WRITE, cx, move |this, granted, cx| {
+                if let Some((writable, _)) = this.files.writable.get_mut(&answered) {
+                    *writable = Some(granted);
+                }
+                if granted {
+                    this.resume_pending_saves(&answered, cx);
+                }
+            });
+        self.files.writable.insert(env.clone(), (None, task));
+        None
+    }
+
+    fn resume_pending_saves(&mut self, env: &str, cx: &mut Context<Self>) {
         for (key, state) in &mut self.files.previews {
             if key.checkout.env != env || !state.save.pending() {
                 continue;
@@ -467,8 +577,12 @@ impl Workspace {
         }));
     }
 
-    /// The write's socket is the environment the file was opened on, whatever is open now.
+    /// The write's socket is the environment the file was opened on, whatever is open now. Without
+    /// write access the edits stay unsaved until it returns.
     fn start_write(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<(crate::rpc::RpcClient, u64, String)> {
+        if self.files.writable.get(&key.checkout.env).and_then(|(granted, _)| *granted) != Some(true) {
+            return None;
+        }
         let client = self.env_client(&key.checkout.env)?;
         let state = self.files.previews.get_mut(key)?;
         let contents = state.editor.as_ref()?.read(cx).value().to_string();
@@ -532,6 +646,18 @@ impl Workspace {
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
         let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
         let draft = !matches!(self.target, Some(Target::Thread { .. }));
+        let read_only =
+            (self.can_write_files(&checkout.env, cx) == Some(false) && !logic::is_host_path(&path)).then(|| {
+                div()
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(tokens.border)
+                    .text_size(gpui_kit::rems(0.625))
+                    .text_color(tokens.muted_foreground)
+                    .child("Read-only connection. Unsaved edits are kept until write access returns.")
+            });
         let notice = self.files.previews.get(&key).and_then(|state| match state.load {
             Load::Text { truncated: true, byte_length } if !logic::loads_full_file(&path, draft) => Some(
                 div()
@@ -550,7 +676,11 @@ impl Workspace {
             ),
             _ => None,
         });
-        let body = if folder {
+        let body = if folder && logic::is_host_path(&path) {
+            // A host folder roots its own tree (`hostFolderPath`).
+            let root = super::Checkout { env: checkout.env.clone(), cwd: path.clone() };
+            self.render_tree(&root, None, reveal, window, cx)
+        } else if folder {
             self.render_tree(&checkout, Some(&path), reveal, window, cx)
         } else {
             let max = EXPLORER_MAX.min(width - CONTENT_MIN).max(EXPLORER_MIN);
@@ -601,6 +731,7 @@ impl Workspace {
             .min_h_0()
             .bg(tokens.background)
             .child(subheader)
+            .children(read_only)
             .children(notice)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .into_any_element()
@@ -649,7 +780,7 @@ impl Workspace {
                         .text_color(tokens.muted_foreground.opacity(0.6))
                         .into_any_element()
                 } else {
-                    self.crumb_menu(&key.checkout, &parent, &path, tokens, cx)
+                    self.crumb_menu(&key.checkout, &parent, &path, project_name, tokens, cx)
                 });
             }
             parent = crumb.clone();
@@ -699,7 +830,7 @@ impl Workspace {
         let text = state.is_some_and(|s| matches!(s.load, Load::Text { .. }));
         let kind = state.map_or(logic::FileKind::Text, |s| s.kind);
         let mode = (!folder).then(|| Rendered::of(&path)).flatten();
-        let rendered = mode.is_some_and(|mode| self.files.shows_rendered(mode));
+        let rendered = mode.is_some_and(|mode| self.files.shows_rendered(key, mode));
         let shows_raw_text = text && !rendered && kind != logic::FileKind::Pdf;
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
@@ -720,9 +851,14 @@ impl Workspace {
                     (false, Rendered::Table) => IconName::Table2,
                     (false, _) => IconName::Eye,
                 };
+                let key = key.clone();
                 el.child(action("file-rendered", icon, mode.toggle_label(rendered).into(), rendered).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.files.set_rendered(mode, !rendered);
+                        let request = this.files.reveals.get(&key).map(|(_, request)| *request);
+                        if let Some(state) = this.files.previews.get_mut(&key) {
+                            state.rendered_reveal = if rendered { None } else { request };
+                        }
                         cx.notify();
                     }),
                 ))
@@ -767,9 +903,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let render_markdown = self.files.render_markdown;
-        let delimiter = logic::table_delimiter(&key.path).filter(|_| self.files.shows_rendered(Rendered::Table));
-        let render_mermaid = self.files.shows_rendered(Rendered::Mermaid);
+        let render_markdown = self.files.shows_rendered(key, Rendered::Markdown);
+        let delimiter = logic::table_delimiter(&key.path).filter(|_| self.files.shows_rendered(key, Rendered::Table));
+        let render_mermaid = self.files.shows_rendered(key, Rendered::Mermaid);
         let kind = self.files.previews.get(key).map_or(logic::FileKind::Text, |s| s.kind);
         match self.files.previews.get(key).map(|s| &s.load) {
             Some(Load::Asset) => {
@@ -781,13 +917,18 @@ impl Workspace {
                 };
             }
             Some(Load::Binary) => return self.render_asset_file(key, kind, width, window, cx),
-            Some(Load::Text { .. }) if kind == logic::FileKind::Html && self.files.shows_rendered(Rendered::Html) => {
+            Some(Load::Text { .. })
+                if kind == logic::FileKind::Html && self.files.shows_rendered(key, Rendered::Html) =>
+            {
                 return self.render_document(key, kind, window, cx);
             }
             _ => {}
         }
         let image = matches!(self.files.previews.get(key).map(|s| &s.load), Some(Load::Image))
             .then(|| self.workspace_image(key, cx));
+        let media_menu = image.is_some().then(|| self.render_media_menu()).flatten();
+        // A truncated read, a host file or a connection without write access shows the source read-only.
+        let editable = self.can_write_files(&key.checkout.env, cx) == Some(true) && !logic::is_host_path(&key.path);
         let Some(state) = self.files.previews.get_mut(key) else { return div().into_any_element() };
         let centered = |child: AnyElement| {
             div()
@@ -803,10 +944,53 @@ impl Workspace {
         };
         match &state.load {
             Load::Loading => centered(Spinner::new().large().color(tokens.muted_foreground).into_any_element()),
-            Load::Image => centered(match image.flatten() {
-                Some(image) => img(image).max_w_full().max_h_full().object_fit(ObjectFit::Contain).into_any_element(),
-                None => Spinner::new().large().color(tokens.muted_foreground).into_any_element(),
-            }),
+            Load::Image => match image.unwrap_or(WorkspaceImage::Loading) {
+                WorkspaceImage::Loading => {
+                    centered(Spinner::new().large().color(tokens.muted_foreground).into_any_element())
+                }
+                // `MediaActions`: a right click opens the image's menu; hovering names its path.
+                loaded => {
+                    let ready = match &loaded {
+                        WorkspaceImage::Ready(image) => Some(image.clone()),
+                        _ => None,
+                    };
+                    let tooltip: SharedString = logic::absolute_path(&key.checkout.cwd, &key.path).into();
+                    let menu_key = key.clone();
+                    let menu_image = ready.clone();
+                    div()
+                        .id("workspace-image")
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .px(px(24.))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .on_mouse_down(
+                            gpui_kit::MouseButton::Right,
+                            cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                                let kind = super::media::MediaKind::Image;
+                                let image = menu_image.clone();
+                                this.open_media_menu(&menu_key, kind, image, event.position, window, cx);
+                            }),
+                        )
+                        .child(match ready {
+                            Some(image) => {
+                                img(image).max_w_full().max_h_full().object_fit(ObjectFit::Contain).into_any_element()
+                            }
+                            None => div()
+                                .text_center()
+                                .text_xs()
+                                .line_height(gpui_kit::relative(1.625))
+                                .text_color(tokens.error)
+                                .child("Unable to load workspace image.")
+                                .into_any_element(),
+                        })
+                        .children(media_menu)
+                        .into_any_element()
+                }
+            },
             Load::Binary | Load::Asset => div().into_any_element(),
             Load::Failed { message, attempted, cwd } => {
                 let workspace = cwd.clone().unwrap_or_else(|| key.checkout.cwd.clone());
@@ -859,6 +1043,15 @@ impl Workspace {
                     let saved = state.saved.clone();
                     let view =
                         state.markdown.get_or_insert_with(|| cx.new(|cx| TextViewState::markdown(&saved, cx))).clone();
+                    // `onTaskListChange`: a task's checkbox edits the file, which saves as typing does.
+                    let toggle = (editable && !*truncated).then(|| {
+                        let (this, key) = (cx.entity().downgrade(), key.clone());
+                        move |item_start: usize, checked: bool, window: &mut Window, cx: &mut gpui_kit::App| {
+                            let _ = this.update(cx, |this, cx| {
+                                this.toggle_markdown_task(&key, item_start, checked, window, cx);
+                            });
+                        }
+                    });
                     return div()
                         .id("file-markdown")
                         .flex_1()
@@ -866,14 +1059,14 @@ impl Workspace {
                         .overflow_y_scroll()
                         .px(px(24.))
                         .py(px(16.))
-                        .child(TextView::new(&view))
+                        .child(TextView::new(&view).when_some(toggle, TextView::on_task_toggle))
                         .into_any_element();
                 }
                 let Some(editor) = state.editor.clone() else { return div().into_any_element() };
                 Editor::new(&editor)
                     .appearance(false)
                     .bordered(false)
-                    .readonly(*truncated)
+                    .readonly(*truncated || !editable)
                     .h_full()
                     .font_family(tokens.fonts.mono)
                     .into_any_element()
@@ -965,18 +1158,26 @@ impl Workspace {
     }
 
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.
-    fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui_kit::Image>> {
+    fn workspace_image(&mut self, key: &FileKey, cx: &mut Context<Self>) -> WorkspaceImage {
+        let resource = self.image_resource(key);
+        let env = &key.checkout.env;
+        let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
+        let images = self.files.images.entry(env.clone()).or_insert_with(|| cx.new(|_| Default::default())).clone();
+        images.update(cx, |images, cx| match images.get(resource.clone(), client, endpoint, cx) {
+            Some(image) => WorkspaceImage::Ready(image),
+            None if images.failed(&resource) => WorkspaceImage::Failed,
+            None => WorkspaceImage::Loading,
+        })
+    }
+
+    fn image_resource(&self, key: &FileKey) -> Value {
         let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
-        let resource = match &self.target {
+        match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
             }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
-        };
-        let env = &key.checkout.env;
-        let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
-        let images = self.files.images.entry(env.clone()).or_insert_with(|| cx.new(|_| Default::default())).clone();
-        images.update(cx, |images, cx| images.get(resource, client, endpoint, cx))
+        }
     }
 
     /// The editor the details card's Open in launches.
@@ -1007,4 +1208,18 @@ async fn fetch_asset(
                 .context("Text previews support files up to 256 MB.")
         })
         .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_handled;
+
+    #[test]
+    fn a_line_reveal_holds_the_source_until_the_rendered_view_is_picked() {
+        assert!(reveal_handled(None, None));
+        assert!(reveal_handled(Some((None, 3)), None), "an open without a line keeps the rendered view");
+        assert!(!reveal_handled(Some((Some(12), 3)), None));
+        assert!(reveal_handled(Some((Some(12), 3)), Some(3)), "picking the rendered view handles the reveal");
+        assert!(!reveal_handled(Some((Some(12), 4)), Some(3)), "a newer line request shows the source again");
+    }
 }

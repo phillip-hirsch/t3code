@@ -596,6 +596,31 @@ fn render_diff(
         geometry: state.geometry().clone(),
         state: cx.entity(),
     });
+    let sticky = if props.header_visible && !state.rows().is_empty() {
+        state.sticky_header()
+    } else {
+        None
+    };
+    let sticky_header = sticky.map(|(file, push)| {
+        let height = state.sticky_height().clone();
+        div()
+            .id("diff-sticky-header")
+            .absolute()
+            .top(push)
+            .left_0()
+            .right_0()
+            .occlude()
+            .bg(cx.theme().background)
+            .child(render_file_header(file, &code, window, cx))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| height.set(bounds.size.height),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+    });
     let rows = state.rows().clone();
     let scrollbar = state.list().clone();
     let horizontal = state.horizontal_scroll().clone();
@@ -638,6 +663,7 @@ fn render_diff(
             state.selection().clone(),
             state.geometry().clone(),
         ))
+        .children(sticky_header)
         .when(has_rows && !soft_wrap, |this| {
             this.child(
                 ScrollableMask::new(Axis::Horizontal, &horizontal).id("diff-horizontal-wheel"),

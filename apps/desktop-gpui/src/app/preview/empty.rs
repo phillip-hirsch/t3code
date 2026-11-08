@@ -3,17 +3,18 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
+    AnyElement, AppContext as _, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::NavStatus;
+use crate::preview::{self, FileDownload, NavStatus, Session};
 use crate::theme::Tokens;
 
 /// `PREVIEW_ERROR_CODE_MESSAGES`.
@@ -125,7 +126,7 @@ impl Workspace {
         let thread_id = self.preview_thread_id()?;
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab));
         let blank = !self.preview.tabs.contains_key(tab.as_str())
-            && session.is_none_or(|s| !s.server_hosted() && matches!(s.nav_status, NavStatus::Idle));
+            && session.is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
         if !blank {
             return None;
         }
@@ -163,9 +164,39 @@ impl Workspace {
         self.preview.discovery.subscribed = Some(((environment, urls), task));
     }
 
-    /// Opens a card's URL in the blank tab (`handleOpenServerUrl`).
-    fn open_in_blank_tab(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_address(&url, window, cx);
+    /// Opens a card's URL in the blank tab (`handleOpenServerUrl`); a tab this computer hosts
+    /// reaches a remote environment's loopback servers through the environment's host.
+    fn open_in_blank_tab(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let server = self.active_session(&thread_id).is_some_and(Session::server_hosted);
+        let url = if server {
+            preview::normalize_url(&raw).map_err(str::to_owned)
+        } else {
+            Ok(self.discovered_url(&thread_id, &raw))
+        };
+        match url {
+            Ok(url) => {
+                self.record_visit(&thread_id, &raw);
+                self.navigate_preview(thread_id, url, window, cx);
+            }
+            Err(message) => {
+                self.error = Some(format!("Could not open this address. {message}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// `resolveDiscoveredServerUrl` for `thread_id`'s environment: only this app's own server
+    /// shares this computer's loopback.
+    pub(super) fn discovered_url(&self, thread_id: &str, raw: &str) -> String {
+        let environment = self.thread_environment(thread_id);
+        if !self.environment_remote && environment.as_ref() == self.primary_environment() {
+            return preview::resolve_discovered_url(raw, None);
+        }
+        match environment.as_ref().and_then(|environment| self.env_endpoint(environment)) {
+            Some(endpoint) => preview::resolve_discovered_url(raw, Some(&endpoint.http_base)),
+            None => raw.to_owned(),
+        }
     }
 
     /// `PreviewEmptyState`: recents and live servers, else the "No preview yet" note.
@@ -368,11 +399,14 @@ impl Workspace {
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let NavStatus::LoadFailed { url, code, description, .. } = status else { return None };
+        let NavStatus::LoadFailed { url, code, description, download, .. } = status else { return None };
         let host = url::Url::parse(url)
             .ok()
             .and_then(|u| u.host_str().map(|h| u.port().map_or_else(|| h.to_owned(), |p| format!("{h}:{p}"))))
             .unwrap_or_else(|| url.clone());
+        if let Some(download) = download {
+            return Some(self.render_file_not_shown(tab_id, url, host, download, tokens, cx));
+        }
         let label = if description.is_empty() {
             format!("ERR_{}", if *code == 0 { "FAILED".into() } else { code.abs().to_string() })
         } else {
@@ -494,15 +528,131 @@ impl Workspace {
                                         .small()
                                         .label("Reload")
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(tab) = this.preview.tabs.get(&reload_tab) {
-                                                let _ = tab.view.read(cx).raw().reload();
-                                            }
+                                            this.refresh_preview_tab(&reload_tab, cx);
                                         })),
                                 ),
                         ),
                 )
                 .into_any_element(),
         )
+    }
+
+    /// `PreviewFileNotShown`: the navigation was a file the server's browser downloaded.
+    fn render_file_not_shown(
+        &self,
+        tab_id: &str,
+        url: &str,
+        host: String,
+        download: &FileDownload,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (open, tab, saving) = (url.to_owned(), tab_id.to_owned(), download.clone());
+        div()
+            .id("preview-file-not-shown")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(tokens.background)
+            .child(
+                v_flex()
+                    .mx_auto()
+                    .size_full()
+                    .max_w(px(576.))
+                    .px_8()
+                    .py_16()
+                    .child(
+                        super::super::titlebar::icon("icons/file-x.svg")
+                            .with_size(px(48.))
+                            .mb_6()
+                            .text_color(tokens.muted_foreground.opacity(0.7)),
+                    )
+                    .child(
+                        div()
+                            .mb_3()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.foreground)
+                            .child("This file can\u{2019}t be shown here"),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .text_sm()
+                            .text_color(tokens.muted_foreground)
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.foreground)
+                                    .child(download.file_name.clone()),
+                            )
+                            .child(format!("\u{a0}from {host} was downloaded instead.")),
+                    )
+                    .child(
+                        h_flex()
+                            .mt_auto()
+                            .pt_8()
+                            .gap_2()
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("preview-file-open")
+                                    .outline()
+                                    .small()
+                                    .label("Open in browser")
+                                    .on_click(move |_, _, cx| cx.open_url(&open)),
+                            )
+                            .child(Button::new("preview-file-download").primary().small().label("Download").on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.save_preview_download(&tab, &saving, window, cx);
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Download: fetches the file the server's browser kept and writes it where the user picks.
+    fn save_preview_download(
+        &self,
+        tab_id: &str,
+        download: &FileDownload,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_id) = self.preview_thread_id() else { return };
+        let Some(endpoint) = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned()) else {
+            return;
+        };
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("threadId", thread_id)
+            .append_pair("tabId", tab_id)
+            .append_pair("id", &download.id)
+            .finish();
+        let url = format!("{}/api/preview-stream/download?{query}", endpoint.http_base);
+        let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
+        let picked = cx.prompt_for_new_path(&directory, Some(&download.file_name));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            let fetched = crate::runtime()
+                .spawn(async move {
+                    let request = reqwest::Client::new().get(url).bearer_auth(endpoint.bearer_token);
+                    request.send().await?.error_for_status()?.bytes().await
+                })
+                .await;
+            let written = match fetched {
+                Ok(Ok(bytes)) => {
+                    cx.background_spawn(async move { std::fs::write(&path, bytes) }).await.map_err(|e| e.to_string())
+                }
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = written {
+                let _ = cx.update(|window, cx| {
+                    let toast = Notification::error(error).title("Could not save file");
+                    window.push_notification(toast, cx);
+                });
+            }
+        })
+        .detach();
     }
 }
 

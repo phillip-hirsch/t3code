@@ -29,7 +29,18 @@ pub enum NavStatus {
         code: i64,
         #[serde(default)]
         description: String,
+        /// The navigation was a file the server's browser downloaded instead of showing.
+        #[serde(default)]
+        download: Option<FileDownload>,
     },
+}
+
+/// `PreviewFileDownload`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDownload {
+    pub id: String,
+    pub file_name: String,
 }
 
 impl NavStatus {
@@ -56,8 +67,13 @@ impl NavStatus {
             NavStatus::Idle => json!({"_tag": "Idle"}),
             NavStatus::Loading { url, title } => json!({"_tag": "Loading", "url": url, "title": title}),
             NavStatus::Success { url, title } => json!({"_tag": "Success", "url": url, "title": title}),
-            NavStatus::LoadFailed { url, title, code, description } => {
-                json!({"_tag": "LoadFailed", "url": url, "title": title, "code": code, "description": description})
+            NavStatus::LoadFailed { url, title, code, description, download } => {
+                let mut status =
+                    json!({"_tag": "LoadFailed", "url": url, "title": title, "code": code, "description": description});
+                if let Some(download) = download {
+                    status["download"] = json!({"id": download.id, "fileName": download.file_name});
+                }
+                status
             }
         }
     }
@@ -317,6 +333,15 @@ pub struct ThreadPreviews {
     server_epoch: Option<String>,
     revision: u64,
     pub list_loaded: bool,
+    /// Tabs whose close is in flight (`suppressedTabIds`): their snapshots stay out until it settles.
+    closing: std::collections::HashSet<String>,
+}
+
+/// A tab taken out by [`ThreadPreviews::begin_close`], to put back if the close fails.
+#[derive(Debug)]
+pub struct ClosingTab {
+    tab_id: String,
+    restore: Option<(usize, Session)>,
 }
 
 /// What an applied event asks of the caller.
@@ -362,6 +387,9 @@ impl ThreadPreviews {
 
     /// Keeps a newer local copy when the incoming one is older (`updatedAt` is ISO-8601).
     fn upsert(&mut self, session: Session) {
+        if self.closing.contains(&session.tab_id) {
+            return;
+        }
         match self.sessions.iter_mut().find(|s| s.tab_id == session.tab_id) {
             Some(existing) if existing.updated_at > session.updated_at => {}
             Some(existing) => *existing = session,
@@ -384,7 +412,11 @@ impl ThreadPreviews {
             return Ok(());
         }
         let previous = std::mem::take(&mut self.sessions);
-        for session in list.sessions {
+        if !same_server {
+            self.closing.clear();
+        }
+        self.closing.retain(|tab| list.sessions.iter().any(|s| &s.tab_id == tab));
+        for session in list.sessions.into_iter().filter(|s| !self.closing.contains(&s.tab_id)) {
             let newer = previous
                 .iter()
                 .find(|s| same_server && s.tab_id == session.tab_id && s.updated_at > session.updated_at);
@@ -425,6 +457,8 @@ impl ThreadPreviews {
             code: i64,
             #[serde(default)]
             description: String,
+            #[serde(default)]
+            download: Option<FileDownload>,
         }
         let event = Event::deserialize(event)?;
         if self.server_epoch.as_deref().is_some_and(|epoch| epoch != event.server_epoch) {
@@ -436,6 +470,9 @@ impl ThreadPreviews {
         match event.kind.as_str() {
             "opened" | "navigated" | "resized" => {
                 let Some(snapshot) = event.snapshot else { return Ok(Applied::Ignored) };
+                if self.closing.contains(&snapshot.tab_id) {
+                    return Ok(Applied::Ignored);
+                }
                 if event.kind == "opened" || self.active_tab.is_none() {
                     self.active_tab = Some(snapshot.tab_id.clone());
                 }
@@ -450,10 +487,14 @@ impl ThreadPreviews {
                     title: event.title,
                     code: event.code,
                     description: event.description,
+                    download: event.download,
                 };
                 session.updated_at = event.created_at;
             }
-            "closed" => self.remove(&event.tab_id),
+            "closed" => {
+                self.remove(&event.tab_id);
+                self.closing.remove(&event.tab_id);
+            }
             _ => return Ok(Applied::Ignored),
         }
         self.server_epoch = Some(event.server_epoch);
@@ -463,10 +504,33 @@ impl ThreadPreviews {
 
     /// A snapshot a request returned (`applyPreviewServerSnapshot`); `focus` makes it the active tab.
     pub fn apply_snapshot(&mut self, snapshot: Session, focus: bool) {
+        if self.closing.contains(&snapshot.tab_id) {
+            return;
+        }
         if focus || self.active().is_none() {
             self.active_tab = Some(snapshot.tab_id.clone());
         }
         self.upsert(snapshot);
+    }
+
+    /// `beginPreviewSessionClose`: the tab leaves the list while `preview.close` runs.
+    pub fn begin_close(&mut self, tab_id: &str) -> ClosingTab {
+        let restore = self.sessions.iter().position(|s| s.tab_id == tab_id).map(|i| (i, self.sessions[i].clone()));
+        self.remove(tab_id);
+        self.closing.insert(tab_id.to_owned());
+        ClosingTab { tab_id: tab_id.to_owned(), restore }
+    }
+
+    /// `cancelPreviewSessionClose`: a failed close puts the tab back in its place, focused.
+    pub fn cancel_close(&mut self, closing: ClosingTab) {
+        if !self.closing.remove(&closing.tab_id) {
+            return;
+        }
+        let Some((index, session)) = closing.restore else { return };
+        self.active_tab = Some(session.tab_id.clone());
+        if self.get(&session.tab_id).is_none() {
+            self.sessions.insert(index.min(self.sessions.len()), session);
+        }
     }
 
     pub fn remove(&mut self, tab_id: &str) {
@@ -633,6 +697,101 @@ fn encode_uri_component(input: &str) -> String {
         }
     }
     out
+}
+
+/// `normalizeHostname`.
+fn normalize_hostname(host: &str) -> String {
+    host.to_ascii_lowercase().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_owned()
+}
+
+/// `isLocalLoopbackHost`.
+fn is_local_loopback_host(host: &str) -> bool {
+    let host = normalize_hostname(host);
+    host == "localhost" || host == "::1" || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.octets()[0] == 127)
+}
+
+/// `isPrivateNetworkHost` (`packages/shared/src/hostClassification.ts`).
+fn is_private_network_host(host: &str) -> bool {
+    let host = normalize_hostname(host);
+    if host == "::"
+        || host == "home.arpa"
+        || is_local_loopback_host(&host)
+        || [".localhost", ".local", ".home.arpa", ".ts.net"].iter().any(|suffix| host.ends_with(suffix))
+        || (!host.contains('.') && !host.contains(':'))
+    {
+        return true;
+    }
+    let private_v4 = |ip: std::net::Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        matches!(a, 0 | 10 | 127)
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 169 && b == 254)
+            || (a == 198 && (18..=19).contains(&b))
+    };
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return private_v4(ip);
+    }
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80, private_v4),
+        Err(_) => false,
+    }
+}
+
+/// `resolveDiscoveredServerUrl`: a loopback server URL from the environment's scan, pointed at the
+/// environment's host when this computer's loopback is another machine's (`environment_base` is
+/// its HTTP base then; `None` for this app's own server). What it can't map stays as given.
+pub fn resolve_discovered_url(raw: &str, environment_base: Option<&str>) -> String {
+    let Ok(normalized) = normalize_url(raw) else { return raw.to_owned() };
+    let Ok(mut parsed) = url::Url::parse(&normalized) else { return raw.to_owned() };
+    let loopback =
+        parsed.host_str().is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]"));
+    let Some(base) = environment_base.filter(|_| loopback) else { return normalized };
+    let Some(environment_host) = url::Url::parse(base).ok().and_then(|url| url.host_str().map(normalize_hostname))
+    else {
+        return raw.to_owned();
+    };
+    // Past the private network this needs the planned authenticated preview gateway.
+    if !is_private_network_host(&environment_host) {
+        return raw.to_owned();
+    }
+    // localhost lets the browser reach loopback servers bound to either IPv4 or IPv6.
+    let host = if is_local_loopback_host(&environment_host) {
+        "localhost".to_owned()
+    } else if environment_host.contains(':') {
+        format!("[{environment_host}]")
+    } else {
+        environment_host
+    };
+    let port = parsed.port_or_known_default();
+    if parsed.set_host(Some(&host)).is_err() || parsed.set_port(port).is_err() {
+        return raw.to_owned();
+    }
+    parsed.into()
+}
+
+/// `previewPdfAssetUrl`: a PDF of the server's signed assets that a server tab opened, as this
+/// client fetches it. The server's browser may reach it on its host's loopback, so such a URL goes
+/// through this client's own connection to the environment instead.
+pub fn pdf_asset_url(raw: &str, http_base: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let base = url::Url::parse(http_base).ok()?;
+    let path = url.path();
+    let pdf = path.len() > 4 && path.get(path.len() - 4..).is_some_and(|ext| ext.eq_ignore_ascii_case(".pdf"));
+    if !matches!(url.scheme(), "http" | "https") || !path.starts_with("/api/assets/") || !pdf {
+        return None;
+    }
+    let host = url.host_str().unwrap_or_default();
+    if url.origin() != base.origin() && !is_local_loopback_host(host) && host != "0.0.0.0" {
+        return Some(url.into());
+    }
+    let mut local = base.join(path).ok()?;
+    local.set_query(url.query());
+    local.set_fragment(url.fragment());
+    Some(local.into())
 }
 
 /// The address bar's text: the page URL, or nothing for a blank tab.
@@ -876,50 +1035,26 @@ pub fn resolve_discovered_server_url(raw: &str, environment_base: Option<&str>) 
     parsed.into()
 }
 
-/// `normalizeHostname`.
-fn normalize_hostname(host: &str) -> String {
-    host.to_ascii_lowercase().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_owned()
-}
-
-/// `isLocalLoopbackHost`.
-fn is_local_loopback_host(host: &str) -> bool {
-    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
-
-/// `isPrivateNetworkHost`, for a normalized host.
-fn is_private_network_host(host: &str) -> bool {
-    use std::net::IpAddr;
-    let private_v4 = |[a, b, ..]: [u8; 4]| {
-        matches!(a, 0 | 10 | 127)
-            || (a == 100 && (64..=127).contains(&b))
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 169 && b == 254)
-            || (a == 198 && (18..=19).contains(&b))
-    };
-    if host == "::"
-        || is_local_loopback_host(host)
-        || [".localhost", ".local", ".home.arpa", ".ts.net"].iter().any(|suffix| host.ends_with(suffix))
-        || host == "home.arpa"
-        || (!host.contains('.') && !host.contains(':'))
-    {
-        return true;
-    }
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => private_v4(ip.octets()),
-        Ok(IpAddr::V6(ip)) => ip.to_ipv4_mapped().map_or_else(
-            || {
-                let first = ip.segments()[0];
-                first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
-            },
-            |ip| private_v4(ip.octets()),
-        ),
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pdf_asset_urls_go_through_this_clients_connection() {
+        let base = "http://env.test:3773";
+        assert_eq!(
+            pdf_asset_url("http://127.0.0.1:3773/api/assets/t/a.PDF?sig=1#page=2", base).as_deref(),
+            Some("http://env.test:3773/api/assets/t/a.PDF?sig=1#page=2"),
+            "the host's loopback is reached through the environment"
+        );
+        assert_eq!(
+            pdf_asset_url("https://cdn.test/api/assets/a.pdf", base).as_deref(),
+            Some("https://cdn.test/api/assets/a.pdf"),
+            "another public origin stays as it is"
+        );
+        assert_eq!(pdf_asset_url("http://env.test:3773/files/a.pdf", base), None, "not a signed asset");
+        assert_eq!(pdf_asset_url("http://env.test:3773/api/assets/a.png", base), None);
+        assert_eq!(pdf_asset_url("file:///api/assets/a.pdf", base), None);
+    }
+
     use super::*;
 
     #[test]
@@ -978,6 +1113,53 @@ mod tests {
         assert!(after.fresh_reveals(&after).is_empty(), "already shown");
         let again = previews(true, vec![quiet, forced]);
         assert_eq!(again.fresh_reveals(&after), [("b".to_owned(), true)], "a new request reveals again");
+    }
+
+    #[test]
+    fn discovered_servers_resolve_against_the_environment_host() {
+        let local = resolve_discovered_url("localhost:5173", None);
+        assert_eq!(local, "http://localhost:5173/", "this app's own server keeps loopback");
+        let lan = Some("http://192.168.1.20:3773");
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/app?x=1#h", lan),
+            "http://192.168.1.20:5173/app?x=1#h"
+        );
+        assert_eq!(resolve_discovered_url("0.0.0.0:3000", lan), "http://192.168.1.20:3000/");
+        assert_eq!(resolve_discovered_url("http://[::1]:8080/", lan), "http://192.168.1.20:8080/");
+        assert_eq!(
+            resolve_discovered_url("http://localhost/", lan),
+            "http://192.168.1.20/",
+            "the default port stays implicit"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("https://box.tail1.ts.net")),
+            "http://box.tail1.ts.net:5173/"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("http://[fd7a:115c::5]:3773")),
+            "http://[fd7a:115c::5]:5173/"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://127.0.0.1:5173/", Some("http://127.0.0.1:4100")),
+            "http://localhost:5173/",
+            "a tunnel's loopback"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://localhost:5173/", Some("https://t3.example.com")),
+            "http://localhost:5173/",
+            "a public host has no route yet"
+        );
+        assert_eq!(
+            resolve_discovered_url("http://10.0.0.5:5173/", lan),
+            "http://10.0.0.5:5173/",
+            "only loopback URLs move"
+        );
+        assert!(
+            is_private_network_host("nas")
+                && is_private_network_host("::ffff:10.1.2.3")
+                && is_private_network_host("fe80::1")
+        );
+        assert!(!is_private_network_host("8.8.8.8") && !is_private_network_host("2001:db8::1"));
     }
 
     #[test]
@@ -1180,6 +1362,15 @@ mod tests {
         previews.apply_event(&failed).unwrap();
         assert!(matches!(previews.active().unwrap().nav_status, NavStatus::LoadFailed { code: -105, .. }));
 
+        let downloaded = json!({"type": "failed", "threadId": "t1", "tabId": "c", "createdAt": "4", "serverEpoch": "e1",
+            "revision": 6, "url": "https://c.test/a.zip", "title": "", "code": -3, "description": "ERR_ABORTED",
+            "download": {"id": "d1", "fileName": "a.zip"}});
+        previews.apply_event(&downloaded).unwrap();
+        let status = &previews.active().unwrap().nav_status;
+        let download = FileDownload { id: "d1".into(), file_name: "a.zip".into() };
+        assert!(matches!(status, NavStatus::LoadFailed { download: Some(d), .. } if *d == download));
+        assert_eq!(status.to_json()["download"], json!({"id": "d1", "fileName": "a.zip"}));
+
         let closed = json!({"type": "closed", "threadId": "t1", "tabId": "c", "createdAt": "5", "serverEpoch": "e1",
             "revision": 7});
         previews.apply_event(&closed).unwrap();
@@ -1188,6 +1379,36 @@ mod tests {
         let restarted = json!({"type": "closed", "threadId": "t1", "tabId": "b", "createdAt": "6", "serverEpoch": "e2",
             "revision": 1});
         assert_eq!(previews.apply_event(&restarted).unwrap(), Applied::Relist);
+    }
+
+    #[test]
+    fn a_failed_close_restores_the_tab_and_a_closing_tab_ignores_updates() {
+        let mut previews = ThreadPreviews::default();
+        let list = |revision: u64| json!({"sessions": [session("a", "1"), session("b", "2"), session("c", "3")], "serverEpoch": "e1", "revision": revision});
+        previews.apply_list(&list(1)).unwrap();
+        let closing = previews.begin_close("b");
+        assert!(previews.get("b").is_none());
+        let navigated = json!({"type": "navigated", "threadId": "t1", "tabId": "b", "createdAt": "4", "serverEpoch": "e1",
+            "revision": 2, "snapshot": session("b", "4")});
+        assert_eq!(previews.apply_event(&navigated).unwrap(), Applied::Ignored, "a closing tab stays out");
+        previews.apply_list(&list(3)).unwrap();
+        assert!(previews.get("b").is_none(), "and out of a list");
+        previews.active_tab = Some("a".into());
+        previews.cancel_close(closing);
+        let order: Vec<&str> = previews.sessions.iter().map(|s| s.tab_id.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c"], "it returns to its place");
+        assert_eq!(previews.active_tab.as_deref(), Some("b"));
+
+        let closing = previews.begin_close("c");
+        let closed = json!({"type": "closed", "threadId": "t1", "tabId": "c", "createdAt": "5", "serverEpoch": "e1",
+            "revision": 4});
+        previews.apply_event(&closed).unwrap();
+        previews.cancel_close(closing);
+        assert!(previews.get("c").is_none(), "a close the server confirmed stays closed");
+        let reopened = json!({"type": "opened", "threadId": "t1", "tabId": "c", "createdAt": "6",
+            "serverEpoch": "e1", "revision": 5, "snapshot": session("c", "6")});
+        previews.apply_event(&reopened).unwrap();
+        assert!(previews.get("c").is_some(), "the id is usable again");
     }
 
     #[test]

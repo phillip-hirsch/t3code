@@ -4,6 +4,7 @@
 //! Other surfaces render in their own modules (files, terminal, pull requests, side chats); the
 //! device surface is not native, so the launcher leaves it out.
 
+mod commit_link;
 mod diff_base;
 mod diff_load;
 mod diff_open;
@@ -23,8 +24,8 @@ use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
-    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
-    LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
+    FocusHandle, Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div, px,
 };
 use serde_json::{Value, json};
@@ -37,6 +38,8 @@ use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 const DEFAULT_WIDTH: f32 = 540.;
+/// A diff read this recently counts as fresh when the panel shows (`LIVE_REFRESH_MIN_INTERVAL_MS`).
+const REVALIDATE_FLOOR: std::time::Duration = std::time::Duration::from_secs(10);
 const MIN_WIDTH: f32 = 360.;
 const MAX_WIDTH_FRACTION: f32 = 0.7;
 /// The chat column keeps at least this much beside the panel.
@@ -172,6 +175,17 @@ impl PanelState {
         }
     }
 
+    /// `moveSurface`: a dragged tab takes `to`'s place, the tabs between shifting over.
+    fn move_surface(&mut self, surface: &Surface, to: &Surface) {
+        let (Some(from), Some(to)) =
+            (self.surfaces.iter().position(|s| s == surface), self.surfaces.iter().position(|s| s == to))
+        else {
+            return;
+        };
+        let moved = self.surfaces.remove(from);
+        self.surfaces.insert(to, moved);
+    }
+
     /// `openFile`: a file's tab replaces the standalone Files tree and keeps its place when open.
     fn open_file(&mut self, path: String) {
         self.surfaces.retain(|s| *s != Surface::Files);
@@ -229,6 +243,14 @@ impl PanelState {
     }
 }
 
+impl DiffKey {
+    /// The same files asked for again: only the reads' revisions differ.
+    fn same_selection(&self, other: &Self) -> bool {
+        (&self.target, &self.cwd, &self.scope, &self.base_ref, self.ignore_whitespace)
+            == (&other.target, &other.cwd, &other.scope, &other.base_ref, other.ignore_whitespace)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct DiffKey {
     target: Target,
@@ -252,7 +274,7 @@ enum DiffLoad {
         head: Option<String>,
         base: Option<String>,
         truncated: bool,
-        /// Files whose patches are still loading.
+        /// Patch reads asked for that have not settled.
         pending: usize,
     },
     Empty(&'static str),
@@ -263,6 +285,7 @@ enum DiffLoad {
 struct Commit {
     sha: String,
     subject: String,
+    committed_at: Option<String>,
 }
 
 /// How [`Workspace::show_diff_files`] puts files in the patch.
@@ -285,21 +308,67 @@ struct FilePatches {
     files: Vec<diff_load::FileStat>,
     /// `files` by path, for the headers' counts.
     stats: std::rc::Rc<HashMap<SharedString, diff_load::FileStat>>,
+    /// Each file's index in `files`, by path.
+    index: HashMap<SharedString, usize>,
+    /// The header-only row each file shows until its patch settles (the `:pending` rows).
+    placeholders: Vec<Vec<DiffFile>>,
     rows: Vec<Option<(Vec<DiffFile>, diff_load::FileState)>>,
-    _retries: Vec<Task<()>>,
+    demand: diff_load::PatchDemand,
+    _reads: Vec<Task<()>>,
+}
+
+impl FilePatches {
+    fn new(
+        selection: (Target, DiffScope),
+        client: RpcClient,
+        request: diff_load::PatchRequest,
+        files: Vec<diff_load::FileStat>,
+        previous: Option<&Self>,
+    ) -> Self {
+        let stats = files.iter().map(|file| (file.path.clone().into(), file.clone())).collect();
+        let index = files.iter().enumerate().map(|(index, file)| (file.path.clone().into(), index)).collect();
+        // A refresh of the same selection keeps the patches it read, each read again behind them.
+        let rows = previous.map_or_else(
+            || vec![None; files.len()],
+            |previous| diff_load::carried_rows(&previous.files, &previous.rows, &files),
+        );
+        let mut demand = diff_load::PatchDemand::new(files.len());
+        demand.request(rows.iter().enumerate().filter_map(|(index, row)| row.as_ref().map(|_| index)));
+        Self {
+            selection,
+            client,
+            request,
+            stats: std::rc::Rc::new(stats),
+            index,
+            placeholders: files.iter().map(diff_load::placeholder).collect(),
+            rows,
+            demand,
+            files,
+            _reads: Vec::new(),
+        }
+    }
 }
 
 pub(super) struct RightPanel {
     panels: HashMap<Target, PanelState>,
     width: f32,
-    /// The "+" menu is open; a native browser view must not cover it.
+    /// The "+" menu is open; a native browser view must not cover it. It also opens the menu,
+    /// as `rightPanel.new` does.
     pub(super) add_menu_open: bool,
+    /// The launcher's "Open browser in a profile" menu is open.
+    pub(super) profiles_menu_open: bool,
+    /// The launcher (`RightPanelEmptyState`), one Tab stop, and the row its arrows reached
+    /// among the available surfaces.
+    launcher_focus: FocusHandle,
+    launcher_highlight: Option<usize>,
     /// A tab's right-click menu, at its window position.
     tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     diff: Entity<DiffState>,
     loaded: Option<DiffKey>,
     load: DiffLoad,
     _task: Option<Task<()>>,
+    /// The branch's commits for the scope menu, read beside the diff (`branchCommitsQuery`).
+    _commits_task: Option<Task<()>>,
     /// The wrap and whitespace toggles; unset, they follow `wordWrap` and `diffIgnoreWhitespace`.
     wrap: Option<bool>,
     ignore_whitespace: Option<bool>,
@@ -310,6 +379,11 @@ pub(super) struct RightPanel {
     /// The selection whose files `diff` holds.
     shown: Option<(Target, DiffScope)>,
     refresh: u64,
+    /// When the last diff read landed, and whether one is on its way (`dataUpdatedAt`, `isPending`).
+    diff_read_at: Option<std::time::Instant>,
+    diff_reading: bool,
+    /// The git diff showed at the last render, to revalidate it when it shows again.
+    git_diff_shown: bool,
     commits: Vec<Commit>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
@@ -341,32 +415,44 @@ pub(super) struct RightPanel {
     tree_rows: std::rc::Rc<[diff_tree::Row]>,
     /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
+    toolbar_focus: DiffToolbarFocus,
+    tree_pane: diff_tree::TreePane,
     _diff_events: Subscription,
 }
 
 impl RightPanel {
     pub(super) fn new(cx: &mut Context<Workspace>) -> Self {
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
-        let diff_events = cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| {
-            if matches!(event, DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_)) {
-                this.remember_collapsed(cx);
+        let diff_events = cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| match event {
+            // The kit's chevron on a file still loading: unfold it and read it now.
+            DiffEvent::FileExpanded(path) if this.pending_patch(path).is_some() => {
+                this.fold_diff_file(path, false, cx);
             }
+            DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_) => this.remember_collapsed(cx),
+            _ => {}
         });
         Self {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
             add_menu_open: false,
+            profiles_menu_open: false,
+            launcher_focus: cx.focus_handle().tab_stop(true),
+            launcher_highlight: None,
             tab_menu: None,
             diff,
             loaded: None,
             load: DiffLoad::Idle,
             _task: None,
+            _commits_task: None,
             wrap: None,
             ignore_whitespace: None,
             diff_mount: None,
             collapsed: HashMap::new(),
             shown: None,
             refresh: 0,
+            diff_read_at: None,
+            diff_reading: false,
+            git_diff_shown: false,
             commits: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
             diff_refs: ScrollHandle::new(),
@@ -386,13 +472,70 @@ impl RightPanel {
             tree_selected: None,
             tree_rows: std::rc::Rc::new([]),
             pending_reveal: None,
+            toolbar_focus: DiffToolbarFocus::new(cx),
+            tree_pane: diff_tree::TreePane::new(cx),
             _diff_events: diff_events,
+        }
+    }
+}
+
+/// The diff toolbar's Tab stops (`Button` and `Toggle`); the layout segments are one stop
+/// between them, like the web's `ToggleGroup`.
+struct DiffToolbarFocus {
+    refresh: FocusHandle,
+    collapse: FocusHandle,
+    stacked: FocusHandle,
+    split: FocusHandle,
+    wrap: FocusHandle,
+    whitespace: FocusHandle,
+    tests: FocusHandle,
+    tree: FocusHandle,
+}
+
+impl DiffToolbarFocus {
+    fn new(cx: &mut App) -> Self {
+        let stop = || cx.focus_handle().tab_stop(true);
+        Self {
+            refresh: stop(),
+            collapse: stop(),
+            stacked: stop(),
+            split: stop(),
+            wrap: stop(),
+            whitespace: stop(),
+            tests: stop(),
+            tree: stop(),
         }
     }
 }
 
 /// Drag payload for the left-edge resize handle.
 struct RightPanelResize;
+
+/// A tab dragged along the strip (`SortableTabList`).
+struct DraggedTab(Surface);
+
+/// The pill that follows the pointer while a tab drags.
+struct TabDragPreview {
+    title: SharedString,
+    colors: (Hsla, Hsla),
+}
+
+impl gpui_kit::Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (background, foreground) = self.colors;
+        div()
+            .h(px(24.))
+            .max_w(px(144.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .bg(background)
+            .text_color(foreground)
+            .text_xs()
+            .child(div().min_w_0().truncate().child(self.title.clone()))
+    }
+}
 
 impl Workspace {
     fn panel_state(&self) -> Option<&PanelState> {
@@ -483,6 +626,22 @@ impl Workspace {
         }
         self.sync_active_browser(window, cx);
         cx.notify();
+    }
+
+    /// [`open_surface`](Self::open_surface) on `target`'s panel, which may not be the one showing.
+    pub(super) fn open_surface_on(
+        &mut self,
+        target: &Target,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target.as_ref() == Some(target) {
+            return self.open_surface(surface, window, cx);
+        }
+        let panel = self.right_panel.panels.entry(target.clone()).or_default();
+        panel.user_revision += 1;
+        panel.upsert(surface);
     }
 
     fn activate_surface(&mut self, surface: Surface, window: &mut Window, cx: &mut Context<Self>) {
@@ -770,13 +929,89 @@ impl Workspace {
     /// Records the shown selection's folds once the user changes one.
     fn remember_collapsed(&mut self, cx: &mut Context<Self>) {
         let Some(shown) = self.right_panel.shown.clone() else { return };
+        // Rows without lines are folded for them, not by the user: one that did not load drops
+        // out, and one still loading keeps the fold it had.
+        let previous = self.current_folds();
         let state = self.right_panel.diff.read(cx);
-        // Rows that did not load are folded for them, not by the user.
         let failed =
-            |path: &&SharedString| self.right_panel.patch_states.get(*path) == Some(&diff_load::FileState::Failed);
-        let folded =
-            state.files().iter().map(DiffFile::path).filter(|path| state.is_file_collapsed(path) && !failed(path));
+            |path: &SharedString| self.right_panel.patch_states.get(path) == Some(&diff_load::FileState::Failed);
+        let folded = state.files().iter().map(DiffFile::path).filter(|path| {
+            if self.pending_patch(path).is_some() {
+                previous.contains(*path)
+            } else {
+                state.is_file_collapsed(path) && !failed(path)
+            }
+        });
         self.right_panel.collapsed.insert(shown, folded.cloned().collect());
+    }
+
+    /// The shown selection's folded files: as the user left them, else `diffFilesCollapsed`.
+    fn current_folds(&self) -> HashSet<SharedString> {
+        let Some(shown) = &self.right_panel.shown else { return HashSet::new() };
+        let paths: Vec<SharedString> = self.right_panel.all_diff_files.iter().map(|f| f.path().clone()).collect();
+        collapsed_files(
+            self.right_panel.collapsed.get(shown),
+            self.client_settings.values.bool("diffFilesCollapsed"),
+            &paths,
+        )
+    }
+
+    /// The index of `path` among the shown selection's lazily read files while its patch is
+    /// still on its way.
+    fn pending_patch(&self, path: &str) -> Option<usize> {
+        let patches = self.right_panel.patches.as_ref()?;
+        if self.right_panel.shown.as_ref() != Some(&patches.selection) {
+            return None;
+        }
+        patches.index.get(path).copied().filter(|index| patches.rows[*index].is_none())
+    }
+
+    /// Folds the shown files to `folded`, remembered for the selection; rows without lines stay
+    /// folded whatever the user chose.
+    fn set_diff_folds(&mut self, folded: HashSet<SharedString>, cx: &mut Context<Self>) {
+        let Some(shown) = self.right_panel.shown.clone() else { return };
+        let paths: Vec<SharedString> =
+            self.right_panel.diff.read(cx).files().iter().map(|file| file.path().clone()).collect();
+        let lineless: HashSet<SharedString> = paths
+            .iter()
+            .filter(|path| {
+                self.pending_patch(path).is_some()
+                    || self.right_panel.patch_states.get(*path) == Some(&diff_load::FileState::Failed)
+            })
+            .cloned()
+            .collect();
+        self.right_panel.diff.update(cx, |state, cx| {
+            for path in &paths {
+                state.set_file_collapsed(path, folded.contains(path) || lineless.contains(path), cx);
+            }
+        });
+        let failed =
+            |path: &SharedString| self.right_panel.patch_states.get(path) == Some(&diff_load::FileState::Failed);
+        let folded = folded.iter().filter(|path| !failed(path)).cloned().collect();
+        self.right_panel.collapsed.insert(shown, folded);
+        cx.notify();
+    }
+
+    /// The header's fold toggle (`toggleDiffFileCollapsed`): a file still loading unfolds and is
+    /// read at once.
+    pub(super) fn fold_diff_file(&mut self, path: &str, collapsed: bool, cx: &mut Context<Self>) {
+        let mut folded = self.current_folds();
+        if collapsed {
+            folded.insert(path.to_owned().into());
+        } else {
+            folded.remove(path);
+        }
+        self.set_diff_folds(folded, cx);
+        if let Some(index) = self.pending_patch(path).filter(|_| !collapsed) {
+            self.request_file_patches([index], cx);
+        }
+    }
+
+    /// `revealDiffFile`: unfolds the file, asks for its patch if it is still loading, and
+    /// scrolls to it.
+    fn reveal_diff_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.fold_diff_file(path, false, cx);
+        self.right_panel.diff.update(cx, |state, cx| state.scroll_to_file(path, cx));
     }
 
     /// `useProactivePanels` for turn diffs: with proactive panels on, a turn that just completed
@@ -942,8 +1177,13 @@ impl Workspace {
             self.reveal_pending_file(cx);
             return;
         }
-        self.right_panel.loaded = Some(key);
         let selection = (target.clone(), scope.clone());
+        // A refresh of the shown selection keeps it readable until the new read lands.
+        let retain = self.right_panel.loaded.as_ref().is_some_and(|loaded| loaded.same_selection(&key))
+            && self.right_panel.shown.as_ref() == Some(&selection)
+            && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
+        let install = if retain { Install::Update } else { Install::Replace };
+        self.right_panel.loaded = Some(key);
         let (Some(client), Target::Thread { id: thread_id, .. }) = (self.client(), target) else { return };
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
@@ -989,48 +1229,59 @@ impl Workspace {
             DiffScope::Branch => Some("branch-range"),
             DiffScope::Turn(_) => None,
         };
-        let commits_request = cwd.clone().filter(|_| source_kind.is_some()).map(|cwd| {
+        if let Some(cwd) = cwd.clone() {
             let mut input = json!({"cwd": cwd});
             if let Some(base) = remembered_base.clone() {
                 input["baseRef"] = base.into();
             }
-            input
-        });
+            let client = client.clone();
+            self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
+                let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+                let _ = this.update(cx, |this, cx| {
+                    this.right_panel.commits = parse_commits(&reply);
+                    cx.notify();
+                });
+            }));
+        }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
             _ => None,
         };
-        self.right_panel.load = DiffLoad::Loading;
-        (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        if !retain {
+            self.right_panel.load = DiffLoad::Loading;
+            (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        }
         let diff = self.right_panel.diff.clone();
+        self.right_panel.diff_reading = true;
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
             let (method, input) = request;
             let result = client.request(method, input).await;
-            let commits = match commits_request {
-                Some(input) => client.request("review.getBranchCommits", input).await.ok(),
-                None => None,
-            };
+            let read = result.is_ok();
             let parsed =
                 cx.background_executor()
                     .spawn(async move {
                         result.map_err(|error| error.to_string()).map(|value| parse_diff(&value, source_kind))
                     })
                     .await;
-            let (deferred, source_base) = match &parsed {
-                Ok(Some(parsed)) => (parsed.deferred.clone(), parsed.base.clone()),
-                _ => (Vec::new(), None),
+            // `useReviewFilePatches`: each file's patch on its own, as the viewport asks for them.
+            let source_base = match &parsed {
+                Ok(Some(parsed)) => parsed.base.clone(),
+                _ => None,
             };
-            let shown = this.update(cx, |this, cx| {
-                if let Some(commits) = commits {
-                    this.right_panel.commits = commits["commits"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|c| {
-                            Some(Commit { sha: c["sha"].as_str()?.into(), subject: c["subject"].as_str()?.into() })
-                        })
-                        .collect();
+            let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
+            let patch_request = source_kind.zip(cwd).map(|(source_kind, cwd)| diff_load::PatchRequest {
+                cwd,
+                base_ref,
+                commit_sha,
+                source_kind,
+                ignore_whitespace,
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.right_panel.diff_reading = false;
+                if read {
+                    this.right_panel.diff_read_at = Some(std::time::Instant::now());
                 }
+                let previous = this.right_panel.patches.take().filter(|_| retain);
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
@@ -1048,126 +1299,166 @@ impl Workspace {
                             let sum = |count: fn(&DiffFile) -> usize| parsed.files.iter().map(count).sum::<usize>();
                             (sum(DiffFile::additions), sum(DiffFile::deletions))
                         });
-                        this.show_diff_files(&selection, parsed.files, Install::Replace, cx);
+                        let pending = match patch_request.filter(|_| !parsed.deferred.is_empty()) {
+                            Some(request) => {
+                                let patches = FilePatches::new(
+                                    selection.clone(),
+                                    client.clone(),
+                                    request,
+                                    parsed.deferred,
+                                    previous.as_ref(),
+                                );
+                                let outstanding = patches.demand.outstanding();
+                                this.right_panel.patches = Some(patches);
+                                this.show_file_patches(install, cx);
+                                this.start_patch_reads(cx);
+                                outstanding
+                            }
+                            None => {
+                                this.show_diff_files(&selection, parsed.files, install, cx);
+                                0
+                            }
+                        };
                         DiffLoad::Ready {
                             additions,
                             deletions,
                             head: parsed.head,
                             base: parsed.base,
                             truncated: parsed.truncated,
-                            pending: parsed.deferred.len(),
+                            pending,
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
                 cx.notify();
             });
-            if shown.is_err() || deferred.is_empty() {
-                return;
-            }
-            // `useReviewFilePatches`: each file's patch on its own, a few at a time, in path order.
-            let (Some(source_kind), Some(cwd)) = (source_kind, cwd) else { return };
-            let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
-            let request = diff_load::PatchRequest { cwd, base_ref, commit_sha, source_kind, ignore_whitespace };
-            let started = this.update(cx, |this, _| {
-                this.right_panel.patches = Some(FilePatches {
-                    selection: selection.clone(),
-                    client: client.clone(),
-                    request: request.clone(),
-                    stats: std::rc::Rc::new(
-                        deferred.iter().map(|file| (file.path.clone().into(), file.clone())).collect(),
-                    ),
-                    files: deferred.clone(),
-                    rows: vec![None; deferred.len()],
-                    _retries: Vec::new(),
-                });
-            });
-            if started.is_err() {
-                return;
-            }
-            for (batch, files) in deferred.chunks(diff_load::PATCH_READS).enumerate() {
-                let requests = files.iter().map(|file| client.request("review.getDiffPreview", request.input(file)));
-                let replies = futures::future::join_all(requests).await;
-                let files = files.to_vec();
-                let settled = cx
-                    .background_executor()
-                    .spawn(async move {
-                        files
-                            .iter()
-                            .zip(replies)
-                            .map(|(file, reply)| {
-                                if let Err(error) = &reply {
-                                    log::warn!("diff file patch failed: {error}");
-                                }
-                                diff_load::settle_file(file, reply.as_ref().ok(), source_kind)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-                let first = batch * diff_load::PATCH_READS;
-                let shown = this.update(cx, |this, cx| this.settle_file_patches(first, settled, cx));
-                if !matches!(shown, Ok(true)) {
-                    return;
-                }
-            }
         }));
         cx.notify();
     }
 
-    /// Puts settled rows from `first` on into the lazily read files and shows them; false once
-    /// another selection replaced them.
-    fn settle_file_patches(
-        &mut self,
-        first: usize,
-        settled: Vec<(Vec<DiffFile>, diff_load::FileState)>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(patches) = &mut self.right_panel.patches else { return false };
-        for (row, result) in patches.rows.iter_mut().skip(first).zip(settled) {
-            *row = Some(result);
+    /// Starts the patch reads the demand lets run now; the patch shows it is loading while any
+    /// asked-for read is outstanding.
+    fn start_patch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        let outstanding = patches.demand.outstanding();
+        if let DiffLoad::Ready { pending, .. } = &mut self.right_panel.load
+            && *pending != outstanding
+        {
+            *pending = outstanding;
+            cx.notify();
         }
-        let settled = || patches.rows.iter().flatten();
-        let files: Vec<DiffFile> = settled().flat_map(|(files, _)| files.iter().cloned()).collect();
-        let states: HashMap<SharedString, diff_load::FileState> = settled()
-            .filter(|(_, state)| *state != diff_load::FileState::Loaded)
-            .flat_map(|(files, state)| files.iter().map(|file| (file.path().clone(), *state)))
-            .collect();
-        let pending = patches.rows.iter().filter(|row| row.is_none()).count();
+        for index in patches.demand.start() {
+            let (client, file) = (patches.client.clone(), patches.files[index].clone());
+            let (input, source_kind) = (patches.request.input(&file), patches.request.source_kind);
+            patches._reads.push(cx.spawn(async move |this, cx| {
+                let reply = client.request("review.getDiffPreview", input).await;
+                if let Err(error) = &reply {
+                    log::warn!("diff file patch failed: {error}");
+                }
+                let settled = cx
+                    .background_executor()
+                    .spawn(async move { diff_load::settle_file(&file, reply.as_ref().ok(), source_kind) })
+                    .await;
+                let _ = this.update(cx, |this, cx| this.settle_file_patch(index, settled, cx));
+            }));
+        }
+    }
+
+    /// Asks for files' patches by their index among the lazily read files.
+    fn request_file_patches(&mut self, indices: impl IntoIterator<Item = usize>, cx: &mut Context<Self>) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.demand.request(indices);
+        self.start_patch_reads(cx);
+    }
+
+    /// Puts a settled read in its file's place and starts the next one waiting.
+    fn settle_file_patch(
+        &mut self,
+        index: usize,
+        settled: (Vec<DiffFile>, diff_load::FileState),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.rows[index] = Some(settled);
+        patches.demand.settle(index);
+        self.start_patch_reads(cx);
+        self.show_file_patches(Install::Update, cx);
+    }
+
+    /// Shows every lazily read file: its patch once settled, else its placeholder header.
+    fn show_file_patches(&mut self, install: Install, cx: &mut Context<Self>) {
+        let Some(patches) = &self.right_panel.patches else { return };
+        let (mut files, mut states, mut lineless) = (Vec::new(), HashMap::new(), Vec::new());
+        for (row, placeholder) in patches.rows.iter().zip(&patches.placeholders) {
+            match row {
+                Some((rows, state)) => {
+                    if *state != diff_load::FileState::Loaded {
+                        states.extend(rows.iter().map(|file| (file.path().clone(), *state)));
+                    }
+                    if *state == diff_load::FileState::Failed {
+                        lineless.extend(rows.iter().map(|file| file.path().clone()));
+                    }
+                    files.extend(rows.iter().cloned());
+                }
+                None => {
+                    lineless.extend(placeholder.iter().map(|file| file.path().clone()));
+                    files.extend(placeholder.iter().cloned());
+                }
+            }
+        }
         let selection = patches.selection.clone();
         self.right_panel.patch_states = std::rc::Rc::new(states);
-        self.show_diff_files(&selection, files, Install::Update, cx);
-        // A row that did not load has no lines to show, so it stays folded.
-        let states = self.right_panel.patch_states.clone();
+        self.show_diff_files(&selection, files, install, cx);
+        // A row with no lines yet, or one that did not load, has nothing to unfold.
         self.right_panel.diff.update(cx, |state, cx| {
-            for (path, _) in states.iter().filter(|(_, state)| **state == diff_load::FileState::Failed) {
+            for path in &lineless {
                 state.set_file_collapsed(path, true, cx);
             }
         });
-        if let DiffLoad::Ready { pending: left, .. } = &mut self.right_panel.load {
-            *left = pending;
-        }
         self.rebuild_tree_rows(cx);
         cx.notify();
-        true
+    }
+
+    /// `DiffFileLoadingBoundary` and each pending header's `load`: reads the files whose headers
+    /// come within the demand margin below the viewport unless the user folded them, and the
+    /// next batch once the last file comes near.
+    fn request_visible_patches(&mut self, cx: &mut Context<Self>) {
+        let Some(patches) = &self.right_panel.patches else { return };
+        if self.right_panel.shown.as_ref() != Some(&patches.selection) || !patches.rows.iter().any(Option::is_none) {
+            return;
+        }
+        let state = self.right_panel.diff.read(cx);
+        let near = state.files_near_viewport(px(diff_load::DEMAND_MARGIN));
+        if near.is_empty() {
+            return;
+        }
+        let at_end = near.end >= state.files().len();
+        let asked: Vec<(usize, SharedString)> = state.files()[near]
+            .iter()
+            .filter_map(|file| Some((*patches.index.get(file.path())?, file.path().clone())))
+            .filter(|(index, _)| patches.rows[*index].is_none() && !patches.demand.is_requested(*index))
+            .collect();
+        let first_unsettled = patches.rows.iter().position(Option::is_none);
+        let indices: Vec<usize> = if asked.is_empty() {
+            Vec::new()
+        } else {
+            let folded = self.current_folds();
+            asked.into_iter().filter(|(_, path)| !folded.contains(path)).map(|(index, _)| index).collect()
+        };
+        let Some(patches) = &mut self.right_panel.patches else { return };
+        patches.demand.request(indices);
+        if let Some(first) = first_unsettled.filter(|_| at_end) {
+            patches.demand.load_next(first);
+        }
+        self.start_patch_reads(cx);
     }
 
     /// `retry`: reads a file whose patch did not load again.
     fn retry_file_patch(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(patches) = &mut self.right_panel.patches else { return };
-        let Some(index) = patches.files.iter().position(|file| file.path == path) else { return };
-        let (client, file) = (patches.client.clone(), patches.files[index].clone());
-        let (input, source_kind) = (patches.request.input(&file), patches.request.source_kind);
-        patches._retries.push(cx.spawn(async move |this, cx| {
-            let reply = client.request("review.getDiffPreview", input).await;
-            if let Err(error) = &reply {
-                log::warn!("diff file patch failed: {error}");
-            }
-            let settled = cx
-                .background_executor()
-                .spawn(async move { diff_load::settle_file(&file, reply.as_ref().ok(), source_kind) })
-                .await;
-            let _ = this.update(cx, |this, cx| this.settle_file_patches(index, vec![settled], cx));
-        }));
+        let Some(&index) = patches.index.get(path) else { return };
+        patches.demand.retry(index);
+        self.start_patch_reads(cx);
     }
 
     /// Puts a selection's loaded files in the patch, folded as the user left them.
@@ -1211,11 +1502,7 @@ impl Workspace {
             return;
         };
         self.right_panel.pending_reveal = None;
-        self.right_panel.diff.update(cx, |state, cx| {
-            state.set_file_collapsed(&path, false, cx);
-            state.scroll_to_file(&path, cx);
-        });
-        self.remember_collapsed(cx);
+        self.reveal_diff_file(&path, cx);
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -1226,7 +1513,34 @@ impl Workspace {
     }
 
     /// The inline panel beside the main column, or `None` while closed.
+    /// The panel shows a git diff (not a turn's), which edits outside T3 Code can change.
+    fn git_diff_shown(&self) -> bool {
+        self.right_panel_open()
+            && self.active_surface() == Some(&Surface::Diff)
+            && self.diff_available()
+            && self.panel_state().is_some_and(|panel| !matches!(panel.scope, DiffScope::Turn(_)))
+    }
+
+    /// `useLiveRefresh(…, { refreshOnShow })` for the git diff: showing it, or the window
+    /// regaining focus while it shows, reads it again unless a read landed within the floor.
+    /// Edits made outside T3 Code bump no mutation id, so nothing else would. Returns whether
+    /// a read was asked for.
+    pub(super) fn revalidate_diff(&mut self) -> bool {
+        let stale =
+            should_revalidate(self.right_panel.diff_read_at, self.right_panel.diff_reading, std::time::Instant::now());
+        if !stale || !self.git_diff_shown() {
+            return false;
+        }
+        self.right_panel.refresh += 1;
+        true
+    }
+
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let git_diff_shown = self.git_diff_shown();
+        if git_diff_shown && !self.right_panel.git_diff_shown {
+            self.revalidate_diff();
+        }
+        self.right_panel.git_diff_shown = git_diff_shown;
         let mount = self.target.clone().filter(|_| self.active_surface() == Some(&Surface::Diff));
         if self.right_panel.diff_mount != mount {
             self.right_panel.diff_mount = mount;
@@ -1238,8 +1552,15 @@ impl Workspace {
         };
         self.sync_side_chat(side_chat.as_deref(), window, cx);
         self.sync_discovered_servers(window, cx);
-        let width = self.right_panel_width(window)?;
+        // A hidden panel closes its "+" menu, so showing the panel again leaves it closed.
+        let Some(width) = self.right_panel_width(window) else {
+            self.right_panel.add_menu_open = false;
+            return None;
+        };
         self.sync_diff(window, cx);
+        if self.active_surface() == Some(&Surface::Diff) {
+            self.request_visible_patches(cx);
+        }
         let tokens = *theme::tokens(cx);
         let panel = self.panel_state().cloned().unwrap_or_default();
         // A newly active tab, or a new tab, can sit outside the scrolled strip.
@@ -1337,7 +1658,17 @@ impl Workspace {
     /// `handleAddSurfaceMenuKeyDown`: an available surface's letter closes the "+" menu and opens it.
     fn add_surface_for_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(shortcut) = SurfaceShortcut::for_keystroke(&event.keystroke) else { return };
-        let available = match shortcut {
+        if !self.surface_available(shortcut) {
+            return;
+        }
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+        self.open_surface_shortcut(shortcut, window, cx);
+    }
+
+    /// Whether the "+" menu and the launcher offer `shortcut`'s surface and it can open here.
+    fn surface_available(&self, shortcut: SurfaceShortcut) -> bool {
+        match shortcut {
             SurfaceShortcut::Browser => self.browser_available(),
             SurfaceShortcut::Terminal => self.terminal_available(),
             SurfaceShortcut::Files => self.project_target().is_some(),
@@ -1345,12 +1676,10 @@ impl Workspace {
             SurfaceShortcut::PullRequest => self.thread_pull_request_target().is_some(),
             SurfaceShortcut::LinkedPullRequests => self.thread_links_pull_requests(),
             SurfaceShortcut::SideChat => self.side_chats_offered() && self.side_chat_disabled_reason().is_none(),
-        };
-        if !available {
-            return;
         }
-        cx.stop_propagation();
-        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+    }
+
+    fn open_surface_shortcut(&mut self, shortcut: SurfaceShortcut, window: &mut Window, cx: &mut Context<Self>) {
         match shortcut {
             SurfaceShortcut::Browser => self.add_browser_surface(window, cx),
             SurfaceShortcut::Terminal => self.add_terminal_surface(window, cx),
@@ -1364,6 +1693,93 @@ impl Workspace {
             SurfaceShortcut::LinkedPullRequests => self.open_surface(Surface::PullRequests, window, cx),
             SurfaceShortcut::SideChat => self.add_side_chat_surface(window, cx),
         }
+    }
+
+    /// The launcher's available surfaces in row order (`availableActions`).
+    fn launcher_actions(&self) -> Vec<SurfaceShortcut> {
+        SurfaceShortcut::ALL.into_iter().filter(|shortcut| self.surface_available(*shortcut)).collect()
+    }
+
+    /// The panel shows the launcher in place of a surface.
+    fn launcher_shown(&self) -> bool {
+        self.right_panel_open()
+            && match self.active_surface() {
+                None => true,
+                Some(Surface::Browser(_)) => !matches!(self.target, Some(Target::Thread { .. })),
+                Some(_) => false,
+            }
+    }
+
+    /// `rightPanel.new`: focuses the "+" menu open, unless another menu or dialog is up. A held
+    /// key is still claimed without reopening it.
+    pub(super) fn open_add_surface_menu(&mut self, layer_open: bool, held: bool, cx: &mut Context<Self>) -> bool {
+        if !self.right_panel_open() || (layer_open && !self.right_panel.add_menu_open) {
+            return false;
+        }
+        if !held && !self.right_panel.add_menu_open {
+            self.right_panel.add_menu_open = true;
+            cx.notify();
+        }
+        true
+    }
+
+    /// The launcher's window-wide letters (`handleShortcut`): an available surface's letter
+    /// opens it while the launcher shows, unless focus is typing or a menu or dialog is up.
+    pub(super) fn launcher_letter_key(
+        &mut self,
+        keystroke: &gpui_kit::Keystroke,
+        typing_or_layer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if typing_or_layer || self.right_panel.add_menu_open || self.right_panel.profiles_menu_open {
+            return false;
+        }
+        if self.page.is_some() || self.settings.is_some() || self.tab_menu_open() || !self.launcher_shown() {
+            return false;
+        }
+        let Some(shortcut) = SurfaceShortcut::for_keystroke(keystroke) else { return false };
+        if !self.surface_available(shortcut) {
+            return false;
+        }
+        self.open_surface_shortcut(shortcut, window, cx);
+        true
+    }
+
+    /// A launcher row's hover highlights it, and leaving it clears its highlight.
+    fn launcher_hover(
+        &self,
+        shortcut: SurfaceShortcut,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, hovered: &bool, _, cx| {
+            let index = this.launcher_actions().iter().position(|action| *action == shortcut);
+            if *hovered {
+                this.right_panel.launcher_highlight = index;
+            } else if this.right_panel.launcher_highlight == index {
+                this.right_panel.launcher_highlight = None;
+            }
+            cx.notify();
+        })
+    }
+
+    /// The focused launcher's arrows and Enter (`handleKeyDown`).
+    fn launcher_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let actions = self.launcher_actions();
+        let highlight = self.right_panel.launcher_highlight.filter(|_| !actions.is_empty());
+        let highlight = highlight.map(|index| index.min(actions.len().saturating_sub(1)));
+        match launcher_step(&event.keystroke, highlight, actions.len()) {
+            Some(LauncherStep::Highlight(index)) => {
+                self.right_panel.launcher_highlight = Some(index);
+                cx.notify();
+            }
+            Some(LauncherStep::Activate) => {
+                let Some(shortcut) = highlight.and_then(|index| actions.get(index).copied()) else { return };
+                self.open_surface_shortcut(shortcut, window, cx);
+            }
+            None => return,
+        }
+        cx.stop_propagation();
     }
 
     /// The 40px tab strip, a drag region clear of the panel toggles and caption buttons.
@@ -1484,6 +1900,7 @@ impl Workspace {
                             None => menu,
                         }
                     })
+                    .open(add_menu_open)
                     .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                         this.right_panel.add_menu_open = *open;
                         cx.notify();
@@ -1569,6 +1986,7 @@ impl Workspace {
         let close_focused = close_focus.is_focused(window) && window.last_input_was_keyboard();
         // The `outline-ring/50` focus outline, drawn 2px inside each button.
         let ring = tokens.ring.opacity(0.5);
+        let (dragged, drop_target, drag_title) = (surface.clone(), surface.clone(), title.clone());
         h_flex()
             .id(ElementId::Name(group.clone()))
             .group(group.clone())
@@ -1647,6 +2065,17 @@ impl Workspace {
                 cx.listener(move |this, _, window, cx| this.close_surface(middle.clone(), window, cx)),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.activate_surface(activate.clone(), window, cx)))
+            .on_drag(DraggedTab(dragged), move |_, _, _, cx| {
+                let title = drag_title.clone();
+                cx.new(|_| TabDragPreview { title, colors: (accent, foreground) })
+            })
+            .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent.opacity(0.6)))
+            .on_drop(cx.listener(move |this, DraggedTab(surface): &DraggedTab, _, cx| {
+                if let Some(panel) = this.panel_state_mut() {
+                    panel.move_surface(surface, &drop_target);
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
@@ -1660,12 +2089,19 @@ impl Workspace {
     /// `RightPanelEmptyState`: "Open a surface" with the surfaces this client has.
     fn render_launcher(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let hover = tokens.accent.opacity(0.6);
+        let actions = self.launcher_actions();
+        let highlighted = self
+            .right_panel
+            .launcher_highlight
+            .filter(|_| !actions.is_empty())
+            .and_then(|index| actions.get(index.min(actions.len() - 1)).copied());
         let row = |id: &'static str,
                    glyph: AnyElement,
                    label: &'static str,
                    key: &'static str,
                    available: bool,
                    hint: &'static str| {
+            let shortcut = SurfaceShortcut::ALL.into_iter().find(|s| s.letter() == key);
             h_flex()
                 .id(id)
                 .h(px(32.))
@@ -1679,7 +2115,9 @@ impl Workspace {
                 .child(kbd(key, tokens))
                 .map(|el| {
                     if available {
-                        el.cursor_pointer().hover(move |style| style.bg(hover))
+                        el.cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .when(shortcut.is_some() && shortcut == highlighted, |el| el.bg(hover))
                     } else {
                         el.opacity(0.5).tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
                     }
@@ -1694,6 +2132,7 @@ impl Workspace {
             browser_available,
             "Only available in a thread.",
         )
+        .when(browser_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Browser, cx)))
         .when(browser_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
         });
@@ -1719,7 +2158,7 @@ impl Workspace {
                             profile_items(menu.max_w(px(224.)), &profiles, &view, window)
                         })
                         .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                            this.right_panel.add_menu_open = *open;
+                            this.right_panel.profiles_menu_open = *open;
                             cx.notify();
                         })),
                 ),
@@ -1736,6 +2175,7 @@ impl Workspace {
             terminal_available,
             "Available when a project is open.",
         )
+        .when(terminal_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Terminal, cx)))
         .when(terminal_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_terminal_surface(window, cx)))
         });
@@ -1748,6 +2188,7 @@ impl Workspace {
             files_available,
             "Available when a project is open.",
         )
+        .when(files_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Files, cx)))
         .when(files_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::Files, window, cx)))
         });
@@ -1760,6 +2201,7 @@ impl Workspace {
             diff_available,
             "Available for Git repositories.",
         )
+        .when(diff_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Diff, cx)))
         .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
         let target = self.thread_pull_request_target();
         let pull_request = row(
@@ -1770,6 +2212,7 @@ impl Workspace {
             target.is_some(),
             "No pull request on this branch yet.",
         )
+        .when(target.is_some(), |el| el.on_hover(self.launcher_hover(SurfaceShortcut::PullRequest, cx)))
         .when_some(target, |el, reference| {
             el.on_click(cx.listener(move |this, _, window, cx| {
                 this.open_surface(Surface::PullRequest(reference.clone()), window, cx);
@@ -1784,6 +2227,7 @@ impl Workspace {
             linked,
             "No linked pull requests available.",
         )
+        .when(linked, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::LinkedPullRequests, cx)))
         .when(linked, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::PullRequests, window, cx)))
         });
@@ -1798,10 +2242,15 @@ impl Workspace {
                 reason.unwrap_or("Available after the first message."),
             )
             .when(reason.is_none(), |el| {
-                el.on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
+                el.on_hover(self.launcher_hover(SurfaceShortcut::SideChat, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
             })
         });
+        // `tabIndex={0}`: one Tab stop whose arrows and Enter drive the rows.
         div()
+            .id("right-panel-launcher")
+            .track_focus(&self.right_panel.launcher_focus)
+            .on_key_down(cx.listener(Self::launcher_key))
             .flex_1()
             .min_h_0()
             .flex()
@@ -1872,6 +2321,16 @@ impl Workspace {
         let menu_scope = scope.clone();
         let menu_turns = turns;
         let menu_latest = latest;
+        let identity = self.target_project().and_then(|project| project.repository_identity.clone());
+        let menu_identity = identity.clone();
+        // `headerCommitSha`: the picked commit's short SHA beside the menu, linked to its host.
+        let header_sha = match &scope {
+            DiffScope::Commit(sha) => {
+                let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, sha));
+                Some(commit_sha_link("diff-commit-sha", sha, url, &view, None, tokens))
+            }
+            _ => None,
+        };
         let scope_menu = Button::new("diff-scope")
             .custom(
                 ButtonCustomVariant::new(cx)
@@ -1935,20 +2394,40 @@ impl Workspace {
                     menu
                 });
                 let (commits, scope, commit_view) = (commits.clone(), menu_scope.clone(), view.clone());
-                menu.submenu("Commits", window, cx, move |mut menu, window, _| {
+                let identity = menu_identity.clone();
+                menu.submenu("Commits", window, cx, move |mut menu, window, cx| {
                     if commits.is_empty() {
                         return menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
                     }
+                    let now = crate::timestamp::now_ms();
+                    let popup = cx.entity().downgrade();
                     for commit in &commits {
                         let value = DiffScope::Commit(commit.sha.clone());
                         let checked = scope == value;
-                        menu = menu.item(PopupMenuItem::new(commit.subject.clone()).checked(checked).on_click(
-                            window.listener_for(&commit_view, move |this, _, _, cx| {
-                                this.set_diff_scope(value.clone(), cx);
-                            }),
-                        ));
+                        let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, &commit.sha));
+                        let time: SharedString = commit
+                            .committed_at
+                            .as_deref()
+                            .and_then(crate::timestamp::parse_ms)
+                            .map(|at| crate::timestamp::relative_label(now - at))
+                            .unwrap_or_default()
+                            .into();
+                        let row = CommitRow {
+                            subject: commit.subject.clone().into(),
+                            time,
+                            sha: commit.sha.clone(),
+                            url,
+                            view: commit_view.clone(),
+                            menu: popup.clone(),
+                        };
+                        menu =
+                            menu.item(PopupMenuItem::element(move |_, cx| row.render(cx)).checked(checked).on_click(
+                                window.listener_for(&commit_view, move |this, _, _, cx| {
+                                    this.set_diff_scope(value.clone(), cx);
+                                }),
+                            ));
                     }
-                    menu.max_h(px(320.)).scrollable(true)
+                    menu.max_h(px(320.)).max_w(px(384.)).scrollable(true)
                 })
             });
         let scheme = self.diff_color_scheme();
@@ -1987,6 +2466,7 @@ impl Workspace {
         let (test_files, hide_tests, tree_open) =
             (self.right_panel.diff_test_files, self.right_panel.hide_test_files, self.right_panel.tree_open);
         let has_files = !self.right_panel.all_diff_files.is_empty();
+        let focus = &self.right_panel.toolbar_focus;
         let header = h_flex()
             .h(px(28.))
             .mb_3()
@@ -2001,6 +2481,7 @@ impl Workspace {
                     .min_w_0()
                     .gap_3()
                     .child(scope_menu)
+                    .children(header_sha)
                     .children(refs),
             )
             .child(
@@ -2018,7 +2499,7 @@ impl Workspace {
                     }))
                     .when(can_refresh, |el| {
                         el.child(
-                            icon_toggle("diff-refresh", "icons/refresh-cw.svg", false, tokens, cx)
+                            icon_toggle("diff-refresh", "icons/refresh-cw.svg", false, tokens, &focus.refresh)
                                 .tooltip(|window, cx| Tooltip::new("Refresh diff").build(window, cx))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.right_panel.refresh += 1;
@@ -2031,25 +2512,31 @@ impl Workspace {
                         let path =
                             if all_collapsed { "icons/chevrons-up-down.svg" } else { "icons/chevrons-down-up.svg" };
                         el.child(
-                            icon_toggle("diff-collapse", path, false, tokens, cx)
+                            icon_toggle("diff-collapse", path, false, tokens, &focus.collapse)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.right_panel.diff.update(cx, |state, cx| {
-                                        let paths: Vec<SharedString> =
-                                            state.files().iter().map(|file| file.path().clone()).collect();
-                                        for path in &paths {
-                                            state.set_file_collapsed(path, !all_collapsed, cx);
-                                        }
-                                    });
-                                    this.remember_collapsed(cx);
-                                    cx.notify();
+                                    let shown: Vec<SharedString> = this
+                                        .right_panel
+                                        .diff
+                                        .read(cx)
+                                        .files()
+                                        .iter()
+                                        .map(|file| file.path().clone())
+                                        .collect();
+                                    let mut folded = this.current_folds();
+                                    if all_collapsed {
+                                        folded.retain(|path| !shown.contains(path));
+                                    } else {
+                                        folded.extend(shown);
+                                    }
+                                    this.set_diff_folds(folded, cx);
                                 })),
                         )
                     })
                     .child(self.render_layout_toggle(tokens, cx))
                     .child({
                         let label = if wrap { "Disable line wrapping" } else { "Enable line wrapping" };
-                        icon_toggle("diff-wrap", "icons/text-wrap.svg", wrap, tokens, cx)
+                        icon_toggle("diff-wrap", "icons/text-wrap.svg", wrap, tokens, &focus.wrap)
                             .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.right_panel.wrap = Some(!wrap);
@@ -2059,12 +2546,18 @@ impl Workspace {
                     .child({
                         let label =
                             if ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" };
-                        icon_toggle("diff-whitespace", "icons/pilcrow.svg", ignore_whitespace, tokens, cx)
-                            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
-                                cx.notify();
-                            }))
+                        icon_toggle(
+                            "diff-whitespace",
+                            "icons/pilcrow.svg",
+                            ignore_whitespace,
+                            tokens,
+                            &focus.whitespace,
+                        )
+                        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.right_panel.ignore_whitespace = Some(!ignore_whitespace);
+                            cx.notify();
+                        }))
                     })
                     .when(test_files > 0, |el| {
                         let label: SharedString = match (hide_tests, test_files) {
@@ -2073,18 +2566,24 @@ impl Workspace {
                             (false, _) => "Hide test files".into(),
                         };
                         el.child(
-                            icon_toggle("diff-hide-tests", "icons/flask-conical-off.svg", hide_tests, tokens, cx)
-                                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.right_panel.hide_test_files = !hide_tests;
-                                    this.apply_diff_files(cx);
-                                })),
+                            icon_toggle(
+                                "diff-hide-tests",
+                                "icons/flask-conical-off.svg",
+                                hide_tests,
+                                tokens,
+                                &focus.tests,
+                            )
+                            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.right_panel.hide_test_files = !hide_tests;
+                                this.apply_diff_files(cx);
+                            })),
                         )
                     })
                     .when(has_files, |el| {
                         let label = if tree_open { "Hide file tree" } else { "Show file tree" };
                         el.child(
-                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, cx)
+                            icon_toggle("diff-file-tree", "icons/folder-tree.svg", tree_open, tokens, &focus.tree)
                                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.right_panel.tree_open = !tree_open;
@@ -2185,7 +2684,10 @@ impl Workspace {
                                 .into_any_element(),
                             }
                         })
-                        .when(tree_open, |el| el.child(self.render_diff_tree(tokens, cx))),
+                        .when(tree_open, |el| {
+                            let row = self.right_panel_width(window).unwrap_or_default();
+                            el.child(self.render_diff_tree(row, tokens, window, cx))
+                        }),
                 )
                 // `DiffFileLoadingBoundary` while file patches are still on their way.
                 .when(pending > 0, |el| {
@@ -2208,11 +2710,29 @@ impl Workspace {
     /// The stacked / split segmented toggle (`ToggleGroup variant="segmented"`), saved as `diffLayout`.
     fn render_layout_toggle(&self, tokens: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let split = self.diff_mode() == DiffMode::Split;
+        let focus = &self.right_panel.toolbar_focus;
+        let ring = tokens.ring;
         let segment = |id: &'static str, path: &'static str, pressed: bool, value: bool, cx: &mut Context<Self>| {
             let pressed_bg = tokens.input.opacity(0.72);
             let hover = tokens.input.opacity(0.32);
+            // One Tab stop on the pressed segment; the arrows, Home and End move between them.
+            let own = if value { &focus.split } else { &focus.stacked };
+            let (stacked, split_focus) = (focus.stacked.clone(), focus.split.clone());
             div()
                 .id(id)
+                .track_focus(&own.clone().tab_stop(pressed))
+                .focus_visible(move |s| s.border_2().border_color(ring))
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    let to_split = match event.keystroke.key.as_str() {
+                        _ if event.keystroke.modifiers.modified() => return,
+                        "left" | "right" | "up" | "down" => !value,
+                        "home" => false,
+                        "end" => true,
+                        _ => return,
+                    };
+                    window.focus(if to_split { &split_focus } else { &stacked }, cx);
+                    cx.stop_propagation();
+                })
                 .h(px(24.))
                 .px(px(10.))
                 .flex()
@@ -2457,6 +2977,22 @@ struct ParsedDiff {
     truncated: bool,
 }
 
+/// `review.getBranchCommits`' commits, newest first as the server lists them.
+fn parse_commits(reply: &Value) -> Vec<Commit> {
+    reply["commits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            Some(Commit {
+                sha: c["sha"].as_str()?.into(),
+                subject: c["subject"].as_str()?.into(),
+                committed_at: c["committedAt"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
     let Some(kind) = source_kind else {
         let files = diff_load::parse_patch(value["diff"].as_str()?, false);
@@ -2480,6 +3016,12 @@ fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
     // A lazily loaded source shows every file, so the size notice no longer applies.
     let truncated = truncated && deferred.is_empty();
     Some(ParsedDiff { files, deferred, totals, head: text("headRef"), base: text("baseRef"), truncated })
+}
+
+/// Whether showing the diff reads it again: only a diff already read, with no read on its way,
+/// whose last read is older than [`REVALIDATE_FLOOR`].
+fn should_revalidate(read_at: Option<std::time::Instant>, reading: bool, now: std::time::Instant) -> bool {
+    !reading && read_at.is_some_and(|at| now.saturating_duration_since(at) >= REVALIDATE_FLOOR)
 }
 
 /// `HH:MM` from an ISO timestamp, as the turn menu labels completion.
@@ -2522,16 +3064,91 @@ fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
 }
 
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
+/// A commit's short SHA (`font-mono text-xs text-muted-foreground`), underlined as a link to
+/// its host's page when it has one; the link opens without picking the commit, and closes
+/// `menu` when it sits in one.
+fn commit_sha_link(
+    id: impl Into<ElementId>,
+    sha: &str,
+    url: Option<String>,
+    view: &Entity<Workspace>,
+    menu: Option<gpui_kit::WeakEntity<PopupMenu>>,
+    tokens: &Tokens,
+) -> AnyElement {
+    let short: SharedString = sha.chars().take(7).collect::<String>().into();
+    let base =
+        div().id(id.into()).flex_none().font_family(tokens.fonts.mono).text_xs().text_color(tokens.muted_foreground);
+    let Some(url) = url else { return base.child(short).into_any_element() };
+    let (view, tip) = (view.clone(), SharedString::from(url.clone()));
+    base.underline()
+        .cursor_pointer()
+        .child(short)
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            view.update(cx, |this, cx| this.open_link(&url, event, window, cx));
+            if let Some(menu) = menu.as_ref().and_then(gpui_kit::WeakEntity::upgrade) {
+                cx.defer(move |cx| menu.update(cx, |_, cx| cx.emit(DismissEvent)));
+            }
+        })
+        .into_any_element()
+}
+
+/// A Commits menu row: the subject (with its tooltip), how long ago, and the SHA link.
+#[derive(Clone)]
+struct CommitRow {
+    subject: SharedString,
+    time: SharedString,
+    sha: String,
+    url: Option<String>,
+    view: Entity<Workspace>,
+    menu: gpui_kit::WeakEntity<PopupMenu>,
+}
+
+impl CommitRow {
+    fn render(&self, cx: &App) -> AnyElement {
+        let tokens = theme::tokens(cx);
+        let subject = self.subject.clone();
+        let link = commit_sha_link(
+            ElementId::Name(format!("diff-commit-link:{}", self.sha).into()),
+            &self.sha,
+            self.url.clone(),
+            &self.view,
+            Some(self.menu.clone()),
+            tokens,
+        );
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .child(
+                h_flex()
+                    .id(ElementId::Name(format!("diff-commit-row:{}", self.sha).into()))
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .child(div().flex_1().min_w_0().truncate().child(self.subject.clone()))
+                    .child(div().flex_none().text_xs().text_color(tokens.muted_foreground).child(self.time.clone()))
+                    .tooltip(move |window, cx| Tooltip::new(subject.clone()).build(window, cx)),
+            )
+            .child(div().flex_none().px_2().child(link))
+            .into_any_element()
+    }
+}
+
+/// A toolbar button or toggle: a Tab stop that Enter and Space press, ringed while focused by key.
 fn icon_toggle(
     id: &'static str,
     path: &'static str,
     pressed: bool,
     tokens: &Tokens,
-    _: &mut Context<Workspace>,
+    focus: &FocusHandle,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let accent = tokens.accent;
+    let (accent, ring) = (tokens.accent, tokens.ring);
     div()
         .id(id)
+        .track_focus(focus)
+        .focus_visible(move |s| s.border_2().border_color(ring))
         .size(px(28.))
         .flex_none()
         .flex()
@@ -2575,6 +3192,30 @@ enum SurfaceShortcut {
 }
 
 impl SurfaceShortcut {
+    /// The launcher's and the "+" menu's order.
+    const ALL: [Self; 7] = [
+        Self::Browser,
+        Self::Terminal,
+        Self::Files,
+        Self::Diff,
+        Self::PullRequest,
+        Self::LinkedPullRequests,
+        Self::SideChat,
+    ];
+
+    /// The letter its rows show.
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Browser => "B",
+            Self::Terminal => "T",
+            Self::Files => "F",
+            Self::Diff => "D",
+            Self::PullRequest => "P",
+            Self::LinkedPullRequests => "L",
+            Self::SideChat => "S",
+        }
+    }
+
     /// `surfaceShortcutActionForKey`: Ctrl, Alt and Cmd chords are commands, not letters.
     fn for_keystroke(keystroke: &gpui_kit::Keystroke) -> Option<Self> {
         let modifiers = &keystroke.modifiers;
@@ -2594,10 +3235,82 @@ impl SurfaceShortcut {
     }
 }
 
+/// What a key does in the focused launcher.
+#[derive(Debug, PartialEq, Eq)]
+enum LauncherStep {
+    Highlight(usize),
+    Activate,
+}
+
+/// `RightPanelEmptyState`'s `handleKeyDown` over `len` available rows: Down and Right move the
+/// highlight on and Up and Left back, wrapping; Enter opens the highlighted row.
+fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len: usize) -> Option<LauncherStep> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform || len == 0 {
+        return None;
+    }
+    Some(match keystroke.key.as_str() {
+        "down" | "right" => LauncherStep::Highlight(highlight.map_or(0, |index| (index + 1) % len)),
+        "up" | "left" => LauncherStep::Highlight(highlight.map_or(len - 1, |index| (index + len - 1) % len)),
+        "enter" => LauncherStep::Activate,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn showing_the_diff_reads_it_again_only_after_the_floor() {
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let read = |ago: u64| now.checked_sub(std::time::Duration::from_secs(ago));
+        assert!(should_revalidate(read(11), false, now));
+        assert!(should_revalidate(read(10), false, now));
+        assert!(!should_revalidate(read(3), false, now), "a mutation's refetch counts as the revalidation");
+        assert!(!should_revalidate(read(60), true, now), "a read on its way is about to land");
+        assert!(!should_revalidate(None, false, now), "the first read is the mount's own");
+    }
+
+    #[test]
+    fn a_dragged_tab_takes_the_place_of_the_tab_it_drops_on() {
+        let mut panel = PanelState {
+            surfaces: vec![Surface::Diff, Surface::Files, Surface::PullRequests, Surface::Terminal("t".into())],
+            ..PanelState::default()
+        };
+        let order = |panel: &PanelState| panel.surfaces.clone();
+        panel.move_surface(&Surface::Diff, &Surface::PullRequests);
+        assert_eq!(
+            order(&panel),
+            [Surface::Files, Surface::PullRequests, Surface::Diff, Surface::Terminal("t".into())]
+        );
+        panel.move_surface(&Surface::Terminal("t".into()), &Surface::Files);
+        assert_eq!(
+            order(&panel),
+            [Surface::Terminal("t".into()), Surface::Files, Surface::PullRequests, Surface::Diff]
+        );
+        let before = order(&panel);
+        panel.move_surface(&Surface::Files, &Surface::Files);
+        panel.move_surface(&Surface::SideChat("gone".into()), &Surface::Files);
+        assert_eq!(order(&panel), before);
+    }
+
+    #[test]
+    fn launcher_arrows_wrap_through_the_available_rows() {
+        let step = |key: &'static str, highlight: Option<usize>, len: usize| {
+            launcher_step(&gpui_kit::Keystroke::parse(key).unwrap(), highlight, len)
+        };
+        assert_eq!(step("down", None, 3), Some(LauncherStep::Highlight(0)));
+        assert_eq!(step("right", Some(2), 3), Some(LauncherStep::Highlight(0)));
+        assert_eq!(step("up", None, 3), Some(LauncherStep::Highlight(2)));
+        assert_eq!(step("left", Some(0), 3), Some(LauncherStep::Highlight(2)));
+        assert_eq!(step("up", Some(2), 3), Some(LauncherStep::Highlight(1)));
+        assert_eq!(step("enter", Some(1), 3), Some(LauncherStep::Activate));
+        assert_eq!(step("ctrl-down", None, 3), None);
+        assert_eq!(step("down", None, 0), None);
+        assert_eq!(step("t", None, 3), None);
+    }
 
     #[test]
     fn add_menu_letters_open_surfaces_only_without_command_modifiers() {

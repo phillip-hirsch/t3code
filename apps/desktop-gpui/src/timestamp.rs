@@ -18,6 +18,17 @@ pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+/// `formatRelativeTimeLabel` for an elapsed time: "just now", "5m ago", "3h ago", "2d ago".
+pub fn relative_label(elapsed_ms: i64) -> String {
+    let minutes = elapsed_ms.max(0) / 60_000;
+    match minutes {
+        0 => "just now".into(),
+        1..60 => format!("{minutes}m ago"),
+        60..1440 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
 /// `Date.prototype.toISOString`: "2026-11-05T18:30:00.000Z"; `None` out of range.
 pub fn iso(ms: i64) -> Option<String> {
     DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())

@@ -791,8 +791,8 @@ impl MarkdownPlugin for FileChips {
 }
 
 impl Workspace {
-    /// `handleOpenInFilePreview`: a file in the workspace opens in the thread's panel; the
-    /// platform modifier, or a file outside it, opens the preferred editor.
+    /// `handleOpenInFilePreview`: a file in the workspace, or a host file or folder outside it,
+    /// opens in the thread's panel; the platform modifier, or host media, opens the preferred editor.
     fn open_file_chip(
         &mut self,
         path: &str,
@@ -807,10 +807,12 @@ impl Workspace {
                 this.open_host_file_in_browser(without_position(&target), window, cx);
                 return;
             }
-            let relative = workspace_relative(without_position(&target), this.git_cwd().as_deref());
-            match relative {
-                Some(relative) if !editor && matches!(this.target, Some(super::Target::Thread { .. })) => {
-                    this.open_file(&relative, line, window, cx);
+            let path = without_position(&target);
+            let panel_path = workspace_relative(path, this.git_cwd().as_deref())
+                .or_else(|| super::files::opens_host_path_in_panel(path).then(|| path.to_owned()));
+            match panel_path {
+                Some(panel_path) if !editor && matches!(this.target, Some(super::Target::Thread { .. })) => {
+                    this.open_file(&panel_path, line, window, cx);
                 }
                 _ => this.open_file_link(&target, window, cx),
             }

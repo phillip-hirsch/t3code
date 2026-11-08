@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Bounds, ClickEvent, Context, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _,
-    StyledImage as _, Task, Window, canvas, div, img, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString,
+    Styled as _, StyledImage as _, Task, Window, canvas, div, img, px,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -28,7 +29,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::{Session, Viewport};
+use crate::preview::{self, NavStatus, Session, Viewport};
 use crate::theme::Tokens;
 
 const TAB_GONE: u16 = 4404;
@@ -49,6 +50,13 @@ struct Dialog {
     kind: String,
     message: String,
     default_value: String,
+}
+
+/// The text a prompt's response field resets to when the page's dialog changes
+/// (`setPromptText(next.dialog?.defaultValue ?? "")`), else `None` to keep the user's edit.
+fn prompt_reset(previous: Option<&Dialog>, next: Option<&Dialog>) -> Option<String> {
+    let key = |dialog: Option<&Dialog>| dialog.map(|d| (d.message.clone(), d.default_value.clone()));
+    (key(previous) != key(next)).then(|| next.map(|d| d.default_value.clone()).unwrap_or_default())
 }
 
 impl Control {
@@ -138,6 +146,8 @@ pub(super) struct ServerStream {
     sent_size: Option<(u32, u32)>,
     buttons: u8,
     focus: FocusHandle,
+    /// A `prompt` dialog's response.
+    prompt: Entity<InputState>,
     _task: Task<()>,
 }
 
@@ -152,19 +162,39 @@ impl ServerStream {
     }
 }
 
+/// A server tab's PDF (`pdfUrl`), shown in a native view over its stream as the web's `<embed>`.
+struct PdfView {
+    url: String,
+    view: Option<Entity<gpui_webview::WebView>>,
+    shown: bool,
+}
+
 #[derive(Default)]
 pub(super) struct ServerStreams {
     streams: HashMap<String, ServerStream>,
-    /// The agent tab the panel drew this frame.
-    pub(super) drawn: Option<String>,
+    pdfs: HashMap<String, PdfView>,
+    /// The agent tabs the panel and the mini player drew this frame, and those drawn as PDFs.
+    pub(super) drawn: Vec<String>,
+    pdf_drawn: Vec<String>,
 }
 
 impl Workspace {
-    /// Keeps the stream of the agent tab on screen and closes the others.
-    pub(super) fn retain_server_streams(&mut self, cx: &mut App) {
-        let drawn = self.preview.server.drawn.take();
+    /// Keeps the streams of the agent tabs on screen and closes the others; shows their PDFs
+    /// unless GPUI draws over them (`covered`).
+    pub(super) fn retain_server_streams(&mut self, covered: bool, cx: &mut App) {
+        let drawn = std::mem::take(&mut self.preview.server.drawn);
+        let pdf_drawn = std::mem::take(&mut self.preview.server.pdf_drawn);
+        self.preview.server.pdfs.retain(|tab, _| pdf_drawn.contains(tab));
+        for pdf in self.preview.server.pdfs.values_mut() {
+            if let Some(view) = &pdf.view
+                && pdf.shown == covered
+            {
+                pdf.shown = !covered;
+                let _ = view.read(cx).set_visible(pdf.shown);
+            }
+        }
         self.preview.server.streams.retain(|tab, stream| {
-            let keep = drawn.as_ref() == Some(tab);
+            let keep = drawn.contains(tab);
             if !keep {
                 for image in stream.stale.drain(..).chain(stream.frame.take()) {
                     cx.drop_image(image, None);
@@ -172,6 +202,20 @@ impl Workspace {
             }
             keep
         });
+    }
+
+    /// Connects `tab_id`'s stream, or keeps it connected through this frame.
+    pub(super) fn keep_server_stream(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_server_stream(thread_id, tab_id, window, cx);
+        if !self.preview.server.drawn.iter().any(|drawn| drawn == tab_id) {
+            self.preview.server.drawn.push(tab_id.to_owned());
+        }
     }
 
     fn ensure_server_stream(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -233,6 +277,7 @@ impl Workspace {
             sent_size: None,
             buttons: 0,
             focus: cx.focus_handle(),
+            prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
         self.preview.server.streams.insert(tab_id.to_owned(), stream);
@@ -261,6 +306,10 @@ impl Workspace {
             Incoming::Message(message) => match message["type"].as_str() {
                 Some("control") => {
                     let Some(control) = Control::parse(&message) else { return };
+                    let previous = stream.control.as_ref().and_then(|c| c.dialog.as_ref());
+                    if let Some(text) = prompt_reset(previous, control.dialog.as_ref()) {
+                        stream.prompt.update(cx, |input, cx| input.set_value(text, window, cx));
+                    }
                     let gained = control.mine() && !stream.control.as_ref().is_some_and(Control::mine);
                     stream.control = Some(control);
                     if gained {
@@ -303,23 +352,70 @@ impl Workspace {
         }
     }
 
+    /// The tab's PDF view while it shows a signed PDF asset: `None` otherwise, `Some(None)` while
+    /// its view starts.
+    fn server_pdf_view(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Option<Entity<gpui_webview::WebView>>> {
+        let session = self.preview.threads.get(thread_id)?.get(tab_id)?;
+        let NavStatus::Success { url, .. } = &session.nav_status else { return None };
+        let endpoint = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned())?;
+        let url = preview::pdf_asset_url(url, &endpoint.http_base)?;
+        self.preview.server.pdf_drawn.push(tab_id.to_owned());
+        if let Some(pdf) = self.preview.server.pdfs.get_mut(tab_id) {
+            if pdf.url != url {
+                if let Some(view) = &pdf.view {
+                    view.update(cx, |view, _| view.load_url(&url));
+                }
+                pdf.url = url;
+            }
+            return Some(pdf.view.clone());
+        }
+        self.preview.server.pdfs.insert(tab_id.to_owned(), PdfView { url, view: None, shown: false });
+        let tab = tab_id.to_owned();
+        // `build_view` runs only from a task.
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(url) = this.preview.server.pdfs.get(&tab).map(|pdf| pdf.url.clone()) else { return };
+                let builder = wry::WebViewBuilder::new().with_url(url).with_visible(false).with_focused(false);
+                match super::build_view(builder, window, cx) {
+                    Ok(view) => {
+                        if let Some(pdf) = this.preview.server.pdfs.get_mut(&tab) {
+                            pdf.view = Some(cx.new(|_| view));
+                        }
+                    }
+                    Err(error) => log::warn!("could not show the PDF: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        Some(None)
+    }
+
     /// Sends `input` to the agent tab on screen, if this viewer may.
     pub(super) fn send_server_input(&self, tab_id: &str, input: Value) -> bool {
         self.preview.server.streams.get(tab_id).is_some_and(|stream| stream.send(input))
     }
 
-    /// The agent tab's page: the control bar over its latest frame.
+    /// The agent tab's page: its latest frame with the control bar above it, or below it
+    /// (`controlPosition="bottom"`) in the mini player.
+    #[expect(clippy::too_many_arguments, reason = "a render helper's layout options")]
     pub(super) fn render_server_page(
         &mut self,
         thread_id: &str,
         tab_id: &str,
         follow_size: bool,
+        bar_below: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.ensure_server_stream(thread_id, tab_id, window, cx);
-        self.preview.server.drawn = Some(tab_id.to_owned());
+        self.keep_server_stream(thread_id, tab_id, window, cx);
         let Some(stream) = self.preview.server.streams.get_mut(tab_id) else {
             return div().flex_1().into_any_element();
         };
@@ -351,7 +447,7 @@ impl Workspace {
             .gap_2()
             .px_2()
             .py_1()
-            .border_b_1()
+            .map(|bar| if bar_below { bar.border_t_1() } else { bar.border_b_1() })
             .border_color(tokens.border)
             .bg(tokens.background)
             .child(div().text_xs().text_color(tokens.muted_foreground).child(control_label(control.as_ref())))
@@ -367,9 +463,17 @@ impl Workspace {
                         this.send_server_input(&tab, json!({"type": claim}));
                     }))
             }));
+        // The native view would cover GPUI's dialog and stop overlays.
+        let overlay = self.render_server_overlay(tab_id, tokens, cx);
+        let pdf = if overlay.is_none() { self.server_pdf_view(thread_id, tab_id, window, cx) } else { None };
+        let stream = &self.preview.server.streams[tab_id];
         let fit = page_fit(stream.bounds.get(), stream.frame_size, stream.viewport);
-        let cursor = stream.agent_pointer.filter(|_| !mine).zip(fit).map(|((x, y), fit)| fit.to_local(x, y)).map(
-            |(left, top)| {
+        let cursor = stream
+            .agent_pointer
+            .filter(|_| !mine && pdf.is_none())
+            .zip(fit)
+            .map(|((x, y), fit)| fit.to_local(x, y))
+            .map(|(left, top)| {
                 div()
                     .absolute()
                     .left(px(left - 6.))
@@ -379,8 +483,7 @@ impl Workspace {
                     .border_2()
                     .border_color(tokens.background)
                     .bg(tokens.primary)
-            },
-        );
+            });
         let frame = stream.frame.clone().map(|frame| img(frame).size_full().object_fit(ObjectFit::Contain));
         let bounds_cell = stream.bounds.clone();
         let tab = tab_id.to_owned();
@@ -395,6 +498,7 @@ impl Workspace {
             .track_focus(&stream.focus)
             .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
             .children(frame)
+            .children(pdf.flatten().map(|view| div().absolute().inset_0().child(view)))
             .children(cursor)
             .on_mouse_down(
                 MouseButton::Left,
@@ -426,18 +530,19 @@ impl Workspace {
                     cx.stop_propagation();
                 }
             }))
-            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
-                if this.server_key(&key_tab, "down", &e.keystroke, cx) {
+            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                if this.server_key(&key_tab, "down", &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }))
-            .on_key_up(cx.listener(move |this, e: &KeyUpEvent, _, cx| {
-                if this.server_key(&key_up_tab, "up", &e.keystroke, cx) {
+            .on_key_up(cx.listener(move |this, e: &KeyUpEvent, window, cx| {
+                if this.server_key(&key_up_tab, "up", &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }));
-        let overlay = self.render_server_overlay(tab_id, tokens, cx);
-        v_flex().flex_1().min_h_0().relative().child(bar).child(body.children(overlay)).into_any_element()
+        let body = body.children(overlay);
+        let page = v_flex().flex_1().min_h_0().relative();
+        if bar_below { page.child(body).child(bar) } else { page.child(bar).child(body) }.into_any_element()
     }
 
     /// The page's dialog, or the stop that ended the stream.
@@ -456,6 +561,8 @@ impl Workspace {
                 .border_color(tokens.border)
                 .bg(tokens.background)
                 .shadow_lg()
+                // Presses on the dialog reach its controls, not the page under it.
+                .occlude()
         };
         let cover = || {
             v_flex()
@@ -520,15 +627,15 @@ impl Workspace {
         }
         let control = stream.control.as_ref()?;
         let dialog = control.dialog.as_ref()?;
+        let is_prompt = dialog.kind == "prompt";
         let respond = |id: &'static str, label: &'static str, accept: bool, cx: &mut Context<Self>| {
-            let (tab, prompt) = (tab.clone(), dialog.default_value.clone());
-            let is_prompt = dialog.kind == "prompt";
+            let (tab, prompt) = (tab.clone(), stream.prompt.clone());
             let button = Button::new(id).small().label(label);
             let button = if accept { button.primary() } else { button.outline() };
-            button.on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+            button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let mut input = json!({"type": "dialog", "accept": accept});
                 if accept && is_prompt {
-                    input["promptText"] = prompt.clone().into();
+                    input["promptText"] = prompt.read(cx).value().to_string().into();
                 }
                 this.send_server_input(&tab, input);
             }))
@@ -538,7 +645,7 @@ impl Workspace {
                 .child(div().text_sm().child(SharedString::from(dialog.message.clone())))
                 .map(|el| {
                     if control.mine() {
-                        el.child(
+                        el.when(is_prompt, |el| el.child(Input::new(&stream.prompt))).child(
                             h_flex()
                                 .justify_end()
                                 .gap_2()
@@ -631,9 +738,17 @@ impl Workspace {
         )
     }
 
-    fn server_key(&mut self, tab_id: &str, action: &str, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    fn server_key(
+        &mut self,
+        tab_id: &str,
+        action: &str,
+        keystroke: &Keystroke,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(stream) = self.preview.server.streams.get(tab_id) else { return false };
-        if !stream.control.as_ref().is_some_and(Control::mine) {
+        // Keys typed into the page's own overlays, such as a prompt's response, stay there.
+        if !stream.control.as_ref().is_some_and(Control::mine) || !stream.focus.is_focused(window) {
             return false;
         }
         let m = &keystroke.modifiers;
@@ -681,7 +796,10 @@ impl Workspace {
         let Some(client) = self.thread_client(&session.thread_id) else { return };
         let mut input = json!({"threadId": session.thread_id, "viewport": viewport_json(&session.viewport)});
         if let Some(url) = session.nav_status.url() {
-            input["url"] = url.into();
+            // A page moving to this computer reaches the environment's loopback servers on its host.
+            input["url"] =
+                if session.server_hosted() { self.discovered_url(&session.thread_id, url) } else { url.to_owned() }
+                    .into();
         }
         if !session.server_hosted() {
             input["runtime"] = "server".into();
@@ -689,6 +807,8 @@ impl Workspace {
         if let Some(profile) = &session.profile_id {
             input["profileId"] = profile.clone().into();
         }
+        // The moved tab opens where the move started, even if another thread shows by then.
+        let origin = self.target.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -698,7 +818,9 @@ impl Workspace {
                     Ok(moved) => {
                         let tab = moved.tab_id.clone();
                         this.preview.threads.entry(session.thread_id.clone()).or_default().apply_snapshot(moved, true);
-                        this.open_surface(Surface::Browser(tab), window, cx);
+                        if let Some(origin) = &origin {
+                            this.open_surface_on(origin, Surface::Browser(tab), window, cx);
+                        }
                         this.close_preview_tab(session.thread_id.clone(), session.tab_id.clone(), window, cx);
                     }
                     Err(error) => window.push_notification(
@@ -977,7 +1099,13 @@ mod tests {
         let dialog = Control::parse(&json!({"canOperate": true, "controller": "you", "generation": 2,
             "dialog": {"type": "prompt", "message": "Name?", "defaultValue": "x"}}))
         .unwrap();
-        assert_eq!(dialog.dialog.unwrap().default_value, "x");
+        let prompt = dialog.dialog.unwrap();
+        assert_eq!(prompt.default_value, "x");
+        assert_eq!(prompt_reset(None, Some(&prompt)).as_deref(), Some("x"), "a new prompt shows its default");
+        assert_eq!(prompt_reset(Some(&prompt), Some(&prompt.clone())), None, "a repeated control keeps the edit");
+        let next = Dialog { message: "Age?".into(), ..prompt.clone() };
+        assert_eq!(prompt_reset(Some(&prompt), Some(&next)).as_deref(), Some("x"), "another prompt resets");
+        assert_eq!(prompt_reset(Some(&prompt), None).as_deref(), Some(""), "a closed dialog clears it");
     }
 
     #[test]

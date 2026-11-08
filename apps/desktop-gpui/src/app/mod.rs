@@ -403,6 +403,9 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);
+                    if this.revalidate_diff() {
+                        cx.notify();
+                    }
                 }
             }),
         ];
@@ -1231,7 +1234,7 @@ impl Render for Workspace {
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
-        let mini_player = self.render_preview_mini_player(cx);
+        let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
