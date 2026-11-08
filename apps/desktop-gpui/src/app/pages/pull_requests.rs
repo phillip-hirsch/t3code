@@ -16,7 +16,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight, Hsla,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, list, px, relative, rgb, svg,
 };
@@ -70,6 +70,8 @@ enum Row {
     },
     Entry {
         entry: Rc<Entry>,
+        /// The row is a button: a Tab stop that Enter or Space opens.
+        focus: FocusHandle,
         stat: Option<(u64, u64)>,
         elsewhere: bool,
         first: bool,
@@ -140,6 +142,9 @@ pub(in crate::app) struct PullRequestsState {
     prefetch: Option<(String, Task<()>)>,
     /// The searchable Author or Labels picker, while open.
     facet_search: Option<facets::FacetSearch>,
+    /// Each listed row's focus, kept across rebuilds, and the listener that prefetches a row
+    /// focus rests on (attached at the next render, which has the window).
+    row_focus: std::collections::HashMap<String, (FocusHandle, Option<Subscription>)>,
 }
 
 impl PullRequestsState {
@@ -148,7 +153,7 @@ impl PullRequestsState {
         let subscription = cx.subscribe(&search, |this, search, event: &InputEvent, cx| match event {
             InputEvent::Change => {
                 this.pull_requests.typed = search.read(cx).value().trim().to_owned();
-                this.rebuild_pull_request_rows();
+                this.rebuild_pull_request_rows(cx);
                 this.debounce_pull_request_search(cx);
                 cx.notify();
             }
@@ -192,6 +197,7 @@ impl PullRequestsState {
             prefetched: None,
             prefetch: None,
             facet_search: None,
+            row_focus: std::collections::HashMap::new(),
         }
     }
 
@@ -260,7 +266,7 @@ impl Workspace {
         change(&mut self.pull_requests);
         self.pull_requests.page_size = PAGE_SIZE;
         self.read_pull_requests(false, cx);
-        self.rebuild_pull_request_rows();
+        self.rebuild_pull_request_rows(cx);
         cx.notify();
     }
 
@@ -457,7 +463,7 @@ impl Workspace {
                     }
                     Err(failure) => state.error = Some(failure.into()),
                 }
-                this.rebuild_pull_request_rows();
+                this.rebuild_pull_request_rows(cx);
                 cx.notify();
             });
         })
@@ -531,7 +537,7 @@ impl Workspace {
                 }
                 this.pull_requests.partitions = Some(Partitions { key, authored, reviewing });
                 this.read_pull_request_stats(cx);
-                this.rebuild_pull_request_rows();
+                this.rebuild_pull_request_rows(cx);
                 cx.notify();
             });
         })
@@ -575,7 +581,7 @@ impl Workspace {
         let reread = match patch_entries(&listing, &mut list.entries, reference, reply) {
             ListPatch::Refresh => true,
             ListPatch::Patched => {
-                self.rebuild_pull_request_rows();
+                self.rebuild_pull_request_rows(cx);
                 in_flight
             }
             ListPatch::Unchanged => in_flight,
@@ -658,7 +664,7 @@ impl Workspace {
                     let key = logic::stat_key(field("projectId"), field("repository"), count("number"));
                     this.pull_requests.stats.insert(key, (count("additions"), count("deletions")));
                 }
-                this.rebuild_pull_request_rows();
+                this.rebuild_pull_request_rows(cx);
                 cx.notify();
             });
         })
@@ -686,7 +692,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn rebuild_pull_request_rows(&mut self) {
+    fn rebuild_pull_request_rows(&mut self, cx: &mut App) {
         let key = self.partition_key();
         let state = &mut self.pull_requests;
         let partitions = state.partitions.as_ref().filter(|p| p.key == key && state.typed.is_empty());
@@ -716,7 +722,16 @@ impl Workspace {
                     });
                 }
                 for (position, entry) in group.entries.into_iter().enumerate() {
+                    let focus = match state.row_focus.get(&entry.key()) {
+                        Some((focus, _)) => focus.clone(),
+                        None => {
+                            let focus = cx.focus_handle().tab_stop(true);
+                            state.row_focus.insert(entry.key(), (focus.clone(), None));
+                            focus
+                        }
+                    };
                     rows.push(Row::Entry {
+                        focus,
                         stat: logic::diff_stat(&entry, &state.stats),
                         elsewhere: logic::matched_elsewhere(&entry, &text),
                         first: position == 0 && (index == 0 || !group.label.is_empty()),
@@ -738,11 +753,17 @@ impl Workspace {
                 }));
             }
         }
+        let shown: std::collections::HashSet<String> = rows
+            .iter()
+            .filter_map(|row| if let Row::Entry { entry, .. } = row { Some(entry.key()) } else { None })
+            .collect();
+        state.row_focus.retain(|key, _| shown.contains(key));
         state.list_state.reset(rows.len());
         state.rows = Rc::from(rows);
     }
 
     pub(super) fn render_pull_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.listen_to_pull_request_row_focus(window, cx);
         let tokens = *theme::tokens(cx);
         let state = &self.pull_requests;
         let shown = state.rows.iter().any(|row| matches!(row, Row::Entry { .. }));
@@ -768,6 +789,22 @@ impl Workspace {
             return column.into_any_element();
         }
         h_flex().size_full().min_h_0().child(column).child(self.render_pr_panel_column(window, cx)).into_any_element()
+    }
+
+    /// `onFocus={() => onIntent(entry)}`: a row focus rests on prefetches like one the pointer rests on.
+    fn listen_to_pull_request_row_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (key, (focus, listener)) in &mut self.pull_requests.row_focus {
+            if listener.is_some() {
+                continue;
+            }
+            let key = key.clone();
+            *listener = Some(cx.on_focus(focus, window, move |this, _, cx| {
+                let entry = this.pull_requests.held_entries().find(|e| e.key() == key).cloned();
+                if let Some(entry) = entry {
+                    this.intend_pull_request(&entry, true, cx);
+                }
+            }));
+        }
     }
 
     fn render_pull_request_toolbar(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -798,7 +835,7 @@ impl Workspace {
             .child("Sort")
             .dropdown_menu(radio_menu(SORTS, sort, sort_icon, view.clone(), |this, value, cx| {
                 this.pull_requests.sort = value;
-                this.rebuild_pull_request_rows();
+                this.rebuild_pull_request_rows(cx);
                 cx.notify();
             }));
 
@@ -1173,14 +1210,15 @@ impl Workspace {
         list(self.pull_requests.list_state.clone(), move |index, window, cx| {
             let content = match &rows[index] {
                 Row::Header { key, label, count, first } => group_header(key, label, *count, *first, &t),
-                Row::Entry { entry, stat, elsewhere, first } => {
+                Row::Entry { entry, focus, stat, elsewhere, first } => {
                     let selected = selected.as_ref().is_some_and(|r| *r == reference_of(entry));
                     let origin = RowOrigin {
                         show_provider,
                         environment: environment_labels.get(&entry.environment_id).cloned(),
                     };
                     pull_request_row(
-                        entry, *stat, *elsewhere, *first, selected, &origin, meta_width, now, &view, &t, window, cx,
+                        entry, focus, *stat, *elsewhere, *first, selected, &origin, meta_width, now, &view, &t, window,
+                        cx,
                     )
                 }
                 Row::Stale(error) => stale_banner(error.clone(), &view, &t, window),
@@ -1589,6 +1627,7 @@ fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
 
 fn pull_request_row(
     entry: &Rc<Entry>,
+    focus: &FocusHandle,
     stat: Option<(u64, u64)>,
     elsewhere: bool,
     first: bool,
@@ -1737,11 +1776,28 @@ fn pull_request_row(
         );
 
     let picked = entry.clone();
+    let pressed = entry.clone();
     let rested = entry.clone();
+    let focused = focus.is_focused(window);
+    // `focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring`
+    let ring = (focused && window.last_input_was_keyboard())
+        .then(|| vec![gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(1.)).inset()]);
     h_flex()
         .id(ElementId::Name(id("row").into()))
+        .track_focus(focus)
+        .when_some(ring, gpui_kit::Styled::shadow)
+        .on_key_down(window.listener_for(view, move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+            let key = event.keystroke.key.as_str();
+            if matches!(key, "enter" | "space") && !event.keystroke.modifiers.modified() {
+                cx.stop_propagation();
+                this.open_pull_request_panel(reference_of(&pressed), Some(pressed.clone()), cx);
+            }
+        }))
         .on_hover(window.listener_for(view, move |this, resting: &bool, _, cx| {
-            this.intend_pull_request(&rested, *resting, cx);
+            // `onPointerLeave` keeps the intent of a row that still has focus.
+            if *resting || !focused {
+                this.intend_pull_request(&rested, *resting, cx);
+            }
         }))
         .when(!first, |el| el.mt(px(2.)))
         .w_full()
@@ -1772,9 +1828,14 @@ fn pull_request_row(
                 }),
         )
         .child(v_flex().flex_1().min_w_0().child(title_line).child(meta_line))
-        .on_click(window.listener_for(view, move |this, _, _, cx| {
-            this.open_pull_request_panel(reference_of(&picked), Some(picked.clone()), cx);
-        }))
+        .on_click({
+            let focus = focus.clone();
+            window.listener_for(view, move |this, _, window, cx| {
+                // A pressed button takes focus in a browser, so Enter and Tab go on from it.
+                window.focus(&focus, cx);
+                this.open_pull_request_panel(reference_of(&picked), Some(picked.clone()), cx);
+            })
+        })
         .into_any_element()
 }
 
