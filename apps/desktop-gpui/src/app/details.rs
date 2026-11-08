@@ -48,6 +48,7 @@ struct CardColors {
     muted: Hsla,
     track: Hsla,
     tick: Hsla,
+    ring: Hsla,
 }
 
 impl CardColors {
@@ -66,6 +67,7 @@ impl CardColors {
             label: tokens.foreground.opacity(0.8),
             muted: tokens.muted_foreground,
             tick: tokens.foreground.opacity(0.6),
+            ring: tokens.ring,
             track: tokens.muted_foreground.opacity(if tokens.dark { 0.2 } else { 0.3 }),
         }
     }
@@ -550,7 +552,7 @@ impl Workspace {
         };
         if saved.is_empty() && importable.is_empty() {
             return Some(
-                action_row("details-add-script", colors, cx)
+                action_row("details-add-script", colors, true, cx)
                     .child(icon("icons/plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .child(div().ml(px(2.)).truncate().child("Add project script"))
                     .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
@@ -744,8 +746,7 @@ impl Workspace {
             let running = self.vcs.running().is_some();
             let enabled = !running && self.can_write_source_control();
             rows.push(
-                action_row("details-init-git", colors, cx)
-                    .when(!enabled, |el| el.opacity(0.64))
+                action_row("details-init-git", colors, enabled, cx)
                     .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
                     .child(div().ml(px(2.)).child(if running { "Initializing..." } else { "Initialize Git" }))
                     .when(enabled, |el| {
@@ -817,6 +818,8 @@ impl Workspace {
         split_row("details-git", colors, cx)
             .child(
                 split_primary("details-git-primary", colors, !disabled, cx)
+                    // `aria-disabled` with its reason: still a tab stop.
+                    .when(disabled, |el| keyboard_button(el, colors))
                     .child(icon(quick.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
                     .child(div().min_w_0().truncate().child(quick.label.clone()))
                     .when_some(hint, |el, hint| {
@@ -1162,7 +1165,7 @@ impl Workspace {
         let deletion = if deletions > 0 { git::deletion_color(tokens, scheme) } else { tokens.muted_foreground };
         // `changesBaseLabel`: working-tree totals have no base.
         let base_label: SharedString = base.map_or_else(|| "Uncommitted".into(), |base| format!("vs {base}").into());
-        action_row("details-changes", colors, cx)
+        action_row("details-changes", colors, true, cx)
             .child(icon("icons/file-diff.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
             .child(
                 h_flex()
@@ -1534,10 +1537,36 @@ fn row(colors: &CardColors) -> gpui_kit::Div {
         .text_color(colors.label)
 }
 
-/// `part="row"`: a whole-row button with the panel's hover fill.
-fn action_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
+/// `part="row"`: a whole-row button with the panel's hover fill; a disabled one is dimmed and
+/// out of the tab order.
+fn action_row(
+    id: &'static str,
+    colors: &CardColors,
+    enabled: bool,
+    _: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     let hover = colors.hover;
-    row(colors).id(id).cursor_pointer().hover(move |style| style.bg(hover))
+    let row = row(colors).id(id);
+    if enabled {
+        keyboard_button(row.cursor_pointer().hover(move |style| style.bg(hover)), colors)
+    } else {
+        row.opacity(0.64)
+    }
+}
+
+/// `ThreadDetailsControl` as a keyboard button: a tab stop that Enter and Space click, with
+/// `focus-visible:ring-2 ring-inset`. The ring takes 2px of the row's 10px inset, so nothing moves.
+fn keyboard_button(
+    element: gpui_kit::Stateful<gpui_kit::Div>,
+    colors: &CardColors,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = colors.ring;
+    element
+        .tab_index(0)
+        .px(px(8.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
 }
 
 /// `THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS`: the pair shares one hover fill and shows its hairline.
@@ -1565,7 +1594,7 @@ fn split_primary(
         .text_size(px(13.))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
         .text_color(colors.label)
-        .when(enabled, |el| el.cursor_pointer().hover(move |style| style.bg(hover)))
+        .when(enabled, |el| keyboard_button(el.cursor_pointer().hover(move |style| style.bg(hover)), colors))
         .when(!enabled, |el| el.opacity(0.64))
 }
 
