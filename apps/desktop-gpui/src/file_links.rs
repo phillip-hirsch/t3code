@@ -70,14 +70,15 @@ const EXTENSIONLESS: [&str; 27] = [
     "CODEOWNERS",
 ];
 
-const GENERIC_TLDS: [&str; 25] = [
-    "com", "net", "org", "io", "dev", "app", "ai", "co", "edu", "gov", "mil", "info", "biz", "xyz", "me", "tv", "cc",
-    "gg", "chat", "cloud", "site", "online", "tech", "store", "link",
+const GENERIC_TLDS: [&str; 24] = [
+    "com", "net", "org", "io", "dev", "app", "ai", "co", "edu", "gov", "mil", "info", "biz", "xyz", "me", "tv", "gg",
+    "chat", "cloud", "site", "online", "tech", "store", "link",
 ];
 
-const COUNTRY_TLDS: [&str; 31] = [
+// C++ sources end in `.cc`, so `allocator.cc:217` names a file, not a host and port.
+const COUNTRY_TLDS: [&str; 32] = [
     "uk", "de", "fr", "nl", "se", "no", "fi", "dk", "pl", "ch", "at", "be", "es", "it", "pt", "eu", "us", "ca", "au",
-    "nz", "jp", "kr", "cn", "br", "ru", "mx", "ie", "cz", "tr", "sg", "hk",
+    "nz", "jp", "kr", "cn", "br", "ru", "mx", "ie", "cz", "tr", "sg", "hk", "cc",
 ];
 
 fn is_digits(text: &str) -> bool {
@@ -557,6 +558,7 @@ mod tests {
             "/Users/me/a.txt",
             "C:\\repo\\a.rs",
             "main.rs:4:2",
+            "allocator.cc:217",
         ];
         for code in yes {
             assert!(inline_code_candidate(code).is_some(), "{code} is a file");
