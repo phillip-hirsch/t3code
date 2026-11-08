@@ -33,6 +33,10 @@ impl Workspace {
         if context.editable_focus && self.sidebar_open.shown() && self.sidebar.has_undo() {
             context.editable_focus = false;
         }
+        let typing = context.editable_focus || context.combobox_focus || context.terminal_focus;
+        if self.launcher_letter_key(keystroke, typing || context.layer_open, window, cx) {
+            return true;
+        }
         let keymap = self.keymap.clone();
         let command = keymap::resolve(&keymap, keystroke, &context);
         if let Some(command) = command {
@@ -99,6 +103,7 @@ impl Workspace {
                 self.preview_command(command, window, cx);
             }
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
+            "rightPanel.new" if chat => return self.open_add_surface_menu(context.layer_open, held, cx),
             "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),
             "rightPanel.close" if chat => return held || self.close_active_surface(window, cx),
             "diff.toggle" if chat => self.toggle_diff(window, cx),

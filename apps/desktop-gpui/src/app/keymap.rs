@@ -44,6 +44,9 @@ pub(super) struct ShortcutContext {
     pub composer_requires_modifier: bool,
     /// Not a `when` key: focus sits in an open combobox.
     pub combobox_focus: bool,
+    /// Not a `when` key: a menu, popover, dialog or the palette is up
+    /// (`LAUNCHER_SHORTCUT_BLOCKING_LAYERS`).
+    pub layer_open: bool,
 }
 
 impl ShortcutContext {
@@ -354,6 +357,9 @@ impl super::Workspace {
             composer_requires_modifier: composer_focus
                 && super::send::requires_modifier(shortcut, &self.composer.read(cx).value()),
             combobox_focus: focus_in(stack, COMBOBOX_CONTEXT),
+            layer_open: ["PopupMenu", "Popover", "Dialog"].iter().any(|layer| focus_in(stack, layer))
+                || self.palette.is_some()
+                || self.model_picker_open(),
         }
     }
 

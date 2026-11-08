@@ -23,8 +23,8 @@ use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, DragMoveEvent, Element, ElementId, Empty, Entity,
-    Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
-    LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
+    FocusHandle, Focusable as _, GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div, px,
 };
 use serde_json::{Value, json};
@@ -292,8 +292,15 @@ struct FilePatches {
 pub(super) struct RightPanel {
     panels: HashMap<Target, PanelState>,
     width: f32,
-    /// The "+" menu is open; a native browser view must not cover it.
+    /// The "+" menu is open; a native browser view must not cover it. It also opens the menu,
+    /// as `rightPanel.new` does.
     pub(super) add_menu_open: bool,
+    /// The launcher's "Open browser in a profile" menu is open.
+    pub(super) profiles_menu_open: bool,
+    /// The launcher (`RightPanelEmptyState`), one Tab stop, and the row its arrows reached
+    /// among the available surfaces.
+    launcher_focus: FocusHandle,
+    launcher_highlight: Option<usize>,
     /// A tab's right-click menu, at its window position.
     tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     diff: Entity<DiffState>,
@@ -356,6 +363,9 @@ impl RightPanel {
             panels: HashMap::new(),
             width: DEFAULT_WIDTH,
             add_menu_open: false,
+            profiles_menu_open: false,
+            launcher_focus: cx.focus_handle().tab_stop(true),
+            launcher_highlight: None,
             tab_menu: None,
             diff,
             loaded: None,
@@ -1238,7 +1248,11 @@ impl Workspace {
         };
         self.sync_side_chat(side_chat.as_deref(), window, cx);
         self.sync_discovered_servers(window, cx);
-        let width = self.right_panel_width(window)?;
+        // A hidden panel closes its "+" menu, so showing the panel again leaves it closed.
+        let Some(width) = self.right_panel_width(window) else {
+            self.right_panel.add_menu_open = false;
+            return None;
+        };
         self.sync_diff(window, cx);
         let tokens = *theme::tokens(cx);
         let panel = self.panel_state().cloned().unwrap_or_default();
@@ -1336,7 +1350,17 @@ impl Workspace {
     /// `handleAddSurfaceMenuKeyDown`: an available surface's letter closes the "+" menu and opens it.
     fn add_surface_for_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(shortcut) = SurfaceShortcut::for_keystroke(&event.keystroke) else { return };
-        let available = match shortcut {
+        if !self.surface_available(shortcut) {
+            return;
+        }
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+        self.open_surface_shortcut(shortcut, window, cx);
+    }
+
+    /// Whether the "+" menu and the launcher offer `shortcut`'s surface and it can open here.
+    fn surface_available(&self, shortcut: SurfaceShortcut) -> bool {
+        match shortcut {
             SurfaceShortcut::Browser => self.browser_available(),
             SurfaceShortcut::Terminal => self.terminal_available(),
             SurfaceShortcut::Files => self.project_target().is_some(),
@@ -1344,12 +1368,10 @@ impl Workspace {
             SurfaceShortcut::PullRequest => self.thread_pull_request_target().is_some(),
             SurfaceShortcut::LinkedPullRequests => self.thread_links_pull_requests(),
             SurfaceShortcut::SideChat => self.side_chats_offered() && self.side_chat_disabled_reason().is_none(),
-        };
-        if !available {
-            return;
         }
-        cx.stop_propagation();
-        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+    }
+
+    fn open_surface_shortcut(&mut self, shortcut: SurfaceShortcut, window: &mut Window, cx: &mut Context<Self>) {
         match shortcut {
             SurfaceShortcut::Browser => self.add_browser_surface(window, cx),
             SurfaceShortcut::Terminal => self.add_terminal_surface(window, cx),
@@ -1363,6 +1385,93 @@ impl Workspace {
             SurfaceShortcut::LinkedPullRequests => self.open_surface(Surface::PullRequests, window, cx),
             SurfaceShortcut::SideChat => self.add_side_chat_surface(window, cx),
         }
+    }
+
+    /// The launcher's available surfaces in row order (`availableActions`).
+    fn launcher_actions(&self) -> Vec<SurfaceShortcut> {
+        SurfaceShortcut::ALL.into_iter().filter(|shortcut| self.surface_available(*shortcut)).collect()
+    }
+
+    /// The panel shows the launcher in place of a surface.
+    fn launcher_shown(&self) -> bool {
+        self.right_panel_open()
+            && match self.active_surface() {
+                None => true,
+                Some(Surface::Browser(_)) => !matches!(self.target, Some(Target::Thread { .. })),
+                Some(_) => false,
+            }
+    }
+
+    /// `rightPanel.new`: focuses the "+" menu open, unless another menu or dialog is up. A held
+    /// key is still claimed without reopening it.
+    pub(super) fn open_add_surface_menu(&mut self, layer_open: bool, held: bool, cx: &mut Context<Self>) -> bool {
+        if !self.right_panel_open() || (layer_open && !self.right_panel.add_menu_open) {
+            return false;
+        }
+        if !held && !self.right_panel.add_menu_open {
+            self.right_panel.add_menu_open = true;
+            cx.notify();
+        }
+        true
+    }
+
+    /// The launcher's window-wide letters (`handleShortcut`): an available surface's letter
+    /// opens it while the launcher shows, unless focus is typing or a menu or dialog is up.
+    pub(super) fn launcher_letter_key(
+        &mut self,
+        keystroke: &gpui_kit::Keystroke,
+        typing_or_layer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if typing_or_layer || self.right_panel.add_menu_open || self.right_panel.profiles_menu_open {
+            return false;
+        }
+        if self.page.is_some() || self.settings.is_some() || self.tab_menu_open() || !self.launcher_shown() {
+            return false;
+        }
+        let Some(shortcut) = SurfaceShortcut::for_keystroke(keystroke) else { return false };
+        if !self.surface_available(shortcut) {
+            return false;
+        }
+        self.open_surface_shortcut(shortcut, window, cx);
+        true
+    }
+
+    /// A launcher row's hover highlights it, and leaving it clears its highlight.
+    fn launcher_hover(
+        &self,
+        shortcut: SurfaceShortcut,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, hovered: &bool, _, cx| {
+            let index = this.launcher_actions().iter().position(|action| *action == shortcut);
+            if *hovered {
+                this.right_panel.launcher_highlight = index;
+            } else if this.right_panel.launcher_highlight == index {
+                this.right_panel.launcher_highlight = None;
+            }
+            cx.notify();
+        })
+    }
+
+    /// The focused launcher's arrows and Enter (`handleKeyDown`).
+    fn launcher_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let actions = self.launcher_actions();
+        let highlight = self.right_panel.launcher_highlight.filter(|_| !actions.is_empty());
+        let highlight = highlight.map(|index| index.min(actions.len().saturating_sub(1)));
+        match launcher_step(&event.keystroke, highlight, actions.len()) {
+            Some(LauncherStep::Highlight(index)) => {
+                self.right_panel.launcher_highlight = Some(index);
+                cx.notify();
+            }
+            Some(LauncherStep::Activate) => {
+                let Some(shortcut) = highlight.and_then(|index| actions.get(index).copied()) else { return };
+                self.open_surface_shortcut(shortcut, window, cx);
+            }
+            None => return,
+        }
+        cx.stop_propagation();
     }
 
     /// The 40px tab strip, a drag region clear of the panel toggles and caption buttons.
@@ -1482,6 +1591,7 @@ impl Workspace {
                             None => menu,
                         }
                     })
+                    .open(add_menu_open)
                     .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                         this.right_panel.add_menu_open = *open;
                         cx.notify();
@@ -1618,12 +1728,19 @@ impl Workspace {
     /// `RightPanelEmptyState`: "Open a surface" with the surfaces this client has.
     fn render_launcher(&self, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let hover = tokens.accent.opacity(0.6);
+        let actions = self.launcher_actions();
+        let highlighted = self
+            .right_panel
+            .launcher_highlight
+            .filter(|_| !actions.is_empty())
+            .and_then(|index| actions.get(index.min(actions.len() - 1)).copied());
         let row = |id: &'static str,
                    glyph: AnyElement,
                    label: &'static str,
                    key: &'static str,
                    available: bool,
                    hint: &'static str| {
+            let shortcut = SurfaceShortcut::ALL.into_iter().find(|s| s.letter() == key);
             h_flex()
                 .id(id)
                 .h(px(32.))
@@ -1637,7 +1754,9 @@ impl Workspace {
                 .child(kbd(key, tokens))
                 .map(|el| {
                     if available {
-                        el.cursor_pointer().hover(move |style| style.bg(hover))
+                        el.cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .when(shortcut.is_some() && shortcut == highlighted, |el| el.bg(hover))
                     } else {
                         el.opacity(0.5).tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
                     }
@@ -1652,6 +1771,7 @@ impl Workspace {
             browser_available,
             "Only available in a thread.",
         )
+        .when(browser_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Browser, cx)))
         .when(browser_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_browser_surface(window, cx)))
         });
@@ -1677,7 +1797,7 @@ impl Workspace {
                             profile_items(menu.max_w(px(224.)), &profiles, &view, window)
                         })
                         .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                            this.right_panel.add_menu_open = *open;
+                            this.right_panel.profiles_menu_open = *open;
                             cx.notify();
                         })),
                 ),
@@ -1694,6 +1814,7 @@ impl Workspace {
             terminal_available,
             "Available when a project is open.",
         )
+        .when(terminal_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Terminal, cx)))
         .when(terminal_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.add_terminal_surface(window, cx)))
         });
@@ -1706,6 +1827,7 @@ impl Workspace {
             files_available,
             "Available when a project is open.",
         )
+        .when(files_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Files, cx)))
         .when(files_available, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::Files, window, cx)))
         });
@@ -1718,6 +1840,7 @@ impl Workspace {
             diff_available,
             "Available for Git repositories.",
         )
+        .when(diff_available, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::Diff, cx)))
         .when(diff_available, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_changes(window, cx))));
         let target = self.thread_pull_request_target();
         let pull_request = row(
@@ -1728,6 +1851,7 @@ impl Workspace {
             target.is_some(),
             "No pull request on this branch yet.",
         )
+        .when(target.is_some(), |el| el.on_hover(self.launcher_hover(SurfaceShortcut::PullRequest, cx)))
         .when_some(target, |el, reference| {
             el.on_click(cx.listener(move |this, _, window, cx| {
                 this.open_surface(Surface::PullRequest(reference.clone()), window, cx);
@@ -1742,6 +1866,7 @@ impl Workspace {
             linked,
             "No linked pull requests available.",
         )
+        .when(linked, |el| el.on_hover(self.launcher_hover(SurfaceShortcut::LinkedPullRequests, cx)))
         .when(linked, |el| {
             el.on_click(cx.listener(|this, _, window, cx| this.open_surface(Surface::PullRequests, window, cx)))
         });
@@ -1756,10 +1881,15 @@ impl Workspace {
                 reason.unwrap_or("Available after the first message."),
             )
             .when(reason.is_none(), |el| {
-                el.on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
+                el.on_hover(self.launcher_hover(SurfaceShortcut::SideChat, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.add_side_chat_surface(window, cx)))
             })
         });
+        // `tabIndex={0}`: one Tab stop whose arrows and Enter drive the rows.
         div()
+            .id("right-panel-launcher")
+            .track_focus(&self.right_panel.launcher_focus)
+            .on_key_down(cx.listener(Self::launcher_key))
             .flex_1()
             .min_h_0()
             .flex()
@@ -2533,6 +2663,30 @@ enum SurfaceShortcut {
 }
 
 impl SurfaceShortcut {
+    /// The launcher's and the "+" menu's order.
+    const ALL: [Self; 7] = [
+        Self::Browser,
+        Self::Terminal,
+        Self::Files,
+        Self::Diff,
+        Self::PullRequest,
+        Self::LinkedPullRequests,
+        Self::SideChat,
+    ];
+
+    /// The letter its rows show.
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Browser => "B",
+            Self::Terminal => "T",
+            Self::Files => "F",
+            Self::Diff => "D",
+            Self::PullRequest => "P",
+            Self::LinkedPullRequests => "L",
+            Self::SideChat => "S",
+        }
+    }
+
     /// `surfaceShortcutActionForKey`: Ctrl, Alt and Cmd chords are commands, not letters.
     fn for_keystroke(keystroke: &gpui_kit::Keystroke) -> Option<Self> {
         let modifiers = &keystroke.modifiers;
@@ -2552,10 +2706,48 @@ impl SurfaceShortcut {
     }
 }
 
+/// What a key does in the focused launcher.
+#[derive(Debug, PartialEq, Eq)]
+enum LauncherStep {
+    Highlight(usize),
+    Activate,
+}
+
+/// `RightPanelEmptyState`'s `handleKeyDown` over `len` available rows: Down and Right move the
+/// highlight on and Up and Left back, wrapping; Enter opens the highlighted row.
+fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len: usize) -> Option<LauncherStep> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform || len == 0 {
+        return None;
+    }
+    Some(match keystroke.key.as_str() {
+        "down" | "right" => LauncherStep::Highlight(highlight.map_or(0, |index| (index + 1) % len)),
+        "up" | "left" => LauncherStep::Highlight(highlight.map_or(len - 1, |index| (index + len - 1) % len)),
+        "enter" => LauncherStep::Activate,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn launcher_arrows_wrap_through_the_available_rows() {
+        let step = |key: &'static str, highlight: Option<usize>, len: usize| {
+            launcher_step(&gpui_kit::Keystroke::parse(key).unwrap(), highlight, len)
+        };
+        assert_eq!(step("down", None, 3), Some(LauncherStep::Highlight(0)));
+        assert_eq!(step("right", Some(2), 3), Some(LauncherStep::Highlight(0)));
+        assert_eq!(step("up", None, 3), Some(LauncherStep::Highlight(2)));
+        assert_eq!(step("left", Some(0), 3), Some(LauncherStep::Highlight(2)));
+        assert_eq!(step("up", Some(2), 3), Some(LauncherStep::Highlight(1)));
+        assert_eq!(step("enter", Some(1), 3), Some(LauncherStep::Activate));
+        assert_eq!(step("ctrl-down", None, 3), None);
+        assert_eq!(step("down", None, 0), None);
+        assert_eq!(step("t", None, 3), None);
+    }
 
     #[test]
     fn add_menu_letters_open_surfaces_only_without_command_modifiers() {
