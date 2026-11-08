@@ -1258,6 +1258,14 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
+    /// `/projects/$projectKey`: Settings › Projects with the group holding `project_id` picked,
+    /// on every environment (`getSidebarProjectSettingsKey`, resolved as Settings groups them).
+    pub(in crate::app) fn open_project_settings(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let project = self.settings_project_groups().into_iter().find(|g| g.contains(project_id)).map(|g| g.key);
+        self.settings_ui.scope = crate::settings::scope::ScopeSearch { project, machine: None };
+        self.open_settings("projects", cx);
+    }
+
     /// A new thread route that the filter hides widens it to every project, like the web's
     /// route reveal, so history, links and the palette never open a thread with no row.
     fn reveal_route(&mut self, groups: &[ProjectGroup], searching: bool) {
@@ -2260,6 +2268,7 @@ impl Workspace {
             let (new_in, pin) = (workspace.clone(), workspace.clone());
             let settings = workspace.clone();
             let (project_id, root, member_ids) = (project_id.clone(), root.clone(), member_ids.clone());
+            let settings_project = project_id.clone();
             menu.item(PopupMenuItem::new("New thread").on_click(move |_, window, cx| {
                 let _ = new_in.update(cx, |this, cx| this.start_draft(project_id.clone(), window, cx));
             }))
@@ -2275,7 +2284,7 @@ impl Workspace {
             )
             .item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
                 move |_, _, cx| {
-                    let _ = settings.update(cx, |this, cx| this.open_settings("projects", cx));
+                    let _ = settings.update(cx, |this, cx| this.open_project_settings(&settings_project, cx));
                 },
             ))
         }

@@ -199,6 +199,7 @@ impl Workspace {
         let view = cx.weak_entity();
         let path = project.map(|p| p.workspace_root.clone());
         let has_project = project.is_some();
+        let settings_project = project_id.to_owned();
         let draft = self.draft_target(project_id);
         move |menu, window, cx| {
             let path = path.clone();
@@ -219,10 +220,10 @@ impl Workspace {
                     },
                 );
             if has_project {
-                let view = view.clone();
+                let (view, project_id) = (view.clone(), settings_project.clone());
                 menu = menu.item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
                     move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.open_settings("projects", cx));
+                        let _ = view.update(cx, |this, cx| this.open_project_settings(&project_id, cx));
                     },
                 ));
             }

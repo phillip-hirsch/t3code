@@ -930,7 +930,11 @@ impl ThreadMenu {
             }
             menu.item(PopupMenuItem::new("Thread ID").on_click(copy(id.clone())))
         });
-        menu = menu.item(act!(item("Project settings"), |this, _w, cx, _id| this.open_settings("projects", cx)));
+        menu = menu.item(act!(item("Project settings"), |this, _w, cx, id| {
+            if let Some(project_id) = this.shell.threads.iter().find(|t| t.id == id).map(|t| t.project_id.clone()) {
+                this.open_project_settings(&project_id, cx);
+            }
+        }));
         menu = menu.separator();
         menu = menu.item(
             act!(item("Archive thread"), |this, window, cx, id| this.archive_thread(&id, window, cx))

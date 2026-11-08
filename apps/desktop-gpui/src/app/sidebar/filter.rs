@@ -142,11 +142,11 @@ impl Workspace {
     /// `in_project` (Shift, `chat.newLocal`) or there is one open project (whatever the
     /// filter shows), else "New thread in…" in the palette.
     pub(in crate::app) fn new_thread(&mut self, in_project: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if in_project || !self.new_thread_opens_picker() {
-            if let Some(project_id) = self.new_thread_project() {
-                self.start_draft(project_id, window, cx);
-                return;
-            }
+        if (in_project || !self.new_thread_opens_picker())
+            && let Some(project_id) = self.new_thread_project()
+        {
+            self.start_draft(project_id, window, cx);
+            return;
         }
         self.sidebar_open.close_sheet();
         self.open_palette(View::NewThreadIn, window, cx);
@@ -330,6 +330,7 @@ impl Workspace {
                     let name = &g.display_name;
                     let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
                     let gear_title: SharedString = format!("Project settings for {name}").into();
+                    let settings_project = g.representative().id.clone();
                     let pin_group: SharedString = format!("filter-pin-{}", g.key).into();
                     div()
                         .ml_auto()
@@ -345,7 +346,7 @@ impl Workspace {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.close_filter(cx);
-                                    this.open_settings("projects", cx);
+                                    this.open_project_settings(&settings_project, cx);
                                 }))
                                 .child(gpui_kit::component::Icon::new(IconName::Settings).size(px(14.))),
                         )

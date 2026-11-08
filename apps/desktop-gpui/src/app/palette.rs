@@ -73,6 +73,8 @@ enum Run {
     Thread(String),
     Project(String),
     Settings(&'static str),
+    /// Settings › Projects with this project's group picked.
+    ProjectSettings(String),
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
@@ -676,9 +678,13 @@ impl Workspace {
             row.terms = &["pin", "unpin", "project", "favorite"];
             rows.push(row);
         }
-        if let Some(project) = current {
-            let mut row = lucide("project-settings", IconName::Folder, "Project settings", Run::Settings("projects"));
-            row.description = Some(Description::Text(self.group_name(project)));
+        // `contextualProjectGroup`: the open project's group, else the first.
+        let current_group = self.current_project().and_then(|p| Some((groups.iter().find(|g| g.contains(&p.id))?, p)));
+        let contextual = current_group.or_else(|| groups.first().map(|g| (g, g.representative())));
+        if let Some((group, project)) = contextual {
+            let run = Run::ProjectSettings(project.id.clone());
+            let mut row = lucide("project-settings", IconName::Folder, "Project settings", run);
+            row.description = Some(Description::Text(group.display_name.clone().into()));
             row.terms = &[
                 "project",
                 "settings",
@@ -1065,6 +1071,7 @@ impl Workspace {
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
             Run::Project(project_id) => self.open_project(&project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
+            Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
             Run::Page(page) => self.open_page(page, cx),
             Run::Find => self.open_thread_find_or_explain(window, cx),
             Run::ScratchThread(environment) => self.start_scratch_thread(environment, None, window, cx),
