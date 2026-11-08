@@ -495,12 +495,100 @@ impl Workspace {
             detail: Some("This permanently clears conversation history for this thread."),
             destructive: true,
         };
-        self.confirm_then(question, window, cx, move |this, _, cx| {
-            if this.thread_client(&thread_id).is_some() {
-                this.expire_undo(&thread_id);
-                this.thread_command("thread.delete", &thread_id, json!({}), cx);
-            }
+        self.confirm_then(question, window, cx, move |this, window, cx| this.delete_confirmed(&thread_id, window, cx));
+    }
+
+    /// `deleteThread` once agreed: offers to remove a worktree only this thread uses, stops the
+    /// thread's provider sessions, deletes it, then removes the worktree if asked to.
+    fn delete_confirmed(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(client), Some(thread)) = (self.thread_client(thread_id), self.thread(thread_id)) else { return };
+        let environment = thread.environment_id.clone();
+        let info = self.env_info(&environment).unwrap_or_else(|| self.server_info());
+        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+        let scratch_root = info.scratch_workspace_root.as_deref().map(crate::project_groups::normalize_path);
+        let removable = project.filter(|p| {
+            scratch_root.as_deref() != Some(crate::project_groups::normalize_path(&p.workspace_root).as_str())
         });
+        let siblings: Vec<_> = self.shell.threads.iter().filter(|t| t.environment_id == environment).collect();
+        let orphan = orphaned_worktree(&siblings, thread_id)
+            .filter(|_| removable.is_some() && self.env_grants(&environment, "source-control:write"));
+        let automatic = removable.is_some_and(|p| {
+            crate::settings::scope::worktree_cleanup_rules(&info.settings, Some(&p.scope_project()))
+                .get("worktreeOnDelete")
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+        // A shell that leaves idle subagent children out can't prove nobody else uses the worktree.
+        let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true);
+        let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
+        let project_root = removable.map(|p| p.workspace_root.clone());
+        let thread_id = thread_id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut orphan = orphan.filter(|_| !automatic);
+            if let (Some(path), true) = (&orphan, ask_server) {
+                let occupants =
+                    client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
+                let alone = occupants.ok().and_then(|value| {
+                    let ids = value["threadIds"].as_array()?.clone();
+                    Some(ids.iter().all(|id| id.as_str() == Some(&thread_id)))
+                });
+                if alone != Some(true) {
+                    orphan = None;
+                }
+            }
+            let mut remove = false;
+            if let Some(path) = &orphan {
+                let message = format!(
+                    "This thread is the only one linked to this worktree:\n{}\n\nDelete the worktree too?",
+                    worktree_display(path)
+                );
+                let Ok(answer) =
+                    this.update_in(cx, |_, window, cx| super::super::confirm::confirm(&message, true, window, cx))
+                else {
+                    return;
+                };
+                let Ok(agreed) = answer.await else { return };
+                remove = agreed;
+            }
+            if has_runtime {
+                stop_provider_sessions(&client, &thread_id).await;
+            }
+            let command = Self::thread_command_value("thread.delete", &thread_id, json!({}));
+            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(failure_message(Some("Failed to delete thread"), &error.to_string()).into());
+                    cx.notify();
+                });
+                return;
+            }
+            let removing = this.update(cx, |this, _| {
+                this.expire_undo(&thread_id);
+                remove && this.env_grants(&environment, "source-control:write")
+            });
+            let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
+                return;
+            };
+            let removed = client
+                .request("vcs.removeWorktree", json!({"cwd": root, "path": path, "force": true}))
+                .await
+                .map_err(|error| {
+                    ("Failed to delete worktree", format!("Could not remove {}. {error}", worktree_display(&path)))
+                });
+            let failure = match removed {
+                Ok(_) => client
+                    .request("vcs.refreshStatus", json!({"cwd": root}))
+                    .await
+                    .err()
+                    .map(|error| ("Worktree deleted, but Git status refresh failed", error.to_string())),
+                Err(failure) => Some(failure),
+            };
+            if let Some((title, description)) = failure {
+                let _ = this.update_in(cx, |_, window, cx| {
+                    window.push_notification(Notification::error(description).title(title), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// Runs `then` at once when the question's setting is off, else once the user agrees.
@@ -823,6 +911,52 @@ fn native_rows(menu: PopupMenu) -> PopupMenu {
     if cfg!(windows) { menu.item_text(Some("Segoe UI".into()), px(12.), px(26.)) } else { menu }
 }
 
+/// `getOrphanedWorktreePathForThread`: the thread's worktree when no other listed thread uses it.
+fn orphaned_worktree(threads: &[&crate::model::ThreadShell], thread_id: &str) -> Option<String> {
+    let path = threads.iter().find(|t| t.id == thread_id)?.worktree_path.as_deref()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let key = crate::project_groups::normalize_path(path);
+    let shared = threads.iter().any(|t| {
+        t.id != thread_id && t.worktree_path.as_deref().is_some_and(|p| crate::project_groups::normalize_path(p) == key)
+    });
+    (!shared).then(|| path.to_owned())
+}
+
+/// `formatWorktreePathForDisplay`: the worktree's folder name.
+fn worktree_display(path: &str) -> &str {
+    let trimmed = path.trim();
+    trimmed
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed)
+}
+
+/// `stopThreadSession`: detaches each provider session the thread holds; failures don't stop
+/// the delete, which detaches them on the server too.
+async fn stop_provider_sessions(client: &crate::rpc::RpcClient, thread_id: &str) {
+    let Ok(projection) = client.request("orchestration.getThreadProjection", json!({"threadId": thread_id})).await
+    else {
+        return;
+    };
+    let command_id = new_id();
+    let sessions = projection["providerSessions"].as_array().cloned().unwrap_or_default();
+    for session in sessions.iter().filter_map(|s| s["id"].as_str()) {
+        let command = json!({
+            "type": "provider-session.detach",
+            "commandId": format!("{command_id}:detach:{session}"),
+            "threadId": thread_id,
+            "providerSessionId": session,
+            "reason": "client-requested",
+        });
+        let _ = client.request("orchestration.dispatchCommand", command).await;
+    }
+}
+
 /// A submenu a read-only connection can't open: the web disables it and its children.
 fn locked_submenu(label: &'static str, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenuItem {
     PopupMenuItem::submenu(label, PopupMenu::build(window, cx, |menu, _, _| menu)).disabled(true)
@@ -978,5 +1112,35 @@ impl ThreadMenu {
         let delete =
             if cfg!(target_os = "macos") { item("Delete").icon(Icon::new(Lucide::Trash)) } else { item("Delete") };
         menu.item(op!(delete, false, |this, window, cx, id| this.delete_thread(&id, window, cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worktree_is_orphaned_only_when_no_other_thread_uses_it() {
+        let thread = |id: &str, worktree: Option<&str>| -> crate::model::ThreadShell {
+            serde_json::from_value(json!({
+                "id": id, "projectId": "p", "title": id, "status": "idle",
+                "updatedAt": "2026-01-01T00:00:00.000Z", "worktreePath": worktree,
+            }))
+            .unwrap()
+        };
+        let (a, b) = (thread("a", Some("/repo/wt")), thread("b", Some("/repo/wt/")));
+        let (c, local) = (thread("c", Some("/repo/other")), thread("d", None));
+        assert_eq!(orphaned_worktree(&[&a, &c, &local], "a").as_deref(), Some("/repo/wt"));
+        // The same checkout spelled with a trailing slash is shared.
+        assert_eq!(orphaned_worktree(&[&a, &b], "a"), None);
+        assert_eq!(orphaned_worktree(&[&a, &local], "d"), None);
+        assert_eq!(orphaned_worktree(&[&a], "missing"), None);
+    }
+
+    #[test]
+    fn worktree_paths_show_their_folder_name() {
+        assert_eq!(worktree_display("/repo/.t3/worktrees/feature-x/"), "feature-x");
+        assert_eq!(worktree_display(r"C:\repo\wt\feature"), "feature");
+        assert_eq!(worktree_display("plain"), "plain");
     }
 }

@@ -102,10 +102,15 @@ impl Workspace {
         self.sessions.iter_mut().find(|s| s.is(environment_id))
     }
 
-    /// `useEnvironmentScope(environmentId, "orchestration:operate")`: whether this client may
-    /// change the environment's threads. A pending or failed check grants nothing.
+    /// `readEnvironmentScope`: whether this client holds `scope` on the environment. A pending
+    /// or failed check grants nothing.
+    pub(super) fn env_grants(&self, environment_id: &str, scope: &str) -> bool {
+        self.session(environment_id).is_some_and(|s| s.grants.grants(scope))
+    }
+
+    /// Whether this client may change the environment's threads.
     pub(super) fn can_operate(&self, environment_id: &str) -> bool {
-        self.session(environment_id).is_some_and(|s| s.grants.grants("orchestration:operate"))
+        self.env_grants(environment_id, "orchestration:operate")
     }
 
     /// The open target lives on the primary environment (or nothing is open).
