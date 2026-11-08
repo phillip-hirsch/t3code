@@ -125,7 +125,7 @@ impl Workspace {
         let thread_id = self.preview_thread_id()?;
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab));
         let blank = !self.preview.tabs.contains_key(tab.as_str())
-            && session.is_none_or(|s| !s.server_hosted() && matches!(s.nav_status, NavStatus::Idle));
+            && session.is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
         if !blank {
             return None;
         }

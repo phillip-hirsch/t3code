@@ -961,15 +961,25 @@ impl Workspace {
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
         let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id)).cloned();
+        let server = session.as_ref().filter(|s| s.server_hosted());
+        // An agent tab's stream stays connected under the empty and unreachable states, so a URL
+        // picked there and a Reload reach the page.
+        if server.is_some() {
+            self.keep_server_stream(thread_id, tab_id, window, cx);
+        }
         // A failed load shows `PreviewUnreachable` in place of the page (and its native view).
         let status = match self.preview.tabs.get(tab_id) {
             Some(tab) => Some(tab.status.clone()),
-            None => session.as_ref().filter(|s| s.server_hosted()).map(|s| s.nav_status.clone()),
+            None => server.map(|s| s.nav_status.clone()),
         };
         if let Some(page) = status.and_then(|status| self.render_unreachable(tab_id, &status, &tokens, cx)) {
             return div().flex_1().min_h_0().child(page).into_any_element();
         }
-        if let Some(session) = session.as_ref().filter(|s| s.server_hosted()) {
+        if let Some(session) = server {
+            if matches!(session.nav_status, NavStatus::Idle) {
+                let empty = self.render_preview_empty_state(thread_id, &tokens, cx);
+                return div().flex_1().min_h_0().child(empty).into_any_element();
+            }
             let follow_size = session.viewport.size().is_none();
             return self.render_server_page(thread_id, tab_id, follow_size, false, &tokens, window, cx);
         }

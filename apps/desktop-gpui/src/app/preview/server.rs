@@ -174,6 +174,20 @@ impl Workspace {
         });
     }
 
+    /// Connects `tab_id`'s stream, or keeps it connected through this frame.
+    pub(super) fn keep_server_stream(
+        &mut self,
+        thread_id: &str,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_server_stream(thread_id, tab_id, window, cx);
+        if !self.preview.server.drawn.iter().any(|drawn| drawn == tab_id) {
+            self.preview.server.drawn.push(tab_id.to_owned());
+        }
+    }
+
     fn ensure_server_stream(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview.server.streams.contains_key(tab_id) {
             return;
@@ -321,8 +335,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.ensure_server_stream(thread_id, tab_id, window, cx);
-        self.preview.server.drawn.push(tab_id.to_owned());
+        self.keep_server_stream(thread_id, tab_id, window, cx);
         let Some(stream) = self.preview.server.streams.get_mut(tab_id) else {
             return div().flex_1().into_any_element();
         };
