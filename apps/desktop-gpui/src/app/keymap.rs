@@ -135,6 +135,17 @@ fn unshifted(key: &str) -> Option<&'static str> {
 /// `key_char` the typed character (the web's `key`); either may match.
 pub(super) fn matches(keystroke: &Keystroke, shortcut: &Shortcut, mac: bool) -> bool {
     let m = &keystroke.modifiers;
+    // AltGr (Ctrl+Alt off macOS) typing a character other than a letter or digit is text.
+    if !mac
+        && m.control
+        && m.alt
+        && keystroke.key_char.as_deref().is_some_and(|typed| {
+            let mut chars = typed.chars();
+            !matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_alphanumeric())
+        })
+    {
+        return false;
+    }
     let meta = shortcut.meta_key || (shortcut.mod_key && mac);
     let ctrl = shortcut.ctrl_key || (shortcut.mod_key && !mac);
     if m.platform != meta || m.control != ctrl || m.alt != shortcut.alt_key {
@@ -430,6 +441,21 @@ mod tests {
         assert_eq!(resolve_on(rules, &key("cmd-w"), &rest, true), Some("rightPanel.close"));
         assert_eq!(resolve_on(rules, &key("ctrl-w"), &rest, true), None);
         assert_eq!(resolve_on(&custom, &key("cmd-alt-y"), &rest, true), Some("sidebar.toggle"));
+    }
+
+    #[test]
+    fn altgr_text_runs_no_shortcut_off_macos() {
+        let rules = merge_with_defaults(&[
+            compile("mod+alt+q", "sidebar.toggle", None).unwrap(),
+            compile("mod+alt+e", "usage.open", None).unwrap(),
+        ]);
+        let rest = ShortcutContext::default();
+        let typed = |text: &'static str, typed: &str| Keystroke { key_char: Some(typed.to_owned()), ..key(text) };
+        assert_eq!(resolve_on(&rules, &typed("ctrl-alt-q", "@"), &rest, false), None, "German AltGr+Q types @");
+        assert_eq!(resolve_on(&rules, &typed("ctrl-alt-e", "€"), &rest, false), None);
+        assert_eq!(resolve_on(&rules, &typed("ctrl-alt-q", "q"), &rest, false), Some("sidebar.toggle"));
+        assert_eq!(resolve_on(&rules, &key("ctrl-alt-q"), &rest, false), Some("sidebar.toggle"), "no text typed");
+        assert_eq!(resolve_on(&rules, &typed("cmd-alt-q", "œ"), &rest, true), Some("sidebar.toggle"));
     }
 
     #[test]
