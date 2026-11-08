@@ -160,6 +160,9 @@ pub struct Provider {
     /// Empty means every runtime mode.
     #[serde(default)]
     pub supported_runtime_modes: Vec<String>,
+    /// `continuation`: instances sharing a `groupKey` can continue each other's threads.
+    #[serde(default)]
+    pub continuation: Option<Value>,
     /// `false` hides the composer's Plan toggle.
     #[serde(default)]
     pub show_interaction_mode_toggle: Option<bool>,
@@ -1077,6 +1080,12 @@ pub struct AppThread {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
+    /// The instance its provider session runs on (`runtime.providerInstanceId`).
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// `"v1_import"` for a thread brought over from the old event store.
+    #[serde(default)]
+    pub history_origin: Option<String>,
     /// Why the last `checkpoint.rollback` failed, keyed by its command id.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
@@ -1141,6 +1150,9 @@ pub struct ProviderThread {
     pub provider_instance_id: Option<String>,
     #[serde(default)]
     pub app_thread_id: Option<String>,
+    /// The provider's own thread, which a handoff resumes from.
+    #[serde(default)]
+    pub native_thread_ref: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1148,6 +1160,8 @@ pub struct ProviderThread {
 pub struct ProviderSession {
     pub id: String,
     pub status: String,
+    #[serde(default)]
+    pub driver: Option<String>,
     /// `OrchestrationV2ProviderCapabilities`.
     #[serde(default)]
     pub capabilities: Value,
@@ -1524,6 +1538,32 @@ impl ThreadProjection {
             markdown => markdown,
         };
         Some((plan, markdown))
+    }
+
+    /// `threadHasStarted`: it ran, holds items, or has a provider session.
+    pub fn has_started(&self) -> bool {
+        !self.runs.is_empty() || !self.turn_items.is_empty() || self.provider_session().is_some()
+    }
+
+    /// `threadSupportsProviderHandoff`: its next turn may move to another provider.
+    pub fn supports_provider_handoff(&self) -> bool {
+        if let Some(session) = self.provider_session() {
+            return session.capabilities["sessions"]["supportsProviderSwitchingViaHandoff"].as_bool() == Some(true);
+        }
+        if self.runs.iter().any(|run| is_active_run_status(&run.status)) {
+            return false;
+        }
+        if self.thread.history_origin.as_deref() == Some("v1_import") || self.runs.is_empty() {
+            return true;
+        }
+        // A stopped session leaves the projection, but its native thread can still hand off.
+        let instance = self.thread.model_selection.as_ref().map(|s| &s.instance_id);
+        self.provider_threads.iter().any(|thread| {
+            Some(&thread.id) == self.thread.active_provider_thread_id.as_ref()
+                && thread.app_thread_id.as_ref() == Some(&self.thread.id)
+                && thread.provider_instance_id.as_ref() == instance
+                && thread.native_thread_ref.as_ref().is_some_and(|r| !r.is_null())
+        })
     }
 
     /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.

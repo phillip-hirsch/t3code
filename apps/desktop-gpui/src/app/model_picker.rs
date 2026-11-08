@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use super::Workspace;
 use super::composer::{control_button, runtime_modes};
-use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel, ServerInfo};
+use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel, ServerInfo, ThreadProjection};
 use crate::model_label;
 use crate::theme::{self, Tokens};
 
@@ -44,6 +44,43 @@ pub(in crate::app) struct PickHost {
     pub current: Option<ModelSelection>,
     pub include: fn(&Provider) -> bool,
     pub on_pick: OnPick,
+}
+
+/// The providers a started thread may continue on when its provider cannot hand off
+/// (`deriveLockedProvider`, `lockedContinuationGroupKey` in `resolveComposerProviderSelection`).
+#[derive(Debug, PartialEq)]
+struct ProviderLock {
+    driver: String,
+    group: Option<String>,
+    /// Antigravity history without a group stays on its own instance.
+    exact_instance: Option<String>,
+}
+
+impl ProviderLock {
+    fn of(projection: &ThreadProjection, providers: &[Provider]) -> Option<Self> {
+        if !projection.has_started() || projection.supports_provider_handoff() {
+            return None;
+        }
+        let selection = projection.thread.model_selection.as_ref();
+        let instance_driver = || {
+            let instance = &selection?.instance_id;
+            Some(providers.iter().find(|p| &p.instance_id == instance).map_or(instance, |p| &p.driver).clone())
+        };
+        let driver = projection.provider_session().and_then(|s| s.driver.clone()).or_else(instance_driver)?;
+        let locked = projection.thread.provider_instance_id.as_ref().or(selection.map(|s| &s.instance_id));
+        let group = locked
+            .and_then(|id| providers.iter().find(|p| &p.instance_id == id))
+            .and_then(|p| p.continuation.as_ref()?["groupKey"].as_str().map(str::to_owned));
+        let exact_instance = locked.filter(|_| driver == "antigravity" && group.is_none()).cloned();
+        Some(Self { driver, group, exact_instance })
+    }
+
+    fn allows(&self, provider: &Provider) -> bool {
+        let group = provider.continuation.as_ref().and_then(|c| c["groupKey"].as_str());
+        provider.driver == self.driver
+            && self.group.as_deref().is_none_or(|key| group == Some(key))
+            && self.exact_instance.as_ref().is_none_or(|id| *id == provider.instance_id)
+    }
 }
 
 /// The composer trigger's text and marks: what its natural width depends on, besides the font.
@@ -218,9 +255,19 @@ impl Workspace {
         }
     }
 
-    /// The providers the open picker offers.
+    /// The providers the open picker offers: its host's, else those the open thread may continue on.
     fn picker_includes(&self, provider: &Provider) -> bool {
-        self.picker.host.as_ref().is_none_or(|host| (host.include)(provider))
+        match &self.picker.host {
+            Some(host) => (host.include)(provider),
+            None => self.composer_provider_lock().is_none_or(|lock| lock.allows(provider)),
+        }
+    }
+
+    fn composer_provider_lock(&self) -> Option<ProviderLock> {
+        if !matches!(self.target, Some(super::Target::Thread { .. })) {
+            return None;
+        }
+        ProviderLock::of(self.open_projection()?, &self.server_info().providers)
     }
 
     /// The docked picker keeps its popup open; any other closes and hands the model to its host.
@@ -1307,6 +1354,34 @@ fn set_favorite(info: &mut ServerInfo, key: &(String, String), favorite: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_that_cannot_hand_off_keeps_its_provider_and_continuation_group() {
+        let providers: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "codex", "driver": "codex", "continuation": {"groupKey": "home"}},
+            {"instanceId": "codex-work", "driver": "codex", "continuation": {"groupKey": "work"}},
+            {"instanceId": "codex-home2", "driver": "codex", "continuation": {"groupKey": "home"}},
+            {"instanceId": "claude", "driver": "claudeAgent"},
+        ]))
+        .unwrap();
+        let projection = |session_handoff: bool| -> ThreadProjection {
+            serde_json::from_value(json!({
+                "thread": {"id": "t", "title": "t", "modelSelection": {"instanceId": "codex", "model": "m"},
+                    "providerInstanceId": "codex", "activeProviderThreadId": "pt"},
+                "runs": [{"id": "r", "status": "completed", "ordinal": 1, "providerThreadId": "pt"}],
+                "providerThreads": [{"id": "pt", "appThreadId": "t", "providerSessionId": "s", "providerInstanceId": "codex"}],
+                "providerSessions": [{"id": "s", "status": "ready", "driver": "codex",
+                    "capabilities": {"sessions": {"supportsProviderSwitchingViaHandoff": session_handoff}}}],
+            }))
+            .unwrap()
+        };
+        let lock = ProviderLock::of(&projection(false), &providers).unwrap();
+        let allowed: Vec<&str> = providers.iter().filter(|p| lock.allows(p)).map(|p| p.instance_id.as_str()).collect();
+        assert_eq!(allowed, ["codex", "codex-home2"]);
+        assert_eq!(ProviderLock::of(&projection(true), &providers), None, "a handoff may switch providers");
+        let fresh: ThreadProjection = serde_json::from_value(json!({"thread": {"id": "t", "title": "t"}})).unwrap();
+        assert_eq!(ProviderLock::of(&fresh, &providers), None, "an unstarted thread picks freely");
+    }
 
     #[test]
     fn provider_steps_wrap_through_favorites() {
