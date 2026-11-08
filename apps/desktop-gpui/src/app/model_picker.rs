@@ -138,7 +138,7 @@ pub(super) struct PickerState {
     /// The search has focus: its underline takes the ring colour (`focus-within:border-ring`).
     search_focused: bool,
     query: String,
-    /// `autoHighlight`: nothing until a filter or the arrows highlight a row.
+    /// `focusItemOnOpen`: the current model on open; then a filter's first row or the arrows'.
     highlighted: Option<usize>,
     /// The effort column's focused stop (`effort_stops`); `None` while the search has the keys.
     effort_focus: Option<usize>,
@@ -222,6 +222,8 @@ impl Workspace {
         self.picker.search_focused = true;
         self.picker.open = Some(id);
         self.picker.host = host;
+        let current = self.picker_current();
+        self.picker.highlighted = self.picker_rows(current.as_ref()).0.iter().position(|row| row.selected);
         cx.notify();
     }
 
@@ -922,6 +924,7 @@ impl Workspace {
         let column = v_flex()
             .w(px(if searching { LIST + RAIL } else { LIST }))
             .h_full()
+            .bg(t.foreground.opacity(0.012))
             .when(!searching, |el| el.border_l_1().border_color(rule))
             .child(search_row)
             .child(list)
