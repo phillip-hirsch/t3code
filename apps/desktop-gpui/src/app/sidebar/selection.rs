@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::actions::UndoAction;
 use super::now_ms;
-use crate::app::{Target, Workspace};
+use crate::app::Workspace;
 use crate::inbox::{self, Facts};
 
 /// The selected rows and the anchor a Shift-click ranges from.
@@ -231,15 +231,13 @@ impl Workspace {
         }
         for id in ids {
             let entry = self.undo_entry(id);
-            self.thread_command("thread.settle", id, json!({}), cx);
-            self.push_undo(UndoAction::Settled, entry, cx);
+            let plan = self.plan_leave(id, ids);
+            self.thread_command_then("thread.settle", id, json!({}), window, cx, move |this, window, cx| {
+                this.push_undo(UndoAction::Settled, entry, cx);
+                this.leave(plan, window, cx);
+            });
         }
         self.clear_selection(cx);
-        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
-            && ids.contains(&open)
-        {
-            self.leave_threads(&open, ids, window, cx);
-        }
     }
 
     /// Snoozes each thread until `wake_ms`, moving on past all of them from the open one.
@@ -254,26 +252,41 @@ impl Workspace {
         }
         self.clear_selection(cx);
         let until = crate::timestamp::iso(wake_ms).unwrap_or_default();
-        let mut commands = Vec::new();
-        for id in ids {
-            let entry = self.undo_entry(id);
-            commands.push(Self::thread_command_value("thread.snooze", id, json!({"snoozedUntil": until})));
-            self.push_undo(UndoAction::Snoozed, entry, cx);
-        }
-        self.dispatch_batch(
-            commands,
-            false,
-            |failed, succeeded| match succeeded {
-                0 => "Failed to snooze threads".into(),
-                _ => format!("Failed to snooze {failed} thread{}", plural(failed)),
-            },
-            cx,
-        );
-        if let Some(Target::Thread { id: open, .. }) = self.target.clone()
-            && ids.contains(&open)
-        {
-            self.leave_threads(&open, ids, window, cx);
-        }
+        let steps: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                let command = Self::thread_command_value("thread.snooze", id, json!({"snoozedUntil": until}));
+                Some((self.thread_client(id)?, command, self.undo_entry(id), self.plan_leave(id, ids)))
+            })
+            .collect();
+        // Each undo and the move past the open thread wait for the server to take its snooze.
+        cx.spawn_in(window, async move |this, cx| {
+            let (mut accepted, mut failed, mut first_error) = (Vec::new(), 0, None);
+            for (client, command, entry, plan) in steps {
+                match client.request("orchestration.dispatchCommand", command).await {
+                    Ok(_) => accepted.push((entry, plan)),
+                    Err(error) => {
+                        failed += 1;
+                        first_error.get_or_insert(error.to_string());
+                    }
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                let title = match accepted.len() {
+                    0 => "Failed to snooze threads".to_owned(),
+                    _ => format!("Failed to snooze {failed} thread{}", plural(failed)),
+                };
+                for (entry, plan) in accepted {
+                    this.push_undo(UndoAction::Snoozed, entry, cx);
+                    this.leave(plan, window, cx);
+                }
+                if let Some(error) = first_error {
+                    this.error = Some(super::actions::failure_message(Some(&title), &error).into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Deletes the threads, asked first unless `confirmThreadDelete` is off.
